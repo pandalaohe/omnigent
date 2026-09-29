@@ -1841,6 +1841,7 @@ async def _send_to_in_flight_child(
                 remote=remote,
                 host_id=host_id,
                 placement_label=placement_label,
+                registered_by="sys_session_send",
             )
             fresh.status = "running"
             # Best-effort dispatch-id stamp for restart recovery only; the
@@ -4052,6 +4053,7 @@ async def _execute_subagent_tool(
         remote=remote_child,
         host_id=remote_host,
         placement_label=_placement_label(member_host_name, remote_workspace),
+        registered_by="sys_session_send",
     )
     if remote_child_bound:
         # A new remote child's ``running`` edge is emitted on its own host's
@@ -4624,6 +4626,7 @@ async def _send_to_existing_session(
         remote=remote_child,
         host_id=child_host if remote_child else None,
         placement_label=child_placement,
+        registered_by="sys_session_send",
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -5083,6 +5086,7 @@ async def _finalize_created_session(
             remote=remote,
             host_id=host_id if remote else None,
             placement_label=placement_label,
+            registered_by="sys_session_create",
         )
         post_error = await _post_created_child_message(
             server_client, child_id, message, remote=remote

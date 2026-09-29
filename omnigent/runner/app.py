@@ -193,6 +193,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, No
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
+    child_session_framework_instructions,
     raw_author_instructions,
     session_startup_extras,
 )
@@ -578,6 +579,7 @@ _SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
 _SUBAGENT_DELIVERY_UNTRACKED = "untracked"
 _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
 _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
+_SUBAGENT_DELIVERY_QUIET = "quiet"
 # Runner-owned labels on a child session that make sub-agent result delivery
 # durable across a runner restart. The dispatch id is stamped when a turn is
 # sent to the child; the delivered id is the receipt the parent's
@@ -1801,6 +1803,13 @@ class _SubagentWorkEntry:
         ``"host_a1b2c3"``; ``None`` for a same-host child.
     :param placement_label: Where the child runs, as ``"<host> · <cwd>"``,
         e.g. ``"fn · ~/projects/app"``; ``None`` when unknown.
+    :param delivered_result_key: Server item id of the last assistant message
+        whose result was delivered from this entry, or ``None`` when no key
+        was readable. A terminal edge carrying the same key is a duplicate;
+        a different key is the child's next turn.
+    :param registered_by: The surface that registered the entry, e.g.
+        ``"sys_session_create"`` or ``"sys_session_send"``. ``None`` for a
+        recovery/forwarder-registered entry (a codex-internal thread).
     :param started_monotonic: Runner-local monotonic instant this dispatch
         was registered, used by the remote-member liveness interval.
     :param last_remote_check_monotonic: Runner-local monotonic instant of the
@@ -1822,6 +1831,8 @@ class _SubagentWorkEntry:
     remote: bool = False
     host_id: str | None = None
     placement_label: str | None = None
+    delivered_result_key: str | None = None
+    registered_by: str | None = None
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
 
@@ -1850,7 +1861,9 @@ class _SubagentDeliveryAck:
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
-_drained_delivered_subagent_children: set[str] = set()
+# Drained children's last delivered result keys. A later terminal edge whose
+# result key matches is a duplicate; a different key is the child's next turn.
+_drained_delivered_subagent_results: dict[str, str | None] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -2103,6 +2116,8 @@ def register_subagent_work(
     remote: bool = False,
     host_id: str | None = None,
     placement_label: str | None = None,
+    registered_by: str | None = None,
+    flow_neutral: bool = False,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -2128,6 +2143,13 @@ def register_subagent_work(
         ``"host_a1b2c3"``; see :attr:`_SubagentWorkEntry.host_id`.
     :param placement_label: Where the child runs, as ``"<host> · <cwd>"``;
         see :attr:`_SubagentWorkEntry.placement_label`.
+    :param registered_by: The surface that registered the entry, e.g.
+        ``"sys_session_create"`` or ``"sys_session_send"``; see
+        :attr:`_SubagentWorkEntry.registered_by`.
+    :param flow_neutral: When ``True``, a fresh entry does not join the
+        parent's running flow. Recovery registers turns the mother did not
+        dispatch this way, so an undispatched result is held only when the
+        child already belonged to the flow.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -2137,6 +2159,14 @@ def register_subagent_work(
             children.discard(child_session_id)
             if not children:
                 _subagent_work_by_parent.pop(prior.parent_session_id, None)
+    # The last delivered result key survives a re-dispatch: it is what makes
+    # a delayed or retried terminal edge for the prior turn a duplicate
+    # instead of a cancellation of the new one (D9).
+    previous_result_key = (
+        prior.delivered_result_key
+        if prior is not None and prior.delivered
+        else _drained_delivered_subagent_results.get(child_session_id)
+    )
 
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
@@ -2149,13 +2179,16 @@ def register_subagent_work(
         remote=remote,
         host_id=host_id,
         placement_label=placement_label,
+        delivered_result_key=previous_result_key,
+        registered_by=registered_by,
     )
-    _drained_delivered_subagent_children.discard(child_session_id)
+    _drained_delivered_subagent_results.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
-    from omnigent.runner.flows import note_child_dispatch
+    if not flow_neutral:
+        from omnigent.runner.flows import note_child_dispatch
 
-    note_child_dispatch(parent_session_id, child_session_id)
+        note_child_dispatch(parent_session_id, child_session_id)
     return entry
 
 
@@ -2206,7 +2239,8 @@ def unregister_subagent_work(
         that dispatch.
     :param remember_drained_delivery: Whether to remember a delivered
         entry as drained so duplicate terminal status reports for the
-        same child are acknowledged as already delivered.
+        same result are acknowledged as already delivered while a later
+        turn's result still delivers.
     :returns: None.
     """
     entry = _subagent_work_by_child.get(child_session_id)
@@ -2215,7 +2249,7 @@ def unregister_subagent_work(
     if work_id is not None and entry.work_id != work_id:
         return
     if remember_drained_delivery and entry.delivered:
-        _drained_delivered_subagent_children.add(child_session_id)
+        _drained_delivered_subagent_results[child_session_id] = entry.delivered_result_key
     _subagent_work_by_child.pop(child_session_id, None)
     _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
@@ -2239,11 +2273,11 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     :returns: None.
     """
     unregister_subagent_work(session_id)
-    _drained_delivered_subagent_children.discard(session_id)
+    _drained_delivered_subagent_results.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
-        _drained_delivered_subagent_children.discard(child_id)
+        _drained_delivered_subagent_results.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
@@ -2368,11 +2402,11 @@ async def _list_child_sessions(
         params["after"] = page["last_id"]
 
 
-async def _fetch_latest_assistant_text(
+async def _fetch_latest_assistant_item(
     server_client: httpx.AsyncClient, session_id: str
-) -> str | None:
+) -> tuple[str | None, str] | None:
     """
-    Return the newest assistant message text from the latest turn.
+    Return the latest turn's newest assistant message as ``(id, text)``.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param session_id: Session to read, e.g. ``"conv_child456"``.
@@ -2380,7 +2414,8 @@ async def _fetch_latest_assistant_text(
     crossing that boundary would reuse an assistant answer from an older turn.
     Meta messages do not start a turn and are skipped.
 
-    :returns: Joined text blocks of the latest turn's newest assistant message
+    :returns: The server item id (``None`` when the page omitted it) and the
+        joined text blocks of the latest turn's newest assistant message
         (empty when that message carries no text, matching live delivery), or
         ``None`` when the latest turn has no assistant message.
     :raises _SubagentRecoveryReadError: When a page read fails.
@@ -2394,7 +2429,9 @@ async def _fetch_latest_assistant_text(
                 continue
             if item_type == "message":
                 if item.get("role") == "assistant":
-                    return "\n".join(
+                    raw_id = item.get("id")
+                    item_id = raw_id if isinstance(raw_id, str) and raw_id else None
+                    return item_id, "\n".join(
                         block["text"]
                         for block in item.get("content", [])
                         if block.get("type") in {"output_text", "text"} and block.get("text")
@@ -2407,6 +2444,78 @@ async def _fetch_latest_assistant_text(
         if not page.get("has_more") or not page.get("last_id"):
             return None
         params["after"] = page["last_id"]
+
+
+async def _fetch_latest_assistant_text(
+    server_client: httpx.AsyncClient, session_id: str
+) -> str | None:
+    """Return the newest assistant message text from the latest turn."""
+    item = await _fetch_latest_assistant_item(server_client, session_id)
+    return None if item is None else item[1]
+
+
+async def _result_key(
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    snapshot: _SessionSnapshot | None = None,
+) -> str | None:
+    """
+    Resolve one terminal result's identity: the child's last assistant item.
+
+    The item id is stable across forwarder retries and Stop-hook replays, so
+    it distinguishes a duplicate terminal edge from the child's next turn
+    (D9). One retry covers a transient read failure; a persistent failure is
+    logged and reads as no key, which falls back to the old delivery rules.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param snapshot: The child's snapshot when one was already read; a failed
+        snapshot skips the read rather than paying a doomed request.
+    :returns: The server item id, or ``None`` when unreadable.
+    """
+    if snapshot is not None and not snapshot.ok:
+        return None
+    last_error: Exception | None = None
+    for _attempt in range(2):
+        try:
+            item = await _fetch_latest_assistant_item(server_client, child_session_id)
+        except _SubagentRecoveryReadError as exc:
+            last_error = exc
+            continue
+        return None if item is None else item[0]
+    _logger.warning(
+        "Result-key read failed for child=%s: %s; dedup falls back to the child id",
+        child_session_id,
+        last_error,
+    )
+    return None
+
+
+async def _collab_enabled_live(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> bool:
+    """
+    Read the session owner's live session-collaboration master switch.
+
+    A failed or unreadable read counts as enabled, mirroring the flow-timer
+    read: a transient server hiccup must not silently disable the new
+    collaboration surfaces.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: A session in the tree whose owner's setting applies.
+    :returns: ``False`` only when the server says the master switch is off.
+    """
+    try:
+        resp = await server_client.get(f"/v1/sessions/{session_id}/collab-settings", timeout=10.0)
+        if resp.status_code != 200:
+            return True
+        body = resp.json()
+    except Exception:  # noqa: BLE001 — any failure reads as the default
+        return True
+    if not isinstance(body, dict):
+        return True
+    return body.get("enabled") is not False
 
 
 async def _recover_subagent_results_from_server(
@@ -2446,7 +2555,7 @@ async def _recover_subagent_results_from_server(
             continue
         existing = get_subagent_work(child_id)
         if (existing is not None and existing.status != "waiting") or (
-            child_id in _drained_delivered_subagent_children
+            child_id in _drained_delivered_subagent_results
         ):
             continue
         labels = child.get("labels")
@@ -2454,12 +2563,15 @@ async def _recover_subagent_results_from_server(
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
+        result_key: str | None = None
         if status == "failed":
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
         elif not interrupted:
-            output = await _fetch_latest_assistant_text(server_client, child_id)
+            item = await _fetch_latest_assistant_item(server_client, child_id)
+            if item is not None:
+                result_key, output = item
             if output is None and status == "stopped":
                 output = "Sub-agent stopped before producing a reliable final result."
             elif output is None and status == "killed":
@@ -2468,7 +2580,7 @@ async def _recover_subagent_results_from_server(
         if (
             get_subagent_work(child_id) is not existing
             or (existing is not None and existing.status != "waiting")
-            or child_id in _drained_delivered_subagent_children
+            or child_id in _drained_delivered_subagent_results
         ):
             continue
         entry = existing or register_subagent_work(
@@ -2482,9 +2594,22 @@ async def _recover_subagent_results_from_server(
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"
             continue
-        ack = mark_subagent_work_terminal(child_id, status=status, output=output)
+        ack = mark_subagent_work_terminal(
+            child_id, status=status, output=output, result_key=result_key
+        )
         if ack.delivered_now:
             schedule_wake(entry)
+
+
+def _is_quiet_output(output: str | None) -> bool:
+    """Whether a result's last non-empty line is exactly ``[quiet]`` (D9)."""
+    if output is None:
+        return False
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped == "[quiet]"
+    return False
 
 
 def mark_subagent_work_terminal(
@@ -2492,9 +2617,16 @@ def mark_subagent_work_terminal(
     *,
     status: str,
     output: str | None,
+    result_key: str | None = None,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
+
+    Delivery is keyed on the result, not the child: a terminal edge whose
+    ``result_key`` (the last assistant item's server id) matches the last
+    delivered one is a duplicate, while a different key is the child's next
+    turn and is delivered — even after the mother drained the prior result.
+    A missing key falls back to the old child-level dedup.
 
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :param status: Terminal status: ``"completed"``, ``"failed"``, or
@@ -2504,6 +2636,8 @@ def mark_subagent_work_terminal(
         If an earlier terminal report could not be delivered, a later
         report for the same child replaces the undelivered status and
         output before retrying parent inbox delivery.
+    :param result_key: Server item id of this result's last assistant
+        message, or ``None`` when no key was readable.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
@@ -2514,18 +2648,39 @@ def mark_subagent_work_terminal(
         )
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
-        if child_session_id in _drained_delivered_subagent_children:
+        if child_session_id in _drained_delivered_subagent_results:
+            drained_key = _drained_delivered_subagent_results[child_session_id]
+            if result_key is None or result_key == drained_key:
+                return _SubagentDeliveryAck(
+                    entry=None,
+                    delivered=True,
+                    delivered_now=False,
+                    reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+                )
+            # A new result whose entry is gone should have been reopened by
+            # ``_ensure_subagent_work_entry``; arriving here means the caller
+            # skipped it, so report it as untracked rather than swallowing it.
             return _SubagentDeliveryAck(
                 entry=None,
-                delivered=True,
+                delivered=False,
                 delivered_now=False,
-                reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+                reason=_SUBAGENT_DELIVERY_UNTRACKED,
             )
         return _SubagentDeliveryAck(
             entry=None,
             delivered=False,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_UNTRACKED,
+        )
+    # A retried or delayed terminal edge for an already-delivered result:
+    # its key was stored at delivery, so a repeat never re-opens the turn
+    # (and never terminates a newer turn the child has since started).
+    if result_key is not None and entry.delivered_result_key == result_key:
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
@@ -2540,13 +2695,21 @@ def mark_subagent_work_terminal(
             entry.output = output
             entry.completed_at = time.time()
             entry.delivered = False
-            return _deliver_subagent_completion(entry)
+            return _deliver_subagent_completion(entry, result_key)
         if status == entry.status and output is not None and output != entry.output:
             entry.output = output
             entry.completed_at = time.time()
             entry.delivered = False
-            return _deliver_subagent_completion(entry)
+            return _deliver_subagent_completion(entry, result_key)
         if entry.delivered:
+            # A new key (checked above) on a delivered terminal entry is the
+            # child's next turn: reopen and deliver (D9).
+            if result_key is not None:
+                entry.status = status
+                entry.output = output
+                entry.completed_at = time.time()
+                entry.delivered = False
+                return _deliver_subagent_completion(entry, result_key)
             return _SubagentDeliveryAck(
                 entry=entry,
                 delivered=True,
@@ -2563,18 +2726,25 @@ def mark_subagent_work_terminal(
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
-        return _deliver_subagent_completion(entry)
+        return _deliver_subagent_completion(entry, result_key)
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
-    return _deliver_subagent_completion(entry)
+    return _deliver_subagent_completion(entry, result_key)
 
 
-def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDeliveryAck:
+def _deliver_subagent_completion(
+    entry: _SubagentWorkEntry, result_key: str | None = None
+) -> _SubagentDeliveryAck:
     """
     Push a terminal sub-agent payload into the parent session inbox.
 
+    A quiet result — output whose last non-empty line is ``[quiet]`` — is
+    recorded as delivered (key stored) without an inbox entry or wake: the
+    child marked its own turn as routine.
+
     :param entry: Terminal sub-agent work entry to deliver.
+    :param result_key: The result's identity, stored on delivery.
     :returns: Delivery acknowledgement describing whether the payload is
         confirmed in the parent inbox.
     """
@@ -2584,6 +2754,15 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             delivered=True,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+        )
+    if _is_quiet_output(entry.output):
+        entry.delivered = True
+        entry.delivered_result_key = result_key
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_QUIET,
         )
     inbox = _session_inboxes_ref.get(entry.parent_session_id)
     if inbox is None:
@@ -2617,6 +2796,7 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
         }
     )
     entry.delivered = True
+    entry.delivered_result_key = result_key
     return _SubagentDeliveryAck(
         entry=entry,
         delivered=True,
@@ -4510,6 +4690,21 @@ def create_runner_app(
             workspace=snapshot.workspace,
             worktree=snapshot.worktree,
         )
+        # A child session also carries the quiet-result rule (D9); the
+        # per-session text channel feeds both native startup and the
+        # per-turn framework instructions.
+        child_instructions = child_session_framework_instructions(
+            has_parent=snapshot.parent_session_id is not None
+        )
+        if child_instructions:
+            _session_global_instructions[session_id] = "\n\n".join(
+                part
+                for part in [
+                    _session_global_instructions[session_id],
+                    *child_instructions,
+                ]
+                if part and part.strip()
+            )
         # A relay started before this init (resource access precedes the
         # handshake) read the previous flag; rebuild it in place on a flip.
         _stale_relay = _session_comment_relays.get(session_id)
@@ -6478,12 +6673,28 @@ def create_runner_app(
             _session_sub_agent_names[conv_id] = name
         return name
 
-    async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
+    async def _ensure_subagent_work_entry(
+        conv_id: str,
+        *,
+        result_key: str | None = None,
+    ) -> _SubagentWorkEntry | None:
+        """
+        Rebuild a lost work entry for a child, or return the existing one.
+
+        A drained child keeps its last delivered result key: a later terminal
+        edge with a different key is a new turn and rebuilds the entry, while
+        the same key (or no readable key) stays a duplicate. Rebuilt entries
+        are flow-neutral — recovery handles turns the mother did not dispatch,
+        so it must not join a running flow; a child already in the run keeps
+        its membership and is still held (``hold_child_wake``).
+        """
         existing = get_subagent_work(conv_id)
         if existing is not None:
             return existing
-        if conv_id in _drained_delivered_subagent_children:
-            return None
+        if conv_id in _drained_delivered_subagent_results:
+            drained_key = _drained_delivered_subagent_results[conv_id]
+            if result_key is None or result_key == drained_key:
+                return None
         try:
             snapshot = await _session_snapshot(conv_id)
         except Exception:  # noqa: BLE001 — best-effort recovery
@@ -6503,6 +6714,7 @@ def create_runner_app(
             placement_label=await _placement_label_for(
                 server_client, host_id=snapshot.host_id, workspace=snapshot.workspace
             ),
+            flow_neutral=True,
         )
 
     async def _is_mirrored_claude_agent_tool_child(conv_id: str) -> bool:
@@ -9398,15 +9610,17 @@ def create_runner_app(
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
-        # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
-        # thread in the parent's own app-server, so its completion is not the
-        # parent's to collect — waking the parent would inject an inbox notice
-        # into a chat the user is reading. The wrapper label is only set by the
-        # spawn-tool path, so a forwarder-registered child is caught by the
-        # parent's harness instead.
-        if is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+        # A codex-native internal thread (a /side side chat, or one codex
+        # spawned) is consumed inside the parent's own app-server, so waking
+        # the parent would inject a notice into a chat the user is reading.
+        # The skip is narrowed to entries no Omnigent tool registered — the
+        # wrapper label path and forwarder/recovery entries — so a real
+        # sys_session_create / sys_session_send child of a Codex mother
+        # still wakes it (D12).
+        codex_internal = is_codex_native_subagent_wrapper(entry.wrapper_label) or (
             _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
-        ):
+        )
+        if codex_internal and entry.registered_by is None:
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
@@ -9593,9 +9807,15 @@ def create_runner_app(
         _background_tasks.add(task)
 
     def _mark_subagent_terminal_and_wake(
-        child_session_id: str, *, status: str, output: str | None
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        result_key: str | None = None,
     ) -> _SubagentDeliveryAck:
-        ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
+        ack = mark_subagent_work_terminal(
+            child_session_id, status=status, output=output, result_key=result_key
+        )
         if ack.entry is not None and ack.delivered_now:
             _wake_for_delivered_result(ack.entry)
         if ack.entry is not None and ack.delivered:
@@ -11674,6 +11894,7 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
+            result_key: str | None = None
             if isinstance(data, dict) and status in (
                 "running",
                 "waiting",
@@ -11739,18 +11960,36 @@ def create_runner_app(
                     # from that hand-back), so an inbox entry and a wake notice
                     # would deliver it twice.
                     return Response(status_code=204)
-                recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                result_key = await _result_key(server_client, conversation_id)
+                current_entry = get_subagent_work(conversation_id)
+                undispatched = (
+                    current_entry is None or current_entry.status in _SUBAGENT_TERMINAL_STATUSES
+                )
+                if (
+                    result_key is not None
+                    and undispatched
+                    and not await _collab_enabled_live(server_client, conversation_id)
+                ):
+                    # The master switch is off: a result of a turn this
+                    # runner did not dispatch is acknowledged without
+                    # recovery or wake, the pre-existing duplicate handling.
+                    return Response(status_code=204)
+                recovered_entry = await _ensure_subagent_work_entry(
+                    conversation_id, result_key=result_key
+                )
             if status in ("idle", "completed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="completed",
                     output=output if output is not None else "",
+                    result_key=result_key,
                 )
             elif status == "failed":
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
                     status="failed",
                     output=output or "Error: native sub-agent turn failed",
+                    result_key=result_key,
                 )
             elif status in ("stopped", "killed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
@@ -11758,6 +11997,7 @@ def create_runner_app(
                     status=status,
                     output=output
                     or f"Sub-agent {status} before producing a reliable final result.",
+                    result_key=result_key,
                 )
             if delivery_ack is not None:
                 if (
