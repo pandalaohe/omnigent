@@ -12,8 +12,8 @@ import psutil
 import pytest
 
 from omnigent.runner.owner_file import (
+    OwnerEntry,
     read_owner_entries,
-    read_owner_entries_with_kind,
     write_owner_entry,
 )
 
@@ -49,14 +49,14 @@ def test_write_two_entries_and_read_back(tmp_path: Path) -> None:
         write_owner_entry(pid=second.pid, conversation_id="conv_b", kind="tmux")
 
         entries = read_owner_entries(tmp_path)
-        with_kind = read_owner_entries_with_kind(tmp_path)
     finally:
         _terminate(first)
         _terminate(second)
 
-    assert entries == {first.pid: "conv_a", second.pid: "conv_b"}
-    assert with_kind[first.pid] == ("conv_a", "harness")
-    assert with_kind[second.pid] == ("conv_b", "tmux")
+    assert entries == {
+        first.pid: OwnerEntry(pid=first.pid, conversation_id="conv_a", kind="harness"),
+        second.pid: OwnerEntry(pid=second.pid, conversation_id="conv_b", kind="tmux"),
+    }
 
 
 def test_dead_entry_dropped_on_next_write(tmp_path: Path) -> None:
@@ -72,7 +72,9 @@ def test_dead_entry_dropped_on_next_write(tmp_path: Path) -> None:
     finally:
         _terminate(live)
 
-    assert entries == {live.pid: "conv_live"}
+    assert entries == {
+        live.pid: OwnerEntry(pid=live.pid, conversation_id="conv_live", kind="tmux")
+    }
 
 
 def test_dead_runner_file_is_deleted_on_read(tmp_path: Path) -> None:

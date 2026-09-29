@@ -1653,6 +1653,11 @@ async def test_resource_sampling_frame_sets_fast_mode_and_wakes_the_loop() -> No
         assert host._resource_wake.is_set()
         assert host._resource_fast_interval_s == 10.0
         assert host._resource_interval() == 10.0
+
+        # A renewal while already fast must not add a sample on top of the timer.
+        host._resource_wake.clear()
+        await host._dispatch_host_frame(ws, HostResourceSamplingFrame(interval_s=10, lease_s=40))
+        assert not host._resource_wake.is_set()
     finally:
         _cleanup_host(host)
 

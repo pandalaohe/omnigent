@@ -5115,12 +5115,15 @@ class HostProcess:
                 )
             await ws.send(encode_host_frame(options_result))
         elif isinstance(frame, HostResourceSamplingFrame):
-            # A viewer is watching: hold the fast cadence for the lease and
-            # wake the sampler so the switch takes effect at once. A lapsed
-            # lease needs no reset — _resource_interval reads the deadline.
+            # A viewer is watching: hold the fast cadence for the lease. Only a
+            # slow -> fast switch wakes the sampler; renewals every 10 s must not
+            # add samples on top of the fast timer. A lapsed lease needs no
+            # reset — _resource_interval reads the deadline.
+            was_fast = time.monotonic() < self._resource_fast_until
             self._resource_fast_until = time.monotonic() + max(0, frame.lease_s)
             self._resource_fast_interval_s = float(min(60, max(10, frame.interval_s)))
-            self._resource_wake.set()
+            if not was_fast:
+                self._resource_wake.set()
         elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.

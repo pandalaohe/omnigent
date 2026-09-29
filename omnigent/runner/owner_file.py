@@ -104,37 +104,18 @@ def write_owner_entry(*, pid: int, conversation_id: str, kind: OwnerKind) -> Non
         _logger.debug("owner-file write failed", exc_info=True)
 
 
-def read_owner_entries(data_dir: Path) -> dict[int, str]:
-    """Return ``pid -> conversation_id`` for every live ownership record.
+def read_owner_entries(data_dir: Path) -> dict[int, OwnerEntry]:
+    """Return ``pid -> OwnerEntry`` for every live ownership record.
 
     Files whose runner ``(pid, create_time)`` is no longer live are deleted;
     entries whose process is gone or whose pid was reused are ignored.
 
     :param data_dir: Data directory holding ``run/owners/``.
-    :returns: Live pid → conversation id mapping, empty on any failure.
+    :returns: Live pid → record mapping, empty on any failure.
     """
     try:
-        return {
-            record.pid: record.conversation_id for record in _read_owner_records(data_dir).values()
-        }
+        return _read_owner_records(data_dir)
     except Exception:  # noqa: BLE001 — the monitor must not fail its caller
-        _logger.debug("owner-file read failed", exc_info=True)
-        return {}
-
-
-def read_owner_entries_with_kind(data_dir: Path) -> dict[int, tuple[str, str]]:
-    """Like :func:`read_owner_entries`, keeping each record's kind.
-
-    :param data_dir: Data directory holding ``run/owners/``.
-    :returns: Live pid → ``(conversation_id, kind)`` mapping, empty on any
-        failure.
-    """
-    try:
-        return {
-            record.pid: (record.conversation_id, record.kind)
-            for record in _read_owner_records(data_dir).values()
-        }
-    except Exception:  # noqa: BLE001
         _logger.debug("owner-file read failed", exc_info=True)
         return {}
 

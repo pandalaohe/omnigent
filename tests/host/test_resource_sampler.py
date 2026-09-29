@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from omnigent.host.frames import ResourceProcessRow
 from omnigent.host.resource_sampler import (
     ResourceSampler,
     _apply_payload_cap,
+    _cpu_busy_total,
     child_pids,
 )
 from omnigent.runner.owner_file import write_owner_entry
@@ -240,6 +242,27 @@ def _row(
     )
 
 
+def test_cpu_busy_total_does_not_double_count_linux_guest_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Linux guest / guest_nice are already inside user / nice."""
+    cpu_times_type = namedtuple(
+        "cpu_times",
+        "user nice system idle iowait irq softirq steal guest guest_nice",
+    )
+    cpu_times = cpu_times_type(10.0, 2.0, 3.0, 50.0, 5.0, 1.0, 2.0, 0.0, 4.0, 1.0)
+
+    monkeypatch.setattr(sampler_mod.sys, "platform", "linux")
+    busy, total = _cpu_busy_total(cpu_times)
+    assert total == 73.0
+    assert busy == 18.0
+
+    monkeypatch.setattr(sampler_mod.sys, "platform", "darwin")
+    busy, total = _cpu_busy_total(cpu_times)
+    assert total == 78.0
+    assert busy == 23.0
+
+
 def test_payload_cap_keeps_ancestors_of_kept_rows() -> None:
     """A hot descendant pulls its quiet ancestors into the capped payload."""
     rows = [_row(1, 0, 0.0, role="daemon")]
@@ -267,7 +290,7 @@ def test_payload_cap_folds_remaining_rows_under_nearest_kept_parent() -> None:
     (summary,) = folded
     assert summary.pid == 0
     assert summary.ppid == 1
-    assert summary.name == "其他 4 个进程"
+    assert summary.name == "4 other processes"
     assert summary.session_id is None
     assert summary.cpu_pct == 14.0
     assert summary.rss == 14

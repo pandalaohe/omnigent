@@ -62,6 +62,25 @@ def publish(user_key: str, event: dict[str, Any]) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
 
+def publish_all(event: dict[str, Any]) -> None:
+    """
+    Broadcast an event to every subscriber in the current workspace.
+
+    Used by workspace-wide notices (e.g. the system-status change nudge)
+    where per-user targeting would need a roster the server does not keep.
+    Payload-free events make the over-delivery harmless; each client
+    refetches the data it is allowed to see. Call inside
+    :func:`omnigent.db.db_models.workspace_scope` to select the workspace.
+
+    :param event: The event dict to deliver, e.g.
+        ``{"type": "system_status_changed"}``.
+    """
+    with _lock:
+        subs = [entry for subscribers in _subscribers.values() for entry in subscribers]
+    for queue, loop in subs:
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+
 async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:
     """
     Subscribe to discovery events for ``user_key`` until cancelled.

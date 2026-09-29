@@ -2445,6 +2445,17 @@ def register_core_routes(
                                 "projects-changed push failed; client converges on next load",
                                 exc_info=True,
                             )
+                elif evt_type == "system_status_changed":
+                    async with emit_lock:
+                        try:
+                            await _send({"type": "system_status_changed"})
+                        except WebSocketDisconnect:
+                            raise
+                        except Exception:
+                            _logger.warning(
+                                "system-status-changed push failed; client converges on next load",
+                                exc_info=True,
+                            )
 
         reader_task = asyncio.create_task(_reader(), name="session-updates-reader")
         ticker_task = asyncio.create_task(_ticker(), name="session-updates-ticker")

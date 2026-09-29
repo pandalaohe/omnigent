@@ -700,6 +700,20 @@ def announce_projects_changed(user_id: str | None) -> None:
     user_session_stream.publish(_discovery_key(user_id), {"type": "projects_changed"})
 
 
+def announce_system_status_changed() -> None:
+    """
+    Push a payload-free ``system_status_changed`` event to every subscriber
+    in the current workspace.
+
+    Called when the hub's finding set changes so open clients refetch the
+    summary (which the server filters per user). No data rides the event —
+    over-delivery leaks nothing — and it is a no-op with no subscribers.
+
+    Call inside :func:`omnigent.db.db_models.workspace_scope`.
+    """
+    user_session_stream.publish_all({"type": "system_status_changed"})
+
+
 def _native_ask_gate_lock(conversation_id: str, deciding_policy: str) -> asyncio.Lock:
     """
     Return the lock serializing native ASK gates for one (session, policy).

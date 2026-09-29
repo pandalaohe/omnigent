@@ -9,6 +9,7 @@ user's stream in another's. Regression for OMNI-7361.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -47,3 +48,27 @@ async def test_discovery_events_isolated_across_workspaces() -> None:
         user_session_stream.publish(user, {"type": "session_added", "session_id": "ws1"})
     event = await asyncio.wait_for(task, timeout=2.0)
     assert event == {"type": "session_added", "session_id": "ws1"}
+
+
+@pytest.mark.asyncio
+async def test_publish_all_reaches_every_workspace_subscriber() -> None:
+    """``publish_all`` fans out to every user in the current workspace only."""
+    with workspace_scope(1):
+        alice_task = asyncio.create_task(_collect_one("alice@example.com"))
+        bob_task = asyncio.create_task(_collect_one("bob@example.com"))
+        await asyncio.sleep(0)
+    with workspace_scope(2):
+        carol_task = asyncio.create_task(_collect_one("carol@example.com"))
+        await asyncio.sleep(0)
+
+    with workspace_scope(1):
+        user_session_stream.publish_all({"type": "system_status_changed"})
+
+    expected = {"type": "system_status_changed"}
+    assert await asyncio.wait_for(alice_task, timeout=2.0) == expected
+    assert await asyncio.wait_for(bob_task, timeout=2.0) == expected
+    await asyncio.sleep(0.05)
+    assert not carol_task.done(), "another workspace's subscriber must not receive it"
+    carol_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await carol_task

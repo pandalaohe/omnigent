@@ -32,7 +32,7 @@ from omnigent.host.frames import (
     ResourceMachine,
     ResourceProcessRow,
 )
-from omnigent.runner.owner_file import read_owner_entries_with_kind
+from omnigent.runner.owner_file import read_owner_entries
 
 _logger = logging.getLogger(__name__)
 
@@ -132,7 +132,6 @@ def _macos_child_pids(pid: int) -> list[int] | None:
 class _ProcSample:
     """Per-process CPU baseline, keyed by ``(pid, create_time)``."""
 
-    process: psutil.Process
     cpu_total: float
     wall: float
 
@@ -238,9 +237,9 @@ class ResourceSampler:
         # Owner records are written at spawn, so they win over the None a
         # zygote / runner child would inherit — the harness is a zygote
         # child, the tmux server has daemonized away.
-        for pid, (conversation_id, kind) in read_owner_entries_with_kind(self._data_dir).items():
-            if kind in _OWNER_KINDS:
-                roots[pid] = _Root(kind, conversation_id)
+        for pid, record in read_owner_entries(self._data_dir).items():
+            if record.kind in _OWNER_KINDS:
+                roots[pid] = _Root(record.kind, record.conversation_id)
         return roots
 
     def _collect_rows(self, roots: dict[int, _Root]) -> list[ResourceProcessRow]:
@@ -282,7 +281,7 @@ class ResourceSampler:
                     if elapsed > 0
                     else 0.0
                 )
-            self._fresh_proc_cache[key] = _ProcSample(process, cpu_total, now)
+            self._fresh_proc_cache[key] = _ProcSample(cpu_total, now)
             return ResourceProcessRow(
                 pid=pid,
                 ppid=process.ppid(),
@@ -393,6 +392,12 @@ def _cpu_busy_total(times: object) -> tuple[float, float]:
         return 0.0, 0.0
     values = [float(value) for value in times if isinstance(value, (int, float))]
     total = sum(values)
+    if sys.platform.startswith("linux"):
+        # On Linux guest / guest_nice are already counted in user / nice
+        # (psutil's own _cpu_tot_time subtracts them), so summing every
+        # field would count them twice.
+        for field_name in ("guest", "guest_nice"):
+            total -= float(getattr(times, field_name, 0.0))
     idle = float(getattr(times, "idle", 0.0)) + float(getattr(times, "iowait", 0.0))
     return total - idle, total
 
@@ -451,7 +456,7 @@ def _apply_payload_cap(
             ResourceProcessRow(
                 pid=0,
                 ppid=parent_pid,
-                name=f"其他 {int(count)} 个进程",
+                name=f"{int(count)} other processes",
                 role=_FOLDED_ROLE,
                 session_id=parent.session_id if parent is not None else None,
                 cpu_pct=cpu_pct,

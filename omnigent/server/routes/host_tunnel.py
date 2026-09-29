@@ -48,6 +48,7 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPostBindHookResultFrame,
     HostRemoveWorktreeResultFrame,
+    HostResourceSnapshotFrame,
     HostRunnerExitedFrame,
     HostRunnerLogRunawayFrame,
     HostRunnerStatusResultFrame,
@@ -97,6 +98,9 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_resource_snapshot: (
+        Callable[[HostConnection, HostResourceSnapshotFrame], None] | None
+    ) = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     conversation_store: ConversationStore | None = None,
@@ -127,6 +131,10 @@ def create_host_tunnel_router(
         and push the cause to the open view — the only failure signal
         for a runner that crashed before connecting its tunnel (so the
         runner-tunnel ``on_runner_disconnect`` path never fires).
+    :param on_resource_snapshot: Optional callback fired for every
+        ``host.resource_snapshot`` report; receives the connection and the
+        decoded frame. The system-status hub consumes it; ``None`` drops the
+        reports.
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
     :param on_host_update: Optional async callback fired when a connected
@@ -357,6 +365,7 @@ def create_host_tunnel_router(
                     host_registry,
                     runner_exit_reports,
                     on_runner_exited,
+                    on_resource_snapshot,
                     on_host_update,
                     conversation_store,
                 ),
@@ -549,6 +558,7 @@ async def _receive_loop(
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_resource_snapshot: Callable[[HostConnection, HostResourceSnapshotFrame], None] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
     conversation_store: ConversationStore | None,
 ) -> None:
@@ -566,6 +576,8 @@ async def _receive_loop(
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
         when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_resource_snapshot: Callback fired with the connection and
+        frame for every ``host.resource_snapshot``; ``None`` drops it.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     :param conversation_store: Store used to flag a session whose runner
@@ -721,6 +733,13 @@ async def _receive_loop(
                     frame.bytes_last_hour,
                     frame.observed_at,
                 )
+            continue
+
+        if isinstance(frame, HostResourceSnapshotFrame):
+            # One-way telemetry: the host's system-status snapshot. Consumed
+            # by the hub callback; no result frame goes back.
+            if on_resource_snapshot is not None:
+                on_resource_snapshot(conn, frame)
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):

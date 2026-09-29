@@ -1006,7 +1006,7 @@ def test_resource_snapshot_frame_round_trip() -> None:
             ResourceProcessRow(
                 pid=0,
                 ppid=200,
-                name="其他 3 个进程",
+                name="3 other processes",
                 role="folded",
                 session_id="conv_a",
                 cpu_pct=3.0,
