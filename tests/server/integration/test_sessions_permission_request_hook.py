@@ -6075,6 +6075,42 @@ async def test_deferred_setting_off_keeps_blocking(
     assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
 
 
+async def test_deferred_async_approvals_stay_claude_only(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Kimi / Devin drop the deny message, so their hook keeps blocking even
+    with the owner's async-approvals setting on.
+    """
+    await _enable_async_approvals(monkeypatch)
+
+    agent = await create_test_agent(
+        client,
+        "test-deferred-kimi-blocking",
+        executor={"type": "omnigent", "config": {"harness": "kimi-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Bash")
+    payload["_omnigent_elicitation_id"] = "elicit_kimi_" + "0" * 32
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"].get("async_kind") is None
+    assert event["params"].get("approval_ref") is None
+    assert not hook_task.done()
+
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
 def _codex_command_payload(
     request_id: int | str,
     command: str | list[str],
@@ -6156,6 +6192,62 @@ async def test_codex_command_approval_defers_and_grants(
         assert again.status_code == 200, again.text
         assert again.json() == {"decision": "accept"}
         assert forwarded == []
+        await collector.assert_no_event(0.2)
+    finally:
+        await collector.stop()
+
+
+async def test_codex_command_grant_replays_remembered_amendment(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A grant stored with an execpolicy amendment re-issues the structured
+    ``acceptWithExecpolicyAmendment`` decision instead of a bare accept.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-codex-deferred-remember")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/codex-elicitation-request"
+    amendment = ["pnpm", "vitest"]
+
+    def _remember_payload(request_id: int) -> dict[str, Any]:
+        payload = _codex_command_payload(request_id, ["pnpm", "vitest"])
+        payload["params"]["availableDecisions"] = [
+            "accept",
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}},
+            "decline",
+        ]
+        return payload
+
+    try:
+        first = await client.post(url, json=_remember_payload(61))
+        assert first.json() == {"decision": "decline"}
+        event = await _next_elicitation(collector)
+        accept = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"execpolicy_amendment": amendment},
+        )
+        assert accept.status_code == 202, accept.text
+        await _wait_until(lambda: any("granted" in text for _, text in delivered.calls))
+        await _drain_until_quiet(collector)
+
+        second = await client.post(url, json=_remember_payload(62))
+        assert second.status_code == 200, second.text
+        assert second.json() == {
+            "decision": {
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": amendment,
+                }
+            }
+        }
         await collector.assert_no_event(0.2)
     finally:
         await collector.stop()

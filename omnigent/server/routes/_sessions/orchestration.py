@@ -1129,8 +1129,9 @@ def start_detached_elicitation(
 
 async def cancel_detached_elicitation_tasks() -> None:
     """
-    Cancel and await every in-flight detached elicitation park.
+    Cancel and await every request-detached task.
 
+    Covers detached elicitation parks and pending-notice deliveries.
     Lifespan-teardown hook: a parked card has no request to sever, so
     without this it would outlive the ASGI shutdown and die wherever the
     loop teardown happens to kill it. Pending cards are lost, which is

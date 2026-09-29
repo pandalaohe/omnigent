@@ -79,6 +79,7 @@ from omnigent.server.routes._sessions.approval_grants import (
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
+    _detached_elicitation_tasks,
     _llm_response_denied_turns,
     _logger,
     _runner_relay_tasks,
@@ -352,10 +353,6 @@ _APPROVAL_DENIED_TEXT = (
     "[System: approval #{aid} denied by the user: do not run {action}.{feedback}]"
 )
 
-#: Strong refs to background pending-text deliveries until they settle.
-# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
-_pending_delivery_tasks: set[asyncio.Task[Any]] = set()
-
 
 def _approval_action_label(tool_name: str, preview: str) -> str:
     """
@@ -449,8 +446,9 @@ def _start_background_delivery(
     Post one system message after the current response, off its path.
 
     Used by the Codex hook, whose forwarder must relay the JSON-RPC
-    result before the pending text steers the model. The task is held in
-    a module-level set so it can't be garbage-collected mid-retry.
+    result before the pending text steers the model. The task joins the
+    detached-elicitation set: it can't be garbage-collected mid-retry,
+    and lifespan teardown cancels it.
 
     :param session_id: Session to deliver into.
     :param text: The ``[System: …]`` message.
@@ -466,8 +464,8 @@ def _start_background_delivery(
             runner_router=runner_router,
         )
     )
-    _pending_delivery_tasks.add(task)
-    task.add_done_callback(_pending_delivery_tasks.discard)
+    _detached_elicitation_tasks.add(task)
+    task.add_done_callback(_detached_elicitation_tasks.discard)
 
 
 def _permission_decision(
@@ -939,10 +937,10 @@ def register_hooks_routes(
         ``response.elicitation_request`` SSE event on the session stream
         so the web UI's :file:`ApprovalCard` renders inline and
         long-polls until the verdict arrives via the session ``approval``
-        event path. With it on, an eligible call is parked detached and
-        answered at once with a deny and the pending notice: the model
-        re-issues the call later, and a one-shot grant approves it without
-        a second card. A live grant short-circuits both.
+        event path. With it on, an eligible Claude-native call is parked
+        detached and answered at once with a deny and the pending notice:
+        the model re-issues the call later, and a one-shot grant approves
+        it without a second card. A live grant short-circuits both.
 
         Response shape follows Claude Code's PermissionRequest hook
         contract: ``hookSpecificOutput.decision.behavior`` is
@@ -1051,10 +1049,13 @@ def register_hooks_routes(
                 f"{native_agent.display_name} harness.",
                 code=ErrorCode.CONFLICT,
             )
-        # The async-approval switch applies to every vendor on this hook
-        # (Kimi / Devin share it). The timeout fields stay Claude-only:
-        # those bridges keep their hardcoded fallback budgets below.
-        approval_timeout = await _approval_timeout_for_session(session_id)
+        # Deferral applies to the Claude-native hook only: Kimi / Devin
+        # drop the deny message, so those bridges keep blocking. The
+        # timeout fields stay Claude-only too: those bridges keep their
+        # hardcoded fallback budgets below.
+        approval_timeout: ApprovalTimeout | None = (
+            await _approval_timeout_for_session(session_id) if is_claude else None
+        )
         # Check ownership after the metadata awaits, without yielding before registration.
         elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
         # A re-issued call the user already granted runs without a second
@@ -1076,7 +1077,9 @@ def register_hooks_routes(
         # an action. AskUserQuestion / ExitPlanMode need ``updatedInput`` on
         # the verdict and have their own cards, so they stay blocking.
         deferrable = (
-            approval_timeout.async_approvals and tool_name not in _DEFERRED_APPROVAL_EXCLUDED_TOOLS
+            approval_timeout is not None
+            and approval_timeout.async_approvals
+            and tool_name not in _DEFERRED_APPROVAL_EXCLUDED_TOOLS
         )
         deferred_elicitation_id: str | None = None
         deferred_aid: str | None = None
@@ -1221,14 +1224,13 @@ def register_hooks_routes(
         # Claude waits on the owner's configured timeout. The two hardcoded
         # budgets stay for Kimi / Devin below: their AskUserQuestion-named tool
         # keeps its shorter fallback, and neither consumes the timeout fields.
-        timeout_policy: HarnessTimeoutPolicy | None = (
-            HarnessTimeoutPolicy(
+        timeout_policy: HarnessTimeoutPolicy | None = None
+        if is_claude:
+            assert approval_timeout is not None
+            timeout_policy = HarnessTimeoutPolicy(
                 timeout_s=approval_timeout.timeout_s,
                 stop=_claude_timeout_stop if approval_timeout.stop_turn else None,
             )
-            if is_claude
-            else None
-        )
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
@@ -1892,10 +1894,14 @@ def register_hooks_routes(
                 codex_command_grant_key(codex_request.codex_params.get("command"), cwd),
             )
             if granted is not None:
+                try:
+                    body = codex_request.build_response(granted)
+                except OmnigentError:
+                    # The retry no longer offers the stored execpolicy
+                    # amendment; a plain accept still honors the grant.
+                    body = codex_request.build_response(ElicitationResult(action="accept"))
                 return Response(
-                    content=json.dumps(
-                        codex_request.build_response(ElicitationResult(action="accept"))
-                    ),
+                    content=json.dumps(body),
                     media_type="application/json",
                 )
         # Async questions are answered outside the turn that asked them

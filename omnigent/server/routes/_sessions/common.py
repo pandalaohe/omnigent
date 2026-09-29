@@ -898,10 +898,11 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
-# Strong refs to detached elicitation parks (async question cards), discarded
-# on completion and cancelled at lifespan teardown.
+# Strong refs to detached tasks: elicitation parks (async question cards) and
+# pending-notice deliveries, discarded on completion and cancelled at lifespan
+# teardown.
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
-_detached_elicitation_tasks: set[asyncio.Task[None]] = set()
+_detached_elicitation_tasks: set[asyncio.Task[Any]] = set()
 
 
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0

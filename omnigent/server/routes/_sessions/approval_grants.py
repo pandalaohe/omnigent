@@ -22,7 +22,8 @@ def claude_grant_key(
     ``Bash`` keys on the command and payload cwd only: the model retypes
     the description and timeout when it re-issues the call, so those
     fields must not break the match. Every other tool keys on the
-    canonicalized full input, where a drift means a different call.
+    canonicalized full input plus cwd: the same input under a different
+    working directory is a different call.
 
     :param tool_name: Gated tool from the PermissionRequest payload.
     :param tool_input: Tool input from the payload, or ``None``.
@@ -35,6 +36,7 @@ def claude_grant_key(
     return (
         tool_name,
         json.dumps(_canonical_tool_input(tool_input), sort_keys=True),
+        cwd or "",
     )
 
 

@@ -498,3 +498,39 @@ async def test_delivery_retry_persists_notice_on_final_failure(
     )
     assert persisted == [("conv_test", text)]
     assert attempts >= 1
+
+
+async def test_pending_delivery_is_cancelled_at_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending-notice delivery is registered where teardown cancels it."""
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def _blocking_delivery(
+        session_id: str,
+        text: str,
+        *,
+        conversation_store: Any,
+        runner_router: Any,
+    ) -> bool:
+        started.set()
+        await blocker.wait()
+        return True
+
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", _blocking_delivery)
+
+    hooks_routes._start_background_delivery(
+        "conv_shutdown",
+        "[System: approval pending]",
+        conversation_store=object(),
+        runner_router=None,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    pending = list(orchestration._detached_elicitation_tasks)
+    assert len(pending) == 1
+
+    await orchestration.cancel_detached_elicitation_tasks()
+
+    assert pending[0].cancelled()
+    assert pending[0] not in orchestration._detached_elicitation_tasks
