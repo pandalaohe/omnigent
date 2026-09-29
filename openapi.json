@@ -10719,7 +10719,8 @@
                 "approval_timeout",
                 "agent_pins",
                 "calling_defaults",
-                "calling_last"
+                "calling_last",
+                "session_collab"
               ]
             },
             "title": "Settings",
@@ -13656,6 +13657,7 @@
                         "context_indicator",
                         "keyboard_shortcuts",
                         "mobile_assistant",
+                        "session_collab",
                         "session_navigation",
                         "usage_context"
                       ]
@@ -13733,7 +13735,8 @@
                 "approval_timeout",
                 "agent_pins",
                 "calling_defaults",
-                "calling_last"
+                "calling_last",
+                "session_collab"
               ],
               "title": "Namespace",
               "type": "string"
