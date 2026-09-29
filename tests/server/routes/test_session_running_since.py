@@ -14,6 +14,7 @@ Also covers the snapshot's ``last_message_preview`` gate
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
 
@@ -70,6 +71,34 @@ def running_since_calls(
     _session_running_since_cache.update(memory_snapshot)
 
 
+@pytest.fixture()
+def captured_running_since(
+    monkeypatch: pytest.MonkeyPatch,
+    running_since_calls: list[tuple[str, int, bool]],
+) -> list[Callable[[int], None]]:
+    """Capture the worker's ``on_resolved`` callbacks without invoking them.
+
+    The real reporter runs on the worker thread and hands the resolved stamp
+    back to the event loop, so a test controls *when* a resolution lands and
+    can replay the stale-callback interleaving deterministically.
+    """
+    resolutions: list[Callable[[int], None]] = []
+
+    def _capture(
+        session_id: str,
+        started_at: int,
+        *,
+        previous_known: bool,
+        on_resolved: Callable[[int], None],
+    ) -> None:
+        running_since_calls.append((session_id, started_at, previous_known))
+        if not previous_known:
+            resolutions.append(on_resolved)
+
+    monkeypatch.setattr(session_live_state, "persist_running_since", _capture)
+    return resolutions
+
+
 def test_note_running_edge_stamps_on_idle_to_running(
     running_since_calls: list[tuple[str, int, bool]],
 ) -> None:
@@ -97,13 +126,78 @@ def test_note_running_edge_unknown_previous_defers_to_worker(
 
     The worker must decide whether the turn carried over, so the edge does
     not write memory synchronously; it refreshes the cache from
-    ``on_resolved`` when the worker resolves.
+    ``on_resolved`` when the worker resolves, and only while the session
+    still reads as running.
     """
+    _session_status_cache["conv_a"] = "running"
     _note_running_edge("conv_a", None, "running")
 
     (session_id, started_at, previous_known) = running_since_calls[0]
     assert (session_id, previous_known) == ("conv_a", False)
     assert _session_running_since_cache.get("conv_a") == started_at
+
+
+@pytest.mark.asyncio
+async def test_note_running_edge_stale_resolution_cannot_overwrite_newer_stamp(
+    running_since_calls: list[tuple[str, int, bool]],
+    captured_running_since: list[Callable[[int], None]],
+) -> None:
+    """A late unknown-previous resolution loses to a newer synchronous stamp.
+
+    Reproduces the race where an idle edge and a new known-previous running
+    edge land before the worker drains: the stale callback must not replace
+    the newer stamp the second edge already wrote.
+    """
+    sid = "conv_race"
+    _note_running_edge(sid, None, "running")
+    assert len(captured_running_since) == 1
+
+    _publish_status(sid, "idle")
+    _publish_status(sid, "running")
+    newer_stamp = running_since_calls[-1][1]
+    assert _session_running_since_cache.get(sid) == newer_stamp
+
+    captured_running_since[0](99)
+    await asyncio.sleep(0)
+    assert _session_running_since_cache.get(sid) == newer_stamp
+
+
+@pytest.mark.asyncio
+async def test_note_running_edge_resolution_after_idle_is_dropped(
+    captured_running_since: list[Callable[[int], None]],
+) -> None:
+    """A resolution landing after the period ended writes nothing.
+
+    The idle edge dropped the stamp, so letting the stale callback recreate
+    one would resurrect a dead running period.
+    """
+    sid = "conv_late"
+    _note_running_edge(sid, None, "running")
+    _publish_status(sid, "idle")
+
+    captured_running_since[0](99)
+    await asyncio.sleep(0)
+    assert sid not in _session_running_since_cache
+
+
+@pytest.mark.asyncio
+async def test_note_running_edge_resolution_while_running_fills_missing_stamp(
+    captured_running_since: list[Callable[[int], None]],
+) -> None:
+    """A resolution for a still-running session with no stamp is adopted.
+
+    This is the carried-over-turn case the unknown-previous branch exists
+    for: the worker's resolved stamp must reach the cache when nothing newer
+    has claimed it.
+    """
+    sid = "conv_fill"
+    _session_status_cache[sid] = "running"
+    _session_running_since_cache.pop(sid, None)
+
+    _note_running_edge(sid, None, "running")
+    captured_running_since[0](99)
+    await asyncio.sleep(0)
+    assert _session_running_since_cache.get(sid) == 99
 
 
 @pytest.mark.parametrize(

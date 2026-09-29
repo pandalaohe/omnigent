@@ -8884,29 +8884,47 @@ async def test_sys_session_get_info_many_dedupes_ids() -> None:
     assert requested == ["conv_a", "conv_b"]
 
 
+_BAD_MULTI_ARGS_IDS_ERROR = (
+    "sys_session_get_info: 'session_ids' must be a non-empty list of non-empty strings (max 20)"
+)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "arguments",
+    "arguments,expected_error",
     [
-        pytest.param({"session_id": "conv_a", "session_ids": ["conv_b"]}, id="both-forms"),
-        pytest.param({"session_ids": [f"conv_{i}" for i in range(21)]}, id="over-max-ids"),
-        pytest.param({"session_ids": []}, id="empty-list"),
-        pytest.param({"session_ids": [""]}, id="empty-string-id"),
-        pytest.param({"session_ids": "conv_a"}, id="not-a-list"),
+        pytest.param(
+            {"session_id": "conv_a", "session_ids": ["conv_b"]},
+            "sys_session_get_info: pass session_id or session_ids, not both",
+            id="both-forms",
+        ),
+        pytest.param(
+            {"session_ids": [f"conv_{i}" for i in range(21)]},
+            "sys_session_get_info: 'session_ids' accepts at most 20 entries",
+            id="over-max-ids",
+        ),
+        pytest.param({"session_ids": []}, _BAD_MULTI_ARGS_IDS_ERROR, id="empty-list"),
+        pytest.param({"session_ids": [""]}, _BAD_MULTI_ARGS_IDS_ERROR, id="empty-string-id"),
+        pytest.param({"session_ids": "conv_a"}, _BAD_MULTI_ARGS_IDS_ERROR, id="not-a-list"),
     ],
 )
 async def test_sys_session_get_info_rejects_bad_multi_args_without_server_call(
     arguments: dict[str, Any],
+    expected_error: str,
 ) -> None:
     """
-    Every malformed ``session_ids`` / combination is rejected locally with a
-    typed error, before any HTTP call — so a bad argument never fans out into
-    20 doomed requests (and never silently describes the caller instead).
+    Every malformed ``session_ids`` / combination is rejected locally with the
+    exact typed error, before any HTTP call — the handler records requests and
+    answers 500 rather than raising, because production catches transport
+    exceptions and a raise would mask a server call instead of failing.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
+    requests: list[str] = []
+
     async def _server_handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError(f"server must not be reached: {request.url}")
+        requests.append(str(request.url))
+        return httpx.Response(500, json={"error": "unexpected server call"})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
@@ -8919,9 +8937,9 @@ async def test_sys_session_get_info_rejects_bad_multi_args_without_server_call(
             conversation_id="conv_caller",
         )
 
+    assert requests == []
     info = json.loads(output)
-    assert isinstance(info["error"], str)
-    assert info["error"].startswith("sys_session_get_info")
+    assert info["error"] == expected_error
 
 
 @pytest.mark.asyncio
@@ -8981,18 +8999,35 @@ async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> 
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_context_fraction_null_without_window() -> None:
+@pytest.mark.parametrize(
+    "last_total_tokens,context_window,expected_fraction",
+    [
+        pytest.param(50000, None, None, id="missing-window"),
+        pytest.param(50000, 0, None, id="zero-window"),
+        pytest.param(0, 200000, 0.0, id="zero-tokens"),
+    ],
+)
+async def test_sys_session_get_info_context_fraction(
+    last_total_tokens: int,
+    context_window: int | None,
+    expected_fraction: float | None,
+) -> None:
     """
-    A missing (or zero) context window leaves ``context_used_fraction``
-    ``None`` — a fabricated 0 or a divide error would both misreport context
-    pressure.
+    ``context_used_fraction`` needs a positive window, and zero tokens is a
+    valid reading: a missing (or zero) window leaves the fraction ``None`` —
+    a fabricated 0 or a divide error would both misreport context pressure —
+    while 0 tokens over a real window is exactly ``0.0``.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json=_session_info_snapshot("conv_nowin", last_total_tokens=50000),
+            json=_session_info_snapshot(
+                "conv_ctx",
+                last_total_tokens=last_total_tokens,
+                context_window=context_window,
+            ),
         )
 
     async with httpx.AsyncClient(
@@ -9001,15 +9036,15 @@ async def test_sys_session_get_info_context_fraction_null_without_window() -> No
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_get_info",
-            arguments=json.dumps({"session_id": "conv_nowin"}),
+            arguments=json.dumps({"session_id": "conv_ctx"}),
             server_client=server_client,
             conversation_id="conv_caller",
         )
 
     info = json.loads(output)
-    assert info["context_tokens"] == 50000
-    assert info["context_window"] is None
-    assert info["context_used_fraction"] is None
+    assert info["context_tokens"] == last_total_tokens
+    assert info["context_window"] == context_window
+    assert info["context_used_fraction"] == expected_fraction
 
 
 @pytest.mark.asyncio

@@ -4940,7 +4940,11 @@ def _note_running_edge(session_id: str, previous_status: str | None, status: str
     previous status (server restart, or the probe on a freshly bound
     session) only the enqueue happens: the worker keeps the row's carried-over
     label when the turn continued across the restart, or writes ``now`` and
-    reports the resolved stamp back into the cache.
+    reports the resolved stamp back into the cache. The report is handed back
+    onto the caller's event loop (``call_soon_threadsafe`` when one is
+    running), where it lands only if the session still reads running/waiting
+    and no synchronous stamp from a later known edge has since won; a
+    resolution arriving after the period ended is dropped.
 
     :param session_id: Session/conversation identifier.
     :param previous_status: The status the caller observed before *status*,
@@ -4959,11 +4963,28 @@ def _note_running_edge(session_id: str, previous_status: str | None, status: str
             session_id, now, previous_known=True, on_resolved=lambda _value: None
         )
         return
+
+    loop: asyncio.AbstractEventLoop | None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    def _apply(value: int) -> None:
+        if _session_status_cache.get(session_id) not in ("running", "waiting"):
+            return
+        if session_id in _session_running_since_cache:
+            return
+        _session_running_since_cache[session_id] = value
+
+    on_resolved = (
+        _apply if loop is None else lambda value: loop.call_soon_threadsafe(_apply, value)
+    )
     session_live_state.persist_running_since(
         session_id,
         now,
         previous_known=False,
-        on_resolved=lambda value: _session_running_since_cache.__setitem__(session_id, value),
+        on_resolved=on_resolved,
     )
 
 

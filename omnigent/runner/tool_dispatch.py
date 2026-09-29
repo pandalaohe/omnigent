@@ -6413,13 +6413,14 @@ def _session_info_context_fraction(tokens: object, window: object) -> float | No
 
     :param tokens: Snapshot ``last_total_tokens``.
     :param window: Snapshot ``context_window``.
-    :returns: ``round(tokens / window, 3)`` (unclamped) when both are positive
-        ints, else ``None``.
+    :returns: ``round(tokens / window, 3)`` (unclamped) when *tokens* is a
+        non-negative int and *window* a positive int, else ``None``. Zero
+        tokens is a valid reading (``0.0``), not a missing one.
     """
     if (
         isinstance(tokens, int)
         and not isinstance(tokens, bool)
-        and tokens > 0
+        and tokens >= 0
         and isinstance(window, int)
         and not isinstance(window, bool)
         and window > 0
