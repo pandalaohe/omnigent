@@ -864,7 +864,20 @@ class SystemStatusHub:
 
 
 def write_history(path: Path, payload: dict[str, Any]) -> None:
-    """Write a history payload atomically; a failure is logged and ignored."""
+    """Write a history payload atomically; a failure is logged and ignored.
+
+    A hub that never recorded a point would otherwise create the data
+    directory in the user's home on every app lifespan. An existing file is
+    still overwritten: an owner reset empties the history, and leaving the
+    stale points behind would reload the previous owner's data on restart.
+    """
+    hosts = payload.get("hosts")
+    has_points = bool(payload.get("server")) or (
+        isinstance(hosts, dict)
+        and any(isinstance(entry, dict) and entry.get("points") for entry in hosts.values())
+    )
+    if not has_points and not path.exists():
+        return
     try:
         _atomic_write_json(path, payload)
     except OSError:

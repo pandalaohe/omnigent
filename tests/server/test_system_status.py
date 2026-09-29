@@ -697,6 +697,46 @@ def test_history_payload_snapshots_the_point_lists(tmp_path: Path) -> None:
     assert payload["hosts"]["0:host_a"]["points"], "the payload owns a copy"
 
 
+def test_save_history_without_points_creates_nothing(tmp_path: Path) -> None:
+    """A hub that never recorded a point must not create the state directory."""
+    hub = SystemStatusHub(tmp_path, None)
+
+    asyncio.run(hub.save_history())
+    hub.close()
+
+    assert not hub.history_path.exists()
+    assert not hub.history_path.parent.exists()
+
+
+def test_save_history_overwrites_stale_file_after_owner_reset(tmp_path: Path) -> None:
+    """An owner reset empties the history; the stale points must not survive."""
+    hub = SystemStatusHub(tmp_path, None)
+    _connect(hub, host_id="host_a", now=0.0)
+    hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=1.0)
+    _tick(hub, 60.0)
+    asyncio.run(hub.save_history())
+    assert hub.history_path.exists()
+
+    hub.host_changed(
+        host_id="host_a",
+        workspace_id=0,
+        owner="bob",
+        name="laptop-host_a",
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        now=120.0,
+    )
+    assert hub.history_payload()["hosts"]["0:host_a"]["points"] == []
+
+    asyncio.run(hub.save_history())
+    hub.close()
+
+    assert json.loads(hub.history_path.read_text()) == {
+        "version": 1,
+        "server": [],
+        "hosts": {"0:host_a": {"owner": "bob", "name": "laptop-host_a", "points": []}},
+    }
+
+
 def test_save_history_writes_in_submission_order(tmp_path: Path, monkeypatch) -> None:
     """A cancelled save leaves its queued write ahead of the next one."""
     hub = SystemStatusHub(tmp_path, None)
