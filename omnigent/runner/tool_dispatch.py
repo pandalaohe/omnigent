@@ -291,6 +291,12 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
+# Priority 5f.0b: Session-open write. ``sys_session_open`` opens a plain
+# top-level session on any host / project / agent of the caller's user.
+# Advertised only to top-level sessions with peer messaging on; the
+# server refuses a child sender regardless.
+_SESSION_OPEN_TOOLS = frozenset({"sys_session_open"})
+
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
 # state via the Omnigent server's existing REST endpoints (GET /items, GET
@@ -478,6 +484,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
@@ -534,6 +541,7 @@ def build_native_relay_tool_schemas(
     spec: AgentSpec | None,
     *,
     peer_messaging_enabled: bool = False,
+    session_open_enabled: bool = False,
 ) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
@@ -553,6 +561,9 @@ def build_native_relay_tool_schemas(
         gate can't be evaluated without the spec), mirroring the relay.
     :param peer_messaging_enabled: When ``True`` a no-spawn spec still
         registers ``sys_session_send`` in by-id mode for peer sends.
+    :param session_open_enabled: When ``True`` (peer messaging on and the
+        session top-level) the session also advertises
+        ``sys_session_open``.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -593,6 +604,7 @@ def build_native_relay_tool_schemas(
         for schema in ToolManager(
             spec,
             peer_messaging_enabled=peer_messaging_enabled,
+            session_open_enabled=session_open_enabled,
             os_env_schema_only=True,
         ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
@@ -629,6 +641,16 @@ def build_native_relay_tool_schemas(
             fallback_schema = _string_object_dict(
                 SysSessionSendTool(sub_specs={}, peer_enabled=True).get_schema()
             )
+            if fallback_schema is not None:
+                function = _string_object_dict(fallback_schema.get("function"))
+                if function is not None:
+                    _append(function)
+        if session_open_enabled:
+            # Top-level native sessions open peers on other hosts; the
+            # session-open surface is spec-independent in the fallback.
+            from omnigent.tools.builtins.session_open import SysSessionOpenTool
+
+            fallback_schema = _string_object_dict(SysSessionOpenTool().get_schema())
             if fallback_schema is not None:
                 function = _string_object_dict(fallback_schema.get("function"))
                 if function is not None:
@@ -895,6 +917,7 @@ _ALL_LOCAL_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
@@ -964,7 +987,7 @@ def should_dispatch_locally(tool_name: str) -> bool:
 # release flag is part of the key: the same spec advertises a different
 # surface under each flag.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -994,6 +1017,7 @@ def _granted_tool_names(
     harness: str | None = None,
     *,
     peer_messaging_enabled: bool = False,
+    session_open_enabled: bool = False,
 ) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
 
@@ -1010,16 +1034,20 @@ def _granted_tool_names(
     :param peer_messaging_enabled: The session's cached peer-messaging flag;
         ``True`` adds the by-id ``sys_session_send`` a no-spawn spec registers,
         mirroring the turn surface.
+    :param session_open_enabled: The session's cached open flag (peer
+        messaging on and the session top-level); ``True`` adds
+        ``sys_session_open``.
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness, peer_messaging_enabled)
+    cache_key = (id(agent_spec), harness, peer_messaging_enabled, session_open_enabled)
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
     manager = ToolManager(
         agent_spec,
         peer_messaging_enabled=peer_messaging_enabled,
+        session_open_enabled=session_open_enabled,
         os_env_schema_only=True,
     )
     try:
@@ -1042,6 +1070,7 @@ def _ungranted_tool_reason(
     effective_harness: str | None = None,
     *,
     peer_messaging_enabled: bool = False,
+    session_open_enabled: bool = False,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
 
@@ -1057,16 +1086,21 @@ def _ungranted_tool_reason(
         was actually advertised. ``None`` falls back to the spec.
     :param peer_messaging_enabled: The session's cached peer-messaging flag,
         so the judged surface matches the one the session advertised.
+    :param session_open_enabled: The session's cached open flag, so the
+        judged surface matches the one the session advertised.
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
 
     if not isinstance(agent_spec, _AgentSpec):
         return None
+    if tool_name in _SESSION_OPEN_TOOLS and not session_open_enabled:
+        return "sys_session_open is available only to top-level sessions"
     try:
         granted = _granted_tool_names(
             agent_spec,
             _effective_harness_name(agent_spec, effective_harness),
             peer_messaging_enabled=peer_messaging_enabled,
+            session_open_enabled=session_open_enabled,
         )
     except Exception as exc:
         _logger.exception("granted tool surface unavailable for %s", tool_name)
@@ -2457,6 +2491,29 @@ def _peer_messaging_enabled_for(conversation_id: str | None) -> bool:
         import omnigent.runner.app as _runner_app_mod
 
         get_flag = getattr(_runner_app_mod, "get_session_peer_messaging_enabled", None)
+        if callable(get_flag):
+            return bool(get_flag(conversation_id))
+    except ImportError:  # pragma: no cover — runner always present in prod
+        return False
+    return False
+
+
+def _session_open_enabled_for(conversation_id: str | None) -> bool:
+    """Return the session's cached session-open flag, defaulting off.
+
+    Reads the runner's per-session init snapshot cache (seeded from the
+    server's session-init envelope). Importing the runner app module is
+    lazy so unit tests can exercise dispatch standalone.
+
+    :param conversation_id: The caller's session id, or ``None``.
+    :returns: ``True`` when the session is top-level with peer messaging on.
+    """
+    if not conversation_id:
+        return False
+    try:
+        import omnigent.runner.app as _runner_app_mod
+
+        get_flag = getattr(_runner_app_mod, "get_session_open_enabled", None)
         if callable(get_flag):
             return bool(get_flag(conversation_id))
     except ImportError:  # pragma: no cover — runner always present in prod
@@ -4456,6 +4513,72 @@ def _finalize_created_session(
             "project_id": data.get("project_id"),
         }
     )
+
+
+_SESSION_OPEN_ALLOWED_ARGS = frozenset(
+    {
+        "project",
+        "host",
+        "agent",
+        "model",
+        "reasoning_effort",
+        "message",
+        "from_ref",
+        "wait_for_host",
+        "title",
+    }
+)
+
+
+async def _execute_session_open_tool(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """Validate a session-open call and return the server's JSON view.
+
+    The route runs the whole resolver chain (project / host / root / agent /
+    directory / rate / create), so the runner only screens the argument
+    names and required strings. Worktree creation can take a while, hence
+    the longer timeout; the server's JSON — including refusal states — is
+    passed through unchanged.
+
+    :param args: Parsed ``sys_session_open`` arguments.
+    :param server_client: Runner's server client, or ``None``.
+    :param conversation_id: The calling (sender) session id, or ``None``.
+    :returns: The server's response text, or a compact error JSON.
+    """
+
+    def invalid(message: str) -> str:
+        return json.dumps(
+            {"error": "invalid_session_open_args", "message": message},
+            separators=(",", ":"),
+        )
+
+    if server_client is None or conversation_id is None:
+        return invalid("session open requires server_client and conversation_id")
+    extra = set(args) - _SESSION_OPEN_ALLOWED_ARGS
+    if extra:
+        return invalid(f"unexpected argument: {sorted(extra)[0]}")
+    for key in ("project", "host", "agent"):
+        value = args.get(key)
+        if not isinstance(value, str) or not value:
+            return invalid(f"'{key}' must be a non-empty string")
+    wait = args.get("wait_for_host")
+    if wait is not None and not isinstance(wait, bool):
+        return invalid("'wait_for_host' must be a boolean")
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/open",
+            json=dict(args),
+            timeout=180.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps(
+            {"error": "session_open_failed", "detail": str(exc)}, separators=(",", ":")
+        )
+    return response.text
 
 
 async def _execute_session_create(
@@ -7544,6 +7667,7 @@ async def execute_tool(
             agent_spec,
             effective_harness,
             peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
+            session_open_enabled=_session_open_enabled_for(conversation_id),
         )
         if refusal is not None:
             return json.dumps({"error": refusal})
@@ -7657,6 +7781,12 @@ async def execute_tool(
                 publish_event=publish_event,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+            )
+        elif tool_name in _SESSION_OPEN_TOOLS:
+            output = await _execute_session_open_tool(
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
@@ -9376,6 +9506,7 @@ def _spawn_async_tool(
             agent_spec,
             effective_harness,
             peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
+            session_open_enabled=_session_open_enabled_for(conversation_id),
         )
         if refusal is not None:
             return f"Error: sys_call_async refused: {refusal}"

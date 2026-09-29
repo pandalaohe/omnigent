@@ -2412,6 +2412,7 @@ async def _auto_create_pi_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
     peer_messaging_enabled: bool = False,
+    session_open_enabled: bool = False,
     global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
@@ -2431,6 +2432,8 @@ async def _auto_create_pi_terminal(
         startup text for the first injected message.
     :param peer_messaging_enabled: Registers ``sys_session_send`` in
         by-id mode on the relay surface, from the session's init snapshot.
+    :param session_open_enabled: Registers ``sys_session_open`` on the
+        relay surface for a top-level session with peer messaging on.
     :returns: Created terminal resource view.
     """
     await _cancel_auto_forwarder_task(session_id)
@@ -2501,6 +2504,7 @@ async def _auto_create_pi_terminal(
         pi_tools = build_native_relay_tool_schemas(
             spec_for_tools,
             peer_messaging_enabled=peer_messaging_enabled,
+            session_open_enabled=session_open_enabled,
         )
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
@@ -7684,6 +7688,7 @@ def _ensure_orchestrator_skills_in_bundle(
 _ROUTED_SPAWN_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__omnigent__sys_session_create",
     "mcp__omnigent__sys_agent_list",
+    "mcp__omnigent__sys_session_open",
     "mcp__omnigent__sys_session_send",
     "mcp__omnigent__sys_read_inbox",
 )
@@ -9269,6 +9274,7 @@ class NativeLaunchContext:
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
     peer_messaging_enabled: bool = False
+    session_open_enabled: bool = False
     global_instructions: str | None = None
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
@@ -9304,6 +9310,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         ensure_comment_relay=ctx.ensure_comment_relay,
         peer_messaging_enabled=ctx.peer_messaging_enabled,
+        session_open_enabled=ctx.session_open_enabled,
         global_instructions=ctx.global_instructions,
     )
 

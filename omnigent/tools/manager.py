@@ -39,6 +39,7 @@ from omnigent.tools.builtins import (
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionOpenTool,
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
@@ -113,6 +114,7 @@ class ToolManager:
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
         peer_messaging_enabled: bool = False,
+        session_open_enabled: bool = False,
         *,
         os_env_schema_only: bool = False,
     ) -> None:
@@ -146,12 +148,18 @@ class ToolManager:
             session with no spawn grant still registers
             ``sys_session_send`` in by-id mode so it can message a
             peer session.
+        :param session_open_enabled: Server-owned flag derived from the
+            snapshot: peer messaging on AND the session is top-level.
+            When ``True`` (and peer messaging is on) the session also
+            registers ``sys_session_open`` so it can open plain
+            top-level sessions on other hosts and projects.
         :param os_env_schema_only: Register static OS tool schemas without
             creating an environment. For metadata callers only; OS tool
             execution remains runner-owned. Preserves the ``os_env`` gate.
         """
         self._spec = spec
         self._peer_messaging_enabled = peer_messaging_enabled
+        self._session_open_enabled = session_open_enabled
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
@@ -486,6 +494,13 @@ class ToolManager:
             self._tools[SysSessionShareTool.name()] = SysSessionShareTool(
                 allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
             )
+
+        # A top-level session with peer messaging on may open plain
+        # top-level sessions on any of its user's hosts and projects. A
+        # child may not (it shares the parent's runner token, so the
+        # server refuses a child sender too).
+        if self._peer_messaging_enabled and self._session_open_enabled:
+            self._tools[SysSessionOpenTool.name()] = SysSessionOpenTool()
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         # The peer-messaging flag makes every session a peer sender: with

@@ -278,6 +278,7 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -872,9 +873,13 @@ def register_events_routes(
     runner_tunnel_tokens: frozenset[str] | None = None,
     feature_flags: FeatureFlags | None = None,
     peer_message_store: PeerMessageStore | None = None,
+    project_store: ProjectStore | None = None,
     app_state: Any | None = None,
 ) -> None:
-    """Register the events, stream, and delete routes on router."""
+    """Register the events, stream, and delete routes on router.
+
+    :param project_store: Project lookups for the session-open routes.
+    """
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
@@ -1030,7 +1035,7 @@ def register_events_routes(
 
     from omnigent.server.routes.sessions.routes_peer import register_peer_routes
 
-    register_peer_routes(
+    peer = register_peer_routes(
         router,
         post_event_impl=_peer_post_event,
         conversation_store=conversation_store,
@@ -1042,6 +1047,26 @@ def register_events_routes(
         peer_message_store=peer_message_store,
         runner_router=runner_router,
         agent_store=agent_store,
+        app_state=app_state,
+    )
+    from omnigent.server.routes.sessions.routes_open import register_open_routes
+
+    register_open_routes(
+        router,
+        peer=peer,
+        project_store=project_store,
+        conversation_store=conversation_store,
+        agent_store=agent_store,
+        runner_router=runner_router,
+        permission_store=permission_store,
+        auth_provider=auth_provider,
+        runner_tunnel_tokens=runner_tunnel_tokens,
+        feature_flags=feature_flags,
+        host_registry=host_registry,
+        agent_cache=agent_cache,
+        file_store=file_store,
+        artifact_store=artifact_store,
+        background_title_coordinator=background_title_coordinator,
         app_state=app_state,
     )
 

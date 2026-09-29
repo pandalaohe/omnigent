@@ -4197,6 +4197,9 @@ def create_app(
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(_host_id)
             archive_close_coordinator.trigger_pending(host_id=_host_id)
+            pending = getattr(app.state, "pending_session_opens", None)
+            if pending is not None and host_registry.get(_host_id) is not None:
+                pending.trigger(_host_id)
 
         app.include_router(
             create_host_tunnel_router(

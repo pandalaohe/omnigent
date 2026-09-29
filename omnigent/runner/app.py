@@ -1321,12 +1321,15 @@ class _CommentRelayBinding:
         e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
     :param peer_messaging_enabled: Flag the surface was built with; a
         flip rebuilds the relay like an agent switch does.
+    :param session_open_enabled: Session-open flag the surface was built
+        with; a flip rebuilds the relay like an agent switch does.
     """
 
     relay: ClaudeNativeToolRelay
     spec_entry: _SpecEntry | None
     bridge_dir: Path
     peer_messaging_enabled: bool = False
+    session_open_enabled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3286,6 +3289,10 @@ _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
 # no flag kwarg. Kept beside the other snapshot dicts: the raw envelope
 # cache is TTL'd.
 _session_peer_messaging_enabled_ref: dict[str, bool] = {}
+# session_id → session-open flag (peer messaging on AND top-level), seeded
+# from the init snapshot. A child shares its parent's runner, so this is
+# what hides sys_session_open from children on the runner surface.
+_session_open_enabled_ref: dict[str, bool] = {}
 
 
 def get_session_peer_messaging_enabled(session_id: str) -> bool:
@@ -3296,6 +3303,20 @@ def get_session_peer_messaging_enabled(session_id: str) -> bool:
     :returns: ``True`` when the session initialized with the flag on.
     """
     return _session_peer_messaging_enabled_ref.get(session_id, False)
+
+
+def get_session_open_enabled(session_id: str) -> bool:
+    """
+    Return the session's cached session-open flag, defaulting off.
+
+    The flag is ``peer_messaging_enabled and parent_session_id is None``,
+    computed at init-snapshot seed time: only a top-level session with
+    peer messaging on may open another session.
+
+    :param session_id: Session/conversation ID, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when the session may open top-level sessions.
+    """
+    return _session_open_enabled_ref.get(session_id, False)
 
 
 def get_session_agent_id(session_id: str) -> str | None:
@@ -3484,6 +3505,9 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot, seeded from
     # the envelope and cleared with the session.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
+    # session_id → session-open flag (peer messaging on and top-level),
+    # seeded from the same snapshot and cleared with the session.
+    _session_open_enabled = _session_open_enabled_ref
     # session_id → the session's startup extras from the init snapshot: the
     # worktree line (when the session records one) followed by the server-held
     # global text. Read by the launch and composition points, never from the
@@ -4401,7 +4425,7 @@ def create_runner_app(
     async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
         # An envelope-free re-init (WS reconnect, resume) carries no snapshot:
-        # keep this session's last known project_assignments / peer_messaging /
+        # keep this session's last known peer-messaging / session-open /
         # global-instructions values rather than silently reverting to defaults.
         _session_tool_schemas.pop(session_id, None)
         return _SessionInitContext(envelope=None)
@@ -4441,6 +4465,9 @@ def create_runner_app(
         if snapshot.reasoning_effort:
             _session_reasoning_effort[session_id] = snapshot.reasoning_effort
         _session_peer_messaging_enabled[session_id] = snapshot.peer_messaging_enabled
+        _session_open_enabled[session_id] = (
+            snapshot.peer_messaging_enabled and snapshot.parent_session_id is None
+        )
         _session_global_instructions[session_id] = session_startup_extras(
             snapshot.global_instructions,
             workspace=snapshot.workspace,
@@ -4451,6 +4478,7 @@ def create_runner_app(
         _stale_relay = _session_comment_relays.get(session_id)
         if _stale_relay is not None and (
             _stale_relay.peer_messaging_enabled != snapshot.peer_messaging_enabled
+            or _stale_relay.session_open_enabled != _session_open_enabled[session_id]
         ):
             await _ensure_comment_relay_started(
                 session_id, explicit_bridge_dir=_stale_relay.bridge_dir
@@ -5085,6 +5113,7 @@ def create_runner_app(
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
+                session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
@@ -5902,6 +5931,7 @@ def create_runner_app(
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
         _session_peer_messaging_enabled.pop(session_id, None)
+        _session_open_enabled.pop(session_id, None)
         _session_global_instructions.pop(session_id, None)
         _session_permission_mode.pop(session_id, None)
         _session_approval_mode.pop(session_id, None)
@@ -9627,11 +9657,13 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         peer_for_relay = _session_peer_messaging_enabled.get(session_id, False)
+        open_for_relay = _session_open_enabled.get(session_id, False)
         current = _session_comment_relays.get(session_id)
         if (
             current is not None
             and current.spec_entry is spec_entry
             and current.peer_messaging_enabled == peer_for_relay
+            and current.session_open_enabled == open_for_relay
             and known_bridge_dir is None
         ):
             return
@@ -9655,6 +9687,7 @@ def create_runner_app(
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
             and current.peer_messaging_enabled == peer_for_relay
+            and current.session_open_enabled == open_for_relay
         ):
             return
 
@@ -9663,6 +9696,7 @@ def create_runner_app(
         relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
             _unwrap_spec_entry(spec_entry),
             peer_messaging_enabled=peer_for_relay,
+            session_open_enabled=open_for_relay,
         )
 
         _captured_session_id = session_id
@@ -9751,6 +9785,7 @@ def create_runner_app(
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             peer_messaging_enabled=peer_for_relay,
+            session_open_enabled=open_for_relay,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -10146,6 +10181,7 @@ def create_runner_app(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
                         peer_messaging_enabled=_session_peer_messaging_enabled.get(conv, False),
+                        session_open_enabled=_session_open_enabled.get(conv, False),
                         os_env_schema_only=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
@@ -10494,6 +10530,7 @@ def create_runner_app(
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
                         peer_messaging_enabled=_session_peer_messaging_enabled.get(conv_id, False),
+                        session_open_enabled=_session_open_enabled.get(conv_id, False),
                         global_instructions=_session_global_instructions.get(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
@@ -12299,6 +12336,7 @@ def create_runner_app(
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
+                session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
             )
             _ensure_build: (

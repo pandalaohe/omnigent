@@ -1003,6 +1003,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         feature_flags=feature_flags,
         peer_message_store=peer_message_store,
+        project_store=project_store,
         app_state=app_state,
     )
 
