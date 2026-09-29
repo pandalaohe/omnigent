@@ -2141,6 +2141,9 @@ def register_subagent_work(
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
+    from omnigent.runner.flows import note_child_dispatch
+
+    note_child_dispatch(parent_session_id, child_session_id)
     return entry
 
 
@@ -3499,8 +3502,8 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
-    # Flow MCP steps dispatch through this process's MCP manager.
-    from omnigent.runner.flows import set_runner_mcp_manager
+    # Flows: MCP steps use this process's MCP manager; a running flow holds its children's wakes.
+    from omnigent.runner.flows import hold_child_wake, set_runner_mcp_manager
 
     set_runner_mcp_manager(mcp_manager)
     # session_id → the session's startup extras from the init snapshot: the
@@ -6525,7 +6528,7 @@ def create_runner_app(
             if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
                 continue
             if _deliver_subagent_completion(entry).delivered_now:
-                _schedule_subagent_wake(entry)
+                _wake_for_delivered_result(entry)
 
     async def _run_subagent_recovery(parent_id: str) -> None:
         """
@@ -6557,7 +6560,7 @@ def create_runner_app(
                 await _recover_subagent_results_from_server(
                     server_client=server_client,
                     parent_id=parent_id,
-                    schedule_wake=_schedule_subagent_wake,
+                    schedule_wake=_wake_for_delivered_result,
                 )
             except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
                 _logger.warning(
@@ -9390,6 +9393,13 @@ def create_runner_app(
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)
 
+    def _wake_for_delivered_result(entry: _SubagentWorkEntry) -> None:
+        # A result for work a running flow dispatched is reported by the flow's
+        # one end wake; re-wakes and stranded retries never consult the hold.
+        if hold_child_wake(entry.parent_session_id, entry.child_session_id):
+            return
+        _schedule_subagent_wake(entry)
+
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
         inbox = _session_inboxes.get(parent_session_id)
         drained = inbox is None or inbox.empty()
@@ -9541,7 +9551,7 @@ def create_runner_app(
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
         if ack.entry is not None and ack.delivered_now:
-            _schedule_subagent_wake(ack.entry)
+            _wake_for_delivered_result(ack.entry)
         if ack.entry is not None and ack.delivered:
             _settle_member_obligation_for_child(ack.entry)
         elif (
