@@ -8248,8 +8248,13 @@ async def execute_tool(
                     args,
                     server_client=server_client,
                     conversation_id=conversation_id,
-                    # Upstream's own switch: a ``timers: true`` spec ignores ours.
-                    collab_governed=agent_spec is None or not agent_spec.timers,
+                    # Upstream's own switch: a ``timers: true`` spec ignores ours. With
+                    # no spec (unresolved), only the collab flag can have exposed them.
+                    collab_governed=(
+                        not agent_spec.timers
+                        if agent_spec is not None
+                        else _peer_messaging_enabled_for(conversation_id)
+                    ),
                 )
             else:
                 output = await _execute_timer_cancel(

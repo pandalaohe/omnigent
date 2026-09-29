@@ -634,6 +634,31 @@ async def test_timer_set_follows_collab_settings_only_without_spec_timers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session", [_SESSION, "conv_no_flag"])
+async def test_timer_without_a_resolved_spec_is_governed_only_under_the_collab_flag(
+    server: _FakeServer, session: str
+) -> None:
+    from omnigent.runner import app as runner_app
+
+    server.flow_timer_enabled = False
+    async with _client(server) as client:
+        output = json.loads(
+            await execute_tool(
+                tool_name="sys_timer_set",
+                arguments=json.dumps({"seconds": 30}),
+                server_client=client,
+                conversation_id=session,
+            )
+        )
+    if session == _SESSION:
+        assert "flow_timer_enabled" in output["error"]
+    else:
+        # Flag off: only a ``timers: true`` spec can have granted the tool.
+        assert output["status"] == "scheduled"
+        runner_app.cancel_timer(session, output["timer_id"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("spec_timers", [False, True])
 async def test_timer_firing_stops_on_row8_off_only_without_spec_timers(
     server: _FakeServer, spec_timers: bool
