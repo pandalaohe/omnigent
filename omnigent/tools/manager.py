@@ -34,6 +34,7 @@ from omnigent.tools.builtins import (
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
+    SysSessionArchiveTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
@@ -43,12 +44,14 @@ from omnigent.tools.builtins import (
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
+    SysSessionUnarchiveTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
 )
+from omnigent.tools.builtins.flow import SysFlowCancelTool, SysFlowListTool, SysFlowStartTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
@@ -310,9 +313,15 @@ class ToolManager:
             an already-registered tool. Defensive — should not
             happen given the standard registration order.
         """
-        if not self._spec.timers:
-            return
-        for tool in (SysTimerSetTool(), SysTimerCancelTool()):
+        tools: list[Tool] = []
+        # The session-collaboration flag also grants timers, so every session
+        # with collaboration on (native ones included) can schedule its wake.
+        if self._spec.timers or self._peer_messaging_enabled:
+            tools += [SysTimerSetTool(), SysTimerCancelTool()]
+        # Flows (time composed with tool calls) are collaboration tools.
+        if self._peer_messaging_enabled:
+            tools += [SysFlowStartTool(), SysFlowListTool(), SysFlowCancelTool()]
+        for tool in tools:
             if tool.name() in self._tools:
                 raise ValueError(
                     f"sys_timer_* tool {tool.name()!r} collides with an already-registered tool"
@@ -501,6 +510,11 @@ class ToolManager:
         # server refuses a child sender too).
         if self._peer_messaging_enabled and self._session_open_enabled:
             self._tools[SysSessionOpenTool.name()] = SysSessionOpenTool()
+        if self._peer_messaging_enabled:
+            # Archive / unarchive reach any session the user owns, so they
+            # ride the collaboration flag rather than the spawn grant.
+            self._tools[SysSessionArchiveTool.name()] = SysSessionArchiveTool()
+            self._tools[SysSessionUnarchiveTool.name()] = SysSessionUnarchiveTool()
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         # The peer-messaging flag makes every session a peer sender: with

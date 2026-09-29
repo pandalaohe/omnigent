@@ -195,6 +195,11 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Server-reserved label whose value is the archive revision whose teardown
+# waits for the whole session tree to go idle before it is torn down. It
+# matches only its own revision, so unarchive or re-archive voids it.
+ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY = "omnigent.archive_stop_when_idle"
+
 # New-session id an archived session was continued into (``POST
 # /v1/sessions/{sid}/continue``). The archived row keeps the pointer so a
 # repeat continue returns the same session instead of minting another one.
@@ -1022,6 +1027,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         close_cli_on_archive: bool = False,
+        archive_stop_when_idle: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -1080,6 +1086,12 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :param close_cli_on_archive: Atomically create a durable teardown
             request when this call transitions ``archived`` to ``True``.
+        :param archive_stop_when_idle: When ``True`` alongside
+            ``close_cli_on_archive`` on an archive transition, atomically
+            stamp the server-reserved idle-deferral label naming the new
+            archive revision, so the teardown waits for the tree to settle.
+            Deletes any prior label on a transition without it (including
+            unarchive). No effect outside a transition.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """

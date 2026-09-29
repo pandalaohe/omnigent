@@ -40,6 +40,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
@@ -73,6 +74,11 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+# Conversation-label key carrying the epoch-seconds start of a session's
+# current running period. Defined here so this module and the routes package
+# share one string without this module importing the routes package.
+RUNNING_SINCE_LABEL_KEY: str = "omnigent.running_since"
 
 
 def configure(
@@ -185,6 +191,58 @@ def persist_live_status(session_id: str, status: str) -> None:
             _last_status.pop(session_id, None)
 
     submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+
+
+def persist_running_since(
+    session_id: str,
+    started_at: int,
+    *,
+    previous_known: bool,
+    on_resolved: Callable[[int], None],
+) -> None:
+    """
+    Persist the start of a session's current running period.
+
+    Called from the status chokepoint on the edge into running/waiting. The
+    label is the restart fallback for ``SessionResponse.running_since``: the
+    in-memory cache on the tunnel-holding replica is authoritative while the
+    process lives, and a replica that lacks it reads the label back.
+
+    Runs on the same ordered best-effort worker as :func:`persist_live_status`
+    (inside a copy of the caller's ``contextvars``, so the workspace-scoped
+    store write lands in the right workspace). When *previous_known* is
+    ``False`` (server restart, or a probe on a freshly bound session) the
+    worker first reads the row: a stamp already carried over on a
+    still-running/waiting conversation is kept — the turn continued across the
+    restart — otherwise *started_at* is written. Either way ``on_resolved``
+    receives the kept or written stamp so the caller can refresh its
+    in-memory cache.
+
+    :param session_id: Session/conversation identifier.
+    :param started_at: Epoch seconds the running period began.
+    :param previous_known: Whether the caller already knew the previous
+        status; it then owns the in-memory stamp itself.
+    :param on_resolved: Called on the worker thread with the kept or written
+        stamp. Only used when *previous_known* is ``False``.
+    """
+    if _store is None:
+        return
+
+    store = _store
+
+    def _write() -> None:
+        if not previous_known:
+            conv = store.get_conversation(session_id)
+            if conv is not None and conv.live_status in ("running", "waiting"):
+                label = conv.labels.get(RUNNING_SINCE_LABEL_KEY)
+                if isinstance(label, str) and label.isdigit():
+                    on_resolved(int(label))
+                    return
+        store.set_labels(session_id, {RUNNING_SINCE_LABEL_KEY: str(started_at)})
+        if not previous_known:
+            on_resolved(started_at)
+
+    submit("running_since", _write)
 
 
 def persist_scheduled_run_completion(

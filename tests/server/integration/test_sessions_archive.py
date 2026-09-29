@@ -22,9 +22,12 @@ import httpx
 import pytest
 
 from omnigent.cli_retention import CliRetentionPolicy
+from omnigent.server.archive_close import ArchiveCloseCoordinator
+from omnigent.server.cli_release_store import CliReleaseIntentStore
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
+from omnigent.stores.conversation_store import ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -771,3 +774,417 @@ async def test_agent_contents_404_for_nonexistent_session(
     """GET /v1/sessions/{id}/agent/contents returns 404 for a missing session."""
     resp = await client.get("/v1/sessions/conv_nonexistent/agent/contents")
     assert resp.status_code == 404
+
+
+# ── stop_when_idle deferral ──────────────────────────────
+
+
+async def test_stop_when_idle_defers_teardown_until_the_tree_settles(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A ``stop_when_idle`` archive parks the teardown while the tree runs.
+
+    The PATCH writes the durable deferral label naming the archive
+    revision; the deferred teardown only proceeds after the status has
+    read idle continuously for the settle window.
+    """
+    session = await create_test_session(client, name="archive-idle-defer")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+    real_wait = _sessions_orchestration._wait_for_archive_idle
+    wait_started = asyncio.Event()
+    wait_revisions: list[int] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    async def _recording_wait(
+        wait_session_id: str,
+        revision: int,
+        conversation_store: object,
+    ) -> None:
+        # Prove the deferral wait actually started for this revision, so the
+        # empty-stop assertions below cannot pass on a crashed task.
+        wait_revisions.append(revision)
+        wait_started.set()
+        await real_wait(wait_session_id, revision, conversation_store)
+
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.5),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+            patch.object(_sessions_facade, "_wait_for_archive_idle", _recording_wait),
+            patch.object(_sessions_orchestration, "_wait_for_archive_idle", _recording_wait),
+        ):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            row = conv_store.get_conversation(session_id)
+            assert row is not None
+            assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(row.archive_revision)
+            await asyncio.wait_for(wait_started.wait(), timeout=5.0)
+            assert wait_revisions == [row.archive_revision]
+
+            # The detached teardown passes the (zeroed) undo grace and parks in
+            # the idle wait: a running tree keeps it there across several polls.
+            await asyncio.sleep(0.25)
+            assert stopped == []
+
+            _sessions_common._session_status_cache[session_id] = "idle"
+            # Inside the settle window nothing releases...
+            await asyncio.sleep(0.25)
+            assert stopped == []
+            # ...and after it the teardown proceeds.
+            for _ in range(100):
+                if stopped:
+                    break
+                await asyncio.sleep(0.05)
+            assert stopped == [session_id]
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+        await _drain_detached_stops()
+
+
+async def test_stop_when_idle_idle_blip_does_not_release_the_teardown(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A quiet-pane idle blip shorter than the settle window is not turn end."""
+    session = await create_test_session(client, name="archive-idle-blip")
+    session_id = session["id"]
+    stopped: list[str] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.4),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+        ):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            await asyncio.sleep(0.1)
+
+            # A brief idle reading inside the settle window...
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await asyncio.sleep(0.2)
+            assert stopped == []
+
+            # ...then busy again: the settle clock must restart, so the
+            # original near-window reading cannot release the teardown.
+            _sessions_common._session_status_cache[session_id] = "running"
+            await asyncio.sleep(0.3)
+            assert stopped == []
+
+            _sessions_common._session_status_cache[session_id] = "idle"
+            for _ in range(100):
+                if stopped:
+                    break
+                await asyncio.sleep(0.05)
+            assert stopped == [session_id]
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+        await _drain_detached_stops()
+
+
+async def test_stop_when_idle_unarchive_during_the_wait_skips_teardown(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An unarchive mid-wait drops the deferral and tears nothing down."""
+    session = await create_test_session(client, name="archive-idle-unarchive")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 5.0),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+        ):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            await asyncio.sleep(0.1)
+
+            undo = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+            assert undo.status_code == 200
+            assert undo.json()["archived"] is False
+            row = conv_store.get_conversation(session_id)
+            assert row is not None
+            assert ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY not in row.labels
+
+            # Even after the settle window the tree is not torn down: the
+            # wait's root re-read saw the unarchive and returned.
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await asyncio.sleep(0.3)
+            assert stopped == []
+            await _drain_detached_stops()
+            assert stopped == []
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_rearchive_while_waiting_restarts_the_wait_for_the_new_revision(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A re-archive during a parked wait is evaluated on its own revision.
+
+    The first wait's completion for revision 1 must not cover revision 3: if
+    an unarchive and re-archive land while the old wait is parked, the
+    expansion has to wait again for the new revision's tree to settle.
+    """
+    session = await create_test_session(client, name="archive-rearchive-wait")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+    wait_revisions: list[int] = []
+    first_wait_started = asyncio.Event()
+    release_first_wait = asyncio.Event()
+    real_wait = _sessions_orchestration._wait_for_archive_idle
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    async def _gated_wait(
+        wait_session_id: str,
+        revision: int,
+        conversation_store: object,
+    ) -> None:
+        wait_revisions.append(revision)
+        if len(wait_revisions) == 1:
+            # Park the first revision's wait while the test changes revisions.
+            first_wait_started.set()
+            await release_first_wait.wait()
+            return
+        await real_wait(wait_session_id, revision, conversation_store)
+
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conv_store,
+        host_store=None,
+        host_registry=None,
+        runner_router=None,
+        intent_store=CliReleaseIntentStore(db_uri),
+        scan_interval_seconds=3600,
+    )
+    app.state.archive_close_coordinator = coordinator
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.3),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+            patch.object(_sessions_facade, "_wait_for_archive_idle", _gated_wait),
+            patch.object(_sessions_orchestration, "_wait_for_archive_idle", _gated_wait),
+        ):
+            first = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert first.status_code == 200
+            first_row = conv_store.get_conversation(session_id)
+            assert first_row is not None
+            assert first_row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(
+                first_row.archive_revision
+            )
+            await asyncio.wait_for(first_wait_started.wait(), timeout=5.0)
+            assert wait_revisions == [1]
+
+            # Revision 2 (unarchive) then revision 3 (re-archive with the
+            # deferral) while the revision-1 wait is parked.
+            undo = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+            assert undo.status_code == 200
+            again = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert again.status_code == 200
+            row = conv_store.get_conversation(session_id)
+            assert row is not None
+            assert row.archive_revision == 3
+            assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == "3"
+
+            release_first_wait.set()
+            # The expansion must wait for revision 3, not release on the
+            # revision-1 wait it already honoured.
+            for _ in range(100):
+                if len(wait_revisions) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert wait_revisions == [1, 3]
+            await asyncio.sleep(0.2)
+            assert stopped == []
+
+            # A running tree keeps the new wait parked; only its own settle
+            # window of idle releases the teardown.
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await asyncio.sleep(0.15)
+            assert stopped == []
+            for _ in range(100):
+                if stopped:
+                    break
+                await asyncio.sleep(0.05)
+            assert stopped == [session_id]
+    finally:
+        app.state.archive_close_coordinator = None
+        release_first_wait.set()
+        _sessions_common._session_status_cache.pop(session_id, None)
+        await _drain_detached_stops()
+
+
+async def test_archive_without_stop_when_idle_writes_no_deferral_label(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The web archive path keeps its timing and writes no deferral label."""
+    session = await create_test_session(client, name="archive-no-idle-label")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_facade, "_best_effort_stop", _recording_stop):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            await _drain_detached_stops()
+        assert resp.status_code == 200
+        row = conv_store.get_conversation(session_id)
+        assert row is not None
+        assert ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY not in row.labels
+        # No wait: the teardown ran as before.
+        assert stopped == [session_id]
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_client_cannot_seed_the_archive_deferral_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """A client-supplied deferral label is rejected like other reserved keys."""
+    session = await create_test_session(client, name="archive-forged-label")
+    session_id = session["id"]
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "archived": True,
+            "labels": {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: "1"},
+        },
+    )
+    assert resp.status_code == 400
+
+    listed = await client.get(f"/v1/sessions/{session_id}")
+    assert listed.status_code == 200
+    assert listed.json()["archived"] is False
+
+
+async def test_unarchive_after_archive_accepts_new_user_work(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unarchiving lifts the fence so a later user message is accepted."""
+    session = await create_test_session(client, name="archive-unarchive-work")
+    session_id = session["id"]
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "resume the work"}],
+        },
+    }
+
+    archived = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"archived": True, "stop_when_idle": True},
+    )
+    assert archived.status_code == 200
+    await _drain_detached_stops()
+
+    rejected = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+    assert rejected.status_code == 409
+
+    unarchived = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+    assert unarchived.status_code == 200
+    await _drain_detached_stops()
+
+    # A live runner proves the endpoint got past the archive fence: without
+    # it the message would still be dispatchable but fail later on runner
+    # binding, which is unrelated to what this test asserts.
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def _get_runner_client(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        _get_runner_client,
+    )
+    try:
+        accepted = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+    finally:
+        await fake_runner.aclose()
+    assert accepted.status_code == 202, accepted.text
+
+
+async def test_child_sessions_include_archived(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``include_archived`` surfaces an archived child and its flag."""
+    session = await create_test_session(client, name="archive-child-list")
+    parent_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=parent_id,
+        agent_id=session["agent_id"],
+    )
+
+    archived = await client.patch(f"/v1/sessions/{child.id}", json={"archived": True})
+    assert archived.status_code == 200
+    await _drain_detached_stops()
+
+    default = await client.get(f"/v1/sessions/{parent_id}/child_sessions")
+    assert default.status_code == 200
+    assert [row["id"] for row in default.json()["data"]] == []
+
+    included = await client.get(
+        f"/v1/sessions/{parent_id}/child_sessions",
+        params={"include_archived": "true"},
+    )
+    assert included.status_code == 200
+    rows = {row["id"]: row for row in included.json()["data"]}
+    assert rows[child.id]["archived"] is True

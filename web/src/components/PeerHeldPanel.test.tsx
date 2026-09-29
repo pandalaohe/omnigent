@@ -103,7 +103,7 @@ describe("PeerHeldPanel", () => {
     await screen.findAllByTestId("peer-held-row");
 
     expect(screen.getByTestId("peer-held-reason")).toHaveTextContent(
-      "Paused: automatic relay chain passed 30 hops without you. Release to continue.",
+      "Paused: automatic relay chain passed your relay depth limit without you. Release to continue.",
     );
     const pendingRow = document.querySelector('[data-peer-id="peer_pending"]');
     expect(pendingRow).not.toBeNull();

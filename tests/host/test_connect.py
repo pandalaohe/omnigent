@@ -58,6 +58,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPostBindHookFrame,
     HostPostBindHookResultFrame,
+    HostResourceSamplingFrame,
+    HostResourceSnapshotFrame,
     HostRunnerExitedFrame,
     HostRunnerLogRunawayFrame,
     HostRunnerStatusFrame,
@@ -70,6 +72,8 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ResourceMachine,
+    ResourceProcessRow,
     decode_host_frame,
     encode_host_frame,
 )
@@ -1545,6 +1549,139 @@ async def test_live_host_reports_a_runaway_runner_log_once(
     # The payload carries no file path, which may contain user directories.
     assert str(tmp_path) not in ws.sent[0]
     _cleanup_host(host)
+
+
+class _FakeResourceSampler:
+    """Sampler stand-in that records its inputs and returns a fixed frame."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.last_cpu_ms = 0.0
+
+    def sample(
+        self,
+        *,
+        runner_sessions: dict[int, str | None],
+        zygote_pid: int | None,
+        interval_s: int,
+    ) -> HostResourceSnapshotFrame:
+        self.calls.append(
+            {
+                "runner_sessions": dict(runner_sessions),
+                "zygote_pid": zygote_pid,
+                "interval_s": interval_s,
+            }
+        )
+        return HostResourceSnapshotFrame(
+            sampled_at="2026-09-24T09:25:00+00:00",
+            interval_s=interval_s,
+            machine=ResourceMachine(
+                cpu_pct=1.5,
+                mem_used=2,
+                mem_total=4,
+                disk_used=5,
+                disk_total=10,
+                load1=0.25,
+            ),
+            processes=[
+                ResourceProcessRow(
+                    pid=4242,
+                    ppid=1,
+                    name="runner",
+                    role="runner",
+                    session_id="conv_x",
+                    cpu_pct=0.5,
+                    rss=100,
+                )
+            ],
+            runner_count=len(runner_sessions),
+            sampler_cpu_ms=0.0,
+            monitor_rss_delta=0,
+        )
+
+
+async def test_resource_snapshot_loop_sends_a_decodable_frame() -> None:
+    """The loop copies runner state, samples off-loop, and sends one frame."""
+    host = _make_host_process()
+    fake_sampler = _FakeResourceSampler()
+    host._resource_sampler = fake_sampler
+    runner_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    host._runners["runner_x"] = _RunnerHandle(
+        proc=runner_proc,
+        log_path=Path("/tmp/runner-x.log"),
+        session_id="conv_x",
+    )
+    host._zygote = SimpleNamespace(unreaped_pid=7777)  # type: ignore[assignment]
+    ws = _RecordingWS()
+    # The loop samples on its interval; a lease wake makes the first one
+    # immediate so the test does not wait 60 s.
+    host._resource_wake.set()
+
+    task = asyncio.create_task(host._resource_snapshot_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+        _cleanup_host(host)
+
+    assert fake_sampler.calls[0]["runner_sessions"] == {runner_proc.pid: "conv_x"}
+    assert fake_sampler.calls[0]["zygote_pid"] == 7777
+    assert fake_sampler.calls[0]["interval_s"] == 60
+    assert fake_sampler.last_cpu_ms > 0.0
+    frame = decode_host_frame(ws.sent[0])
+    assert isinstance(frame, HostResourceSnapshotFrame)
+    assert frame.interval_s == 60
+    # The frame carries the PREVIOUS sample's cost, measured after encode.
+    assert frame.sampler_cpu_ms == 0.0
+    assert frame.runner_count == 1
+    assert frame.processes[0].session_id == "conv_x"
+
+
+async def test_resource_sampling_frame_sets_fast_mode_and_wakes_the_loop() -> None:
+    """A sampling lease holds the fast cadence and wakes the waiting loop."""
+    host = _make_host_process()
+    ws = _RecordingWS()
+    try:
+        await host._dispatch_host_frame(ws, HostResourceSamplingFrame(interval_s=10, lease_s=40))
+
+        assert host._resource_wake.is_set()
+        assert host._resource_fast_interval_s == 10.0
+        assert host._resource_interval() == 10.0
+
+        # A renewal while already fast must not add a sample on top of the timer.
+        host._resource_wake.clear()
+        await host._dispatch_host_frame(ws, HostResourceSamplingFrame(interval_s=10, lease_s=40))
+        assert not host._resource_wake.is_set()
+    finally:
+        _cleanup_host(host)
+
+
+async def test_resource_sampling_lease_expiry_returns_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the lease lapses the sampler returns to the 60 s cadence."""
+    import omnigent.host.connect as connect_mod
+
+    clock = SimpleNamespace(value=1000.0)
+
+    class _TimeProxy:
+        def monotonic(self) -> float:
+            return clock.value
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(time, name)
+
+    monkeypatch.setattr(connect_mod, "time", _TimeProxy())
+    host = _make_host_process()
+    ws = _RecordingWS()
+    try:
+        await host._dispatch_host_frame(ws, HostResourceSamplingFrame(interval_s=10, lease_s=40))
+        assert host._resource_interval() == 10.0
+
+        clock.value = 1040.5
+        assert host._resource_interval() == 60.0
+    finally:
+        _cleanup_host(host)
 
 
 @pytest.mark.parametrize("sample_first", [True, False])

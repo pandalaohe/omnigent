@@ -1384,3 +1384,65 @@ async def test_untracked_terminal_report_is_single_shot(
 
     assert server_client.attempts == 1, "the terminal report must not be retried"
     assert sleeps == [], "a lost report must not back off and retry"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow_running", [True, False])
+async def test_child_dispatched_by_a_running_flow_delivers_without_a_wake(
+    _clean_subagent_registry: None, flow_running: bool
+) -> None:
+    """A running flow's child reports through the flow's end wake, not its own."""
+    from omnigent.runner import flows
+    from omnigent.tools.builtins.flow import validate_flow_start_args
+
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    run = flows._FlowRun(
+        flow_id="flow_x",
+        plan=validate_flow_start_args({"steps": [{"tool": "x", "args": {}}]}),  # type: ignore[arg-type]
+        ctx=flows.FlowContext(server_client=None, conversation_id=PARENT_SESSION_ID),  # type: ignore[arg-type]
+        created_mono=0.0,
+        started_at=0.0,
+    )
+    flows._session_flows[PARENT_SESSION_ID] = {"flow_x": run}
+    token = flows._step_run.set(run if flow_running else None)
+    try:
+        runner_app.register_subagent_work(
+            parent_session_id=PARENT_SESSION_ID,
+            child_session_id=CHILD_SESSION_ID,
+            agent="reviewer",
+            title="review",
+        )
+    finally:
+        flows._step_run.reset(token)
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(spec_version=1, name="reviewer")
+
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "ok"},
+                },
+            )
+            await asyncio.sleep(0.1)
+    finally:
+        flows._session_flows.pop(PARENT_SESSION_ID, None)
+    assert resp.status_code == 204
+    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].qsize() == 1
+    wakes = [
+        url for url, _ in server_client.posts if url == f"/v1/sessions/{PARENT_SESSION_ID}/events"
+    ]
+    assert (len(wakes), run.held_child_results) == ((0, 1) if flow_running else (1, 0))

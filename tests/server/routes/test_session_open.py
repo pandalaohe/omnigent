@@ -622,23 +622,22 @@ async def test_stalled_pending_fire_reserves_the_root(
 
 
 @pytest.mark.asyncio
-async def test_rate_limits_the_sixth_open(
+async def test_rate_limits_the_eleventh_open(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The sixth open inside the window is refused with the setting text."""
+    """The open past the window's count is refused with the setting text."""
     env = open_env
     env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
     _patch_create(env, monkeypatch)
     async with await _client(env) as client:
-        for _ in range(5):
+        for _ in range(10):
             data = await _post(client, env["sender"].id, env["sender_token"], from_ref="main")
             assert data["state"] == "opened"
         refused = await _post(client, env["sender"].id, env["sender_token"], from_ref="main")
     assert refused["state"] == "refused"
     assert refused["reason"] == "open_rate"
     assert refused["message"] == (
-        "Opening sessions too fast (setting: 5 per 1 minute; "
-        "Settings > General > Session collaboration)"
+        "Opening sessions too fast (setting: 10 per 1 minute; Settings > Session collaboration)"
     )
 
 
@@ -990,3 +989,20 @@ async def test_fire_revalidates_the_host(
     env["app"].state.pending_session_opens.trigger(HOST_ID)
     assert await _wait_for(lambda: len(lines) == 1)
     assert lines == [f"[System: session {sid} could not open on host {HOST_NAME}: host_offline]"]
+
+
+@pytest.mark.asyncio
+async def test_master_switch_off_refuses_open(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the owner's collaboration switch off the route refuses; on admits."""
+    env = open_env
+    _patch_create(env, monkeypatch)
+    env["app"].state.user_preferences_store = _FakePreferences({"enabled": False})
+    async with await _client(env) as client:
+        refused = await _post(client, env["sender"].id, env["sender_token"])
+        assert refused["state"] == "refused"
+        assert refused["reason"] == "collab_disabled"
+        env["app"].state.user_preferences_store = _FakePreferences({"enabled": True})
+        opened = await _post(client, env["sender"].id, env["sender_token"])
+    assert opened["state"] == "opened"

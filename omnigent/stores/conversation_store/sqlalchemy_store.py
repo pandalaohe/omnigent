@@ -102,6 +102,7 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVE_LOCK_LABEL_KEY,
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -4462,6 +4463,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         close_cli_on_archive: bool = False,
+        archive_stop_when_idle: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -4508,6 +4510,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             append). JSON-encoded into the column.
         :param archived: New archived state. ``True`` archives,
             ``False`` unarchives, ``None`` leaves unchanged.
+        :param close_cli_on_archive: Atomically record the durable teardown
+            request when this call transitions ``archived`` to ``True``.
+        :param archive_stop_when_idle: When ``True`` alongside
+            ``close_cli_on_archive`` on an archive transition, stamp the
+            server-reserved idle-deferral label with the new archive revision
+            in the same transaction. A transition without it deletes any
+            prior label, as does unarchive. No effect outside a transition.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -4616,6 +4625,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                         row.archive_close_requested_revision = row.archive_revision
                     elif not archived:
                         row.archive_close_requested_revision = None
+                    if archived and close_cli_on_archive and archive_stop_when_idle:
+                        # The deferral names this revision in the same commit as
+                        # the transition, so recovery can never observe the
+                        # archive without its idle marker.
+                        _upsert_labels(
+                            ap_sess,
+                            conversation_id,
+                            {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: str(row.archive_revision)},
+                            now,
+                        )
+                    else:
+                        # An archive without the flag and an unarchive both void
+                        # the prior revision's deferral; drop the stale row.
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+                            )
+                        )
                     ap_changed = True
             if ap_changed:
                 row.updated_at = now

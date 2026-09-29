@@ -612,7 +612,11 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     HarnessTimeoutPolicy as HarnessTimeoutPolicy,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    _ARCHIVE_IDLE_MAX_WAIT_S as _ARCHIVE_IDLE_MAX_WAIT_S,
+    _ARCHIVE_IDLE_POLL_S as _ARCHIVE_IDLE_POLL_S,
+    _ARCHIVE_IDLE_SETTLE_S as _ARCHIVE_IDLE_SETTLE_S,
     _accumulate_session_usage as _accumulate_session_usage,
+    _archive_idle_deferred as _archive_idle_deferred,
     _best_effort_stop as _best_effort_stop,
     _context_labels_from_turn_usage as _context_labels_from_turn_usage,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,
@@ -667,6 +671,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _schedule_deferred_elicitation_clear as _schedule_deferred_elicitation_clear,
     _spawn_native_approval_popup_forward as _spawn_native_approval_popup_forward,
     _spawn_native_blocked_notice_forward as _spawn_native_blocked_notice_forward,
+    _wait_for_archive_idle as _wait_for_archive_idle,
     _wait_for_host_bound_runner_client as _wait_for_host_bound_runner_client,
     _wake_parent_for_blocked_child as _wake_parent_for_blocked_child,
     configure_subagent_block_notifier as configure_subagent_block_notifier,
@@ -946,6 +951,18 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         agent_cache=agent_cache,
+        user_preferences_store=user_preferences_store,
+    )
+
+    from omnigent.server.routes.sessions.routes_collab_settings import (
+        register_collab_settings_routes,
+    )
+
+    register_collab_settings_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
         user_preferences_store=user_preferences_store,
     )
 

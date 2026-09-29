@@ -690,13 +690,19 @@ def register_core_routes(
                 # Blocking store read; inside the try so a read failure still
                 # falls back to the id-only body.
                 global_instructions = await asyncio.to_thread(current_global_instructions_text)
+                # Prefer the initializer's owner-aware snapshot; embedded
+                # builds without one keep the deployment flag.
+                initializer = getattr(request.app.state, "runner_session_initializer", None)
+                peer_messaging_enabled = (
+                    await initializer.resolve_peer_messaging(conv)
+                    if initializer is not None
+                    else request.app.state.feature_flags.enabled(Feature.SESSION_PEER_MESSAGING)
+                )
                 init_body = build_runner_session_init_payload(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
-                    peer_messaging_enabled=request.app.state.feature_flags.enabled(
-                        Feature.SESSION_PEER_MESSAGING
-                    ),
+                    peer_messaging_enabled=peer_messaging_enabled,
                     global_instructions=global_instructions,
                 )
             except Exception:
@@ -1519,6 +1525,7 @@ def register_core_routes(
         include_liveness: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
+        include_preview: bool = Query(default=False),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1549,6 +1556,11 @@ def register_core_routes(
             stale AP-process caches. Browser reload/bind requests use
             this to recover from fixed bugs without restarting the AP
             server.
+        :param include_preview: When ``True``, fill
+            ``last_message_preview`` with an excerpt of the session's
+            newest visible message (one batched items read). The web
+            chat never sets it; orchestrating callers use it to peek at
+            a peer session without fetching the transcript.
         :returns: The matching :class:`SessionResponse`.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -1562,7 +1574,7 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
@@ -1579,6 +1591,10 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        if include_preview:
+            previews = await _message_previews_for([session_id])
+            snapshot.last_message_preview = previews.get(session_id)
+        return snapshot
 
     @router.get(
         "/sessions/{session_id}/labels",
@@ -2507,6 +2523,17 @@ def register_core_routes(
                                 "projects-changed push failed; client converges on next load",
                                 exc_info=True,
                             )
+                elif evt_type == "system_status_changed":
+                    async with emit_lock:
+                        try:
+                            await _send({"type": "system_status_changed"})
+                        except WebSocketDisconnect:
+                            raise
+                        except Exception:
+                            _logger.warning(
+                                "system-status-changed push failed; client converges on next load",
+                                exc_info=True,
+                            )
 
         reader_task = asyncio.create_task(_reader(), name="session-updates-reader")
         ticker_task = asyncio.create_task(_ticker(), name="session-updates-ticker")
@@ -3234,6 +3261,15 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        # Only a real archive transition carries the idle deferral; passing it
+        # through the store keeps the label write in the same commit. Spread
+        # conditionally so fakes with explicit signatures see only the kwargs
+        # they define.
+        archive_stop_when_idle_kwargs: dict[str, Any] = (
+            {"archive_stop_when_idle": True}
+            if body.archived is True and body.stop_when_idle
+            else {}
+        )
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -3254,6 +3290,7 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
             close_cli_on_archive=close_on_archive,
+            **archive_stop_when_idle_kwargs,
         )
         if updated is None:
             raise _session_not_found()
@@ -3289,6 +3326,8 @@ def register_core_routes(
             # archived-flag re-check covers a cross-replica Undo.
             _cancel_pending_archive_stop(session_id)
             if conv.archived:
+                # The transition above deleted the idle-deferral marker in the
+                # same commit; the revision bump already voided it.
                 # Clear the runner-side archive fence for the newer revision.
                 _spawn_archive_unfence(
                     session_id,

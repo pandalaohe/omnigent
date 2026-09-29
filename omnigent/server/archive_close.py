@@ -176,6 +176,10 @@ class ArchiveCloseCoordinator:
         root_id = key[1]
         from omnigent.server.routes import sessions as _sessions_facade
 
+        # The revision whose idle wait this expansion already honoured. A
+        # re-archive bumps the revision, so the new deferral is waited afresh
+        # rather than trusting the old wait's completion.
+        idle_waited_revision: int | None = None
         while True:
             root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
             if root is None:
@@ -195,6 +199,20 @@ class ArchiveCloseCoordinator:
                 (root.archived_at or 0) + _sessions_facade._ARCHIVE_STOP_UNDO_GRACE_S - time.time()
             )
             if remaining <= 0:
+                # A stop_when_idle archive holds the teardown until the whole
+                # tree has been idle for the settle window. Wait once per
+                # revision, then re-read the row (the wait's own re-reads
+                # honour a mid-wait unarchive or re-archive) and re-apply the
+                # guards above.
+                if (
+                    _sessions_facade._archive_idle_deferred(root)
+                    and root.archive_revision != idle_waited_revision
+                ):
+                    await _sessions_facade._wait_for_archive_idle(
+                        root_id, root.archive_revision, self._conversation_store
+                    )
+                    idle_waited_revision = root.archive_revision
+                    continue
                 break
             await asyncio.sleep(remaining)
         now = int(time.time())

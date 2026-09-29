@@ -922,3 +922,27 @@ def test_projects_changed_event_forwards_to_client(
         sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
         frame = _recv_until(ws, {"projects_changed"})
         assert frame["type"] == "projects_changed"
+
+
+def test_system_status_changed_event_forwards_to_client(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """A ``system_status_changed`` nudge reaches the connected client.
+
+    The hub announces workspace-wide (``publish_all``) when findings
+    change; the stream must forward the payload-free event so every open
+    client refetches its summary and the sidebar dot stays current.
+    ``fast_rescan`` makes a dropped forward fail fast on exhausted
+    heartbeats instead of blocking.
+    """
+    from omnigent.server.routes._sessions.helpers import announce_system_status_changed
+
+    s1 = _seed_session(stores, owner=ALICE, title="watched")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        announce_system_status_changed()
+        frame = _recv_until(ws, {"system_status_changed"})
+        assert frame["type"] == "system_status_changed"

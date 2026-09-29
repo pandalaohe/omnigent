@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -90,12 +91,14 @@ class RunnerSessionInitializer:
         *,
         server_version: str,
         peer_messaging_enabled: bool = False,
+        peer_messaging_resolver: Callable[[Conversation], bool] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
         self._peer_messaging_enabled = peer_messaging_enabled
+        self._peer_messaging_resolver = peer_messaging_resolver
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._tasks: dict[
@@ -103,6 +106,29 @@ class RunnerSessionInitializer:
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[_SessionInitKey, str] = {}
+        # What each successful post carried, per (runner, generation, session):
+        # a resolved value that differs means the init must be re-posted.
+        self._applied_peer: dict[tuple[str, int, str], bool] = {}
+        # (task, value) for each in-flight post, keyed like ``_applied_peer``.
+        # The task identity lets a finished post clear only its own entry.
+        self._pending_peer: dict[
+            tuple[str, int, str],
+            tuple[asyncio.Task[httpx.Response], bool],
+        ] = {}
+
+    async def resolve_peer_messaging(self, conversation: Conversation) -> bool:
+        """Resolve the peer-messaging snapshot for one session.
+
+        The resolver reads the owner's master switch; a blocking store read,
+        so it runs in a thread. Without a resolver the constructed flag wins
+        (embedded/test transports and flag-off deployments).
+
+        :param conversation: The session being initialized.
+        :returns: Whether the runner should expose peer messaging.
+        """
+        if self._peer_messaging_resolver is None:
+            return self._peer_messaging_enabled
+        return await asyncio.to_thread(self._peer_messaging_resolver, conversation)
 
     async def initialize(
         self,
@@ -124,6 +150,8 @@ class RunnerSessionInitializer:
         # identity fallback keeps embedded/test transports usable without
         # weakening the real tunnel-generation key.
         generation = id(connection) if connection is not None else id(runner_client)
+        peer = await self.resolve_peer_messaging(conversation)
+        pkey = (runner_id, generation, conversation.id)
         effective_archive_states = archive_states or [runner_archive_state(conversation)]
         archive_key = tuple(
             (state.scope_id, state.revision, state.archived) for state in effective_archive_states
@@ -138,74 +166,164 @@ class RunnerSessionInitializer:
             resume_interrupted_turn,
         )
         task = self._tasks.get(key)
-        if task is None:
-            recovery_id = (
-                self._recovery_ids.setdefault(key, uuid4().hex)
-                if resume_interrupted_turn
-                else None
+        if (
+            task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+            and self._applied_peer.get(pkey) is not None
+            and self._applied_peer[pkey] != peer
+        ):
+            # A flipped collaboration switch invalidates the cached success:
+            # drop it so this call posts a fresh envelope.
+            self._tasks.pop(key, None)
+            task = None
+        created = task is None
+        if created:
+            task = self._start_post(
+                conversation,
+                runner_client,
+                key=key,
+                pkey=pkey,
+                runner_id=runner_id,
+                peer=peer,
+                timeout=timeout,
+                suppress_recovery_turn=suppress_recovery_turn,
+                archive_states=effective_archive_states,
+                resume_interrupted_turn=resume_interrupted_turn,
             )
-
-            async def post_session_init() -> httpx.Response:
-                # Built here, not before create_task: the store read blocks,
-                # and awaiting between the single-flight lookup and the task
-                # registration would let a second caller start its own init.
-                payload = build_runner_session_init_payload(
-                    conversation,
-                    server_version=self._server_version,
-                    suppress_recovery_turn=suppress_recovery_turn,
-                    archive_states=effective_archive_states,
-                    peer_messaging_enabled=self._peer_messaging_enabled,
-                    global_instructions=await asyncio.to_thread(current_global_instructions_text),
-                    resume_interrupted_turn=resume_interrupted_turn,
-                    recovery_id=recovery_id,
-                )
-                if self._conversation_store is not None and self._file_store is not None:
-                    from omnigent.server.routes._sessions.helpers import (
-                        _filesystem_attachment_in_history,
-                        require_filesystem_attachment_runtime,
-                    )
-
-                    attachment = await asyncio.to_thread(
-                        _filesystem_attachment_in_history,
-                        conversation.id,
-                        self._conversation_store,
-                        self._file_store,
-                    )
-                    if attachment is not None:
-                        require_filesystem_attachment_runtime(
-                            host_id=None,
-                            runner_id=runner_id,
-                            host_registry=None,
-                            tunnel_registry=self._registry,
-                        )
-                return await self._post_initialize(
-                    runner_client,
-                    session_id=conversation.id,
-                    runner_id=runner_id,
-                    payload=payload,
-                    timeout=timeout,
-                )
-
-            task = asyncio.create_task(
-                post_session_init(),
-                name=f"runner-session-init-{conversation.id}",
+        # Record what the awaited post carries before it lands, so a switch
+        # flip racing it (or an invalidation) cannot misattribute readiness.
+        pending = self._pending_peer.get(pkey)
+        if created:
+            carried = peer
+        elif pending is not None and pending[0] is task:
+            carried = pending[1]
+        else:
+            carried = self._applied_peer.get(pkey, peer)
+        response = await self._await_initialized(conversation, task, key)
+        if not (200 <= response.status_code < 300 and carried != peer):
+            return response
+        # The awaited post carried a stale value: post this call's value,
+        # reusing a retry another joined caller already started, and never
+        # resurrecting a key an invalidation removed.
+        current = self._tasks.get(key)
+        if current is task:
+            self._tasks.pop(key, None)
+            retry = self._start_post(
+                conversation,
+                runner_client,
+                key=key,
+                pkey=pkey,
+                runner_id=runner_id,
+                peer=peer,
+                timeout=timeout,
+                suppress_recovery_turn=suppress_recovery_turn,
+                archive_states=effective_archive_states,
+                resume_interrupted_turn=resume_interrupted_turn,
             )
-            self._tasks[key] = task
+        elif current is not None and self._pending_peer.get(pkey) == (current, peer):
+            retry = current
+        else:
+            return response
+        return await self._await_initialized(conversation, retry, key)
 
-            def _drop_failed(done: asyncio.Task[httpx.Response]) -> None:
-                if self._tasks.get(key) is not done:
-                    return
-                if done.cancelled():
-                    self._tasks.pop(key, None)
-                    return
-                if done.exception() is not None:
-                    self._tasks.pop(key, None)
-                    return
-                response = done.result()
-                if response.status_code >= 400:
-                    self._tasks.pop(key, None)
+    def _start_post(
+        self,
+        conversation: Conversation,
+        runner_client: httpx.AsyncClient,
+        *,
+        key: _SessionInitKey,
+        pkey: tuple[str, int, str],
+        runner_id: str,
+        peer: bool,
+        timeout: float,
+        suppress_recovery_turn: bool,
+        archive_states: list[RunnerArchiveState],
+        resume_interrupted_turn: bool,
+    ) -> asyncio.Task[httpx.Response]:
+        """Start one init post, tracking its carried value while in flight."""
+        recovery_id = (
+            self._recovery_ids.setdefault(key, uuid4().hex) if resume_interrupted_turn else None
+        )
 
-            task.add_done_callback(_drop_failed)
+        async def post_session_init() -> httpx.Response:
+            # Built here, not before create_task: the store read blocks,
+            # and awaiting between the single-flight lookup and the task
+            # registration would let a second caller start its own init.
+            payload = build_runner_session_init_payload(
+                conversation,
+                server_version=self._server_version,
+                suppress_recovery_turn=suppress_recovery_turn,
+                archive_states=archive_states,
+                peer_messaging_enabled=peer,
+                global_instructions=await asyncio.to_thread(current_global_instructions_text),
+                resume_interrupted_turn=resume_interrupted_turn,
+                recovery_id=recovery_id,
+            )
+            if self._conversation_store is not None and self._file_store is not None:
+                from omnigent.server.routes._sessions.helpers import (
+                    _filesystem_attachment_in_history,
+                    require_filesystem_attachment_runtime,
+                )
+
+                attachment = await asyncio.to_thread(
+                    _filesystem_attachment_in_history,
+                    conversation.id,
+                    self._conversation_store,
+                    self._file_store,
+                )
+                if attachment is not None:
+                    require_filesystem_attachment_runtime(
+                        host_id=None,
+                        runner_id=runner_id,
+                        host_registry=None,
+                        tunnel_registry=self._registry,
+                    )
+            response = await self._post_initialize(
+                runner_client,
+                session_id=conversation.id,
+                runner_id=runner_id,
+                payload=payload,
+                timeout=timeout,
+            )
+            if 200 <= response.status_code < 300:
+                self._applied_peer[pkey] = peer
+            return response
+
+        task = asyncio.create_task(
+            post_session_init(),
+            name=f"runner-session-init-{conversation.id}",
+        )
+        self._tasks[key] = task
+        self._pending_peer[pkey] = (task, peer)
+
+        def _drop_finished(done: asyncio.Task[httpx.Response]) -> None:
+            pending = self._pending_peer.get(pkey)
+            if pending is not None and pending[0] is done:
+                self._pending_peer.pop(pkey, None)
+            if self._tasks.get(key) is not done:
+                return
+            if done.cancelled():
+                self._tasks.pop(key, None)
+                return
+            if done.exception() is not None:
+                self._tasks.pop(key, None)
+                return
+            response = done.result()
+            if response.status_code >= 400:
+                self._tasks.pop(key, None)
+
+        task.add_done_callback(_drop_finished)
+        return task
+
+    async def _await_initialized(
+        self,
+        conversation: Conversation,
+        task: asyncio.Task[httpx.Response],
+        key: _SessionInitKey,
+    ) -> httpx.Response:
+        """Await one post and normalize a rejected inference snapshot."""
         try:
             response = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -224,12 +342,46 @@ class RunnerSessionInitializer:
             self._tasks.pop(key, None)
         return response
 
+    async def peer_flag_stale(
+        self,
+        conversation: Conversation,
+        runner_client: httpx.AsyncClient,
+    ) -> bool:
+        """Whether the current tunnel generation carries an outdated flag.
+
+        The current value is the one an in-flight post carries, since that
+        post lands when it finishes; without one, the last applied value
+        counts. Neither value present — a session whose runner just
+        connected — reports not stale and picks the value up through its
+        normal initialization.
+
+        :param conversation: The session being initialized.
+        :param runner_client: The runner client this request would post to.
+        :returns: ``True`` when the current snapshot differs from the
+            currently resolved one.
+        """
+        runner_id = conversation.runner_id
+        if runner_id is None:
+            return False
+        connection = self._registry.get(runner_id)
+        generation = id(connection) if connection is not None else id(runner_client)
+        pkey = (runner_id, generation, conversation.id)
+        pending = self._pending_peer.get(pkey)
+        current = pending[1] if pending is not None else self._applied_peer.get(pkey)
+        if current is None:
+            return False
+        return current != await self.resolve_peer_messaging(conversation)
+
     def invalidate_session(self, session_id: str) -> None:
         """A new binding needs fresh readiness and a new continuation identity."""
         for key in list(self._tasks.keys() | self._recovery_ids.keys()):
             if key[2] == session_id:
                 self._tasks.pop(key, None)
                 self._recovery_ids.pop(key, None)
+        for pkey in list(self._applied_peer.keys() | self._pending_peer.keys()):
+            if pkey[2] == session_id:
+                self._applied_peer.pop(pkey, None)
+                self._pending_peer.pop(pkey, None)
 
     async def _post_initialize(
         self,
@@ -279,3 +431,7 @@ class RunnerSessionInitializer:
             task = self._tasks.pop(key)
             if not task.done():
                 task.cancel()
+        for pkey in list(self._applied_peer.keys() | self._pending_peer.keys()):
+            if pkey[0] == runner_id:
+                self._applied_peer.pop(pkey, None)
+                self._pending_peer.pop(pkey, None)

@@ -202,6 +202,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
     _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _RUNNING_SINCE_LABEL_KEY,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
@@ -231,6 +232,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_mcp_startup_cache,
+    _session_running_since_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -299,6 +301,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_failure_from_runner_response,
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
+    _note_running_edge,
     _owner_from_grants,
     _parse_background_tasks,
     _parse_external_conversation_item,
@@ -391,6 +394,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -1095,6 +1099,119 @@ def _archive_close_in_progress(root_session_id: str) -> bool:
     return root_session_id in _archive_close_intents
 
 
+# A tree reads as idle only after this many seconds with no session in
+# ``running``/``waiting``: native PTY watchers publish ``idle`` on a quiet pane
+# mid-turn, so a single idle reading is not proof the turn ended.
+_ARCHIVE_IDLE_SETTLE_S = 20.0
+# Leak guard for the archive idle wait: a status stuck at ``running`` must not
+# pin a runner forever after the archive. Measured from ``archived_at``.
+_ARCHIVE_IDLE_MAX_WAIT_S = 3600.0
+# How often the idle wait re-reads the root row and the status cache.
+_ARCHIVE_IDLE_POLL_S = 2.0
+
+
+def _archive_idle_deferred(conv: Any) -> bool:
+    """
+    Return whether a conversation row still asks for an idle archive teardown.
+
+    :param conv: A conversation row, or ``None`` when the read found nothing.
+    :returns: ``True`` when the row is archived and its deferral label names
+        its own current archive revision.
+    """
+    return (
+        conv is not None
+        and bool(conv.archived)
+        and conv.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(conv.archive_revision)
+    )
+
+
+async def _wait_for_archive_idle(
+    session_id: str,
+    revision: int,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Wait until one archive revision's tree is idle (or its leak guard expires).
+
+    Used by the archive teardown for a ``stop_when_idle`` archive: the
+    caller's turn ends with the closing reply, so tearing the runner down
+    before the whole tree reads idle would cut it. Every poll re-reads the
+    root and returns as soon as a successful read shows the row is no longer
+    archived, its revision differs from ``revision``, or its deferral label
+    no longer names ``revision`` — an unarchive or re-archive voids the wait
+    and the new revision is evaluated afresh. A failed read (root or
+    descendants) is never evidence of idleness: that poll counts as busy and
+    the settle clock restarts. Bounded by ``_ARCHIVE_IDLE_MAX_WAIT_S`` from
+    the ``archived_at`` of this revision.
+
+    :param session_id: Root session/conversation identifier.
+    :param revision: The archive revision whose teardown is deferred.
+    :param conversation_store: Store for the root row and descendant lookups.
+    """
+    # Resolve through the facade so a test's monkeypatch of the constants is
+    # honored here.
+    from omnigent.server.routes import sessions as _facade
+
+    first_call = time.time()
+    deadline: float | None = None
+    idle_since: float | None = None
+    # The tree is collected once and reused; a failed lookup is retried on
+    # every poll, and until it succeeds the tree counts as busy.
+    tree: list[str] | None = None
+    while True:
+        now = time.time()
+        if tree is None:
+            try:
+                descendant_ids = await _collect_descendant_conversation_ids(
+                    conversation_store, session_id
+                )
+            except Exception:  # noqa: BLE001 - a failed lookup is not idleness.
+                _logger.debug(
+                    "Archive idle descendant lookup failed for %s; tree stays busy",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+            else:
+                tree = [session_id, *descendant_ids]
+        root_ok = False
+        try:
+            root = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001 - a failed read is not idleness.
+            _logger.debug(
+                "Archive idle root re-read failed for %s; poll counts as busy",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            root_ok = True
+            if (
+                root is None
+                or not _archive_idle_deferred(root)
+                or root.archive_revision != revision
+            ):
+                return
+            if deadline is None:
+                deadline = (root.archived_at or now) + _facade._ARCHIVE_IDLE_MAX_WAIT_S
+        if deadline is None:
+            # No successful read at this revision yet: bound the wait from the
+            # first call rather than trusting an unreadable row.
+            deadline = first_call + _facade._ARCHIVE_IDLE_MAX_WAIT_S
+        if now >= deadline:
+            return
+        busy = tree is None or not root_ok
+        if not busy:
+            busy = any(_session_status_cache.get(sid) in ("running", "waiting") for sid in tree)
+        if busy:
+            idle_since = None
+        elif idle_since is None:
+            idle_since = now
+        if idle_since is not None and now - idle_since >= _facade._ARCHIVE_IDLE_SETTLE_S:
+            return
+        await asyncio.sleep(_facade._ARCHIVE_IDLE_POLL_S)
+
+
 async def _archive_stop_one(
     target_id: str,
     conversation: Any,
@@ -1452,6 +1569,40 @@ def _spawn_archive_stop(
             with contextlib.suppress(Exception):
                 await asyncio.shield(archive_close_coordinator.trigger(session_id))
             return
+        # Coordinator-less fallback (tests / in-process setups): honour the
+        # durable deferral marker ourselves. A failed re-read is not evidence
+        # of idleness, so retry a transient blip; a sustained failure returns
+        # without stopping — never kill a session whose state we could not
+        # read, a later lifecycle event reaps it.
+        # A wait binds to one revision: after a cross-replica re-archive the
+        # loop re-reads and waits again for the new revision's own idleness.
+        idle_waited_revision: int | None = None
+        while True:
+            row: Any = None
+            for _attempt in range(_ARCHIVE_STOP_LOOKUP_ATTEMPTS):
+                try:
+                    row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    break
+                except Exception:  # noqa: BLE001
+                    if _attempt + 1 >= _ARCHIVE_STOP_LOOKUP_ATTEMPTS:
+                        _logger.warning(
+                            "Archive deferral lookup failed for %s after %d attempts; "
+                            "leaving the runner (reaped by a later lifecycle event)",
+                            session_id,
+                            _ARCHIVE_STOP_LOOKUP_ATTEMPTS,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                        return
+                    await asyncio.sleep(_ARCHIVE_STOP_LOOKUP_RETRY_S)
+            if row is None or not row.archived:
+                return
+            revision = row.archive_revision
+            if _archive_idle_deferred(row) and revision != idle_waited_revision:
+                await _wait_for_archive_idle(session_id, revision, conversation_store)
+                idle_waited_revision = revision
+                continue
+            break
         _archive_close_intents.add(session_id)
         try:
             await _archive_stop(session_id, conversation_store, runner_router, host_registry)
@@ -11998,6 +12149,8 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
+                    previous = _session_status_cache.get(session_id)
+                    _note_running_edge(session_id, previous, raw)
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
                         session_live_state.persist_live_status(session_id, raw)
@@ -12205,6 +12358,16 @@ async def _get_session_snapshot(
         if exit_error is not None:
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
+    # The start of the current running period as the server observed it: the
+    # in-memory stamp on the tunnel-holding replica first, the persisted label
+    # as the restart / other-replica fallback. Only meaningful while running.
+    running_since: int | None = None
+    if status == "running":
+        running_since = _session_running_since_cache.get(session_id)
+        if running_since is None:
+            raw_running_since = conv.labels.get(_RUNNING_SINCE_LABEL_KEY)
+            if isinstance(raw_running_since, str) and raw_running_since.isdigit():
+                running_since = int(raw_running_since)
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
@@ -12361,11 +12524,16 @@ async def _get_session_snapshot(
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage
+    response.running_since = running_since
     return response
 
 
 __all__ = [
+    "_ARCHIVE_IDLE_MAX_WAIT_S",
+    "_ARCHIVE_IDLE_POLL_S",
+    "_ARCHIVE_IDLE_SETTLE_S",
     "_accumulate_session_usage",
+    "_archive_idle_deferred",
     "_archive_stop",
     "_best_effort_stop",
     "_bind_and_launch_managed_runner",
@@ -12429,6 +12597,7 @@ __all__ = [
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
+    "_wait_for_archive_idle",
     "_wait_for_host_bound_runner_client",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",

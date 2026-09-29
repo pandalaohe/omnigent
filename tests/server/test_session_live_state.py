@@ -55,6 +55,8 @@ class _RecordingStore:
         self.pending_writes: list[tuple[str, int]] = []
         self.touches: list[list[str]] = []
         self.clears: list[str] = []
+        self.label_writes: list[tuple[str, dict[str, str]]] = []
+        self.conversations: dict[str, object] = {}
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -68,6 +70,20 @@ class _RecordingStore:
 
     def clear_runner_liveness(self, runner_id: str) -> None:
         self.clears.append(runner_id)
+
+    def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
+        self.label_writes.append((conversation_id, dict(updates)))
+
+    def get_conversation(self, conversation_id: str) -> object | None:
+        return self.conversations.get(conversation_id)
+
+
+class _FakeConversation:
+    """Minimal conversation row for the running-since worker's row check."""
+
+    def __init__(self, *, live_status: str | None, labels: dict[str, str]) -> None:
+        self.live_status = live_status
+        self.labels = labels
 
 
 @pytest.fixture()
@@ -97,6 +113,89 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+def test_persist_running_since_previous_known_writes_label(
+    recording_store: _RecordingStore,
+) -> None:
+    """A known-previous turn start writes the stamp label and skips the row read.
+
+    The caller already stamped its in-memory cache synchronously, so the
+    worker must not consult the row (that read is only the restart fallback)
+    and must not call ``on_resolved``. If the label write regressed, a server
+    restart mid-turn would lose the turn start.
+    """
+    resolved: list[int] = []
+    session_live_state.persist_running_since(
+        "conv_1", 111, previous_known=True, on_resolved=resolved.append
+    )
+    _wait_until(lambda: bool(recording_store.label_writes))
+
+    assert recording_store.label_writes == [
+        ("conv_1", {session_live_state.RUNNING_SINCE_LABEL_KEY: "111"})
+    ]
+    assert resolved == []
+
+
+def test_persist_running_since_keeps_carried_over_stamp(
+    recording_store: _RecordingStore,
+) -> None:
+    """An unknown-previous edge keeps a carried-over stamp on a running row.
+
+    Previous unknown means the server just restarted (or a probe ran on a
+    freshly bound session): the turn may have continued across the restart,
+    so the row's still-running status plus an existing label wins over the
+    edge's ``now``. Overwriting it would make a mid-turn session's
+    ``running_seconds`` restart from the restart time.
+    """
+    recording_store.conversations["conv_1"] = _FakeConversation(
+        live_status="running",
+        labels={session_live_state.RUNNING_SINCE_LABEL_KEY: "99"},
+    )
+    resolved: list[int] = []
+    session_live_state.persist_running_since(
+        "conv_1", 111, previous_known=False, on_resolved=resolved.append
+    )
+    _wait_until(lambda: bool(resolved))
+
+    assert resolved == [99]
+    assert recording_store.label_writes == []
+
+
+def test_persist_running_since_writes_now_when_row_idle(
+    recording_store: _RecordingStore,
+) -> None:
+    """A new running edge over an idle row writes and resolves ``now``.
+
+    This is the normal first edge after a server restart on a session that
+    was not mid-turn: there is nothing to carry over, so the stamp is the
+    edge's own start time — in the DB for later readers and back into the
+    caller's in-memory cache via ``on_resolved``.
+    """
+    recording_store.conversations["conv_1"] = _FakeConversation(
+        live_status="idle",
+        labels={session_live_state.RUNNING_SINCE_LABEL_KEY: "99"},
+    )
+    resolved: list[int] = []
+    session_live_state.persist_running_since(
+        "conv_1", 111, previous_known=False, on_resolved=resolved.append
+    )
+    _wait_until(lambda: bool(resolved))
+
+    assert resolved == [111]
+    assert recording_store.label_writes == [
+        ("conv_1", {session_live_state.RUNNING_SINCE_LABEL_KEY: "111"})
+    ]
+
+
+def test_persist_running_since_noop_without_store() -> None:
+    """Nothing is enqueued (and no callback fires) when persistence is off."""
+    session_live_state.configure(None)
+    resolved: list[int] = []
+    session_live_state.persist_running_since(
+        "conv_1", 111, previous_known=False, on_resolved=resolved.append
+    )
+    assert resolved == []
 
 
 def test_pending_count_hook_persists_publish_and_resolve(

@@ -366,7 +366,7 @@ async def test_only_child_creates_spend_the_open_rate_budget(
             "/v1/sessions", json={"project_id": project_id}, headers=_headers()
         )
         assert parent.status_code == 201, parent.text
-        # Top-level creates (the web "Add agent" shape) never count.
+        # Top-level creates never count.
         for index in range(6):
             top = await client.post(
                 "/v1/sessions",
@@ -374,7 +374,7 @@ async def test_only_child_creates_spend_the_open_rate_budget(
                 headers=_headers(),
             )
             assert top.status_code == 201, top.text
-        for index in range(5):
+        for index in range(10):
             child = await client.post(
                 "/v1/sessions",
                 json={
@@ -390,12 +390,12 @@ async def test_only_child_creates_spend_the_open_rate_budget(
             json={
                 "agent_id": AGENT_ID,
                 "parent_session_id": parent.json()["id"],
-                "title": "child-5",
+                "title": "child-10",
             },
             headers=_headers(),
         )
         assert refused.status_code == 429, refused.text
-        assert "setting: 5 per 1 minute" in refused.json()["detail"]
+        assert "setting: 10 per 1 minute" in refused.json()["detail"]
     finally:
         session_open_rate._OPEN_TIMESTAMPS.clear()
 
@@ -451,7 +451,7 @@ async def test_multipart_child_create_spends_the_budget(
         )
         assert parent.status_code == 201, parent.text
         parent_id = parent.json()["id"]
-        for index in range(5):
+        for index in range(10):
             response = await client.post(
                 "/v1/sessions",
                 data={"metadata": json.dumps({"parent_session_id": parent_id})},

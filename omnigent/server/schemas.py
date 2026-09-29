@@ -901,6 +901,10 @@ class ChildSessionSummary(BaseModel):
     :param created_at: Unix epoch timestamp of child creation.
     :param updated_at: Unix epoch timestamp of the child's most
         recent update.
+    :param archived: ``True`` when the child session is archived.
+        Archived children are excluded from the default listing; the
+        ``include_archived`` query parameter surfaces them so callers
+        can tell a freed name from a merely hidden one.
     :param agent_id: Agent id recorded on the latest task,
         e.g. ``"ag_abc123"``. ``None`` if the child has no tasks
         yet (rare — ``_spawn_one`` creates a task atomically with
@@ -969,6 +973,7 @@ class ChildSessionSummary(BaseModel):
     kind: str = "sub_agent"
     created_at: int
     updated_at: int
+    archived: bool = False
     agent_id: str | None = None
     agent_name: str | None = None
     current_task_id: str | None = None
@@ -2342,6 +2347,21 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param running_since: Epoch seconds at which the current running period
+        began, as the server observed the status edge that opened it; ``None``
+        whenever the snapshot status is not ``"running"``. The server's
+        observation, not a harness turn id: for a session whose harness owns
+        the status directly (relay / SDK / codex-native / claude-native with
+        its status file) it is the turn start, while a claude-native session
+        on the PTY fallback reports a quiet lull as ``"idle"`` and restarts
+        this stamp when activity resumes. The in-memory stamp wins; the
+        persisted ``omnigent.running_since`` label is the fallback after a
+        server restart or on a replica without the runner tunnel.
+    :param last_message_preview: One-line excerpt of the session's newest
+        visible message. Filled only when the request asked with
+        ``include_preview=true`` (default ``false``, and never for callers
+        that don't ask); ``None`` otherwise or when the session has no
+        visible messages.
     """
 
     id: str
@@ -2418,6 +2438,8 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    running_since: int | None = None
+    last_message_preview: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -2536,6 +2558,11 @@ class UpdateSessionRequest(BaseModel):
         owner-private, only the session owner may file it, and only into a
         project they own — the server verifies both. Independent of the
         legacy ``omni_project`` label, which is set via ``labels``.
+    :param stop_when_idle: Only meaningful alongside ``archived: true``.
+        When ``True`` the archive teardown, after the undo window, also waits
+        (bounded) until the session tree leaves the running state. Set by an
+        agent archiving its own session or an ancestor, whose turn would
+        otherwise be cut. Default ``False`` keeps the web archive's timing.
     """
 
     runner_id: str | None = None
@@ -2555,6 +2582,7 @@ class UpdateSessionRequest(BaseModel):
     archive_locked: bool | None = None
     project_id: str | None = None
     silent: bool = False
+    stop_when_idle: bool = False
 
     model_config = ConfigDict(extra="forbid")
 

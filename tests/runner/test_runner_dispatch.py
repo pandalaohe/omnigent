@@ -7328,6 +7328,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "worktree": None,
             "updated_at": None,
             "last_message_preview": None,
+            "archived": None,
+            "archived_at": None,
         },
         {
             "session_id": "s2",
@@ -7342,6 +7344,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "worktree": None,
             "updated_at": None,
             "last_message_preview": None,
+            "archived": None,
+            "archived_at": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -7685,8 +7689,7 @@ async def test_sys_session_create_maps_open_rate_refusal() -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     refusal = (
-        "Opening sessions too fast (setting: 5 per 1 minute; "
-        "Settings > General > Session collaboration)"
+        "Opening sessions too fast (setting: 5 per 1 minute; Settings > Session collaboration)"
     )
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -7958,8 +7961,7 @@ async def test_sys_session_create_config_path_maps_open_rate_refusal(tmp_path: P
 
     (tmp_path / "helper.yaml").write_text("name: helper\nprompt: do helpful things\n")
     refusal = (
-        "Opening sessions too fast (setting: 5 per 1 minute; "
-        "Settings > General > Session collaboration)"
+        "Opening sessions too fast (setting: 5 per 1 minute; Settings > Session collaboration)"
     )
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -8144,6 +8146,51 @@ async def test_sys_session_get_info_maps_error_statuses(
     info = json.loads(output)
     assert info["error"] == expected_error
     assert info["session_id"] == "conv_missing"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_single_path_keeps_legacy_error_shapes() -> None:
+    """
+    The single-id path keeps its pre-multi-id transport / non-200 error
+    messages (no ``session_id`` key) even though the shared item projection
+    now reports those failures with one.
+
+    Rewriting the single path to reuse ``_session_info_item`` must not leak
+    the multi-id item shape into existing callers/tests: the transport error
+    stays ``sys_session_get_info failed: <exc>`` and a 5xx stays
+    ``sys_session_get_info returned <code>``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _transport_failure(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_transport_failure),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+    assert json.loads(output) == {"error": "sys_session_get_info failed: refused"}
+
+    async def _server_error(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_error),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+    assert json.loads(output) == {"error": "sys_session_get_info returned 500"}
 
 
 @pytest.mark.asyncio
@@ -8653,6 +8700,420 @@ async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None
     # raw ``pi-native-ui`` must not appear anywhere in the tool output.
     assert info["agent_name"] == "Pi"
     assert "pi-native-ui" not in output
+
+
+# ``Date`` header used by the multi-session get_info tests: 2000 epoch seconds,
+# so a snapshot ``created_at``/``updated_at`` yields exact durations.
+_SESSION_INFO_DATE = "Thu, 01 Jan 1970 00:33:20 GMT"
+
+
+def _session_info_snapshot(session_id: str, **overrides: Any) -> dict[str, Any]:
+    """Minimal 200 snapshot body for the multi-session get_info tests."""
+    body: dict[str, Any] = {
+        "id": session_id,
+        "agent_id": f"ag_{session_id}",
+        "agent_name": "helper",
+        "status": "idle",
+        "created_at": 1000,
+        "updated_at": 1900,
+        "pending_elicitations": [],
+    }
+    body.update(overrides)
+    return body
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_many_returns_ordered_items_and_durations() -> None:
+    """
+    ``session_ids`` returns ``{"sessions": [...]}`` in input order, each item
+    carrying the snapshot's new runtime fields with durations derived from the
+    response's ``Date`` header.
+
+    The duration contract is the point: ``as_of`` is the server's clock, so a
+    runner on another host computes ``age_seconds`` / ``idle_seconds`` /
+    ``running_seconds`` without mixing in its own clock. If the projection
+    dropped a field or used the runner's clock, the asserted values would
+    differ.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/v1/sessions/"):
+            assert request.url.params["include_items"] == "false"
+            assert request.url.params["include_liveness"] == "false"
+            assert request.url.params["include_preview"] == "true"
+            sid = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                headers={"date": _SESSION_INFO_DATE},
+                json=_session_info_snapshot(
+                    sid,
+                    status="running",
+                    running_since=1950,
+                    last_total_tokens=50000,
+                    context_window=200000,
+                ),
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": ["conv_a", "conv_b", "conv_c"]}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    items = json.loads(output)["sessions"]
+    assert [item["session_id"] for item in items] == ["conv_a", "conv_b", "conv_c"]
+    for item in items:
+        assert item["status"] == "running"
+        assert item["as_of"] == 2000
+        assert item["created_at"] == 1000
+        assert item["age_seconds"] == 1000
+        assert item["idle_seconds"] == 100
+        assert item["running_since"] == 1950
+        assert item["running_seconds"] == 50
+        assert item["context_used_fraction"] == 0.25
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_idle_session_has_null_running_fields() -> None:
+    """
+    An idle session reports ``running_since`` / ``running_seconds`` as
+    ``None`` — including when a stale snapshot omitted the key entirely. A
+    non-null value here would tell an orchestrator a turn is in flight when
+    the server says idle.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"date": _SESSION_INFO_DATE},
+            json=_session_info_snapshot("conv_idle", status="idle"),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": ["conv_idle"]}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    (item,) = json.loads(output)["sessions"]
+    assert item["running_since"] is None
+    assert item["running_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_many_reports_per_item_errors() -> None:
+    """
+    An inaccessible or unknown id yields its own typed error item, and the
+    other items still come back — one bad id must never fail the whole call.
+
+    The item shapes (``{"session_id", "error"}``) are what let an orchestrator
+    fan out over a batch without pre-checking every id.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        sid = request.url.path.rsplit("/", 1)[-1]
+        if sid == "conv_ok":
+            return httpx.Response(200, json=_session_info_snapshot(sid))
+        if sid == "conv_denied":
+            return httpx.Response(403, json={"error": "denied"})
+        return httpx.Response(404, json={"error": "missing"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": ["conv_ok", "conv_denied", "conv_missing"]}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    items = json.loads(output)["sessions"]
+    assert [item["session_id"] for item in items] == [
+        "conv_ok",
+        "conv_denied",
+        "conv_missing",
+    ]
+    assert items[0]["status"] == "idle"
+    assert items[1] == {"error": "access_denied", "session_id": "conv_denied"}
+    assert items[2] == {"error": "session_not_found", "session_id": "conv_missing"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_many_keeps_each_items_host_readiness() -> None:
+    """
+    Sessions on different hosts each report their own ``host_id`` and
+    configured harness readiness; the runner and host lookups are per item,
+    not folded across the batch. Without that, an item would show another
+    session's host readiness and mislead the orchestrator about where a
+    session can run.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    readiness = {
+        "host_1": {"claude-native": True},
+        "host_2": {"codex-native": False},
+    }
+    online = {"runner_1": True, "runner_2": False}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_a":
+            return httpx.Response(
+                200,
+                json=_session_info_snapshot(
+                    "conv_a",
+                    status="running",
+                    host_id="host_1",
+                    runner_id="runner_1",
+                ),
+            )
+        if path == "/v1/sessions/conv_b":
+            return httpx.Response(
+                200,
+                json=_session_info_snapshot(
+                    "conv_b",
+                    status="idle",
+                    host_id="host_2",
+                    runner_id="runner_2",
+                ),
+            )
+        if path.startswith("/v1/hosts/"):
+            host_id = path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json={"configured_harnesses": readiness[host_id]})
+        if path.startswith("/v1/runners/") and path.endswith("/status"):
+            runner_id = path.split("/")[3]
+            return httpx.Response(200, json={"online": online[runner_id]})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": ["conv_a", "conv_b"]}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert by_id["conv_a"]["host_id"] == "host_1"
+    assert by_id["conv_a"]["configured_harnesses"] == {"claude-native": True}
+    assert by_id["conv_a"]["runner_online"] is True
+    assert by_id["conv_b"]["host_id"] == "host_2"
+    assert by_id["conv_b"]["configured_harnesses"] == {"codex-native": False}
+    assert by_id["conv_b"]["runner_online"] is False
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_many_dedupes_ids() -> None:
+    """
+    Duplicate ids collapse to one item and one snapshot GET, preserving first
+    occurrence order. Without the dedupe the batch would fetch (and report)
+    the same session twice.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requested: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        sid = request.url.path.rsplit("/", 1)[-1]
+        requested.append(sid)
+        return httpx.Response(200, json=_session_info_snapshot(sid))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": ["conv_a", "conv_a", "conv_b"]}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    items = json.loads(output)["sessions"]
+    assert [item["session_id"] for item in items] == ["conv_a", "conv_b"]
+    assert requested == ["conv_a", "conv_b"]
+
+
+_BAD_MULTI_ARGS_IDS_ERROR = (
+    "sys_session_get_info: 'session_ids' must be a non-empty list of non-empty strings (max 20)"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments,expected_error",
+    [
+        pytest.param(
+            {"session_id": "conv_a", "session_ids": ["conv_b"]},
+            "sys_session_get_info: pass session_id or session_ids, not both",
+            id="both-forms",
+        ),
+        pytest.param(
+            {"session_ids": [f"conv_{i}" for i in range(21)]},
+            "sys_session_get_info: 'session_ids' accepts at most 20 entries",
+            id="over-max-ids",
+        ),
+        pytest.param({"session_ids": []}, _BAD_MULTI_ARGS_IDS_ERROR, id="empty-list"),
+        pytest.param({"session_ids": [""]}, _BAD_MULTI_ARGS_IDS_ERROR, id="empty-string-id"),
+        pytest.param({"session_ids": "conv_a"}, _BAD_MULTI_ARGS_IDS_ERROR, id="not-a-list"),
+    ],
+)
+async def test_sys_session_get_info_rejects_bad_multi_args_without_server_call(
+    arguments: dict[str, Any],
+    expected_error: str,
+) -> None:
+    """
+    Every malformed ``session_ids`` / combination is rejected locally with the
+    exact typed error, before any HTTP call — the handler records requests and
+    answers 500 rather than raising, because production catches transport
+    exceptions and a raise would mask a server call instead of failing.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(500, json={"error": "unexpected server call"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert requests == []
+    info = json.loads(output)
+    assert info["error"] == expected_error
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> None:
+    """
+    The single-id form stays a flat object: existing keys unchanged, the new
+    runtime fields appended. Callers written against the pre-multi-id shape
+    must not have to start unwrapping ``sessions``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"date": _SESSION_INFO_DATE},
+            json=_session_info_snapshot(
+                "conv_one",
+                updated_at=1990,
+                running_since=1980,
+                archived=True,
+                archived_at=1500,
+                last_total_tokens=1000,
+                context_window=4000,
+                total_cost_usd=0.5,
+                last_task_error={"code": "executor_error", "message": "boom"},
+                last_message_preview="latest words",
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_one"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert "sessions" not in info
+    assert info["session_id"] == "conv_one"
+    assert info["last_activity_at"] == 1990
+    assert info["archived"] is True
+    assert info["archived_at"] == 1500
+    assert info["total_cost_usd"] == 0.5
+    assert info["context_tokens"] == 1000
+    assert info["context_window"] == 4000
+    assert info["context_used_fraction"] == 0.25
+    assert info["last_error"] == {"code": "executor_error", "message": "boom"}
+    assert info["last_message_preview"] == "latest words"
+    assert info["running_since"] == 1980
+    assert info["running_seconds"] == 20
+    assert info["idle_seconds"] == 10
+    assert info["age_seconds"] == 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "last_total_tokens,context_window,expected_fraction",
+    [
+        pytest.param(50000, None, None, id="missing-window"),
+        pytest.param(50000, 0, None, id="zero-window"),
+        pytest.param(0, 200000, 0.0, id="zero-tokens"),
+    ],
+)
+async def test_sys_session_get_info_context_fraction(
+    last_total_tokens: int,
+    context_window: int | None,
+    expected_fraction: float | None,
+) -> None:
+    """
+    ``context_used_fraction`` needs a positive window, and zero tokens is a
+    valid reading: a missing (or zero) window leaves the fraction ``None`` —
+    a fabricated 0 or a divide error would both misreport context pressure —
+    while 0 tokens over a real window is exactly ``0.0``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_session_info_snapshot(
+                "conv_ctx",
+                last_total_tokens=last_total_tokens,
+                context_window=context_window,
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_ctx"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["context_tokens"] == last_total_tokens
+    assert info["context_window"] == context_window
+    assert info["context_used_fraction"] == expected_fraction
 
 
 @pytest.mark.asyncio

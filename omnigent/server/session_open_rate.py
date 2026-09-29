@@ -63,7 +63,7 @@ def admit_open(app_state: Any, owner: str) -> str | None:
         if len(stamps) >= count:
             return (
                 f"Opening sessions too fast (setting: {count} per "
-                f"{_window_text(window_s)}; Settings > General > Session collaboration)"
+                f"{_window_text(window_s)}; Settings > Session collaboration)"
             )
         stamps.append(now)
     return None

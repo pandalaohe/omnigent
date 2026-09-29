@@ -55,6 +55,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
 )
+from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
 from omnigent.tools.builtins.session_open import SysSessionOpenTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -93,6 +94,7 @@ __all__ = [
     "SysScheduledTaskDeleteTool",
     "SysScheduledTaskListTool",
     "SysScheduledTaskUpdateTool",
+    "SysSessionArchiveTool",
     "SysSessionCloseTool",
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
@@ -102,6 +104,7 @@ __all__ = [
     "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",
+    "SysSessionUnarchiveTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
     "UpdateCommentTool",

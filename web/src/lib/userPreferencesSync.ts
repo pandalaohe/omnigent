@@ -8,7 +8,8 @@ export type UserPreferenceNamespace =
   | "agent_badges"
   | "agent_pins"
   | "calling_defaults"
-  | "calling_last";
+  | "calling_last"
+  | "session_collab";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -58,6 +59,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     calling_last: {
       storageKey: "omnigent:calling-last",
       eventName: "omnigent:calling-last-changed",
+    },
+    session_collab: {
+      storageKey: "omnigent:session-collab",
+      eventName: "omnigent:session-collab-changed",
     },
   };
 

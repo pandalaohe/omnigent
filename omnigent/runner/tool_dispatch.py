@@ -28,10 +28,12 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -62,6 +64,8 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.runner import flows
+from omnigent.runner.flows import FLOW_TOOL_NAMES
 from omnigent.runtime import pending_elicitations
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -74,6 +78,7 @@ from omnigent.tools.builtins.async_inbox import (
 )
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
+from omnigent.tools.builtins.flow import validate_flow_start_args
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
     OS_ENV_TOOL_TYPES,
@@ -83,6 +88,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsWriteTool,
 )
 from omnigent.tools.builtins.panel import OpenInPanelTool
+from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -315,6 +321,10 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# Priority 5f.0b: Archive / unarchive any session the user owns, over the same
+# owner-gated PATCH /v1/sessions/{id} the web archive uses.
+_SESSION_ARCHIVE_TOOLS = frozenset({SysSessionArchiveTool.name(), SysSessionUnarchiveTool.name()})
+
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
 _SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"][
@@ -376,6 +386,10 @@ _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 # Priority 5g: Timer tools — runner-local asyncio.sleep tasks
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
+
+# Priority 5g.1: Flow tools — runner-local flows (time composed with tool
+# calls, one wake at the end). Gated with the timer tools on ``timers:``.
+_FLOW_TOOLS = FLOW_TOOL_NAMES
 
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
 # included in the tool surface only when smart routing is enabled.
@@ -479,6 +493,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _SESSION_ARCHIVE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -508,6 +523,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
+    # Timers and flows: a native session is woken only by a server event, so
+    # the runner-side wake tools must ride the relay (ToolManager gates them).
+    | _TIMER_TOOLS
+    | _FLOW_TOOLS
 )
 
 
@@ -655,6 +674,29 @@ def build_native_relay_tool_schemas(
                 function = _string_object_dict(fallback_schema.get("function"))
                 if function is not None:
                     _append(function)
+        if peer_messaging_enabled:
+            # Archive tools, timers and flows follow the manager's
+            # collaboration-flag rule.
+            from omnigent.tools.builtins.flow import (
+                SysFlowCancelTool,
+                SysFlowListTool,
+                SysFlowStartTool,
+            )
+            from omnigent.tools.builtins.timer import SysTimerCancelTool, SysTimerSetTool
+
+            for timed_cls in (
+                SysSessionArchiveTool,
+                SysSessionUnarchiveTool,
+                SysTimerSetTool,
+                SysTimerCancelTool,
+                SysFlowStartTool,
+                SysFlowListTool,
+                SysFlowCancelTool,
+            ):
+                function = _string_object_dict(timed_cls().get_schema().get("function"))
+                if function is not None:
+                    _append(function)
+
     # Relay OS tools unconditionally for centralized policy enforcement.
     # Their schemas are static and need no OS environment or working directory.
     for tool_cls in OS_ENV_TOOL_TYPES:
@@ -920,12 +962,14 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _SESSION_ARCHIVE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _NIMBLE_RESEARCH_TOOLS
     | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
+    | _FLOW_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
     | _COMMENT_TOOLS
@@ -1430,6 +1474,7 @@ async def _list_child_sessions(
     limit: int = 100,
     tool: str | None = None,
     session_name: str | None = None,
+    include_archived: bool = False,
 ) -> list[_JsonObject] | str:
     """
     Fetch child-session summaries for a parent session.
@@ -1441,12 +1486,16 @@ async def _list_child_sessions(
         children whose title is ``"{tool}:{session_name}"``
         server-side.
     :param session_name: See ``tool``.
+    :param include_archived: When ``True``, archived children are
+        returned too (each row carries ``archived``).
     :returns: List of child summary dicts, or an error string.
     """
     params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if tool and session_name:
         params["tool"] = tool
         params["session_name"] = session_name
+    if include_archived:
+        params["include_archived"] = "true"
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}/child_sessions",
         params=params,
@@ -1483,7 +1532,8 @@ async def _find_existing_child_session(
     :param agent: Sub-agent name, e.g. ``"claude"``.
     :param title: Caller-chosen child title, e.g. ``"issue-1756"``.
     :returns: Matching child summary, ``None`` when absent, or an error
-        string when the server lookup failed.
+        string when the server lookup failed or the matching child is
+        archived (its name is taken but cannot be woken).
     """
     children = await _list_child_sessions(
         server_client=server_client,
@@ -1491,6 +1541,7 @@ async def _find_existing_child_session(
         limit=1,
         tool=agent,
         session_name=title,
+        include_archived=True,
     )
     if isinstance(children, str):
         return children
@@ -1505,6 +1556,18 @@ async def _find_existing_child_session(
         session_title = title_value if isinstance(title_value, str) else None
         if is_session_closed(labels, session_title):
             continue
+        if child.get("archived") is True:
+            return json.dumps(
+                {
+                    "error": "session_archived",
+                    "conversation_id": child.get("id"),
+                    "message": (
+                        "this (agent, title) sub-agent session is archived; "
+                        "unarchive it with sys_session_unarchive to continue, "
+                        "or sys_session_close it to free the name."
+                    ),
+                }
+            )
         return child
     return None
 
@@ -1720,6 +1783,9 @@ async def _send_to_in_flight_child(
     """
     from omnigent.runner import app as _runner_app
 
+    # A flow step owns the steered turn before the child can complete it; the
+    # agent's own steer releases the child only once its post has landed.
+    flows.note_child_dispatch(conversation_id, child_session_id, release=False)
     # Post first — before any register/stamp — so a failure leaves the live
     # turn's tracking untouched (nothing to roll back, never a teardown).
     try:
@@ -1740,6 +1806,7 @@ async def _send_to_in_flight_child(
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
+    flows.note_child_dispatch(conversation_id, child_session_id)
     async with _runner_app.in_flight_send_lock(child_session_id):
         entry = _runner_app.get_subagent_work(child_session_id)
         if entry is not None and entry.status in ("running", "waiting"):
@@ -5331,6 +5398,7 @@ async def _execute_timer_set(
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
+    collab_governed: bool = True,
 ) -> str:
     """
     Schedule a timer that fires after a delay.
@@ -5340,6 +5408,9 @@ async def _execute_timer_set(
     :param server_client: httpx client for persisting firings.
     :param conversation_id: Session the timer belongs to, e.g.
         ``"conv_abc123"``.
+    :param collab_governed: ``False`` when the spec grants timers itself
+        (``timers: true``); only timers exposed through the collaboration
+        flag follow the collaboration settings.
     :returns: JSON string with ``timer_id`` and ``status``.
     """
     from omnigent.runner import app as _app
@@ -5350,6 +5421,8 @@ async def _execute_timer_set(
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
+    if collab_governed and not await flows.read_flow_timer_enabled(server_client, conversation_id):
+        return json.dumps({"error": flows.FLOW_TIMER_OFF_ERROR})
 
     timer_id = f"timer_{uuid.uuid4().hex}"
     task = asyncio.create_task(
@@ -5360,6 +5433,7 @@ async def _execute_timer_set(
             repeat=repeat,
             note=note,
             server_client=server_client,
+            collab_governed=collab_governed,
         ),
         name=f"timer-{timer_id}",
     )
@@ -5383,6 +5457,7 @@ async def _timer_loop(
     repeat: bool,
     note: str | None,
     server_client: httpx.AsyncClient,
+    collab_governed: bool = True,
 ) -> None:
     """
     Background loop: sleep then fire timer notifications.
@@ -5393,12 +5468,18 @@ async def _timer_loop(
     :param repeat: Loop indefinitely when True.
     :param note: Optional note echoed in firing text.
     :param server_client: httpx client for persistence.
+    :param collab_governed: Whether the collaboration settings apply.
     """
     from omnigent.runner import app as _app
 
     try:
         while True:
             await asyncio.sleep(seconds)
+            # Settings row ``flow_timer_enabled`` turned off → stop, no wake.
+            if collab_governed and not await flows.read_flow_timer_enabled(
+                server_client, conversation_id
+            ):
+                break
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
@@ -5432,6 +5513,48 @@ async def _timer_loop(
         return
     finally:
         _app.unregister_timer(conversation_id, timer_id)
+
+
+async def _execute_flow_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    **context: object,
+) -> str:
+    """
+    Dispatch ``sys_flow_start`` / ``sys_flow_list`` / ``sys_flow_cancel``.
+
+    :param tool_name: One of :data:`_FLOW_TOOLS`.
+    :param args: Parsed tool arguments.
+    :param server_client: httpx client for settings reads, policy checks and
+        the end wake.
+    :param conversation_id: Calling session, e.g. ``"conv_abc123"``.
+    :param context: The remaining ``execute_tool`` keyword arguments, captured
+        into :class:`~omnigent.runner.flows.FlowContext` for the flow's steps.
+    :returns: JSON tool output.
+    """
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a conversation context"})
+    if tool_name == "sys_flow_list":
+        return flows.list_flows(conversation_id)
+    if tool_name == "sys_flow_cancel":
+        flow_id = args.get("flow_id")
+        if not isinstance(flow_id, str) or not flow_id:
+            return json.dumps({"error": "flow_id is required"})
+        return await flows.cancel_flow(conversation_id, flow_id)
+    plan = validate_flow_start_args(args)
+    if isinstance(plan, str):
+        return json.dumps({"error": plan})
+    if server_client is None:
+        return json.dumps({"error": "sys_flow_start requires server_client"})
+    ctx = flows.FlowContext(
+        server_client=server_client,
+        conversation_id=conversation_id,
+        **context,  # type: ignore[arg-type]
+    )
+    return await flows.start_flow(plan, ctx)
 
 
 async def _execute_timer_cancel(
@@ -6077,11 +6200,19 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        archived = args.get("archived", "exclude")
+        if archived not in ("exclude", "include", "only"):
+            return json.dumps(
+                {"error": "sys_session_list 'archived' must be one of exclude, include, only"}
+            )
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            {
+                "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+                "archived": archived,
+            },
         )
         if isinstance(window, str):
             return window
@@ -6093,6 +6224,7 @@ async def _execute_session_query_tool(
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
+            archived=archived,
         )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
@@ -6148,58 +6280,200 @@ async def _host_harnesses_or_none(
     return readiness if isinstance(readiness, dict) else None
 
 
+# Cap on ``sys_session_get_info``'s ``session_ids`` fan-out; 20 parallel
+# snapshot GETs (each plus best-effort runner/host lookups) is the bound.
+_SESSION_INFO_MAX_IDS = 20
+
+# Per-item transport-failure prefix. The single-session path rewrites it to
+# the legacy ``sys_session_get_info failed: <exc>`` message.
+_SESSION_INFO_LOOKUP_FAILED_PREFIX = "lookup_failed: "
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
     server_client: httpx.AsyncClient,
 ) -> str:
     """
-    Return a session's metadata snapshot via ``GET /v1/sessions/{id}``.
+    Return session metadata snapshots via ``GET /v1/sessions/{id}``.
 
-    Resolves the target from ``args["session_id"]`` (falling back to the
-    caller's own ``conversation_id`` when omitted), fetches the session
-    snapshot, and projects the metadata fields — status, title, agent
-    binding, runner binding, host and its reported harness readiness,
-    reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
-    count). Runner connectivity
-    is resolved best-effort via
-    ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
-    the lookup fails or no runner is bound); host readiness is likewise
+    Single-session form: ``args["session_id"]`` (falling back to the caller's
+    own ``conversation_id`` when omitted) describes one session as a flat
+    object, unchanged from before. Multi-session form: ``args["session_ids"]``
+    (1..:data:`_SESSION_INFO_MAX_IDS`, de-duplicated, input order kept)
+    describes each target and always returns ``{"sessions": [...]}`` — even
+    for one id. An inaccessible or unknown id yields its own
+    ``{"session_id", "error"}`` item and never fails the whole call.
+
+    Per item, projects the snapshot fields — status, title, agent binding,
+    runner binding, host and its reported harness readiness, reasoning
+    effort, effective model, parent linkage, workspace / git branch,
+    persisted last-activity time, the outstanding approval prompts, and the
+    snapshot's durations and runtime facts (session age, idle time, current
+    running period, cost, context usage, last error, archive state,
+    last-message excerpt). Durations are derived on the server's clock:
+    ``as_of`` is the response's HTTP ``Date`` header (fallback: the runner's
+    clock), and ``age_seconds`` / ``idle_seconds`` / ``running_seconds`` are
+    ``as_of`` minus the corresponding server-stamped timestamp, floored at 0.
+
+    Runner connectivity is resolved best-effort via
+    ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when the
+    lookup fails or no runner is bound); host readiness is likewise
     best-effort via ``GET /v1/hosts/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
-    (the server denied the read, so from the caller's vantage the target
-    is one it may not see).
+    (the server denied the read, so from the caller's vantage the target is
+    one it may not see).
 
-    :param args: Parsed tool arguments; optional ``session_id``.
-    :param conversation_id: The caller's own session id, used as the
-        default target when ``session_id`` is omitted.
+    :param args: Parsed tool arguments; optional ``session_id`` or
+        ``session_ids`` (mutually exclusive).
+    :param conversation_id: The caller's own session id, used as the default
+        target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: JSON metadata object, or a JSON error object.
+    :returns: JSON metadata object, or ``{"sessions": [item, ...]}``; a JSON
+        error object on a bad argument combination.
     """
-    raw_target = args.get("session_id") or conversation_id
-    if not isinstance(raw_target, str) or not raw_target:
+    raw_single = args.get("session_id")
+    if "session_ids" not in args:
+        target = raw_single or conversation_id
+        if not isinstance(target, str) or not target:
+            return json.dumps(
+                {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
+            )
+        item = await _session_info_item(target, server_client)
+        error = item.get("error")
+        if error is None:
+            return json.dumps(item)
+        if isinstance(error, str) and error.startswith(_SESSION_INFO_LOOKUP_FAILED_PREFIX):
+            detail = error[len(_SESSION_INFO_LOOKUP_FAILED_PREFIX) :]
+            return json.dumps({"error": f"sys_session_get_info failed: {detail}"})
+        if isinstance(error, str) and error.startswith("sys_session_get_info returned "):
+            return json.dumps({"error": error})
+        return json.dumps({"error": error, "session_id": target})
+
+    if raw_single:
         return json.dumps(
-            {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
+            {"error": "sys_session_get_info: pass session_id or session_ids, not both"}
         )
+    raw_many = args.get("session_ids")
+    invalid_ids_rule = (
+        "sys_session_get_info: 'session_ids' must be a non-empty list of "
+        f"non-empty strings (max {_SESSION_INFO_MAX_IDS})"
+    )
+    if not isinstance(raw_many, list) or not raw_many:
+        return json.dumps({"error": invalid_ids_rule})
+    if len(raw_many) > _SESSION_INFO_MAX_IDS:
+        return json.dumps(
+            {
+                "error": (
+                    f"sys_session_get_info: 'session_ids' accepts at most "
+                    f"{_SESSION_INFO_MAX_IDS} entries"
+                )
+            }
+        )
+    targets: list[str] = []
+    for value in raw_many:
+        if not isinstance(value, str) or not value:
+            return json.dumps({"error": invalid_ids_rule})
+        if value not in targets:
+            targets.append(value)
+    items = await asyncio.gather(
+        *(_session_info_item(target, server_client) for target in targets)
+    )
+    return json.dumps({"sessions": list(items)})
+
+
+def _session_info_duration(as_of: int, value: object) -> int | None:
+    """
+    Seconds between a server-stamped timestamp and the server's ``as_of``.
+
+    :param as_of: Server clock (epoch seconds) at snapshot time.
+    :param value: The stamped timestamp; non-integers (including ``bool``)
+        yield ``None``.
+    :returns: ``max(0, as_of - value)`` seconds, or ``None`` when *value* is
+        not an int.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, as_of - value)
+    return None
+
+
+def _session_info_as_of(resp: httpx.Response) -> int:
+    """
+    Read the server clock from a snapshot response's HTTP ``Date`` header.
+
+    :param resp: The ``GET /v1/sessions/{id}`` response.
+    :returns: The header as epoch seconds; the runner's own clock when the
+        header is absent or unparsable.
+    """
+    raw_date = resp.headers.get("date")
+    if raw_date:
+        try:
+            return int(parsedate_to_datetime(raw_date).timestamp())
+        except (TypeError, ValueError):
+            pass
+    return int(time.time())
+
+
+def _session_info_context_fraction(tokens: object, window: object) -> float | None:
+    """
+    Token occupancy as a fraction of the model's context window.
+
+    :param tokens: Snapshot ``last_total_tokens``.
+    :param window: Snapshot ``context_window``.
+    :returns: ``round(tokens / window, 3)`` (unclamped) when *tokens* is a
+        non-negative int and *window* a positive int, else ``None``. Zero
+        tokens is a valid reading (``0.0``), not a missing one.
+    """
+    if (
+        isinstance(tokens, int)
+        and not isinstance(tokens, bool)
+        and tokens >= 0
+        and isinstance(window, int)
+        and not isinstance(window, bool)
+        and window > 0
+    ):
+        return round(tokens / window, 3)
+    return None
+
+
+async def _session_info_item(target: str, server_client: httpx.AsyncClient) -> _JsonObject:
+    """
+    Project one session's snapshot into a ``sys_session_get_info`` item.
+
+    :param target: Session/conversation id to describe.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The metadata item, or an ``{"error", "session_id"}`` object
+        (``session_not_found`` / ``access_denied`` / ``lookup_failed: …`` /
+        non-200 status).
+    """
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{raw_target}",
-            params={"include_items": "false", "include_liveness": "false"},
+            f"/v1/sessions/{target}",
+            params={
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_preview": "true",
+            },
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
+        return {
+            "error": f"{_SESSION_INFO_LOOKUP_FAILED_PREFIX}{exc}",
+            "session_id": target,
+        }
     if resp.status_code == 404:
-        return json.dumps({"error": "session_not_found", "session_id": raw_target})
+        return {"error": "session_not_found", "session_id": target}
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "session_id": raw_target})
+        return {"error": "access_denied", "session_id": target}
     if resp.status_code != 200:
-        return json.dumps({"error": f"sys_session_get_info returned {resp.status_code}"})
+        return {
+            "error": f"sys_session_get_info returned {resp.status_code}",
+            "session_id": target,
+        }
     snap: _JsonObject = resp.json()
+    as_of = _session_info_as_of(resp)
     pending_value = snap.get("pending_elicitations")
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
@@ -6209,44 +6483,61 @@ async def _session_get_info_via_rest(
         _runner_online_or_none(snap_runner_id, server_client),
         _host_harnesses_or_none(snap_host_id, server_client),
     )
-    return json.dumps(
-        {
-            "session_id": snap.get("id"),
-            "status": snap.get("status"),
-            # Persisted conversation activity is distinct from lifecycle
-            # status: repeated polls with an unchanged value let an
-            # orchestrator detect a running session that is not advancing.
-            "last_activity_at": snap.get("updated_at"),
-            "title": snap.get("title"),
-            "agent_id": snap.get("agent_id"),
-            # Present the public agent name: a native-UI wrapper session
-            # (e.g. ``pi-native-ui``) reports its clean display name (``Pi``)
-            # so the internal ``-native-ui`` wrapper name never leaks to the
-            # model answering "what agent are you?". Non-wrapper names are
-            # unchanged.
-            "agent_name": public_agent_name(snap_agent_name),
-            "runner_id": snap.get("runner_id"),
-            "runner_online": runner_online,
-            "host_id": snap.get("host_id"),
-            "configured_harnesses": configured_harnesses,
-            "parent_session_id": snap.get("parent_session_id"),
-            "sub_agent_name": snap.get("sub_agent_name"),
-            "reasoning_effort": snap.get("reasoning_effort"),
-            # Effective model: a per-session override wins over the
-            # agent spec's default; both may be None when unset.
-            "model": snap.get("model_override") or snap.get("llm_model"),
-            "workspace": snap.get("workspace"),
-            "worktree": snap.get("worktree"),
-            "git_branch": snap.get("git_branch"),
-            # The outstanding approval prompts themselves (original
-            # elicitation-request event dicts), plus a count for quick
-            # status checks. Surfacing the prompts — not just a tally —
-            # lets the orchestrator see what each blocked session is
-            # waiting on.
-            "pending_elicitations": pending,
-            "pending_elicitation_count": len(pending),
-        }
-    )
+    context_tokens = snap.get("last_total_tokens")
+    context_window = snap.get("context_window")
+    return {
+        "session_id": snap.get("id"),
+        "status": snap.get("status"),
+        # Persisted conversation activity is distinct from lifecycle
+        # status: repeated polls with an unchanged value let an
+        # orchestrator detect a running session that is not advancing.
+        "last_activity_at": snap.get("updated_at"),
+        "title": snap.get("title"),
+        "agent_id": snap.get("agent_id"),
+        # Present the public agent name: a native-UI wrapper session
+        # (e.g. ``pi-native-ui``) reports its clean display name (``Pi``)
+        # so the internal ``-native-ui`` wrapper name never leaks to the
+        # model answering "what agent are you?". Non-wrapper names are
+        # unchanged.
+        "agent_name": public_agent_name(snap_agent_name),
+        "runner_id": snap.get("runner_id"),
+        "runner_online": runner_online,
+        "host_id": snap.get("host_id"),
+        "configured_harnesses": configured_harnesses,
+        "parent_session_id": snap.get("parent_session_id"),
+        "sub_agent_name": snap.get("sub_agent_name"),
+        "reasoning_effort": snap.get("reasoning_effort"),
+        # Effective model: a per-session override wins over the
+        # agent spec's default; both may be None when unset.
+        "model": snap.get("model_override") or snap.get("llm_model"),
+        "workspace": snap.get("workspace"),
+        "worktree": snap.get("worktree"),
+        "git_branch": snap.get("git_branch"),
+        # The outstanding approval prompts themselves (original
+        # elicitation-request event dicts), plus a count for quick
+        # status checks. Surfacing the prompts — not just a tally —
+        # lets the orchestrator see what each blocked session is
+        # waiting on.
+        "pending_elicitations": pending,
+        "pending_elicitation_count": len(pending),
+        "created_at": snap.get("created_at"),
+        # Durations are computed against the server's own clock (the HTTP
+        # Date header), never the runner's, so a remote runner can't skew
+        # them.
+        "age_seconds": _session_info_duration(as_of, snap.get("created_at")),
+        "idle_seconds": _session_info_duration(as_of, snap.get("updated_at")),
+        "running_since": snap.get("running_since"),
+        "running_seconds": _session_info_duration(as_of, snap.get("running_since")),
+        "as_of": as_of,
+        "last_message_preview": snap.get("last_message_preview"),
+        "archived": snap.get("archived"),
+        "archived_at": snap.get("archived_at"),
+        "total_cost_usd": snap.get("total_cost_usd"),
+        "context_tokens": context_tokens,
+        "context_window": context_window,
+        "context_used_fraction": _session_info_context_fraction(context_tokens, context_window),
+        "last_error": snap.get("last_task_error"),
+    }
 
 
 def _omnigent_error_message(resp: httpx.Response) -> str | None:
@@ -6970,6 +7261,7 @@ async def _session_list_via_rest(
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
+    archived: str = "exclude",
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -6979,9 +7271,10 @@ async def _session_list_via_rest(
     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
     permission-bounded list of every session the caller can access, each
     annotated with status + runner connectivity, optionally filtered by
-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
-    best-effort: a failure in either view yields an empty list for it
-    rather than failing the whole call.
+    ``agent_name`` and by the archived view — see
+    :func:`_collect_global_sessions`. Both are best-effort: a failure in
+    either view yields an empty list for it rather than failing the whole
+    call.
 
     :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -6990,6 +7283,9 @@ async def _session_list_via_rest(
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
+    :param archived: Archived-session view for the global list —
+        ``"exclude"`` (default), ``"include"``, or ``"only"``. Joins the
+        cursor's filter set so a cursor cannot be replayed under another view.
     :returns: The legacy complete JSON result while it fits, otherwise a
         bounded page with continuation metadata.
     """
@@ -7002,6 +7298,7 @@ async def _session_list_via_rest(
             agent_name,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
+            archived=archived,
         )
     )
     return _bounded_discovery_result(
@@ -7010,7 +7307,10 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters={
+            "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+            "archived": archived,
+        },
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -7113,6 +7413,139 @@ async def _rename_current_session_via_rest(
     return json.dumps({"renamed": True, "title": updated_title, "reason": None})
 
 
+# Bound on the caller-ancestry walk; deeper trees fail safe to "in lineage".
+_ARCHIVE_LINEAGE_MAX_HOPS = 32
+
+
+def _archive_error(tool_name: str, resp: httpx.Response, session_id: str) -> str:
+    """Map a non-2xx session PATCH to the archive tools' typed errors."""
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": session_id})
+    if resp.status_code in (401, 403):
+        return json.dumps(
+            {
+                "error": "access_denied",
+                "session_id": session_id,
+                "message": "only the session owner can archive or unarchive it.",
+            }
+        )
+    detail = _omnigent_error_message(resp)
+    return json.dumps(
+        {
+            "error": f"{tool_name} returned {resp.status_code}",
+            **({"detail": detail} if detail else {}),
+        }
+    )
+
+
+async def _caller_lineage_contains(
+    target_id: str,
+    caller_id: str,
+    server_client: httpx.AsyncClient,
+) -> bool:
+    """
+    Return whether ``target_id`` is the caller or one of its ancestors.
+
+    Archiving a session tears down its whole subtree, so the caller's own
+    turn is at risk exactly when this holds. Any lookup failure fails safe
+    to ``True``: the teardown then waits for the turn instead of cutting it.
+
+    :param target_id: Session being archived, e.g. ``"conv_root"``.
+    :param caller_id: The calling session id, e.g. ``"conv_child"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the caller sits in the target's subtree.
+    """
+    current: str | None = caller_id
+    for _hop in range(_ARCHIVE_LINEAGE_MAX_HOPS):
+        if current is None:
+            return False
+        if current == target_id:
+            return True
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{current}",
+                params={"include_items": "false", "include_liveness": "false"},
+                timeout=30.0,
+            )
+        except Exception:  # noqa: BLE001
+            return True
+        if resp.status_code != 200:
+            return True
+        body = _string_object_dict(resp.json())
+        if body is None:
+            return True
+        current = _optional_string(body.get("parent_session_id"))
+    return True
+
+
+async def _session_archive_via_rest(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Archive or unarchive a session through ``PATCH /v1/sessions/{id}``.
+
+    Same route and owner gate as the web archive: the server requires owner
+    access, applies the 8-second undo window and the Host's stop-on-archive
+    policy. A target that is the caller or its ancestor is archived with
+    ``stop_when_idle`` so the teardown waits for the caller's turn to end;
+    the server applies it only on a real archive transition, so the intent is
+    sent on every archive PATCH rather than decided from a snapshot that a
+    concurrent unarchive could make stale.
+
+    :param tool_name: ``"sys_session_archive"`` or ``"sys_session_unarchive"``.
+    :param args: Parsed tool arguments; ``session_id`` (optional for archive,
+        defaulting to the caller).
+    :param conversation_id: The calling session id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON result, or a JSON error object (``session_not_found``,
+        ``access_denied``, or a status error).
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session id"})
+    archive = tool_name == SysSessionArchiveTool.name()
+    raw_target = args.get("session_id")
+    if raw_target is None and archive:
+        raw_target = conversation_id
+    if not isinstance(raw_target, str) or not raw_target:
+        return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
+    target_id = raw_target
+    # The PATCH is the owner gate and maps 404/401/403, so no snapshot read is
+    # needed. The deferral intent is always recomputed from the caller lineage
+    # and always sent: a GET's archived flag could have gone stale before the
+    # PATCH, and the intent must never be dropped on that interleaving.
+    patch_body: _JsonObject = {"archived": archive}
+    stop_when_idle = archive and await _caller_lineage_contains(
+        target_id, conversation_id, server_client
+    )
+    if stop_when_idle:
+        patch_body["stop_when_idle"] = True
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{target_id}", json=patch_body, timeout=30.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if resp.status_code != 200:
+        return _archive_error(tool_name, resp, target_id)
+    result: _JsonObject = {"archived": archive, "session_id": target_id}
+    if archive:
+        # The Host policy is applied server-side and not echoed back, so the
+        # stop is stated as conditional rather than promised.
+        result["runner_stop"] = (
+            "if its host stops runners on archive: after your current turn ends"
+            if stop_when_idle
+            else "if its host stops runners on archive: after the 8-second undo window"
+        )
+        result["undo"] = "sys_session_unarchive, or Unarchive in the web Archive list"
+    return json.dumps(result)
+
+
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
@@ -7207,13 +7640,14 @@ async def _collect_global_sessions(
     *,
     after: str | None,
     limit: int,
+    archived: str = "exclude",
 ) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id, project_id,
-    workspace, updated_at, last_message_preview}``.
+    workspace, updated_at, last_message_preview, archived, archived_at}``.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -7225,6 +7659,9 @@ async def _collect_global_sessions(
         non-empty string.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param archived: ``"exclude"`` (default) lists live sessions only,
+        ``"include"`` adds archived rows, and ``"only"`` lists archived
+        rows exclusively.
     :returns: Projected global session entries and continuation metadata.
     """
     params: dict[str, str | int] = {
@@ -7233,6 +7670,10 @@ async def _collect_global_sessions(
         "visibility": "all",
         "include_preview": 1,
     }
+    if archived == "include":
+        params["include_archived"] = "true"
+    elif archived == "only":
+        params["visibility"] = "archived"
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -7271,6 +7712,8 @@ async def _collect_global_sessions(
                 "worktree": r.get("worktree"),
                 "updated_at": r.get("updated_at"),
                 "last_message_preview": r.get("last_message_preview"),
+                "archived": r.get("archived"),
+                "archived_at": r.get("archived_at"),
             }
             for r in rows
         ],
@@ -7542,10 +7985,22 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    # The tree gate above is the sub-agent test. A sys_session_create child
+    # keeps its verbatim title, so a title that does not parse as
+    # "<agent>:<title>" names the agent from the snapshot instead (same
+    # fallback as the by-id send path) rather than refusing the close.
+    display_title = title_without_closed_marker(_optional_string(target_snap.get("title"))) or ""
+    parsed = _parse_session_title(display_title)
+    agent_label = (
+        parsed.agent
+        or _optional_string(target_snap.get("sub_agent_name"))
+        or _optional_string(target_snap.get("agent_name"))
+        or "agent"
+    )
+    instance_title = parsed.title if parsed.title is not None else display_title
+    # Suffixing the display title frees the duplicate-title slot for every
+    # title form; for "<agent>:<title>" it equals the canonical tombstone.
+    new_title = f"{display_title}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -7567,8 +8022,8 @@ async def _session_close_via_rest(
         {
             "closed": True,
             "conversation_id": target_id,
-            "agent": parsed.agent,
-            "title": parsed.title,
+            "agent": agent_label,
+            "title": instance_title,
         }
     )
 
@@ -7818,6 +8273,15 @@ async def execute_tool(
                 conversation_id,
                 server_client,
             )
+        elif tool_name in _SESSION_ARCHIVE_TOOLS:
+            if not _peer_messaging_enabled_for(conversation_id):
+                return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
+            output = await _session_archive_via_rest(
+                tool_name,
+                args,
+                conversation_id=conversation_id,
+                server_client=server_client,
+            )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(
                 tool_name,
@@ -7875,12 +8339,38 @@ async def execute_tool(
                     args,
                     server_client=server_client,
                     conversation_id=conversation_id,
+                    # Upstream's own switch: a ``timers: true`` spec ignores ours. With
+                    # no spec (unresolved), only the collab flag can have exposed them.
+                    collab_governed=(
+                        not agent_spec.timers
+                        if agent_spec is not None
+                        else _peer_messaging_enabled_for(conversation_id)
+                    ),
                 )
             else:
                 output = await _execute_timer_cancel(
                     args,
                     conversation_id=conversation_id,
                 )
+        elif tool_name in _FLOW_TOOLS:
+            if not _peer_messaging_enabled_for(conversation_id):
+                return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
+            output = await _execute_flow_tool(
+                tool_name,
+                args,
+                server_client=server_client,
+                terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                runner_workspace=runner_workspace,
+                local_tool_workdir=local_tool_workdir,
+                filesystem_registry=filesystem_registry,
+                effective_harness=effective_harness,
+            )
         elif tool_name in _TASK_LIFECYCLE_TOOLS:
             output = await _execute_task_lifecycle_tool(
                 args,

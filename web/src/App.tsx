@@ -63,6 +63,10 @@ const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
+const SystemStatusPage = withPageView(
+  "system_status",
+  lazy(() => import("@/pages/SystemStatusPage").then((m) => ({ default: m.SystemStatusPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -192,6 +196,7 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
+          <Route path={`${prefix}/system`} element={<SystemStatusPage />} />
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section

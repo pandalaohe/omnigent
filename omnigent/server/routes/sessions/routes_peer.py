@@ -22,7 +22,8 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, NamedTuple, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -69,6 +70,9 @@ from omnigent.stores.conversation_store import PROJECT_LABEL_KEY, SIDE_CHAT_LABE
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
+
+if TYPE_CHECKING:
+    from omnigent.server.user_preferences_store import CollabSettings
 
 _logger = logging.getLogger(__name__)
 
@@ -286,14 +290,49 @@ def latest_input_depth(
         return 0
 
 
+@dataclass(frozen=True)
+class PeerLimits:
+    """Admission budgets for one sender owner.
+
+    Defaults are the module constants; the send route resolves the sender
+    owner's stored settings into an instance per send.
+    """
+
+    pair_count: int
+    pair_window_s: float
+    sender_count: int
+    sender_window_s: float
+    dup_window_s: float
+
+    @classmethod
+    def from_settings(cls, settings: CollabSettings) -> PeerLimits:
+        """Project the owner's stored pair / sender / duplicate budgets."""
+        return cls(
+            pair_count=settings.pair_rate_count,
+            pair_window_s=settings.pair_rate_window_s,
+            sender_count=settings.sender_rate_count,
+            sender_window_s=settings.sender_rate_window_s,
+            dup_window_s=settings.duplicate_window_s,
+        )
+
+
+DEFAULT_PEER_LIMITS = PeerLimits(
+    pair_count=PEER_PAIR_LIMIT,
+    pair_window_s=PEER_PAIR_WINDOW_S,
+    sender_count=PEER_SENDER_LIMIT,
+    sender_window_s=PEER_SENDER_WINDOW_S,
+    dup_window_s=PEER_DUP_WINDOW,
+)
+
+
 class _PeerAdmission:
     """Process-local loop guards for peer sends.
 
     One asyncio lock per sender serializes admission; the duplicate check
     plus the slot reservation happen atomically under that lock BEFORE any
     await on stores or the runner, so two identical concurrent sends admit
-    exactly once. Admission never refuses: a send past the pair (6 / 60 s)
-    or sender (60 / 600 s) budget takes a future slot, and the route stores
+    exactly once. Admission never refuses: a send past the owner's configured
+    pair / sender budget takes a future slot, and the route stores
     ``not_before`` from it. A later failed send removes its own slot by
     value so a pair backlog never leaves a phantom entry behind.
 
@@ -328,6 +367,7 @@ class _PeerAdmission:
         receiver_id: str,
         text: str,
         *,
+        limits: PeerLimits = DEFAULT_PEER_LIMITS,
         now: float | None = None,
     ) -> tuple[str | None, float, float | None]:
         """Admit one send and return its verdict, delay, and slot.
@@ -338,11 +378,13 @@ class _PeerAdmission:
         at or after the pair's last slot, FIFO per receiver) at which
         neither window would hold more than its limit. The pair ledger is
         per receiver, so a backlog to one receiver never delays sends to
-        another.
+        another. Ledgers prune against the caller's current windows, so a
+        changed limit applies from the next send.
 
         :param sender_id: The sending session.
         :param receiver_id: The receiving session.
         :param text: Raw message text.
+        :param limits: The sender owner's admission budgets.
         :param now: Monotonic clock override for tests.
         :returns: ``("dropped:duplicate", 0.0, None)`` for a duplicate,
             else ``(None, delay_seconds, slot)``.
@@ -352,17 +394,19 @@ class _PeerAdmission:
         normalized = self.normalize_text(text)
         text_key = (sender_id, receiver_id, normalized)
         seen_at = self._pair_texts.get(text_key)
-        if seen_at is not None and moment - seen_at < PEER_DUP_WINDOW:
+        if seen_at is not None and moment - seen_at < limits.dup_window_s:
             return "dropped:duplicate", 0.0, None
-        pair_sends = [t for t in self._pair_sends.get(pair, []) if t > moment - PEER_PAIR_WINDOW_S]
+        pair_sends = [
+            t for t in self._pair_sends.get(pair, []) if t > moment - limits.pair_window_s
+        ]
         sender_sends = [
-            t for t in self._sender_sends.get(sender_id, []) if t > moment - PEER_SENDER_WINDOW_S
+            t for t in self._sender_sends.get(sender_id, []) if t > moment - limits.sender_window_s
         ]
         slot = max(moment, pair_sends[-1]) if pair_sends else moment
-        if len(pair_sends) >= PEER_PAIR_LIMIT:
-            slot = max(slot, pair_sends[-PEER_PAIR_LIMIT] + PEER_PAIR_WINDOW_S)
-        if len(sender_sends) >= PEER_SENDER_LIMIT:
-            slot = max(slot, sender_sends[-PEER_SENDER_LIMIT] + PEER_SENDER_WINDOW_S)
+        if len(pair_sends) >= limits.pair_count:
+            slot = max(slot, pair_sends[-limits.pair_count] + limits.pair_window_s)
+        if len(sender_sends) >= limits.sender_count:
+            slot = max(slot, sender_sends[-limits.sender_count] + limits.sender_window_s)
         pair_sends.append(slot)
         sender_sends.append(slot)
         sender_sends.sort()
@@ -978,6 +1022,7 @@ def register_peer_routes(
         receiver = await asyncio.to_thread(conversation_store.get_conversation, receiver_id)
         if receiver is None:
             raise _session_not_found()
+        sender_owner: str | None = None
         receiver_owner: str | None = None
         if permission_store is not None:
             sender_owner = await asyncio.to_thread(
@@ -993,6 +1038,21 @@ def register_peer_routes(
                     "peer_id": None,
                     "ref": body.correlation_id or "",
                 }
+        owner = sender_owner if permission_store is not None else RESERVED_USER_LOCAL
+        prefs_store = (
+            getattr(app_state, "user_preferences_store", None) if app_state is not None else None
+        )
+        cfg = await asyncio.to_thread(
+            read_collab_settings, prefs_store, owner or RESERVED_USER_LOCAL
+        )
+        if not system and not cfg.enabled:
+            return {
+                "disposition": "refused",
+                "reason": "collab_disabled",
+                "peer_id": None,
+                "ref": body.correlation_id or "",
+                "receiver": _receiver_summary(receiver, runner_online=None),
+            }
         if receiver.parent_conversation_id is not None:
             return {
                 "disposition": "refused",
@@ -1031,7 +1091,12 @@ def register_peer_routes(
         if system:
             verdict, delay, slot = None, 0.0, None
         else:
-            verdict, delay, slot = _PEER_ADMISSION.reserve(sender_id, receiver_id, body.text)
+            verdict, delay, slot = _PEER_ADMISSION.reserve(
+                sender_id,
+                receiver_id,
+                body.text,
+                limits=PeerLimits.from_settings(cfg),
+            )
         if verdict is not None:
             disposition, _, reason = verdict.partition(":")
             return {
@@ -1083,7 +1148,7 @@ def register_peer_routes(
                     correlation_id=body.correlation_id,
                     relay_depth=depth,
                     created_at=now,
-                    expires_at=deferred_until or now + PEER_QUEUE_LIFETIME,
+                    expires_at=deferred_until or now + cfg.undelivered_ttl_s,
                 ),
             )
             return await _queued_response_for_record(queued, runner_online)
@@ -1107,7 +1172,7 @@ def register_peer_routes(
                 or receiver.archived_at is not None
             ):
                 terminal_verdict = "failed:closed"
-            if terminal_verdict is None and not system and depth > PEER_RELAY_DEPTH_LIMIT:
+            if terminal_verdict is None and not system and depth > cfg.relay_depth_max:
                 record = await asyncio.to_thread(
                     peer_message_store.create,
                     SessionPeerMessage(
@@ -1121,7 +1186,7 @@ def register_peer_routes(
                         reason="relay_limit",
                         relay_depth=depth,
                         created_at=now,
-                        expires_at=deferred_until or now + PEER_HOLD_LIFETIME,
+                        expires_at=deferred_until or now + cfg.undelivered_ttl_s,
                     ),
                 )
                 reply_to = await _mark_reply_locked(record, body.correlation_id)
@@ -1151,7 +1216,7 @@ def register_peer_routes(
                         correlation_id=body.correlation_id,
                         relay_depth=depth,
                         created_at=now,
-                        expires_at=deferred_until or now + PEER_HOLD_LIFETIME,
+                        expires_at=deferred_until or now + cfg.undelivered_ttl_s,
                     ),
                 )
                 reply_to = await _mark_reply_locked(record, body.correlation_id)
@@ -1218,7 +1283,7 @@ def register_peer_routes(
                             relay_depth=depth,
                             not_before=not_before,
                             created_at=now,
-                            expires_at=deferred_until or now + PEER_QUEUE_LIFETIME,
+                            expires_at=deferred_until or now + cfg.undelivered_ttl_s,
                         ),
                     )
                     return await _queued_response_for_record(record, runner_online)
@@ -1241,7 +1306,7 @@ def register_peer_routes(
                     correlation_id=body.correlation_id,
                     relay_depth=depth,
                     created_at=now,
-                    expires_at=deferred_until or now + PEER_QUEUE_LIFETIME,
+                    expires_at=deferred_until or now + cfg.undelivered_ttl_s,
                 ),
             )
             record = delivering

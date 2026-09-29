@@ -47,6 +47,7 @@ from omnigent.server.routes.sessions.routes_peer import (
     effective_owner_id,
 )
 from omnigent.server.schemas import ProjectSessionCreateRequest, SessionGitOptions
+from omnigent.server.session_collab import COLLAB_DISABLED_MESSAGE, require_collab_enabled
 from omnigent.server.session_open_rate import admit_open
 from omnigent.server.user_preferences_store import read_collab_settings
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
@@ -479,6 +480,8 @@ def register_open_routes(
         sender = await asyncio.to_thread(conversation_store.get_conversation, entry.sender_id)
         if sender is None:
             return _problem("failed", "sender_gone", "The opening session no longer exists.")
+        if not await _collab_enabled(entry.owner):
+            return _problem("failed", "collab_disabled", COLLAB_DISABLED_MESSAGE)
         if host_registry is None or host_registry.get(entry.host_id) is None:
             return _problem(
                 "failed",
@@ -574,6 +577,18 @@ def register_open_routes(
             )
         finally:
             in_flight.pop(entry.sid, None)
+
+    async def _collab_enabled(owner: str) -> bool:
+        """Whether *owner*'s session-collaboration master switch is on."""
+        try:
+            await asyncio.to_thread(
+                require_collab_enabled,
+                getattr(app_state, "user_preferences_store", None),
+                owner,
+            )
+        except OmnigentError:
+            return False
+        return True
 
     async def _occupied_sessions(*, owner: str, host_id: str, root_workspace: str) -> list[Any]:
         """Non-closed top-level sessions sitting in *root_workspace*.
@@ -716,7 +731,8 @@ def register_open_routes(
         # The create path authorizes against the request user without a
         # permission store; the owner sentinel is only for grants and locks.
         create_user_id = owner if permission_store else request_user_id
-        # Master switch: SCC15 wires require_collab_enabled(store, owner) here.
+        if not await _collab_enabled(owner):
+            return _problem("refused", "collab_disabled", COLLAB_DISABLED_MESSAGE)
         project = (
             await asyncio.to_thread(project_store.get, body.project, user_id=owner)
             if project_store and _store_id(body.project)
