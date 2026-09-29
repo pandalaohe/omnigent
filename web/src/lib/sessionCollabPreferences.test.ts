@@ -32,14 +32,14 @@ describe("session collab preferences", () => {
       JSON.stringify({
         enabled: "yes",
         openRateCount: 7,
-        openRateWindowS: 90.5,
+        openRateWindowSeconds: 90.5,
         relayDepthMax: 101,
         pairRateCount: 1001,
-        pairRateWindowS: 101,
+        pairRateWindowSeconds: 101,
         senderRateCount: "60",
-        senderRateWindowS: 0,
-        duplicateWindowS: 0,
-        undeliveredTtlS: 7200,
+        senderRateWindowSeconds: 0,
+        duplicateWindowSeconds: 0,
+        undeliveredTtlSeconds: 7200,
         defaultInbound: "bogus",
         flowTimerEnabled: 1,
       }),
@@ -48,22 +48,21 @@ describe("session collab preferences", () => {
     expect(readSessionCollabPreferences()).toEqual({
       ...SESSION_COLLAB_DEFAULTS,
       openRateCount: 7,
-      pairRateWindowS: 101,
-      duplicateWindowS: 0,
-      undeliveredTtlS: 7200,
+      pairRateWindowSeconds: 101,
+      undeliveredTtlSeconds: 7200,
     });
   });
 
-  it("keeps a zero duplicate window and non-accept inbound policy", () => {
+  it("keeps a one-second duplicate window and a non-accept inbound policy", () => {
     writeSessionCollabPreferences({
       ...SESSION_COLLAB_DEFAULTS,
-      duplicateWindowS: 0,
+      duplicateWindowSeconds: 1,
       defaultInbound: "refuse",
     });
 
     expect(readSessionCollabPreferences()).toEqual({
       ...SESSION_COLLAB_DEFAULTS,
-      duplicateWindowS: 0,
+      duplicateWindowSeconds: 1,
       defaultInbound: "refuse",
     });
   });

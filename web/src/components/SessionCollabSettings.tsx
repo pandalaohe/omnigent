@@ -27,8 +27,7 @@ const HINTS = {
     "A relay chain of messages between sessions longer than this is held until you release it.",
   pairRate: "Messages past this rate between one pair of sessions wait in a queue.",
   senderRate: "The same limit applied per sending session across all of its receivers.",
-  duplicate:
-    "An identical message to the same session inside this window is dropped. Set 0 to turn it off.",
+  duplicate: "An identical message to the same session inside this window is dropped.",
   undelivered: "A queued or held message not delivered within this time expires.",
   defaultInbound:
     "Applies to sessions created after you change it; each session can still change its own policy.",
@@ -133,11 +132,11 @@ export function SessionCollabSettings() {
           <span className="text-sm text-muted-foreground">sessions per</span>
           <NumericField
             ariaLabel="Session open rate window in minutes"
-            value={preferences.openRateWindowS / 60}
-            min={SESSION_COLLAB_BOUNDS.openRateWindowS.min / 60}
-            max={SESSION_COLLAB_BOUNDS.openRateWindowS.max / 60}
+            value={preferences.openRateWindowSeconds / 60}
+            min={SESSION_COLLAB_BOUNDS.openRateWindowSeconds.min / 60}
+            max={SESSION_COLLAB_BOUNDS.openRateWindowSeconds.max / 60}
             disabled={disabled}
-            onCommit={(minutes) => update({ openRateWindowS: minutes * 60 })}
+            onCommit={(minutes) => update({ openRateWindowSeconds: minutes * 60 })}
           />
           <span className="text-sm text-muted-foreground">min</span>
         </SettingRow>
@@ -170,11 +169,11 @@ export function SessionCollabSettings() {
             <span className="text-sm text-muted-foreground">messages per</span>
             <NumericField
               ariaLabel="Session pair rate window in seconds"
-              value={preferences.pairRateWindowS}
-              min={SESSION_COLLAB_BOUNDS.pairRateWindowS.min}
-              max={SESSION_COLLAB_BOUNDS.pairRateWindowS.max}
+              value={preferences.pairRateWindowSeconds}
+              min={SESSION_COLLAB_BOUNDS.pairRateWindowSeconds.min}
+              max={SESSION_COLLAB_BOUNDS.pairRateWindowSeconds.max}
               disabled={disabled}
-              onCommit={(pairRateWindowS) => update({ pairRateWindowS })}
+              onCommit={(pairRateWindowSeconds) => update({ pairRateWindowSeconds })}
             />
             <span className="text-sm text-muted-foreground">sec</span>
           </SettingRow>
@@ -193,11 +192,11 @@ export function SessionCollabSettings() {
             <span className="text-sm text-muted-foreground">messages per</span>
             <NumericField
               ariaLabel="Sending session rate window in minutes"
-              value={preferences.senderRateWindowS / 60}
-              min={SESSION_COLLAB_BOUNDS.senderRateWindowS.min / 60}
-              max={SESSION_COLLAB_BOUNDS.senderRateWindowS.max / 60}
+              value={preferences.senderRateWindowSeconds / 60}
+              min={SESSION_COLLAB_BOUNDS.senderRateWindowSeconds.min / 60}
+              max={SESSION_COLLAB_BOUNDS.senderRateWindowSeconds.max / 60}
               disabled={disabled}
-              onCommit={(minutes) => update({ senderRateWindowS: minutes * 60 })}
+              onCommit={(minutes) => update({ senderRateWindowSeconds: minutes * 60 })}
             />
             <span className="text-sm text-muted-foreground">min</span>
           </SettingRow>
@@ -207,11 +206,11 @@ export function SessionCollabSettings() {
           <SettingRow label="Duplicate message window" hint={HINTS.duplicate}>
             <NumericField
               ariaLabel="Duplicate message window in seconds"
-              value={preferences.duplicateWindowS}
-              min={SESSION_COLLAB_BOUNDS.duplicateWindowS.min}
-              max={SESSION_COLLAB_BOUNDS.duplicateWindowS.max}
+              value={preferences.duplicateWindowSeconds}
+              min={SESSION_COLLAB_BOUNDS.duplicateWindowSeconds.min}
+              max={SESSION_COLLAB_BOUNDS.duplicateWindowSeconds.max}
               disabled={disabled}
-              onCommit={(duplicateWindowS) => update({ duplicateWindowS })}
+              onCommit={(duplicateWindowSeconds) => update({ duplicateWindowSeconds })}
             />
             <span className="text-sm text-muted-foreground">sec</span>
           </SettingRow>
@@ -221,11 +220,11 @@ export function SessionCollabSettings() {
           <SettingRow label="Undelivered message lifetime" hint={HINTS.undelivered}>
             <NumericField
               ariaLabel="Undelivered message lifetime in hours"
-              value={preferences.undeliveredTtlS / 3600}
-              min={SESSION_COLLAB_BOUNDS.undeliveredTtlS.min / 3600}
-              max={SESSION_COLLAB_BOUNDS.undeliveredTtlS.max / 3600}
+              value={preferences.undeliveredTtlSeconds / 3600}
+              min={SESSION_COLLAB_BOUNDS.undeliveredTtlSeconds.min / 3600}
+              max={SESSION_COLLAB_BOUNDS.undeliveredTtlSeconds.max / 3600}
               disabled={disabled}
-              onCommit={(hours) => update({ undeliveredTtlS: hours * 3600 })}
+              onCommit={(hours) => update({ undeliveredTtlSeconds: hours * 3600 })}
             />
             <span className="text-sm text-muted-foreground">hours</span>
           </SettingRow>

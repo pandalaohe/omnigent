@@ -5,51 +5,33 @@ export const SESSION_COLLAB_CHANGED_EVENT = "omnigent:session-collab-changed";
 
 export type SessionCollabInboundPolicy = "accept" | "hold" | "refuse";
 
+/** Field names are the stored JSON keys the server accessor reads. */
 export interface SessionCollabPreferences {
   /** Master switch: off hides the collaboration tools and refuses peer routes. */
   enabled: boolean;
   openRateCount: number;
-  openRateWindowS: number;
+  openRateWindowSeconds: number;
   relayDepthMax: number;
   pairRateCount: number;
-  pairRateWindowS: number;
+  pairRateWindowSeconds: number;
   senderRateCount: number;
-  senderRateWindowS: number;
-  duplicateWindowS: number;
-  undeliveredTtlS: number;
+  senderRateWindowSeconds: number;
+  duplicateWindowSeconds: number;
+  undeliveredTtlSeconds: number;
   defaultInbound: SessionCollabInboundPolicy;
   flowTimerEnabled: boolean;
 }
 
-/**
- * Stored JSON field names (camelCase, mirroring the server accessor's keys).
- * Kept in one object so a rename on either side is a one-place edit.
- */
-export const SESSION_COLLAB_FIELD_KEYS = {
-  enabled: "enabled",
-  openRateCount: "openRateCount",
-  openRateWindowS: "openRateWindowS",
-  relayDepthMax: "relayDepthMax",
-  pairRateCount: "pairRateCount",
-  pairRateWindowS: "pairRateWindowS",
-  senderRateCount: "senderRateCount",
-  senderRateWindowS: "senderRateWindowS",
-  duplicateWindowS: "duplicateWindowS",
-  undeliveredTtlS: "undeliveredTtlS",
-  defaultInbound: "defaultInbound",
-  flowTimerEnabled: "flowTimerEnabled",
-} as const;
-
 export type SessionCollabNumericField =
   | "openRateCount"
-  | "openRateWindowS"
+  | "openRateWindowSeconds"
   | "relayDepthMax"
   | "pairRateCount"
-  | "pairRateWindowS"
+  | "pairRateWindowSeconds"
   | "senderRateCount"
-  | "senderRateWindowS"
-  | "duplicateWindowS"
-  | "undeliveredTtlS";
+  | "senderRateWindowSeconds"
+  | "duplicateWindowSeconds"
+  | "undeliveredTtlSeconds";
 
 /** Accepted range per numeric field, in the stored unit (seconds for windows). */
 export const SESSION_COLLAB_BOUNDS: Record<
@@ -57,27 +39,27 @@ export const SESSION_COLLAB_BOUNDS: Record<
   { min: number; max: number }
 > = {
   openRateCount: { min: 1, max: 100 },
-  openRateWindowS: { min: 60, max: 86400 },
+  openRateWindowSeconds: { min: 60, max: 86400 },
   relayDepthMax: { min: 1, max: 100 },
   pairRateCount: { min: 1, max: 1000 },
-  pairRateWindowS: { min: 1, max: 3600 },
+  pairRateWindowSeconds: { min: 1, max: 3600 },
   senderRateCount: { min: 1, max: 10000 },
-  senderRateWindowS: { min: 60, max: 86400 },
-  duplicateWindowS: { min: 0, max: 86400 },
-  undeliveredTtlS: { min: 3600, max: 604800 },
+  senderRateWindowSeconds: { min: 60, max: 86400 },
+  duplicateWindowSeconds: { min: 1, max: 86400 },
+  undeliveredTtlSeconds: { min: 3600, max: 604800 },
 };
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   enabled: true,
   openRateCount: 5,
-  openRateWindowS: 60,
+  openRateWindowSeconds: 60,
   relayDepthMax: 30,
   pairRateCount: 6,
-  pairRateWindowS: 60,
+  pairRateWindowSeconds: 60,
   senderRateCount: 60,
-  senderRateWindowS: 600,
-  duplicateWindowS: 600,
-  undeliveredTtlS: 86400,
+  senderRateWindowSeconds: 600,
+  duplicateWindowSeconds: 600,
+  undeliveredTtlSeconds: 86400,
   defaultInbound: "accept",
   flowTimerEnabled: true,
 };
@@ -104,40 +86,22 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
   if (!value || typeof value !== "object") return { ...SESSION_COLLAB_DEFAULTS };
   const raw = value as Record<string, unknown>;
   return {
-    enabled: normalizeBoolean(
-      raw[SESSION_COLLAB_FIELD_KEYS.enabled],
-      SESSION_COLLAB_DEFAULTS.enabled,
+    enabled: normalizeBoolean(raw.enabled, SESSION_COLLAB_DEFAULTS.enabled),
+    openRateCount: normalizeInteger(raw.openRateCount, "openRateCount"),
+    openRateWindowSeconds: normalizeInteger(raw.openRateWindowSeconds, "openRateWindowSeconds"),
+    relayDepthMax: normalizeInteger(raw.relayDepthMax, "relayDepthMax"),
+    pairRateCount: normalizeInteger(raw.pairRateCount, "pairRateCount"),
+    pairRateWindowSeconds: normalizeInteger(raw.pairRateWindowSeconds, "pairRateWindowSeconds"),
+    senderRateCount: normalizeInteger(raw.senderRateCount, "senderRateCount"),
+    senderRateWindowSeconds: normalizeInteger(
+      raw.senderRateWindowSeconds,
+      "senderRateWindowSeconds",
     ),
-    openRateCount: normalizeInteger(raw[SESSION_COLLAB_FIELD_KEYS.openRateCount], "openRateCount"),
-    openRateWindowS: normalizeInteger(
-      raw[SESSION_COLLAB_FIELD_KEYS.openRateWindowS],
-      "openRateWindowS",
-    ),
-    relayDepthMax: normalizeInteger(raw[SESSION_COLLAB_FIELD_KEYS.relayDepthMax], "relayDepthMax"),
-    pairRateCount: normalizeInteger(raw[SESSION_COLLAB_FIELD_KEYS.pairRateCount], "pairRateCount"),
-    pairRateWindowS: normalizeInteger(
-      raw[SESSION_COLLAB_FIELD_KEYS.pairRateWindowS],
-      "pairRateWindowS",
-    ),
-    senderRateCount: normalizeInteger(
-      raw[SESSION_COLLAB_FIELD_KEYS.senderRateCount],
-      "senderRateCount",
-    ),
-    senderRateWindowS: normalizeInteger(
-      raw[SESSION_COLLAB_FIELD_KEYS.senderRateWindowS],
-      "senderRateWindowS",
-    ),
-    duplicateWindowS: normalizeInteger(
-      raw[SESSION_COLLAB_FIELD_KEYS.duplicateWindowS],
-      "duplicateWindowS",
-    ),
-    undeliveredTtlS: normalizeInteger(
-      raw[SESSION_COLLAB_FIELD_KEYS.undeliveredTtlS],
-      "undeliveredTtlS",
-    ),
-    defaultInbound: normalizeInbound(raw[SESSION_COLLAB_FIELD_KEYS.defaultInbound]),
+    duplicateWindowSeconds: normalizeInteger(raw.duplicateWindowSeconds, "duplicateWindowSeconds"),
+    undeliveredTtlSeconds: normalizeInteger(raw.undeliveredTtlSeconds, "undeliveredTtlSeconds"),
+    defaultInbound: normalizeInbound(raw.defaultInbound),
     flowTimerEnabled: normalizeBoolean(
-      raw[SESSION_COLLAB_FIELD_KEYS.flowTimerEnabled],
+      raw.flowTimerEnabled,
       SESSION_COLLAB_DEFAULTS.flowTimerEnabled,
     ),
   };
