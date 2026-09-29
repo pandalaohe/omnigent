@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -199,6 +201,48 @@ def test_owner_change_resets_telemetry_and_findings(tmp_path: Path) -> None:
         hub.history("host_a", user_id="bob", is_admin=False, own_host_ids=set(), workspace_id=0)
         == []
     )
+
+
+def test_owner_change_announces_dropped_findings(tmp_path: Path, monkeypatch) -> None:
+    """An owner reset that drops a finding bumps the revision and announces once."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = time.time()
+    _connect(hub, host_id="host_a", now=now)
+    for minute in range(10):
+        hub.ingest(
+            host_id="host_a",
+            workspace_id=0,
+            frame=_frame(cpu_pct=95.0),
+            now=now + minute * 60.0 + 1,
+        )
+        _tick(hub, now + (minute + 1) * 60.0)
+    assert (0, "host_a:cpu") in hub._findings
+
+    announcements: list[set[int]] = []
+    monkeypatch.setattr(hub, "_announce", announcements.append)
+    revision = hub._revision
+    hub.host_changed(
+        host_id="host_a",
+        workspace_id=0,
+        owner="bob",
+        name="bob-laptop",
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        now=now + 650.0,
+    )
+    assert hub._revision == revision + 1
+    assert announcements == [{0}]
+
+    _connect(hub, host_id="host_b", now=now + 660.0)
+    hub.host_changed(
+        host_id="host_b",
+        workspace_id=0,
+        owner="bob",
+        name="bob-laptop",
+        conn_capabilities=[CAP_RESOURCE_SNAPSHOT],
+        now=now + 670.0,
+    )
+    assert hub._revision == revision + 1, "an owner change with no findings must not bump"
+    assert len(announcements) == 1
 
 
 def test_tick_closes_a_minute_point_with_top_sessions(tmp_path: Path) -> None:
@@ -651,6 +695,85 @@ def test_history_payload_snapshots_the_point_lists(tmp_path: Path) -> None:
     hub._entries[(0, "host_a")].points.clear()
 
     assert payload["hosts"]["0:host_a"]["points"], "the payload owns a copy"
+
+
+def test_save_history_writes_in_submission_order(tmp_path: Path, monkeypatch) -> None:
+    """A cancelled save leaves its queued write ahead of the next one."""
+    hub = SystemStatusHub(tmp_path, None)
+    _connect(hub, host_id="host_a", now=0.0)
+    hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(cpu_pct=10.0), now=1.0)
+    _tick(hub, 60.0)
+
+    written: list[dict] = []
+    started = threading.Event()
+    release = threading.Event()
+    real_write_history = system_status.write_history
+
+    def blocking_write_history(path: Path, payload: dict) -> None:
+        started.set()
+        assert release.wait(timeout=5.0)
+        written.append(payload)
+        real_write_history(path, payload)
+
+    monkeypatch.setattr(system_status, "write_history", blocking_write_history)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(hub.save_history())
+        assert await asyncio.to_thread(started.wait, 5.0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(cpu_pct=20.0), now=61.0)
+        _tick(hub, 120.0)
+        second = asyncio.create_task(hub.save_history())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(second, timeout=5.0)
+
+    asyncio.run(scenario())
+    hub.close()
+
+    assert [len(payload["hosts"]["0:host_a"]["points"]) for payload in written] == [1, 2]
+    assert json.loads(hub.history_path.read_text()) == written[1]
+
+
+def test_save_settings_writes_in_submission_order(tmp_path: Path, monkeypatch) -> None:
+    """A cancelled settings save leaves its queued write ahead of the next one."""
+    hub = SystemStatusHub(tmp_path, None)
+    old = hub.put_settings({"cpu_pct": 80.0})
+    new = hub.put_settings({"cpu_pct": 70.0})
+
+    written: list[dict] = []
+    started = threading.Event()
+    release = threading.Event()
+    real_write_settings = system_status.write_settings
+
+    def blocking_write_settings(path: Path, payload: dict) -> None:
+        started.set()
+        assert release.wait(timeout=5.0)
+        written.append(payload)
+        real_write_settings(path, payload)
+
+    monkeypatch.setattr(system_status, "write_settings", blocking_write_settings)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(hub.save_settings(old))
+        assert await asyncio.to_thread(started.wait, 5.0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(hub.save_settings(new))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(second, timeout=5.0)
+
+    asyncio.run(scenario())
+    hub.close()
+
+    assert [payload["cpu_pct"] for payload in written] == [80.0, 70.0]
+    assert json.loads(hub.settings_path.read_text()) == new
 
 
 def test_settings_round_trip_and_validation(tmp_path: Path) -> None:

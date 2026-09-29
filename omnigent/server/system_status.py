@@ -14,6 +14,8 @@ five minutes of history lost on a crash. History is bounded to 24 h.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -98,8 +100,9 @@ class SystemStatusHub:
     """Inventory, history, findings and persistence for the system-status view.
 
     Mutating methods run on the server's event loop; the in-memory structures
-    are not locked. Blocking work does not: ``disk_usage_pct`` and the
-    module-level ``write_history`` / ``write_settings`` run on worker threads.
+    are not locked. Blocking work does not: ``disk_usage_pct`` runs on a worker
+    thread, and history / settings writes go through one FIFO writer thread so
+    disk state follows submission order.
 
     :param data_dir: Directory holding the ``system-status/`` state files.
     :param metrics: Server metrics tracker whose ``last_snapshot`` (written by
@@ -122,6 +125,11 @@ class SystemStatusHub:
         self._revision = 0
         self._hub_cpu_ms = 0.0
         self._last_server_counters: tuple[int, int] | None = None
+        # One writer serializes both state files; its thread starts lazily on
+        # the first submit and never outlives ``close()``.
+        self._writer = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="system-status-writer"
+        )
 
     # ── Host lifecycle ───────────────────────────────────────────
 
@@ -167,12 +175,18 @@ class SystemStatusHub:
                     # Re-registering a host id under a new owner must not
                     # expose the previous owner's telemetry or findings.
                     self._reset_telemetry(entry)
-                    for key in [
+                    dropped_keys = [
                         key
                         for key in self._findings
                         if key[0] == workspace_id and key[1].startswith(f"{host_id}:")
-                    ]:
+                    ]
+                    for key in dropped_keys:
                         del self._findings[key]
+                    if dropped_keys:
+                        # A dropped finding is a view change: subscribers must
+                        # see it without waiting for the next tick's evaluation.
+                        self._revision += 1
+                        self._announce({workspace_id})
                 entry.owner = owner
             if name:
                 entry.name = name
@@ -788,6 +802,29 @@ class SystemStatusHub:
                 since=float(points[-1].get("t", now)),
                 points=points,
             )
+
+    async def save_history(self) -> None:
+        """Persist history through the FIFO writer.
+
+        The payload is built on the event loop; the write is shielded so a
+        cancelled caller leaves a queued or running write untouched.
+        """
+        payload = self.history_payload()
+        future = self._writer.submit(write_history, self.history_path, payload)
+        await asyncio.shield(asyncio.wrap_future(future))
+
+    async def save_settings(self, settings: dict[str, float]) -> None:
+        """Persist settings through the same FIFO writer.
+
+        The submit happens before the first await, so writes are ordered by
+        the caller's on-loop ``put_settings`` calls.
+        """
+        future = self._writer.submit(write_settings, self.settings_path, settings)
+        await asyncio.shield(asyncio.wrap_future(future))
+
+    def close(self) -> None:
+        """Wait for queued writes, then stop the writer thread."""
+        self._writer.shutdown(wait=True)
 
     def history_payload(self) -> dict[str, Any]:
         """Build the JSON-able history payload from copies of the point lists.

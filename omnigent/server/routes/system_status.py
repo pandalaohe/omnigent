@@ -20,7 +20,7 @@ from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
-from omnigent.server.system_status import SystemStatusHub, write_settings
+from omnigent.server.system_status import SystemStatusHub
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -145,7 +145,7 @@ def create_system_status_router(
             settings = hub.put_settings(payload)
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-        await asyncio.to_thread(write_settings, hub.settings_path, settings)
+        await hub.save_settings(settings)
         return settings
 
     return router
