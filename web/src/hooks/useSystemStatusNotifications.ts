@@ -13,10 +13,12 @@
 import { useEffect, useRef } from "react";
 import { getNotificationPermission, showNotification } from "@/lib/browserNotifications";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { useNavigate } from "@/lib/routing";
 import { useSystemStatusSummary } from "@/hooks/useSystemStatus";
 
 export function useSystemStatusNotifications(): void {
   const { data } = useSystemStatusSummary();
+  const navigate = useNavigate();
   // `null` until the first summary arrives: that load seeds the baseline.
   const previousIds = useRef<Set<string> | null>(null);
 
@@ -34,8 +36,11 @@ export function useSystemStatusNotifications(): void {
         title: "System status",
         body: finding.detail,
         tag: `omnigent:system:${finding.id}`,
+        // Browser path: run navigation directly. Desktop shell path: forward
+        // `navigatePath` over IPC (the closure can't cross the boundary).
+        onClick: () => navigate("/system"),
         navigatePath: "/system",
       });
     }
-  }, [data]);
+  }, [data, navigate]);
 }

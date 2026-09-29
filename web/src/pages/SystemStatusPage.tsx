@@ -2,16 +2,20 @@
 // every visible host's machine metrics and 24 h CPU trend, and each host's
 // omnigent process tree attributed to its session.
 //
-// The page never renders the health-check surface (a later task). A member
-// receives `server: null` and only their own hosts — the page just renders
-// what the permission-filtered response contains.
+// A member receives `server: null` and only their own hosts — the page just
+// renders what the permission-filtered response contains.
 
 import { Fragment, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
+import { Button } from "@/components/ui/button";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import {
+  type HealthCheckNotice,
+  useStartHealthCheck,
+} from "@/hooks/useStartHealthCheck";
 import {
   useSystemHistory,
   useSystemStatus,
@@ -104,10 +108,15 @@ function FindingsBanner({
   findings,
   hostNames,
   sessionTitles,
+  onRunHealthCheck,
+  healthCheckPending,
 }: {
   findings: SystemStatusFinding[];
   hostNames: Map<string, string>;
   sessionTitles: Map<string, string>;
+  /** Admin-only action; absent for members. */
+  onRunHealthCheck?: () => void;
+  healthCheckPending?: boolean;
 }) {
   if (findings.length === 0) {
     return (
@@ -118,43 +127,93 @@ function FindingsBanner({
     );
   }
   return (
-    <ul className="flex flex-col gap-2" data-testid="system-status-findings">
-      {findings.map((finding) => (
-        <li
-          key={finding.id}
-          className={cn(
-            "flex items-start gap-2 rounded-lg border px-3 py-2 text-ui",
-            finding.level === "red"
-              ? "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400"
-              : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400",
-          )}
-        >
-          <span
+    <div className="flex flex-col gap-2">
+      <ul className="flex flex-col gap-2" data-testid="system-status-findings">
+        {findings.map((finding) => (
+          <li
+            key={finding.id}
             className={cn(
-              "mt-1 size-2 shrink-0 rounded-full",
-              finding.level === "red" ? "bg-red-500" : "bg-amber-500",
+              "flex items-start gap-2 rounded-lg border px-3 py-2 text-ui",
+              finding.level === "red"
+                ? "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400"
+                : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400",
             )}
-            aria-hidden="true"
-          />
-          <span className="min-w-0">
-            <span className="font-medium">
-              {finding.target === "server"
-                ? "Server"
-                : (hostNames.get(finding.target) ?? finding.target)}
-            </span>{" "}
-            {finding.detail}
-            {finding.top_session !== null && (
-              <>
-                {" · "}
-                <Link to={`/c/${finding.top_session}`} className="underline">
-                  {sessionLabel(finding.top_session, sessionTitles)}
-                </Link>
-              </>
-            )}
-          </span>
-        </li>
-      ))}
-    </ul>
+          >
+            <span
+              className={cn(
+                "mt-1 size-2 shrink-0 rounded-full",
+                finding.level === "red" ? "bg-red-500" : "bg-amber-500",
+              )}
+              aria-hidden="true"
+            />
+            <span className="min-w-0">
+              <span className="font-medium">
+                {finding.target === "server"
+                  ? "Server"
+                  : (hostNames.get(finding.target) ?? finding.target)}
+              </span>{" "}
+              {finding.detail}
+              {finding.top_session !== null && (
+                <>
+                  {" · "}
+                  <Link to={`/c/${finding.top_session}`} className="underline">
+                    {sessionLabel(finding.top_session, sessionTitles)}
+                  </Link>
+                </>
+              )}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {onRunHealthCheck !== undefined && (
+        <div>
+          <Button
+            size="sm"
+            variant="outline"
+            loading={healthCheckPending}
+            onClick={onRunHealthCheck}
+          >
+            Run health check
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HealthCheckNoticeBox({ notice }: { notice: HealthCheckNotice }) {
+  if (notice.kind === "error") {
+    return (
+      <div
+        role="alert"
+        className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+      >
+        {notice.message}
+        {notice.sessionId !== undefined && (
+          <>
+            {" "}
+            <Link to={`/c/${notice.sessionId}`} className="underline">
+              Open the session
+            </Link>
+            .
+          </>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="mb-4 rounded-md border bg-muted/30 px-3 py-2 text-ui text-muted-foreground">
+      {notice.message}
+      {notice.kind === "unset" && (
+        <>
+          {" "}
+          <Link to="/settings/system-status" className="underline">
+            Open System status settings
+          </Link>
+          .
+        </>
+      )}
+    </div>
   );
 }
 
@@ -447,6 +506,7 @@ export function SystemStatusPage() {
   const status = useSystemStatus({ live: true });
   // The thresholds are admin-only; members never see the bytes line.
   const settings = useSystemStatusSettings({ enabled: isAdmin });
+  const healthCheck = useStartHealthCheck();
   // Titles ride the sidebar's already-loaded rows; no extra request.
   const { data: conversationsData } = useLoadedConversations();
   const sessionTitles = useMemo(() => {
@@ -482,18 +542,36 @@ export function SystemStatusPage() {
   const threshold = settings.data?.cpu_pct ?? null;
   return (
     <PageScroll maxWidthClassName="max-w-5xl" contentClassName="px-8">
-      <div className="mb-4">
-        <h1 className="text-2xl font-semibold">System status</h1>
-        <p className="mt-1 text-ui text-muted-foreground">
-          Resources on this server and on every visible host, with omnigent's process tree
-          attributed to its session.
-        </p>
+      <div className="mb-6 flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-1">
+          <h1 className="text-2xl font-semibold">System status</h1>
+          <p className="text-ui text-muted-foreground">
+            Resources on this server and on every visible host, with omnigent's process tree
+            attributed to its session.
+          </p>
+        </div>
+        {isAdmin && (
+          <Button
+            className="shrink-0"
+            loading={healthCheck.pending}
+            componentId="system.health-check"
+            onClick={() => void healthCheck.start()}
+          >
+            Run health check
+          </Button>
+        )}
       </div>
+
+      {isAdmin && healthCheck.notice !== null && (
+        <HealthCheckNoticeBox notice={healthCheck.notice} />
+      )}
 
       <FindingsBanner
         findings={data.findings}
         hostNames={hostNames}
         sessionTitles={sessionTitles}
+        onRunHealthCheck={isAdmin ? () => void healthCheck.start() : undefined}
+        healthCheckPending={healthCheck.pending}
       />
 
       {data.server !== null && (

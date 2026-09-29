@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -17,7 +19,7 @@ from omnigent.host.frames import (
     ResourceProcessRow,
 )
 from omnigent.server.routes.system_status import create_system_status_router
-from omnigent.server.system_status import SystemStatusHub
+from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
 from omnigent.stores.host_store import Host
 
 _ALICE = "alice@example.com"
@@ -63,6 +65,7 @@ def _build(
     *,
     admins: tuple[str, ...] = ("admin@example.com",),
     hosts: list[Host] | None = None,
+    host_versions: Callable[[list[str]], dict[str, str]] | None = None,
 ) -> tuple[TestClient, SystemStatusHub]:
     hub = SystemStatusHub(tmp_path, None)
     app = FastAPI()
@@ -77,6 +80,7 @@ def _build(
             _HostStore(hosts or []),
             auth_provider=_AuthProvider(),
             permission_store=_PermissionStore(*admins),
+            host_versions=host_versions,
         ),
         prefix="/v1",
     )
@@ -271,6 +275,62 @@ def test_settings_admin_only_with_validation(tmp_path: Path) -> None:
             json=payload,
         )
         assert bad.status_code == 400, payload
+
+
+def test_brief_admin_only_and_settings_payload(tmp_path: Path) -> None:
+    """Members get 403; the admin brief and settings carry the new fields."""
+    client, hub = _build(
+        tmp_path,
+        host_versions=lambda host_ids: dict.fromkeys(host_ids, "1.2.3"),
+    )
+    _seed(hub)
+
+    member_brief = client.get("/v1/system/brief", headers={"X-Test-User": _BOB})
+    assert member_brief.status_code == 403
+    member_put = client.put(
+        "/v1/system/settings",
+        headers={"X-Test-User": _BOB},
+        json={"health_check": {"project_id": "p1"}},
+    )
+    assert member_put.status_code == 403
+
+    admin_brief = client.get("/v1/system/brief", headers={"X-Test-User": "admin@example.com"})
+    assert admin_brief.status_code == 200
+    payload = admin_brief.json()
+    assert "Monitor snapshot, generated" in payload["text"]
+    assert "version 1.2.3" in payload["text"]
+    assert datetime.fromisoformat(payload["generated_at"]).tzinfo is not None
+
+    settings = client.get("/v1/system/settings", headers={"X-Test-User": "admin@example.com"})
+    assert settings.status_code == 200
+    assert settings.json()["health_check"] == {
+        "project_id": None,
+        "host_id": None,
+        "prompt": None,
+    }
+    assert settings.json()["default_health_check_prompt"] == DEFAULT_HEALTH_CHECK_PROMPT
+
+    updated = client.put(
+        "/v1/system/settings",
+        headers={"X-Test-User": "admin@example.com"},
+        json={"health_check": {"project_id": "p1", "host_id": "h1", "prompt": None}},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["health_check"] == {
+        "project_id": "p1",
+        "host_id": "h1",
+        "prompt": None,
+    }
+    assert updated.json()["default_health_check_prompt"] == DEFAULT_HEALTH_CHECK_PROMPT
+
+    bad = client.put(
+        "/v1/system/settings",
+        headers={"X-Test-User": "admin@example.com"},
+        json={"health_check": {"project_id": 5}},
+    )
+    assert bad.status_code == 400
+    after = client.get("/v1/system/settings", headers={"X-Test-User": "admin@example.com"})
+    assert after.json()["health_check"] == {"project_id": "p1", "host_id": "h1", "prompt": None}
 
 
 def test_single_user_mode_without_permission_store(tmp_path: Path) -> None:

@@ -35,21 +35,23 @@ def _frame(
     sampler_cpu_ms: float = 0.5,
     monitor_rss_delta: int = 1024,
     sessions: dict[str, float] | None = None,
+    processes: list[ResourceProcessRow] | None = None,
 ) -> HostResourceSnapshotFrame:
     """Build a realistic-enough snapshot frame for hub tests."""
-    session_cpu = {"conv_a": 1.0} if sessions is None else sessions
-    processes = [
-        ResourceProcessRow(
-            pid=100 + index,
-            ppid=99,
-            name=f"proc{index}",
-            role="child",
-            session_id=session_id,
-            cpu_pct=cpu,
-            rss=1024 * 1024,
-        )
-        for index, (session_id, cpu) in enumerate(session_cpu.items())
-    ]
+    if processes is None:
+        session_cpu = {"conv_a": 1.0} if sessions is None else sessions
+        processes = [
+            ResourceProcessRow(
+                pid=100 + index,
+                ppid=99,
+                name=f"proc{index}",
+                role="child",
+                session_id=session_id,
+                cpu_pct=cpu,
+                rss=1024 * 1024,
+            )
+            for index, (session_id, cpu) in enumerate(session_cpu.items())
+        ]
     return HostResourceSnapshotFrame(
         sampled_at="2026-09-29T09:25:00+00:00",
         interval_s=60,
@@ -825,6 +827,7 @@ def test_settings_round_trip_and_validation(tmp_path: Path) -> None:
         "mem_pct": 90.0,
         "disk_pct": 90.0,
         "server_5xx_pct": 5.0,
+        "health_check": {"project_id": None, "host_id": None, "prompt": None},
     }
 
     updated = hub.put_settings({"cpu_pct": 70, "cpu_sustain_min": 3.0})
@@ -876,3 +879,390 @@ def test_hub_never_calls_metrics_snapshot() -> None:
     """The hub reads ``metrics.last_snapshot``; snapshot() resets its baseline."""
     source = inspect.getsource(system_status)
     assert ".snapshot(" not in source
+
+
+def _brief(
+    hub: SystemStatusHub,
+    now: float,
+    *,
+    workspace_id: int = 0,
+    own_offline_hosts: list[dict[str, object]] | None = None,
+    host_versions: dict[str, str] | None = None,
+    server_version: str = "9.9.9",
+) -> str:
+    return hub.brief(
+        now=now,
+        workspace_id=workspace_id,
+        own_offline_hosts=own_offline_hosts or [],
+        host_versions=host_versions or {},
+        server_version=server_version,
+    )
+
+
+def test_health_check_settings_round_trip(tmp_path: Path) -> None:
+    """The health_check object round-trips; the thresholds stay numeric."""
+    hub = SystemStatusHub(tmp_path, None)
+    assert hub.get_settings()["health_check"] == {
+        "project_id": None,
+        "host_id": None,
+        "prompt": None,
+    }
+
+    updated = hub.put_settings(
+        {"health_check": {"project_id": "p1", "host_id": "h1", "prompt": None}}
+    )
+    assert updated["health_check"] == {"project_id": "p1", "host_id": "h1", "prompt": None}
+    assert updated["cpu_pct"] == 85.0
+    assert updated["cpu_sustain_min"] == 10
+
+    replaced = hub.put_settings({"health_check": {"project_id": "p2"}})
+    assert replaced["health_check"] == {"project_id": "p2", "host_id": None, "prompt": None}
+    assert hub.get_settings()["health_check"]["project_id"] == "p2"
+
+
+def test_health_check_settings_validation(tmp_path: Path) -> None:
+    """Bad payloads raise; a whitespace-only prompt becomes ``None``."""
+    hub = SystemStatusHub(tmp_path, None)
+    hub.put_settings({"health_check": {"project_id": "p1", "host_id": "h1", "prompt": "x"}})
+    before = hub.get_settings()
+
+    bad_values: list[object] = [
+        5,
+        {"foo": 1},
+        {"project_id": 5},
+        {"project_id": ""},
+        {"project_id": "x" * 65},
+        {"host_id": 5},
+        {"host_id": ""},
+        {"host_id": "x" * 65},
+        {"prompt": 5},
+        {"prompt": "x" * 20_001},
+    ]
+    for bad in bad_values:
+        with pytest.raises(ValueError):
+            hub.put_settings({"health_check": bad})
+    assert hub.get_settings() == before
+
+    cleared = hub.put_settings({"health_check": {"prompt": "  \n "}})
+    assert cleared["health_check"] == {"project_id": None, "host_id": None, "prompt": None}
+
+
+def test_health_check_settings_survive_restart(tmp_path: Path) -> None:
+    """A persisted health_check is restored; an invalid one falls back."""
+    hub = SystemStatusHub(tmp_path, None)
+    stored = hub.put_settings(
+        {"health_check": {"project_id": "p1", "host_id": "h1", "prompt": "custom"}}
+    )
+    system_status.write_settings(hub.settings_path, stored)
+    hub.close()
+
+    reloaded = SystemStatusHub(tmp_path, None)
+    assert reloaded.get_settings()["health_check"] == {
+        "project_id": "p1",
+        "host_id": "h1",
+        "prompt": "custom",
+    }
+
+    hub.settings_path.write_text(json.dumps({"cpu_pct": 70, "health_check": {"project_id": 5}}))
+    repaired = SystemStatusHub(tmp_path, None)
+    assert repaired.get_settings()["health_check"] == {
+        "project_id": None,
+        "host_id": None,
+        "prompt": None,
+    }
+    assert repaired.get_settings()["cpu_pct"] == 70.0
+
+
+def test_brief_happy_path(tmp_path: Path) -> None:
+    """Brief carries header, finding, server maxima, host summaries and tables."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_750_000_000.0
+    hub._server_points = [
+        {
+            "t": now - 3600.0,
+            "cpu": 10.0,
+            "rss": 100 * 1024 * 1024,
+            "in_flight": 1,
+            "websockets": 2,
+            "req": 100,
+            "err": 20,
+            "load1": 0.5,
+            "disk_pct": 95.0,
+        },
+        {
+            "t": now - 60.0,
+            "cpu": 20.0,
+            "rss": 200 * 1024 * 1024,
+            "in_flight": 5,
+            "websockets": 3,
+            "req": 50,
+            "err": 1,
+            "load1": 0.6,
+            "disk_pct": 40.0,
+        },
+    ]
+    hub._findings[(0, "host_a:cpu")] = {
+        "id": "host_a:cpu",
+        "target": "host_a",
+        "kind": "cpu",
+        "level": "amber",
+        "since": now - 600.0,
+        "detail": "cpu above 85% for 10 minutes",
+        "top_session": "conv_a",
+    }
+
+    _connect(hub, host_id="host_a", now=now)
+    hub.ingest(
+        host_id="host_a",
+        workspace_id=0,
+        frame=_frame(
+            cpu_pct=12.0,
+            processes=[
+                ResourceProcessRow(
+                    pid=1,
+                    ppid=0,
+                    name="omnigent-daemon",
+                    role="daemon",
+                    session_id=None,
+                    cpu_pct=0.5,
+                    rss=50 * 1024 * 1024,
+                    started_at=now - 11_520.0,
+                ),
+                ResourceProcessRow(
+                    pid=2,
+                    ppid=1,
+                    name="hot-child",
+                    role="child",
+                    session_id="conv_a",
+                    cpu_pct=40.0,
+                    rss=10 * 1024 * 1024,
+                    started_at=now - 60.0,
+                ),
+            ],
+        ),
+        now=now,
+    )
+    hub._entries[(0, "host_a")].points = [
+        {
+            "t": now - 120.0,
+            "cpu_max": 95.0,
+            "mem_used": 15 * _GIB,
+            "mem_total": 16 * _GIB,
+            "disk_pct": 80.0,
+            "load1": 4.0,
+            "top": [["conv_b", 10.0], ["conv_a", 2.0]],
+        },
+        {
+            "t": now - 60.0,
+            "cpu_max": 20.0,
+            "mem_used": 8 * _GIB,
+            "mem_total": 16 * _GIB,
+            "disk_pct": 50.0,
+            "load1": 1.0,
+            "top": [["conv_b", 5.0], ["conv_c", 3.0]],
+        },
+    ]
+
+    _connect(hub, host_id="host_b", now=now)
+    hub.ingest(host_id="host_b", workspace_id=0, frame=_frame(cpu_pct=5.0), now=now)
+    hub._entries[(0, "host_b")].points = [
+        {
+            "t": now - 60.0,
+            "cpu_max": 30.0,
+            "mem_used": 4 * _GIB,
+            "mem_total": 16 * _GIB,
+            "disk_pct": 20.0,
+            "load1": 0.5,
+            "top": [],
+        }
+    ]
+
+    text = _brief(hub, now, host_versions={"host_a": "1.2.3", "host_b": "1.2.3"})
+
+    assert text.startswith(
+        f"Monitor snapshot, generated {system_status._format_utc(now)}, server 9.9.9\n"
+    )
+    assert "- [amber] host_a: cpu above 85% for 10 minutes" in text
+    assert "top conv_a)" in text
+    assert f"24h: max cpu 20.0% at {system_status._format_utc(now - 60.0)}" in text
+    assert f"max in-flight 5 at {system_status._format_utc(now - 60.0)}" in text
+    assert f"max disk 95.0% at {system_status._format_utc(now - 3600.0)}" in text
+    assert "requests 150" in text
+    assert "5xx 21 (14.0%)" in text
+    assert text.count("version 1.2.3") == 2
+    assert "coverage 2/1440 min" in text
+    assert "max memory 93.8%" in text
+    assert "top sessions: conv_b 15.0%, conv_c 3.0%, conv_a 2.0%" in text
+    assert text.index("omnigent-daemon") < text.index("hot-child"), "roots come first"
+    assert text.rstrip().endswith(
+        "Only Omnigent's own processes are sampled; other processes on these machines "
+        "are not listed."
+    )
+
+
+def test_brief_stays_under_the_byte_cap(tmp_path: Path) -> None:
+    """3 hosts x 200 long-named root rows stay within 16 KiB with cap lines."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_750_000_000.0
+    hub._server_points = [
+        {
+            "t": now - 60.0,
+            "cpu": 10.0,
+            "rss": 100 * 1024 * 1024,
+            "in_flight": 1,
+            "websockets": 1,
+            "req": 10,
+            "err": 0,
+            "load1": 0.5,
+            "disk_pct": 40.0,
+        }
+    ]
+    hub._findings[(0, "host_a:cpu")] = {
+        "id": "host_a:cpu",
+        "target": "host_a",
+        "kind": "cpu",
+        "level": "amber",
+        "since": now - 600.0,
+        "detail": "cpu above 85% for 10 minutes",
+        "top_session": None,
+    }
+    long_name = "p" * 60
+    for host_id in ("host_a", "host_b", "host_c"):
+        _connect(hub, host_id=host_id, now=now)
+        rows = [
+            ResourceProcessRow(
+                pid=index,
+                ppid=0,
+                name=f"{long_name}{index}",
+                role="runner",
+                session_id=None,
+                cpu_pct=float(index),
+                rss=1024 * 1024,
+                started_at=now - index,
+            )
+            for index in range(200)
+        ]
+        hub.ingest(host_id=host_id, workspace_id=0, frame=_frame(processes=rows), now=now)
+        hub._entries[(0, host_id)].points = [
+            {
+                "t": now - 60.0,
+                "cpu_max": 10.0,
+                "mem_used": _GIB,
+                "mem_total": 2 * _GIB,
+                "disk_pct": 10.0,
+                "load1": 0.1,
+                "top": [["conv_a", 1.0]],
+            }
+        ]
+
+    text = _brief(hub, now)
+
+    assert len(text.encode("utf-8")) <= 16_384
+    assert "Monitor snapshot, generated" in text
+    assert "- [amber] host_a: cpu above 85%" in text
+    assert "Server:" in text
+    assert "24h: max cpu 10.0%" in text
+    for host_id in ("host_a", "host_b", "host_c"):
+        assert f"Host {host_id} (" in text
+        assert f"Host {host_id} process table:" in text
+    assert text.count("24h: max cpu") == 4, "server + one per host"
+    assert text.count("coverage 1/1440 min") == 4, "server + one per host"
+    assert text.count("top sessions: conv_a 1.0%") == 3
+    assert text.count("rows not shown (cap)") >= 3
+    assert text.rstrip().endswith(
+        "Only Omnigent's own processes are sampled; other processes on these machines "
+        "are not listed."
+    )
+
+
+def test_brief_caps_a_large_host_head(tmp_path: Path) -> None:
+    """60 online hosts with no process rows still stay within 16 KiB."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_750_000_000.0
+    hub._server_points = [
+        {
+            "t": now - 60.0,
+            "cpu": 10.0,
+            "rss": 100 * 1024 * 1024,
+            "in_flight": 1,
+            "websockets": 1,
+            "req": 10,
+            "err": 0,
+            "load1": 0.5,
+            "disk_pct": 40.0,
+        }
+    ]
+    for index in range(60):
+        host_id = f"h{index:02d}"
+        _connect(hub, host_id=host_id, now=now)
+        hub.ingest(host_id=host_id, workspace_id=0, frame=_frame(processes=[]), now=now)
+        hub._entries[(0, host_id)].points = [
+            {
+                "t": now - 60.0,
+                "cpu_max": 10.0,
+                "mem_used": _GIB,
+                "mem_total": 2 * _GIB,
+                "disk_pct": 10.0,
+                "load1": 0.1,
+                "top": [["conv_a", 1.0]],
+            }
+        ]
+
+    text = _brief(hub, now)
+
+    assert len(text.encode("utf-8")) <= 16_384
+    assert text.startswith("Monitor snapshot, generated ")
+    assert "Server:" in text
+    assert "Latest: cpu 10.0%" in text
+    assert text.endswith("… brief truncated at the 16 KB cap\n")
+
+
+def test_brief_offline_host_shows_only_the_sample_age(tmp_path: Path) -> None:
+    """A host with no live tunnel gets one line and no metrics or table."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_750_000_000.0
+    _connect(hub, host_id="host_a", now=now - 10_000.0)
+    hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=now - 8100.0)
+    _tick(hub, now - 8000.0)
+    hub.host_changed(
+        host_id="host_a",
+        workspace_id=0,
+        owner="alice",
+        name=None,
+        conn_capabilities=None,
+        now=now - 100.0,
+    )
+
+    text = _brief(hub, now, host_versions={"host_a": "1.2.3"})
+
+    host_lines = [line for line in text.splitlines() if line.startswith("Host host_a")]
+    assert len(host_lines) == 1
+    assert "— offline, version 1.2.3, last sample 2h13m ago" in host_lines[0]
+    assert "Host host_a process table:" not in text
+    assert "Latest:" not in text
+
+
+def test_brief_coverage_counts_distinct_minutes(tmp_path: Path) -> None:
+    """300 one-minute points inside the window read as 300/1440."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_750_000_000.0
+    _connect(hub, host_id="host_a", now=now - 100_000.0)
+    hub.ingest(host_id="host_a", workspace_id=0, frame=_frame(), now=now - 200.0)
+    points = [
+        {
+            "t": now - 60.0 * (index + 1),
+            "cpu_max": 1.0,
+            "mem_used": 1,
+            "mem_total": 2,
+            "disk_pct": 1.0,
+            "load1": 0.1,
+            "top": [],
+        }
+        for index in range(300)
+    ]
+    points.append(dict(points[0]))
+    hub._entries[(0, "host_a")].points = points
+
+    text = _brief(hub, now)
+
+    assert "coverage 300/1440 min" in text

@@ -561,6 +561,35 @@ export async function createSession(
 }
 
 /**
+ * Create a session in a project on a host without naming an agent.
+ *
+ * Omitting `agent_id` and `workspace` is the point: the server resolves the
+ * project's calling defaults and the project's directory on that host. Used by
+ * the one-click health check so the ops session is an ordinary project session.
+ */
+export async function createProjectSession(opts: {
+  projectId: string;
+  hostId: string;
+  title: string;
+}): Promise<Session> {
+  const res = await authenticatedFetch("/v1/sessions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
+    body: JSON.stringify({
+      project_id: opts.projectId,
+      host_id: opts.hostId,
+      title: opts.title,
+      initial_items: [],
+    }),
+  });
+  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
  * Start a fresh session continuing an archived one.
  *
  * The server creates it on the archived session's host and launch

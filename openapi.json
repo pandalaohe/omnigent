@@ -20294,6 +20294,30 @@
         ]
       }
     },
+    "/v1/system/brief": {
+      "get": {
+        "description": "Return the monitor brief for the caller's admin host set.",
+        "operationId": "get_system_brief_v1_system_brief_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get System Brief V1 System Brief Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get System Brief",
+        "tags": [
+          "system"
+        ]
+      }
+    },
     "/v1/system/history": {
       "get": {
         "description": "Return one target's age-filtered points; 404 when not visible.",
@@ -20341,7 +20365,7 @@
     },
     "/v1/system/settings": {
       "get": {
-        "description": "Return the finding thresholds (admin only).",
+        "description": "Return the thresholds and health-check settings (admin only).",
         "operationId": "get_system_settings_v1_system_settings_get",
         "responses": {
           "200": {
@@ -20363,7 +20387,7 @@
         ]
       },
       "put": {
-        "description": "Validate and store thresholds, returning the effective settings.",
+        "description": "Validate and store settings, returning the effective set.",
         "operationId": "put_system_settings_v1_system_settings_put",
         "requestBody": {
           "content": {

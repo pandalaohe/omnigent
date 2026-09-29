@@ -16,8 +16,11 @@ const notifications = vi.hoisted(() => ({
   showNotification: vi.fn(),
 }));
 
+const navigateMock = vi.hoisted(() => vi.fn());
+
 vi.mock("@/lib/browserNotifications", () => notifications);
 vi.mock("@/lib/nativeBridge", () => ({ isNativeShell: () => false }));
+vi.mock("@/lib/routing", () => ({ useNavigate: () => navigateMock }));
 
 import { useSystemStatusNotifications } from "./useSystemStatusNotifications";
 
@@ -42,6 +45,7 @@ beforeEach(() => {
   notifications.getNotificationPermission.mockReset();
   notifications.showNotification.mockReset();
   notifications.getNotificationPermission.mockReturnValue("granted");
+  navigateMock.mockReset();
 });
 
 afterEach(cleanup);
@@ -99,5 +103,20 @@ describe("useSystemStatusNotifications", () => {
     rerender();
 
     expect(notifications.showNotification).not.toHaveBeenCalled();
+  });
+
+  it("navigates to /system when the notification is clicked", () => {
+    setFindings([]);
+    const { rerender } = renderHook(() => useSystemStatusNotifications());
+    setFindings([finding("host_1:cpu")]);
+    rerender();
+
+    const shown = notifications.showNotification.mock.calls[0][0] as {
+      onClick?: () => void;
+      navigatePath?: string;
+    };
+    expect(shown.navigatePath).toBe("/system");
+    shown.onClick?.();
+    expect(navigateMock).toHaveBeenCalledWith("/system");
   });
 });
