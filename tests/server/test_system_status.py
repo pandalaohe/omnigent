@@ -1175,6 +1175,48 @@ def test_brief_stays_under_the_byte_cap(tmp_path: Path) -> None:
     )
 
 
+def test_brief_caps_a_large_host_head(tmp_path: Path) -> None:
+    """60 online hosts with no process rows still stay within 16 KiB."""
+    hub = SystemStatusHub(tmp_path, None)
+    now = 1_750_000_000.0
+    hub._server_points = [
+        {
+            "t": now - 60.0,
+            "cpu": 10.0,
+            "rss": 100 * 1024 * 1024,
+            "in_flight": 1,
+            "websockets": 1,
+            "req": 10,
+            "err": 0,
+            "load1": 0.5,
+            "disk_pct": 40.0,
+        }
+    ]
+    for index in range(60):
+        host_id = f"h{index:02d}"
+        _connect(hub, host_id=host_id, now=now)
+        hub.ingest(host_id=host_id, workspace_id=0, frame=_frame(processes=[]), now=now)
+        hub._entries[(0, host_id)].points = [
+            {
+                "t": now - 60.0,
+                "cpu_max": 10.0,
+                "mem_used": _GIB,
+                "mem_total": 2 * _GIB,
+                "disk_pct": 10.0,
+                "load1": 0.1,
+                "top": [["conv_a", 1.0]],
+            }
+        ]
+
+    text = _brief(hub, now)
+
+    assert len(text.encode("utf-8")) <= 16_384
+    assert text.startswith("Monitor snapshot, generated ")
+    assert "Server:" in text
+    assert "Latest: cpu 10.0%" in text
+    assert text.endswith("… brief truncated at the 16 KB cap\n")
+
+
 def test_brief_offline_host_shows_only_the_sample_age(tmp_path: Path) -> None:
     """A host with no live tunnel gets one line and no metrics or table."""
     hub = SystemStatusHub(tmp_path, None)

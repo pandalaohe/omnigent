@@ -754,8 +754,9 @@ class SystemStatusHub:
         :param server_version: Version of this server.
         :returns: The brief. Once the next process-table row would push it
             past :data:`_BRIEF_CAP_BYTES` UTF-8 bytes, that row and the rest
-            of the tables become ``… N rows not shown (cap)`` lines; the
-            summary lines before the tables are never cut.
+            of the tables become ``… N rows not shown (cap)`` lines. If the
+            remaining lines alone exceed the cap, the text is cut at a line
+            boundary and ends with a truncation marker.
         """
         started = time.thread_time()
         try:
@@ -1320,7 +1321,23 @@ def _emit_capped(head: list[str], tables: list[tuple[str, list[str]]], footer: s
             lines.append(_cap_line(len(rows) - shown))
             cut = True
     lines.append(footer)
-    return "\n".join(lines) + "\n"
+    text = "\n".join(lines) + "\n"
+    if _encoded_len(text) <= _BRIEF_CAP_BYTES:
+        return text
+    # The head cannot shrink under the row budget, so cut it at a line
+    # boundary with room for the marker.
+    marker = "… brief truncated at the 16 KB cap"
+    room = _BRIEF_CAP_BYTES - _encoded_len(marker) - 1
+    kept: list[str] = []
+    kept_bytes = 0
+    for line in lines:
+        size = _encoded_len(line) + 1
+        if kept_bytes + size > room:
+            break
+        kept.append(line)
+        kept_bytes += size
+    prefix = "\n".join(kept) + "\n" if kept else ""
+    return f"{prefix}{marker}\n"
 
 
 def _cap_line(count: int) -> str:
