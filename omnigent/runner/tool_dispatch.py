@@ -1959,12 +1959,22 @@ _REMOTE_CHILD_READY_POLL_S = 3.0
 async def _fetch_session_metadata(
     server_client: httpx.AsyncClient,
     session_id: str,
+    *,
+    include_liveness: bool = False,
 ) -> _JsonObject | None:
-    """Read one session's metadata-only snapshot, or ``None`` when unreadable."""
+    """Read one session's metadata-only snapshot, or ``None`` when unreadable.
+
+    :param include_liveness: Request the runner/host liveness lookup. The
+        server returns ``runner_online`` as ``None`` without it, so only the
+        readiness poll opts in.
+    """
+    params = dict(_SESSION_METADATA_PARAMS)
+    if include_liveness:
+        params["include_liveness"] = "true"
     try:
         resp = await server_client.get(
             f"/v1/sessions/{session_id}",
-            params=_SESSION_METADATA_PARAMS,
+            params=params,
             timeout=10.0,
         )
     except (httpx.HTTPError, RuntimeError):
@@ -3207,30 +3217,6 @@ async def _host_readiness(
             reason = reported if isinstance(reported, str) and reported else "not configured"
             return f"harness {harness!r} is not ready there ({reason})", name
     return None, name
-
-
-async def _member_host_dispatch_error(
-    role: str,
-    host_id: str,
-    harness: str | None,
-    *,
-    server_client: httpx.AsyncClient,
-) -> str | None:
-    """
-    Re-check the member's target host at dispatch time.
-
-    :param role: The named sub-agent role, e.g. ``"researcher"``.
-    :param host_id: The member's target host id.
-    :param harness: The member's frozen harness, or ``None`` to skip the
-        harness check.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: An error string naming role, host, and reason, or ``None`` when
-        the host is online and the harness is reported ready.
-    """
-    reason, _name = await _host_readiness(host_id, server_client=server_client, harness=harness)
-    if reason is None:
-        return None
-    return _member_dispatch_unavailable_error(role, host_id, reason)
 
 
 async def _member_workspace_on_host(
@@ -5031,7 +5017,9 @@ async def _wait_for_runner_online(
     timeout = _REMOTE_CHILD_READY_TIMEOUT_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + timeout
     while True:
-        snapshot = await _fetch_session_metadata(server_client, child_session_id)
+        snapshot = await _fetch_session_metadata(
+            server_client, child_session_id, include_liveness=True
+        )
         if snapshot is not None and snapshot.get("runner_online") is True:
             return True
         if time.monotonic() >= deadline:
@@ -5220,12 +5208,26 @@ async def _finalize_created_session(
     )
 
     if isinstance(message, str) and message:
+        # Stamp the dispatch id before the first turn runs, mirroring the
+        # by-id send path: restart recovery finds an undrained create-
+        # dispatched turn through this label. Best effort — a lost stamp
+        # costs one unrecovered turn, never a lost result in this process.
+        work_id = _runner_app.new_subagent_work_id()
+        stamp_error = await _patch_subagent_label(
+            server_client, child_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        )
+        if stamp_error is not None:
+            _logger.warning(
+                "Failed to stamp sub-agent dispatch id for created child=%s: %s",
+                child_id,
+                stamp_error,
+            )
         _runner_app.register_subagent_work(
             parent_session_id=conversation_id,
             child_session_id=child_id,
             agent=agent_label,
             title=label,
-            work_id=_runner_app.new_subagent_work_id(),
+            work_id=work_id,
             remote=remote,
             host_id=host_id if remote else None,
             placement_label=placement_label,
@@ -5391,13 +5393,20 @@ async def _child_session_create_refusal(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The calling session id.
     :param snapshot: The caller's already-read snapshot, or ``None``.
-    :returns: The refusal JSON, or ``None`` when the caller is top-level or
-        its snapshot is unreadable (fail open, matching the create path's
-        existing tolerance of a transient lookup hiccup).
+    :returns: The refusal JSON, ``None`` when the caller is top-level, or a
+        retryable ``caller_lookup_failed`` error when the snapshot is
+        unreadable — unknown parentage must not grant a create.
     """
     if snapshot is None:
         snapshot = await _session_snapshot(server_client, conversation_id)
-    if snapshot is None or not _optional_string(snapshot.get("parent_session_id")):
+    if snapshot is None:
+        return json.dumps(
+            {
+                "error": "caller_lookup_failed",
+                "message": "could not read the calling session; retry",
+            }
+        )
+    if not _optional_string(snapshot.get("parent_session_id")):
         return None
     return json.dumps(
         {
