@@ -47,6 +47,7 @@ const {
   pinnedIdsRef,
   projectSessionsMock,
   useHostsMock,
+  systemStatusSummaryRef,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
@@ -74,6 +75,16 @@ const {
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
   useHostsMock: vi.fn(),
+  // Summary for the "System status" nav indicator; undefined renders the
+  // default ok/green dot with no count.
+  systemStatusSummaryRef: {
+    current: undefined as
+      { revision: number; level: "ok" | "amber" | "red"; findings: { id: string }[] } | undefined,
+  },
+}));
+
+vi.mock("@/hooks/useSystemStatus", () => ({
+  useSystemStatusSummary: () => ({ data: systemStatusSummaryRef.current }),
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -308,6 +319,7 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
   pinnedIdsRef.current = [];
+  systemStatusSummaryRef.current = undefined;
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
   // The bound session's startup signal (send in flight / PTY pending) feeds
@@ -1244,6 +1256,22 @@ describe("Sidebar session list", () => {
     const usage = screen.getByTestId("usage-nav");
     expect(usage).toHaveAttribute("href", "/usage");
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("renders the System status nav dot and finding count from the summary", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    systemStatusSummaryRef.current = {
+      revision: 2,
+      level: "amber",
+      findings: [{ id: "host_1:cpu" }, { id: "host_1:disk" }],
+    };
+    renderSidebar();
+
+    const nav = screen.getByTestId("system-status-nav");
+    expect(nav).toHaveAttribute("href", "/system");
+    expect(within(nav).getByText("System status")).toBeInTheDocument();
+    expect(within(nav).getByTestId("system-status-dot")).toHaveClass("bg-amber-500");
+    expect(within(nav).getByTestId("system-status-count")).toHaveTextContent("2");
   });
 
   it("hides Canvas navigation while the release feature is off", () => {

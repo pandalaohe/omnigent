@@ -202,6 +202,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
     _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _RUNNING_SINCE_LABEL_KEY,
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
@@ -231,6 +232,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_mcp_startup_cache,
+    _session_running_since_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -299,6 +301,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_failure_from_runner_response,
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
+    _note_running_edge,
     _owner_from_grants,
     _parse_background_tasks,
     _parse_external_conversation_item,
@@ -12149,6 +12152,8 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
+                    previous = _session_status_cache.get(session_id)
+                    _note_running_edge(session_id, previous, raw)
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
                         session_live_state.persist_live_status(session_id, raw)
@@ -12356,6 +12361,16 @@ async def _get_session_snapshot(
         if exit_error is not None:
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
+    # The start of the current running period as the server observed it: the
+    # in-memory stamp on the tunnel-holding replica first, the persisted label
+    # as the restart / other-replica fallback. Only meaningful while running.
+    running_since: int | None = None
+    if status == "running":
+        running_since = _session_running_since_cache.get(session_id)
+        if running_since is None:
+            raw_running_since = conv.labels.get(_RUNNING_SINCE_LABEL_KEY)
+            if isinstance(raw_running_since, str) and raw_running_since.isdigit():
+                running_since = int(raw_running_since)
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
@@ -12512,6 +12527,7 @@ async def _get_session_snapshot(
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage
+    response.running_since = running_since
     return response
 
 

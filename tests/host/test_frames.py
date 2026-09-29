@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     HostPostBindHookResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
+    HostResourceSamplingFrame,
+    HostResourceSnapshotFrame,
     HostRunnerExitedFrame,
     HostRunnerLogRunawayFrame,
     HostRunnerStatusFrame,
@@ -61,6 +63,8 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ResourceMachine,
+    ResourceProcessRow,
     classify_launch_refusal,
     decode_host_frame,
     encode_host_frame,
@@ -965,6 +969,164 @@ def test_runner_log_runaway_frame_missing_bytes_raises() -> None:
             '{"kind": "host.runner_log_runaway", "runner_id": "runner_abc123",'
             ' "observed_at": "2026-09-23T09:25:00+00:00"}'
         )
+
+
+def test_resource_snapshot_frame_round_trip() -> None:
+    """Machine metrics, process rows, roles, and attribution survive the wire."""
+    original = HostResourceSnapshotFrame(
+        sampled_at="2026-09-24T09:25:00+00:00",
+        interval_s=60,
+        machine=ResourceMachine(
+            cpu_pct=37.5,
+            mem_used=8 * 1024 * 1024 * 1024,
+            mem_total=16 * 1024 * 1024 * 1024,
+            disk_used=100,
+            disk_total=200,
+            load1=1.25,
+        ),
+        processes=[
+            ResourceProcessRow(
+                pid=100,
+                ppid=1,
+                name="omnigent",
+                role="daemon",
+                session_id=None,
+                cpu_pct=0.5,
+                rss=10,
+                started_at=1_700_000_000.0,
+            ),
+            ResourceProcessRow(
+                pid=200,
+                ppid=100,
+                name="runner",
+                role="runner",
+                session_id="conv_a",
+                cpu_pct=2.0,
+                rss=20,
+                started_at=1_700_000_100.5,
+            ),
+            ResourceProcessRow(
+                pid=0,
+                ppid=200,
+                name="3 other processes",
+                role="folded",
+                session_id="conv_a",
+                cpu_pct=3.0,
+                rss=30,
+            ),
+        ],
+        runner_count=1,
+        sampler_cpu_ms=0.5,
+        monitor_rss_delta=4096,
+    )
+
+    decoded = decode_host_frame(encode_host_frame(original))
+
+    assert decoded == original
+
+
+def test_resource_snapshot_frame_round_trip_without_load() -> None:
+    """A host without a load average (Windows) round-trips ``load1=None``."""
+    original = HostResourceSnapshotFrame(
+        sampled_at="2026-09-24T09:25:00+00:00",
+        interval_s=10,
+        machine=ResourceMachine(
+            cpu_pct=0.0,
+            mem_used=0,
+            mem_total=0,
+            disk_used=0,
+            disk_total=0,
+            load1=None,
+        ),
+        processes=[],
+        runner_count=0,
+        sampler_cpu_ms=0.0,
+        monitor_rss_delta=0,
+    )
+
+    decoded = decode_host_frame(encode_host_frame(original))
+
+    assert decoded == original
+    assert decoded.machine.load1 is None
+
+
+def test_resource_snapshot_frame_without_started_at_decodes_none() -> None:
+    """An older host's row without ``started_at`` decodes it as ``None``."""
+    payload = {
+        "kind": "host.resource_snapshot",
+        "sampled_at": "2026-09-24T09:25:00+00:00",
+        "interval_s": 60,
+        "machine": {
+            "cpu_pct": 0.0,
+            "mem_used": 0,
+            "mem_total": 0,
+            "disk_used": 0,
+            "disk_total": 0,
+            "load1": None,
+        },
+        "processes": [
+            {
+                "pid": 1,
+                "ppid": 0,
+                "name": "omnigent",
+                "role": "daemon",
+                "session_id": None,
+                "cpu_pct": 0.0,
+                "rss": 0,
+            }
+        ],
+        "runner_count": 0,
+        "sampler_cpu_ms": 0.0,
+        "monitor_rss_delta": 0,
+    }
+
+    decoded = decode_host_frame(json.dumps(payload))
+
+    assert isinstance(decoded, HostResourceSnapshotFrame)
+    assert decoded.processes[0].started_at is None
+
+
+def test_resource_snapshot_frame_rejects_unknown_process_role() -> None:
+    """A role outside the sampler's vocabulary is malformed, not attributed."""
+    payload = {
+        "kind": "host.resource_snapshot",
+        "sampled_at": "2026-09-24T09:25:00+00:00",
+        "interval_s": 60,
+        "machine": {
+            "cpu_pct": 0.0,
+            "mem_used": 0,
+            "mem_total": 0,
+            "disk_used": 0,
+            "disk_total": 0,
+            "load1": None,
+        },
+        "processes": [
+            {
+                "pid": 1,
+                "ppid": 0,
+                "name": "mystery",
+                "role": "mystery",
+                "session_id": None,
+                "cpu_pct": 0.0,
+                "rss": 0,
+            }
+        ],
+        "runner_count": 0,
+        "sampler_cpu_ms": 0.0,
+        "monitor_rss_delta": 0,
+    }
+    with pytest.raises(ValueError, match="role"):
+        decode_host_frame(json.dumps(payload))
+
+
+def test_resource_sampling_frame_round_trip() -> None:
+    """A fast-mode lease carries its interval and lease intact."""
+    original = HostResourceSamplingFrame(interval_s=10, lease_s=40)
+
+    decoded = decode_host_frame(encode_host_frame(original))
+
+    assert isinstance(decoded, HostResourceSamplingFrame)
+    assert decoded == original
 
 
 def test_runner_status_frame_round_trip() -> None:

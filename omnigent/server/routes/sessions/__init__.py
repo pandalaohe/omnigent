@@ -957,6 +957,18 @@ def create_sessions_router(
         user_preferences_store=user_preferences_store,
     )
 
+    from omnigent.server.routes.sessions.routes_collab_settings import (
+        register_collab_settings_routes,
+    )
+
+    register_collab_settings_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        user_preferences_store=user_preferences_store,
+    )
+
     register_items_routes(
         router,
         conversation_store=conversation_store,

@@ -741,7 +741,7 @@ class SysSessionListTool(Tool):
 
 class SysSessionGetInfoTool(Tool):
     """
-    Return a single session's metadata snapshot (no transcript).
+    Return one or many sessions' metadata snapshots (no transcript).
 
     A **global read**: resolves against any session the caller is
     permitted to access (bounded by the server's per-user permission
@@ -749,16 +749,26 @@ class SysSessionGetInfoTool(Tool):
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, parent
-    linkage, workspace / git branch, persisted last-activity time, and
-    the count of outstanding approval prompts. Comparing
-    ``last_activity_at`` across polls distinguishes a running session that
-    is advancing from one whose persisted output has stalled. For the
+    linkage, workspace / git branch, persisted last-activity time,
+    outstanding approval prompts, cost, context usage, last error, archive
+    state, and a last-message excerpt.
+
+    Durations (``age_seconds``, ``idle_seconds``, ``running_seconds``) are
+    computed on the server's clock, so a runner on another host can't skew
+    them. ``running_since`` is the start of the current running period as
+    the server observes status; for a claude-native session without its
+    status file a quiet lull reads as idle and restarts it. Comparing
+    ``running_since`` / ``last_activity_at`` across polls distinguishes a
+    running session that is advancing from one that has stalled. For the
     conversation transcript, use
     ``sys_session_get_history`` instead. List rows carry project,
     workspace, last activity time and a last-message excerpt.
 
     ``session_id`` is optional — when omitted, the caller's own
-    session is described.
+    session is described. ``session_ids`` describes several sessions in one
+    call (1..20, de-duplicated, input order kept) and returns
+    ``{"sessions": [...]}`` with a per-item error for an unknown or
+    inaccessible id.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
     (plus best-effort runner status and host readiness lookups) and projects
@@ -776,14 +786,20 @@ class SysSessionGetInfoTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Return a session's metadata: lifecycle status, title, "
+            "Return one or more sessions' metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
-            "parent session, workspace, "
-            "persisted last-activity time, and outstanding approval "
-            "prompts. Global read — any "
-            "session you can access. Pass session_id to target another "
-            "session; omit it to describe your own. Metadata only — "
+            "parent session, workspace, persisted last-activity time, "
+            "outstanding approval prompts, cost, context usage, last error, "
+            "archive state, and a last-message excerpt. Durations "
+            "(age_seconds, idle_seconds, running_seconds) are computed on the "
+            "server clock; running_since is the start of the current running "
+            "period as the server observes status (for claude-native without "
+            "its status file, a quiet lull reads as idle and restarts it). "
+            "Global read — any session you can access. Pass session_id to "
+            "target one session, or session_ids (up to 20) to describe many "
+            'in one call as {"sessions": [...]} with per-item errors; omit '
+            "both to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript, "
             "including a peer's full history."
         )
@@ -793,7 +809,8 @@ class SysSessionGetInfoTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; ``session_id`` is optional.
+            ``"function"`` sub-dict; ``session_id`` / ``session_ids`` are
+            optional and mutually exclusive.
         """
         return {
             "type": "function",
@@ -810,7 +827,23 @@ class SysSessionGetInfoTool(Tool):
                                 "describe, e.g. 'conv_abc123'. Get this "
                                 "from sys_session_list or a prior "
                                 "sys_session_send handle. Omit to "
-                                "describe the calling session itself."
+                                "describe the calling session itself. "
+                                "Mutually exclusive with session_ids."
+                            ),
+                        },
+                        "session_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "description": (
+                                "Several sessions (conversation_ids) to "
+                                "describe in one call, e.g. ['conv_a', "
+                                "'conv_b']. De-duplicated; input order kept. "
+                                'Returns {"sessions": [...]} with one item '
+                                "per id — an unknown or inaccessible id "
+                                "yields an error item instead of failing the "
+                                "call. Mutually exclusive with session_id."
                             ),
                         },
                     },

@@ -50,6 +50,7 @@ from omnigent.tools.builtins import (
     any_skill_has_resources,
     get_builtin_tool,
 )
+from omnigent.tools.builtins.flow import SysFlowCancelTool, SysFlowListTool, SysFlowStartTool
 from omnigent.tools.builtins.handoff import SysHandoffReportTool, SysSessionHandoffTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
@@ -347,9 +348,15 @@ class ToolManager:
             an already-registered tool. Defensive — should not
             happen given the standard registration order.
         """
-        if not self._spec.timers:
-            return
-        for tool in (SysTimerSetTool(), SysTimerCancelTool()):
+        tools: list[Tool] = []
+        # The session-collaboration flag also grants timers, so every session
+        # with collaboration on (native ones included) can schedule its wake.
+        if self._spec.timers or self._peer_messaging_enabled:
+            tools += [SysTimerSetTool(), SysTimerCancelTool()]
+        # Flows (time composed with tool calls) are collaboration tools.
+        if self._peer_messaging_enabled:
+            tools += [SysFlowStartTool(), SysFlowListTool(), SysFlowCancelTool()]
+        for tool in tools:
             if tool.name() in self._tools:
                 raise ValueError(
                     f"sys_timer_* tool {tool.name()!r} collides with an already-registered tool"
