@@ -62,6 +62,8 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.runner import flows
+from omnigent.runner.flows import FLOW_TOOL_NAMES
 from omnigent.runtime import pending_elicitations
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -105,6 +107,7 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalReadTool,
     SysTerminalSendTool,
 )
+from omnigent.tools.builtins.flow import validate_flow_start_args
 from omnigent.tools.builtins.timer import (
     # Shared with the in-process sys_timer_set tool so the runner's firing
     # loop validates the same argument shape and delay ceiling the LLM-facing
@@ -372,6 +375,10 @@ _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 
+# Priority 5g.1: Flow tools — runner-local flows (time composed with tool
+# calls, one wake at the end). Gated with the timer tools on ``timers:``.
+_FLOW_TOOLS = FLOW_TOOL_NAMES
+
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
 # included in the tool surface only when smart routing is enabled.
 _ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
@@ -517,6 +524,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
+    # Timers and flows: a native session is woken only by a server event, so
+    # the runner-side wake tools must ride the relay (ToolManager gates them).
+    | _TIMER_TOOLS
+    | _FLOW_TOOLS
 )
 
 
@@ -683,6 +694,25 @@ def build_native_relay_tool_schemas(
 
             for cls in (SysSessionHandoffTool, SysHandoffReportTool):
                 function = _string_object_dict(cls().get_schema().get("function"))
+                if function is not None:
+                    _append(function)
+        if peer_messaging_enabled:
+            # Timers and flows follow the manager's collaboration-flag rule.
+            from omnigent.tools.builtins.flow import (
+                SysFlowCancelTool,
+                SysFlowListTool,
+                SysFlowStartTool,
+            )
+            from omnigent.tools.builtins.timer import SysTimerCancelTool, SysTimerSetTool
+
+            for timed_cls in (
+                SysTimerSetTool,
+                SysTimerCancelTool,
+                SysFlowStartTool,
+                SysFlowListTool,
+                SysFlowCancelTool,
+            ):
+                function = _string_object_dict(timed_cls().get_schema().get("function"))
                 if function is not None:
                     _append(function)
 
@@ -957,6 +987,7 @@ _ALL_LOCAL_TOOLS = (
     | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
+    | _FLOW_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
     | _COMMENT_TOOLS
@@ -5471,6 +5502,8 @@ async def _execute_timer_set(
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
+    if not await flows.read_flow_timer_enabled(server_client, conversation_id):
+        return json.dumps({"error": flows.FLOW_TIMER_OFF_ERROR})
 
     timer_id = f"timer_{uuid.uuid4().hex}"
     task = asyncio.create_task(
@@ -5520,6 +5553,9 @@ async def _timer_loop(
     try:
         while True:
             await asyncio.sleep(seconds)
+            # Settings row ``flow_timer_enabled`` turned off → stop, no wake.
+            if not await flows.read_flow_timer_enabled(server_client, conversation_id):
+                break
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
@@ -5553,6 +5589,48 @@ async def _timer_loop(
         return
     finally:
         _app.unregister_timer(conversation_id, timer_id)
+
+
+async def _execute_flow_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    **context: object,
+) -> str:
+    """
+    Dispatch ``sys_flow_start`` / ``sys_flow_list`` / ``sys_flow_cancel``.
+
+    :param tool_name: One of :data:`_FLOW_TOOLS`.
+    :param args: Parsed tool arguments.
+    :param server_client: httpx client for settings reads, policy checks and
+        the end wake.
+    :param conversation_id: Calling session, e.g. ``"conv_abc123"``.
+    :param context: The remaining ``execute_tool`` keyword arguments, captured
+        into :class:`~omnigent.runner.flows.FlowContext` for the flow's steps.
+    :returns: JSON tool output.
+    """
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a conversation context"})
+    if tool_name == "sys_flow_list":
+        return flows.list_flows(conversation_id)
+    if tool_name == "sys_flow_cancel":
+        flow_id = args.get("flow_id")
+        if not isinstance(flow_id, str) or not flow_id:
+            return json.dumps({"error": "flow_id is required"})
+        return await flows.cancel_flow(conversation_id, flow_id)
+    plan = validate_flow_start_args(args)
+    if isinstance(plan, str):
+        return json.dumps({"error": plan})
+    if server_client is None:
+        return json.dumps({"error": "sys_flow_start requires server_client"})
+    ctx = flows.FlowContext(
+        server_client=server_client,
+        conversation_id=conversation_id,
+        **context,  # type: ignore[arg-type]
+    )
+    return await flows.start_flow(plan, ctx)
 
 
 async def _execute_timer_cancel(
@@ -8002,6 +8080,23 @@ async def execute_tool(
                     args,
                     conversation_id=conversation_id,
                 )
+        elif tool_name in _FLOW_TOOLS:
+            output = await _execute_flow_tool(
+                tool_name,
+                args,
+                server_client=server_client,
+                terminal_registry=terminal_registry,
+                resource_registry=resource_registry,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                runner_workspace=runner_workspace,
+                local_tool_workdir=local_tool_workdir,
+                filesystem_registry=filesystem_registry,
+                effective_harness=effective_harness,
+            )
         elif tool_name in _TASK_LIFECYCLE_TOOLS:
             output = await _execute_task_lifecycle_tool(
                 args,
