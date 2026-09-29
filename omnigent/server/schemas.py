@@ -86,6 +86,7 @@ UserPreferenceNamespace = Literal[
     "agent_pins",
     "calling_defaults",
     "calling_last",
+    "session_collab",
 ]
 
 
