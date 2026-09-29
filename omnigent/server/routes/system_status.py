@@ -49,9 +49,9 @@ def create_system_status_router(
 
     async def _is_admin(request: Request) -> bool:
         """Whether the caller may see the server card and all hosts."""
+        user_id = require_user(request, auth_provider)
         if permission_store is None:
             return True
-        user_id = require_user(request, auth_provider)
         if user_id is None:
             return False
         return await asyncio.to_thread(permission_store.is_admin, user_id)

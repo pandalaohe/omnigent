@@ -63,7 +63,7 @@ def _host(host_id: str, name: str, user_id: str, status: str = "online") -> Host
 def _build(
     tmp_path: Path,
     *,
-    admins: tuple[str, ...] = ("admin@example.com",),
+    admins: tuple[str, ...] | None = ("admin@example.com",),
     hosts: list[Host] | None = None,
     host_versions: Callable[[list[str]], dict[str, str]] | None = None,
 ) -> tuple[TestClient, SystemStatusHub]:
@@ -79,7 +79,7 @@ def _build(
         create_system_status_router(
             _HostStore(hosts or []),
             auth_provider=_AuthProvider(),
-            permission_store=_PermissionStore(*admins),
+            permission_store=_PermissionStore(*admins) if admins is not None else None,
             host_versions=host_versions,
         ),
         prefix="/v1",
@@ -243,6 +243,18 @@ def test_anonymous_requests_get_401(tmp_path: Path) -> None:
     assert client.get("/v1/system/brief").status_code == 401
     assert client.get("/v1/system/settings").status_code == 401
     assert client.put("/v1/system/settings", json={"cpu_pct": 70}).status_code == 401
+
+
+def test_anonymous_gets_401_without_permission_store(tmp_path: Path) -> None:
+    """Auth configured without a permission store still rejects anonymous callers."""
+    client, _hub = _build(tmp_path, admins=None)
+
+    assert client.get("/v1/system/status").status_code == 401
+    assert client.get("/v1/system/settings").status_code == 401
+    assert client.put("/v1/system/settings", json={"cpu_pct": 70}).status_code == 401
+
+    admin = client.get("/v1/system/settings", headers={"X-Test-User": "admin@example.com"})
+    assert admin.status_code == 200
 
 
 def test_settings_admin_only_with_validation(tmp_path: Path) -> None:
