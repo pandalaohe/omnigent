@@ -2342,6 +2342,21 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param running_since: Epoch seconds at which the current running period
+        began, as the server observed the status edge that opened it; ``None``
+        whenever the snapshot status is not ``"running"``. The server's
+        observation, not a harness turn id: for a session whose harness owns
+        the status directly (relay / SDK / codex-native / claude-native with
+        its status file) it is the turn start, while a claude-native session
+        on the PTY fallback reports a quiet lull as ``"idle"`` and restarts
+        this stamp when activity resumes. The in-memory stamp wins; the
+        persisted ``omnigent.running_since`` label is the fallback after a
+        server restart or on a replica without the runner tunnel.
+    :param last_message_preview: One-line excerpt of the session's newest
+        visible message. Filled only when the request asked with
+        ``include_preview=true`` (default ``false``, and never for callers
+        that don't ask); ``None`` otherwise or when the session has no
+        visible messages.
     """
 
     id: str
@@ -2418,6 +2433,8 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    running_since: int | None = None
+    last_message_preview: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
