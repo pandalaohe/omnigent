@@ -44,8 +44,6 @@ def collab_owner_for(
     conv: Conversation,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
-    *,
-    fallback_user: str | None = None,
 ) -> str:
     """Return the user whose collaboration settings govern *conv*.
 
@@ -57,17 +55,13 @@ def collab_owner_for(
     :param conv: The session row.
     :param conversation_store: Store used for the parent walk.
     :param permission_store: Permission store, or ``None``.
-    :param fallback_user: Caller-known user id, used when no owner grant
-        resolves (e.g. a create request's authenticated user).
     :returns: The owner user id, never ``None``.
     """
     # Lazy: routes_peer imports the orchestration module, so a module-level
     # import here would close the cycle.
     from omnigent.server.routes.sessions.routes_peer import effective_owner_id
 
-    return effective_owner_id(conv, conversation_store, permission_store) or (
-        fallback_user or RESERVED_USER_LOCAL
-    )
+    return effective_owner_id(conv, conversation_store, permission_store) or RESERVED_USER_LOCAL
 
 
 def session_peer_enabled(

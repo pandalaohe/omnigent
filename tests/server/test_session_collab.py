@@ -8,6 +8,7 @@ a seeded store.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import uuid
 from typing import Any
@@ -183,17 +184,11 @@ async def test_master_off_refuses_sends_but_not_system(collab_env: dict[str, Any
 # ── session_collab helpers ──────────────────────────────────────────
 
 
-def test_collab_owner_for_prefers_the_grant_then_the_fallback() -> None:
-    """Without a permission store the fallback user or the local user wins."""
+def test_collab_owner_for_defaults_to_the_local_user() -> None:
+    """Without a permission store the reserved local user wins."""
     conversation = _conversation()
 
     assert collab_owner_for(conversation, None, None) == RESERVED_USER_LOCAL  # type: ignore[arg-type]
-    assert (
-        collab_owner_for(  # type: ignore[arg-type]
-            conversation, None, None, fallback_user="alice@example.com"
-        )
-        == "alice@example.com"
-    )
 
 
 def test_session_peer_enabled_reads_the_owner_switch(db_uri: str) -> None:
@@ -492,4 +487,86 @@ async def test_invalidation_forgets_the_applied_peer_value() -> None:
     state["enabled"] = False
     initializer.invalidate_session(conversation.id)
     assert not initializer._applied_peer
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+
+class _HoldableClient:
+    """Fake runner client whose POST blocks until released, recording bodies."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
+        self.calls.append(kwargs["json"])
+        self.entered.set()
+        await self.release.wait()
+        return httpx.Response(201, json={"status": "initialized"})
+
+
+@pytest.mark.asyncio
+async def test_initialize_retries_when_a_joined_post_carries_a_stale_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on → in-flight off → on: the joined off post must not win."""
+    state = {"enabled": True}
+    registry = _Registry()
+    initializer = RunnerSessionInitializer(
+        registry,  # type: ignore[arg-type]
+        server_version="test",
+        peer_messaging_resolver=lambda _conv: state["enabled"],
+    )
+    conversation = _conversation()
+    client = _HoldableClient()
+
+    joined: list[asyncio.Task[httpx.Response]] = []
+    real_shield = asyncio.shield
+
+    def _spy_shield(awaitable: Any) -> Any:
+        task = asyncio.ensure_future(awaitable)
+        joined.append(task)
+        return real_shield(task)
+
+    monkeypatch.setattr(asyncio, "shield", _spy_shield)
+
+    client.release.set()
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 1
+    assert _peer_flag(client.calls[0]) is True
+
+    # The switch flips off and its post is still in flight.
+    state["enabled"] = False
+    client.entered.clear()
+    client.release.clear()
+    off = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    assert _peer_flag(client.calls[-1]) is False
+
+    # The switch flips back on while the off post is pending: the generation
+    # will carry the pending value, so the resolved flag is stale.
+    state["enabled"] = True
+    assert await initializer.peer_flag_stale(conversation, client) is True  # type: ignore[arg-type]
+
+    # A new call resolves the on value and joins the in-flight off post.
+    joined.clear()
+    on = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+
+    async def _joined_off_post() -> None:
+        while not joined:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(_joined_off_post(), timeout=5)
+    assert len(client.calls) == 2, "the second call must join, not post a third time"
+
+    client.release.set()
+    await asyncio.gather(off, on)
+
+    # The joined off post applied False; the on call posts once more with the
+    # latest resolved value and the applied snapshot follows it.
+    assert len(client.calls) == 3
+    assert _peer_flag(client.calls[-1]) is True
+    pkey = (conversation.runner_id or "", id(registry.connection), conversation.id)
+    assert initializer._applied_peer[pkey] is True
+    assert not initializer._pending_peer
     assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
