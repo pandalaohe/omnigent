@@ -29,8 +29,15 @@ export function isHostColorKey(value: unknown): value is HostColorKey {
   return typeof value === "string" && BY_KEY.has(value);
 }
 
-/** User picks keyed by host id; absent entries fall back to the automatic colour. */
-export type HostColorPreferences = Record<string, HostColorKey>;
+/**
+ * Stored tombstone for "reset to automatic"; read exactly like an absent
+ * key. A reset must write it because preference patches shallow-merge and
+ * cannot delete a host's key.
+ */
+export const AUTO_HOST_COLOR = "auto";
+
+/** User picks keyed by host id; absent and ``"auto"`` entries fall back to the automatic colour. */
+export type HostColorPreferences = Record<string, HostColorKey | typeof AUTO_HOST_COLOR>;
 
 export const LOCAL_HOST_LABEL = "Local machine";
 

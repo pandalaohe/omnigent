@@ -6,7 +6,12 @@ import { Switch } from "@/components/ui/switch";
 import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
-import { HOST_COLORS, hostDisplayName, type HostColorPreferences } from "@/lib/hostColors";
+import {
+  HOST_COLORS,
+  hostDisplayName,
+  AUTO_HOST_COLOR,
+  type HostColorPreferences,
+} from "@/lib/hostColors";
 import { patchHostColor } from "@/lib/hostColorPreferences";
 import { Link } from "@/lib/routing";
 import {
@@ -99,7 +104,8 @@ function SettingRow({
  * automatic hash colour. Rows with no pick read "Automatic".
  */
 function HostColorRow({ host, preferences }: { host: Host; preferences: HostColorPreferences }) {
-  const selected = preferences[host.host_id] ?? null;
+  const stored = preferences[host.host_id];
+  const selected = stored === undefined || stored === AUTO_HOST_COLOR ? null : stored;
   const name = hostDisplayName(host.host_id, host);
   return (
     <div

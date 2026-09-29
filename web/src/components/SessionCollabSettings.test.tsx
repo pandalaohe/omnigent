@@ -119,7 +119,8 @@ describe("SessionCollabSettings", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reset to automatic" }));
 
-    expect(readHostColorPreferences()).toEqual({});
+    expect(readHostColorPreferences()).toEqual({ "host-1": "auto" });
     expect(screen.queryByRole("button", { name: "Reset to automatic" })).toBeNull();
+    expect(screen.getAllByTestId("host-color-row")[0]).toHaveTextContent("Automatic");
   });
 });

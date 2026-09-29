@@ -7506,13 +7506,13 @@ function applyChildSessionUpdated(
     return;
   }
   if (patch.archived === true) {
-    // Archived: leave the active list now. The prefix invalidation cancels a
-    // list fetch already in flight (it would otherwise land the row again)
-    // and refetches both zones.
+    // Invalidation cancels only observed queries; an unmounted panel's
+    // in-flight fetch would land the archived row again, so cancel it here.
     queryClient.setQueryData<ChildSessionInfo[]>(
       key,
       current.filter((c) => c.id !== childId),
     );
+    void queryClient.cancelQueries({ queryKey: key, exact: true }, { revert: false });
     queryClient.invalidateQueries({ queryKey: key });
     return;
   }

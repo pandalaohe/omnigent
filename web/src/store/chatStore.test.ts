@@ -9463,6 +9463,70 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       unsubscribe();
     });
 
+    it("keeps an archived child out when its list query lost every observer mid-fetch", async () => {
+      // The Agents panel unmounts while the active list is refetching, so
+      // default invalidation would not cancel that unobserved request; its
+      // stale response would land the archived row and a remount inside the
+      // staleTime window would show it without fetching.
+      const key = childSessionsQueryKey("conv_parent");
+      const staleRow: ChildSessionInfo = {
+        id: "conv_child1",
+        title: "researcher:auth",
+        task_summary: null,
+        tool: "researcher",
+        session_name: "auth",
+        current_task_status: "completed",
+        busy: false,
+        last_message_preview: "done",
+        pending_elicitations_count: 0,
+      };
+      let calls = 0;
+      let resolveFirst!: (rows: ChildSessionInfo[]) => void;
+      // The same options `useChildSessions` passes to useQuery.
+      const hookOptions = {
+        queryKey: key,
+        queryFn: () => {
+          calls += 1;
+          return new Promise<ChildSessionInfo[]>((resolve) => {
+            resolveFirst = resolve;
+          });
+        },
+        staleTime: 60_000,
+        retry: false,
+        refetchOnMount: false,
+      };
+      client.setQueryData<ChildSessionInfo[]>(key, [staleRow]);
+      const observer = new QueryObserver<ChildSessionInfo[]>(client, hookOptions);
+      const unsubscribe = observer.subscribe(() => {});
+      const pending = observer.refetch();
+      await vi.waitFor(() => expect(calls).toBe(1));
+
+      unsubscribe();
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          archived: true,
+          archived_at: 1_700_000_000,
+          busy: false,
+          last_message_preview: "done",
+        },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(key)).toEqual([]);
+
+      resolveFirst([staleRow]);
+      await pending;
+
+      const remounted = new QueryObserver<ChildSessionInfo[]>(client, hookOptions);
+      const unsubscribeRemounted = remounted.subscribe(() => {});
+      expect(remounted.getCurrentResult().data).toEqual([]);
+      // Refetch-on-mount is off, so the stale response is the only fetch.
+      expect(calls).toBe(1);
+      unsubscribeRemounted();
+    });
+
     it("does not resurrect an archived child on a later status delta", () => {
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
       const spy = vi.spyOn(client, "invalidateQueries");

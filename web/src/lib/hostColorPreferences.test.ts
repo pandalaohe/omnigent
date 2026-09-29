@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type * as HostColorPreferencesModule from "./hostColorPreferences";
+import {
+  HOST_COLORS_STORAGE_KEY,
+  normalizeHostColorPreferences,
+  patchHostColor,
+  readHostColorPreferences,
+} from "./hostColorPreferences";
 
 const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
 
@@ -8,63 +13,58 @@ vi.mock("./userPreferencesSync", () => ({
   queueUserPreferencePatch: queuePatchMock,
 }));
 
-let hostColorPreferences: typeof HostColorPreferencesModule;
-
-beforeEach(async () => {
+beforeEach(() => {
   localStorage.clear();
   queuePatchMock.mockReset();
-  // `patchHostColor` remembers this page session's changed keys, so each test
-  // needs a fresh module rather than the previous test's union.
-  vi.resetModules();
-  hostColorPreferences = await import("./hostColorPreferences");
 });
 
 describe("hostColorPreferences", () => {
-  it("drops unknown keys, unknown palette values, nulls and non-strings", () => {
+  it("drops unknown keys, unknown palette values, nulls and non-strings, keeps auto", () => {
     expect(
-      hostColorPreferences.normalizeHostColorPreferences({
+      normalizeHostColorPreferences({
         h1: "purple",
         h2: "chartreuse",
         h3: null,
         h4: 7,
+        h5: "auto",
         "": "blue",
       }),
-    ).toEqual({ h1: "purple" });
-    expect(hostColorPreferences.normalizeHostColorPreferences(null)).toEqual({});
-    expect(hostColorPreferences.normalizeHostColorPreferences(["purple"])).toEqual({});
+    ).toEqual({ h1: "purple", h5: "auto" });
+    expect(normalizeHostColorPreferences(null)).toEqual({});
+    expect(normalizeHostColorPreferences(["purple"])).toEqual({});
   });
 
-  it("queues the union of changed keys and mirrors the full map locally", () => {
-    hostColorPreferences.patchHostColor("h1", "purple");
+  it("queues the full local map and mirrors it locally", () => {
+    patchHostColor("h1", "purple");
     expect(queuePatchMock).toHaveBeenLastCalledWith("host_colors", { h1: "purple" });
 
-    hostColorPreferences.patchHostColor("h2", "green");
+    patchHostColor("h2", "green");
     expect(queuePatchMock).toHaveBeenLastCalledWith("host_colors", {
       h1: "purple",
       h2: "green",
     });
-    expect(
-      JSON.parse(localStorage.getItem(hostColorPreferences.HOST_COLORS_STORAGE_KEY) ?? "null"),
-    ).toEqual({
+    expect(JSON.parse(localStorage.getItem(HOST_COLORS_STORAGE_KEY) ?? "null")).toEqual({
       h1: "purple",
       h2: "green",
     });
   });
 
-  it("resets one host with an explicit null patch and drops it from the mirror", () => {
-    hostColorPreferences.patchHostColor("h1", "purple");
-    hostColorPreferences.patchHostColor("h1", null);
+  it("resets one host to the auto tombstone in the patch and the mirror", () => {
+    patchHostColor("h1", "purple");
+    patchHostColor("h1", null);
 
-    expect(queuePatchMock).toHaveBeenLastCalledWith("host_colors", { h1: null });
-    expect(hostColorPreferences.readHostColorPreferences()).toEqual({});
-    expect(localStorage.getItem(hostColorPreferences.HOST_COLORS_STORAGE_KEY)).toBeNull();
+    expect(queuePatchMock).toHaveBeenLastCalledWith("host_colors", { h1: "auto" });
+    expect(readHostColorPreferences()).toEqual({ h1: "auto" });
+    expect(JSON.parse(localStorage.getItem(HOST_COLORS_STORAGE_KEY) ?? "null")).toEqual({
+      h1: "auto",
+    });
   });
 
   it("sanitizes malformed stored values on read", () => {
     localStorage.setItem(
-      hostColorPreferences.HOST_COLORS_STORAGE_KEY,
-      JSON.stringify({ h1: "purple", h2: null, h3: "nope" }),
+      HOST_COLORS_STORAGE_KEY,
+      JSON.stringify({ h1: "purple", h2: null, h3: "nope", h4: "auto" }),
     );
-    expect(hostColorPreferences.readHostColorPreferences()).toEqual({ h1: "purple" });
+    expect(readHostColorPreferences()).toEqual({ h1: "purple", h4: "auto" });
   });
 });
