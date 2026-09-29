@@ -88,6 +88,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsWriteTool,
 )
 from omnigent.tools.builtins.panel import OpenInPanelTool
+from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -315,6 +316,10 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# Priority 5f.0b: Archive / unarchive any session the user owns, over the same
+# owner-gated PATCH /v1/sessions/{id} the web archive uses.
+_SESSION_ARCHIVE_TOOLS = frozenset({SysSessionArchiveTool.name(), SysSessionUnarchiveTool.name()})
+
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
 _SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"][
@@ -496,6 +501,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _SESSION_ARCHIVE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _HANDOFF_TOOLS
@@ -694,7 +700,12 @@ def build_native_relay_tool_schemas(
                     _append(function)
             from omnigent.tools.builtins.handoff import SysHandoffReportTool, SysSessionHandoffTool
 
-            for cls in (SysSessionHandoffTool, SysHandoffReportTool):
+            for cls in (
+                SysSessionHandoffTool,
+                SysHandoffReportTool,
+                SysSessionArchiveTool,
+                SysSessionUnarchiveTool,
+            ):
                 function = _string_object_dict(cls().get_schema().get("function"))
                 if function is not None:
                     _append(function)
@@ -983,6 +994,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _SESSION_ARCHIVE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _NIMBLE_RESEARCH_TOOLS
@@ -1494,6 +1506,7 @@ async def _list_child_sessions(
     limit: int = 100,
     tool: str | None = None,
     session_name: str | None = None,
+    include_archived: bool = False,
 ) -> list[_JsonObject] | str:
     """
     Fetch child-session summaries for a parent session.
@@ -1505,12 +1518,16 @@ async def _list_child_sessions(
         children whose title is ``"{tool}:{session_name}"``
         server-side.
     :param session_name: See ``tool``.
+    :param include_archived: When ``True``, archived children are
+        returned too (each row carries ``archived``).
     :returns: List of child summary dicts, or an error string.
     """
     params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if tool and session_name:
         params["tool"] = tool
         params["session_name"] = session_name
+    if include_archived:
+        params["include_archived"] = "true"
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}/child_sessions",
         params=params,
@@ -1547,7 +1564,8 @@ async def _find_existing_child_session(
     :param agent: Sub-agent name, e.g. ``"claude"``.
     :param title: Caller-chosen child title, e.g. ``"issue-1756"``.
     :returns: Matching child summary, ``None`` when absent, or an error
-        string when the server lookup failed.
+        string when the server lookup failed or the matching child is
+        archived (its name is taken but cannot be woken).
     """
     children = await _list_child_sessions(
         server_client=server_client,
@@ -1555,6 +1573,7 @@ async def _find_existing_child_session(
         limit=1,
         tool=agent,
         session_name=title,
+        include_archived=True,
     )
     if isinstance(children, str):
         return children
@@ -1569,6 +1588,18 @@ async def _find_existing_child_session(
         session_title = title_value if isinstance(title_value, str) else None
         if is_session_closed(labels, session_title):
             continue
+        if child.get("archived") is True:
+            return json.dumps(
+                {
+                    "error": "session_archived",
+                    "conversation_id": child.get("id"),
+                    "message": (
+                        "this (agent, title) sub-agent session is archived; "
+                        "unarchive it with sys_session_unarchive to continue, "
+                        "or sys_session_close it to free the name."
+                    ),
+                }
+            )
         return child
     return None
 
@@ -6282,11 +6313,19 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        archived = args.get("archived", "exclude")
+        if archived not in ("exclude", "include", "only"):
+            return json.dumps(
+                {"error": "sys_session_list 'archived' must be one of exclude, include, only"}
+            )
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            {
+                "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+                "archived": archived,
+            },
         )
         if isinstance(window, str):
             return window
@@ -6298,6 +6337,7 @@ async def _execute_session_query_tool(
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
+            archived=archived,
         )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
@@ -7334,6 +7374,7 @@ async def _session_list_via_rest(
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
+    archived: str = "exclude",
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -7343,9 +7384,10 @@ async def _session_list_via_rest(
     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
     permission-bounded list of every session the caller can access, each
     annotated with status + runner connectivity, optionally filtered by
-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
-    best-effort: a failure in either view yields an empty list for it
-    rather than failing the whole call.
+    ``agent_name`` and by the archived view — see
+    :func:`_collect_global_sessions`. Both are best-effort: a failure in
+    either view yields an empty list for it rather than failing the whole
+    call.
 
     :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -7354,6 +7396,9 @@ async def _session_list_via_rest(
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
+    :param archived: Archived-session view for the global list —
+        ``"exclude"`` (default), ``"include"``, or ``"only"``. Joins the
+        cursor's filter set so a cursor cannot be replayed under another view.
     :returns: The legacy complete JSON result while it fits, otherwise a
         bounded page with continuation metadata.
     """
@@ -7366,6 +7411,7 @@ async def _session_list_via_rest(
             agent_name,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
+            archived=archived,
         )
     )
     return _bounded_discovery_result(
@@ -7374,7 +7420,10 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters={
+            "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+            "archived": archived,
+        },
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -7477,6 +7526,139 @@ async def _rename_current_session_via_rest(
     return json.dumps({"renamed": True, "title": updated_title, "reason": None})
 
 
+# Bound on the caller-ancestry walk; deeper trees fail safe to "in lineage".
+_ARCHIVE_LINEAGE_MAX_HOPS = 32
+
+
+def _archive_error(tool_name: str, resp: httpx.Response, session_id: str) -> str:
+    """Map a non-2xx session PATCH to the archive tools' typed errors."""
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": session_id})
+    if resp.status_code in (401, 403):
+        return json.dumps(
+            {
+                "error": "access_denied",
+                "session_id": session_id,
+                "message": "only the session owner can archive or unarchive it.",
+            }
+        )
+    detail = _omnigent_error_message(resp)
+    return json.dumps(
+        {
+            "error": f"{tool_name} returned {resp.status_code}",
+            **({"detail": detail} if detail else {}),
+        }
+    )
+
+
+async def _caller_lineage_contains(
+    target_id: str,
+    caller_id: str,
+    server_client: httpx.AsyncClient,
+) -> bool:
+    """
+    Return whether ``target_id`` is the caller or one of its ancestors.
+
+    Archiving a session tears down its whole subtree, so the caller's own
+    turn is at risk exactly when this holds. Any lookup failure fails safe
+    to ``True``: the teardown then waits for the turn instead of cutting it.
+
+    :param target_id: Session being archived, e.g. ``"conv_root"``.
+    :param caller_id: The calling session id, e.g. ``"conv_child"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the caller sits in the target's subtree.
+    """
+    current: str | None = caller_id
+    for _hop in range(_ARCHIVE_LINEAGE_MAX_HOPS):
+        if current is None:
+            return False
+        if current == target_id:
+            return True
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{current}",
+                params={"include_items": "false", "include_liveness": "false"},
+                timeout=30.0,
+            )
+        except Exception:  # noqa: BLE001
+            return True
+        if resp.status_code != 200:
+            return True
+        body = _string_object_dict(resp.json())
+        if body is None:
+            return True
+        current = _optional_string(body.get("parent_session_id"))
+    return True
+
+
+async def _session_archive_via_rest(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Archive or unarchive a session through ``PATCH /v1/sessions/{id}``.
+
+    Same route and owner gate as the web archive: the server requires owner
+    access, applies the 8-second undo window and the Host's stop-on-archive
+    policy. A target that is the caller or its ancestor is archived with
+    ``stop_when_idle`` so the teardown waits for the caller's turn to end;
+    the server applies it only on a real archive transition, so the intent is
+    sent on every archive PATCH rather than decided from a snapshot that a
+    concurrent unarchive could make stale.
+
+    :param tool_name: ``"sys_session_archive"`` or ``"sys_session_unarchive"``.
+    :param args: Parsed tool arguments; ``session_id`` (optional for archive,
+        defaulting to the caller).
+    :param conversation_id: The calling session id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON result, or a JSON error object (``session_not_found``,
+        ``access_denied``, or a status error).
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session id"})
+    archive = tool_name == SysSessionArchiveTool.name()
+    raw_target = args.get("session_id")
+    if raw_target is None and archive:
+        raw_target = conversation_id
+    if not isinstance(raw_target, str) or not raw_target:
+        return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
+    target_id = raw_target
+    # The PATCH is the owner gate and maps 404/401/403, so no snapshot read is
+    # needed. The deferral intent is always recomputed from the caller lineage
+    # and always sent: a GET's archived flag could have gone stale before the
+    # PATCH, and the intent must never be dropped on that interleaving.
+    patch_body: _JsonObject = {"archived": archive}
+    stop_when_idle = archive and await _caller_lineage_contains(
+        target_id, conversation_id, server_client
+    )
+    if stop_when_idle:
+        patch_body["stop_when_idle"] = True
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{target_id}", json=patch_body, timeout=30.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+    if resp.status_code != 200:
+        return _archive_error(tool_name, resp, target_id)
+    result: _JsonObject = {"archived": archive, "session_id": target_id}
+    if archive:
+        # The Host policy is applied server-side and not echoed back, so the
+        # stop is stated as conditional rather than promised.
+        result["runner_stop"] = (
+            "if its host stops runners on archive: after your current turn ends"
+            if stop_when_idle
+            else "if its host stops runners on archive: after the 8-second undo window"
+        )
+        result["undo"] = "sys_session_unarchive, or Unarchive in the web Archive list"
+    return json.dumps(result)
+
+
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
@@ -7571,13 +7753,14 @@ async def _collect_global_sessions(
     *,
     after: str | None,
     limit: int,
+    archived: str = "exclude",
 ) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id, project_id,
-    workspace, updated_at, last_message_preview}``.
+    workspace, updated_at, last_message_preview, archived, archived_at}``.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -7589,6 +7772,9 @@ async def _collect_global_sessions(
         non-empty string.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param archived: ``"exclude"`` (default) lists live sessions only,
+        ``"include"`` adds archived rows, and ``"only"`` lists archived
+        rows exclusively.
     :returns: Projected global session entries and continuation metadata.
     """
     params: dict[str, str | int] = {
@@ -7597,6 +7783,10 @@ async def _collect_global_sessions(
         "visibility": "all",
         "include_preview": 1,
     }
+    if archived == "include":
+        params["include_archived"] = "true"
+    elif archived == "only":
+        params["visibility"] = "archived"
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -7635,6 +7825,8 @@ async def _collect_global_sessions(
                 "worktree": r.get("worktree"),
                 "updated_at": r.get("updated_at"),
                 "last_message_preview": r.get("last_message_preview"),
+                "archived": r.get("archived"),
+                "archived_at": r.get("archived_at"),
             }
             for r in rows
         ],
@@ -7906,10 +8098,22 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    # The tree gate above is the sub-agent test. A sys_session_create child
+    # keeps its verbatim title, so a title that does not parse as
+    # "<agent>:<title>" names the agent from the snapshot instead (same
+    # fallback as the by-id send path) rather than refusing the close.
+    display_title = title_without_closed_marker(_optional_string(target_snap.get("title"))) or ""
+    parsed = _parse_session_title(display_title)
+    agent_label = (
+        parsed.agent
+        or _optional_string(target_snap.get("sub_agent_name"))
+        or _optional_string(target_snap.get("agent_name"))
+        or "agent"
+    )
+    instance_title = parsed.title if parsed.title is not None else display_title
+    # Suffixing the display title frees the duplicate-title slot for every
+    # title form; for "<agent>:<title>" it equals the canonical tombstone.
+    new_title = f"{display_title}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -7931,8 +8135,8 @@ async def _session_close_via_rest(
         {
             "closed": True,
             "conversation_id": target_id,
-            "agent": parsed.agent,
-            "title": parsed.title,
+            "agent": agent_label,
+            "title": instance_title,
         }
     )
 
@@ -8181,6 +8385,15 @@ async def execute_tool(
                 args,
                 conversation_id,
                 server_client,
+            )
+        elif tool_name in _SESSION_ARCHIVE_TOOLS:
+            if not _peer_messaging_enabled_for(conversation_id):
+                return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
+            output = await _session_archive_via_rest(
+                tool_name,
+                args,
+                conversation_id=conversation_id,
+                server_client=server_client,
             )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(

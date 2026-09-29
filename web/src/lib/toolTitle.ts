@@ -76,6 +76,14 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const id = asString(args.session_id);
     return id === null ? verbOnly("Get session info") : { verb: "Get session info:", body: id };
   },
+  sys_session_archive: (args) => {
+    const id = asString(args.session_id);
+    return id === null ? verbOnly("Archive this session") : { verb: "Archive session:", body: id };
+  },
+  sys_session_unarchive: (args) => {
+    const id = asString(args.session_id);
+    return id === null ? verbOnly("Unarchive session") : { verb: "Unarchive session:", body: id };
+  },
 
   // Agent-management tools.
   sys_agent_get: (args) => {
