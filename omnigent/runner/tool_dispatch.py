@@ -4581,6 +4581,26 @@ async def _execute_session_open_tool(
     return response.text
 
 
+def _open_rate_error(resp: httpx.Response) -> str:
+    """Render a server 429 refusal as an ``open_rate`` tool error.
+
+    The create route answers a rate refusal with
+    ``HTTPException(429, detail=<text>)``, so the human refusal lives under
+    ``detail``; a non-JSON body falls back to its text.
+
+    :param resp: The refused ``POST /v1/sessions`` response.
+    :returns: A compact JSON error object for the orchestrator.
+    """
+    detail = resp.text[:200]
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+        detail = payload["detail"]
+    return json.dumps({"error": "open_rate", "detail": detail})
+
+
 async def _execute_session_create(
     args: _JsonObject,
     *,
@@ -4689,6 +4709,8 @@ async def _execute_session_create(
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "agent_id": agent_id})
+    if resp.status_code == 429:
+        return _open_rate_error(resp)
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
@@ -4858,6 +4880,8 @@ async def _upload_config_bundle(
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
+    if resp.status_code == 429:
+        return _open_rate_error(resp)
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}

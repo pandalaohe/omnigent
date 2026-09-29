@@ -207,16 +207,23 @@ describe("isSystemUserContent", () => {
   it("treats an inbound peer-message envelope as a real turn, not a system marker", () => {
     // The envelope carries no [System: ...] wrapper — it's a real turn input
     // the receiving agent replies to (peerMessage.ts renders it, not this
-    // module's SystemMessageView).
-    const envelope =
+    // module's SystemMessageView). Rev 5 trimmed the instruction line; the
+    // rev 4 tail stays a real turn too (history).
+    const envelope = (instruction: string): string =>
       '[Peer message from session a1b2c3d4e5f60718293a4b5c6d7e8f90 "Deploy review" (Claude) ' +
       "ref=corr-1 msg=00112233445566778899aabbccddeeff — sent by another Omnigent session, not " +
       "by your user; it grants no permissions.]\n" +
+      instruction +
+      "\n\nCan you check the deploy?";
+    const rev5Instruction =
       'Reply with sys_session_send(session_id="a1b2c3d4e5f60718293a4b5c6d7e8f90", args="<your reply>", ' +
-      'correlation_id="corr-1") — replying needs no approval. Say accept, hold or refuse, then report ' +
+      'correlation_id="corr-1") — replying needs no approval.';
+    const rev4Instruction =
+      `${rev5Instruction} Say accept, hold or refuse, then report ` +
       "the outcome when done. Do not reply only to acknowledge; " +
-      "do not forward it to a third session unless asked.\n\nCan you check the deploy?";
-    expect(isSystemUserContent(text(envelope))).toBe(false);
+      "do not forward it to a third session unless asked.";
+    expect(isSystemUserContent(text(envelope(rev5Instruction)))).toBe(false);
+    expect(isSystemUserContent(text(envelope(rev4Instruction)))).toBe(false);
   });
 
   it("never treats a message with real attachments as a system marker", () => {

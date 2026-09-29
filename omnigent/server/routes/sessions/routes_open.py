@@ -55,7 +55,7 @@ from omnigent.util.session_lifecycle import is_session_closed, title_without_clo
 _logger = logging.getLogger(__name__)
 
 # Owner lock: two concurrent opens for one owner cannot both pass the
-# directory check. Process-local, like the hand-off owner locks.
+# directory check. Process-local, like the open route's owner locks.
 # custom-lint: disable-next=workspace-scoped-cache -- owner lock; a key collision only serializes
 _OWNER_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -506,6 +506,17 @@ def register_open_routes(
             )
         except OmnigentError:
             return _problem("failed", "agent_not_found", "The agent is no longer available.")
+        if (
+            agent.session_id is not None
+            and permission_store is not None
+            and await asyncio.to_thread(get_session_owner_id, agent.session_id, permission_store)
+            != entry.owner
+        ):
+            return _problem(
+                "failed",
+                "agent_not_found",
+                "The agent belongs to another user's session.",
+            )
         occupied = await _occupied_sessions(
             owner=entry.owner,
             host_id=entry.host_id,

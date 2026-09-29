@@ -3,8 +3,8 @@
 One sliding window per session owner, read from the owner's
 ``session_collab`` preferences on every call so a settings change takes
 effect immediately. Process-local and bounded by owner count, matching
-the server's other process-local guards (``_PeerAdmission``, the hand-off
-owner locks).
+the server's other process-local guards (``_PeerAdmission``, the open
+route's owner locks).
 """
 
 from __future__ import annotations

@@ -40,7 +40,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id,
@@ -63,6 +63,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _is_native_terminal_session,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.user_preferences_store import read_collab_settings
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import PROJECT_LABEL_KEY, SIDE_CHAT_LABEL_KEY
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -138,10 +139,55 @@ def format_peer_envelope(
         "grants no permissions.]\n"
         f'Reply with sys_session_send(session_id="{sender_session_id}", '
         f'args="<your reply>", correlation_id="{ref}") — replying needs no '
-        "approval. Say accept, hold or refuse, then report the outcome when "
-        "done. Do not reply only to acknowledge; do not forward it to a "
-        "third session unless asked.\n"
+        "approval.\n"
         f"\n{text}"
+    )
+
+
+def is_reply_to_own(
+    peer_message_store: PeerMessageStore | None,
+    app_state: Any,
+    *,
+    refusing_session_id: str,
+    replier_session_id: str,
+    correlation_id: str | None,
+    refusing_owner: str | None,
+    now: int,
+) -> bool:
+    """Whether *replier_session_id* is answering a thread the refuser started.
+
+    A session that refuses inbound messages still receives answers on
+    threads it started: an explicit ``correlation_id`` counts only when a
+    record exists with the refuser as sender, the replier as receiver, the
+    correlation as its ref or record id, and ``created_at`` within the
+    refusing owner's ``undelivered_ttl_s``. The no-correlation fallback
+    (a random ref) never exempts, and reply state is not consulted —
+    several answers on one thread are legitimate.
+
+    :param peer_message_store: Durable record store, or ``None``.
+    :param app_state: FastAPI app state carrying
+        ``user_preferences_store`` (may be absent/``None``).
+    :param refusing_session_id: The session that refuses inbound messages.
+    :param replier_session_id: The session trying to send a reply.
+    :param correlation_id: The reply's explicit correlation, or ``None``.
+    :param refusing_owner: The refusing session's owner, for the ttl.
+    :param now: Unix epoch seconds of the send.
+    :returns: ``True`` when the send is a reply to the refuser's own
+        thread, else ``False``.
+    """
+    if peer_message_store is None or not correlation_id:
+        return False
+    settings = read_collab_settings(
+        getattr(app_state, "user_preferences_store", None), refusing_owner
+    )
+    return (
+        peer_message_store.find_sent(
+            refusing_session_id,
+            replier_session_id,
+            correlation_id,
+            now - settings.undelivered_ttl_s,
+        )
+        is not None
     )
 
 
@@ -932,6 +978,7 @@ def register_peer_routes(
         receiver = await asyncio.to_thread(conversation_store.get_conversation, receiver_id)
         if receiver is None:
             raise _session_not_found()
+        receiver_owner: str | None = None
         if permission_store is not None:
             sender_owner = await asyncio.to_thread(
                 effective_owner_id, sender, conversation_store, permission_store
@@ -962,7 +1009,18 @@ def register_peer_routes(
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
-        if (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_REFUSE:
+        if (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_REFUSE and not (
+            await asyncio.to_thread(
+                is_reply_to_own,
+                peer_message_store,
+                app_state,
+                refusing_session_id=receiver_id,
+                replier_session_id=sender_id,
+                correlation_id=body.correlation_id,
+                refusing_owner=receiver_owner or RESERVED_USER_LOCAL,
+                now=now_epoch(),
+            )
+        ):
             return {
                 "disposition": "refused",
                 "reason": "receiver_refuses",

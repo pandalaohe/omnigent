@@ -590,6 +590,55 @@ async def test_waiting_open_fires_on_host_trigger(
 
 
 @pytest.mark.asyncio
+async def test_fire_revalidates_session_agent_ownership(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending open refuses when its agent becomes another owner's."""
+    env = open_env
+    env["online"]["on"] = False
+    lines: list[str] = []
+
+    async def notify_line(_sender_id: str, line: str) -> None:
+        lines.append(line)
+
+    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
+    async with await _client(env) as client:
+        waiting = await _post(client, env["sender"].id, env["sender_token"], wait_for_host=True)
+    sid = waiting["session_id"]
+
+    # The agent was a template at registration; by fire time it is a
+    # session-scoped agent owned by Bob (Alice has only READ sharing).
+    shared_agent_id = generate_agent_id()
+    bob_conv = env["conversations"].create_conversation(
+        agent_id=env["agent_id"], title="bob", runner_id=token_bound_runner_id("bob")
+    )
+    env["permissions"].grant(BOB, bob_conv.id, LEVEL_OWNER)
+    env["permissions"].grant(ALICE, bob_conv.id, LEVEL_READ)
+    shared_agent = Agent(
+        id=shared_agent_id,
+        created_at=1,
+        name="shared-agent",
+        bundle_location="test:///shared",
+        session_id=bob_conv.id,
+    )
+    real_get = env["agents"].get
+    monkeypatch.setattr(
+        env["agents"],
+        "get",
+        lambda aid: shared_agent if aid == shared_agent_id else real_get(aid),
+    )
+    entry = env["app"].state.pending_session_opens._entries[sid]
+    entry.agent_id = shared_agent_id
+
+    env["online"]["on"] = True
+    env["app"].state.pending_session_opens.trigger(HOST_ID)
+    assert await _wait_for(lambda: len(lines) == 1)
+    assert lines == [
+        f"[System: session {sid} could not open on host {HOST_NAME}: agent_not_found]"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_waiting_open_expires_with_a_line(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:

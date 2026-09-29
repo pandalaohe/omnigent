@@ -38,11 +38,13 @@ from starlette.requests import Request
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes.sessions.routes_peer import (
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
     effective_owner_id,
     format_peer_back_notice,
+    is_reply_to_own,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores import ConversationStore
@@ -227,18 +229,31 @@ class PeerSweeper:
                 await self._notify_for(record, "failed", "closed", receiver_title, self._app)
             return
         if (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_REFUSE:
-            moved = await asyncio.to_thread(
-                self._store.transition,
-                record.id,
-                "refused_by_user",
-                "receiver_refuses",
-                (record.state,),
+            receiver_owner = effective_owner_id(
+                receiver, self._conversation_store, self._permission_store
             )
-            if moved:
-                await self._notify_for(
-                    record, "refused_by_user", "receiver_refuses", receiver_title, self._app
+            if not await asyncio.to_thread(
+                is_reply_to_own,
+                self._store,
+                getattr(self._app, "state", None),
+                refusing_session_id=receiver.id,
+                replier_session_id=record.sender_session_id,
+                correlation_id=record.ref,
+                refusing_owner=receiver_owner or RESERVED_USER_LOCAL,
+                now=now,
+            ):
+                moved = await asyncio.to_thread(
+                    self._store.transition,
+                    record.id,
+                    "refused_by_user",
+                    "receiver_refuses",
+                    (record.state,),
                 )
-            return
+                if moved:
+                    await self._notify_for(
+                        record, "refused_by_user", "receiver_refuses", receiver_title, self._app
+                    )
+                return
         if self._permission_store is not None:
             sender = await asyncio.to_thread(
                 self._conversation_store.get_conversation, record.sender_session_id

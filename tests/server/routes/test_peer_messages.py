@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import time
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -316,10 +317,7 @@ def test_envelope_pins_header_and_instruction_lines() -> None:
     )
     assert lines[1] == (
         'Reply with sys_session_send(session_id="sess1", args="<your reply>", '
-        'correlation_id="corr1") — replying needs no approval. Say accept, '
-        "hold or refuse, then report the outcome when done. Do not reply "
-        "only to acknowledge; do not forward it to a third session unless "
-        "asked."
+        'correlation_id="corr1") — replying needs no approval.'
     )
     assert lines[2] == ""
     assert lines[3] == "do the thing"
@@ -623,6 +621,107 @@ async def test_receiver_refuses_policy(
         assert fake.calls == []
     finally:
         peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
+
+
+async def test_reply_exemption_delivers_on_own_thread(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """A refusing session still receives an answer on a thread it started."""
+    refusing = peer_env["receiver"]
+    replier = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    peer_env["conv_store"].set_labels(refusing.id, {"peer_inbound": "refuse"})
+    try:
+        cid = f"thread-{uuid.uuid4().hex}"
+        started = await peer_client.post(
+            f"/v1/sessions/{replier.id}/peer-messages",
+            json={
+                "sender_session_id": refusing.id,
+                "text": f"q-{uuid.uuid4().hex}",
+                "correlation_id": cid,
+            },
+            headers=_headers(ALICE, peer_env["receiver_token"]),
+        )
+        assert started.json()["disposition"] == "delivered", started.text
+        reply = await peer_client.post(
+            f"/v1/sessions/{refusing.id}/peer-messages",
+            json={
+                "sender_session_id": replier.id,
+                "text": f"a-{uuid.uuid4().hex}",
+                "correlation_id": cid,
+            },
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert reply.json()["disposition"] == "delivered", reply.text
+        assert reply.json()["reason"] is None
+        assert len(fake.calls) == 2
+    finally:
+        peer_env["conv_store"].set_labels(refusing.id, {"peer_inbound": "accept"})
+
+
+async def test_reply_exemption_needs_an_explicit_correlation(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """An uncorrelated message is still refused by the same receiver."""
+    refusing = peer_env["receiver"]
+    replier = peer_env["sender"]
+    peer_env["conv_store"].set_labels(refusing.id, {"peer_inbound": "refuse"})
+    try:
+        cid = f"thread-{uuid.uuid4().hex}"
+        started = await peer_client.post(
+            f"/v1/sessions/{replier.id}/peer-messages",
+            json={
+                "sender_session_id": refusing.id,
+                "text": f"q-{uuid.uuid4().hex}",
+                "correlation_id": cid,
+            },
+            headers=_headers(ALICE, peer_env["receiver_token"]),
+        )
+        assert started.json()["disposition"] == "delivered", started.text
+        resp = await peer_client.post(
+            f"/v1/sessions/{refusing.id}/peer-messages",
+            json={"sender_session_id": replier.id, "text": f"a-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "refused"
+        assert resp.json()["reason"] == "receiver_refuses"
+    finally:
+        peer_env["conv_store"].set_labels(refusing.id, {"peer_inbound": "accept"})
+
+
+async def test_reply_exemption_refuses_a_correlation_older_than_the_ttl(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """A correlation outside the refuser's undelivered ttl does not exempt."""
+    refusing = peer_env["receiver"]
+    replier = peer_env["sender"]
+    peer_env["conv_store"].set_labels(refusing.id, {"peer_inbound": "refuse"})
+    peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=refusing.id,
+            receiver_session_id=replier.id,
+            ref="thread-old",
+            text="old",
+            state="delivered",
+            created_at=int(time.time()) - 90_000,
+            expires_at=0,
+        )
+    )
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{refusing.id}/peer-messages",
+            json={
+                "sender_session_id": replier.id,
+                "text": f"a-{uuid.uuid4().hex}",
+                "correlation_id": "thread-old",
+            },
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "refused"
+        assert resp.json()["reason"] == "receiver_refuses"
+    finally:
+        peer_env["conv_store"].set_labels(refusing.id, {"peer_inbound": "accept"})
 
 
 @pytest.mark.parametrize(

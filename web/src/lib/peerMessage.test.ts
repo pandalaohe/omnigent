@@ -5,12 +5,19 @@ const SENDER_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
 const REF = "corr-abc123";
 const PEER_ID = "00112233445566778899aabbccddeeff";
 
-function envelope(headerLine: string, body = "Can you check the deploy status?"): string {
-  const instruction =
-    `Reply with sys_session_send(session_id="${SENDER_ID}", args="<your reply>", ` +
-    `correlation_id="${REF}") — replying needs no approval. Say accept, hold or refuse, then ` +
-    `report the outcome when done. Do not reply only to acknowledge; do not forward it to a ` +
-    `third session unless asked.`;
+const REV5_INSTRUCTION =
+  `Reply with sys_session_send(session_id="${SENDER_ID}", args="<your reply>", ` +
+  `correlation_id="${REF}") — replying needs no approval.`;
+const REV4_INSTRUCTION =
+  `${REV5_INSTRUCTION} Say accept, hold or refuse, then ` +
+  `report the outcome when done. Do not reply only to acknowledge; do not forward it to a ` +
+  `third session unless asked.`;
+
+function envelope(
+  headerLine: string,
+  body = "Can you check the deploy status?",
+  instruction = REV5_INSTRUCTION,
+): string {
   return `${headerLine}\n${instruction}\n\n${body}`;
 }
 
@@ -47,6 +54,25 @@ describe("parsePeerMessage", () => {
       title: "Deploy review",
       agent: "Codex",
       projectId: "omnigent",
+      ref: REF,
+      peerId: PEER_ID,
+      body: "Can you check the deploy status?",
+    });
+  });
+
+  it("still parses a rev 4 instruction line", () => {
+    const parsed = parsePeerMessage(
+      envelope(
+        header('"Deploy review" (Claude)'),
+        "Can you check the deploy status?",
+        REV4_INSTRUCTION,
+      ),
+    );
+    expect(parsed).toEqual({
+      senderId: SENDER_ID,
+      title: "Deploy review",
+      agent: "Claude",
+      projectId: undefined,
       ref: REF,
       peerId: PEER_ID,
       body: "Can you check the deploy status?",

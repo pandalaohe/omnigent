@@ -5,11 +5,11 @@ from __future__ import annotations
 import builtins
 from typing import Any, cast
 
-from sqlalchemy import asc, desc, func, select, update
+from sqlalchemy import asc, desc, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlSessionPeerMessage, current_workspace_id
+from omnigent.db.db_models import SqlSessionPeerMessage, current_workspace_id, uuid_to_bytes
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -230,6 +230,46 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                     .where(SqlSessionPeerMessage.sender_session_id == sender_session_id)
                     .where(SqlSessionPeerMessage.receiver_session_id == receiver_session_id)
                     .where(SqlSessionPeerMessage.replied_at.is_(None))
+                    .order_by(
+                        desc(SqlSessionPeerMessage.created_at),
+                        desc(SqlSessionPeerMessage.id),
+                    )
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                return None
+            return _record_to_entity(row)
+
+    def find_sent(
+        self,
+        sender_session_id: str,
+        receiver_session_id: str,
+        ref_or_id: str,
+        created_after: int,
+    ) -> SessionPeerMessage | None:
+        """Return the pair's newest matching record, or ``None``."""
+        # A correlation id is arbitrary text; comparing it against the
+        # Uuid16 ``id`` column would fail at bind time unless it is a valid
+        # id, so that half of the OR is added only when it can match.
+        matches = [SqlSessionPeerMessage.ref == ref_or_id]
+        try:
+            uuid_to_bytes(ref_or_id)
+        except ValueError:
+            pass
+        else:
+            matches.append(SqlSessionPeerMessage.id == ref_or_id)
+        with self._session("find_sent_peer_message") as session:
+            row = (
+                session.execute(
+                    select(SqlSessionPeerMessage)
+                    .where(SqlSessionPeerMessage.workspace_id == current_workspace_id())
+                    .where(SqlSessionPeerMessage.sender_session_id == sender_session_id)
+                    .where(SqlSessionPeerMessage.receiver_session_id == receiver_session_id)
+                    .where(or_(*matches))
+                    .where(SqlSessionPeerMessage.created_at >= created_after)
                     .order_by(
                         desc(SqlSessionPeerMessage.created_at),
                         desc(SqlSessionPeerMessage.id),

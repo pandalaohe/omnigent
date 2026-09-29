@@ -156,6 +156,31 @@ class PeerMessageStore(ABC):
         ...
 
     @abstractmethod
+    def find_sent(
+        self,
+        sender_session_id: str,
+        receiver_session_id: str,
+        ref_or_id: str,
+        created_after: int,
+    ) -> SessionPeerMessage | None:
+        """
+        Return the newest sender→receiver record matching *ref_or_id*.
+
+        Used by the reply exemption: a refusing session's own thread is
+        identified by a record it sent to the replier whose ``ref`` or
+        ``id`` equals the reply's correlation. Any state counts (the
+        original may be delivered, queued or failed).
+
+        :param sender_session_id: The refuser session (original sender).
+        :param receiver_session_id: The replier session (original receiver).
+        :param ref_or_id: Correlation id to match against ``ref`` or ``id``.
+        :param created_after: Inclusive lower bound on ``created_at``.
+        :returns: The newest matching :class:`SessionPeerMessage`, or
+            ``None``.
+        """
+        ...
+
+    @abstractmethod
     def count_for_ref(self, ref: str) -> int:
         """
         Count records carrying *ref*.
