@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from omnigent.tools.base import Tool, ToolContext
 
@@ -109,7 +109,9 @@ def _seconds(args: dict[str, Any], key: str, *, allow_zero: bool) -> float | Non
     return value
 
 
-def _positive_int(args: dict[str, Any], key: str, *, ceiling: int | None = None) -> int | None | str:
+def _positive_int(
+    args: dict[str, Any], key: str, *, ceiling: int | None = None
+) -> int | None | str:
     """Validate an optional positive integer field."""
     raw = args.get(key)
     if raw is None:
@@ -165,7 +167,7 @@ def _validate_stop_when(raw: object, step_count: int) -> StopWhen | None | str:
     step = raw.get("step", step_count - 1)
     if not isinstance(step, int) or isinstance(step, bool) or not 0 <= step < step_count:
         return f"stop_when.step must be an integer from 0 to {step_count - 1}"
-    return StopWhen(op=op, value=value, path=path, step=step)
+    return StopWhen(op=cast(StopOp, op), value=value, path=path, step=step)
 
 
 def validate_flow_start_args(args: dict[str, Any]) -> FlowPlan | str:
@@ -217,7 +219,7 @@ def validate_flow_start_args(args: dict[str, Any]) -> FlowPlan | str:
         for_s=for_s,
         times=times,
         stop_when=stop_when,
-        bring_back=bring_back,
+        bring_back=cast(BringBack, bring_back),
         max_chars=max_chars if max_chars is not None else FLOW_DEFAULT_MAX_CHARS,
         note=note,
     )

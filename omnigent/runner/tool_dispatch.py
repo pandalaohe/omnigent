@@ -76,6 +76,7 @@ from omnigent.tools.builtins.async_inbox import (
 )
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
+from omnigent.tools.builtins.flow import validate_flow_start_args
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
     OS_ENV_TOOL_TYPES,
@@ -107,7 +108,6 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalReadTool,
     SysTerminalSendTool,
 )
-from omnigent.tools.builtins.flow import validate_flow_start_args
 from omnigent.tools.builtins.timer import (
     # Shared with the in-process sys_timer_set tool so the runner's firing
     # loop validates the same argument shape and delay ceiling the LLM-facing

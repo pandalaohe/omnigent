@@ -144,12 +144,11 @@ async def read_flow_timer_enabled(server_client: httpx.AsyncClient, session_id: 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param session_id: Session whose owner's setting applies, e.g.
         ``"conv_abc123"``.
-    :returns: ``False`` only when the server says the row is off.
+    :returns: ``False`` only when the server says the row or the master
+        switch is off.
     """
     try:
-        resp = await server_client.get(
-            f"/v1/sessions/{session_id}/collab-settings", timeout=10.0
-        )
+        resp = await server_client.get(f"/v1/sessions/{session_id}/collab-settings", timeout=10.0)
         if resp.status_code != 200:
             if resp.status_code != 404:
                 _logger.warning(
@@ -166,8 +165,10 @@ async def read_flow_timer_enabled(server_client: httpx.AsyncClient, session_id: 
             extra={"session_id": session_id},
         )
         return True
-    value = body.get("flow_timer_enabled") if isinstance(body, dict) else None
-    return value if isinstance(value, bool) else True
+    if not isinstance(body, dict):
+        return True
+    # The master switch (``enabled``) off turns flows and timers off too.
+    return all(body.get(key) is not False for key in ("enabled", "flow_timer_enabled"))
 
 
 # ── Stop condition ────────────────────────────────────────────
@@ -413,7 +414,9 @@ async def _run_step(run: _FlowRun, index: int, args: dict[str, Any]) -> str:
         manager = _runner_mcp_manager
         if manager is None or ctx.agent_spec is None:
             return f"Error: MCP tool {step.tool!r} is unavailable"
-        return await manager.call_tool(ctx.agent_spec, step.tool, args, session_id=ctx.conversation_id)
+        return await manager.call_tool(
+            ctx.agent_spec, step.tool, args, session_id=ctx.conversation_id
+        )
     return await execute_tool(
         tool_name=step.tool,
         arguments=json.dumps(args),
@@ -556,7 +559,7 @@ async def _run_flow(run: _FlowRun) -> None:
             await _post_wake(run)
     except asyncio.CancelledError:
         return
-    except Exception:  # noqa: BLE001 — never leak a background failure
+    except Exception:
         _logger.exception(
             "flow %s failed", run.flow_id, extra={"session_id": run.ctx.conversation_id}
         )
@@ -581,7 +584,11 @@ async def _result_policy_output(ctx: FlowContext, result: _StepResult) -> str:
                 "event": {
                     "type": "PHASE_TOOL_RESULT",
                     "data": {"result": result.output},
-                    "request_data": {"name": result.tool, "tool": result.tool, "args": result.args},
+                    "request_data": {
+                        "name": result.tool,
+                        "tool": result.tool,
+                        "args": result.args,
+                    },
                 }
             },
             timeout=30.0,

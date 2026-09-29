@@ -22,6 +22,7 @@ class _FakeServer:
 
     def __init__(self) -> None:
         self.flow_timer_enabled: bool | None = True
+        self.collab_enabled = True
         self.tool_call_verdict = "POLICY_ACTION_ALLOW"
         self.tool_result_verdict: dict[str, Any] = {"result": "POLICY_ACTION_ALLOW"}
         self.rewrite_args: dict[str, Any] | None = None
@@ -35,7 +36,13 @@ class _FakeServer:
         if path.endswith("/collab-settings"):
             if self.flow_timer_enabled is None:
                 return httpx.Response(404, json={"detail": "not found"})
-            return httpx.Response(200, json={"flow_timer_enabled": self.flow_timer_enabled})
+            return httpx.Response(
+                200,
+                json={
+                    "enabled": self.collab_enabled,
+                    "flow_timer_enabled": self.flow_timer_enabled,
+                },
+            )
         if path.endswith("/policies/evaluate"):
             event = json.loads(request.content)["event"]
             if event["type"] == "PHASE_TOOL_RESULT":
@@ -218,6 +225,15 @@ async def test_row8_off_refuses_start(server: _FakeServer, scripted: list[str]) 
 
 
 @pytest.mark.asyncio
+async def test_master_switch_off_refuses_start(server: _FakeServer, scripted: list[str]) -> None:
+    scripted.append("x")
+    server.collab_enabled = False
+    async with _client(server) as client:
+        started = await _start(client, {"steps": _STEP})
+    assert "error" in started
+
+
+@pytest.mark.asyncio
 async def test_row8_turned_off_mid_run_stops_without_wake(
     server: _FakeServer, scripted: list[str]
 ) -> None:
@@ -236,7 +252,9 @@ async def test_row8_turned_off_mid_run_stops_without_wake(
 
 
 @pytest.mark.asyncio
-async def test_settings_route_missing_reads_as_on(server: _FakeServer, scripted: list[str]) -> None:
+async def test_settings_route_missing_reads_as_on(
+    server: _FakeServer, scripted: list[str]
+) -> None:
     scripted.append("x")
     server.flow_timer_enabled = None  # older server: 404
     async with _client(server) as client:
@@ -257,9 +275,7 @@ async def test_cancel_returns_summary_and_list_shows_running(
         second = await _start(client, {"steps": _STEP, "start_after_s": 30})
         await asyncio.sleep(0.05)
         listed = json.loads(
-            await execute_tool(
-                tool_name="sys_flow_list", arguments="{}", conversation_id=_SESSION
-            )
+            await execute_tool(tool_name="sys_flow_list", arguments="{}", conversation_id=_SESSION)
         )["flows"]
         by_id = {flow["flow_id"]: flow for flow in listed}
         assert set(by_id) == {first["flow_id"], second["flow_id"]}
@@ -478,10 +494,19 @@ async def test_wake_is_posted_once_even_when_it_fails(
 def _relay_names(spec: Any, *, peer: bool) -> set[str]:
     from omnigent.runner import tool_dispatch
 
-    return {s["name"] for s in tool_dispatch.build_native_relay_tool_schemas(spec, peer_messaging_enabled=peer)}
+    return {
+        s["name"]
+        for s in tool_dispatch.build_native_relay_tool_schemas(spec, peer_messaging_enabled=peer)
+    }
 
 
-_TIMED = {"sys_timer_set", "sys_timer_cancel", "sys_flow_start", "sys_flow_list", "sys_flow_cancel"}
+_TIMED = {
+    "sys_timer_set",
+    "sys_timer_cancel",
+    "sys_flow_start",
+    "sys_flow_list",
+    "sys_flow_cancel",
+}
 
 
 @pytest.mark.parametrize("spec_timers", [False, True])
