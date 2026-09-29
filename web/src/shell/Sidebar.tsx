@@ -26,6 +26,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  ActivityIcon,
   ArchiveIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
@@ -226,6 +227,7 @@ import {
 } from "@/lib/sessionFilterPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { useSystemStatusSummary, type SystemStatusLevel } from "@/hooks/useSystemStatus";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -447,6 +449,7 @@ function useActiveNavItem(): {
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
+  isSystemStatusPage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
 } {
@@ -459,6 +462,7 @@ function useActiveNavItem(): {
   const isCanvasPage = !isExtensionRoute && leaf === "canvas";
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
+  const isSystemStatusPage = !isExtensionRoute && leaf === "system";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const isNewSessionRoute =
@@ -477,9 +481,69 @@ function useActiveNavItem(): {
     isCanvasPage,
     isTasksPage,
     isUsagePage,
+    isSystemStatusPage,
     activeExtensionPageId,
     newSessionProjectName,
   };
+}
+
+// Green / amber / red, mirroring the finding levels. The dot's accessible
+// name carries the level; the count is plain text next to it.
+const SYSTEM_STATUS_DOT_CLASS: Record<SystemStatusLevel, string> = {
+  ok: "bg-emerald-500",
+  amber: "bg-amber-500",
+  red: "bg-red-500",
+};
+
+/**
+ * The "System status" primary-nav row with its live indicator.
+ *
+ * Reads the payload-free summary query (no interval — refreshed only by the
+ * `system_status_changed` nudge or a socket reconnect), so the sidebar adds
+ * no resident poll of its own.
+ */
+function SystemStatusPrimaryNavLink({
+  active,
+  onClick,
+}: {
+  active: boolean;
+  onClick: (event: MouseEvent<HTMLAnchorElement>) => void;
+}) {
+  const { data } = useSystemStatusSummary();
+  const level = data?.level ?? "ok";
+  const count = data?.findings.length ?? 0;
+  return (
+    <PrimaryNavLink
+      to="/system"
+      label="System status"
+      icon={ActivityIcon}
+      active={active}
+      onClick={onClick}
+      componentId="sidebar.system_status"
+      testId="system-status-nav"
+      trailing={
+        <span className="ml-auto flex items-center gap-1.5">
+          <span
+            data-testid="system-status-dot"
+            role="img"
+            aria-label={`System status: ${level}`}
+            className={cn("size-2 shrink-0 rounded-full", SYSTEM_STATUS_DOT_CLASS[level])}
+          />
+          {count > 0 && (
+            <span
+              data-testid="system-status-count"
+              className={cn(
+                "text-10 font-medium tabular-nums",
+                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+              )}
+            >
+              {count}
+            </span>
+          )}
+        </span>
+      }
+    />
+  );
 }
 
 /**
@@ -776,6 +840,7 @@ function SidebarImpl({
     isCanvasPage,
     isTasksPage,
     isUsagePage,
+    isSystemStatusPage,
     activeExtensionPageId,
     newSessionProjectName,
   } = useActiveNavItem();
@@ -1343,6 +1408,7 @@ function SidebarImpl({
                   </Link>
                 </Button>
               )}
+              <SystemStatusPrimaryNavLink active={isSystemStatusPage} onClick={onNavClick} />
             </div>
 
             {/* Wrapper (not the `aside`) anchors the floating Settings button:

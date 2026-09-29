@@ -416,6 +416,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           refreshProjects();
           void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           return;
+        case "system_status_changed":
+          // Payload-free nudge: the server only says "findings changed".
+          // Summary consumers refetch their own permission-filtered view.
+          void queryClient.invalidateQueries({ queryKey: ["system-status", "summary"] });
+          return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           queryClient.setQueryData<PinnedConversationsResult>(

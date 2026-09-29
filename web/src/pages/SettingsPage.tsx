@@ -96,6 +96,12 @@ import {
 } from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useIsAdmin } from "@/hooks/useIsAdmin";
+import {
+  useSystemStatusSettings,
+  useUpdateSystemStatusSettings,
+  type SystemStatusSettings,
+} from "@/hooks/useSystemStatus";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -351,6 +357,7 @@ export function SettingsPage() {
     section === "members" ||
     section === "policies" ||
     section === "global-instructions" ||
+    section === "system-status" ||
     section === "sharing"
   ) {
     return (
@@ -361,6 +368,8 @@ export function SettingsPage() {
           <PoliciesPage />
         ) : section === "global-instructions" ? (
           <GlobalInstructionsPage />
+        ) : section === "system-status" ? (
+          <SystemStatusSettingsSection />
         ) : (
           <SharingPage />
         )}
@@ -392,6 +401,170 @@ export function SettingsPage() {
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
       {section === "updates" && isElectronShell() && <UpdatesSection />}
+    </PageScroll>
+  );
+}
+
+/**
+ * Admin thresholds for the resource monitor (``/settings/system-status``).
+ *
+ * Mirrors the server's settings mapping exactly: the four percentages the hub
+ * evaluates. The sustained windows ("10 minutes" for CPU, "2 minutes" for
+ * memory, "5 minutes" for the 5xx ratio) are server constants, shown as text
+ * rather than editable fields. Non-admins see a permission message; the
+ * endpoints 403 regardless.
+ */
+
+type SystemStatusSettingsDraft = Record<keyof SystemStatusSettings, string>;
+
+const SYSTEM_STATUS_THRESHOLD_FIELDS: {
+  key: keyof SystemStatusSettings;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    key: "cpu_pct",
+    label: "CPU threshold (%)",
+    hint: "Alert when above this for 10 consecutive minutes.",
+  },
+  {
+    key: "mem_pct",
+    label: "Memory threshold (%)",
+    hint: "Alert when above this for 2 consecutive minutes.",
+  },
+  {
+    key: "disk_pct",
+    label: "Disk threshold (%)",
+    hint: "Alert when the newest minute is above this.",
+  },
+  {
+    key: "server_5xx_pct",
+    label: "Server 5xx failure rate (%)",
+    hint: "Alert over 5 minutes with at least 20 requests.",
+  },
+];
+
+function toSettingsDraft(settings: SystemStatusSettings): SystemStatusSettingsDraft {
+  return {
+    cpu_pct: String(settings.cpu_pct),
+    mem_pct: String(settings.mem_pct),
+    disk_pct: String(settings.disk_pct),
+    server_5xx_pct: String(settings.server_5xx_pct),
+  };
+}
+
+function fromSettingsDraft(draft: SystemStatusSettingsDraft): SystemStatusSettings {
+  return {
+    cpu_pct: Number(draft.cpu_pct),
+    mem_pct: Number(draft.mem_pct),
+    disk_pct: Number(draft.disk_pct),
+    server_5xx_pct: Number(draft.server_5xx_pct),
+  };
+}
+
+export function SystemStatusSettingsSection() {
+  const isAdmin = useIsAdmin();
+  const settings = useSystemStatusSettings({ enabled: isAdmin });
+  const update = useUpdateSystemStatusSettings();
+  const [draft, setDraft] = useState<SystemStatusSettingsDraft | null>(null);
+  // Server values the draft was last synced from, serialized. A draft equal
+  // to the last sync adopts fresh server values (e.g. after Save); edits made
+  // before a refetch resolves survive it.
+  const lastSynced = useRef("");
+
+  useEffect(() => {
+    if (settings.data === undefined) return;
+    const synced = lastSynced.current;
+    const next = toSettingsDraft(settings.data);
+    setDraft((current) =>
+      current === null || JSON.stringify(current) === synced ? next : current,
+    );
+    lastSynced.current = JSON.stringify(next);
+  }, [settings.data]);
+
+  if (!isAdmin) {
+    return (
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+        <h1 className="mb-2 text-2xl font-semibold">System status</h1>
+        <p className="text-ui text-muted-foreground">
+          You don't have permission to manage system status settings.
+        </p>
+      </PageScroll>
+    );
+  }
+
+  const savedDraft = settings.data !== undefined ? toSettingsDraft(settings.data) : null;
+  const unchanged =
+    draft !== null && savedDraft !== null && JSON.stringify(draft) === JSON.stringify(savedDraft);
+
+  return (
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+      <div className="mb-6">
+        <h1 className="text-2xl font-semibold">System status</h1>
+        <p className="mt-1 text-ui text-muted-foreground">
+          Thresholds for the resource monitor's findings, in percent.
+        </p>
+      </div>
+
+      {draft === null ? (
+        <p className="text-ui text-muted-foreground">Loading...</p>
+      ) : (
+        <form
+          className="flex max-w-xl flex-col gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            update.mutate(fromSettingsDraft(draft));
+          }}
+        >
+          {SYSTEM_STATUS_THRESHOLD_FIELDS.map((field) => (
+            <label key={field.key} className="flex flex-col gap-1">
+              <span className="text-sm font-medium">{field.label}</span>
+              <Input
+                type="number"
+                min={0}
+                max={100}
+                step="any"
+                value={draft[field.key]}
+                onChange={(event) =>
+                  setDraft((current) =>
+                    current === null ? current : { ...current, [field.key]: event.target.value },
+                  )
+                }
+              />
+              <span className="text-xs text-muted-foreground">{field.hint}</span>
+            </label>
+          ))}
+          <div className="flex items-center gap-2">
+            <Button
+              type="submit"
+              loading={update.isPending}
+              disabled={unchanged || update.isPending}
+            >
+              Save
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Only sustained breaches notify; short spikes do not.
+            </span>
+          </div>
+        </form>
+      )}
+
+      {settings.isError && (
+        <div
+          role="alert"
+          className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+        >
+          {settings.error.message}
+        </div>
+      )}
+      {update.isError && (
+        <div
+          role="alert"
+          className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+        >
+          {update.error.message}
+        </div>
+      )}
     </PageScroll>
   );
 }

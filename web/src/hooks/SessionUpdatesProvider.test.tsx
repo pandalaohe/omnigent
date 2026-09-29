@@ -236,6 +236,19 @@ describe("SessionUpdatesProvider host changes", () => {
   });
 });
 
+describe("SessionUpdatesProvider system status", () => {
+  it("invalidates the system-status summary on a system_status_changed frame", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    act(() => frameHandler()({ type: "system_status_changed" }));
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["system-status", "summary"] });
+  });
+});
+
 describe("SessionUpdatesProvider comments fingerprint", () => {
   it("invalidates the comments cache when a changed frame moves the fingerprint", () => {
     const client = new QueryClient();
