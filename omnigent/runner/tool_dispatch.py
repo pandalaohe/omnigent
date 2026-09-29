@@ -1811,6 +1811,7 @@ async def _send_to_in_flight_child(
             # Reuse the one entry so its single completion delivers under it;
             # re-stamping/replacing here is what would orphan that completion.
             work_id = entry.work_id
+            flows.note_child_dispatch(conversation_id, child_session_id)
         else:
             # No active tracked turn: the old turn ended and a fresh one started,
             # or the in-flight turn was untracked locally (post-restart). Track

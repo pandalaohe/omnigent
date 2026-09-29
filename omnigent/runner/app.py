@@ -2141,6 +2141,9 @@ def register_subagent_work(
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
+    from omnigent.runner.flows import note_child_dispatch
+
+    note_child_dispatch(parent_session_id, child_session_id)
     return entry
 
 
@@ -3499,8 +3502,8 @@ def create_runner_app(
     # session_id → peer-messaging flag from the init snapshot. Same
     # placement and lifecycle as the project-assignments one above.
     _session_peer_messaging_enabled = _session_peer_messaging_enabled_ref
-    # Flow MCP steps dispatch through this process's MCP manager.
-    from omnigent.runner.flows import set_runner_mcp_manager
+    # Flows: MCP steps use this process's MCP manager; a running flow holds its children's wakes.
+    from omnigent.runner.flows import hold_child_wake, set_runner_mcp_manager
 
     set_runner_mcp_manager(mcp_manager)
     # session_id → the session's startup extras from the init snapshot: the
@@ -9349,6 +9352,9 @@ def create_runner_app(
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
+            return
+        # Work a running flow dispatched reports through the flow's one end wake.
+        if hold_child_wake(entry.parent_session_id, entry.child_session_id):
             return
         # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
         # thread in the parent's own app-server, so its completion is not the

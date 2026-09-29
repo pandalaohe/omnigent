@@ -27,6 +27,10 @@ class _FakeServer:
         self.tool_result_verdict: dict[str, Any] = {"result": "POLICY_ACTION_ALLOW"}
         self.rewrite_args: dict[str, Any] | None = None
         self.wakes: list[dict[str, Any]] = []
+        # sys_session_send steps: target snapshots, the peer route's answer, child posts.
+        self.sessions: dict[str, dict[str, Any]] = {_SESSION: {"id": _SESSION, "labels": {}}}
+        self.peer_answer: dict[str, Any] = {"disposition": "delivered", "reason": None}
+        self.child_messages: list[str] = []
         self.requests: list[tuple[str, str]] = []
         self.woken = asyncio.Event()
 
@@ -51,10 +55,22 @@ class _FakeServer:
             if self.rewrite_args is not None:
                 verdict["data"] = self.rewrite_args
             return httpx.Response(200, json=verdict)
-        if path.endswith("/events"):
+        if path == f"/v1/sessions/{_SESSION}/events":
             self.wakes.append(json.loads(request.content))
             self.woken.set()
             return httpx.Response(202, json={"queued": True})
+        if path.endswith("/peer-messages"):
+            return httpx.Response(
+                200, json={"peer_id": "peer_1", "ref": "", "receiver": {}, **self.peer_answer}
+            )
+        target = path.removeprefix("/v1/sessions/").split("/")[0]
+        if request.method == "POST" and path.endswith("/events"):
+            self.child_messages.append(target)
+            return httpx.Response(200, json={"status": "accepted"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"id": target})
+        if request.method == "GET" and target in self.sessions and path.count("/") == 3:
+            return httpx.Response(200, json=self.sessions[target])
         if path.endswith("/comments"):
             return httpx.Response(200, json={"comments": [], "state": "idle"})
         return httpx.Response(404)
@@ -202,6 +218,90 @@ async def test_step_error_text_stays_behind_the_result_policy(
         await asyncio.wait_for(server.woken.wait(), timeout=2)
     assert server.wake_summary()["reason"] == "step_error"
     assert "BLOCKED_MARKER" not in json.dumps(server.wakes)
+
+
+def _send_step(target: str) -> list[dict[str, Any]]:
+    return [{"tool": "sys_session_send", "args": {"session_id": target, "args": "status?"}}]
+
+
+@pytest.fixture
+def inbox(_clean_subagent_registry: None) -> None:
+    from omnigent.runner import app as runner_app
+
+    runner_app._session_inboxes_ref[_SESSION] = asyncio.Queue()
+
+
+@pytest.mark.asyncio
+async def test_send_step_to_own_child_holds_its_wake_until_the_flow_ends(
+    server: _FakeServer, inbox: None
+) -> None:
+    from omnigent.runner import app as runner_app
+
+    child = "conv_child"
+    server.sessions[child] = {"id": child, "parent_session_id": _SESSION, "labels": {}}
+    async with _client(server) as client:
+        await _start(client, {"steps": _send_step(child), "every_s": 0.05, "times": 3})
+        for _ in range(100):
+            if server.child_messages:
+                break
+            await asyncio.sleep(0.01)
+        # The child's turn starts; later ticks steer it through the same work entry.
+        assert runner_app.mark_subagent_work_started(child) is not None
+        # The child finishing while the flow runs: its wake is held for the end wake.
+        assert flows.hold_child_wake(_SESSION, child) is True
+        await asyncio.wait_for(server.woken.wait(), timeout=2)
+    summary = server.wake_summary()
+    assert (summary["reason"], summary["ticks"]) == ("count_done", 3)
+    assert summary["child_results_in_inbox"] == 1
+    assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
+    assert server.child_messages == [child] * 3
+    assert flows.hold_child_wake(_SESSION, child) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["delivered", "queued", "held", "pending"])
+async def test_send_step_to_a_peer_is_a_normal_step(
+    server: _FakeServer, inbox: None, disposition: str
+) -> None:
+    server.sessions["conv_peer"] = {"id": "conv_peer", "parent_session_id": None, "labels": {}}
+    server.peer_answer = {"disposition": disposition, "reason": None}
+    async with _client(server) as client:
+        await _start(client, {"steps": _send_step("conv_peer")})
+        await asyncio.wait_for(server.woken.wait(), timeout=2)
+    summary = server.wake_summary()
+    assert summary["reason"] == "count_done"
+    assert json.loads(summary["results"][0]["output"])["disposition"] == disposition
+    assert "child_results_in_inbox" not in summary
+    assert server.child_messages == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent", "disposition", "reason"),
+    [
+        pytest.param(None, "refused", "not_same_owner", id="refused-peer"),
+        pytest.param("conv_child", "refused", "is_subagent", id="grandchild"),
+        pytest.param(None, "dropped", "duplicate", id="dropped"),
+        pytest.param(None, "failed", "closed", id="failed"),
+    ],
+)
+async def test_send_step_the_server_refuses_ends_step_error(
+    server: _FakeServer, inbox: None, parent: str | None, disposition: str, reason: str
+) -> None:
+    server.sessions["conv_target"] = {
+        "id": "conv_target",
+        "parent_session_id": parent,
+        "labels": {},
+    }
+    server.peer_answer = {"disposition": disposition, "reason": reason}
+    async with _client(server) as client:
+        await _start(client, {"steps": _send_step("conv_target"), "every_s": 0.01, "times": 5})
+        await asyncio.wait_for(server.woken.wait(), timeout=2)
+    summary = server.wake_summary()
+    assert (summary["reason"], summary["ticks"]) == ("step_error", 1)
+    assert summary["detail"] == "steps[0] (sys_session_send) returned an error"
+    output = json.loads(summary["results"][0]["output"])
+    assert (output["disposition"], output["reason"]) == (disposition, reason)
 
 
 @pytest.mark.asyncio
