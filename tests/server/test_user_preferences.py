@@ -847,3 +847,35 @@ async def test_preferences_api_accepts_the_approval_timeout_namespace(
         assert read_approval_timeout(
             SqlAlchemyUserPreferencesStore(db_uri), "timeout@example.com"
         ) == ApprovalTimeout(timeout_s=600.0, stop_turn=False)
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_accepts_the_host_colors_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The host_colors namespace is allowlisted and merges one host per patch."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "hostcolors@example.com"}
+        first_host = {"51dc949aba31e24ca8f047d6fba31a0d": "teal"}
+        patched = await client.patch(
+            "/v1/me/preferences/host_colors",
+            headers=headers,
+            json={"value": first_host},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["host_colors"] == first_host
+
+        # One-key patch: a second host colour merges without clobbering the
+        # first, which is what keeps concurrent per-host picks safe.
+        second_host = {"9b2ec6de30f5e014c7056afe505510c3": "amber"}
+        patched = await client.patch(
+            "/v1/me/preferences/host_colors",
+            headers=headers,
+            json={"value": second_host},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["host_colors"] == {**first_host, **second_host}

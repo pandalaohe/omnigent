@@ -1,9 +1,9 @@
 // Subagents tab content for the right-side rail. Renders the session
-// tree under the root conversation — a "main" link back to the root,
-// then its sub-agent sessions recursively (children, grandchildren,
-// …) down to ``MAX_TREE_DEPTH`` levels, each level indented one step
-// further. The user can move between any agents in the tree without
-// leaving the rail.
+// tree under the root conversation: a "main" row, the active zone
+// (top-level children grouped host → cwd with grandchildren nested
+// under their row, depth ≤ MAX_TREE_DEPTH), and the collapsed past
+// zone of archived children. The user can move between any agents in
+// the tree without leaving the rail.
 //
 // The active session may itself be a descendant (the user clicked
 // into a sub-agent). The rail still renders the tree from the
@@ -14,40 +14,18 @@
 // Each row is a Link to the target conversation page so cmd/middle-
 // click opens it in a new tab, matching the sidebar's behavior.
 
-import { lazy, Suspense, useState } from "react";
-import type { ComponentType, SVGProps } from "react";
+import { Fragment, lazy, Suspense, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import {
-  BookOpenIcon,
-  BotIcon,
-  CircleStopIcon,
-  Code2Icon,
-  CompassIcon,
   ChevronDownIcon,
   ChevronRightIcon,
-  CornerDownRightIcon,
-  FileTextIcon,
-  FlaskConicalIcon,
+  CircleStopIcon,
   ListIcon,
   NetworkIcon,
   PlusIcon,
-  ScanSearchIcon,
-  SearchIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
-import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
-import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
-import { CodexIcon } from "@/components/icons/CodexIcon";
-import { CursorIcon } from "@/components/icons/CursorIcon";
-import { DevinIcon } from "@/components/icons/DevinIcon";
-import { GooseIcon } from "@/components/icons/GooseIcon";
-import { HermesIcon } from "@/components/icons/HermesIcon";
-import { KimiIcon } from "@/components/icons/KimiIcon";
-import { KiroIcon } from "@/components/icons/KiroIcon";
-import { NessieIcon } from "@/components/icons/NessieIcon";
-import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
-import { OttoIcon } from "@/components/icons/OttoIcon";
-import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -57,24 +35,33 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { RailAgentBadge, childAgentDisplay } from "@/components/RailAgentBadge";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
-import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  MAX_TREE_DEPTH,
+  useChildSessions,
+  usePastChildSessions,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { useStopSession } from "@/hooks/useConversations";
+import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { useSession } from "@/hooks/useSession";
+import { hostColor, hostDisplayName } from "@/lib/hostColors";
+import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
-import type { SessionItem } from "@/lib/types";
+import type { Session, SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
-
-const SubagentsGraphView = lazy(() =>
-  import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
-);
 import {
-  CLAUDE_NATIVE_SUBAGENT_WRAPPER,
-  nativeCodingAgentForWrapper,
-  WRAPPER_LABEL_KEY,
-} from "@/lib/nativeCodingAgents";
+  childPrimaryLabel,
+  groupChildren,
+  shortenPath,
+  type ChildHostGroup,
+  type ChildSessionLike,
+} from "./subagentRailGroups";
 import {
   activityDotClassName,
   childStatus,
@@ -85,12 +72,9 @@ import {
 import { AddAgentDialog } from "./AddAgentDialog";
 import { ReconcileSubagentsButton } from "./ReconcileSubagentsButton";
 
-const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
-const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
-const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
-// Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
-const PI_AGENT_NAME = "pi";
-type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
+const SubagentsGraphView = lazy(() =>
+  import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
+);
 
 interface SubagentsPanelProps {
   /** The conversation currently rendered in main. Used only to
@@ -109,16 +93,53 @@ interface StopTarget {
   label: string;
 }
 
+const UNKNOWN_DIRECTORY = "(unknown directory)";
+
+/** Normalize a session snapshot to the child-row shape the shared helpers read. */
+function sessionLike(session: Session | null, fallbackId: string): ChildSessionLike {
+  return {
+    id: session?.id ?? fallbackId,
+    title: session?.title,
+    sub_agent_name: session?.subAgentName,
+    agent_name: session?.agentName,
+    agent_id: session?.agentId,
+    harness: session?.harness,
+    host_id: session?.hostId,
+    labels: session?.labels ?? {},
+  };
+}
+
+function hostNameForHost(hostId: string | null | undefined, hosts: Map<string, Host>): string {
+  return hostDisplayName(hostId, hostId ? hosts.get(hostId) : undefined);
+}
+
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const { session: rootSession } = useSession(rootSessionId);
+  const { data: hosts } = useHosts();
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+  const [collapsedHosts, setCollapsedHosts] = useState<Record<string, boolean>>({});
+  const [collapsedCwds, setCollapsedCwds] = useState<Record<string, boolean>>({});
+  const [pastExpanded, setPastExpanded] = useState(false);
   const [stopTarget, setStopTarget] = useState<StopTarget | null>(null);
+  const past = usePastChildSessions(rootSessionId, pastExpanded);
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
   };
+  const hostsById = useMemo(
+    () => new Map((hosts ?? []).map((host) => [host.host_id, host])),
+    [hosts],
+  );
+  const hostNameFor = (hostId: string | null | undefined) => hostNameForHost(hostId, hostsById);
+  const hostGroups = useMemo(
+    () => groupChildren(children, rootSession?.hostId ?? null),
+    [children, rootSession?.hostId],
+  );
+  const warmCount = children.filter((child) => child.warm_state === "warm").length;
+  const coldCount = children.filter((child) => child.warm_state === "cold").length;
+  const showsWarmCounts = children.some((child) => child.warm_state != null);
   const recheckButton =
     rootSession != null &&
     isOwnerLevel(rootSession.permissionLevel) &&
@@ -192,19 +213,85 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         Add agent
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
-        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
-          <SubagentRow
-            key={child.id}
-            child={child}
-            depth={1}
+        <MainRow
+          rootSessionId={rootSessionId}
+          isActive={conversationId === rootSessionId}
+          hostNameFor={hostNameFor}
+        />
+        <li
+          data-testid="subagent-active-zone"
+          className="flex items-center gap-2 border-b bg-muted/40 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase"
+        >
+          <span>Active · {children.length}</span>
+          {showsWarmCounts && (
+            <span className="ml-auto font-normal normal-case">
+              warm {warmCount} · cold {coldCount}
+            </span>
+          )}
+        </li>
+        {hostGroups.map((group) => (
+          <HostGroupRows
+            key={group.hostId}
+            group={group}
+            hostName={hostNameFor(group.hostId)}
+            collapsed={collapsedHosts[group.hostId] ?? false}
+            onToggleHost={() =>
+              setCollapsedHosts((current) => ({
+                ...current,
+                [group.hostId]: !current[group.hostId],
+              }))
+            }
+            collapsedCwds={collapsedCwds}
+            onToggleCwd={(key) =>
+              setCollapsedCwds((current) => ({ ...current, [key]: !current[key] }))
+            }
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
             canStopChildren={rootSession != null && isOwnerLevel(rootSession.permissionLevel)}
             onRequestStop={(id, label) => setStopTarget({ id, label })}
+            hostNameFor={hostNameFor}
           />
         ))}
+        <PastZoneHeader
+          expanded={pastExpanded}
+          count={past.children.length}
+          hasMore={past.hasNextPage}
+          onToggle={() => setPastExpanded((expanded) => !expanded)}
+        />
+        {pastExpanded && (
+          <>
+            {past.isLoading && past.children.length === 0 && (
+              <li className="px-2.5 py-4 text-center text-sm text-muted-foreground">Loading…</li>
+            )}
+            {past.error && past.children.length === 0 && (
+              <li className="px-2.5 py-4 text-center text-sm text-muted-foreground">
+                Failed to load archived agents.
+              </li>
+            )}
+            {past.children.map((child) => (
+              <PastChildRow
+                key={child.id}
+                child={child}
+                conversationId={conversationId}
+                hostNameFor={hostNameFor}
+              />
+            ))}
+            {past.hasNextPage && (
+              <li>
+                <button
+                  type="button"
+                  data-testid="subagent-past-load-more"
+                  disabled={past.isFetchingNextPage}
+                  onClick={past.fetchNextPage}
+                  className="w-full px-2.5 py-1.5 text-left text-xs text-session-active hover:bg-accent/60 disabled:opacity-60"
+                >
+                  {past.isFetchingNextPage ? "Loading…" : "Load 20 more"}
+                </button>
+              </li>
+            )}
+          </>
+        )}
       </ul>
       {/* Mounted only while open so a closed rail issues no /v1/agents
           fetch and carries none of the dialog's query dependencies. */}
@@ -213,6 +300,144 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       )}
       {stopTarget && <SubagentStopDialog target={stopTarget} onClose={() => setStopTarget(null)} />}
     </div>
+  );
+}
+
+function HostGroupRows({
+  group,
+  hostName,
+  collapsed,
+  onToggleHost,
+  collapsedCwds,
+  onToggleCwd,
+  conversationId,
+  collapsedRows,
+  onToggleCollapsed,
+  canStopChildren,
+  onRequestStop,
+  hostNameFor,
+}: {
+  group: ChildHostGroup;
+  hostName: string;
+  collapsed: boolean;
+  onToggleHost: () => void;
+  collapsedCwds: Record<string, boolean>;
+  onToggleCwd: (key: string) => void;
+  conversationId: string;
+  collapsedRows: Record<string, boolean>;
+  onToggleCollapsed: (id: string) => void;
+  canStopChildren: boolean;
+  onRequestStop: (id: string, label: string) => void;
+  hostNameFor: (hostId: string | null | undefined) => string;
+}) {
+  const colorPreferences = useHostColorPreferences();
+  const dotColor = hostColor(group.hostId, hostName, colorPreferences).hex;
+  return (
+    <>
+      <li>
+        <button
+          type="button"
+          data-testid="subagent-host-group"
+          data-host-id={group.hostId}
+          aria-expanded={!collapsed}
+          onClick={onToggleHost}
+          className="flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-ui font-semibold hover:bg-accent/60"
+        >
+          {collapsed ? (
+            <ChevronRightIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronDownIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+          )}
+          <span
+            aria-hidden
+            data-testid="subagent-host-dot"
+            className="size-2 shrink-0 rounded-full"
+            style={{ backgroundColor: dotColor }}
+          />
+          <span className="truncate">{hostName}</span>
+          <span className="shrink-0 font-normal text-muted-foreground">{group.count}</span>
+        </button>
+      </li>
+      {!collapsed &&
+        group.cwdGroups.map((cwdGroup) => {
+          const key = cwdGroupKey(group.hostId, cwdGroup.cwd);
+          const cwdCollapsed = collapsedCwds[key] ?? false;
+          return (
+            <Fragment key={key}>
+              <li>
+                <button
+                  type="button"
+                  data-testid="subagent-cwd-group"
+                  aria-expanded={!cwdCollapsed}
+                  title={cwdGroup.cwd ?? undefined}
+                  onClick={() => onToggleCwd(key)}
+                  className="flex w-full items-center gap-1.5 py-0.5 pr-2.5 pl-6 text-left font-mono text-[11.5px] font-medium text-muted-foreground hover:bg-accent/60"
+                >
+                  {cwdCollapsed ? (
+                    <ChevronRightIcon aria-hidden className="size-3 shrink-0" />
+                  ) : (
+                    <ChevronDownIcon aria-hidden className="size-3 shrink-0" />
+                  )}
+                  <span className="truncate">
+                    {cwdGroup.cwd ? shortenPath(cwdGroup.cwd) : UNKNOWN_DIRECTORY}
+                  </span>
+                </button>
+              </li>
+              {!cwdCollapsed &&
+                cwdGroup.children.map((child) => (
+                  <SubagentRow
+                    key={child.id}
+                    child={child}
+                    depth={1}
+                    conversationId={conversationId}
+                    collapsedRows={collapsedRows}
+                    onToggleCollapsed={onToggleCollapsed}
+                    canStopChildren={canStopChildren}
+                    onRequestStop={onRequestStop}
+                    hostNameFor={hostNameFor}
+                  />
+                ))}
+            </Fragment>
+          );
+        })}
+    </>
+  );
+}
+
+function cwdGroupKey(hostId: string, cwd: string | null): string {
+  return `${hostId}\u0000${cwd ?? ""}`;
+}
+
+function PastZoneHeader({
+  expanded,
+  count,
+  hasMore,
+  onToggle,
+}: {
+  expanded: boolean;
+  count: number;
+  hasMore: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <li className="mt-1 border-t">
+      <button
+        type="button"
+        data-testid="subagent-past-zone"
+        aria-expanded={expanded}
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 bg-muted/40 px-2.5 py-1 text-left text-[11px] font-semibold tracking-wide text-muted-foreground uppercase hover:bg-accent/60"
+      >
+        <span>
+          Past
+          {count > 0 ? ` · ${count}${hasMore ? "+" : ""}` : ""}
+        </span>
+        <ChevronRightIcon
+          aria-hidden
+          className={cn("ml-auto size-3.5 transition-transform", expanded && "rotate-90")}
+        />
+      </button>
+    </li>
   );
 }
 
@@ -269,7 +494,7 @@ function ViewModeToggle({
 }: {
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
-  recheckButton?: React.ReactNode;
+  recheckButton?: ReactNode;
 }) {
   return (
     <div className="flex h-11 shrink-0 items-center gap-0.5 border-b px-2">
@@ -336,72 +561,6 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
   done: true,
   idle: true,
 };
-
-/**
- * Map a sub-agent type label to a category icon so a mix of agents reads by
- * role at a glance (Claude Code spawns many same-type "Explore" agents — the
- * icon distinguishes roles; the preview line below distinguishes instances).
- * Category icons are monochrome — the row applies the muted color; the
- * fallback is the full-color Otto (starfish) mascot.
- *
- * @param tool - The agent type, e.g. ``"Explore"`` or ``"researcher"``;
- *   ``null`` when the child carries no type.
- * @returns An SVG icon component.
- */
-export function iconForAgentType(tool: string | null): AgentRowIcon {
-  const t = (tool ?? "").toLowerCase();
-  if (t.includes("explore")) return SearchIcon;
-  if (t.includes("research")) return BookOpenIcon;
-  if (t.includes("plan") || t.includes("architect")) return CompassIcon;
-  if (t.includes("review")) return ScanSearchIcon;
-  if (t.includes("test")) return FlaskConicalIcon;
-  if (t.includes("doc") || t.includes("writ")) return FileTextIcon;
-  if (
-    t.includes("code") ||
-    t.includes("eng") ||
-    t.includes("dev") ||
-    t.includes("front") ||
-    t.includes("back")
-  ) {
-    return Code2Icon;
-  }
-  return OttoIcon;
-}
-
-/**
- * Pick a brand glyph for coding child sessions when the summary carries
- * enough identity metadata. Native children identify via their wrapper
- * label (authoritative — a custom scaffold agent merely *named* "codex"
- * must not get the Codex logo). Pi children are scaffold sessions with
- * no wrapper label, so the exact agent name ``"pi"`` is the signal.
- *
- * Only full native sessions get the brand glyph. *Sub-agent* wrapper
- * children (``…-subagent``) deliberately fall through to the role icons
- * (and the Otto fallback) — a native session's sub-agents are all the
- * same brand, so repeating the logo down the tree says nothing, while
- * role icons distinguish what each one is doing.
- *
- * @param child - One child-session summary from the poll or stream.
- * @returns The Claude/Codex/pi glyph component, or ``null`` for generic agents.
- */
-function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
-  const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
-  if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
-  if (nativeAgent?.iconKind === "codex") return CodexIcon;
-  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
-  if (nativeAgent?.iconKind === "pi") return PiIcon;
-  if (nativeAgent?.iconKind === "cursor") return CursorIcon;
-  if (nativeAgent?.iconKind === "kiro") return KiroIcon;
-  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
-  if (nativeAgent?.iconKind === "goose") return GooseIcon;
-  if (nativeAgent?.iconKind === "kimi") return KimiIcon;
-  if (nativeAgent?.iconKind === "hermes") return HermesIcon;
-  if (nativeAgent?.iconKind === "devin") return DevinIcon;
-  // Exact match — substring checks would false-match names like "pipeline".
-  if (child.tool === PI_AGENT_NAME) return PiIcon;
-  return null;
-}
 
 /**
  * Indicator + optional label shared by the main and child rows. The working
@@ -484,37 +643,31 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
   );
 }
 
-/**
- * Pick the primary label for a child-session row.
- *
- * @param child - One child-session summary from the poll or stream.
- * @returns The label shown beside the child icon.
- */
-function childPrimaryLabel(child: ChildSessionInfo): string {
-  // User-added rows use the reserved "ui:<agent>:<name>" title sentinel;
-  // LLM-spawned titles cannot start with "ui:" because the spec validator
-  // rejects "ui" as a sub-agent name.
-  const isUserAdded = child.title?.startsWith("ui:") ?? false;
-  const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  // agy joins these rather than taking the generic path below: its child title
-  // is ``"<role>:<cascade id>"``, so the first-colon split puts the ROLE in
-  // ``tool`` and the cascade UUID in the suffix — and the generic path returns
-  // ``session_name ?? suffix``, both of which are that UUID.
-  const isNativeSubagent =
-    childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === CLAUDE_NATIVE_SUBAGENT_WRAPPER;
-  if (isNativeSubagent && !isUserAdded) {
-    return child.tool ?? child.title ?? child.id;
-  }
-  let titleTask: string | null = null;
-  if (child.title?.includes(":")) {
-    const titleSuffix = child.title.split(":").slice(1).join(":");
-    if (titleSuffix) titleTask = titleSuffix;
-  }
+function WarmStatePill({ state }: { state: ChildSessionInfo["warm_state"] }) {
+  if (state !== "warm" && state !== "cold") return null;
   return (
-    child.task_summary ?? child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id
+    <span
+      data-testid="subagent-warm-state"
+      className="shrink-0 rounded-full border border-border px-1.5 text-[10px] leading-4 text-muted-foreground"
+    >
+      {state === "warm" ? "Warm" : "Cold"}
+    </span>
+  );
+}
+
+/**
+ * Tooltip body shared by active and past rows: agent · host, the full cwd,
+ * the branch when the session recorded one, and the task summary.
+ */
+function ChildTooltipContent({ child, hostName }: { child: ChildSessionInfo; hostName: string }) {
+  const display = childAgentDisplay(child);
+  return (
+    <div className="flex flex-col gap-0.5 text-left">
+      <span>{[display, hostName].filter(Boolean).join(" · ")}</span>
+      {child.cwd && <span className="break-all font-mono text-[11px]">{child.cwd}</span>}
+      {child.git_branch && <span>branch {child.git_branch}</span>}
+      {child.task_summary && <span>{child.task_summary}</span>}
+    </div>
   );
 }
 
@@ -524,11 +677,10 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
  * no children, so the rail is a complete navigation surface for the
  * parent-children tree.
  *
- * The leading icon doubles as the agent-kind indicator: a Claude or
- * Codex glyph for the native wrappers, and a generic bot icon for
- * everything else. Sub-agent rows nest below
- * with their own role icons, so the "main vs sub-agent" distinction
- * is carried by position + nesting connector rather than a pill.
+ * The badge doubles as the agent-kind indicator (letters = agent,
+ * border = host); sub-agent rows nest below with their own badges, so
+ * the "main vs sub-agent" distinction is carried by position and the
+ * indentation gutter rather than a pill.
  */
 // Cap matches the server's child-session preview so the main row reads
 // consistently with the child rows (CSS truncates to one line regardless;
@@ -572,34 +724,15 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-/**
- * Resolve a session's brand icon from its native-wrapper ``iconKind``
- * (authoritative for native-terminal sessions) with a harness-substring
- * fallback for plain SDK sessions that carry no wrapper label — e.g.
- * ``omni --harness kimi``, whose ``harness: "kimi"`` would otherwise fall
- * through to the generic bot. Mirrors ``iconForAgent`` in ``AgentCard.tsx``.
- */
-function iconForWrapperOrHarness(
-  iconKind: string | undefined,
-  harness: string | null | undefined,
-  isNessie: boolean,
-): AgentRowIcon {
-  if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
-  if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
-  if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
-  if (iconKind === "cursor" || harness?.includes("cursor")) return CursorIcon;
-  if (iconKind === "kiro" || harness?.includes("kiro")) return KiroIcon;
-  if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
-  if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
-  if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
-  if (iconKind === "devin" || harness?.includes("devin")) return DevinIcon;
-  // Exact match — a substring check would false-match e.g. "openapi".
-  if (iconKind === "pi" || harness === "pi") return PiIcon;
-  if (isNessie) return NessieIcon;
-  return BotIcon;
-}
-
-function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
+function MainRow({
+  rootSessionId,
+  isActive,
+  hostNameFor,
+}: {
+  rootSessionId: string;
+  isActive: boolean;
+  hostNameFor: (hostId: string | null | undefined) => string;
+}) {
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
@@ -607,7 +740,6 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
-  const Icon = iconForWrapperOrHarness(nativeAgent?.iconKind, session?.harness, isNessie);
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -634,16 +766,19 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         )}
       >
         <div className="flex w-full items-center gap-1">
-          <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+          <RailAgentBadge
+            child={sessionLike(session, rootSessionId)}
+            hostName={hostNameFor(session?.hostId)}
+          />
           <span className="shrink-0 truncate text-sm font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
         </div>
         {preview && (
-          // Indented to align with the title text above: 14px icon + 4px gap.
+          // Indented to align with the title text above: 22px badge + 4px gap.
           <p
             data-testid="subagent-main-preview"
-            className="truncate pl-[18px] text-sm text-muted-foreground"
+            className="truncate pl-[26px] text-sm text-muted-foreground"
           >
             {preview}
           </p>
@@ -654,8 +789,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
 }
 
 // Indentation: depth 1 keeps the original 24px gutter (pl-6); each
-// further level steps in by another 14px so the connector glyphs read
-// as a tree.
+// further level steps in by another 14px so the nesting reads as a tree.
 const ROW_BASE_PADDING_PX = 24;
 const ROW_DEPTH_STEP_PX = 14;
 const ROW_TOGGLE_SIZE_PX = 16;
@@ -672,6 +806,7 @@ function SubagentRow({
   onToggleCollapsed,
   canStopChildren,
   onRequestStop,
+  hostNameFor,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -682,12 +817,13 @@ function SubagentRow({
   onToggleCollapsed: (id: string) => void;
   canStopChildren: boolean;
   onRequestStop: (id: string, label: string) => void;
+  hostNameFor: (hostId: string | null | undefined) => string;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = sessionNavigationSearch(useLocation().search);
-  const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
+  const hostName = hostNameFor(child.host_id);
   const isActive = conversationId === child.id;
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
@@ -704,6 +840,7 @@ function SubagentRow({
       status.activity === "working" ||
       status.activity === "awaiting" ||
       (status.activity === "unverified" && child.busy));
+  const secondary = child.last_message_preview ?? child.task_summary;
   return (
     <>
       <li className="relative">
@@ -723,61 +860,54 @@ function SubagentRow({
             <ToggleIcon aria-hidden="true" className="size-3.5" />
           </button>
         )}
-        <Link
-          // See MainRow: drop session-scoped params on rail navigation
-          // (preserving global ones like ``?debug=1``) so a sticky
-          // ``?file=`` from the previous session doesn't carry over.
-          to={{ pathname: `/c/${child.id}`, search }}
-          data-testid="subagent-row"
-          data-child-session-id={child.id}
-          data-depth={depth}
-          // Left gutter (depth-stepped) + connector glyph nests this row
-          // under its parent, signaling where it sits in the tree.
-          style={{ paddingLeft: rowPaddingLeft(depth) }}
-          className={cn(
-            "flex w-full flex-col gap-0.5 py-2 text-left hover:bg-accent/60",
-            canStop ? "pr-12" : "pr-2.5",
-            isActive && "bg-accent",
-            dim && "opacity-60 hover:opacity-100",
-          )}
-        >
-          <div className="flex w-full items-center gap-1">
-            {hasGrandchildren ? (
-              <span aria-hidden="true" className="-ml-3 size-3 shrink-0" />
-            ) : (
-              <CornerDownRightIcon
-                // Decorative nesting connector — the role icon beside it carries
-                // the meaning, so hide this from the accessibility tree.
-                aria-hidden="true"
-                className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
-              />
-            )}
-            <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
-            {child.routed_model ? (
-              // Model the intelligent router picked for this sub-agent — the
-              // per-subagent half of routing visibility.
-              <span
-                data-testid="subagent-routed-model"
-                title={`Smart routing picked ${child.routed_model}`}
-                className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
-              >
-                {shortModelName(child.routed_model)}
-              </span>
-            ) : null}
-            <span className="flex-1" />
-            <StatusIndicator {...status} />
-          </div>
-          {child.last_message_preview && (
-            // Preview indented to align with the title text on the row
-            // above: 12px connector - 12px (-ml-3) + 4px gap + 14px bot
-            // icon + 4px gap = 22px. Relative to the row's own padding,
-            // so it tracks the depth-stepped gutter automatically.
-            <p className="truncate pl-[22px] text-sm text-muted-foreground">
-              {child.last_message_preview}
-            </p>
-          )}
-        </Link>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Link
+              // See MainRow: drop session-scoped params on rail navigation
+              // (preserving global ones like ``?debug=1``) so a sticky
+              // ``?file=`` from the previous session doesn't carry over.
+              to={{ pathname: `/c/${child.id}`, search }}
+              data-testid="subagent-row"
+              data-child-session-id={child.id}
+              data-depth={depth}
+              // Left gutter (depth-stepped) nests this row under its parent.
+              style={{ paddingLeft: rowPaddingLeft(depth) }}
+              className={cn(
+                "flex w-full flex-col gap-0.5 py-2 text-left hover:bg-accent/60",
+                canStop ? "pr-12" : "pr-2.5",
+                isActive && "bg-accent",
+                dim && "opacity-60 hover:opacity-100",
+              )}
+            >
+              <div className="flex w-full items-center gap-1">
+                <RailAgentBadge child={child} hostName={hostName} />
+                <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
+                {child.routed_model ? (
+                  // Model the intelligent router picked for this sub-agent — the
+                  // per-subagent half of routing visibility.
+                  <span
+                    data-testid="subagent-routed-model"
+                    title={`Smart routing picked ${child.routed_model}`}
+                    className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
+                  >
+                    {shortModelName(child.routed_model)}
+                  </span>
+                ) : null}
+                <span className="flex-1" />
+                <WarmStatePill state={child.warm_state} />
+                <StatusIndicator {...status} />
+              </div>
+              {secondary && (
+                // Preview indented to align with the title text above:
+                // 22px badge + 4px gap.
+                <p className="truncate pl-[26px] text-sm text-muted-foreground">{secondary}</p>
+              )}
+            </Link>
+          </TooltipTrigger>
+          <TooltipContent side="left" align="center">
+            <ChildTooltipContent child={child} hostName={hostName} />
+          </TooltipContent>
+        </Tooltip>
         {canStop && (
           <Button
             type="button"
@@ -804,8 +934,79 @@ function SubagentRow({
             onToggleCollapsed={onToggleCollapsed}
             canStopChildren={canStopChildren}
             onRequestStop={onRequestStop}
+            hostNameFor={hostNameFor}
           />
         ))}
     </>
+  );
+}
+
+/**
+ * Archived time as "Today HH:MM" / "Yesterday HH:MM" / a short date.
+ * ``archived_at`` is epoch seconds.
+ */
+function formatArchivedTime(archivedAt: number | null | undefined): string | null {
+  if (archivedAt == null) return null;
+  const date = new Date(archivedAt * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+  const startOfDay = (value: Date) =>
+    new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const daysAgo = Math.round((startOfDay(new Date()) - startOfDay(date)) / 86_400_000);
+  const clock = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (daysAgo <= 0) return `Today ${clock}`;
+  if (daysAgo === 1) return `Yesterday ${clock}`;
+  return date.toLocaleDateString(undefined, {
+    ...(date.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function PastChildRow({
+  child,
+  conversationId,
+  hostNameFor,
+}: {
+  child: ChildSessionInfo;
+  conversationId: string;
+  hostNameFor: (hostId: string | null | undefined) => string;
+}) {
+  const search = sessionNavigationSearch(useLocation().search);
+  const primary = childPrimaryLabel(child);
+  const hostName = hostNameFor(child.host_id);
+  const archivedLabel = formatArchivedTime(child.archived_at);
+  const isActive = conversationId === child.id;
+  const cwdLabel = child.cwd ? shortenPath(child.cwd) : UNKNOWN_DIRECTORY;
+  return (
+    <li>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Link
+            to={{ pathname: `/c/${child.id}`, search }}
+            data-testid="subagent-past-row"
+            data-child-session-id={child.id}
+            className={cn(
+              "flex w-full flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-accent/60",
+              isActive && "bg-accent",
+            )}
+          >
+            <div className="flex w-full items-center gap-1">
+              <RailAgentBadge child={child} hostName={hostName} />
+              <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
+              <span className="flex-1" />
+              {archivedLabel && (
+                <span className="shrink-0 text-[11px] text-muted-foreground">{archivedLabel}</span>
+              )}
+            </div>
+            <p className="truncate pl-[26px] text-xs text-muted-foreground">
+              {hostName} · {cwdLabel}
+            </p>
+          </Link>
+        </TooltipTrigger>
+        <TooltipContent side="left" align="center">
+          <ChildTooltipContent child={child} hostName={hostName} />
+        </TooltipContent>
+      </Tooltip>
+    </li>
   );
 }

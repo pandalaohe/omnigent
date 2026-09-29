@@ -971,7 +971,7 @@
                 "type": "null"
               }
             ],
-            "description": "Agent id recorded on the latest task, e.g. `\"ag_abc123\"`. `None` if the child has no tasks yet (rare \u2014 `_spawn_one` creates a task atomically with the conversation).",
+            "description": "Agent id bound to the child conversation, e.g. `\"ag_abc123\"`. `None` for legacy rows without an agent binding; unlike `agent_name` this is the durable column value, so it survives a deleted agent row.",
             "title": "Agent Id"
           },
           "agent_name": {
@@ -983,7 +983,7 @@
                 "type": "null"
               }
             ],
-            "description": "Agent type recorded on the latest task, e.g. `\"researcher\"`. Mirrors the `tool` prefix in `title` and is provided alongside it because the title is a denormalized string while `agent_name` is the durable per-task value.",
+            "description": "Name of the agent row bound to the child, e.g. `\"researcher\"`. `None` for legacy rows without an `agent_id` or when the bound agent row cannot be resolved.",
             "title": "Agent Name"
           },
           "archived": {
@@ -991,6 +991,19 @@
             "description": "`True` when the child session is archived. Archived children are excluded from the default listing; the `include_archived` query parameter surfaces them so callers can tell a freed name from a merely hidden one.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch timestamp when the child was most recently archived. `None` while the child is active (or for rows archived before the timestamp existed).",
+            "title": "Archived At"
           },
           "busy": {
             "default": false,
@@ -1027,6 +1040,54 @@
             ],
             "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
             "title": "Current Task Status"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Effective working directory: the child's own `worktree ?? workspace` when set, else the nearest ancestor's. `None` when neither exists.",
+            "title": "Cwd"
+          },
+          "git_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Branch taken from the same row that supplied `cwd` \u2014 a directly placed child with no branch stays `None` rather than borrowing an ancestor's branch.",
+            "title": "Git Branch"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical harness for this child, e.g. `\"codex-native\"`. Resolved per conversation, so children that share an agent row but differ by `harness_override` or bundled sub-agent report their own. `None` when unresolvable.",
+            "title": "Harness"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Effective host the child runs on: the child's own `host_id` when set, else the nearest ancestor's. `None` when neither exists (e.g. a local, hostless session tree).",
+            "title": "Host Id"
           },
           "id": {
             "description": "Child conversation/session identifier, e.g. `\"conv_child123\"`.",
@@ -1132,6 +1193,18 @@
             ],
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For bundled agents, the sub-agent member name within the parent's spec tree, e.g. `\"researcher\"`. `None` for children bound directly to a whole agent row.",
+            "title": "Sub Agent Name"
           },
           "task_summary": {
             "anyOf": [
@@ -8006,6 +8079,42 @@
             "title": "Created At",
             "type": "integer"
           },
+          "effective_cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For sub-agent sessions, the child's own `worktree ?? workspace` when set, else the nearest ancestor's. `None` when neither exists.",
+            "title": "Effective Cwd"
+          },
+          "effective_git_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Branch matching `effective_cwd`, taken from the same row that supplied that directory \u2014 an inherited cwd never borrows the child's own branch. `None` when that row has no recorded branch.",
+            "title": "Effective Git Branch"
+          },
+          "effective_host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For sub-agent sessions, the host the child actually runs on: its own `host_id` when set, else the nearest ancestor's. `None` for top-level sessions and for a child whose chain carries no host.",
+            "title": "Effective Host Id"
+          },
           "external_session_id": {
             "anyOf": [
               {
@@ -10345,7 +10454,8 @@
                 "agent_pins",
                 "calling_defaults",
                 "calling_last",
-                "session_collab"
+                "session_collab",
+                "host_colors"
               ]
             },
             "title": "Settings",
@@ -12595,6 +12705,7 @@
                         "calling_defaults",
                         "calling_last",
                         "context_indicator",
+                        "host_colors",
                         "keyboard_shortcuts",
                         "mobile_assistant",
                         "session_collab",
@@ -12676,7 +12787,8 @@
                 "agent_pins",
                 "calling_defaults",
                 "calling_last",
-                "session_collab"
+                "session_collab",
+                "host_colors"
               ],
               "title": "Namespace",
               "type": "string"
@@ -15357,7 +15469,7 @@
     },
     "/v1/sessions/{session_id}/child_sessions": {
       "get": {
-        "description": "List sub-agent (child) sessions under a parent session.\n\nReturns a page of `ChildSessionSummary` objects\nderived from child conversations (`kind=\"sub_agent\"`,\n`parent_conversation_id=session_id`) plus each child's\nlatest task. Powers the web / REPL debug surfaces' \"child\nsessions\" panel without parsing parent\n`function_call_output` JSON handles. Pagination contract\nmatches `list_session_items` so existing client code\ncan reuse the same cursor logic.\n\n**Returns:** A `PaginatedList` of `ChildSessionSummary` objects.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "description": "List sub-agent (child) sessions under a parent session.\n\nReturns a page of `ChildSessionSummary` objects\nderived from child conversations (`kind=\"sub_agent\"`,\n`parent_conversation_id=session_id`) plus each child's\nlatest task. Powers the web / REPL debug surfaces' \"child\nsessions\" panel without parsing parent\n`function_call_output` JSON handles. Pagination contract\nmatches `list_session_items` so existing client code\ncan reuse the same cursor logic.\n\n**Returns:** A `PaginatedList` of `ChildSessionSummary` objects.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there; 400 if `zone` is combined with `include_archived=true`.",
         "operationId": "list_child_sessions_v1_sessions__session_id__child_sessions_get",
         "parameters": [
           {
@@ -15464,7 +15576,7 @@
             }
           },
           {
-            "description": "When `False` (default), archived children are excluded. When `True`, archived children are returned too, each with `archived: true`.",
+            "description": "When `False` (default), archived children are excluded. When `True`, archived children are returned too, each with `archived: true`. Rejected when combined with `zone`.",
             "in": "query",
             "name": "include_archived",
             "required": false,
@@ -15472,6 +15584,24 @@
               "default": false,
               "title": "Include Archived",
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Rail zone filter. `\"active\"` returns non-archived children newest-created first (equal to `include_archived=False`); `\"past\"` returns only archived children newest-archived first, each with `archived_at` set. `None` (default) keeps the unzoned behaviour driven by `include_archived`. `zone` together with `include_archived=true` is rejected as invalid input.",
+            "in": "query",
+            "name": "zone",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(active|past)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Zone"
             }
           }
         ],

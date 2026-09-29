@@ -7416,16 +7416,21 @@ function applyTerminalDeleted(sessionId: string, resourceId: string): void {
 }
 
 /**
- * Upsert-with-merge a child session into the parent's query cache.
+ * Merge a child-session delta into the parent's cached active list.
  *
  * The event payload is a PARTIAL ``ChildSessionInfo``: snapshot-on-connect
  * carries the full summary, but live runner deltas carry only what
  * changed (a status delta omits ``last_message_preview``; a preview delta
  * carries only it). So we overlay *present* fields onto the existing row
- * (a status flip keeps the preview, a preview update keeps busy/status),
- * and insert from present fields when the child isn't cached yet. Cold
- * cache (parent not viewed since reload) is a no-op — the eventual
- * ``useChildSessions`` mount pulls a fresh list.
+ * (a status flip keeps the preview, a preview update keeps busy/status).
+ *
+ * Membership is the server's call, never a delta's: an unknown child is
+ * never inserted (a partial patch would materialize a row missing every
+ * field it did not carry, and a status edge for an archived child would
+ * resurrect it) — the active key is invalidated so the list refetches.
+ * An archive delta removes the row locally and invalidates the prefix key,
+ * which cancels an in-flight active refetch and refreshes the past zone; an
+ * unarchive delta for an absent row uses the same prefix invalidation.
  */
 function applyChildSessionUpdated(
   parentId: string,
@@ -7434,15 +7439,13 @@ function applyChildSessionUpdated(
 ): void {
   if (queryClient === null) return;
   const key = childSessionsQueryKey(parentId);
-  // Initialize a cold cache rather than skipping: snapshot-on-connect
-  // sends full child rows over the stream, so seeding here lets child
-  // status/preview update live even when no useChildSessions is mounted.
   const current = queryClient.getQueryData<ChildSessionInfo[]>(key) ?? [];
 
   // Build a patch from only the fields PRESENT in the payload (undefined
   // = "not in this delta, leave as-is"); explicit null is a real value.
   const patch: Partial<ChildSessionInfo> = {};
   const strOrNull = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const numOrNull = (v: unknown): number | null => (typeof v === "number" ? v : null);
   const strRecordOrEmpty = (v: unknown): Record<string, string> =>
     v && typeof v === "object"
       ? Object.fromEntries(
@@ -7478,25 +7481,42 @@ function applyChildSessionUpdated(
   if (child.pending_elicitations_count !== undefined)
     patch.pending_elicitations_count =
       typeof child.pending_elicitations_count === "number" ? child.pending_elicitations_count : 0;
+  if (child.host_id !== undefined) patch.host_id = strOrNull(child.host_id);
+  if (child.cwd !== undefined) patch.cwd = strOrNull(child.cwd);
+  if (child.git_branch !== undefined) patch.git_branch = strOrNull(child.git_branch);
+  if (child.harness !== undefined) patch.harness = strOrNull(child.harness);
+  if (child.agent_id !== undefined) patch.agent_id = strOrNull(child.agent_id);
+  if (child.agent_name !== undefined) patch.agent_name = strOrNull(child.agent_name);
+  if (child.sub_agent_name !== undefined) patch.sub_agent_name = strOrNull(child.sub_agent_name);
+  if (child.archived !== undefined) patch.archived = child.archived === true;
+  if (child.archived_at !== undefined) patch.archived_at = numOrNull(child.archived_at);
+  if (child.created_at !== undefined) patch.created_at = numOrNull(child.created_at);
+  if (child.warm_state !== undefined)
+    patch.warm_state =
+      child.warm_state === "warm" || child.warm_state === "cold" ? child.warm_state : null;
 
   const idx = current.findIndex((c) => c.id === childId);
   if (idx === -1) {
-    // Insert: absent fields default (null / not-busy) until a fuller
-    // update (snapshot/refetch) fills them in.
-    const inserted: ChildSessionInfo = {
-      id: childId,
-      title: patch.title ?? null,
-      task_summary: patch.task_summary ?? null,
-      tool: patch.tool ?? null,
-      session_name: patch.session_name ?? null,
-      labels: patch.labels ?? {},
-      current_task_status: patch.current_task_status ?? null,
-      last_task_error: patch.last_task_error ?? null,
-      busy: patch.busy ?? false,
-      last_message_preview: patch.last_message_preview ?? null,
-      pending_elicitations_count: patch.pending_elicitations_count ?? 0,
-    };
-    queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current]);
+    // Unknown row: refetch rather than guess membership. A row absent from
+    // the active cache is either brand new, archived, or not part of it at
+    // all; only the server knows which, and the invalidation is a prefix
+    // match, so an unarchive (`archived: false`) refreshes the past zone
+    // too.
+    queryClient.invalidateQueries({ queryKey: key });
+    return;
+  }
+  if (patch.archived === true) {
+    // Invalidation cancels only observed queries; an unmounted panel's
+    // in-flight fetch would land the archived row again, so cancel it here.
+    // The cancel reverts to the pre-fetch state, so the removal is re-applied.
+    const client = queryClient;
+    const removeRow = () =>
+      client.setQueryData<ChildSessionInfo[]>(key, (rows) => rows?.filter((c) => c.id !== childId));
+    removeRow();
+    void client.cancelQueries({ queryKey: key, exact: true }).then(() => {
+      removeRow();
+      void client.invalidateQueries({ queryKey: key });
+    });
     return;
   }
   const next = [...current];

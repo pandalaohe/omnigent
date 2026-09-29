@@ -2,6 +2,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
@@ -35,6 +36,18 @@ vi.mock("./SubagentsGraphView", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
+  usePastChildSessions: () => ({
+    children: [],
+    isLoading: false,
+    error: null,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
+}));
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({ data: [] }),
 }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -112,10 +125,12 @@ function defaultSession(): ReturnType<typeof useSession> {
 function renderPanel(opts: { conversationId?: string; rootSessionId?: string } = {}) {
   return render(
     <MemoryRouter>
-      <SubagentsPanel
-        conversationId={opts.conversationId ?? "conv_root"}
-        rootSessionId={opts.rootSessionId ?? "conv_root"}
-      />
+      <TooltipProvider delayDuration={0}>
+        <SubagentsPanel
+          conversationId={opts.conversationId ?? "conv_root"}
+          rootSessionId={opts.rootSessionId ?? "conv_root"}
+        />
+      </TooltipProvider>
     </MemoryRouter>,
   );
 }

@@ -109,6 +109,7 @@ import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ChatHeader } from "./ChatHeader";
+import type { ChildSessionLike } from "./subagentRailGroups";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import {
@@ -635,6 +636,23 @@ export function AppShell() {
     isChildSession && activeSession?.parentSessionId
       ? `/c/${activeSession.parentSessionId}`
       : undefined;
+  // Child header identity: the session's own title / sub-agent name plus the
+  // server-computed effective placement, normalized to the rail's child shape
+  // so the badge, label and chip share one rule with the rail.
+  const childBreadcrumbSession = useMemo<ChildSessionLike | null>(() => {
+    if (!isChildSession || !activeSession) return null;
+    return {
+      id: activeSession.id,
+      title: activeSession.title,
+      sub_agent_name: activeSession.subAgentName,
+      agent_name: activeSession.agentName,
+      agent_id: activeSession.agentId,
+      harness: activeSession.harness,
+      host_id: activeSession.effectiveHostId ?? null,
+      labels: activeSession.labels,
+    };
+  }, [isChildSession, activeSession]);
+  const childBreadcrumbCwd = isChildSession ? (activeSession?.effectiveCwd ?? null) : null;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -2245,6 +2263,8 @@ export function AppShell() {
                     }}
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
+                    childSession={childBreadcrumbSession}
+                    childCwd={childBreadcrumbCwd}
                     conversationId={conversationId}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}

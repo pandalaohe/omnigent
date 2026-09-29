@@ -9,17 +9,18 @@ through the spawn workflow) — the route depends only on
 and the relay-fed ``_session_status_cache``, so direct seeding gives
 fast, deterministic coverage of every response field.
 
-The tasks table has been removed. ``current_task_id`` and ``agent_name``
-(previously derived from task rows) are now always ``None``.
-``current_task_status`` is derived from session lifecycle state when
-available, and is otherwise ``None``. ``agent_id`` is populated from the
-conversation row's ``agent_id`` column.
+The tasks table has been removed. ``current_task_id`` is now always
+``None``. ``current_task_status`` is derived from session lifecycle state
+when available, and is otherwise ``None``. ``agent_id`` is populated from
+the conversation row's ``agent_id`` column, and ``agent_name`` /
+``harness`` are resolved from the bound agent row per conversation.
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import itertools
 import json
 import tarfile
 from dataclasses import dataclass
@@ -34,6 +35,9 @@ from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import set_runner_client
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
+from omnigent.stores.conversation_store import (
+    sqlalchemy_store as sqlalchemy_store_module,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -91,14 +95,19 @@ def _seed_child(
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    host_id: str | None = None,
+    workspace: str | None = None,
+    worktree: str | None = None,
+    git_branch: str | None = None,
+    harness_override: str | None = None,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
 
     Mirrors what :func:`omnigent.tools.builtins.spawn._spawn_one` does,
     minus the workflow start and SSE publish. The tasks table has been
-    removed — ``current_task_id``, ``current_task_status``, and
-    ``agent_name`` fields in the summary are always ``None``.
+    removed — ``current_task_id`` and ``current_task_status`` fields in
+    the summary are always ``None``.
 
     :param conv_store: Store for the child conversation.
     :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
@@ -107,6 +116,14 @@ def _seed_child(
         e.g. ``"researcher:auth"``.
     :param agent_id: Agent id to bind to this conversation (populates
         the ``agent_id`` field in the summary).
+    :param host_id: Child's own host, e.g. ``"host_h2"``; requires
+        ``workspace``.
+    :param workspace: Child's own launch directory.
+    :param worktree: Child's own working tree when it differs from
+        ``workspace``.
+    :param git_branch: Branch checked out in the child's own working tree.
+    :param harness_override: Per-session harness override, e.g.
+        ``"codex-native"``.
     :returns: The created child :class:`Conversation`.
     """
     return conv_store.create_conversation(
@@ -114,6 +131,11 @@ def _seed_child(
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
+        host_id=host_id,
+        workspace=workspace,
+        worktree=worktree,
+        git_branch=git_branch,
+        harness_override=harness_override,
     )
 
 
@@ -128,6 +150,23 @@ def _empty_terminal_runner() -> httpx.AsyncClient:
 async def _child_row(client: httpx.AsyncClient, parent_id: str, child_id: str) -> dict[str, Any]:
     rows = (await client.get(f"/v1/sessions/{parent_id}/child_sessions")).json()["data"]
     return next(row for row in rows if row["id"] == child_id)
+
+
+async def _next_child_update(collector: Any) -> dict[str, Any]:
+    """
+    Await the next ``session.child_session.updated`` event on a collector.
+
+    Other event types can interleave on the same conversation stream
+    (e.g. the child's own ``session.status`` edge), so skip until the
+    child-update frame arrives.
+
+    :param collector: A running ``SessionStreamCollector``.
+    :returns: The first child-update event seen.
+    """
+    while True:
+        event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+        if event.get("type") == "session.child_session.updated":
+            return event
 
 
 # ── 404 ──────────────────────────────────────────────────
@@ -556,11 +595,11 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     """
     A single seeded child surfaces every documented summary field.
 
-    The tasks table has been removed — ``current_task_id``,
-    ``current_task_status``, and ``agent_name`` are always ``None``.
-    ``agent_id`` is populated from the conversation row's ``agent_id``
-    column. ``busy`` is derived from the relay-fed cache (defaults to
-    ``False`` with no cache entry).
+    The tasks table has been removed — ``current_task_id`` and
+    ``current_task_status`` are always ``None``. ``agent_id`` is
+    populated from the conversation row's ``agent_id`` column and
+    ``agent_name`` from the bound agent row. ``busy`` is derived from
+    the relay-fed cache (defaults to ``False`` with no cache entry).
 
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
@@ -594,10 +633,10 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["tool"] == "researcher"
     assert row["session_name"] == "auth"
 
-    # agent_id comes from the conversation row (tasks table removed).
+    # agent_id comes from the conversation row; agent_name is resolved
+    # from the bound agent row (tasks table removed).
     assert row["agent_id"] == session["agent_id"]
-    # agent_name and task fields are None (no tasks table).
-    assert row["agent_name"] is None
+    assert row["agent_name"] == "test-agent"
     assert row["current_task_id"] is None
     assert row["current_task_status"] is None
     assert row["last_task_error"] is None
@@ -2926,3 +2965,569 @@ async def test_cross_project_child_is_readable_and_sendable_by_its_mother(
     assert path == f"/v1/sessions/{child.id}/events"
     assert body["type"] == "message"
     assert body["content"] == [{"type": "input_text", "text": "status?"}]
+
+
+# ── Agents rail: zone filter + effective placement ────────
+
+
+async def test_child_sessions_active_zone_pages_exclude_archived(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``zone=active`` returns every non-archived child, newest-created first.
+
+    The rail's active zone pages through all active children, so the
+    filter must exclude archived rows on every page and keep the
+    created-at-desc order stable across the cursor.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param monkeypatch: Pytest patcher, used to pin the store clock so
+        created-at ordering is deterministic.
+    """
+    parent = await _create_parent_session(client, "zone-active-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    base = 1_700_000_000
+    children: list[Conversation] = []
+    for index in range(25):
+        monkeypatch.setattr(sqlalchemy_store_module, "now_epoch", lambda index=index: base + index)
+        children.append(
+            _seed_child(
+                conv_store=conv_store,
+                parent_id=parent["id"],
+                title=f"researcher:c{index}",
+                agent_id=parent["agent_id"],
+            )
+        )
+    for offset, child in enumerate(children[:8]):
+        monkeypatch.setattr(
+            sqlalchemy_store_module, "now_epoch", lambda offset=offset: base + 100 + offset
+        )
+        conv_store.update_conversation(child.id, archived=True)
+
+    expected = [child.id for child in reversed(children[8:])]
+    first = (
+        await client.get(
+            f"/v1/sessions/{parent['id']}/child_sessions",
+            params={"zone": "active", "limit": 10},
+        )
+    ).json()
+    assert first["has_more"] is True
+    assert [row["id"] for row in first["data"]] == expected[:10]
+    assert all(row["archived"] is False for row in first["data"])
+
+    second = (
+        await client.get(
+            f"/v1/sessions/{parent['id']}/child_sessions",
+            params={"zone": "active", "limit": 10, "after": first["last_id"]},
+        )
+    ).json()
+    assert second["has_more"] is False
+    assert [row["id"] for row in second["data"]] == expected[10:]
+
+
+async def test_child_sessions_past_zone_orders_by_archived_at(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``zone=past`` returns only archived children, newest-archived first.
+
+    Each row carries its ``archived_at`` so the rail can label the row,
+    and cursor paging follows the archived-at desc order.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param monkeypatch: Pytest patcher, used to pin the store clock so
+        archived-at ordering is deterministic.
+    """
+    parent = await _create_parent_session(client, "zone-past-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    base = 1_700_000_000
+    children: list[Conversation] = []
+    for index in range(25):
+        monkeypatch.setattr(sqlalchemy_store_module, "now_epoch", lambda index=index: base + index)
+        children.append(
+            _seed_child(
+                conv_store=conv_store,
+                parent_id=parent["id"],
+                title=f"researcher:p{index}",
+                agent_id=parent["agent_id"],
+            )
+        )
+    archived = children[:8]
+    for offset, child in enumerate(archived):
+        monkeypatch.setattr(
+            sqlalchemy_store_module, "now_epoch", lambda offset=offset: base + 100 + offset
+        )
+        conv_store.update_conversation(child.id, archived=True)
+
+    expected = [child.id for child in reversed(archived)]
+    first = (
+        await client.get(
+            f"/v1/sessions/{parent['id']}/child_sessions",
+            params={"zone": "past", "limit": 5},
+        )
+    ).json()
+    assert first["has_more"] is True
+    assert [row["id"] for row in first["data"]] == expected[:5]
+    assert all(row["archived"] is True for row in first["data"])
+
+    second = (
+        await client.get(
+            f"/v1/sessions/{parent['id']}/child_sessions",
+            params={"zone": "past", "limit": 5, "after": first["last_id"]},
+        )
+    ).json()
+    assert second["has_more"] is False
+    assert [row["id"] for row in second["data"]] == expected[5:]
+    archived_times = [row["archived_at"] for row in [*first["data"], *second["data"]]]
+    assert all(value is not None for value in archived_times)
+    assert archived_times == sorted(archived_times, reverse=True)
+
+
+async def test_child_sessions_zone_rejects_include_archived_combo(
+    client: httpx.AsyncClient,
+) -> None:
+    """``zone`` and ``include_archived=true`` together are rejected.
+
+    :param client: The test HTTP client.
+    """
+    parent = await _create_parent_session(client, "zone-bad-combo")
+    resp = await client.get(
+        f"/v1/sessions/{parent['id']}/child_sessions",
+        params={"zone": "past", "include_archived": "true"},
+    )
+    assert resp.status_code == 400
+    assert "zone" in resp.text
+
+
+async def test_child_sessions_inherits_placement_from_ancestor(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A hostless child and grandchild report the nearest placed ancestor.
+
+    Host and directory resolve independently up the chain; the branch
+    travels with the row the directory came from.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    agent = await create_test_agent(client, name="placement-inherit-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root = conv_store.create_conversation(
+        kind="default",
+        title="placed-root",
+        agent_id=agent["id"],
+        host_id="a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        workspace="/srv/parent",
+        worktree="/srv/parent-wt",
+        git_branch="feature/parent",
+    )
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=root.id,
+        title="researcher:child",
+        agent_id=agent["id"],
+    )
+    grandchild = _seed_child(
+        conv_store=conv_store,
+        parent_id=child.id,
+        title="researcher:grandchild",
+        agent_id=agent["id"],
+    )
+
+    expected = ("a1b2c3d4e5f60718293a4b5c6d7e8f90", "/srv/parent-wt", "feature/parent")
+    child_row = await _child_row(client, root.id, child.id)
+    assert (child_row["host_id"], child_row["cwd"], child_row["git_branch"]) == expected
+    grandchild_row = await _child_row(client, child.id, grandchild.id)
+    assert (
+        grandchild_row["host_id"],
+        grandchild_row["cwd"],
+        grandchild_row["git_branch"],
+    ) == expected
+
+
+async def test_child_sessions_own_placement_wins_with_null_branch(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child's own host / workspace wins, and its null branch stays null.
+
+    The inherited branch must not leak onto a directly placed child that
+    records no branch of its own.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    agent = await create_test_agent(client, name="placement-own-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root = conv_store.create_conversation(
+        kind="default",
+        title="branch-parent",
+        agent_id=agent["id"],
+        host_id="51dc949aba31e24ca8f047d6fba31a0d",
+        workspace="/srv/root",
+        git_branch="parent-branch",
+    )
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=root.id,
+        title="researcher:own",
+        agent_id=agent["id"],
+        host_id="9b2ec6de30f5e014c7056afe505510c3",
+        workspace="/srv/child",
+    )
+
+    row = await _child_row(client, root.id, child.id)
+    assert row["host_id"] == "9b2ec6de30f5e014c7056afe505510c3"
+    assert row["cwd"] == "/srv/child"
+    assert row["git_branch"] is None
+
+
+async def test_child_sessions_no_placement_anywhere(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A hostless tree reports null placement rather than inventing values.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    parent = await _create_parent_session(client, "placement-none-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:nowhere",
+        agent_id=parent["agent_id"],
+    )
+
+    row = await _child_row(client, parent["id"], child.id)
+    assert row["host_id"] is None
+    assert row["cwd"] is None
+    assert row["git_branch"] is None
+
+
+async def test_child_sessions_agent_name_and_harness(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child bound to a codex agent reports its name and harness.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    parent = await _create_parent_session(client, "identity-parent")
+    codex_agent = await create_test_agent(
+        client,
+        name="codex-rail-agent",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:codex",
+        agent_id=codex_agent["id"],
+    )
+
+    row = await _child_row(client, parent["id"], child.id)
+    assert row["agent_name"] == "codex-rail-agent"
+    assert row["harness"] == "codex-native"
+    assert row["sub_agent_name"] is None
+
+
+async def test_child_sessions_harness_resolved_per_conversation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Two children of one agent row report their own harness.
+
+    ``harness_override`` lives on the conversation, so the resolver must
+    run per conversation instead of caching by ``agent_id``.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    parent = await _create_parent_session(client, "mixed-harness-parent")
+    agent = await create_test_agent(client, name="mixed-harness-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    base = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:base",
+        agent_id=agent["id"],
+    )
+    overridden = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:override",
+        agent_id=agent["id"],
+        harness_override="codex-native",
+    )
+
+    rows = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    by_id = {row["id"]: row for row in rows}
+    assert by_id[base.id]["harness"] == "claude-sdk"
+    assert by_id[overridden.id]["harness"] == "codex-native"
+    assert by_id[base.id]["agent_name"] == "mixed-harness-agent"
+    assert by_id[overridden.id]["agent_name"] == "mixed-harness-agent"
+
+
+async def test_child_sessions_shared_agent_row_read_once_per_list(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Twenty children on one agent read its row once, not per child.
+
+    The harness still resolves per conversation (``harness_override`` lives
+    on the child row), so a per-``agent_id`` harness cache would be wrong;
+    only the agent row fetch is shared across the list call.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param monkeypatch: Pytest patcher for the agent-store read counter.
+    """
+    from omnigent.runtime._globals import _agent_store
+
+    assert _agent_store is not None
+    parent = await _create_parent_session(client, "memo-parent")
+    agent = await create_test_agent(client, name="memo-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    for index in range(20):
+        _seed_child(
+            conv_store=conv_store,
+            parent_id=parent["id"],
+            title=f"researcher:memo-{index}",
+            agent_id=agent["id"],
+        )
+
+    reads: list[str] = []
+    original_get = _agent_store.get
+
+    def counting_get(agent_id: str, *args: Any, **kwargs: Any) -> Any:
+        reads.append(agent_id)
+        return original_get(agent_id, *args, **kwargs)
+
+    monkeypatch.setattr(_agent_store, "get", counting_get)
+    resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert resp.status_code == 200
+    assert len(resp.json()["data"]) == 20
+    assert reads.count(agent["id"]) == 1
+
+
+async def test_child_status_fan_out_keeps_placement(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A status fan-out event carries the same effective placement as the list.
+
+    The rail patches cached child rows from these events, so an event
+    that omits placement would blank the host / cwd group labels.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    agent = await create_test_agent(client, name="fanout-placement-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root = conv_store.create_conversation(
+        kind="default",
+        title="fanout-root",
+        agent_id=agent["id"],
+        host_id="a65b7d8e4613a95946c9134383308ac7",
+        workspace="/srv/fan",
+        git_branch="fan-branch",
+    )
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=root.id,
+        title="researcher:fanout",
+        agent_id=agent["id"],
+    )
+    collector = await start_session_stream_collector(root.id)
+    try:
+        sessions_module._publish_status(child.id, "running")
+        event = await _next_child_update(collector)
+        payload = event["child"]
+        assert payload["host_id"] == "a65b7d8e4613a95946c9134383308ac7"
+        assert payload["cwd"] == "/srv/fan"
+        assert payload["git_branch"] == "fan-branch"
+        assert payload["agent_name"] == "fanout-placement-agent"
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(root.id)
+
+
+async def test_child_archive_transition_publishes_to_parent_stream(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archive and unarchive each publish the child summary to the parent.
+
+    An archived child emits no further status edges, so the archive
+    transition itself must move the rail row.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param monkeypatch: Pytest patcher, used to zero the archive-stop undo
+        grace so the deferred teardown runs immediately.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    parent = await _create_parent_session(client, "archive-publish-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:archive",
+        agent_id=parent["agent_id"],
+    )
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    collector = await start_session_stream_collector(parent["id"])
+    try:
+        archived_resp = await client.patch(f"/v1/sessions/{child.id}", json={"archived": True})
+        assert archived_resp.status_code == 200, archived_resp.text
+        archived_event = await _next_child_update(collector)
+        assert archived_event["child"]["archived"] is True
+        assert archived_event["child"]["archived_at"] is not None
+
+        unarchived_resp = await client.patch(f"/v1/sessions/{child.id}", json={"archived": False})
+        assert unarchived_resp.status_code == 200, unarchived_resp.text
+        unarchived_event = await _next_child_update(collector)
+        assert unarchived_event["child"]["archived"] is False
+        assert unarchived_event["child"]["archived_at"] is None
+    finally:
+        await collector.stop()
+        session_stream.close(parent["id"])
+
+
+async def test_child_snapshot_reports_effective_placement_from_root(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A deeply nested child snapshot carries the root's effective placement.
+
+    The child page header reads the snapshot directly, so it must not
+    depend on the rail's list cache being loaded.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    agent = await create_test_agent(client, name="header-placement-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root = conv_store.create_conversation(
+        kind="default",
+        title="header-root",
+        agent_id=agent["id"],
+        host_id="3f866cafac81246fb60ae6ceb1a738da",
+        workspace="/srv/header",
+        git_branch="header-branch",
+    )
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=root.id,
+        title="researcher:header-child",
+        agent_id=agent["id"],
+    )
+    grandchild = _seed_child(
+        conv_store=conv_store,
+        parent_id=child.id,
+        title="researcher:header-grandchild",
+        agent_id=agent["id"],
+    )
+
+    snapshot = (await client.get(f"/v1/sessions/{grandchild.id}")).json()
+    assert snapshot["host_id"] is None
+    assert snapshot["effective_host_id"] == "3f866cafac81246fb60ae6ceb1a738da"
+    assert snapshot["effective_cwd"] == "/srv/header"
+    assert snapshot["effective_git_branch"] == "header-branch"
+
+
+async def test_child_sessions_zones_at_scale(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D13 load: 20 active children and 200 archived children page cleanly.
+
+    The active zone loads every non-archived child through the cursor
+    loop; the past zone pages 20 at a time to 200, newest-archived
+    first.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param monkeypatch: Pytest patcher, used to advance the store clock so
+        creation and archive ordering are deterministic at this scale.
+    """
+    parent = await _create_parent_session(client, "scale-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    clock = itertools.count(1_700_100_000)
+    monkeypatch.setattr(sqlalchemy_store_module, "now_epoch", lambda: next(clock))
+
+    active_ids: list[str] = []
+    for index in range(20):
+        active_ids.append(
+            _seed_child(
+                conv_store=conv_store,
+                parent_id=parent["id"],
+                title=f"researcher:active{index}",
+                agent_id=parent["agent_id"],
+            ).id
+        )
+    archived_ids: list[str] = []
+    for index in range(200):
+        child = _seed_child(
+            conv_store=conv_store,
+            parent_id=parent["id"],
+            title=f"researcher:past{index}",
+            agent_id=parent["agent_id"],
+        )
+        conv_store.update_conversation(child.id, archived=True)
+        archived_ids.append(child.id)
+
+    active_rows: list[dict[str, Any]] = []
+    after: str | None = None
+    while True:
+        params: dict[str, Any] = {"zone": "active", "limit": 20}
+        if after is not None:
+            params["after"] = after
+        page = (
+            await client.get(f"/v1/sessions/{parent['id']}/child_sessions", params=params)
+        ).json()
+        active_rows.extend(page["data"])
+        if not page["has_more"]:
+            break
+        after = page["last_id"]
+    assert [row["id"] for row in active_rows] == list(reversed(active_ids))
+    assert all(row["archived"] is False for row in active_rows)
+
+    past_rows: list[dict[str, Any]] = []
+    page_sizes: list[int] = []
+    after = None
+    while True:
+        params = {"zone": "past", "limit": 20}
+        if after is not None:
+            params["after"] = after
+        page = (
+            await client.get(f"/v1/sessions/{parent['id']}/child_sessions", params=params)
+        ).json()
+        page_sizes.append(len(page["data"]))
+        past_rows.extend(page["data"])
+        if not page["has_more"]:
+            break
+        after = page["last_id"]
+    assert page_sizes == [20] * 10
+    assert [row["id"] for row in past_rows] == list(reversed(archived_ids))
+    archived_times = [row["archived_at"] for row in past_rows]
+    assert all(value is not None for value in archived_times)
+    assert archived_times == sorted(archived_times, reverse=True)

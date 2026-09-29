@@ -163,6 +163,7 @@ from omnigent.server.routes._sessions.helpers import (
     _place_project_session,
     _presentation_labels_for_agent,
     _prune_session_read_state,
+    _publish_child_status_to_parent,
     _publish_codex_approval_mode,
     _publish_collaboration_mode,
     _publish_permission_mode,
@@ -3308,6 +3309,16 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        # Archive / unarchive changes a child's rail membership, and an
+        # archived child emits no further status edges — publish its fresh
+        # summary to the parent's stream directly so the row moves without a
+        # reload. Only a real transition is worth an event.
+        if (
+            body.archived is not None
+            and bool(conv.archived) != bool(body.archived)
+            and updated.parent_conversation_id is not None
+        ):
+            _publish_child_status_to_parent(session_id, None)
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).

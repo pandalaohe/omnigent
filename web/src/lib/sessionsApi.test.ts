@@ -186,6 +186,9 @@ describe("createSession", () => {
       workspace: null,
       worktree: null,
       gitBranch: null,
+      effectiveHostId: null,
+      effectiveCwd: null,
+      effectiveGitBranch: null,
     });
   });
 

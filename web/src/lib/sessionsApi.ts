@@ -183,6 +183,14 @@ interface SessionResponseWire {
   terminal_launch_args?: string[] | null;
   /** Worktree branch; ``null`` when the session uses no worktree. */
   git_branch?: string | null;
+  /**
+   * Effective placement for a child session, server-computed (own host/cwd
+   * else the nearest ancestor's). Absent/``null`` for top-level sessions
+   * and for children with no ancestor placement.
+   */
+  effective_host_id?: string | null;
+  effective_cwd?: string | null;
+  effective_git_branch?: string | null;
   items?: SessionItem[];
   // `queued_items` is documented in `omnigent/server/API.md` but
   // is not on `SessionResponse` today (migration plan R5). Typed
@@ -363,6 +371,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     worktree: wire.worktree ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
+    effectiveHostId: wire.effective_host_id ?? null,
+    effectiveCwd: wire.effective_cwd ?? null,
+    effectiveGitBranch: wire.effective_git_branch ?? null,
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
     reasoningEffort: wire.reasoning_effort,

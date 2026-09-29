@@ -245,6 +245,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
+    Placement,
     SessionLiveness,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
@@ -253,6 +254,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec,
     _canonical_worktree_path,
     _child_session_summary_from_conversation,
+    _child_summary_identity,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
@@ -264,6 +266,7 @@ from omnigent.server.routes._sessions.helpers import (
     _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec,
     _devin_subagent_labels_from_body,
+    _effective_placement,
     _emit_server_routing_decision,
     _error_item_from_sse,
     _extract_claude_native_runner_failure,
@@ -278,6 +281,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _handle_advise_models_mcp,
+    _inherited_placement,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -2001,6 +2005,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    conv_store: ConversationStore | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2068,6 +2073,10 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param conv_store: Optional store used to resolve a child session's
+        effective placement (nearest ancestor's host / cwd / branch). The
+        caller supplies it so the ancestor walk runs on this builder's
+        worker thread; ``None`` leaves the effective placement fields null.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -2076,6 +2085,16 @@ def _build_session_response(
             "Session has no agent binding",
             code=ErrorCode.INTERNAL_ERROR,
         )
+    # Only sub-agent sessions report placement; the ancestor walk reads the
+    # store, so it runs here on the caller's worker thread.
+    effective_placement = (
+        _effective_placement(
+            conv,
+            _inherited_placement(conv_store, conv.parent_conversation_id),
+        )
+        if conv.parent_conversation_id is not None and conv_store is not None
+        else Placement(None, None, None)
+    )
     # Usage to display for this node: the SUBTREE total (this session + its
     # sub-agents) when the caller computed it, else this conversation's own
     # usage. Shared by the cost indicator and the per-model breakdown so
@@ -2140,6 +2159,9 @@ def _build_session_response(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        effective_host_id=effective_placement.host_id,
+        effective_cwd=effective_placement.cwd,
+        effective_git_branch=effective_placement.git_branch,
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
@@ -11259,38 +11281,48 @@ async def _child_session_summaries_from_conversations(
 
     ``ChildSessionSummary.last_message_preview`` needs the latest visible
     message per child. Loading those by calling ``list_items`` once per
-    child blocks the event loop and creates N+1 database traffic. This
-    helper reads newest message items for all child ids in a worker
-    thread, computes previews in memory, then builds summaries without
-    further store access.
+    child blocks the event loop and creates N+1 database traffic. One
+    worker-thread pass reads newest message items for all child ids,
+    resolves the parent's inherited placement once, and resolves each
+    child's agent name / harness, then builds every summary in memory.
 
     :param children: Child conversation rows from
         ``list_conversations(kind="sub_agent")``.
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
-    :param conv_store: Conversation store used for the batched message read.
+    :param conv_store: Conversation store used for the batched message read
+        and the placement ancestor walk.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
     if not children:
         return []
     child_ids = [child.id for child in children]
-    message_items_by_child = await asyncio.to_thread(
-        conv_store.list_latest_message_items_for_conversations,
-        child_ids,
-        10,
-    )
-    previews = {
-        child_id: _latest_message_preview(message_items)
-        for child_id, message_items in message_items_by_child.items()
-    }
-    return [
-        _child_session_summary_from_conversation(
-            child,
-            parent_session_id,
-            previews.get(child.id),
+
+    def _build_summaries() -> list[ChildSessionSummary]:
+        message_items_by_child = conv_store.list_latest_message_items_for_conversations(
+            child_ids,
+            10,
         )
-        for child in children
-    ]
+        inherited = _inherited_placement(conv_store, parent_session_id)
+        from omnigent.runtime._globals import _agent_store
+
+        memo: dict[str, Agent | None] = {}
+        summaries: list[ChildSessionSummary] = []
+        for child in children:
+            agent_name, harness = _child_summary_identity(child, _agent_store, memo)
+            summaries.append(
+                _child_session_summary_from_conversation(
+                    child,
+                    parent_session_id,
+                    _latest_message_preview(message_items_by_child.get(child.id, [])),
+                    inherited=inherited,
+                    agent_name=agent_name,
+                    harness=harness,
+                )
+            )
+        return summaries
+
+    return await asyncio.to_thread(_build_summaries)
 
 
 async def _handle_mcp_tools_call(
@@ -12526,6 +12558,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        conv_store=conv_store,
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
