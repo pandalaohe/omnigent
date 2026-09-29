@@ -1868,6 +1868,11 @@ _drained_delivered_subagent_results: dict[str, str | None] = {}
 # is drained, so a recovery-rebuilt entry still knows the child was dispatched
 # by an Omnigent tool and a Codex mother is woken for its later turns.
 _subagent_work_origins: dict[str, str] = {}
+# Parent owning each child's retained state (drained result key or origin)
+# after its entry is gone. A drain removes the child from
+# ``_subagent_work_by_parent``, so parent cleanup finds the remaining
+# per-child entries through this owner map.
+_subagent_retained_state_parents: dict[str, str] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -2191,6 +2196,10 @@ def register_subagent_work(
         # The origin outlives the entry: recovery re-registers a drained child
         # without it and must still know an Omnigent tool dispatched it.
         _subagent_work_origins[child_session_id] = registered_by
+    if child_session_id in _subagent_work_origins:
+        _subagent_retained_state_parents[child_session_id] = parent_session_id
+    else:
+        _subagent_retained_state_parents.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     if not flow_neutral:
@@ -2258,6 +2267,7 @@ def unregister_subagent_work(
         return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_results[child_session_id] = entry.delivered_result_key
+        _subagent_retained_state_parents[child_session_id] = entry.parent_session_id
     _subagent_work_by_child.pop(child_session_id, None)
     _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
@@ -2283,11 +2293,22 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_results.pop(session_id, None)
     _subagent_work_origins.pop(session_id, None)
+    _subagent_retained_state_parents.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_results.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
+        _subagent_retained_state_parents.pop(child_id, None)
+        _in_flight_send_locks.pop(child_id, None)
+    # A drained child left the parent index above, so its retained state is
+    # found through the owner map instead.
+    for child_id, parent_id in list(_subagent_retained_state_parents.items()):
+        if parent_id != session_id:
+            continue
+        _drained_delivered_subagent_results.pop(child_id, None)
+        _subagent_work_origins.pop(child_id, None)
+        _subagent_retained_state_parents.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
@@ -2544,13 +2565,14 @@ async def _result_key(
     Resolve one terminal result's identity from the result it reports.
 
     A terminal edge that carries output text names its own result: the key is
-    the newest assistant item whose transcript text equals that output, so a
-    delayed edge for an older turn can never claim a newer turn's item. An
+    the newest assistant item whose transcript text equals that output. A
+    reported output with no matching item identifies nothing — it must not
+    fall back to the transcript tail, which may belong to a newer turn. An
     edge without output falls back to the transcript tail only when the child
-    is not running/waiting — while a newer turn is live the tail belongs to
-    it, and no key is returned. One retry covers a transient read failure; a
-    persistent failure is logged and reads as no key, which falls back to the
-    old delivery rules.
+    status was read and is neither ``running`` nor ``waiting``: while a newer
+    turn is live the tail belongs to it, and an unreadable status proves
+    nothing. Either case yields no key. One retry covers a transient read
+    failure; a persistent failure is logged and reads as no key.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
@@ -2566,24 +2588,19 @@ async def _result_key(
     last_error: Exception | None = None
     for _attempt in range(2):
         try:
-            tail: tuple[str | None, str] | None = None
             if reported is not None:
                 item = await _fetch_assistant_item_with_text(
                     server_client, child_session_id, reported
                 )
-                if item is not None:
-                    return item[0]
-            else:
-                tail = await _fetch_latest_assistant_item(server_client, child_session_id)
-                if tail is None:
-                    return None
-            # The tail is only this result's item when no newer turn is live.
-            status = await _fetch_session_status(server_client, child_session_id)
-            if status in {"running", "waiting"}:
-                return None
+                return None if item is None else item[0]
+            tail = await _fetch_latest_assistant_item(server_client, child_session_id)
             if tail is None:
-                tail = await _fetch_latest_assistant_item(server_client, child_session_id)
-            return None if tail is None else tail[0]
+                return None
+            # The tail is only this result's item when the child is settled.
+            status = await _fetch_session_status(server_client, child_session_id)
+            if status is None or status in {"running", "waiting"}:
+                return None
+            return tail[0]
         except _SubagentRecoveryReadError as exc:
             last_error = exc
             continue

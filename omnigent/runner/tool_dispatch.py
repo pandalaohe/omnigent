@@ -5210,17 +5210,23 @@ async def _finalize_created_session(
     if isinstance(message, str) and message:
         # Stamp the dispatch id before the first turn runs, mirroring the
         # by-id send path: restart recovery finds an undrained create-
-        # dispatched turn through this label. Best effort — a lost stamp
-        # costs one unrecovered turn, never a lost result in this process.
+        # dispatched turn through this label. A failed stamp fails closed:
+        # the session exists but nothing was sent, so there is no turn to
+        # recover and the caller retries with sys_session_send.
         work_id = _runner_app.new_subagent_work_id()
         stamp_error = await _patch_subagent_label(
             server_client, child_id, _runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
         )
         if stamp_error is not None:
-            _logger.warning(
-                "Failed to stamp sub-agent dispatch id for created child=%s: %s",
-                child_id,
-                stamp_error,
+            return json.dumps(
+                {
+                    "error": "dispatch_stamp_failed",
+                    "conversation_id": child_id,
+                    "message": (
+                        "child session created but its first message was not sent "
+                        "(could not record the dispatch); retry with sys_session_send"
+                    ),
+                }
             )
         _runner_app.register_subagent_work(
             parent_session_id=conversation_id,

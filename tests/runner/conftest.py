@@ -141,6 +141,7 @@ def _clean_subagent_registry() -> Iterator[None]:
         set(runner_app._subagent_recovery_done),
         dict(runner_app._subagent_recovery_locks),
         dict(runner_app._subagent_work_origins),
+        dict(runner_app._subagent_retained_state_parents),
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
@@ -149,6 +150,7 @@ def _clean_subagent_registry() -> Iterator[None]:
     runner_app._subagent_recovery_done.clear()
     runner_app._subagent_recovery_locks.clear()
     runner_app._subagent_work_origins.clear()
+    runner_app._subagent_retained_state_parents.clear()
     try:
         yield
     finally:
@@ -166,6 +168,8 @@ def _clean_subagent_registry() -> Iterator[None]:
         runner_app._subagent_recovery_locks.update(saved[5])
         runner_app._subagent_work_origins.clear()
         runner_app._subagent_work_origins.update(saved[6])
+        runner_app._subagent_retained_state_parents.clear()
+        runner_app._subagent_retained_state_parents.update(saved[7])
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

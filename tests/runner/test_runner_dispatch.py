@@ -7753,6 +7753,8 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
             entry_at_post.append(runner_app.get_subagent_work("conv_child"))
             event_posts.append(json.loads(request.content))
             return httpx.Response(202, json={"queued": True})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -8005,6 +8007,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
             return httpx.Response(200, json={})
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -13345,6 +13349,8 @@ def _create_placement_handler(
             if child_metadata is None:
                 return httpx.Response(404, json={"error": "no metadata"})
             return httpx.Response(200, json=child_metadata)
+        if request.method == "PATCH" and path == f"/v1/sessions/{create_response.get('id')}":
+            return httpx.Response(200, json={})
         if request.method == "POST" and path == f"/v1/sessions/{create_response.get('id')}/events":
             return httpx.Response(event_status, json={"queued": event_status < 400})
         return httpx.Response(404, json={"error": str(request.url)})
@@ -13669,6 +13675,8 @@ async def test_sys_session_create_remote_post_failure_is_child_not_ready(
                 200,
                 json={"id": "conv_notready", "host_id": "host_b", "runner_online": False},
             )
+        if request.method == "PATCH" and path == "/v1/sessions/conv_notready":
+            return httpx.Response(200, json={})
         if request.method == "POST" and path == "/v1/sessions/conv_notready/events":
             event_posts += 1
             return httpx.Response(
@@ -13752,6 +13760,8 @@ async def test_sys_session_create_remote_retries_once_runner_online(
                     "workspace": "/remote/ws",
                 },
             )
+        if request.method == "PATCH" and path == "/v1/sessions/conv_ready":
+            return httpx.Response(200, json={})
         if request.method == "POST" and path == "/v1/sessions/conv_ready/events":
             event_posts += 1
             if event_posts == 1:
@@ -13853,6 +13863,8 @@ async def test_sys_session_create_readiness_poll_requests_liveness(
                     "runner_online": True if online else None,
                 },
             )
+        if request.method == "PATCH" and path == "/v1/sessions/conv_ready":
+            return httpx.Response(200, json={})
         if request.method == "POST" and path == "/v1/sessions/conv_ready/events":
             event_posts += 1
             if event_posts == 1:
@@ -13991,6 +14003,63 @@ async def test_sys_session_create_first_turn_stamps_dispatch_id() -> None:
     )
     assert work_id is not None
     assert patches == [{"labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id}}]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_stamp_failure_fails_closed() -> None:
+    """A create whose dispatch stamp fails sends nothing and reports the error.
+
+    The dispatch label is what restart recovery reads; registering the work and
+    posting the first message after a failed stamp would leave an unrecoverable
+    turn. The create fails closed instead, and the caller can retry the unsent
+    first message with ``sys_session_send``.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    ops: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_caller_fail":
+            return httpx.Response(200, json={"id": "conv_caller_fail", "agent_id": "ag_x"})
+        if request.method == "POST" and path == "/v1/sessions":
+            ops.append("create")
+            return httpx.Response(
+                201, json={"id": "conv_new_fail", "agent_name": "worker", "status": "created"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_new_fail":
+            return httpx.Response(200, json={"id": "conv_new_fail"})
+        if request.method == "PATCH" and path == "/v1/sessions/conv_new_fail":
+            ops.append("patch")
+            return httpx.Response(500, json={"error": "boom"})
+        if request.method == "POST" and path == "/v1/sessions/conv_new_fail/events":
+            ops.append("events")
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "t", "message": "go"}),
+            server_client=server_client,
+            conversation_id="conv_caller_fail",
+        )
+        entry = runner_app.get_subagent_work("conv_new_fail")
+
+    assert json.loads(output) == {
+        "error": "dispatch_stamp_failed",
+        "conversation_id": "conv_new_fail",
+        "message": (
+            "child session created but its first message was not sent "
+            "(could not record the dispatch); retry with sys_session_send"
+        ),
+    }
+    assert entry is None, "a failed stamp must not register the dispatch"
+    assert ops == ["create", "patch"], "a failed stamp must not post the first message"
 
 
 def test_subagent_wake_notice_carries_placement_label() -> None:
@@ -14266,6 +14335,8 @@ async def test_sys_session_create_fast_first_turn_delivers_once_under_its_entry(
             )
         if request.method == "GET" and path == f"/v1/sessions/{child_id}":
             return httpx.Response(200, json={"id": child_id, "workspace": "/w"})
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={})
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             # The child completes before the create call regains control.
             runner_app.mark_subagent_work_terminal(
