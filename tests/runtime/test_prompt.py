@@ -548,3 +548,16 @@ def test_native_startup_instructions_worktree_then_global_last() -> None:
         f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
         f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{worktree_line}\n\nGlobal notice"
     )
+
+
+def test_child_session_quiet_instruction_only_for_children() -> None:
+    """The quiet-result rule is child-only and names the exact marker line."""
+    from omnigent.runtime.prompt import (
+        CHILD_QUIET_INSTRUCTION,
+        child_session_framework_instructions,
+    )
+
+    assert child_session_framework_instructions(has_parent=True) == [CHILD_QUIET_INSTRUCTION]
+    assert child_session_framework_instructions(has_parent=False) == []
+    assert "`[quiet]`" in CHILD_QUIET_INSTRUCTION
+    assert "turn you started yourself" in CHILD_QUIET_INSTRUCTION

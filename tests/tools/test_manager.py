@@ -1426,11 +1426,30 @@ def test_timer_tools_registered_when_enabled() -> None:
 def test_session_create_description_discloses_project_membership() -> None:
     from omnigent.tools.builtins.spawn import SysSessionCreateTool
 
-    assert "the result's `project_id`; null means No Project" in SysSessionCreateTool.description()
-    assert "runs in your working directory and keeps your working tree" in (
-        SysSessionCreateTool.description()
-    )
-    assert "it cannot target another project or host" in SysSessionCreateTool.description()
+    description = SysSessionCreateTool.description()
+    assert "the result's `project_id` is null for No Project" in description
+    assert "Omit all of them to inherit your host, project and working tree" in description
+    assert "`worktree`" in description
+    assert "cross-host child on an SDK harness" in description
+    assert "never removed automatically" in description
+    # Usage policy lives in Global Instructions, not the tool text.
+    assert "should take its own worktree" not in description
+
+
+def test_session_create_schema_exposes_placement() -> None:
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    schema = SysSessionCreateTool().get_schema()
+    params = schema["function"]["parameters"]
+    properties = params["properties"]
+
+    assert {"host", "workspace", "project_id", "worktree"} <= set(properties)
+    worktree = properties["worktree"]
+    assert worktree["type"] == "object"
+    assert worktree["required"] == ["branch"]
+    assert set(worktree["properties"]) == {"branch", "base"}
+    assert worktree["additionalProperties"] is False
+    assert params["additionalProperties"] is False
 
 
 def test_unknown_builtin_logs_warning_and_skips(caplog: pytest.LogCaptureFixture) -> None:

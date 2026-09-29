@@ -235,7 +235,11 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     UpdateSessionRequest,
 )
-from omnigent.server.session_open_rate import admit_open
+from omnigent.server.session_open_rate import (
+    CREATE_ORIGIN_AGENT,
+    CREATE_ORIGIN_HEADER,
+    admit_open,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -725,14 +729,17 @@ def register_core_routes(
         parent_session_id: str | None,
         sub_agent_name: str | None,
     ) -> None:
-        """Refuse a child create when the owner's open-rate window is full.
+        """Refuse an agent-initiated child create when the owner's open-rate window is full.
 
-        An unnamed child create is an open (D7), so it spends the parent
-        owner's open-rate budget before any row is written. Named
-        sub-agent dispatch (``sub_agent_name`` set) is not an open and
-        does not count.
+        An agent's unnamed child create (the runner's ``sys_session_create``
+        POST) is an open (D7), so it spends the parent owner's open-rate
+        budget before any row is written. A create without the agent-origin
+        header — the web UI's "Add agent" dialog, or any other client — is
+        not an agent open and never counts. Named sub-agent dispatch
+        (``sub_agent_name`` set) is not an open and does not count.
 
-        :param request: The create request (for ``app.state``).
+        :param request: The create request (for ``app.state`` and the
+            agent-origin header).
         :param user_id: Authenticated caller, or ``None``.
         :param parent_session_id: The child's parent, or ``None`` for a
             top-level create (never counted).
@@ -740,6 +747,12 @@ def register_core_routes(
         :raises HTTPException: 429 with the settings refusal text.
         """
         if parent_session_id is None or sub_agent_name is not None:
+            return
+        # Only the runner's sys_session_create POST declares itself as
+        # agent-initiated; without the header there is no budget to spend,
+        # so the access check and the charge are both skipped.
+        origin = request.headers.get(CREATE_ORIGIN_HEADER, "")
+        if origin.strip().lower() != CREATE_ORIGIN_AGENT:
             return
         # Authorize the caller on the parent before charging its owner's
         # window: a forged parent link must not spend the real owner's
@@ -1123,9 +1136,10 @@ def register_core_routes(
                         update={"project_id": parent_project_id}
                     )
 
-        # The multipart shape has no sub_agent_name, so any child bundle
-        # create is an open and spends the parent owner's rate budget. The
-        # parent is authorized above, so a forged link cannot charge it.
+        # The multipart shape has no sub_agent_name, so an agent's child
+        # bundle create is an open and spends the parent owner's rate budget
+        # when the create-origin header is present. The parent is authorized
+        # above, so a forged link cannot charge it.
         await _admit_child_create(
             request,
             user_id=user_id,

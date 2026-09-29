@@ -2705,6 +2705,268 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     )
 
 
+# ── Placement (SCC16): workspace, worktree, cross-project ─────────────
+
+_PLACEMENT_HOST_ID = "2b8753b34a61b09af35a01136d40fadf"
+_PLACEMENT_WORKSPACE = "/Users/alice/myrepo"
+_PLACEMENT_PROJECT_ID = "bb11cc22dd33ee44ff55667788990011"
+
+
+class _FakePlacementWebSocket:
+    """Minimal host WebSocket stand-in (the registry only enqueues)."""
+
+    async def send_text(self, data: str) -> None:
+        """No-op: frames flow through the connection's outbound queue."""
+        del data
+
+
+@pytest.fixture()
+async def placement_host(app: Any, db_uri: str) -> Any:
+    """Register a fake host answering workspace stats and worktree creates."""
+    import contextlib as _contextlib
+
+    import pytest_asyncio  # noqa: F401 — fixture decorator precedent
+
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostHelloFrame,
+        HostRemoveWorktreeFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.stores.host_store import HostStore
+
+    HostStore(db_uri).upsert_on_connect(_PLACEMENT_HOST_ID, "placement-host", RESERVED_USER_LOCAL)
+    conn = app.state.host_registry.register(
+        host_id=_PLACEMENT_HOST_ID,
+        ws=_FakePlacementWebSocket(),  # type: ignore[arg-type] — duck-typed
+        hello=HostHelloFrame(
+            version="0.1.0-test", frame_protocol_version=1, name="placement-host"
+        ),
+        owner=RESERVED_USER_LOCAL,
+    )
+    created: list[Any] = []
+
+    async def _drain() -> None:
+        while True:
+            frame_text = await conn.outbound_queue.get()
+            if frame_text is None:
+                return
+            frame = decode_host_frame(frame_text)
+            if isinstance(frame, HostStatFrame):
+                fut = conn.pending_stats.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(
+                        {
+                            "status": "ok",
+                            "exists": True,
+                            "type": "directory",
+                            "canonical_path": frame.path,
+                            "error": None,
+                        }
+                    )
+            elif isinstance(frame, HostCreateWorktreeFrame):
+                created.append(frame)
+                fut = conn.pending_create_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    dirname = frame.branch_name.replace("/", "-")
+                    fut.set_result(
+                        {
+                            "status": "ok",
+                            "worktree_path": f"{frame.repo_path}-worktrees/{dirname}",
+                            "branch": frame.branch_name,
+                            "error": None,
+                        }
+                    )
+            elif isinstance(frame, HostRemoveWorktreeFrame):
+                fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": "ok", "error": None})
+
+    task = asyncio.create_task(_drain())
+    try:
+        yield created
+    finally:
+        conn.outbound_queue.put_nowait(None)
+        with _contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        if not task.done():
+            task.cancel()
+
+
+async def test_child_with_workspace_gets_that_cwd(
+    placement_host: list[Any], client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A child created with a host and workspace is stored at that cwd.
+
+    The workspace is host-validated (the fake host stat answers the
+    boundary round-trip) and the child keeps the parent's runner.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent = conv_store.create_conversation(
+        host_id=_PLACEMENT_HOST_ID,
+        workspace=_PLACEMENT_WORKSPACE,
+        runner_id="runner_parent",
+    )
+    agent = await create_test_agent(client, name="workspace-child-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.id,
+            "host_id": _PLACEMENT_HOST_ID,
+            "workspace": _PLACEMENT_WORKSPACE,
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["host_id"] == _PLACEMENT_HOST_ID
+    assert body["workspace"] == _PLACEMENT_WORKSPACE
+    assert body["runner_id"] == "runner_parent", "a same-host child keeps the parent runner"
+
+
+async def test_child_with_worktree_gets_a_new_branch_worktree(
+    placement_host: list[Any], client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A child create with a git block cuts its own worktree on the host."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent = conv_store.create_conversation(
+        host_id=_PLACEMENT_HOST_ID,
+        workspace=_PLACEMENT_WORKSPACE,
+        runner_id="runner_parent",
+    )
+    agent = await create_test_agent(client, name="worktree-child-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.id,
+            "host_id": _PLACEMENT_HOST_ID,
+            "workspace": _PLACEMENT_WORKSPACE,
+            "git": {"branch_name": "child/fix-auth", "base_branch": "main"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(placement_host) == 1, placement_host
+    frame = placement_host[0]
+    assert frame.repo_path == _PLACEMENT_WORKSPACE
+    assert frame.branch_name == "child/fix-auth"
+    assert frame.base_branch == "main"
+    body = resp.json()
+    assert body["git_branch"] == "child/fix-auth"
+    assert body["workspace"] == f"{_PLACEMENT_WORKSPACE}-worktrees/child-fix-auth"
+
+
+async def test_same_host_child_of_hostless_row_parent_keeps_the_parent_runner(
+    placement_host: list[Any], client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Effective-host affinity: a hostless-row parent still shares its root's runner.
+
+    The parent row carries no host_id (a mirrored/native child row) but its
+    root is host-bound. A placed child that names that same host must keep
+    the inherited runner instead of being unbound for a second launch.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root = conv_store.create_conversation(
+        host_id=_PLACEMENT_HOST_ID,
+        workspace=_PLACEMENT_WORKSPACE,
+        runner_id="runner_root",
+    )
+    parent = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=root.id,
+        runner_id="runner_root",
+    )
+    agent = await create_test_agent(client, name="affinity-child-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.id,
+            "host_id": _PLACEMENT_HOST_ID,
+            "workspace": _PLACEMENT_WORKSPACE,
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["host_id"] == _PLACEMENT_HOST_ID
+    assert body["runner_id"] == "runner_root", (
+        "a same-host placed child of a hostless-row parent must keep the parent runner"
+    )
+
+
+async def test_cross_project_child_is_readable_and_sendable_by_its_mother(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child joined to another project stays reachable from its mother.
+
+    Project membership does not gate a parent's access to its child: the
+    mother can read the child's snapshot and post a message into it. The
+    child is seeded into a second project directly (create-time placement
+    is covered by the project-create suites).
+    """
+    from omnigent.server.routes.sessions import routes_events as events_module
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    parent = await _create_parent_session(client, agent_name="cross-project-agent")
+    SqlAlchemyProjectStore(db_uri).create(_PLACEMENT_PROJECT_ID, "Other project", None)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:other-project",
+        parent_conversation_id=parent["id"],
+        agent_id=parent["agent_id"],
+        project_id=_PLACEMENT_PROJECT_ID,
+    )
+
+    read = await client.get(f"/v1/sessions/{child.id}")
+    assert read.status_code == 200, read.text
+    assert read.json()["parent_session_id"] == parent["id"]
+    assert read.json()["project_id"] == _PLACEMENT_PROJECT_ID
+
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        forwarded.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202, json={"queued": True})
+
+    runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_capture), base_url="http://runner.test"
+    )
+
+    async def _get_runner_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr(events_module, "_get_runner_client", _get_runner_client)
+    try:
+        send = await client.post(
+            f"/v1/sessions/{child.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "status?"}],
+                },
+            },
+        )
+    finally:
+        await runner.aclose()
+
+    assert send.status_code == 202, send.text
+    assert len(forwarded) == 1
+    path, body = forwarded[0]
+    assert path == f"/v1/sessions/{child.id}/events"
+    assert body["type"] == "message"
+    assert body["content"] == [{"type": "input_text", "text": "status?"}]
+
+
 # ── Agents rail: zone filter + effective placement ────────
 
 

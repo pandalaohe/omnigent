@@ -4543,7 +4543,7 @@ async def test_sys_session_send_by_id_rejects_closed_child(
                     "title": "researcher:auth",
                     "parent_session_id": "conv_parent",
                     "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_closed/events":
@@ -4667,7 +4667,7 @@ async def test_sys_session_send_by_id_names_child_from_snapshot(
                     "sub_agent_name": sub_agent_name,
                     "parent_session_id": "conv_parent_by_id",
                     "labels": {},
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_by_id_child":
@@ -7661,6 +7661,8 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         return httpx.Response(404, json={"error": "no agent"})
 
     async with httpx.AsyncClient(
@@ -7693,6 +7695,8 @@ async def test_sys_session_create_maps_open_rate_refusal() -> None:
     )
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         return httpx.Response(429, json={"detail": refusal})
 
     async with httpx.AsyncClient(
@@ -7712,20 +7716,27 @@ async def test_sys_session_create_maps_open_rate_refusal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_spawns_child_under_caller() -> None:
+async def test_sys_session_create_spawns_child_and_posts_first_message() -> None:
     """
     ``sys_session_create`` POSTs a JSON create with
-    ``parent_session_id`` forced to the caller (child-only), passes the
-    agent_id, title, and a queued initial message, and returns a handle
-    carrying the new child's id. If parent_session_id weren't forced to
-    the caller, an orchestrator could create top-level/sibling sessions —
-    so the asserted request body is the security-critical check.
+    ``parent_session_id`` forced to the caller (child-only), then posts the
+    first message as a separate event, and returns a handle carrying the new
+    child's id. The create must not carry ``initial_items``: registering the
+    work entry between the two is what keeps a fast first turn from
+    outrunning its tracking. If parent_session_id weren't forced to the
+    caller, an orchestrator could create top-level/sibling sessions — so the
+    asserted request body is the security-critical check.
     """
+    from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
     captured: dict[str, Any] = {}
+    event_posts: list[dict[str, Any]] = []
+    entry_at_post: list[Any] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             captured.update(json.loads(request.content))
             return httpx.Response(
@@ -7738,6 +7749,66 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
                     "project_id": "project",
                 },
             )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            entry_at_post.append(runner_app.get_subagent_work("conv_child"))
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_child")
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    # Child-only: parent forced to the caller; agent + title threaded
+    # through, and the message NO LONGER rides the create body.
+    assert captured["parent_session_id"] == "conv_caller"
+    assert captured["agent_id"] == "ag_x"
+    assert captured["title"] == "auth"
+    assert "initial_items" not in captured
+    # The message posts after the work entry exists.
+    assert len(event_posts) == 1
+    assert event_posts[0]["data"]["content"][0]["text"] == "start"
+    assert entry_at_post and entry_at_post[0] is not None
+    assert entry is not None and entry.status == "launching"
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+    assert handle["agent_id"] == "ag_x"
+    assert handle["agent_name"] == "researcher"
+    assert handle["project_id"] == "project"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_marks_the_create_as_agent_originated() -> None:
+    """
+    The JSON create POST carries ``X-Omnigent-Create-Origin: agent`` so the
+    server charges the owner's open-rate window only for agent-initiated
+    creates. Without the header the create would look like a web UI create
+    and silently bypass the rate.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_origins: list[str | None] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_origins.append(request.headers.get("X-Omnigent-Create-Origin"))
+            return httpx.Response(201, json={"id": "conv_child", "status": "idle"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -7746,22 +7817,50 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+            arguments=json.dumps({"agent_id": "ag_x"}),
             server_client=server_client,
             conversation_id="conv_caller",
         )
 
-    # Child-only: parent forced to the caller; agent + title + queued
-    # message threaded through to the create body.
-    assert captured["parent_session_id"] == "conv_caller"
-    assert captured["agent_id"] == "ag_x"
-    assert captured["title"] == "auth"
-    assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
-    handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
-    assert handle["agent_id"] == "ag_x"
-    assert handle["agent_name"] == "researcher"
-    assert handle["project_id"] == "project"
+    assert json.loads(output)["conversation_id"] == "conv_child"
+    assert create_origins == ["agent"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_without_message_registers_no_work() -> None:
+    """A message-less create registers no work entry (nothing to reap)."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_idle", "status": "idle"})
+        if request.url.path.endswith("/events"):
+            event_posts.append(request.url.path)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "idle"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_idle")
+        finally:
+            runner_app.unregister_subagent_work("conv_idle")
+
+    assert json.loads(output)["conversation_id"] == "conv_idle"
+    assert entry is None
+    assert event_posts == []
 
 
 @pytest.mark.asyncio
@@ -7805,6 +7904,8 @@ async def test_sys_session_create_neither_mode_omits_the_agent_key() -> None:
     captured: dict[str, Any] = {}
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             captured.update(json.loads(request.content))
             return httpx.Response(
@@ -7881,6 +7982,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     import io
     import tarfile
 
+    from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
     config_text = "name: helper\nprompt: do helpful things\n"
@@ -7890,6 +7992,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     event_bodies: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_requests.append(request)
             return httpx.Response(
@@ -7904,27 +8008,39 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
-            ),
-            server_client=server_client,
-            conversation_id="conv_caller",
-            runner_workspace=tmp_path,
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                runner_workspace=tmp_path,
+            )
+            entry = runner_app.get_subagent_work("conv_child")
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    # A message-bearing bundle create registers the work entry too.
+    assert entry is not None and entry.status == "launching"
 
     # Exactly one multipart create; parent forced to the caller
     # (child-only) and the title threaded into the metadata part.
     assert len(create_requests) == 1, (
         f"expected exactly one create POST, got {len(create_requests)}"
     )
+    # Agent origin rides the multipart create too: the server counts it.
+    assert create_requests[0].headers["X-Omnigent-Create-Origin"] == "agent"
     parts = _parse_multipart_create(create_requests[0])
     assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
 
@@ -7965,6 +8081,8 @@ async def test_sys_session_create_config_path_maps_open_rate_refusal(tmp_path: P
     )
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
         return httpx.Response(429, json={"detail": refusal})
 
     async with httpx.AsyncClient(
@@ -12990,7 +13108,7 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
                     "id": "conv_byid_coder",
                     "parent_session_id": "conv_parent_byid",
                     "title": "claude:merge-task",
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_byid_coder":
@@ -13041,3 +13159,1210 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+@pytest.mark.asyncio
+async def test_send_by_session_id_steers_busy_child_without_work_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-reported running child is steered in flight, not treated as idle.
+
+    The busy signal must come from the session's ``status`` (a SessionResponse
+    has no ``busy`` field). Sending to a running child with no local work entry
+    (post-restart, or a child this runner has not tracked) must take the
+    in-flight path: post into the live turn and adopt exactly one running entry,
+    so the turn's single completion is delivered exactly once.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_parent_busy_by_id", "conv_child_busy_by_id"
+    event_posts: list[dict[str, Any]] = []
+    stamped: list[str] = []
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "title": "worker:busy-task",
+                    "status": "running",
+                },
+            )
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            labels = json.loads(request.content)["labels"]
+            stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    runner_app._session_inboxes_ref[parent_id] = inbox
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": child_id, "args": "report where you are"}),
+                server_client=server_client,
+                conversation_id=parent_id,
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=inbox,
+            )
+            work = runner_app.get_subagent_work(child_id)
+            work_status = work.status if work is not None else None
+            work_id = work.work_id if work is not None else None
+            first = runner_app.mark_subagent_work_terminal(
+                child_id, status="completed", output="done"
+            )
+            second = runner_app.mark_subagent_work_terminal(
+                child_id, status="completed", output="done"
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == child_id
+    assert len(event_posts) == 1
+    assert work_status == "running"
+    assert work_id == stamped[0]
+    assert first.delivered_now is True
+    assert second.delivered_now is False
+    assert inbox.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_refused_from_a_child_session() -> None:
+    """A child session cannot open long-lived children (D2).
+
+    The refusal is structural and runs before any create POST: a child that
+    needs workers uses its harness's own sub-agents, or asks its mother.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child_caller":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child_caller",
+                    "parent_session_id": "conv_mother",
+                    "agent_id": "ag_x",
+                },
+            )
+        posts.append(request.url.path)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "message": "work"}),
+            server_client=server_client,
+            conversation_id="conv_child_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "child_session_create_refused"
+    assert "ask your mother session" in info["message"]
+    assert posts == [], "a refused child create must not reach the server"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_placement_requires_agent_id(tmp_path: Path) -> None:
+    """Placement arguments with ``config_path`` are refused, not dropped.
+
+    The multipart create keeps the parent's runner and carries no placement
+    fields, so accepting the arguments would silently create the child
+    somewhere other than asked.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request.url.path)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "workspace": "/srv/ws"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "placement_requires_agent_id"
+    assert "workspace" in info["message"]
+    assert posts == [], "a placement-refused create must not reach the server"
+
+
+def _create_placement_handler(
+    *,
+    caller_body: dict[str, Any],
+    create_body_log: list[dict[str, Any]],
+    create_response: dict[str, Any],
+    hosts: list[dict[str, str]] | None = None,
+    host_details: dict[str, dict[str, Any]] | None = None,
+    child_metadata: dict[str, Any] | None = None,
+    event_status: int = 202,
+) -> Any:
+    """Build a MockTransport handler serving the placement reads and create."""
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_placement_caller":
+            return httpx.Response(200, json=caller_body)
+        if request.method == "GET" and path == "/v1/hosts":
+            return httpx.Response(200, json={"hosts": hosts or []})
+        if request.method == "GET" and path.startswith("/v1/hosts/"):
+            host_id = path.rsplit("/", 1)[-1]
+            details = (host_details or {}).get(host_id)
+            if details is None:
+                return httpx.Response(404, json={"error": "no host"})
+            return httpx.Response(200, json={"host_id": host_id, **details})
+        if request.method == "POST" and path == "/v1/sessions":
+            create_body_log.append(json.loads(request.content))
+            return httpx.Response(201, json=create_response)
+        if request.method == "GET" and path == f"/v1/sessions/{create_response.get('id')}":
+            if child_metadata is None:
+                return httpx.Response(404, json={"error": "no metadata"})
+            return httpx.Response(200, json=child_metadata)
+        if request.method == "PATCH" and path == f"/v1/sessions/{create_response.get('id')}":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == f"/v1/sessions/{create_response.get('id')}/events":
+            return httpx.Response(event_status, json={"queued": event_status < 400})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    return _handler
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_workspace_places_on_caller_host() -> None:
+    """A workspace without a host stays on the caller's effective host.
+
+    The body must carry the caller's host id so the server validates the
+    workspace and keeps the parent runner (same-host placement), and the
+    result must report where the child actually runs.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={"id": "conv_placement_caller", "host_id": "host_a", "workspace": "/w"},
+        create_body_log=bodies,
+        create_response={
+            "id": "conv_placed",
+            "agent_id": "ag_x",
+            "agent_name": "worker",
+            "status": "idle",
+            "host_id": "host_a",
+        },
+        host_details={"host_a": {"name": "alpha", "status": "online"}},
+        child_metadata={
+            "id": "conv_placed",
+            "host_id": "host_a",
+            "workspace": "/srv/ws",
+            "worktree": "/srv/ws",
+            "git_branch": "fix-auth",
+            "harness": "claude-native",
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "ag_x",
+                        "title": "placed",
+                        "message": "go",
+                        "workspace": "/srv/ws",
+                        "project_id": "proj-other",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_placement_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_placed")
+        finally:
+            runner_app.unregister_subagent_work("conv_placed")
+            runner_app._session_inboxes_ref.pop("conv_placement_caller", None)
+
+    [body] = bodies
+    assert body["parent_session_id"] == "conv_placement_caller"
+    assert body["host_id"] == "host_a"
+    assert body["workspace"] == "/srv/ws"
+    assert body["project_id"] == "proj-other"
+    assert "git" not in body
+    assert entry is not None and entry.placement_label == "alpha · srv/ws"
+    handle = json.loads(output)
+    assert handle["host_id"] == "host_a"
+    assert handle["host_name"] == "alpha"
+    assert handle["workspace"] == "/srv/ws"
+    assert handle["worktree"] == "/srv/ws"
+    assert handle["git_branch"] == "fix-auth"
+    assert handle["harness"] == "claude-native"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_host_equal_to_caller_is_a_noop() -> None:
+    """Naming the caller's own effective host sends no placement fields."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={"id": "conv_placement_caller", "host_id": "host_a"},
+        create_body_log=bodies,
+        create_response={"id": "conv_same", "agent_name": "worker", "status": "idle"},
+        hosts=[{"host_id": "host_a", "name": "alpha"}],
+        child_metadata={"id": "conv_same", "workspace": "/w"},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "same", "host": "alpha"}),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    [body] = bodies
+    assert "host_id" not in body
+    assert "workspace" not in body
+    assert "git" not in body
+    handle = json.loads(output)
+    assert handle["host_id"] == "host_a"
+    assert handle["host_name"] == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_other_host_without_workspace_is_refused() -> None:
+    """A different host with no workspace is refused before any create."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={"id": "conv_placement_caller", "host_id": "host_a"},
+        create_body_log=bodies,
+        create_response={"id": "conv_never"},
+        hosts=[
+            {"host_id": "host_a", "name": "alpha"},
+            {"host_id": "host_b", "name": "beta"},
+        ],
+        host_details={"host_b": {"name": "beta", "status": "online"}},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "remote", "host": "beta"}),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    assert json.loads(output)["error"] == "workspace_required_on_other_host"
+    assert bodies == [], "a placement refusal must not create the child"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_other_host_with_workspace_is_placed() -> None:
+    """A different host with a workspace is pre-checked and created there."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={"id": "conv_placement_caller", "host_id": "host_a"},
+        create_body_log=bodies,
+        create_response={
+            "id": "conv_remote",
+            "agent_id": "ag_x",
+            "agent_name": "worker",
+            "status": "idle",
+            "host_id": "host_b",
+        },
+        hosts=[
+            {"host_id": "host_a", "name": "alpha"},
+            {"host_id": "host_b", "name": "beta"},
+        ],
+        host_details={"host_b": {"name": "beta", "status": "online"}},
+        child_metadata={"id": "conv_remote", "host_id": "host_b", "workspace": "/remote/ws"},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_x", "title": "remote", "host": "beta", "workspace": "/remote/ws"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    [body] = bodies
+    assert body["host_id"] == "host_b"
+    assert body["workspace"] == "/remote/ws"
+    handle = json.loads(output)
+    assert handle["host_id"] == "host_b"
+    assert handle["host_name"] == "beta"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_worktree_uses_caller_cwd() -> None:
+    """A worktree without a workspace is cut from the caller's cwd."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={
+            "id": "conv_placement_caller",
+            "host_id": "host_a",
+            "workspace": "/repo",
+        },
+        create_body_log=bodies,
+        create_response={
+            "id": "conv_wt",
+            "agent_name": "worker",
+            "status": "idle",
+            "host_id": "host_a",
+        },
+        child_metadata={
+            "id": "conv_wt",
+            "host_id": "host_a",
+            "workspace": "/repo/.worktrees/app/fix-auth",
+            "worktree": "/repo/.worktrees/app/fix-auth",
+            "git_branch": "fix-auth",
+            "harness": "claude-native",
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "worktree",
+                    "worktree": {"branch": "fix-auth", "base": "main"},
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    [body] = bodies
+    assert body["host_id"] == "host_a"
+    assert body["workspace"] == "/repo"
+    assert body["git"] == {"branch_name": "fix-auth", "base_branch": "main"}
+    handle = json.loads(output)
+    assert handle["git_branch"] == "fix-auth"
+    assert handle["workspace"] == "/repo/.worktrees/app/fix-auth"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_unknown_host_lists_known_names() -> None:
+    """An unknown host is refused with the names that do exist."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={"id": "conv_placement_caller", "host_id": "host_a"},
+        create_body_log=bodies,
+        create_response={"id": "conv_never"},
+        hosts=[
+            {"host_id": "host_a", "name": "alpha"},
+            {"host_id": "host_b", "name": "beta"},
+        ],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "x", "host": "gamma"}),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "host_not_found"
+    assert "alpha" in info["message"] and "beta" in info["message"]
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_remote_post_failure_is_child_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote child whose runner never comes online fails child_not_ready.
+
+    The work entry is marked failed and is never marked started.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 0.0)
+    started: list[str] = []
+    monkeypatch.setattr(
+        runner_app, "mark_subagent_work_started", lambda cid: started.append(cid) or None
+    )
+
+    bodies: list[dict[str, Any]] = []
+    event_posts = 0
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_placement_caller":
+            return httpx.Response(200, json={"id": "conv_placement_caller", "host_id": "host_a"})
+        if request.method == "GET" and path == "/v1/hosts":
+            return httpx.Response(
+                200,
+                json={
+                    "hosts": [
+                        {"host_id": "host_a", "name": "alpha"},
+                        {"host_id": "host_b", "name": "beta"},
+                    ]
+                },
+            )
+        if request.method == "GET" and path == "/v1/hosts/host_b":
+            return httpx.Response(
+                200, json={"host_id": "host_b", "name": "beta", "status": "online"}
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_notready", "agent_name": "worker", "status": "idle"},
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_notready":
+            return httpx.Response(
+                200,
+                json={"id": "conv_notready", "host_id": "host_b", "runner_online": False},
+            )
+        if request.method == "PATCH" and path == "/v1/sessions/conv_notready":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/sessions/conv_notready/events":
+            event_posts += 1
+            return httpx.Response(
+                503, json={"error": {"code": "runner_unavailable", "message": "No runner"}}
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "ag_x",
+                        "title": "remote",
+                        "message": "go",
+                        "host": "beta",
+                        "workspace": "/remote/ws",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_placement_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_notready")
+            entry_status = entry.status if entry is not None else None
+        finally:
+            runner_app.unregister_subagent_work("conv_notready")
+            runner_app._session_inboxes_ref.pop("conv_placement_caller", None)
+
+    info = json.loads(output)
+    assert info["error"] == "child_not_ready"
+    assert info["conversation_id"] == "conv_notready"
+    assert len(bodies) == 1, "the create itself still happens"
+    assert event_posts == 1, "the readiness wait only retries after an online signal"
+    assert entry_status == "failed"
+    assert started == [], "a failed first post never marks the remote work started"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_remote_retries_once_runner_online(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused first post retries after the child's runner comes online."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 5.0)
+    started: list[str] = []
+    original_started = runner_app.mark_subagent_work_started
+
+    bodies: list[dict[str, Any]] = []
+    event_posts = 0
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_placement_caller":
+            return httpx.Response(200, json={"id": "conv_placement_caller", "host_id": "host_a"})
+        if request.method == "GET" and path == "/v1/hosts":
+            return httpx.Response(200, json={"hosts": [{"host_id": "host_b", "name": "beta"}]})
+        if request.method == "GET" and path == "/v1/hosts/host_b":
+            return httpx.Response(
+                200, json={"host_id": "host_b", "name": "beta", "status": "online"}
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_ready", "agent_name": "worker", "status": "idle"},
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_ready":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_ready",
+                    "host_id": "host_b",
+                    "runner_online": True,
+                    "workspace": "/remote/ws",
+                },
+            )
+        if request.method == "PATCH" and path == "/v1/sessions/conv_ready":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/sessions/conv_ready/events":
+            event_posts += 1
+            if event_posts == 1:
+                return httpx.Response(
+                    503, json={"error": {"code": "runner_unavailable", "message": "No runner"}}
+                )
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    def _record_started(cid: str) -> Any:
+        started.append(cid)
+        return original_started(cid)
+
+    monkeypatch.setattr(runner_app, "mark_subagent_work_started", _record_started)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "ag_x",
+                        "title": "remote",
+                        "message": "go",
+                        "host": "beta",
+                        "workspace": "/remote/ws",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_placement_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_ready")
+            entry_status = entry.status if entry is not None else None
+        finally:
+            runner_app.unregister_subagent_work("conv_ready")
+            runner_app._session_inboxes_ref.pop("conv_placement_caller", None)
+
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_ready"
+    assert event_posts == 2, "the refused post is retried once the runner is online"
+    assert started == ["conv_ready"], "an accepted remote post marks the work started"
+    assert entry_status == "running"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_readiness_poll_requests_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The readiness poll asks for liveness and retries once the runner is up.
+
+    The server returns ``runner_online=None`` without ``include_liveness=true``
+    (``GET /v1/sessions/{id}``), so a poll that omits it can never observe the
+    connection; a refused first POST then always exhausted the budget. The
+    fake server here models that contract: the runner comes online on the
+    second liveness-enabled poll.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_POLL_S", 0.0)
+    started: list[str] = []
+    original_started = runner_app.mark_subagent_work_started
+
+    bodies: list[dict[str, Any]] = []
+    event_posts = 0
+    child_polls = 0
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts, child_polls
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_placement_caller":
+            return httpx.Response(200, json={"id": "conv_placement_caller", "host_id": "host_a"})
+        if request.method == "GET" and path == "/v1/hosts":
+            return httpx.Response(200, json={"hosts": [{"host_id": "host_b", "name": "beta"}]})
+        if request.method == "GET" and path == "/v1/hosts/host_b":
+            return httpx.Response(
+                200, json={"host_id": "host_b", "name": "beta", "status": "online"}
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_ready", "agent_name": "worker", "status": "idle"},
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_ready":
+            child_polls += 1
+            liveness = request.url.params.get("include_liveness") == "true"
+            online = liveness and child_polls >= 2
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_ready",
+                    "host_id": "host_b",
+                    "workspace": "/remote/ws",
+                    "runner_online": True if online else None,
+                },
+            )
+        if request.method == "PATCH" and path == "/v1/sessions/conv_ready":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/sessions/conv_ready/events":
+            event_posts += 1
+            if event_posts == 1:
+                return httpx.Response(
+                    503, json={"error": {"code": "runner_unavailable", "message": "No runner"}}
+                )
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    def _record_started(cid: str) -> Any:
+        started.append(cid)
+        return original_started(cid)
+
+    monkeypatch.setattr(runner_app, "mark_subagent_work_started", _record_started)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server"
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "ag_x",
+                        "title": "remote",
+                        "message": "go",
+                        "host": "beta",
+                        "workspace": "/remote/ws",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_placement_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_ready")
+            entry_status = entry.status if entry is not None else None
+        finally:
+            runner_app.unregister_subagent_work("conv_ready")
+            runner_app._session_inboxes_ref.pop("conv_placement_caller", None)
+
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_ready"
+    assert child_polls >= 2, "the poll must have re-read the child after it came online"
+    assert event_posts == 2, "the refused post is retried once the runner is online"
+    assert started == ["conv_ready"], "an accepted remote post marks the work started"
+    assert entry_status == "running"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_refusal_fails_closed_on_unreadable_caller() -> None:
+    """An unreadable caller snapshot is a retryable refusal, never a create.
+
+    Unknown parentage must not grant a child session the right to open a
+    long-lived grandchild: the server permits nested creates for other
+    surfaces, so the runner's caller check is the barrier.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(503, json={"error": "unavailable"})
+        posts.append(f"{request.method} {request.url.path}")
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "message": "work"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "caller_lookup_failed"
+    assert info["message"] == "could not read the calling session; retry"
+    assert posts == [], "an unreadable caller must not reach the create POST"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_first_turn_stamps_dispatch_id() -> None:
+    """Create finalization stamps the dispatch id before the first post.
+
+    Restart recovery finds an undrained create-dispatched first turn through
+    the child's ``omnigent.subagent.dispatch_id`` label. The by-id send path
+    already stamps it; the create path must too, before the message POST.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    ops: list[str] = []
+    patches: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "agent_id": "ag_x"})
+        if request.method == "POST" and path == "/v1/sessions":
+            ops.append("create")
+            return httpx.Response(
+                201, json={"id": "conv_new", "agent_name": "worker", "status": "created"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_new":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and path == "/v1/sessions/conv_new":
+            ops.append("patch")
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == "/v1/sessions/conv_new/events":
+            ops.append("events")
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "t", "message": "go"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+            entry = runner_app.get_subagent_work("conv_new")
+            work_id = entry.work_id if entry is not None else None
+        finally:
+            runner_app.unregister_subagent_work("conv_new")
+
+    assert json.loads(output)["conversation_id"] == "conv_new"
+    assert ops == ["create", "patch", "events"], (
+        "the dispatch id must be stamped after create and before the first post"
+    )
+    assert work_id is not None
+    assert patches == [{"labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id}}]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_stamp_failure_fails_closed() -> None:
+    """A create whose dispatch stamp fails sends nothing and reports the error.
+
+    The dispatch label is what restart recovery reads; registering the work and
+    posting the first message after a failed stamp would leave an unrecoverable
+    turn. The create fails closed instead, and the caller can retry the unsent
+    first message with ``sys_session_send``.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    ops: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_caller_fail":
+            return httpx.Response(200, json={"id": "conv_caller_fail", "agent_id": "ag_x"})
+        if request.method == "POST" and path == "/v1/sessions":
+            ops.append("create")
+            return httpx.Response(
+                201, json={"id": "conv_new_fail", "agent_name": "worker", "status": "created"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_new_fail":
+            return httpx.Response(200, json={"id": "conv_new_fail"})
+        if request.method == "PATCH" and path == "/v1/sessions/conv_new_fail":
+            ops.append("patch")
+            return httpx.Response(500, json={"error": "boom"})
+        if request.method == "POST" and path == "/v1/sessions/conv_new_fail/events":
+            ops.append("events")
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "t", "message": "go"}),
+            server_client=server_client,
+            conversation_id="conv_caller_fail",
+        )
+        entry = runner_app.get_subagent_work("conv_new_fail")
+
+    assert json.loads(output) == {
+        "error": "dispatch_stamp_failed",
+        "conversation_id": "conv_new_fail",
+        "message": (
+            "child session created but its first message was not sent "
+            "(could not record the dispatch); retry with sys_session_send"
+        ),
+    }
+    assert entry is None, "a failed stamp must not register the dispatch"
+    assert ops == ["create", "patch"], "a failed stamp must not post the first message"
+
+
+def test_subagent_wake_notice_carries_placement_label() -> None:
+    """The wake notice shows where the child ran, after the identity.
+
+    The bracket follows ``agent/title`` so existing matchers on that prefix
+    keep working, and a label-less entry keeps the previous exact notice.
+    """
+    from omnigent.runner.app import _format_subagent_wake_notice
+
+    labelled = _format_subagent_wake_notice(
+        agent="worker",
+        title="phase-a",
+        status="completed",
+        pending=1,
+        placement_label="fn · ~/projects/app",
+    )
+    assert "sub-agent worker/phase-a [fn · ~/projects/app] finished (completed)" in labelled
+    plain = _format_subagent_wake_notice(
+        agent="worker", title="phase-a", status="completed", pending=1
+    )
+    assert "sub-agent worker/phase-a finished (completed)" in plain
+    assert "worker/phase-a [" not in plain
+
+
+def test_format_async_task_item_renders_placement_label() -> None:
+    """The drained inbox result shows the placement after the identity."""
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "handle_id": "conv_child_placed",
+            "agent": "worker",
+            "title": "phase-a",
+            "status": "completed",
+            "output": "done",
+            "placement_label": "fn · ~/projects/app",
+        }
+    )
+    assert "worker:phase-a [fn · ~/projects/app] returned: done" in line
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_session_id_reaches_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grandchild is sendable; the mother tracks nothing and the middle entry stays.
+
+    One work entry per child id means registering the grandchild on the
+    mother would steal the middle session's entry, so the descendant post is
+    plain and reports that the result returns to the middle session.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_mother":
+            return httpx.Response(
+                200, json={"id": "conv_mother", "root_conversation_id": "conv_mother"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_mother/collab-settings":
+            return httpx.Response(200, json={"enabled": True})
+        if request.method == "GET" and path == "/v1/sessions/conv_grandchild":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_grandchild",
+                    "title": "worker:deep",
+                    "parent_session_id": "conv_middle",
+                    "root_conversation_id": "conv_mother",
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_middle":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_middle",
+                    "parent_session_id": "conv_mother",
+                    "root_conversation_id": "conv_mother",
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_grandchild/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    middle_entry = runner_app.register_subagent_work(
+        parent_session_id="conv_mother",
+        child_session_id="conv_middle",
+        agent="worker",
+        title="middle",
+    )
+    middle_work_id = middle_entry.work_id
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_grandchild", "args": "dig deeper"}),
+                server_client=server_client,
+                conversation_id="conv_mother",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+            grandchild_entry = runner_app.get_subagent_work("conv_grandchild")
+            intact = runner_app.get_subagent_work("conv_middle")
+    finally:
+        runner_app.unregister_subagent_work("conv_middle")
+        runner_app._session_inboxes_ref.pop("conv_mother", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_grandchild"
+    assert payload["parent_session_id"] == "conv_middle"
+    assert "the result returns to its parent conv_middle" in payload["message"]
+    assert len(event_posts) == 1
+    assert event_posts[0]["data"]["content"][0]["text"] == "dig deeper"
+    assert grandchild_entry is None, "a descendant send must not register work on the mother"
+    assert intact is not None and intact.work_id == middle_work_id
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_session_id_rejects_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling stays refused: the walk reaches the shared root, not the caller."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling_a":
+            return httpx.Response(
+                200, json={"id": "conv_sibling_a", "root_conversation_id": "conv_root"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling_a/collab-settings":
+            return httpx.Response(200, json={"enabled": True})
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling_b":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_sibling_b",
+                    "title": "worker:other",
+                    "parent_session_id": "conv_root",
+                    "root_conversation_id": "conv_root",
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_root":
+            return httpx.Response(
+                200, json={"id": "conv_root", "root_conversation_id": "conv_root"}
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_sibling_b/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_sibling_b", "args": "hi sibling"}),
+                server_client=server_client,
+                conversation_id="conv_sibling_a",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_sibling_a", None)
+
+    assert json.loads(output)["error"] == "session_out_of_tree"
+    assert event_posts == [], "a sibling send must not post"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_descendant_refused_when_switch_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the live collab switch off a descendant is out of tree again."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_off_mother":
+            return httpx.Response(
+                200, json={"id": "conv_off_mother", "root_conversation_id": "conv_off_mother"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_off_mother/collab-settings":
+            return httpx.Response(200, json={"enabled": False})
+        if request.method == "GET" and path == "/v1/sessions/conv_off_grandchild":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_off_grandchild",
+                    "parent_session_id": "conv_off_middle",
+                    "root_conversation_id": "conv_off_mother",
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_off_grandchild/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_off_grandchild", "args": "hello"}),
+                server_client=server_client,
+                conversation_id="conv_off_mother",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_off_mother", None)
+
+    assert json.loads(output)["error"] == "session_out_of_tree"
+    assert event_posts == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_fast_first_turn_delivers_once_under_its_entry() -> None:
+    """A first turn finishing during the create's message POST delivers once.
+
+    The create registers the work entry before posting the message, so a
+    terminal that lands while the POST is still in flight (modelled by
+    completing the child synchronously in the events handler) maps to that
+    entry: exactly one inbox result, no phantom replacement entry.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_fast_caller", "conv_fast_child"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}":
+            return httpx.Response(200, json={"id": parent_id, "agent_id": "ag_x"})
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={
+                    "id": child_id,
+                    "agent_id": "ag_x",
+                    "agent_name": "worker",
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={"id": child_id, "workspace": "/w"})
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            # The child completes before the create call regains control.
+            runner_app.mark_subagent_work_terminal(
+                child_id, status="completed", output="fast result"
+            )
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    runner_app._session_inboxes_ref[parent_id] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "fast", "message": "go"}),
+                server_client=server_client,
+                conversation_id=parent_id,
+            )
+            entry = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert json.loads(output)["conversation_id"] == child_id
+    assert entry is not None and entry.status == "completed" and entry.delivered
+    assert inbox.qsize() == 1
+    assert inbox.get_nowait()["output"] == "fast result"

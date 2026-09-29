@@ -398,7 +398,7 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
                     "parent_session_id": "conv_member_cross_host",
                     "host_id": _MEMBER_HOST,
                     "labels": {},
-                    "busy": False,
+                    "status": "idle",
                 },
             )
         if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":

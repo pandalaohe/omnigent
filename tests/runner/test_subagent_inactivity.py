@@ -44,12 +44,12 @@ def _clean_registry() -> Iterator[None]:
         dict(runner_app._subagent_work_by_child),
         {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
         dict(runner_app._session_inboxes_ref),
-        set(runner_app._drained_delivered_subagent_children),
+        dict(runner_app._drained_delivered_subagent_results),
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
     runner_app._session_inboxes_ref.clear()
-    runner_app._drained_delivered_subagent_children.clear()
+    runner_app._drained_delivered_subagent_results.clear()
     try:
         yield
     finally:
@@ -59,8 +59,8 @@ def _clean_registry() -> Iterator[None]:
         runner_app._subagent_work_by_parent.update(saved[1])
         runner_app._session_inboxes_ref.clear()
         runner_app._session_inboxes_ref.update(saved[2])
-        runner_app._drained_delivered_subagent_children.clear()
-        runner_app._drained_delivered_subagent_children.update(saved[3])
+        runner_app._drained_delivered_subagent_results.clear()
+        runner_app._drained_delivered_subagent_results.update(saved[3])
 
 
 class _CapturingForwarderClient:
