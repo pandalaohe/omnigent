@@ -20,6 +20,7 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import { buildBubbles } from "./renderItems";
 import { parseEvent } from "./sse";
 import type { Response } from "./types";
 
@@ -1790,6 +1791,75 @@ describe("BlockStream — elicitation", () => {
       cwd: "/tmp/workspace",
       reason: "Run a focused test",
       execPolicyAmendment: [".venv/bin/python", "-m", "pytest"],
+    });
+  });
+
+  it("carries async-card fields through event → block → render item", () => {
+    // The live stream and the refreshed snapshot both enter through
+    // `parseEvent` (the snapshot replays `pending_elicitations` through it),
+    // so one pass through parse → BlockStream → buildBubbles proves every
+    // extra survives to the card on both paths.
+    const event = parseEvent("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elic_async",
+      params: {
+        mode: "form",
+        message: "Claude has questions",
+        requestedSchema: {},
+        phase: "async_question",
+        policy_name: "claude_async_question",
+        async_kind: "question",
+        context: "Read [r](/abs/report.html) first",
+        approval_ref: "q123456",
+        tool_name: "Bash",
+        cwd: "/tmp/ws",
+        source: {
+          session_id: "conv_child",
+          label: "child task",
+          agent: "Claude Code",
+          host: "mac",
+          cwd: "/tmp/ws",
+        },
+        ask_user_question: {
+          questions: [{ question: "Proceed?", header: "Plan", options: [], multiSelect: false }],
+        },
+      },
+    });
+    if (event === null) throw new Error("expected an elicitation event");
+
+    const blocks = new BlockStream().reduceSync([event]);
+    const elic = blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(elic).toBeDefined();
+    expect(elic!.asyncKind).toBe("question");
+    expect(elic!.context).toBe("Read [r](/abs/report.html) first");
+    expect(elic!.approvalRef).toBe("q123456");
+    expect(elic!.toolName).toBe("Bash");
+    expect(elic!.cwd).toBe("/tmp/ws");
+    expect(elic!.source).toEqual({
+      sessionId: "conv_child",
+      label: "child task",
+      agent: "Claude Code",
+      host: "mac",
+      cwd: "/tmp/ws",
+    });
+
+    const bubbles = buildBubbles(blocks, null);
+    const bubble = bubbles[0];
+    if (bubble?.kind !== "assistant") throw new Error("expected an assistant bubble");
+    expect(bubble.items[0]).toMatchObject({
+      kind: "elicitation",
+      asyncKind: "question",
+      context: "Read [r](/abs/report.html) first",
+      approvalRef: "q123456",
+      toolName: "Bash",
+      cwd: "/tmp/ws",
+      source: {
+        sessionId: "conv_child",
+        label: "child task",
+        agent: "Claude Code",
+        host: "mac",
+        cwd: "/tmp/ws",
+      },
     });
   });
 

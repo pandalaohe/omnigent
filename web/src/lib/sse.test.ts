@@ -434,6 +434,79 @@ describe("parseEvent — response.compaction.in_progress", () => {
   });
 });
 
+describe("parseEvent — response.elicitation_request", () => {
+  it("carries the async-card fields off params", () => {
+    // The card kind, context, approval ref, tool/cwd and mirrored-source
+    // stamp ride on params extras; the renderer reads them from the event,
+    // never from the truncated content_preview.
+    const ev = parseEvent("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elic_async",
+      params: {
+        mode: "form",
+        message: "Claude has questions",
+        requestedSchema: {},
+        phase: "async_question",
+        policy_name: "claude_async_question",
+        async_kind: "question",
+        context: "See [r](/abs/report.html)",
+        approval_ref: "a1b2c3",
+        tool_name: "Bash",
+        cwd: "/tmp/ws",
+        source: {
+          session_id: "conv_child",
+          label: "child task",
+          agent: "Claude Code",
+          host: "mac",
+          cwd: "/tmp/ws",
+        },
+        ask_user_question: {
+          questions: [{ question: "?", header: "", options: [], multiSelect: false }],
+        },
+      },
+    });
+    expect(ev).toMatchObject({
+      type: "elicitation_request",
+      asyncKind: "question",
+      context: "See [r](/abs/report.html)",
+      approvalRef: "a1b2c3",
+      toolName: "Bash",
+      cwd: "/tmp/ws",
+      source: {
+        sessionId: "conv_child",
+        label: "child task",
+        agent: "Claude Code",
+        host: "mac",
+        cwd: "/tmp/ws",
+      },
+    });
+  });
+
+  it("drops an unknown async kind and a malformed source without dropping the card", () => {
+    // An unrecognized kind must not exempt the card from the Send lock, and
+    // a source missing its session id has no usable provenance; either way
+    // the card itself still renders.
+    const ev = parseEvent("response.elicitation_request", {
+      elicitation_id: "elic_async_bad",
+      params: {
+        mode: "form",
+        message: "Approval required",
+        requestedSchema: {},
+        async_kind: "later",
+        source: { label: "no-session-id" },
+      },
+    });
+    expect(ev).toMatchObject({
+      type: "elicitation_request",
+      asyncKind: null,
+      source: null,
+      context: null,
+      toolName: null,
+      cwd: null,
+    });
+  });
+});
+
 describe("parseEvent — response.elicitation_resolved", () => {
   it("keeps the verdict the server delivered", () => {
     // A prompt answered on another surface (native terminal popup, second

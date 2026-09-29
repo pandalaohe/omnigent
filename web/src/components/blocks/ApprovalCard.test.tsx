@@ -237,6 +237,59 @@ describe("ApprovalCard — Claude permission interrupt", () => {
   });
 });
 
+describe("ApprovalCard — async card", () => {
+  const props = {
+    elicitationId: "elic_async",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"git status"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("shows the 不挡路 pill with the approval ref on a deferred approval", () => {
+    render(<ApprovalCard {...props} asyncKind="approval" approvalRef="a123456" />);
+
+    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("不挡路 · #a123456");
+  });
+
+  it("hides the interrupt control on an async card but keeps Reject", () => {
+    // An async card never parks a turn, so there is nothing to interrupt;
+    // a blocking card with the same props still offers it (see the
+    // interrupt describe above).
+    render(<ApprovalCard {...props} asyncKind="question" interruptible />);
+
+    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("不挡路");
+    expect(screen.queryByRole("button", { name: "Reject & interrupt" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^reject$/i })).toBeDefined();
+  });
+
+  it("hides the question form's interrupt control on an async card", () => {
+    render(
+      <ApprovalCard
+        {...props}
+        asyncKind="question"
+        interruptible
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Which framework?",
+              header: "",
+              options: [{ label: "React" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId("ask-user-question-form")).toBeDefined();
+    expect(screen.queryByTestId("ask-user-question-abort")).toBeNull();
+  });
+});
+
 describe("ApprovalCard — approve & switch to auto mode", () => {
   const props = {
     elicitationId: "elic_auto",

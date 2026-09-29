@@ -737,8 +737,9 @@ export function ChatPage() {
   // a boolean selector (not the whole `blocks` array): Zustand bails out when
   // the flag is unchanged, so `blocks` reference churn on every streaming
   // frame no longer re-renders this root — only an elicitation edge does.
+  // Async cards never park the session, so they don't suppress the shimmer.
   const hasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
+    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending" && b.asyncKind == null),
   );
 
   // Single-session snapshot (shared cache with chatStore.bindStream).
@@ -3001,11 +3002,14 @@ function ComposerImpl(
   // lands while the user is typing, silently dropping their keystrokes.
   // Mirrored sub-agent prompts (targetSessionId set to a child session)
   // don't gate this session's inbox, so they don't lock it.
+  // Async cards (async_kind set: async question, deferred approval) never
+  // park the session, so they never lock it either.
   const hasPendingElicitation = useChatStore((s) =>
     s.blocks.some(
       (b) =>
         b.type === "elicitation" &&
         b.status === "pending" &&
+        b.asyncKind == null &&
         (b.targetSessionId == null || b.targetSessionId === s.conversationId),
     ),
   );

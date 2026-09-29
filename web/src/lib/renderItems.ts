@@ -34,7 +34,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { CodexPersistMode, RememberScope } from "./types";
+import type { CodexPersistMode, ElicitationSource, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -152,6 +152,12 @@ export type RenderItem =
       allowAutoMode?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
+      asyncKind?: "question" | "approval" | null;
+      context?: string | null;
+      approvalRef?: string | null;
+      source?: ElicitationSource | null;
+      toolName?: string | null;
+      cwd?: string | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -1641,6 +1647,12 @@ function buildAssistantItems(
         allowAutoMode: b.allowAutoMode,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
+        asyncKind: b.asyncKind,
+        context: b.context,
+        approvalRef: b.approvalRef,
+        source: b.source,
+        toolName: b.toolName,
+        cwd: b.cwd,
       });
       i += 1;
       continue;
