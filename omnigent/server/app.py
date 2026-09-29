@@ -31,7 +31,7 @@ from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
-from omnigent.db.db_models import InvalidUuidError
+from omnigent.db.db_models import InvalidUuidError, current_workspace_id
 from omnigent.debug_logging import (
     add_audit_attrs,
     audit_event_logger,
@@ -1886,6 +1886,65 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+
+        # System status: one tick loop rolls up host points, trims history and
+        # evaluates findings; a second loop renews the fast-sampling lease for
+        # hosts someone is watching. Both are no-ops without a host store.
+        system_status_hub: Any = getattr(app_inst.state, "system_status", None)
+        system_status_tick_task: asyncio.Task[None] | None = None
+        system_status_fast_task: asyncio.Task[None] | None = None
+        if system_status_hub is not None:
+            from omnigent.host.frames import (
+                CAP_RESOURCE_SNAPSHOT,
+                HostResourceSamplingFrame,
+                encode_host_frame,
+            )
+            from omnigent.server.system_status import FLUSH_EVERY_TICKS
+
+            async def _system_status_tick_loop() -> None:
+                ticks = 0
+                while True:
+                    await asyncio.sleep(60.0)
+                    try:
+                        server_disk_pct = await asyncio.to_thread(system_status_hub.disk_usage_pct)
+                        system_status_hub.tick(time.time(), server_disk_pct=server_disk_pct)
+                        ticks += 1
+                        if ticks % FLUSH_EVERY_TICKS == 0:
+                            await system_status_hub.save_history()
+                    except Exception:
+                        _logger.exception("system-status tick failed; continuing")
+
+            async def _system_status_fast_loop() -> None:
+                while True:
+                    await asyncio.sleep(10.0)
+                    try:
+                        for workspace_id, host_id in system_status_hub.fast_hosts(time.time()):
+                            conn = host_registry.get(host_id, workspace_id=workspace_id)
+                            if (
+                                conn is None
+                                or CAP_RESOURCE_SNAPSHOT not in conn.hello.capabilities
+                            ):
+                                continue
+                            try:
+                                host_registry.send_text(
+                                    conn,
+                                    encode_host_frame(
+                                        HostResourceSamplingFrame(interval_s=10, lease_s=40)
+                                    ),
+                                )
+                            except ConnectionError:
+                                continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        _logger.exception("system-status fast-mode loop failed; continuing")
+
+            system_status_tick_task = asyncio.create_task(
+                _system_status_tick_loop(), name="system-status-tick"
+            )
+            system_status_fast_task = asyncio.create_task(
+                _system_status_fast_loop(), name="system-status-fast"
+            )
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1995,6 +2054,17 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            if system_status_tick_task is not None:
+                system_status_tick_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await system_status_tick_task
+            if system_status_fast_task is not None:
+                system_status_fast_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await system_status_fast_task
+            if system_status_hub is not None:
+                await system_status_hub.save_history()
+                system_status_hub.close()
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
@@ -4266,18 +4336,47 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        from omnigent.server.admin_list import resolve_data_dir
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
         from omnigent.server.routes.skills import create_skills_router
+        from omnigent.server.routes.system_status import create_system_status_router
+        from omnigent.server.system_status import SystemStatusHub
 
-        async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
+        # System-status hub: inventory + 24 h history for the resource
+        # monitor. Its state files live beside the other OSS server state
+        # (``/data`` on the container, ``~/.omnigent`` on a laptop).
+        system_status = SystemStatusHub(resolve_data_dir(), server_metrics)
+        system_status.load()
+        app.state.system_status = system_status
+
+        async def _on_hosts_changed(host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
+            conn = host_registry.get(host_id)
+            if conn is None:
+                system_status.host_changed(
+                    host_id=host_id,
+                    workspace_id=current_workspace_id(),
+                    owner=owner,
+                    name=None,
+                    conn_capabilities=None,
+                    now=time.time(),
+                )
+            else:
+                system_status.host_changed(
+                    host_id=conn.host_id,
+                    workspace_id=conn.workspace_id,
+                    owner=conn.owner,
+                    name=conn.hello.name,
+                    conn_capabilities=list(conn.hello.capabilities),
+                    now=time.time(),
+                )
             if cli_retention_coordinator is not None:
-                cli_retention_coordinator.trigger(_host_id)
-            archive_close_coordinator.trigger_pending(host_id=_host_id)
+                cli_retention_coordinator.trigger(host_id)
+            archive_close_coordinator.trigger_pending(host_id=host_id)
             coordinator = getattr(app.state, "assignment_coordinator", None)
-            if coordinator is not None and host_registry.get(_host_id) is not None:
-                coordinator.trigger_host(_host_id)
+            if coordinator is not None and host_registry.get(host_id) is not None:
+                coordinator.trigger_host(host_id)
 
         app.include_router(
             create_host_tunnel_router(
@@ -4286,6 +4385,12 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_resource_snapshot=lambda conn, frame: system_status.ingest(
+                    host_id=conn.host_id,
+                    workspace_id=conn.workspace_id,
+                    frame=frame,
+                    now=time.time(),
+                ),
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
@@ -4321,6 +4426,15 @@ def create_app(
             ),
             prefix="/v1",
             tags=["skills"],
+        )
+        app.include_router(
+            create_system_status_router(
+                host_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["system"],
         )
         # Host-facing credential vending: a sandbox fetches its owner's
         # per-provider credential over the launch-token-authenticated channel

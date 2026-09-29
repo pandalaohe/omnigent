@@ -9,6 +9,7 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import errno
 import functools
@@ -102,6 +103,7 @@ from omnigent.host.frames import (
     HostPostBindHookResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
+    HostResourceSamplingFrame,
     HostRunnerExitedFrame,
     HostRunnerLogRunawayFrame,
     HostRunnerStatusFrame,
@@ -127,6 +129,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor, RunnerLogRunawayTracker
 from omnigent.host.post_bind_hook import PostBindHookRunner
+from omnigent.host.resource_sampler import ResourceSampler
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
@@ -150,6 +153,7 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     configure_process_logging,
+    data_dir,
     display_log_path,
     env_truthy,
     open_process_log_file,
@@ -305,6 +309,11 @@ _ORPHAN_REAP_INTERVAL_S = 2.0
 # Sample each live runner's log size on this cadence and report a runner whose
 # log grows past the runaway threshold within the sliding hour window.
 _RUNNER_LOG_RUNAWAY_INTERVAL_S = 300.0
+
+# Resource-snapshot cadence: idle, and while the server holds a sampling
+# lease for a viewer.
+_RESOURCE_SNAPSHOT_INTERVAL_S = 60.0
+_RESOURCE_SNAPSHOT_FAST_INTERVAL_S = 10.0
 
 
 def _install_child_subreaper() -> bool:
@@ -1225,6 +1234,16 @@ class HostProcess:
         # passes; runner startup never waits for them.
         self._maintenance_janitor: HostMaintenanceJanitor | None = None
         self._runner_log_runaway_tracker = RunnerLogRunawayTracker()
+        # Resource monitor: one sampler on one dedicated executor thread
+        # (created lazily) so its CPU baselines stay comparable and its cost
+        # never lands on the event loop. A server lease switches the cadence
+        # to fast; the wake event applies a new lease without waiting out the
+        # current interval.
+        self._resource_sampler: ResourceSampler | None = None
+        self._resource_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._resource_fast_until = 0.0
+        self._resource_fast_interval_s = _RESOURCE_SNAPSHOT_FAST_INTERVAL_S
+        self._resource_wake = asyncio.Event()
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -4246,6 +4265,11 @@ class HostProcess:
                 if self._maintenance_janitor is not None:
                     await self._maintenance_janitor.shutdown()
                     self._maintenance_janitor = None
+                if self._resource_executor is not None:
+                    # wait=False: a job in flight finishes on its own thread;
+                    # the host must not block shutdown on a sample.
+                    self._resource_executor.shutdown(wait=False)
+                    self._resource_executor = None
             finally:
                 if model_options_prewarm_task is not None:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4612,6 +4636,9 @@ class HostProcess:
         runaway_task = asyncio.create_task(
             self._runner_log_runaway_loop(ws), name="host-runner-log-runaway"
         )
+        resource_task = asyncio.create_task(
+            self._resource_snapshot_loop(ws), name="host-resource-snapshot"
+        )
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -4655,6 +4682,9 @@ class HostProcess:
             runaway_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await runaway_task
+            resource_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await resource_task
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
@@ -4788,6 +4818,82 @@ class HostProcess:
             except Exception:  # noqa: BLE001 - advisory telemetry must not stop sampling
                 _logger.debug("Runner log runaway sampling failed", exc_info=True)
             await asyncio.sleep(_RUNNER_LOG_RUNAWAY_INTERVAL_S)
+
+    async def _resource_snapshot_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+    ) -> None:
+        """Send periodic ``host.resource_snapshot`` frames to the server.
+
+        Sampling runs on one dedicated executor thread; this task only copies
+        the runner / zygote state on the event loop, awaits the job, and
+        sends. The job stores its own thread CPU in the sampler for the NEXT
+        frame, so each frame carries the previous sample's measured cost.
+        """
+        while True:
+            # Wait out the current cadence, or wake early when the server
+            # grants a sampling lease so a viewer gets data without waiting.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._resource_wake.wait(), timeout=self._resource_interval()
+                )
+                self._resource_wake.clear()
+            try:
+                runner_sessions = {
+                    handle.proc.pid: handle.session_id for handle in self._runners.values()
+                }
+                zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
+                interval = self._resource_interval()
+                text = await asyncio.get_running_loop().run_in_executor(
+                    self._resource_executor_for(),
+                    self._sample_resource_snapshot,
+                    runner_sessions,
+                    zygote_pid,
+                    int(interval),
+                )
+                await ws.send(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - advisory telemetry must not stop sampling
+                _logger.debug("Host resource snapshot sampling failed", exc_info=True)
+
+    def _sample_resource_snapshot(
+        self,
+        runner_sessions: dict[int, str | None],
+        zygote_pid: int | None,
+        interval_s: int,
+    ) -> str:
+        """Sample + encode on the sampler thread; returns the encoded frame."""
+        sampler = self._resource_sampler
+        if sampler is None:
+            sampler = ResourceSampler(data_dir=data_dir(), daemon_pid=os.getpid())
+            self._resource_sampler = sampler
+        started = time.thread_time()
+        frame = sampler.sample(
+            runner_sessions=runner_sessions,
+            zygote_pid=zygote_pid,
+            interval_s=interval_s,
+        )
+        text = encode_host_frame(frame)
+        sampler.last_cpu_ms = (time.thread_time() - started) * 1000.0
+        return text
+
+    def _resource_executor_for(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the single-worker executor that owns the sampler thread."""
+        executor = self._resource_executor
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="host-resource-sampler",
+            )
+            self._resource_executor = executor
+        return executor
+
+    def _resource_interval(self) -> float:
+        """Current snapshot cadence: fast while a lease holds, else idle."""
+        if time.monotonic() < self._resource_fast_until:
+            return self._resource_fast_interval_s
+        return _RESOURCE_SNAPSHOT_INTERVAL_S
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
@@ -5008,6 +5114,16 @@ class HostProcess:
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
             await ws.send(encode_host_frame(options_result))
+        elif isinstance(frame, HostResourceSamplingFrame):
+            # A viewer is watching: hold the fast cadence for the lease. Only a
+            # slow -> fast switch wakes the sampler; renewals every 10 s must not
+            # add samples on top of the fast timer. A lapsed lease needs no
+            # reset — _resource_interval reads the deadline.
+            was_fast = time.monotonic() < self._resource_fast_until
+            self._resource_fast_until = time.monotonic() + max(0, frame.lease_s)
+            self._resource_fast_interval_s = float(min(60, max(10, frame.interval_s)))
+            if not was_fast:
+                self._resource_wake.set()
         elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.

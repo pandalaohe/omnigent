@@ -20271,6 +20271,175 @@
         ]
       }
     },
+    "/v1/system/history": {
+      "get": {
+        "description": "Return one target's age-filtered points; 404 when not visible.",
+        "operationId": "get_system_history_v1_system_history_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "title": "Target",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get System History V1 System History Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get System History",
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/v1/system/settings": {
+      "get": {
+        "description": "Return the finding thresholds (admin only).",
+        "operationId": "get_system_settings_v1_system_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get System Settings V1 System Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get System Settings",
+        "tags": [
+          "system"
+        ]
+      },
+      "put": {
+        "description": "Validate and store thresholds, returning the effective settings.",
+        "operationId": "put_system_settings_v1_system_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put System Settings V1 System Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put System Settings",
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/v1/system/status": {
+      "get": {
+        "description": "Return the caller's system-status view.\n\n`live=1` records a viewer lease so the fast-mode loop samples the\nreturned hosts every 10 s while the page is open. `summary=1`\nreturns only revision / level / findings (the sidebar poll).",
+        "operationId": "get_system_status_v1_system_status_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "live",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Live",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "summary",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Summary",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get System Status V1 System Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get System Status",
+        "tags": [
+          "system"
+        ]
+      }
+    },
     "/v1/usage": {
       "get": {
         "description": "Aggregate the calling user's LLM spend across their sessions.\n\nrequire_user, not get_user_id: the aggregation scopes to the caller,\nso a request slipping through as `None` in multi-user mode would\nread another scope. Fail closed with 401 instead (`user_id` is\n`None` only when auth is disabled \u2014 the single-user / local case).",

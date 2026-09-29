@@ -2144,6 +2144,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "setup",
         "start",
         "stop",
+        "system",
         "uninstall",
         "update",
         "upgrade",
@@ -7002,6 +7003,92 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 after = page.get("last_id")
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
+
+
+@cli.group("system", invoke_without_command=True)
+@click.pass_context
+def system(ctx: click.Context) -> None:
+    """Inspect the Omnigent server itself.
+
+    \b
+    Examples:
+      omnigent system status
+      omnigent system status --json
+      omnigent system status --server https://myserver.com
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@system.command("status")
+@click.option("--json", "as_json", is_flag=True, help="Print the raw JSON response.")
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+def system_status(as_json: bool, server: str | None) -> None:
+    """Show the server's system status: level, findings, and hosts.
+
+    Read-only; never starts a server of its own. ``--json`` is the
+    machine-readable form for scripts and agents.
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
+    if resolved_server is None:
+        raise click.ClickException("No Omnigent server found. Start a server or pass --server.")
+
+    base_url = resolved_server.api_base
+    with httpx.Client(
+        base_url=base_url,
+        headers=_remote_headers(
+            server_url=base_url,
+            host_id=None,
+            org_id=resolved_server.org_id,
+        ),
+        timeout=30.0,
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        resp = client.get("/v1/system/status")
+        if resp.status_code == 404:
+            raise click.ClickException(
+                "This server does not expose /v1/system/status (system status "
+                "requires a host store)."
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    click.echo(f"level: {payload.get('level', 'ok')} (revision {payload.get('revision', 0)})")
+    for finding in payload.get("findings", []):
+        click.echo(f"  [{finding.get('level')}] {finding.get('id')}: {finding.get('detail')}")
+    for host in payload.get("hosts", []):
+        snapshot = host.get("last_snapshot") or {}
+        machine = snapshot.get("machine") or {}
+        cpu = machine.get("cpu_pct")
+        mem_used = machine.get("mem_used")
+        mem_total = machine.get("mem_total")
+        cpu_text = f"{cpu:.0f}%" if isinstance(cpu, (int, float)) else "-"
+        mem_text = (
+            f"{mem_used * 100 / mem_total:.0f}%"
+            if isinstance(mem_used, (int, float)) and mem_total
+            else "-"
+        )
+        name = host.get("name") or host.get("host_id")
+        click.echo(
+            f"  {name}  {host.get('state')}  cpu {cpu_text}  mem {mem_text}  "
+            f"({host.get('host_id')})"
+        )
 
 
 # Fields on an exported item that belong to the store/envelope, not the typed
