@@ -234,6 +234,35 @@ def _patch_create(
     return captured
 
 
+def _patch_create_gated(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> tuple[asyncio.Event, dict[str, Any]]:
+    """Replace the create orchestration; the first call waits for the event."""
+    gate = asyncio.Event()
+    captured: dict[str, Any] = {"calls": 0, "sids": []}
+
+    async def create_session(*args: Any, **kwargs: Any) -> Any:
+        body = args[3]
+        sid = kwargs["conversation_id"]
+        captured["calls"] += 1
+        captured["sids"].append(sid)
+        if captured["calls"] == 1:
+            await gate.wait()
+        conv = env["conversations"].create_conversation(
+            conversation_id=sid,
+            agent_id=body.agent_id,
+            title=body.title or "opened",
+            host_id=body.host_id,
+            workspace=body.workspace,
+            project_id=body.project_id,
+            runner_id=token_bound_runner_id(secrets.token_hex(16)),
+        )
+        return SimpleNamespace(id=sid), conv
+
+    monkeypatch.setattr(routes_open, "_create_session_from_existing_agent", create_session)
+    return gate, captured
+
+
 async def _wait_for(predicate: Any, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -444,6 +473,119 @@ async def test_blank_from_ref_counts_as_no_ref(
         data = await _post(client, env["sender"].id, env["sender_token"], from_ref=from_ref)
     assert data["state"] == "refused"
     assert data["reason"] == "directory_in_use"
+
+
+@pytest.mark.asyncio
+async def test_stalled_open_reserves_the_root(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-ref open still creating refuses a second root open meanwhile."""
+    env = open_env
+    gate, captured = _patch_create_gated(env, monkeypatch)
+    async with await _client(env) as client:
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{env['sender'].id}/open",
+                json=_body(),
+                headers=_headers(env["sender_token"]),
+            )
+        )
+        assert await _wait_for(lambda: captured["calls"] == 1)
+        sid = captured["sids"][0]
+        second = await asyncio.wait_for(
+            _post(client, env["sender"].id, env["sender_token"]), timeout=5
+        )
+        assert second["state"] == "refused"
+        assert second["reason"] == "directory_in_use"
+        assert f"{sid} (opening)" in second["message"]
+        assert {"id": sid, "name": f"opening {sid[:8]}"} in second["candidates"]
+        gate.set()
+        response = await first
+        assert response.status_code == 200
+        first_data = response.json()
+        assert first_data["state"] == "opened"
+        assert first_data["session_id"] == sid
+        third = await _post(client, env["sender"].id, env["sender_token"])
+    assert third["state"] == "refused"
+    assert third["reason"] == "directory_in_use"
+    assert {"id": sid, "name": "opened"} in third["candidates"]
+    assert all(not candidate["name"].startswith("opening ") for candidate in third["candidates"])
+
+
+@pytest.mark.asyncio
+async def test_stalled_open_does_not_block_a_worktree_open(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled no-ref open does not hold the lock for a from_ref open."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    gate, captured = _patch_create_gated(env, monkeypatch)
+    async with await _client(env) as client:
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{env['sender'].id}/open",
+                json=_body(),
+                headers=_headers(env["sender_token"]),
+            )
+        )
+        assert await _wait_for(lambda: captured["calls"] == 1)
+        worktree = await asyncio.wait_for(
+            _post(client, env["sender"].id, env["sender_token"], from_ref="main"), timeout=5
+        )
+        assert worktree["state"] == "opened"
+        gate.set()
+        response = await first
+    assert response.status_code == 200
+    first_data = response.json()
+    assert first_data["state"] == "opened"
+    assert first_data["session_id"] != worktree["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_failed_create_releases_the_reservation(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create that raises frees the root for the next no-ref open."""
+    env = open_env
+    _patch_create(env, monkeypatch, error=Exception("boom"))
+    async with await _client(env) as client:
+        failed = await _post(client, env["sender"].id, env["sender_token"])
+        assert failed["state"] == "failed"
+        _patch_create(env, monkeypatch)
+        opened = await _post(client, env["sender"].id, env["sender_token"])
+    assert opened["state"] == "opened"
+
+
+@pytest.mark.asyncio
+async def test_stalled_pending_fire_reserves_the_root(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fire that is still creating refuses a second root open meanwhile."""
+    env = open_env
+    env["online"]["on"] = False
+    lines: list[str] = []
+
+    async def notify_line(_sender_id: str, line: str) -> None:
+        lines.append(line)
+
+    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
+    gate, captured = _patch_create_gated(env, monkeypatch)
+    async with await _client(env) as client:
+        waiting = await _post(client, env["sender"].id, env["sender_token"], wait_for_host=True)
+        sid = waiting["session_id"]
+        env["online"]["on"] = True
+        env["app"].state.pending_session_opens.trigger(HOST_ID)
+        assert await _wait_for(lambda: captured["calls"] == 1)
+        refused = await asyncio.wait_for(
+            _post(client, env["sender"].id, env["sender_token"]), timeout=5
+        )
+        assert refused["state"] == "refused"
+        assert refused["reason"] == "directory_in_use"
+        assert f"{sid} (opening)" in refused["message"]
+        assert {"id": sid, "name": f"opening {sid[:8]}"} in refused["candidates"]
+        gate.set()
+        assert await _wait_for(lambda: len(lines) == 1)
+    assert lines == [f"[System: session {sid} opened on host {HOST_NAME}]"]
 
 
 @pytest.mark.asyncio

@@ -863,8 +863,7 @@ class SqlProject(OmnigentBase):
     collaboration_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
-    # Bumped by every collaboration-config change; an assignment records the
-    # value it was created against.
+    # Bumped by every collaboration-config change.
     collaboration_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
@@ -2014,13 +2013,12 @@ class SqlProjectRepository(OmnigentBase):
     :param project_id: The project this repository is registered on (relates
         to ``projects.id``). No DB foreign key (Rule R032); cleanup on
         project deletion is application-owned.
-    :param name: Stable identity used by assignments; unique per project.
+    :param name: Stable identity; unique per project.
     :param remote_url: The shared remote. Carries no credentials.
     :param default_branch: The repository's default branch name.
     :param context_manifest_path: Repo-relative path of the project-context
         manifest, e.g. ``".agents/project/manifest.json"``.
-    :param revision: Bumped on any change; assignments pin the value they
-        were created against.
+    :param revision: Bumped on any change.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if
         the row has never been updated.
@@ -2092,8 +2090,7 @@ class SqlProjectHostBinding(OmnigentBase):
     :param workspace: Absolute path as the host canonicalised it, never as
         typed. Host-native syntax is preserved (POSIX, Windows drive, UNC).
     :param enabled: Disabled bindings are skipped at claim time.
-    :param revision: Bumped on any change; assignments pin the value they
-        started against.
+    :param revision: Bumped on any change.
     :param path_verified_at: Unix epoch seconds of the last successful
         ``host.stat``, or ``None`` if never verified.
     :param created_at: Unix epoch seconds at row creation.

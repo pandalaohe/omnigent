@@ -539,6 +539,9 @@ def register_open_routes(
             )
             if refusal is not None:
                 return refusal
+            if entry.body.from_ref is None:
+                in_flight[entry.sid] = (entry.host_id, root.workspace)
+        try:
             return await _open_now(
                 sid=entry.sid,
                 owner=entry.owner,
@@ -553,6 +556,8 @@ def register_open_routes(
                 body=entry.body,
                 request=_synthetic_request(entry.sid),
             )
+        finally:
+            in_flight.pop(entry.sid, None)
 
     async def _occupied_sessions(*, owner: str, host_id: str, root_workspace: str) -> list[Any]:
         """Non-closed top-level sessions sitting in *root_workspace*.
@@ -575,9 +580,9 @@ def register_open_routes(
         ]
 
     def _occupancy_candidates(
-        occupied: list[Any], pending: list[_PendingOpen]
+        occupied: list[Any], pending: list[_PendingOpen], in_flight: list[str]
     ) -> list[dict[str, str]]:
-        """Render occupied sessions and pending opens as id/name choices."""
+        """Render occupied sessions, pending opens and reservations as choices."""
         candidates = [
             {
                 "id": conv.id,
@@ -592,10 +597,14 @@ def register_open_routes(
             }
             for entry in pending
         )
+        candidates.extend({"id": sid, "name": f"opening {sid[:8]}"} for sid in in_flight)
         return candidates
 
     def _directory_message(
-        occupied: list[Any], pending: list[_PendingOpen], root_workspace: str
+        occupied: list[Any],
+        pending: list[_PendingOpen],
+        in_flight: list[str],
+        root_workspace: str,
     ) -> str:
         """Human refusal text telling the agent to pass ``from_ref``."""
         holders = ", ".join(
@@ -604,6 +613,7 @@ def register_open_routes(
                 for conv in occupied
             ]
             + [entry.sid for entry in pending]
+            + [f"{sid} (opening)" for sid in in_flight]
         )
         return (
             f"Directory {root_workspace!r} is already used by another session "
@@ -620,6 +630,11 @@ def register_open_routes(
         if app_state is not None:
             app_state.pending_session_opens = entry_registry
 
+    # Opens that already passed admission but have not created their session
+    # yet: sid -> (host_id, root_workspace). Only no-ref opens reserve the
+    # root; a from_ref open lands in its own branch worktree.
+    in_flight: dict[str, tuple[str, str]] = {}
+
     async def _directory_refusal(
         *,
         state: str,
@@ -628,7 +643,7 @@ def register_open_routes(
         root_workspace: str,
         from_ref: str | None,
     ) -> dict[str, Any] | None:
-        """Refuse a root-directory open another session or pending open holds.
+        """Refuse a root-directory open another session or opening holds.
 
         A ``from_ref`` open lands in a fresh branch worktree, so it never
         occupies the root and is always admitted.
@@ -642,17 +657,22 @@ def register_open_routes(
         """
         if from_ref is not None:
             return None
+        opening = [
+            sid
+            for sid, (reserved_host, reserved_root) in in_flight.items()
+            if reserved_host == host_id and same_canonical_path(reserved_root, root_workspace)
+        ]
         occupied = await _occupied_sessions(
             owner=owner, host_id=host_id, root_workspace=root_workspace
         )
         pending = entry_registry.entries_for(host_id, root_workspace)
-        if not occupied and not pending:
+        if not occupied and not pending and not opening:
             return None
         return _problem(
             state,
             "directory_in_use",
-            _directory_message(occupied, pending, root_workspace),
-            _occupancy_candidates(occupied, pending),
+            _directory_message(occupied, pending, opening, root_workspace),
+            _occupancy_candidates(occupied, pending, opening),
         )
 
     @router.post("/sessions/{sender_id}/open", include_in_schema=False, response_model=None)
@@ -874,8 +894,12 @@ def register_open_routes(
                     "project": project.name,
                     "agent": agent_name,
                 }
+            sid = uuid.uuid4().hex
+            if body.from_ref is None:
+                in_flight[sid] = (host_id, root.workspace)
+        try:
             return await _open_now(
-                sid=uuid.uuid4().hex,
+                sid=sid,
                 owner=owner,
                 create_user_id=create_user_id,
                 sender=sender,
@@ -888,3 +912,5 @@ def register_open_routes(
                 body=body,
                 request=request,
             )
+        finally:
+            in_flight.pop(sid, None)
