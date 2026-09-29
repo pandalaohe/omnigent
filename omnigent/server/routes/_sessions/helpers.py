@@ -4998,9 +4998,12 @@ def _note_running_edge(session_id: str, previous_status: str | None, status: str
             return
         _session_running_since_cache[session_id] = value
 
-    on_resolved = (
-        _apply if loop is None else lambda value: loop.call_soon_threadsafe(_apply, value)
-    )
+    def on_resolved(value: int) -> None:
+        if loop is None:
+            _apply(value)
+        else:
+            loop.call_soon_threadsafe(_apply, value)
+
     session_live_state.persist_running_since(
         session_id,
         now,
