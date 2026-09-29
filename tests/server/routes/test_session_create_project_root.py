@@ -74,6 +74,11 @@ def _headers(user: str = ALICE) -> dict[str, str]:
     return {"X-Forwarded-Email": user}
 
 
+def _agent_headers(user: str = ALICE, origin: str = "agent") -> dict[str, str]:
+    """Headers for an agent-initiated child create (the runner's POST)."""
+    return {**_headers(user), "X-Omnigent-Create-Origin": origin}
+
+
 async def _project(
     client: httpx.AsyncClient, name: str, config: dict[str, object], user: str = ALICE
 ) -> str:
@@ -355,10 +360,10 @@ class _Preferences:
         return {"version": 1, "settings": {"session_collab": self.settings}}
 
 
-async def test_only_child_creates_spend_the_open_rate_budget(
+async def test_only_agent_child_creates_spend_the_open_rate_budget(
     client: httpx.AsyncClient,
 ) -> None:
-    """Top-level creates are free; the sixth unnamed child create is 429."""
+    """Web-shaped and top-level creates are free; the sixth agent child create is 429."""
     session_open_rate._OPEN_TIMESTAMPS.clear()
     try:
         project_id = await _project(client, "rate", {"agent_id": AGENT_ID})
@@ -366,6 +371,7 @@ async def test_only_child_creates_spend_the_open_rate_budget(
             "/v1/sessions", json={"project_id": project_id}, headers=_headers()
         )
         assert parent.status_code == 201, parent.text
+        parent_id = parent.json()["id"]
         # Top-level creates never count.
         for index in range(6):
             top = await client.post(
@@ -374,28 +380,52 @@ async def test_only_child_creates_spend_the_open_rate_budget(
                 headers=_headers(),
             )
             assert top.status_code == 201, top.text
+        # Web-shaped child creates (no origin header) never count.
+        for index in range(10):
+            web_child = await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": AGENT_ID,
+                    "parent_session_id": parent_id,
+                    "title": f"web-child-{index}",
+                },
+                headers=_headers(),
+            )
+            assert web_child.status_code == 201, web_child.text
+        # Agent-initiated child creates spend the budget.
         for index in range(10):
             child = await client.post(
                 "/v1/sessions",
                 json={
                     "agent_id": AGENT_ID,
-                    "parent_session_id": parent.json()["id"],
+                    "parent_session_id": parent_id,
                     "title": f"child-{index}",
                 },
-                headers=_headers(),
+                headers=_agent_headers(),
             )
             assert child.status_code == 201, child.text
         refused = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": AGENT_ID,
-                "parent_session_id": parent.json()["id"],
+                "parent_session_id": parent_id,
                 "title": "child-10",
             },
-            headers=_headers(),
+            headers=_agent_headers(),
         )
         assert refused.status_code == 429, refused.text
         assert "setting: 10 per 1 minute" in refused.json()["detail"]
+        # With the window full, a web-shaped create is still admitted.
+        web = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": AGENT_ID,
+                "parent_session_id": parent_id,
+                "title": "web-after-limit",
+            },
+            headers=_headers(),
+        )
+        assert web.status_code == 201, web.text
     finally:
         session_open_rate._OPEN_TIMESTAMPS.clear()
 
@@ -442,7 +472,7 @@ async def test_named_sub_agent_creates_do_not_spend_the_budget(
 async def test_multipart_child_create_spends_the_budget(
     client: httpx.AsyncClient,
 ) -> None:
-    """The multipart (config_path) child create counts too."""
+    """The agent's multipart (config_path) child create counts too."""
     session_open_rate._OPEN_TIMESTAMPS.clear()
     try:
         project_id = await _project(client, "multipart-rate", {"agent_id": AGENT_ID})
@@ -462,7 +492,7 @@ async def test_multipart_child_create_spends_the_budget(
                         "application/gzip",
                     )
                 },
-                headers=_headers(),
+                headers=_agent_headers(),
             )
             assert response.status_code == 201, response.text
         refused = await client.post(
@@ -475,7 +505,7 @@ async def test_multipart_child_create_spends_the_budget(
                     "application/gzip",
                 )
             },
-            headers=_headers(),
+            headers=_agent_headers(),
         )
         assert refused.status_code == 429, refused.text
         assert "Opening sessions too fast" in refused.json()["detail"]
@@ -500,13 +530,13 @@ async def test_changed_open_rate_setting_applies_to_child_creates(
             child = await client.post(
                 "/v1/sessions",
                 json={"agent_id": AGENT_ID, "parent_session_id": parent.json()["id"]},
-                headers=_headers(),
+                headers=_agent_headers(),
             )
             assert child.status_code == 201, child.text
         refused = await client.post(
             "/v1/sessions",
             json={"agent_id": AGENT_ID, "parent_session_id": parent.json()["id"]},
-            headers=_headers(),
+            headers=_agent_headers(),
         )
         assert refused.status_code == 429, refused.text
         assert "setting: 2 per 1 minute" in refused.json()["detail"]
@@ -514,7 +544,7 @@ async def test_changed_open_rate_setting_applies_to_child_creates(
         admitted = await client.post(
             "/v1/sessions",
             json={"agent_id": AGENT_ID, "parent_session_id": parent.json()["id"]},
-            headers=_headers(),
+            headers=_agent_headers(),
         )
         assert admitted.status_code == 201, admitted.text
     finally:
@@ -524,7 +554,7 @@ async def test_changed_open_rate_setting_applies_to_child_creates(
 async def test_child_create_authorizes_the_parent_before_charging_rate(
     app: FastAPI, client: httpx.AsyncClient
 ) -> None:
-    """A forged parent link is refused without spending the owner's window."""
+    """A forged agent child create is refused without spending the owner's window."""
     session_open_rate._OPEN_TIMESTAMPS.clear()
     prefs = _Preferences({"openRateCount": 1})
     app.state.user_preferences_store = prefs
@@ -539,21 +569,58 @@ async def test_child_create_authorizes_the_parent_before_charging_rate(
         forged = await client.post(
             "/v1/sessions",
             json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
-            headers=_headers(bob),
+            headers=_agent_headers(bob),
         )
         assert forged.status_code == 404, forged.text
+        # A web-shaped forged create is not admitted by this path at all, but
+        # the create route's own parent authorization still refuses it.
+        web_forged = await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
+            headers=_headers(bob),
+        )
+        assert web_forged.status_code == 404, web_forged.text
         admitted = await client.post(
             "/v1/sessions",
             json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
-            headers=_headers(),
+            headers=_agent_headers(),
         )
         assert admitted.status_code == 201, admitted.text
         refused = await client.post(
             "/v1/sessions",
             json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
-            headers=_headers(),
+            headers=_agent_headers(),
         )
         assert refused.status_code == 429, refused.text
+    finally:
+        session_open_rate._OPEN_TIMESTAMPS.clear()
+
+
+async def test_create_origin_header_value_is_case_insensitive(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """An ``AGENT`` origin still spends the budget (value matched case-insensitively)."""
+    session_open_rate._OPEN_TIMESTAMPS.clear()
+    app.state.user_preferences_store = _Preferences({"openRateCount": 1})
+    try:
+        project_id = await _project(client, "origin-case", {"agent_id": AGENT_ID})
+        parent = await client.post(
+            "/v1/sessions", json={"project_id": project_id}, headers=_headers()
+        )
+        assert parent.status_code == 201, parent.text
+        parent_id = parent.json()["id"]
+        first = await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
+            headers=_agent_headers(origin="AGENT"),
+        )
+        assert first.status_code == 201, first.text
+        second = await client.post(
+            "/v1/sessions",
+            json={"agent_id": AGENT_ID, "parent_session_id": parent_id},
+            headers=_agent_headers(origin="Agent"),
+        )
+        assert second.status_code == 429, second.text
     finally:
         session_open_rate._OPEN_TIMESTAMPS.clear()
 

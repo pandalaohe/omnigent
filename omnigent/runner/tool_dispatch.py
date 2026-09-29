@@ -67,6 +67,10 @@ from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runner import flows
 from omnigent.runner.flows import FLOW_TOOL_NAMES
 from omnigent.runtime import pending_elicitations
+from omnigent.server.session_open_rate import (
+    CREATE_ORIGIN_AGENT,
+    CREATE_ORIGIN_HEADER,
+)
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -296,6 +300,12 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # via the JSON POST /v1/sessions create — same server-permission posture
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
+
+# Both sys_session_create create shapes (JSON and config_path multipart)
+# carry the agent-origin marker: the server charges the owner's open-rate
+# window only for creates that present it, so web UI creates do not spend
+# the agent's budget.
+_AGENT_CREATE_HEADERS = {CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
 
 # Priority 5f.0b: Session-open write. ``sys_session_open`` opens a plain
 # top-level session on any host / project / agent of the caller's user.
@@ -5535,7 +5545,12 @@ async def _execute_session_create(
         placement=placement,
     )
     try:
-        resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+        resp = await server_client.post(
+            "/v1/sessions",
+            json=body,
+            timeout=30.0,
+            headers=_AGENT_CREATE_HEADERS,
+        )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if resp.status_code == 404:
@@ -5665,6 +5680,7 @@ async def _upload_config_bundle(
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
             timeout=60.0,
+            headers=_AGENT_CREATE_HEADERS,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})

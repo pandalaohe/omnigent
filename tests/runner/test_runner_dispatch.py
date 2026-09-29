@@ -7784,6 +7784,39 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_marks_the_create_as_agent_originated() -> None:
+    """
+    The JSON create POST carries ``X-Omnigent-Create-Origin: agent`` so the
+    server charges the owner's open-rate window only for agent-initiated
+    creates. Without the header the create would look like a web UI create
+    and silently bypass the rate.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_origins: list[str | None] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_origins.append(request.headers.get("X-Omnigent-Create-Origin"))
+            return httpx.Response(201, json={"id": "conv_child", "status": "idle"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["conversation_id"] == "conv_child"
+    assert create_origins == ["agent"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_without_message_registers_no_work() -> None:
     """A message-less create registers no work entry (nothing to reap)."""
     from omnigent.runner import app as runner_app
@@ -7988,6 +8021,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     assert len(create_requests) == 1, (
         f"expected exactly one create POST, got {len(create_requests)}"
     )
+    # Agent origin rides the multipart create too: the server counts it.
+    assert create_requests[0].headers["X-Omnigent-Create-Origin"] == "agent"
     parts = _parse_multipart_create(create_requests[0])
     assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
 

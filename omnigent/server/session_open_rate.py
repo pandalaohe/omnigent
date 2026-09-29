@@ -1,4 +1,5 @@
-"""Process-local open-rate admission for ``sys_session_open``.
+"""Process-local open-rate admission for ``sys_session_open`` and
+agent-initiated child creates.
 
 One sliding window per session owner, read from the owner's
 ``session_collab`` preferences on every call so a settings change takes
@@ -23,6 +24,13 @@ _OPEN_TIMESTAMPS: dict[str, deque[float]] = {}
 # Serializes prune/check/append per process so two threads cannot both
 # admit the last open of one owner's window.
 _ADMISSION_LOCK = threading.Lock()
+
+# Marker header the runner's ``sys_session_create`` create POST sends so the
+# server can tell an agent-initiated child create (counts) from a web UI one
+# (does not). Shared by the runner and the server; the value is matched
+# case-insensitively.
+CREATE_ORIGIN_HEADER = "X-Omnigent-Create-Origin"
+CREATE_ORIGIN_AGENT = "agent"
 
 
 def _window_text(window_s: int) -> str:
