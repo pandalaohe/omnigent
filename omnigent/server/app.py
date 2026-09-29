@@ -4432,6 +4432,7 @@ def create_app(
                 host_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+                host_versions=_bulk_host_versions,
             ),
             prefix="/v1",
             tags=["system"],
