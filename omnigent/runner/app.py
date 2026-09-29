@@ -1864,6 +1864,10 @@ _subagent_work_by_parent: dict[str, set[str]] = {}
 # Drained children's last delivered result keys. A later terminal edge whose
 # result key matches is a duplicate; a different key is the child's next turn.
 _drained_delivered_subagent_results: dict[str, str | None] = {}
+# Per-child origin (``_SubagentWorkEntry.registered_by``) kept after the entry
+# is drained, so a recovery-rebuilt entry still knows the child was dispatched
+# by an Omnigent tool and a Codex mother is woken for its later turns.
+_subagent_work_origins: dict[str, str] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -2183,6 +2187,10 @@ def register_subagent_work(
         registered_by=registered_by,
     )
     _drained_delivered_subagent_results.pop(child_session_id, None)
+    if registered_by is not None:
+        # The origin outlives the entry: recovery re-registers a drained child
+        # without it and must still know an Omnigent tool dispatched it.
+        _subagent_work_origins[child_session_id] = registered_by
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     if not flow_neutral:
@@ -2274,10 +2282,12 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_results.pop(session_id, None)
+    _subagent_work_origins.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_results.pop(child_id, None)
+        _subagent_work_origins.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
@@ -2318,6 +2328,22 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
         return False
     agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
+
+
+def _recovered_subagent_origin(snapshot: _SessionSnapshot) -> str | None:
+    """Derive a rebuilt entry's origin from the child's snapshot wrapper label.
+
+    The in-memory origin map does not survive a runner restart. A readable
+    snapshot whose wrapper label is not the codex-native internal one belongs
+    to a child an Omnigent surface dispatched (or an ordinary child), so it is
+    allowed to wake even a Codex mother. An unreadable snapshot or a
+    codex-internal thread returns ``None`` and keeps the wake suppressed.
+    """
+    if not snapshot.ok:
+        return None
+    if is_codex_native_subagent_wrapper(snapshot.wrapper_label):
+        return None
+    return "recovery"
 
 
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
@@ -2446,43 +2472,121 @@ async def _fetch_latest_assistant_item(
         params["after"] = page["last_id"]
 
 
-async def _fetch_latest_assistant_text(
-    server_client: httpx.AsyncClient, session_id: str
-) -> str | None:
-    """Return the newest assistant message text from the latest turn."""
-    item = await _fetch_latest_assistant_item(server_client, session_id)
-    return None if item is None else item[1]
+async def _fetch_assistant_item_with_text(
+    server_client: httpx.AsyncClient, session_id: str, text: str
+) -> tuple[str | None, str] | None:
+    """
+    Return the newest assistant item whose joined text equals *text*.
+
+    Unlike :func:`_fetch_latest_assistant_item` this crosses turn boundaries:
+    a delayed terminal edge reports its own turn's text, which can sit below a
+    newer turn's user message in the transcript.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_child456"``.
+    :param text: The terminal edge's reported output text.
+    :returns: The server item id and joined text, or ``None`` when no
+        assistant item matches.
+    :raises _SubagentRecoveryReadError: When a page read fails.
+    """
+    params: dict[str, str] = {"limit": "100", "order": "desc"}
+    while True:
+        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
+        for item in page.get("data", []):
+            if item.get("type") != "message" or item.get("is_meta") is True:
+                continue
+            if item.get("role") != "assistant":
+                continue
+            item_text = "\n".join(
+                block["text"]
+                for block in item.get("content", [])
+                if block.get("type") in {"output_text", "text"} and block.get("text")
+            )
+            if item_text != text:
+                continue
+            raw_id = item.get("id")
+            return (raw_id if isinstance(raw_id, str) and raw_id else None), item_text
+        if not page.get("has_more") or not page.get("last_id"):
+            return None
+        params["after"] = page["last_id"]
+
+
+async def _fetch_session_status(server_client: httpx.AsyncClient, session_id: str) -> str | None:
+    """Read a session's current status, or ``None`` when unreadable."""
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{session_id}",
+            params=_SESSION_METADATA_PARAMS,
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    status = body.get("status")
+    return status if isinstance(status, str) and status else None
 
 
 async def _result_key(
     server_client: httpx.AsyncClient,
     child_session_id: str,
     snapshot: _SessionSnapshot | None = None,
+    *,
+    output: str | None = None,
 ) -> str | None:
     """
-    Resolve one terminal result's identity: the child's last assistant item.
+    Resolve one terminal result's identity from the result it reports.
 
-    The item id is stable across forwarder retries and Stop-hook replays, so
-    it distinguishes a duplicate terminal edge from the child's next turn
-    (D9). One retry covers a transient read failure; a persistent failure is
-    logged and reads as no key, which falls back to the old delivery rules.
+    A terminal edge that carries output text names its own result: the key is
+    the newest assistant item whose transcript text equals that output, so a
+    delayed edge for an older turn can never claim a newer turn's item. An
+    edge without output falls back to the transcript tail only when the child
+    is not running/waiting — while a newer turn is live the tail belongs to
+    it, and no key is returned. One retry covers a transient read failure; a
+    persistent failure is logged and reads as no key, which falls back to the
+    old delivery rules.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :param snapshot: The child's snapshot when one was already read; a failed
         snapshot skips the read rather than paying a doomed request.
-    :returns: The server item id, or ``None`` when unreadable.
+    :param output: The terminal edge's reported output text, or ``None``.
+    :returns: The server item id, or ``None`` when the result cannot be
+        identified.
     """
     if snapshot is not None and not snapshot.ok:
         return None
+    reported = output if isinstance(output, str) and output else None
     last_error: Exception | None = None
     for _attempt in range(2):
         try:
-            item = await _fetch_latest_assistant_item(server_client, child_session_id)
+            tail: tuple[str | None, str] | None = None
+            if reported is not None:
+                item = await _fetch_assistant_item_with_text(
+                    server_client, child_session_id, reported
+                )
+                if item is not None:
+                    return item[0]
+            else:
+                tail = await _fetch_latest_assistant_item(server_client, child_session_id)
+                if tail is None:
+                    return None
+            # The tail is only this result's item when no newer turn is live.
+            status = await _fetch_session_status(server_client, child_session_id)
+            if status in {"running", "waiting"}:
+                return None
+            if tail is None:
+                tail = await _fetch_latest_assistant_item(server_client, child_session_id)
+            return None if tail is None else tail[0]
         except _SubagentRecoveryReadError as exc:
             last_error = exc
             continue
-        return None if item is None else item[0]
     _logger.warning(
         "Result-key read failed for child=%s: %s; dedup falls back to the child id",
         child_session_id,
@@ -2589,6 +2693,10 @@ async def _recover_subagent_results_from_server(
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
             work_id=dispatch_id,
+            # Only an Omnigent dispatch stamps a dispatch id, so the rebuilt
+            # entry may wake a Codex mother even after a restart wiped the
+            # origin map.
+            registered_by=_subagent_work_origins.get(child_id) or "recovery",
         )
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
@@ -2674,8 +2782,15 @@ def mark_subagent_work_terminal(
         )
     # A retried or delayed terminal edge for an already-delivered result:
     # its key was stored at delivery, so a repeat never re-opens the turn
-    # (and never terminates a newer turn the child has since started).
-    if result_key is not None and entry.delivered_result_key == result_key:
+    # (and never terminates a newer turn the child has since started). A
+    # failure report for that same result still escalates below: the key
+    # names the turn, and a completed record for it may be the watcher's
+    # quiescence edge that the real failure must replace.
+    same_key = result_key is not None and entry.delivered_result_key == result_key
+    failure_escalates = (
+        same_key and status in {"failed", "stopped", "killed"} and entry.status == "completed"
+    )
+    if same_key and not failure_escalates:
         return _SubagentDeliveryAck(
             entry=entry,
             delivered=True,
@@ -6686,7 +6801,10 @@ def create_runner_app(
         the same key (or no readable key) stays a duplicate. Rebuilt entries
         are flow-neutral — recovery handles turns the mother did not dispatch,
         so it must not join a running flow; a child already in the run keeps
-        its membership and is still held (``hold_child_wake``).
+        its membership and is still held (``hold_child_wake``). The entry
+        keeps the child's recorded origin and its effective host (the first
+        host id up the parent chain), so a hostless-row child still carries
+        its host label.
         """
         existing = get_subagent_work(conv_id)
         if existing is not None:
@@ -6703,17 +6821,24 @@ def create_runner_app(
         if not parent_id or parent_id == conv_id:
             return None
         agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
-        from omnigent.runner.tool_dispatch import _placement_label_for
+        from omnigent.runner.tool_dispatch import _effective_host_id, _placement_label_for
 
+        effective_host_id = await _effective_host_id(
+            server_client,
+            conv_id,
+            snapshot={"host_id": snapshot.host_id, "parent_session_id": parent_id},
+        )
         return register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
-            host_id=snapshot.host_id,
+            host_id=effective_host_id,
             placement_label=await _placement_label_for(
-                server_client, host_id=snapshot.host_id, workspace=snapshot.workspace
+                server_client, host_id=effective_host_id, workspace=snapshot.workspace
             ),
+            registered_by=_subagent_work_origins.get(conv_id)
+            or _recovered_subagent_origin(snapshot),
             flow_neutral=True,
         )
 
@@ -11960,7 +12085,7 @@ def create_runner_app(
                     # from that hand-back), so an inbox entry and a wake notice
                     # would deliver it twice.
                     return Response(status_code=204)
-                result_key = await _result_key(server_client, conversation_id)
+                result_key = await _result_key(server_client, conversation_id, output=output)
                 current_entry = get_subagent_work(conversation_id)
                 undispatched = (
                     current_entry is None or current_entry.status in _SUBAGENT_TERMINAL_STATUSES
