@@ -2535,6 +2535,11 @@ class UpdateSessionRequest(BaseModel):
         owner-private, only the session owner may file it, and only into a
         project they own — the server verifies both. Independent of the
         legacy ``omni_project`` label, which is set via ``labels``.
+    :param stop_when_idle: Only meaningful alongside ``archived: true``.
+        When ``True`` the archive teardown, after the undo window, also waits
+        (bounded) until the session tree leaves the running state. Set by an
+        agent archiving its own session or an ancestor, whose turn would
+        otherwise be cut. Default ``False`` keeps the web archive's timing.
     """
 
     runner_id: str | None = None
@@ -2554,6 +2559,7 @@ class UpdateSessionRequest(BaseModel):
     archive_locked: bool | None = None
     project_id: str | None = None
     silent: bool = False
+    stop_when_idle: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
