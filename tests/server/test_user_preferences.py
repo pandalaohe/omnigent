@@ -11,6 +11,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
@@ -29,10 +30,12 @@ from omnigent.server.auth import (
 from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
 from omnigent.server.user_preferences_store import (
     ApprovalTimeout,
+    CollabSettings,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
     read_approval_timeout,
+    read_collab_settings,
     validate_preferences_envelope,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -613,6 +616,157 @@ def test_read_approval_timeout_tolerates_bad_rows_and_shapes() -> None:
             "alice@example.com",
         )
         == default
+    )
+
+
+def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
+    db_uri: str,
+) -> None:
+    """Every gap resolves to the fail-safe collaboration defaults."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    default = CollabSettings()
+    assert read_collab_settings(None, "alice@example.com") == default
+    assert read_collab_settings(store, None) == default
+    assert read_collab_settings(store, "alice@example.com") == default
+
+    store.patch_namespace("alice@example.com", "agent_badges", {"enabled": False})
+    assert read_collab_settings(store, "alice@example.com") == default
+
+
+def test_read_collab_settings_reads_all_twelve_fields(db_uri: str) -> None:
+    """All twelve camelCase fields load; unknown keys are ignored."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "all@example.com",
+        "session_collab",
+        {
+            "enabled": False,
+            "openRateCount": 9,
+            "openRateWindowSeconds": 90,
+            "relayDepthMax": 12,
+            "pairRateCount": 3,
+            "pairRateWindowSeconds": 30,
+            "senderRateCount": 120,
+            "senderRateWindowSeconds": 1200,
+            "duplicateWindowSeconds": 300,
+            "undeliveredTtlSeconds": 7200,
+            "defaultInbound": "refuse",
+            "flowTimerEnabled": False,
+            "unexpectedKey": {"nested": True},
+        },
+    )
+    assert read_collab_settings(store, "all@example.com") == CollabSettings(
+        enabled=False,
+        open_rate_count=9,
+        open_rate_window_s=90,
+        relay_depth_max=12,
+        pair_rate_count=3,
+        pair_rate_window_s=30,
+        sender_rate_count=120,
+        sender_rate_window_s=1200,
+        duplicate_window_s=300,
+        undelivered_ttl_s=7200,
+        default_inbound="refuse",
+        flow_timer_enabled=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored_key", "invalid", "attribute"),
+    [
+        ("enabled", 1, "enabled"),
+        ("enabled", "yes", "enabled"),
+        ("openRateCount", True, "open_rate_count"),
+        ("openRateCount", 0, "open_rate_count"),
+        ("openRateCount", -1, "open_rate_count"),
+        ("openRateCount", "5", "open_rate_count"),
+        ("openRateCount", 5.5, "open_rate_count"),
+        ("defaultInbound", "Accept", "default_inbound"),
+        ("defaultInbound", "", "default_inbound"),
+        ("defaultInbound", True, "default_inbound"),
+        ("defaultInbound", 1, "default_inbound"),
+        ("defaultInbound", None, "default_inbound"),
+    ],
+)
+def test_read_collab_settings_falls_back_per_field(
+    db_uri: str, stored_key: str, invalid: object, attribute: str
+) -> None:
+    """An invalid field takes its own default while valid siblings survive."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "field@example.com",
+        "session_collab",
+        {stored_key: invalid, "relayDepthMax": 12},
+    )
+    settings = read_collab_settings(store, "field@example.com")
+    assert settings.relay_depth_max == 12
+    assert getattr(settings, attribute) == getattr(CollabSettings(), attribute)
+
+
+@pytest.mark.parametrize("stored", ["hold", "refuse"])
+def test_read_collab_settings_reads_default_inbound(db_uri: str, stored: str) -> None:
+    """Each peer-inbound disposition other than the accept default sticks."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace("inbound@example.com", "session_collab", {"defaultInbound": stored})
+    assert read_collab_settings(store, "inbound@example.com").default_inbound == stored
+
+
+def test_read_collab_settings_default_inbound_missing_key_is_accept(db_uri: str) -> None:
+    """A session_collab object without defaultInbound still reads as accept."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace("inbound@example.com", "session_collab", {"relayDepthMax": 12})
+    settings = read_collab_settings(store, "inbound@example.com")
+    assert settings.default_inbound == "accept"
+    assert settings.relay_depth_max == 12
+
+
+def test_read_collab_settings_tolerates_bad_rows_and_shapes() -> None:
+    """A corrupt row or malformed namespace value never fails a caller."""
+    default = CollabSettings()
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise UserPreferencesValidationError("stored preferences are invalid JSON")
+
+    class _ShapeStore:
+        def __init__(self, value: object) -> None:
+            self._value = value
+
+        def get(self, user_id: str) -> object:
+            return self._value
+
+    assert read_collab_settings(_RaisingStore(), "alice@example.com") == default
+    assert read_collab_settings(_ShapeStore([]), "alice@example.com") == default
+    assert (
+        read_collab_settings(
+            _ShapeStore({"settings": {"session_collab": "compact"}}),
+            "alice@example.com",
+        )
+        == default
+    )
+
+
+def test_read_collab_settings_defaults_on_sqlalchemy_error() -> None:
+    """A database failure resolves to defaults instead of raising."""
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise SQLAlchemyError("database unavailable")
+
+    assert read_collab_settings(_RaisingStore(), "alice@example.com") == CollabSettings()
+
+
+def test_store_accepts_session_collab_patch_and_reads_it_back(db_uri: str) -> None:
+    """The namespace is allowlisted; a partial patch keeps field defaults."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    patched = store.patch_namespace(
+        "collab@example.com",
+        "session_collab",
+        {"enabled": False, "openRateCount": 10},
+    )
+    assert patched["settings"]["session_collab"] == {"enabled": False, "openRateCount": 10}
+    assert read_collab_settings(store, "collab@example.com") == CollabSettings(
+        enabled=False, open_rate_count=10
     )
 
 
