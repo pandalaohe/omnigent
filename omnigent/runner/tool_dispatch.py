@@ -6298,17 +6298,6 @@ async def _execute_session_query_tool(
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
-        # The multi-session form is part of session collaboration, not the
-        # single-session read upstream tools rely on.
-        if "session_ids" in args and not _peer_messaging_enabled_for(conversation_id):
-            return json.dumps(
-                {
-                    "error": (
-                        "sys_session_get_info: 'session_ids' is part of session collaboration, "
-                        "which is turned off for this session (Settings > Session collaboration)."
-                    )
-                }
-            )
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
         return await _session_share_via_rest(args, conversation_id, server_client, agent_spec)

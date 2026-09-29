@@ -8638,20 +8638,6 @@ async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None
 _SESSION_INFO_DATE = "Thu, 01 Jan 1970 00:33:20 GMT"
 
 
-@pytest.fixture
-def _session_collab_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Enable session collaboration for the multi-id get_info tests."""
-    from omnigent.runner import app as runner_app
-
-    monkeypatch.setattr(runner_app, "get_session_peer_messaging_enabled", lambda _sid: True)
-
-
-_SESSION_IDS_COLLAB_OFF_ERROR = (
-    "sys_session_get_info: 'session_ids' is part of session collaboration, "
-    "which is turned off for this session (Settings > Session collaboration)."
-)
-
-
 def _session_info_snapshot(session_id: str, **overrides: Any) -> dict[str, Any]:
     """Minimal 200 snapshot body for the multi-session get_info tests."""
     body: dict[str, Any] = {
@@ -8668,9 +8654,7 @@ def _session_info_snapshot(session_id: str, **overrides: Any) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_many_returns_ordered_items_and_durations(
-    _session_collab_on: None,
-) -> None:
+async def test_sys_session_get_info_many_returns_ordered_items_and_durations() -> None:
     """
     ``session_ids`` returns ``{"sessions": [...]}`` in input order, each item
     carrying the snapshot's new runtime fields with durations derived from the
@@ -8728,9 +8712,7 @@ async def test_sys_session_get_info_many_returns_ordered_items_and_durations(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_idle_session_has_null_running_fields(
-    _session_collab_on: None,
-) -> None:
+async def test_sys_session_get_info_idle_session_has_null_running_fields() -> None:
     """
     An idle session reports ``running_since`` / ``running_seconds`` as
     ``None`` — including when a stale snapshot omitted the key entirely. A
@@ -8763,9 +8745,7 @@ async def test_sys_session_get_info_idle_session_has_null_running_fields(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_many_reports_per_item_errors(
-    _session_collab_on: None,
-) -> None:
+async def test_sys_session_get_info_many_reports_per_item_errors() -> None:
     """
     An inaccessible or unknown id yields its own typed error item, and the
     other items still come back — one bad id must never fail the whole call.
@@ -8806,9 +8786,7 @@ async def test_sys_session_get_info_many_reports_per_item_errors(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_many_keeps_each_items_host_readiness(
-    _session_collab_on: None,
-) -> None:
+async def test_sys_session_get_info_many_keeps_each_items_host_readiness() -> None:
     """
     Sessions on different hosts each report their own ``host_id`` and
     configured harness readiness; the runner and host lookups are per item,
@@ -8875,9 +8853,7 @@ async def test_sys_session_get_info_many_keeps_each_items_host_readiness(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_many_dedupes_ids(
-    _session_collab_on: None,
-) -> None:
+async def test_sys_session_get_info_many_dedupes_ids() -> None:
     """
     Duplicate ids collapse to one item and one snapshot GET, preserving first
     occurrence order. Without the dedupe the batch would fetch (and report)
@@ -8908,78 +8884,6 @@ async def test_sys_session_get_info_many_dedupes_ids(
     assert requested == ["conv_a", "conv_b"]
 
 
-@pytest.mark.asyncio
-async def test_sys_session_get_info_many_refused_when_session_collaboration_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    With session collaboration off, ``session_ids`` is refused with the typed
-    error before any HTTP call. The handler records requests and answers 500
-    rather than raising, so a regressed gate surfaces as a recorded request
-    instead of an unhandled transport exception.
-    """
-    from omnigent.runner import app as runner_app
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    monkeypatch.setattr(runner_app, "get_session_peer_messaging_enabled", lambda _sid: False)
-    requests: list[str] = []
-
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        requests.append(str(request.url))
-        return httpx.Response(500, json={"error": "unexpected server call"})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_get_info",
-            arguments=json.dumps({"session_ids": ["conv_a", "conv_b"]}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
-
-    assert requests == []
-    assert json.loads(output) == {"error": _SESSION_IDS_COLLAB_OFF_ERROR}
-
-
-@pytest.mark.asyncio
-async def test_sys_session_get_info_single_form_works_when_session_collaboration_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The single-session read is upstream behaviour and must stay usable with
-    session collaboration off: a ``session_id`` call still returns the flat
-    snapshot rather than the multi-id collaboration error.
-    """
-    from omnigent.runner import app as runner_app
-    from omnigent.runner.tool_dispatch import execute_tool
-
-    monkeypatch.setattr(runner_app, "get_session_peer_messaging_enabled", lambda _sid: False)
-
-    async def _server_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"date": _SESSION_INFO_DATE},
-            json=_session_info_snapshot("conv_one"),
-        )
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_server_handler),
-        base_url="http://server",
-    ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_get_info",
-            arguments=json.dumps({"session_id": "conv_one"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
-
-    info = json.loads(output)
-    assert "sessions" not in info
-    assert info["session_id"] == "conv_one"
-
-
 _BAD_MULTI_ARGS_IDS_ERROR = (
     "sys_session_get_info: 'session_ids' must be a non-empty list of non-empty strings (max 20)"
 )
@@ -9007,7 +8911,6 @@ _BAD_MULTI_ARGS_IDS_ERROR = (
 async def test_sys_session_get_info_rejects_bad_multi_args_without_server_call(
     arguments: dict[str, Any],
     expected_error: str,
-    _session_collab_on: None,
 ) -> None:
     """
     Every malformed ``session_ids`` / combination is rejected locally with the
