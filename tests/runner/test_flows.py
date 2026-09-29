@@ -31,6 +31,8 @@ class _FakeServer:
         self.sessions: dict[str, dict[str, Any]] = {_SESSION: {"id": _SESSION, "labels": {}}}
         self.peer_answer: dict[str, Any] = {"disposition": "delivered", "reason": None}
         self.child_messages: list[str] = []
+        # Per child POST: was the child already a running flow's dispatch?
+        self.owned_at_post: list[bool] = []
         self.requests: list[tuple[str, str]] = []
         self.woken = asyncio.Event()
 
@@ -66,6 +68,8 @@ class _FakeServer:
         target = path.removeprefix("/v1/sessions/").split("/")[0]
         if request.method == "POST" and path.endswith("/events"):
             self.child_messages.append(target)
+            runs = flows._session_flows.get(_SESSION, {}).values()
+            self.owned_at_post.append(any(target in run.children for run in runs))
             return httpx.Response(200, json={"status": "accepted"})
         if request.method == "PATCH":
             return httpx.Response(200, json={"id": target})
@@ -247,7 +251,7 @@ async def test_send_step_to_own_child_holds_its_wake_until_the_flow_ends(
             await asyncio.sleep(0.01)
         # The child's turn starts; later ticks steer it through the same work entry.
         assert runner_app.mark_subagent_work_started(child) is not None
-        # The child finishing while the flow runs: its wake is held for the end wake.
+        # Stands in for the runner's delivered-result hook (runner-app test covers it).
         assert flows.hold_child_wake(_SESSION, child) is True
         await asyncio.wait_for(server.woken.wait(), timeout=2)
     summary = server.wake_summary()
@@ -255,7 +259,29 @@ async def test_send_step_to_own_child_holds_its_wake_until_the_flow_ends(
     assert summary["child_results_in_inbox"] == 1
     assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
     assert server.child_messages == [child] * 3
+    # Tick 1 registers new work, ticks 2-3 steer it: owned before every post.
+    assert server.owned_at_post == [True] * 3
     assert flows.hold_child_wake(_SESSION, child) is False
+
+
+@pytest.mark.asyncio
+async def test_steering_the_agents_running_child_joins_the_flow_before_the_post(
+    server: _FakeServer, inbox: None
+) -> None:
+    from omnigent.runner import app as runner_app
+
+    child = "conv_child"
+    server.sessions[child] = {"id": child, "parent_session_id": _SESSION, "labels": {}}
+    # The agent's own send started the child's turn; the flow then steers that turn.
+    runner_app.register_subagent_work(
+        parent_session_id=_SESSION, child_session_id=child, agent="a", title="t"
+    )
+    assert runner_app.mark_subagent_work_started(child) is not None
+    async with _client(server) as client:
+        await _start(client, {"steps": _send_step(child)})
+        await asyncio.wait_for(server.woken.wait(), timeout=2)
+    assert server.wake_summary()["reason"] == "count_done"
+    assert server.owned_at_post == [True]
 
 
 @pytest.mark.asyncio

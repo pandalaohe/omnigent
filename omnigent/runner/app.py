@@ -6528,7 +6528,7 @@ def create_runner_app(
             if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
                 continue
             if _deliver_subagent_completion(entry).delivered_now:
-                _schedule_subagent_wake(entry)
+                _wake_for_delivered_result(entry)
 
     async def _run_subagent_recovery(parent_id: str) -> None:
         """
@@ -6560,7 +6560,7 @@ def create_runner_app(
                 await _recover_subagent_results_from_server(
                     server_client=server_client,
                     parent_id=parent_id,
-                    schedule_wake=_schedule_subagent_wake,
+                    schedule_wake=_wake_for_delivered_result,
                 )
             except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
                 _logger.warning(
@@ -9353,9 +9353,6 @@ def create_runner_app(
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
-        # Work a running flow dispatched reports through the flow's one end wake.
-        if hold_child_wake(entry.parent_session_id, entry.child_session_id):
-            return
         # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
         # thread in the parent's own app-server, so its completion is not the
         # parent's to collect — waking the parent would inject an inbox notice
@@ -9395,6 +9392,13 @@ def create_runner_app(
         )
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)
+
+    def _wake_for_delivered_result(entry: _SubagentWorkEntry) -> None:
+        # A result for work a running flow dispatched is reported by the flow's
+        # one end wake; re-wakes and stranded retries never consult the hold.
+        if hold_child_wake(entry.parent_session_id, entry.child_session_id):
+            return
+        _schedule_subagent_wake(entry)
 
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
         inbox = _session_inboxes.get(parent_session_id)
@@ -9547,7 +9551,7 @@ def create_runner_app(
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
         if ack.entry is not None and ack.delivered_now:
-            _schedule_subagent_wake(ack.entry)
+            _wake_for_delivered_result(ack.entry)
         if ack.entry is not None and ack.delivered:
             _settle_member_obligation_for_child(ack.entry)
         elif (

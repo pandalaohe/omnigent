@@ -1784,6 +1784,8 @@ async def _send_to_in_flight_child(
     """
     from omnigent.runner import app as _runner_app
 
+    # A flow step owns the steered turn before the child can complete it.
+    flows.note_child_dispatch(conversation_id, child_session_id)
     # Post first — before any register/stamp — so a failure leaves the live
     # turn's tracking untouched (nothing to roll back, never a teardown).
     try:
@@ -1811,7 +1813,6 @@ async def _send_to_in_flight_child(
             # Reuse the one entry so its single completion delivers under it;
             # re-stamping/replacing here is what would orphan that completion.
             work_id = entry.work_id
-            flows.note_child_dispatch(conversation_id, child_session_id)
         else:
             # No active tracked turn: the old turn ended and a fresh one started,
             # or the in-flight turn was untracked locally (post-restart). Track
