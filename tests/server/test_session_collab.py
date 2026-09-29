@@ -570,3 +570,97 @@ async def test_initialize_retries_when_a_joined_post_carries_a_stale_value(
     assert initializer._applied_peer[pkey] is True
     assert not initializer._pending_peer
     assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_initialize_retry_is_single_flight_across_joined_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two on callers joining one in-flight off post start exactly one retry."""
+    state = {"enabled": True}
+    registry = _Registry()
+    initializer = RunnerSessionInitializer(
+        registry,  # type: ignore[arg-type]
+        server_version="test",
+        peer_messaging_resolver=lambda _conv: state["enabled"],
+    )
+    conversation = _conversation()
+    client = _HoldableClient()
+
+    client.release.set()
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert len(client.calls) == 1
+
+    # The switch flips off and its post is still in flight.
+    state["enabled"] = False
+    client.entered.clear()
+    client.release.clear()
+    off = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+
+    # Two callers resolve the flipped-on value and join the held off post.
+    joined = 0
+    both_joined = asyncio.Event()
+    real_shield = asyncio.shield
+
+    def _spy_shield(awaitable: Any) -> Any:
+        nonlocal joined
+        task = asyncio.ensure_future(awaitable)
+        joined += 1
+        if joined == 2:
+            both_joined.set()
+        return real_shield(task)
+
+    monkeypatch.setattr(asyncio, "shield", _spy_shield)
+
+    state["enabled"] = True
+    on_first = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    on_second = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    await asyncio.wait_for(both_joined.wait(), timeout=5)
+    assert len(client.calls) == 2, "both callers must join, not post again"
+
+    client.release.set()
+    await asyncio.gather(off, on_first, on_second)
+
+    assert [_peer_flag(body) for body in client.calls] == [True, False, True]
+    pkey = (conversation.runner_id or "", id(registry.connection), conversation.id)
+    assert initializer._applied_peer[pkey] is True
+    assert not initializer._pending_peer
+    assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["session", "runner"])
+async def test_initialize_does_not_retry_when_invalidated_before_the_waiter_resumes(
+    scope: str,
+) -> None:
+    """A spurious retry must not restore readiness an invalidation cleared."""
+    initializer = RunnerSessionInitializer(
+        _Registry(),  # type: ignore[arg-type]
+        server_version="test",
+        peer_messaging_resolver=lambda _conv: True,
+    )
+    conversation = _conversation()
+    client = _HoldableClient()
+    client.release.clear()
+
+    caller = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    assert len(client.calls) == 1
+
+    task = next(iter(initializer._tasks.values()))
+
+    def _invalidate(_done: asyncio.Task[httpx.Response]) -> None:
+        if scope == "session":
+            initializer.invalidate_session(conversation.id)
+        else:
+            initializer.invalidate_runner(conversation.runner_id or "")
+
+    task.add_done_callback(_invalidate)
+    client.release.set()
+    response = await caller
+
+    assert response.status_code == 201
+    assert len(client.calls) == 1, "the invalidated post must not trigger a retry"
+    assert not initializer._applied_peer
+    assert not initializer._pending_peer

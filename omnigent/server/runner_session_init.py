@@ -180,7 +180,8 @@ class RunnerSessionInitializer:
             # drop it so this call posts a fresh envelope.
             self._tasks.pop(key, None)
             task = None
-        if task is None:
+        created = task is None
+        if created:
             task = self._start_post(
                 conversation,
                 runner_client,
@@ -193,14 +194,24 @@ class RunnerSessionInitializer:
                 archive_states=effective_archive_states,
                 resume_interrupted_turn=resume_interrupted_turn,
             )
+        # Record what the awaited post carries before it lands, so a switch
+        # flip racing it (or an invalidation) cannot misattribute readiness.
+        pending = self._pending_peer.get(pkey)
+        if created:
+            carried = peer
+        elif pending is not None and pending[0] is task:
+            carried = pending[1]
+        else:
+            carried = self._applied_peer.get(pkey, peer)
         response = await self._await_initialized(conversation, task, key)
-        if 200 <= response.status_code < 300 and self._applied_peer.get(pkey) != peer:
-            # The post this call joined carried a different value: a switch
-            # flip raced it. Drop that cached task and post once more for the
-            # value this call resolved. The retry is awaited directly and
-            # never re-checked, so the single retry cannot spin.
-            if self._tasks.get(key) is task:
-                self._tasks.pop(key, None)
+        if not (200 <= response.status_code < 300 and carried != peer):
+            return response
+        # The awaited post carried a stale value: post this call's value,
+        # reusing a retry another joined caller already started, and never
+        # resurrecting a key an invalidation removed.
+        current = self._tasks.get(key)
+        if current is task:
+            self._tasks.pop(key, None)
             retry = self._start_post(
                 conversation,
                 runner_client,
@@ -213,8 +224,11 @@ class RunnerSessionInitializer:
                 archive_states=effective_archive_states,
                 resume_interrupted_turn=resume_interrupted_turn,
             )
-            return await self._await_initialized(conversation, retry, key)
-        return response
+        elif current is not None and self._pending_peer.get(pkey) == (current, peer):
+            retry = current
+        else:
+            return response
+        return await self._await_initialized(conversation, retry, key)
 
     def _start_post(
         self,
