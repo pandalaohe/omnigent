@@ -1435,3 +1435,67 @@ async def test_stop_after_grace_sustained_read_failure_never_stops() -> None:
     # The row read was retried, and a sustained failure skipped the stop.
     assert store.calls == 2
     assert attempted == []
+
+
+@pytest.mark.asyncio
+async def test_stop_after_grace_rewaits_a_mid_wait_rearchive() -> None:
+    """A re-archive during a wait gets its own idle wait before the stop."""
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_rearchive_mid_wait"
+    row = _deferred_row(1)
+    store = _RowsStore(row)
+    events: list[tuple[str, int | None]] = []
+
+    async def _rearchiving_wait(_session_id: str, revision: int, _store: object) -> None:
+        events.append(("wait", revision))
+        if revision == 1:
+            # A cross-replica unarchive + re-archive: new revision, new label.
+            row.archive_revision = 3
+            row.labels[ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY] = "3"
+
+    async def _recording_archive_stop(*_args: object, **_kwargs: object) -> bool:
+        events.append(("stop", None))
+        return True
+
+    with (
+        patch.object(_orchestration_mod, "_wait_for_archive_idle", _rearchiving_wait),
+        patch.object(_orchestration_mod, "_archive_stop", _recording_archive_stop),
+    ):
+        _orchestration_mod._spawn_archive_stop(session_id, store, None, None)
+        task = _orchestration_mod._pending_archive_stops[session_id]
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # Revision 3's idle wait ran before the single teardown.
+    assert events == [("wait", 1), ("wait", 3), ("stop", None)]
+
+
+@pytest.mark.asyncio
+async def test_stop_after_grace_skips_when_unarchived_during_wait() -> None:
+    """An unarchive during the wait is honoured by the re-read, never stopped."""
+    from omnigent.server.routes._sessions import orchestration as _orchestration_mod
+
+    session_id = "conv_unarchived_mid_wait"
+    row = _deferred_row(1)
+    store = _RowsStore(row)
+    waited: list[int] = []
+    stopped: list[str] = []
+
+    async def _unarchiving_wait(_session_id: str, revision: int, _store: object) -> None:
+        waited.append(revision)
+        row.archived = False
+
+    async def _recording_archive_stop(*_args: object, **_kwargs: object) -> bool:
+        stopped.append(session_id)
+        return True
+
+    with (
+        patch.object(_orchestration_mod, "_wait_for_archive_idle", _unarchiving_wait),
+        patch.object(_orchestration_mod, "_archive_stop", _recording_archive_stop),
+    ):
+        _orchestration_mod._spawn_archive_stop(session_id, store, None, None)
+        task = _orchestration_mod._pending_archive_stops[session_id]
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert waited == [1]
+    assert stopped == []

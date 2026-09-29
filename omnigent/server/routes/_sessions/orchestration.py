@@ -1571,25 +1571,35 @@ def _spawn_archive_stop(
         # of idleness, so retry a transient blip; a sustained failure returns
         # without stopping — never kill a session whose state we could not
         # read, a later lifecycle event reaps it.
-        row: Any = None
-        for _attempt in range(_ARCHIVE_STOP_LOOKUP_ATTEMPTS):
-            try:
-                row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-                break
-            except Exception:  # noqa: BLE001
-                if _attempt + 1 >= _ARCHIVE_STOP_LOOKUP_ATTEMPTS:
-                    _logger.warning(
-                        "Archive deferral lookup failed for %s after %d attempts; "
-                        "leaving the runner (reaped by a later lifecycle event)",
-                        session_id,
-                        _ARCHIVE_STOP_LOOKUP_ATTEMPTS,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
-                    return
-                await asyncio.sleep(_ARCHIVE_STOP_LOOKUP_RETRY_S)
-        if _archive_idle_deferred(row):
-            await _wait_for_archive_idle(session_id, row.archive_revision, conversation_store)
+        # A wait binds to one revision: after a cross-replica re-archive the
+        # loop re-reads and waits again for the new revision's own idleness.
+        idle_waited_revision: int | None = None
+        while True:
+            row: Any = None
+            for _attempt in range(_ARCHIVE_STOP_LOOKUP_ATTEMPTS):
+                try:
+                    row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    break
+                except Exception:  # noqa: BLE001
+                    if _attempt + 1 >= _ARCHIVE_STOP_LOOKUP_ATTEMPTS:
+                        _logger.warning(
+                            "Archive deferral lookup failed for %s after %d attempts; "
+                            "leaving the runner (reaped by a later lifecycle event)",
+                            session_id,
+                            _ARCHIVE_STOP_LOOKUP_ATTEMPTS,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                        return
+                    await asyncio.sleep(_ARCHIVE_STOP_LOOKUP_RETRY_S)
+            if row is None or not row.archived:
+                return
+            revision = row.archive_revision
+            if _archive_idle_deferred(row) and revision != idle_waited_revision:
+                await _wait_for_archive_idle(session_id, revision, conversation_store)
+                idle_waited_revision = revision
+                continue
+            break
         _archive_close_intents.add(session_id)
         try:
             await _archive_stop(session_id, conversation_store, runner_router, host_registry)
