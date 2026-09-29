@@ -306,6 +306,9 @@ async def start_flow(plan: FlowPlan, ctx: FlowContext) -> str:
     _session_flows.setdefault(ctx.conversation_id, {})[flow_id] = run
     run.task = asyncio.create_task(_run_flow(run), name=f"flow-{flow_id}")
     _app.register_timer(ctx.conversation_id, flow_id, run.task)
+    # On completion, not in ``_run_flow``: a task cancelled before its first
+    # step never enters the coroutine's ``finally``.
+    run.task.add_done_callback(lambda _task: _forget(run))
     return json.dumps(
         {
             "flow_id": flow_id,
@@ -497,7 +500,9 @@ async def _tick(run: _FlowRun, deadline: float | None) -> bool:
         run.last_step_status = "error" if error else "ok"
         if error is not None:
             run.reason = "step_error"
-            run.detail = f"steps[{index}] ({step.tool}): {error}"
+            # Structural only: the error text is step output and reaches the
+            # session through the PHASE_TOOL_RESULT-checked results.
+            run.detail = f"steps[{index}] ({step.tool}) returned an error"
             run.last_tick = tick_results
             return True
     run.last_tick = tick_results
@@ -521,8 +526,6 @@ async def _tick(run: _FlowRun, deadline: float | None) -> bool:
 
 async def _run_flow(run: _FlowRun) -> None:
     """Background task: tick on schedule, then post one wake summary."""
-    from omnigent.runner import app as _app
-
     loop = asyncio.get_running_loop()
     plan = run.plan
     deadline = None if plan.for_s is None else run.created_mono + plan.for_s
@@ -563,13 +566,18 @@ async def _run_flow(run: _FlowRun) -> None:
         _logger.exception(
             "flow %s failed", run.flow_id, extra={"session_id": run.ctx.conversation_id}
         )
-    finally:
-        flows = _session_flows.get(run.ctx.conversation_id)
-        if flows is not None:
-            flows.pop(run.flow_id, None)
-            if not flows:
-                _session_flows.pop(run.ctx.conversation_id, None)
-        _app.unregister_timer(run.ctx.conversation_id, run.flow_id)
+
+
+def _forget(run: _FlowRun) -> None:
+    """Drop a finished flow from both registries."""
+    from omnigent.runner import app as _app
+
+    flows = _session_flows.get(run.ctx.conversation_id)
+    if flows is not None and flows.get(run.flow_id) is run:
+        flows.pop(run.flow_id)
+        if not flows:
+            _session_flows.pop(run.ctx.conversation_id, None)
+    _app.unregister_timer(run.ctx.conversation_id, run.flow_id)
 
 
 # ── Summary and wake ──────────────────────────────────────────

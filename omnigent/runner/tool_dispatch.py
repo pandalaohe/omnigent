@@ -8081,6 +8081,8 @@ async def execute_tool(
                     conversation_id=conversation_id,
                 )
         elif tool_name in _FLOW_TOOLS:
+            if not _peer_messaging_enabled_for(conversation_id):
+                return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
             output = await _execute_flow_tool(
                 tool_name,
                 args,

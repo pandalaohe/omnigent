@@ -66,6 +66,16 @@ class _FakeServer:
         return json.loads(text.splitlines()[-1])
 
 
+@pytest.fixture(autouse=True)
+def _collab_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flow tools dispatch only for sessions initialized with the collab flag."""
+    from omnigent.runner import app as runner_app
+
+    monkeypatch.setattr(
+        runner_app, "get_session_peer_messaging_enabled", lambda sid: sid == _SESSION
+    )
+
+
 @pytest.fixture
 def server() -> _FakeServer:
     return _FakeServer()
@@ -178,7 +188,39 @@ async def test_step_error_ends_and_wakes(
         await asyncio.wait_for(server.woken.wait(), timeout=2)
     summary = server.wake_summary()
     assert (summary["reason"], summary["ticks"]) == ("step_error", 1)
-    assert "boom" in summary["detail"]
+    assert summary["results"][0]["output"] == output
+
+
+@pytest.mark.asyncio
+async def test_step_error_text_stays_behind_the_result_policy(
+    server: _FakeServer, scripted: list[str]
+) -> None:
+    scripted.append('{"error": "BLOCKED_MARKER"}')
+    server.tool_result_verdict = {"result": "POLICY_ACTION_DENY"}
+    async with _client(server) as client:
+        await _start(client, {"steps": _STEP, "bring_back": "none"})
+        await asyncio.wait_for(server.woken.wait(), timeout=2)
+    assert server.wake_summary()["reason"] == "step_error"
+    assert "BLOCKED_MARKER" not in json.dumps(server.wakes)
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_the_first_step_leaves_no_registry_entry(
+    server: _FakeServer, scripted: list[str]
+) -> None:
+    from omnigent.runner import app as runner_app
+
+    scripted.append("x")
+    async with _client(server) as client:
+        started = await _start(client, {"steps": _STEP, "start_after_s": 30})
+        # No yield between start and cancel: the task body has not run yet.
+        await flows.cancel_flow(_SESSION, started["flow_id"])
+        teardown = await _start(client, {"steps": _STEP, "start_after_s": 30})
+        runner_app.cancel_timer(_SESSION, teardown["flow_id"])
+        await asyncio.sleep(0.01)
+    assert flows._session_flows == {}
+    assert json.loads(flows.list_flows(_SESSION))["flows"] == []
+    assert runner_app._session_timers.get(_SESSION, {}) == {}
 
 
 @pytest.mark.asyncio
@@ -519,6 +561,17 @@ def test_native_relay_advertises_timers_and_flows_under_the_collab_flag(spec_tim
     assert off == ({"sys_timer_set", "sys_timer_cancel"} if spec_timers else set())
     assert _relay_names(None, peer=True) >= _TIMED
     assert _relay_names(None, peer=False).isdisjoint(_TIMED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", sorted(flows.FLOW_TOOL_NAMES))
+async def test_specless_dispatch_refuses_flow_tools_when_the_collab_flag_is_off(
+    tool: str,
+) -> None:
+    output = await execute_tool(
+        tool_name=tool, arguments='{"flow_id": "flow_x"}', conversation_id="conv_other"
+    )
+    assert json.loads(output) == {"error": f"tool {tool!r} is not enabled"}
 
 
 def test_flow_tools_are_refused_when_the_collab_flag_is_off() -> None:
