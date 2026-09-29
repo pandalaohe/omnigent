@@ -96,6 +96,20 @@ def _collab_on(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runner_state(_clean_subagent_registry: None) -> Iterator[None]:
+    """Send steps register child work and child sessions; restore both after each test."""
+    from omnigent.runner import app as runner_app
+
+    saved = dict(runner_app._child_session_parents)
+    runner_app._child_session_parents.clear()
+    try:
+        yield
+    finally:
+        runner_app._child_session_parents.clear()
+        runner_app._child_session_parents.update(saved)
+
+
 @pytest.fixture
 def server() -> _FakeServer:
     return _FakeServer()
@@ -229,7 +243,7 @@ def _send_step(target: str) -> list[dict[str, Any]]:
 
 
 @pytest.fixture
-def inbox(_clean_subagent_registry: None) -> None:
+def inbox() -> None:
     from omnigent.runner import app as runner_app
 
     runner_app._session_inboxes_ref[_SESSION] = asyncio.Queue()
