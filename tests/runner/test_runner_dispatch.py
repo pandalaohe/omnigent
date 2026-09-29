@@ -13346,6 +13346,7 @@ async def test_sys_session_create_workspace_places_on_caller_host() -> None:
                         "title": "placed",
                         "message": "go",
                         "workspace": "/srv/ws",
+                        "project_id": "proj-other",
                     }
                 ),
                 server_client=server_client,
@@ -13360,6 +13361,7 @@ async def test_sys_session_create_workspace_places_on_caller_host() -> None:
     assert body["parent_session_id"] == "conv_placement_caller"
     assert body["host_id"] == "host_a"
     assert body["workspace"] == "/srv/ws"
+    assert body["project_id"] == "proj-other"
     assert "git" not in body
     assert entry is not None and entry.placement_label == "alpha · srv/ws"
     handle = json.loads(output)
