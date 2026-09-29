@@ -39,8 +39,7 @@ describe("session collab preferences", () => {
         senderRateCount: "60",
         senderRateWindowSeconds: 0,
         duplicateWindowSeconds: 0,
-        undeliveredTtlSeconds: 7200,
-        defaultInbound: "bogus",
+        undeliveredTtlSeconds: 300,
         flowTimerEnabled: 1,
       }),
     );
@@ -49,21 +48,19 @@ describe("session collab preferences", () => {
       ...SESSION_COLLAB_DEFAULTS,
       openRateCount: 7,
       pairRateWindowSeconds: 101,
-      undeliveredTtlSeconds: 7200,
+      undeliveredTtlSeconds: 300,
     });
   });
 
-  it("keeps a one-second duplicate window and a non-accept inbound policy", () => {
+  it("keeps a one-second duplicate window", () => {
     writeSessionCollabPreferences({
       ...SESSION_COLLAB_DEFAULTS,
       duplicateWindowSeconds: 1,
-      defaultInbound: "refuse",
     });
 
     expect(readSessionCollabPreferences()).toEqual({
       ...SESSION_COLLAB_DEFAULTS,
       duplicateWindowSeconds: 1,
-      defaultInbound: "refuse",
     });
   });
 

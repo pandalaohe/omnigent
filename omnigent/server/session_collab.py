@@ -5,9 +5,8 @@ namespace per user. This module owns the server-side reads that turn those
 stored values into behaviour: the owner rule every enforcement point shares
 (the top-level ancestor's owner grant, or the reserved local user when auth
 is off), the master-switch snapshot the runner session-init envelope
-carries, the refusal raised by collaboration routes while the switch is
-off, and the creation-time ``peer_inbound`` stamp for new top-level
-sessions. Every read is fail-safe: a missing or broken row resolves to the
+carries, and the refusal raised by collaboration routes while the switch is
+off. Every read is fail-safe: a missing or broken row resolves to the
 accessor's defaults, never an error.
 """
 
@@ -34,10 +33,6 @@ _logger = logging.getLogger(__name__)
 COLLAB_DISABLED_MESSAGE = (
     "Session collaboration is turned off in Settings > Session collaboration."
 )
-
-# Mirrors routes_peer's label; defined here so this module need not import its
-# private name.
-_PEER_INBOUND_LABEL = "peer_inbound"
 
 
 def collab_owner_for(
@@ -115,30 +110,3 @@ def require_collab_enabled(
     if not settings.enabled:
         raise OmnigentError(COLLAB_DISABLED_MESSAGE, code=ErrorCode.FORBIDDEN)
     return settings
-
-
-def stamp_default_inbound(
-    labels: dict[str, str],
-    *,
-    parent_session_id: str | None,
-    prefs_store: SqlAlchemyUserPreferencesStore | None,
-    owner: str | None,
-) -> None:
-    """Stamp a new top-level session's inbound policy from *owner*'s default.
-
-    Only ``hold`` and ``refuse`` are stamped: an absent label already means
-    accept, so the default setting changes no row in that case. A child
-    inherits its parent's policy and an explicit label always wins.
-
-    Blocking: callers run it in a thread.
-
-    :param labels: The create request's initial labels, mutated in place.
-    :param parent_session_id: The new session's parent, or ``None``.
-    :param prefs_store: Preferences store, or ``None``.
-    :param owner: The creating user, or ``None`` for the local user.
-    """
-    if parent_session_id is not None or _PEER_INBOUND_LABEL in labels:
-        return
-    settings = read_collab_settings(prefs_store, owner or RESERVED_USER_LOCAL)
-    if settings.default_inbound in ("hold", "refuse"):
-        labels[_PEER_INBOUND_LABEL] = settings.default_inbound

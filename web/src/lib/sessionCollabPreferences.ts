@@ -3,8 +3,6 @@ import { queueUserPreferencePatch } from "./userPreferencesSync";
 export const SESSION_COLLAB_STORAGE_KEY = "omnigent:session-collab";
 export const SESSION_COLLAB_CHANGED_EVENT = "omnigent:session-collab-changed";
 
-export type SessionCollabInboundPolicy = "accept" | "hold" | "refuse";
-
 /** Field names are the stored JSON keys the server accessor reads. */
 export interface SessionCollabPreferences {
   /** Master switch: off hides the collaboration tools and refuses peer routes. */
@@ -18,7 +16,6 @@ export interface SessionCollabPreferences {
   senderRateWindowSeconds: number;
   duplicateWindowSeconds: number;
   undeliveredTtlSeconds: number;
-  defaultInbound: SessionCollabInboundPolicy;
   flowTimerEnabled: boolean;
 }
 
@@ -46,7 +43,7 @@ export const SESSION_COLLAB_BOUNDS: Record<
   senderRateCount: { min: 1, max: 10000 },
   senderRateWindowSeconds: { min: 60, max: 86400 },
   duplicateWindowSeconds: { min: 1, max: 86400 },
-  undeliveredTtlSeconds: { min: 3600, max: 604800 },
+  undeliveredTtlSeconds: { min: 60, max: 604800 },
 };
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
@@ -60,7 +57,6 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   senderRateWindowSeconds: 600,
   duplicateWindowSeconds: 600,
   undeliveredTtlSeconds: 86400,
-  defaultInbound: "accept",
   flowTimerEnabled: true,
 };
 
@@ -74,12 +70,6 @@ function normalizeInteger(value: unknown, field: SessionCollabNumericField): num
 
 function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
-}
-
-function normalizeInbound(value: unknown): SessionCollabInboundPolicy {
-  return value === "hold" || value === "refuse" || value === "accept"
-    ? value
-    : SESSION_COLLAB_DEFAULTS.defaultInbound;
 }
 
 function normalizePreferences(value: unknown): SessionCollabPreferences {
@@ -99,7 +89,6 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
     ),
     duplicateWindowSeconds: normalizeInteger(raw.duplicateWindowSeconds, "duplicateWindowSeconds"),
     undeliveredTtlSeconds: normalizeInteger(raw.undeliveredTtlSeconds, "undeliveredTtlSeconds"),
-    defaultInbound: normalizeInbound(raw.defaultInbound),
     flowTimerEnabled: normalizeBoolean(
       raw.flowTimerEnabled,
       SESSION_COLLAB_DEFAULTS.flowTimerEnabled,

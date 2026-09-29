@@ -2,20 +2,12 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
 import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
 import { Link } from "@/lib/routing";
 import {
   SESSION_COLLAB_BOUNDS,
   writeSessionCollabPreferences,
-  type SessionCollabInboundPolicy,
   type SessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 
@@ -29,8 +21,6 @@ const HINTS = {
   senderRate: "The same limit applied per sending session across all of its receivers.",
   duplicate: "An identical message to the same session inside this window is dropped.",
   undelivered: "A queued or held message not delivered within this time expires.",
-  defaultInbound:
-    "Applies to sessions created after you change it; each session can still change its own policy.",
   flowTimer: "Lets agents run timed flows and timed wake-ups.",
 };
 
@@ -219,40 +209,14 @@ export function SessionCollabSettings() {
         <div className="mt-4 border-t border-border pt-4">
           <SettingRow label="Undelivered message lifetime" hint={HINTS.undelivered}>
             <NumericField
-              ariaLabel="Undelivered message lifetime in hours"
-              value={preferences.undeliveredTtlSeconds / 3600}
-              min={SESSION_COLLAB_BOUNDS.undeliveredTtlSeconds.min / 3600}
-              max={SESSION_COLLAB_BOUNDS.undeliveredTtlSeconds.max / 3600}
+              ariaLabel="Undelivered message lifetime in minutes"
+              value={preferences.undeliveredTtlSeconds / 60}
+              min={SESSION_COLLAB_BOUNDS.undeliveredTtlSeconds.min / 60}
+              max={SESSION_COLLAB_BOUNDS.undeliveredTtlSeconds.max / 60}
               disabled={disabled}
-              onCommit={(hours) => update({ undeliveredTtlSeconds: hours * 3600 })}
+              onCommit={(minutes) => update({ undeliveredTtlSeconds: minutes * 60 })}
             />
-            <span className="text-sm text-muted-foreground">hours</span>
-          </SettingRow>
-        </div>
-
-        <div className="mt-4 border-t border-border pt-4">
-          <SettingRow label="Default inbound policy for new sessions" hint={HINTS.defaultInbound}>
-            <Select
-              value={preferences.defaultInbound}
-              onValueChange={(value) =>
-                update({ defaultInbound: value as SessionCollabInboundPolicy })
-              }
-              disabled={disabled}
-              componentId="settings.session_collab.default_inbound"
-              valueHasNoPii
-            >
-              <SelectTrigger
-                aria-label="Default inbound policy for new sessions"
-                className="w-28 shrink-0"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="accept">Accept</SelectItem>
-                <SelectItem value="hold">Hold</SelectItem>
-                <SelectItem value="refuse">Refuse</SelectItem>
-              </SelectContent>
-            </Select>
+            <span className="text-sm text-muted-foreground">min</span>
           </SettingRow>
         </div>
       </div>

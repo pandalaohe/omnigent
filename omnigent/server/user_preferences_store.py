@@ -144,10 +144,6 @@ def read_approval_timeout(
 
 SESSION_COLLAB_NAMESPACE = "session_collab"
 
-# Mirrors the per-session ``peer_inbound`` label's three dispositions.
-InboundDisposition: TypeAlias = Literal["accept", "hold", "refuse"]
-_INBOUND_CHOICES: tuple[InboundDisposition, ...] = ("accept", "hold", "refuse")
-
 
 @dataclass(frozen=True)
 class CollabSettings:
@@ -164,7 +160,6 @@ class CollabSettings:
     :param sender_rate_window_s: Sender-rate window in seconds.
     :param duplicate_window_s: Window for suppressing duplicate payloads.
     :param undelivered_ttl_s: Lifetime of undelivered messages in seconds.
-    :param default_inbound: Inbound peer-message disposition for new sessions.
     :param flow_timer_enabled: Whether collaboration flow timers are on.
     """
 
@@ -178,17 +173,15 @@ class CollabSettings:
     sender_rate_window_s: int = 600
     duplicate_window_s: int = 600
     undelivered_ttl_s: int = 86400
-    default_inbound: InboundDisposition = "accept"
     flow_timer_enabled: bool = True
 
 
-_CollabFieldKind: TypeAlias = Literal["bool", "positive_int", "inbound"]
+_CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
 
 # Stored JSON keys are camelCase because the web client writes them. The third
-# entry names how the stored value is read: ``bool`` takes a JSON boolean,
-# ``positive_int`` an int of at least 1 (never a bool), and ``inbound`` one of
-# the three peer-inbound dispositions. One table keeps all twelve mappings in
-# a single place.
+# entry names how the stored value is read: ``bool`` takes a JSON boolean and
+# ``positive_int`` an int of at least 1 (never a bool). One table keeps all
+# eleven mappings in a single place.
 _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("enabled", "enabled", "bool"),
     ("openRateCount", "open_rate_count", "positive_int"),
@@ -200,7 +193,6 @@ _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("senderRateWindowSeconds", "sender_rate_window_s", "positive_int"),
     ("duplicateWindowSeconds", "duplicate_window_s", "positive_int"),
     ("undeliveredTtlSeconds", "undelivered_ttl_s", "positive_int"),
-    ("defaultInbound", "default_inbound", "inbound"),
     ("flowTimerEnabled", "flow_timer_enabled", "bool"),
 )
 
@@ -214,8 +206,6 @@ def _parse_collab_value(kind: _CollabFieldKind, raw: Any) -> Any | None:
             if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
                 return raw
             return None
-        case "inbound":
-            return raw if raw in _INBOUND_CHOICES else None
 
 
 def read_collab_settings(
@@ -229,8 +219,8 @@ def read_collab_settings(
     missing store / owner / namespace, a non-object value, an invalid field,
     a row that fails store validation, or a database error all resolve to the
     fail-safe defaults. A boolean field accepts only a JSON boolean; an integer
-    field accepts only an integer (not a bool) of at least 1; an inbound field
-    accepts only ``accept``/``hold``/``refuse``. Unknown keys are ignored.
+    field accepts only an integer (not a bool) of at least 1. Unknown keys are
+    ignored.
 
     :param store: Preferences store, or ``None`` when the server has no
         synced preferences.

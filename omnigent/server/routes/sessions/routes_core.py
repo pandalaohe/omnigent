@@ -230,7 +230,6 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     UpdateSessionRequest,
 )
-from omnigent.server.session_collab import stamp_default_inbound
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -1200,16 +1199,6 @@ def register_core_routes(
             parsed_metadata = parsed_metadata.model_copy(
                 update={"labels": {**parsed_metadata.labels, **member_labels}}
             )
-        stamped_labels = dict(parsed_metadata.labels or {})
-        await asyncio.to_thread(
-            stamp_default_inbound,
-            stamped_labels,
-            parent_session_id=parsed_metadata.parent_session_id,
-            prefs_store=getattr(request.app.state, "user_preferences_store", None),
-            owner=user_id,
-        )
-        if stamped_labels != (parsed_metadata.labels or {}):
-            parsed_metadata = parsed_metadata.model_copy(update={"labels": stamped_labels})
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
                 _create_session_from_bundle,

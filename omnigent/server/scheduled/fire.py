@@ -905,7 +905,6 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
         ),
         project_config=project.config if project is not None else None,
         master=await load_master(task.user_id, deps.preferences_store),
-        preferences_store=deps.preferences_store,
     )
     conv: Conversation | None = await asyncio.to_thread(
         deps.conversation_store.get_conversation, result.session_id

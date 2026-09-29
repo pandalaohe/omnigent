@@ -2,8 +2,7 @@
 
 The peer-route cases ride on ``test_peer_messages.py``'s app fixture with a
 real preferences store attached; the initializer cases drive a fake runner
-client counting session-init POSTs; the stamp cases are unit reads against
-a seeded store.
+client counting session-init POSTs.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from omnigent.server.session_collab import (
     collab_owner_for,
     require_collab_enabled,
     session_peer_enabled,
-    stamp_default_inbound,
 )
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 
@@ -275,46 +273,6 @@ def test_require_collab_enabled_refuses_with_the_settings_message(db_uri: str) -
     store.patch_namespace(ALICE, SESSION_COLLAB, {"enabled": True})
     assert require_collab_enabled(store, ALICE).enabled is True
     assert require_collab_enabled(None, ALICE).enabled is True
-
-
-@pytest.mark.parametrize("disposition", ["hold", "refuse"])
-def test_stamp_default_inbound_stamps_non_accept(db_uri: str, disposition: str) -> None:
-    """hold / refuse become a peer_inbound label on a new top-level create."""
-    store = SqlAlchemyUserPreferencesStore(db_uri)
-    store.patch_namespace(ALICE, SESSION_COLLAB, {"defaultInbound": disposition})
-    labels: dict[str, str] = {"example": "value"}
-
-    stamp_default_inbound(labels, parent_session_id=None, prefs_store=store, owner=ALICE)
-
-    assert labels == {"example": "value", "peer_inbound": disposition}
-
-
-def test_stamp_default_inbound_skips_accept_children_and_explicit_labels(db_uri: str) -> None:
-    """Accept stamps nothing; a child or an explicit label is left alone."""
-    store = SqlAlchemyUserPreferencesStore(db_uri)
-    store.patch_namespace(ALICE, SESSION_COLLAB, {"defaultInbound": "refuse"})
-
-    accept_store = SqlAlchemyUserPreferencesStore(db_uri)
-    accept_store.patch_namespace(ALICE, SESSION_COLLAB, {"defaultInbound": "accept"})
-    accepted: dict[str, str] = {}
-    stamp_default_inbound(accepted, parent_session_id=None, prefs_store=accept_store, owner=ALICE)
-    assert accepted == {}
-
-    child: dict[str, str] = {}
-    stamp_default_inbound(child, parent_session_id="conv_parent", prefs_store=store, owner=ALICE)
-    assert child == {}
-
-    explicit: dict[str, str] = {"peer_inbound": "accept"}
-    stamp_default_inbound(explicit, parent_session_id=None, prefs_store=store, owner=ALICE)
-    assert explicit == {"peer_inbound": "accept"}
-
-    no_store: dict[str, str] = {}
-    stamp_default_inbound(no_store, parent_session_id=None, prefs_store=None, owner=ALICE)
-    assert no_store == {}
-
-    no_owner: dict[str, str] = {}
-    stamp_default_inbound(no_owner, parent_session_id=None, prefs_store=store, owner=None)
-    assert no_owner == {}
 
 
 # ── forward path: a flipped switch re-inits before dispatch ─────────

@@ -13,7 +13,6 @@ const LABELS = [
   "Rate per sending session",
   "Duplicate message window",
   "Undelivered message lifetime",
-  "Default inbound policy for new sessions",
   "Timed flows",
 ];
 
@@ -29,7 +28,7 @@ beforeEach(() => localStorage.clear());
 afterEach(cleanup);
 
 describe("SessionCollabSettings", () => {
-  it("renders the nine setting labels", () => {
+  it("renders the eight setting labels", () => {
     renderSettings();
 
     for (const label of LABELS) {
@@ -45,7 +44,7 @@ describe("SessionCollabSettings", () => {
     expect(readSessionCollabPreferences().enabled).toBe(false);
     expect(screen.getByLabelText("Relay depth limit")).toBeDisabled();
     expect(screen.getByLabelText("Rate per session pair")).toBeDisabled();
-    expect(screen.getByLabelText("Default inbound policy for new sessions")).toBeDisabled();
+    expect(screen.getByLabelText("Undelivered message lifetime in minutes")).toBeDisabled();
     expect(screen.getByRole("switch", { name: "Timed flows" })).toBeDisabled();
   });
 
@@ -57,6 +56,18 @@ describe("SessionCollabSettings", () => {
 
     expect(readSessionCollabPreferences().relayDepthMax).toBe(3);
     expect(input).toHaveValue(3);
+  });
+
+  it("writes an undelivered message lifetime entered in minutes", () => {
+    renderSettings();
+    const input = screen.getByLabelText("Undelivered message lifetime in minutes");
+
+    expect(input).toHaveValue(1440);
+
+    fireEvent.change(input, { target: { value: "5" } });
+
+    expect(readSessionCollabPreferences().undeliveredTtlSeconds).toBe(300);
+    expect(input).toHaveValue(5);
   });
 
   it("writes nothing for invalid input and restores the previous value on blur", () => {
