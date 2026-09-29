@@ -376,6 +376,11 @@ def register_open_routes(
         request: Request,
     ) -> dict[str, Any]:
         """Create the session, grant ownership, deliver the first message."""
+        # Grant before create persists its row: a create that raises after
+        # writing one must leave the partial session visible and owned.
+        if permission_store is not None:
+            await asyncio.to_thread(permission_store.ensure_user, owner)
+            await asyncio.to_thread(permission_store.grant, owner, sid, LEVEL_OWNER)
         try:
             git = (
                 SessionGitOptions(branch_name=f"open-{sid[:8]}", base_branch=body.from_ref)
@@ -416,10 +421,21 @@ def register_open_routes(
                 if body.from_ref and "already exists" in detail.lower()
                 else "create_failed"
             )
+            if (
+                permission_store is not None
+                and (await asyncio.to_thread(conversation_store.get_conversation, sid)) is None
+            ):
+                # No row was persisted: drop the provisional grant so a retry
+                # does not leave an orphan owner behind.
+                try:
+                    await asyncio.to_thread(permission_store.revoke, owner, sid)
+                except Exception:
+                    _logger.warning(
+                        "Session-open grant cleanup failed",
+                        exc_info=True,
+                        extra={"session_id": sid},
+                    )
             return _problem("failed", reason, f"Could not open the session: {detail}")
-        if permission_store is not None:
-            await asyncio.to_thread(permission_store.ensure_user, owner)
-            await asyncio.to_thread(permission_store.grant, owner, sid, LEVEL_OWNER)
         _announce_session_added(owner, sid)
         first_message: dict[str, Any] | None = None
         if body.message:

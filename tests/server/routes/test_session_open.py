@@ -208,8 +208,14 @@ def _patch_create(
     monkeypatch: pytest.MonkeyPatch,
     *,
     error: Exception | None = None,
+    persist_before_error: bool = False,
 ) -> dict[str, Any]:
-    """Replace the create orchestration and record its call."""
+    """Replace the create orchestration and record its call.
+
+    :param error: Exception the replacement raises, or ``None`` to succeed.
+    :param persist_before_error: Write the conversation row before raising,
+        modelling a create that fails after its row is durable.
+    """
     captured: dict[str, Any] = {}
 
     async def create_session(*args: Any, **kwargs: Any) -> Any:
@@ -217,7 +223,7 @@ def _patch_create(
         sid = kwargs["conversation_id"]
         captured["body"] = body
         captured["kwargs"] = kwargs
-        if error is not None:
+        if error is not None and not persist_before_error:
             raise error
         conv = env["conversations"].create_conversation(
             conversation_id=sid,
@@ -228,6 +234,8 @@ def _patch_create(
             project_id=body.project_id,
             runner_id=token_bound_runner_id(secrets.token_hex(16)),
         )
+        if error is not None:
+            raise error
         return SimpleNamespace(id=sid), conv
 
     monkeypatch.setattr(routes_open, "_create_session_from_existing_agent", create_session)
@@ -545,15 +553,40 @@ async def test_stalled_open_does_not_block_a_worktree_open(
 async def test_failed_create_releases_the_reservation(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A create that raises frees the root for the next no-ref open."""
+    """A create that raises before writing a row frees the root and drops the grant."""
     env = open_env
-    _patch_create(env, monkeypatch, error=Exception("boom"))
+    captured = _patch_create(env, monkeypatch, error=Exception("boom"))
     async with await _client(env) as client:
         failed = await _post(client, env["sender"].id, env["sender_token"])
         assert failed["state"] == "failed"
+        assert failed["reason"] == "create_failed"
+        sid = captured["kwargs"]["conversation_id"]
+        assert env["conversations"].get_conversation(sid) is None
+        assert env["permissions"].get(ALICE, sid) is None
         _patch_create(env, monkeypatch)
         opened = await _post(client, env["sender"].id, env["sender_token"])
     assert opened["state"] == "opened"
+
+
+@pytest.mark.asyncio
+async def test_failed_create_after_row_keeps_the_session_owned(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create that fails after persisting leaves the row owned and occupying."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch, error=Exception("boom"), persist_before_error=True)
+    async with await _client(env) as client:
+        failed = await _post(client, env["sender"].id, env["sender_token"])
+        assert failed["state"] == "failed"
+        assert failed["reason"] == "create_failed"
+        sid = captured["kwargs"]["conversation_id"]
+        assert env["conversations"].get_conversation(sid) is not None
+        assert env["permissions"].get(ALICE, sid) is not None
+        second = await _post(client, env["sender"].id, env["sender_token"])
+    assert second["state"] == "refused"
+    assert second["reason"] == "directory_in_use"
+    assert sid in second["message"]
+    assert {"id": sid, "name": "opened"} in second["candidates"]
 
 
 @pytest.mark.asyncio
