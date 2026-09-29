@@ -126,6 +126,24 @@ class _FakePeerStore(PeerMessageStore):
         candidates.sort(key=lambda r: r.created_at, reverse=True)
         return candidates[0] if candidates else None
 
+    def find_sent(
+        self,
+        sender_session_id: str,
+        receiver_session_id: str,
+        ref_or_id: str,
+        created_after: int,
+    ) -> SessionPeerMessage | None:
+        candidates = [
+            r
+            for r in self._rows.values()
+            if r.sender_session_id == sender_session_id
+            and r.receiver_session_id == receiver_session_id
+            and (r.ref == ref_or_id or r.id == ref_or_id)
+            and r.created_at >= created_after
+        ]
+        candidates.sort(key=lambda r: (r.created_at, r.id), reverse=True)
+        return candidates[0] if candidates else None
+
     def count_for_ref(self, ref: str) -> int:
         return sum(1 for r in self._rows.values() if r.ref == ref)
 
@@ -731,6 +749,57 @@ async def test_deferred_rechecks_inbound_refuse_even_when_held(harness: _Harness
     assert _row(harness.store, record.id).reason == "receiver_refuses"
 
 
+async def test_deferred_recheck_exempts_a_correlated_reply() -> None:
+    """A reply on a thread the refusing receiver started is delivered."""
+    h = _Harness(now=1_000_000)
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "refuse"}))
+    h.seed_record(
+        id="peer_original",
+        sender_session_id="receiver",
+        receiver_session_id="sender",
+        ref="cid-1",
+        state="delivered",
+        created_at=h._now - 1000,
+    )
+    reply = h.seed_record(
+        id="peer_reply",
+        sender_session_id="sender",
+        receiver_session_id="receiver",
+        ref="cid-1",
+        state="pending",
+    )
+    await h.sweeper._tick()
+    assert _row(h.store, reply.id).state == "delivered"
+    assert len(h.deliver.calls) == 1
+
+
+async def test_deferred_recheck_refuses_a_correlation_past_the_ttl() -> None:
+    """A correlation older than the refuser's ttl does not exempt delivery."""
+    h = _Harness(now=1_000_000)
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "refuse"}))
+    h.seed_record(
+        id="peer_original",
+        sender_session_id="receiver",
+        receiver_session_id="sender",
+        ref="cid-old",
+        state="delivered",
+        created_at=h._now - 90_000,
+    )
+    reply = h.seed_record(
+        id="peer_reply",
+        sender_session_id="sender",
+        receiver_session_id="receiver",
+        ref="cid-old",
+        state="pending",
+    )
+    await h.sweeper._tick()
+    assert _row(h.store, reply.id).state == "refused_by_user"
+    assert _row(h.store, reply.id).reason == "receiver_refuses"
+    assert h.deliver.calls == []
+
+
 async def test_deferred_rechecks_owner(harness: _Harness, monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.server import peer_sweeper
 
@@ -743,22 +812,7 @@ async def test_deferred_rechecks_owner(harness: _Harness, monkeypatch: pytest.Mo
     assert harness.deliver.calls == []
 
 
-async def test_handoff_pass_awaited_and_failure_does_not_stop_tick(harness: _Harness) -> None:
-    observed: list[int] = []
-
-    async def failing_pass(now: int) -> None:
-        observed.append(now)
-        raise RuntimeError("handoff pass failed")
-
-    harness.sweeper.set_handoff_pass(failing_pass)
-    harness.sweeper._parked["sender"] = ["notice after failure"]
-    await harness.sweeper._tick()
-    await harness.sweeper._tick()
-    assert observed == [harness._now, harness._now]
-    assert harness.post_event.calls[0]["text"] == "notice after failure"
-
-
 async def test_notify_line_uses_sender_notice_path(harness: _Harness) -> None:
-    await harness.sweeper.notify_line("sender", "hand-off result ready")
+    await harness.sweeper.notify_line("sender", "peer result ready")
     assert harness.post_event.calls[0]["session_id"] == "sender"
-    assert harness.post_event.calls[0]["text"] == "hand-off result ready"
+    assert harness.post_event.calls[0]["text"] == "peer result ready"

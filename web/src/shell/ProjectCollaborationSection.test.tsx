@@ -11,7 +11,6 @@ import {
   getProjectHostRoots,
   putProjectHostBinding,
   putProjectRepository,
-  setProjectCollaborationEnabled,
   verifyProjectHostBinding,
   type ProjectCollaboration,
 } from "@/lib/projectsApi";
@@ -24,7 +23,6 @@ vi.mock("@/lib/projectsApi", () => ({
   getProjectHostRoots: vi.fn(),
   putProjectHostBinding: vi.fn(),
   putProjectRepository: vi.fn(),
-  setProjectCollaborationEnabled: vi.fn(),
   verifyProjectHostBinding: vi.fn(),
 }));
 vi.mock("./WorkspacePicker", () => ({
@@ -59,14 +57,11 @@ vi.mock("@/hooks/useHosts", () => ({
 
 const getMock = vi.mocked(getProjectCollaboration);
 const getHostRootsMock = vi.mocked(getProjectHostRoots);
-const setEnabledMock = vi.mocked(setProjectCollaborationEnabled);
 const putRepoMock = vi.mocked(putProjectRepository);
 const putBindingMock = vi.mocked(putProjectHostBinding);
 
 function collaboration(overrides: Partial<ProjectCollaboration> = {}): ProjectCollaboration {
   return {
-    enabled: false,
-    revision: 3,
     repositories: [],
     bindings: [],
     problems: [],
@@ -133,7 +128,6 @@ function renderSection() {
 beforeEach(() => {
   getMock.mockReset();
   getHostRootsMock.mockReset();
-  setEnabledMock.mockReset();
   putRepoMock.mockReset();
   putBindingMock.mockReset();
   vi.mocked(deleteProjectRepository).mockReset();
@@ -149,47 +143,6 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ProjectCollaborationSection", () => {
-  it("sends the loaded revision when toggling collaboration on", async () => {
-    getMock.mockResolvedValue(collaboration());
-    setEnabledMock.mockResolvedValue({ enabled: true, revision: 4 });
-    renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-enabled")).toBeInTheDocument(),
-    );
-
-    fireEvent.click(screen.getByTestId("project-collaboration-enabled"));
-
-    await waitFor(() => expect(setEnabledMock).toHaveBeenCalledWith("p_1", true, 3));
-  });
-
-  it("shows the conflict notice, refetches, and reflects the server state on a 409", async () => {
-    // First read (revision 3, off); the refetch after the conflict reads the
-    // writer's newer state (revision 4, on) — the switch must follow the server.
-    getMock
-      .mockResolvedValueOnce(collaboration({ enabled: false, revision: 3 }))
-      .mockResolvedValue(collaboration({ enabled: true, revision: 4 }));
-    setEnabledMock.mockRejectedValueOnce(new ApiError("revision mismatch", 409, "conflict"));
-    renderSection();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-enabled")).toBeInTheDocument(),
-    );
-
-    fireEvent.click(screen.getByTestId("project-collaboration-enabled"));
-
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-error")).toHaveTextContent(
-        "Collaboration settings changed elsewhere; the latest settings are shown. Try again.",
-      ),
-    );
-    await waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
-    await waitFor(() =>
-      expect(screen.getByTestId("project-collaboration-enabled")).toHaveAttribute(
-        "data-state",
-        "checked",
-      ),
-    );
-  });
-
   it("adds a repository, omitting a blank manifest path", async () => {
     getMock.mockResolvedValue(collaboration());
     putRepoMock.mockResolvedValue(repo());
@@ -757,7 +710,7 @@ describe("ProjectCollaborationSection", () => {
     await waitFor(() =>
       expect(screen.getByTestId("project-collaboration-error")).toBeInTheDocument(),
     );
-    expect(screen.queryByTestId("project-collaboration-enabled")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-collaboration-repo-open")).not.toBeInTheDocument();
     expect(screen.queryByTestId("project-collaboration-repo-add")).not.toBeInTheDocument();
   });
 });

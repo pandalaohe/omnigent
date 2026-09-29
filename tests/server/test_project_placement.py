@@ -26,7 +26,7 @@ def _project(*, host_id: str | None = "h1", workspace: str = "/config") -> Proje
     config = {"workspace": workspace}
     if host_id is not None:
         config["host_id"] = host_id
-    return Project("p1", "Project", "alice", 1, config=config, collaboration_enabled=True)
+    return Project("p1", "Project", "alice", 1, config=config)
 
 
 def _binding(host_id: str, workspace: str = "/binding") -> ProjectHostBinding:
@@ -39,14 +39,15 @@ def _entry(host_id: str, workspace: str = "/entry") -> ProjectHostEntry:
     return ProjectHostEntry("p1", host_id, workspace, 1)
 
 
-def test_binding_precedes_config_only_with_both_gates() -> None:
+def test_binding_precedes_config_with_flag_on() -> None:
     project = _project()
     binding = _binding("h1")
     on = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
     assert bindings_apply(project, on)
     assert root_on_host(project, [binding], "h1", gates_on=True).workspace == "/binding"
     assert root_on_host(project, [binding], "h1", gates_on=False).workspace == "/config"
-    assert not bindings_apply(replace(project, collaboration_enabled=False), on)
+    # The retired per-project switch no longer gates bindings: the flag alone
+    # decides.
     assert not bindings_apply(project, FeatureFlags())
     assert (
         root_on_host(project, [replace(binding, enabled=False)], "h1", gates_on=True).workspace

@@ -54,7 +54,6 @@ _BOOT_ENV = {
 _BOOT_STORE_CLASSES = (
     "omnigent.stores.agent_store.sqlalchemy_store.SqlAlchemyAgentStore",
     "omnigent.stores.artifact_store.databricks_volumes.DatabricksVolumesArtifactStore",
-    "omnigent.stores.assignment_store.sqlalchemy_store.SqlAlchemyAssignmentStore",
     "omnigent.stores.comment_store.sqlalchemy_store.SqlAlchemyCommentStore",
     "omnigent.stores.conversation_store.sqlalchemy_store.SqlAlchemyConversationStore",
     "omnigent.stores.file_store.sqlalchemy_store.SqlAlchemyFileStore",

@@ -118,8 +118,8 @@ def default_agent_for_host(
 ) -> str | None:
     """The project's per-host default agent id, or ``None`` when unset.
 
-    The single-layer read the hand-off start needs before it commits to an
-    agent; a full create resolves through :func:`resolve_calling` instead.
+    The single-layer read a caller needs before it commits to an agent; a
+    full create resolves through :func:`resolve_calling` instead.
     """
     entry = _project_host_entry(project_config, host_id)
     return _setting(entry.get("agent_id")) if entry is not None else None
@@ -512,7 +512,7 @@ def check_calling_defaults(
     :param agent_name: The resolved agent's display name, or ``None``.
     :param project_name: Project the messages name, or ``None``.
     :param path_label: The create path named in the library-agent refusal,
-        e.g. ``"hand-off"``.
+        e.g. ``"session_create"``.
     :returns: Zero or more ``{"field", "setting", "message"}`` problems, agent
         problems first.
     """

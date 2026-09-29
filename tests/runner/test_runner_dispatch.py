@@ -7680,6 +7680,38 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_maps_open_rate_refusal() -> None:
+    """
+    A 429 from the create maps to ``open_rate`` with the server's refusal
+    text. If the mapping regressed, the orchestrator would tell the agent a
+    generic failure instead of backing off the open rate.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    refusal = (
+        "Opening sessions too fast (setting: 5 per 1 minute; Settings > Session collaboration)"
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"detail": refusal})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "open_rate"
+    assert info["detail"] == refusal
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_spawns_child_under_caller() -> None:
     """
     ``sys_session_create`` POSTs a JSON create with
@@ -7917,6 +7949,39 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
     assert handle["project_id"] == "project"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_config_path_maps_open_rate_refusal(tmp_path: Path) -> None:
+    """
+    The multipart config-path create maps a 429 the same way the JSON
+    create does, so both child-create modes surface ``open_rate``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: do helpful things\n")
+    refusal = (
+        "Opening sessions too fast (setting: 5 per 1 minute; Settings > Session collaboration)"
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"detail": refusal})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "open_rate"
+    assert info["detail"] == refusal
 
 
 @pytest.mark.asyncio

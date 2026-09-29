@@ -40,6 +40,7 @@ from omnigent.tools.builtins import (
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionOpenTool,
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
@@ -51,7 +52,6 @@ from omnigent.tools.builtins import (
     get_builtin_tool,
 )
 from omnigent.tools.builtins.flow import SysFlowCancelTool, SysFlowListTool, SysFlowStartTool
-from omnigent.tools.builtins.handoff import SysHandoffReportTool, SysSessionHandoffTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
@@ -116,8 +116,8 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
-        project_assignments_enabled: bool = False,
         peer_messaging_enabled: bool = False,
+        session_open_enabled: bool = False,
         *,
         os_env_schema_only: bool = False,
     ) -> None:
@@ -146,22 +146,23 @@ class ToolManager:
             tools use this shared instance instead of creating their
             own. ``None`` falls back to per-call creation via
             ``create_os_environment()``.
-        :param project_assignments_enabled: Server-owned release flag
-            carried in the session-init snapshot. When ``True`` the
-            seven ``sys_assignment_*`` tools auto-register so agents
-            can hand work across hosts; when ``False`` none of them
-            registers.
         :param peer_messaging_enabled: Server-owned release flag
             carried in the session-init snapshot. When ``True`` a
             session with no spawn grant still registers
             ``sys_session_send`` in by-id mode so it can message a
             peer session.
+        :param session_open_enabled: Server-owned flag derived from the
+            snapshot: peer messaging on AND the session is top-level.
+            When ``True`` (and peer messaging is on) the session also
+            registers ``sys_session_open`` so it can open plain
+            top-level sessions on other hosts and projects.
         :param os_env_schema_only: Register static OS tool schemas without
             creating an environment. For metadata callers only; OS tool
             execution remains runner-owned. Preserves the ``os_env`` gate.
         """
         self._spec = spec
         self._peer_messaging_enabled = peer_messaging_enabled
+        self._session_open_enabled = session_open_enabled
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
@@ -211,11 +212,6 @@ class ToolManager:
         # Scheduled-task tools are always auto-registered so agents can
         # manage recurring runs at runtime without the spec opting in.
         self._register_scheduled_task_tools()
-        # Assignment tools auto-register only when the server's release
-        # flag is on (same position and mechanism as the scheduled-task
-        # tools above): with the flag off no new tool reaches any agent.
-        if project_assignments_enabled:
-            self._register_assignment_tools()
         # Embedded-browser tools are always auto-registered so any agent
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
@@ -253,37 +249,6 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
-        ):
-            self._tools[tool.name()] = tool
-
-    def _register_assignment_tools(self) -> None:
-        """
-        Auto-register the cross-host assignment builtins.
-
-        Gated on the server's ``Feature.PROJECT_ASSIGNMENTS`` flag (see
-        :meth:`__init__`): agents hand work to another host's agent and
-        report back without any spec opting in. The runner dispatches
-        all seven via the Omnigent server's ``/v1/assignments`` REST
-        endpoints.
-        """
-        from omnigent.tools.builtins.assignments import (
-            SysAssignmentCancelTool,
-            SysAssignmentCompleteTool,
-            SysAssignmentDispatchTool,
-            SysAssignmentGetTool,
-            SysAssignmentListTool,
-            SysAssignmentReadMessagesTool,
-            SysAssignmentSendTool,
-        )
-
-        for tool in (
-            SysAssignmentDispatchTool(),
-            SysAssignmentGetTool(),
-            SysAssignmentListTool(),
-            SysAssignmentSendTool(),
-            SysAssignmentReadMessagesTool(),
-            SysAssignmentCompleteTool(),
-            SysAssignmentCancelTool(),
         ):
             self._tools[tool.name()] = tool
 
@@ -539,9 +504,13 @@ class ToolManager:
                 allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
             )
 
+        # A top-level session with peer messaging on may open plain
+        # top-level sessions on any of its user's hosts and projects. A
+        # child may not (it shares the parent's runner token, so the
+        # server refuses a child sender too).
+        if self._peer_messaging_enabled and self._session_open_enabled:
+            self._tools[SysSessionOpenTool.name()] = SysSessionOpenTool()
         if self._peer_messaging_enabled:
-            self._tools[SysSessionHandoffTool.name()] = SysSessionHandoffTool()
-            self._tools[SysHandoffReportTool.name()] = SysHandoffReportTool()
             # Archive / unarchive reach any session the user owns, so they
             # ride the collaboration flag rather than the spawn grant.
             self._tools[SysSessionArchiveTool.name()] = SysSessionArchiveTool()

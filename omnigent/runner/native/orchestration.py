@@ -2411,8 +2411,8 @@ async def _auto_create_pi_terminal(
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
-    project_assignments_enabled: bool = False,
     peer_messaging_enabled: bool = False,
+    session_open_enabled: bool = False,
     global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
@@ -2430,10 +2430,10 @@ async def _auto_create_pi_terminal(
     :param global_instructions: The server-held global instructions text for
         this session, or ``None`` when none is set. Staged with the rest of the
         startup text for the first injected message.
-    :param project_assignments_enabled: Gates the assignment tools on the
-        relay surface, from the session's init snapshot.
     :param peer_messaging_enabled: Registers ``sys_session_send`` in
         by-id mode on the relay surface, from the session's init snapshot.
+    :param session_open_enabled: Registers ``sys_session_open`` on the
+        relay surface for a top-level session with peer messaging on.
     :returns: Created terminal resource view.
     """
     await _cancel_auto_forwarder_task(session_id)
@@ -2503,8 +2503,8 @@ async def _auto_create_pi_terminal(
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
         pi_tools = build_native_relay_tool_schemas(
             spec_for_tools,
-            project_assignments_enabled=project_assignments_enabled,
             peer_messaging_enabled=peer_messaging_enabled,
+            session_open_enabled=session_open_enabled,
         )
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
@@ -7688,6 +7688,7 @@ def _ensure_orchestrator_skills_in_bundle(
 _ROUTED_SPAWN_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__omnigent__sys_session_create",
     "mcp__omnigent__sys_agent_list",
+    "mcp__omnigent__sys_session_open",
     "mcp__omnigent__sys_session_send",
     "mcp__omnigent__sys_read_inbox",
 )
@@ -9272,8 +9273,8 @@ class NativeLaunchContext:
     skills_filter: str | list[str] = "all"
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
-    project_assignments_enabled: bool = False
     peer_messaging_enabled: bool = False
+    session_open_enabled: bool = False
     global_instructions: str | None = None
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
@@ -9308,8 +9309,8 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         agent_spec=ctx.agent_spec,
         ensure_comment_relay=ctx.ensure_comment_relay,
-        project_assignments_enabled=ctx.project_assignments_enabled,
         peer_messaging_enabled=ctx.peer_messaging_enabled,
+        session_open_enabled=ctx.session_open_enabled,
         global_instructions=ctx.global_instructions,
     )
 

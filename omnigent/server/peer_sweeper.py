@@ -38,11 +38,13 @@ from starlette.requests import Request
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes.sessions.routes_peer import (
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
     effective_owner_id,
     format_peer_back_notice,
+    is_reply_to_own,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores import ConversationStore
@@ -114,15 +116,6 @@ class PeerSweeper:
         self._flush_locks: dict[str, asyncio.Lock] = {}
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
-        self._handoff_pass: Callable[[int], Awaitable[None]] | None = None
-        self._handoff_brief_check: Callable[[SessionPeerMessage], bool] | None = None
-
-    def set_handoff_pass(self, fn: Callable[[int], Awaitable[None]] | None) -> None:
-        """Install the hand-off recovery pass run after peer records each tick."""
-        self._handoff_pass = fn
-
-    def set_handoff_brief_check(self, fn: Callable[[SessionPeerMessage], bool] | None) -> None:
-        self._handoff_brief_check = fn
 
     async def notify_line(
         self, sender_session_id: str, line: str, *, app: Any | None = None
@@ -200,11 +193,6 @@ class PeerSweeper:
             except Exception:
                 _logger.exception("Peer sweeper failed to process record %s", record.id)
         await self._reconcile_stale_delivering(now)
-        if self._handoff_pass is not None:
-            try:
-                await self._handoff_pass(now)
-            except Exception:
-                _logger.exception("Peer sweeper hand-off pass failed")
         for sender_id in list(self._parked.keys()):
             if not self._parked.get(sender_id):
                 continue
@@ -241,18 +229,31 @@ class PeerSweeper:
                 await self._notify_for(record, "failed", "closed", receiver_title, self._app)
             return
         if (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_REFUSE:
-            moved = await asyncio.to_thread(
-                self._store.transition,
-                record.id,
-                "refused_by_user",
-                "receiver_refuses",
-                (record.state,),
+            receiver_owner = effective_owner_id(
+                receiver, self._conversation_store, self._permission_store
             )
-            if moved:
-                await self._notify_for(
-                    record, "refused_by_user", "receiver_refuses", receiver_title, self._app
+            if not await asyncio.to_thread(
+                is_reply_to_own,
+                self._store,
+                getattr(self._app, "state", None),
+                refusing_session_id=receiver.id,
+                replier_session_id=record.sender_session_id,
+                correlation_id=record.ref,
+                refusing_owner=receiver_owner or RESERVED_USER_LOCAL,
+                now=now,
+            ):
+                moved = await asyncio.to_thread(
+                    self._store.transition,
+                    record.id,
+                    "refused_by_user",
+                    "receiver_refuses",
+                    (record.state,),
                 )
-            return
+                if moved:
+                    await self._notify_for(
+                        record, "refused_by_user", "receiver_refuses", receiver_title, self._app
+                    )
+                return
         if self._permission_store is not None:
             sender = await asyncio.to_thread(
                 self._conversation_store.get_conversation, record.sender_session_id
@@ -293,11 +294,6 @@ class PeerSweeper:
         state, _runner_online = await self._true_state(receiver)
         if state != "idle":
             return
-        strict_init = (
-            await asyncio.to_thread(self._handoff_brief_check, record)
-            if self._handoff_brief_check is not None
-            else False
-        )
         moved = await asyncio.to_thread(
             self._store.transition, record.id, "delivering", None, (origin_state,)
         )
@@ -334,7 +330,6 @@ class PeerSweeper:
                 record.id,
                 record.text,
                 acting_user_id=receiver_owner,
-                **({"require_init_success": True} if strict_init else {}),
             )
         except Exception:
             # ``_deliver`` already maps its own expected failures to a

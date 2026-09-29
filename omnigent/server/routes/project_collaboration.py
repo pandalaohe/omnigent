@@ -1,10 +1,7 @@
 """REST API routes for project collaboration configuration.
 
-Covers the opt-in surface of cross-host project collaboration: the
-per-project enable switch, the registered repositories, and the per-host
-directory bindings.
-Assignment dispatch and lifecycle live on a separate router; this module
-only configures where assignments may run.
+Covers the registered repositories and the per-host directory bindings
+that supply project roots and worktree sources.
 
 Every route requires the caller to own the project and the deployment to
 opt into ``Feature.PROJECT_ASSIGNMENTS``. A disabled flag makes each
@@ -54,20 +51,6 @@ _POST_BIND_HOOK_TIMEOUT_S: float = 35.0
 # safe ref-path segment.
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _RESERVED_NAMES = frozenset({".", ".."})
-
-
-class CollaborationPatchRequest(BaseModel):
-    """Request body for ``PATCH /v1/projects/{project_id}/collaboration``.
-
-    :param enabled: The new collaboration switch value.
-    :param expected_revision: The ``collaboration_revision`` the caller read;
-        a mismatch means another writer moved first.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool
-    expected_revision: int
 
 
 class RepositoryPutRequest(BaseModel):
@@ -573,55 +556,19 @@ def create_project_collaboration_router(
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project to inspect.
-        :returns: ``{enabled, revision, repositories, bindings, problems}``.
+        :returns: ``{repositories, bindings, problems}``.
         :raises HTTPException: 404 when the feature is disabled.
         :raises OmnigentError: 401 if unauthenticated, 404 if not found /
             not owned by the caller.
         """
         user_id = require_user(request, auth_provider)
-        project = await _require_owned_project(project_store, project_id, user_id)
+        await _require_owned_project(project_store, project_id, user_id)
         repositories = await asyncio.to_thread(repository_store.list_by_project, project_id)
         bindings = await asyncio.to_thread(binding_store.list_by_project, project_id)
         return {
-            "enabled": project.collaboration_enabled,
-            "revision": project.collaboration_revision,
             "repositories": [_repository_to_response(r) for r in repositories],
             "bindings": [_binding_to_response(b) for b in bindings],
             "problems": _collaboration_problems(repositories, bindings),
-        }
-
-    @router.patch("/projects/{project_id}/collaboration")
-    async def set_collaboration(
-        request: Request,
-        project_id: str,
-        body: CollaborationPatchRequest,
-    ) -> dict[str, Any]:
-        """Enable or disable collaboration, with optimistic-concurrency guard.
-
-        The only route that bumps ``collaboration_revision``; repository and
-        binding changes carry their own ``revision`` and leave it alone.
-
-        :param request: The incoming request, used to identify the user.
-        :param project_id: The project to update.
-        :param body: The new switch value plus the revision the caller read.
-        :returns: ``{enabled, revision}`` of the updated project.
-        :raises HTTPException: 404 when the feature is disabled.
-        :raises OmnigentError: 401 if unauthenticated, 404 if not found /
-            not owned, 409 on a stale ``expected_revision``.
-        """
-        user_id = require_user(request, auth_provider)
-        project = await asyncio.to_thread(
-            project_store.set_collaboration,
-            project_id,
-            user_id=user_id,
-            enabled=body.enabled,
-            expected_revision=body.expected_revision,
-        )
-        if project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return {
-            "enabled": project.collaboration_enabled,
-            "revision": project.collaboration_revision,
         }
 
     @router.put("/projects/{project_id}/repositories/{name}")

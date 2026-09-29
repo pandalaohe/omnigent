@@ -47,18 +47,19 @@ class DefaultHost:
     reason: Literal["config", "single_root", "ambiguous", "none"]
 
 
-def bindings_apply(project: Project, feature_flags: FeatureFlags | None) -> bool:
+def bindings_apply(
+    project: Project,  # noqa: ARG001 — kept for the per-project gate's call shape
+    feature_flags: FeatureFlags | None,
+) -> bool:
     """Return whether binding roots are enabled for this project.
 
-    :param project: Project whose collaboration switch is checked.
+    :param project: Project whose bindings are checked. Kept in the
+        signature so callers stay project-scoped once a per-project gate
+        returns.
     :param feature_flags: Deployment feature snapshot, if available.
-    :returns: Whether both the project switch and assignment flag are on.
+    :returns: Whether the deployment's assignment flag is on.
     """
-    return bool(
-        feature_flags is not None
-        and feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS)
-        and project.collaboration_enabled
-    )
+    return bool(feature_flags is not None and feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS))
 
 
 def _entry_on_host(entries: Iterable[ProjectHostEntry], host_id: str) -> ProjectHostEntry | None:

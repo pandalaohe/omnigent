@@ -407,6 +407,23 @@ def mock_llm() -> Iterator[ControllableMockClient]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_open_rate_windows() -> Iterator[None]:
+    """
+    Clear the process-global session-open rate windows around every test.
+
+    ``session_open_rate._OPEN_TIMESTAMPS`` is module-global and keyed by
+    owner, and the limiter now counts unnamed child creates as well as
+    ``sys_session_open``. Without a reset, children created by one test
+    spend the budget of every later test in the same xdist worker.
+    """
+    from omnigent.server import session_open_rate
+
+    session_open_rate._OPEN_TIMESTAMPS.clear()
+    yield
+    session_open_rate._OPEN_TIMESTAMPS.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_elicitation_state() -> Iterator[None]:
     """
     Clear the module-global elicitation state after every test.

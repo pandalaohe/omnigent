@@ -312,6 +312,7 @@ _PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
 _ROUTED_TOOL_APPROVALS = {
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
+    "sys_session_open": {"approval_mode": "approve"},
     "sys_agent_list": {"approval_mode": "approve"},
     "sys_session_send": {"approval_mode": "approve"},
     "sys_read_inbox": {"approval_mode": "approve"},

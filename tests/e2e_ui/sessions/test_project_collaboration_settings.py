@@ -11,8 +11,7 @@ and re-served with ``features.project_assignments = true`` (the
 ``test_usage_page_feature.py`` precedent), and ``/v1/hosts`` serves one
 online host (the ``test_browse_outside_workspace.py`` precedent). The
 collaboration routes themselves are stubbed with an in-test state dict that
-mirrors the server contract (revision increments on PATCH; a stale
-``expected_revision`` is a 409 ``conflict``).
+mirrors the server contract.
 
 The project itself is real (created via ``POST /v1/projects``), so the
 dialog's own config fetch and the folder kebab are the production paths.
@@ -89,30 +88,24 @@ def _stub_single_host(page: Page) -> None:
 
 def _stub_collaboration(
     page: Page,
-    patch_bodies: list[dict[str, Any]],
     repo_puts: list[dict[str, Any]],
     binding_puts: list[dict[str, Any]],
     unexpected: list[dict[str, Any]],
 ) -> None:
     """Serve the collaboration routes the scenarios use from an in-test state dict.
 
-    Mirrors the server contract: PATCH bumps ``revision`` and rejects a stale
-    ``expected_revision`` with a 409 ``conflict``; a binding add for a path
-    the host cannot stat is a 400 ``invalid_input`` with the server's message.
-    Only the methods and paths the scenarios use are served — anything else
-    is recorded in ``unexpected`` (asserted empty at the end of the test).
+    Mirrors the server contract: a binding add for a path the host cannot stat
+    is a 400 ``invalid_input`` with the server's message. Only the methods and
+    paths the scenarios use are served — anything else is recorded in
+    ``unexpected`` (asserted empty at the end of the test).
     """
 
     state: dict[str, Any] = {
-        "enabled": False,
-        "revision": 1,
         "repositories": {},
     }
 
     def snapshot() -> dict[str, Any]:
         return {
-            "enabled": state["enabled"],
-            "revision": state["revision"],
             "repositories": list(state["repositories"].values()),
             "bindings": [],
             "problems": [],
@@ -141,32 +134,7 @@ def _stub_collaboration(
                 body=json.dumps(snapshot()),
             )
             return
-        if method != "PATCH":
-            reject(route, method, path)
-            return
-        body = json.loads(route.request.post_data or "{}")
-        patch_bodies.append(body)
-        if body.get("expected_revision") != state["revision"]:
-            route.fulfill(
-                status=409,
-                headers={"content-type": "application/json"},
-                body=json.dumps(
-                    {
-                        "error": {
-                            "code": "conflict",
-                            "message": "collaboration settings changed elsewhere",
-                        }
-                    }
-                ),
-            )
-            return
-        state["enabled"] = body["enabled"]
-        state["revision"] += 1
-        route.fulfill(
-            status=200,
-            headers={"content-type": "application/json"},
-            body=json.dumps({"enabled": state["enabled"], "revision": state["revision"]}),
-        )
+        reject(route, method, path)
 
     def handle_repositories(route: Route) -> None:
         path = urlparse(route.request.url).path
@@ -222,44 +190,31 @@ def _stub_collaboration(
     page.route(re.compile(r"/v1/projects/[^/]+/hosts/.+/bindings/.+"), handle_bindings)
 
 
-def test_collaboration_enable_repo_and_rejected_binding(
+def test_collaboration_repo_and_rejected_binding(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Enable collaboration, register a repo, and surface a rejected binding path.
+    """Register a repo and surface a rejected binding path.
 
-    The toggle PATCHes ``{enabled, expected_revision}`` off the loaded
-    revision; the repository add registers ``web``; the binding add for a
-    path the host cannot stat fails with the server's 400 message verbatim
-    and leaves no binding row behind.
+    The repository add registers ``web``; the binding add for a path the host
+    cannot stat fails with the server's 400 message verbatim and leaves no
+    binding row behind.
     """
     base_url, session_id = seeded_session
     project = f"Project {uuid.uuid4().hex[:6]}"
     project_id = _create_project(base_url, project)
-    patch_bodies: list[dict[str, Any]] = []
     repo_puts: list[dict[str, Any]] = []
     binding_puts: list[dict[str, Any]] = []
     unexpected: list[dict[str, Any]] = []
 
     _stub_feature_on(page)
     _stub_single_host(page)
-    _stub_collaboration(page, patch_bodies, repo_puts, binding_puts, unexpected)
+    _stub_collaboration(page, repo_puts, binding_puts, unexpected)
     page.goto(f"{base_url}/c/{session_id}")
 
     _open_project_settings(page, project)
 
     page.get_by_role("tab", name="Collaboration").click()
-
-    # The collaboration switch starts OFF (revision 1 in the stub).
-    toggle = page.get_by_test_id("project-collaboration-enabled")
-    expect(toggle).to_be_visible()
-    expect(toggle).to_have_attribute("data-state", "unchecked")
-
-    # Flip it ON — the PATCH carries the loaded revision.
-    toggle.click()
-    expect(toggle).to_have_attribute("data-state", "checked")
-    expect(page.get_by_test_id("project-collaboration-repo-open")).to_be_enabled()
-    assert patch_bodies[0] == {"enabled": True, "expected_revision": 1}
 
     # Register a repository (manifest left blank → the server default applies).
     page.get_by_test_id("project-collaboration-repo-open").click()
@@ -282,9 +237,8 @@ def test_collaboration_enable_repo_and_rejected_binding(
         page.get_by_test_id(f"project-collaboration-binding-verify-{_HOST_ID}-web")
     ).to_have_count(0)
 
-    # Exact request contract: the enable PATCH, the repository PUT body, and
-    # the binding PUT path + body. No handler saw an unexpected method/path.
-    assert patch_bodies == [{"enabled": True, "expected_revision": 1}]
+    # Exact request contract: the repository PUT body and the binding PUT
+    # path + body. No handler saw an unexpected method/path.
     assert repo_puts == [
         {
             "path": f"/v1/projects/{project_id}/repositories/web",

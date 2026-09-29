@@ -345,7 +345,6 @@ async def test_flag_disabled_every_route_404(
     pid, hid = "0" * 32, "1" * 32
     routes = [
         ("GET", f"/v1/projects/{pid}/collaboration", None),
-        ("PATCH", f"/v1/projects/{pid}/collaboration", {"enabled": True, "expected_revision": 0}),
         (
             "PUT",
             f"/v1/projects/{pid}/repositories/root",
@@ -370,8 +369,6 @@ async def test_flag_disabled_malformed_body_still_404(
 ) -> None:
     """With the flag off, the gate runs before body validation rejects."""
     pid, hid = "0" * 32, "1" * 32
-    resp = await disabled_client.patch(f"/v1/projects/{pid}/collaboration", json={})
-    assert resp.status_code == 404, resp.text
     resp = await disabled_client.put(f"/v1/projects/{pid}/repositories/root", json={})
     assert resp.status_code == 404, resp.text
     resp = await disabled_client.put(f"/v1/projects/{pid}/hosts/{hid}/bindings/primary", json={})
@@ -384,16 +381,10 @@ async def test_flag_disabled_malformed_body_still_404(
 async def test_not_owned_project_404(
     multi_user_client: httpx.AsyncClient,
 ) -> None:
-    """One user can never read or flip another user's collaboration config."""
+    """One user can never read another user's collaboration config."""
     bob_project = await _make_project(multi_user_client, "Bob private", headers=_as_user(BOB))
     resp = await multi_user_client.get(
         f"/v1/projects/{bob_project}/collaboration", headers=_as_user(ALICE)
-    )
-    assert resp.status_code == 404
-    resp = await multi_user_client.patch(
-        f"/v1/projects/{bob_project}/collaboration",
-        json={"enabled": True, "expected_revision": 0},
-        headers=_as_user(ALICE),
     )
     assert resp.status_code == 404
 
@@ -443,7 +434,7 @@ def _insert_dangling_binding(
 async def test_get_returns_config_and_problems(
     collab_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """GET returns the switch, rows, and flagged problems with offending ids."""
+    """GET returns the rows and flagged problems with offending ids."""
     project_id = await _make_project(collab_client)
     repo = await _register_repo(collab_client, project_id)
     bindings = SqlAlchemyProjectHostBindingStore(db_uri)
@@ -464,8 +455,8 @@ async def test_get_returns_config_and_problems(
     resp = await collab_client.get(f"/v1/projects/{project_id}/collaboration")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["enabled"] is False
-    assert body["revision"] == 0
+    assert "enabled" not in body
+    assert "revision" not in body
     assert [r["name"] for r in body["repositories"]] == ["root"]
     assert {b["name"] for b in body["bindings"]} == {"extra", "primary"}
     problems = body["problems"]
@@ -478,38 +469,13 @@ async def test_get_returns_config_and_problems(
     assert lonely.id  # the flagged host's binding exists
 
 
-# ── PATCH revision ────────────────────────────────────────
-
-
-async def test_patch_bumps_revision_and_rejects_stale(
-    collab_client: httpx.AsyncClient,
-) -> None:
-    """PATCH flips the switch with optimistic concurrency."""
-    project_id = await _make_project(collab_client)
-    resp = await collab_client.patch(
-        f"/v1/projects/{project_id}/collaboration",
-        json={"enabled": True, "expected_revision": 0},
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"enabled": True, "revision": 1}
-    stale = await collab_client.patch(
-        f"/v1/projects/{project_id}/collaboration",
-        json={"enabled": False, "expected_revision": 0},
-    )
-    assert stale.status_code == 409
-
-
 @pytest.mark.flaky(reruns=2, reruns_delay=1)
-async def test_repo_and_binding_put_leave_collaboration_revision(
+async def test_binding_put_needs_no_project_switch(
     collab_client: httpx.AsyncClient,
     live_host: dict[str, Any],
 ) -> None:
-    """Repository and binding edits carry their own revision, not the switch's."""
+    """A binding edit needs only the deployment flag, not a project switch."""
     project_id = await _make_project(collab_client)
-    await collab_client.patch(
-        f"/v1/projects/{project_id}/collaboration",
-        json={"enabled": True, "expected_revision": 0},
-    )
     await _register_repo(collab_client, project_id)
     live_host["replies"]["/data/work"] = {
         "status": "ok",
@@ -528,7 +494,8 @@ async def test_repo_and_binding_put_leave_collaboration_revision(
     )
     assert resp.status_code == 200, resp.text
     config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
-    assert config["revision"] == 1
+    assert "enabled" not in config
+    assert "revision" not in config
 
 
 # ── Repository validation ─────────────────────────────────

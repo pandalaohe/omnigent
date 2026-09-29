@@ -1,9 +1,8 @@
 """Tests for collaboration config and the repository/binding stores.
 
-Covers ``ProjectStore.set_collaboration`` (revision bump and conflict),
-repository upsert (revision bump on change only), binding upsert (the
-one-primary invariant per ``(project, host)``), and the per-host project
-entries (upsert / list / delete / existence guard).
+Covers repository upsert (revision bump on change only), binding upsert
+(the one-primary invariant per ``(project, host)``), and the per-host
+project entries (upsert / list / delete / existence guard).
 """
 
 from __future__ import annotations
@@ -67,75 +66,6 @@ def _create_repo(
         remote_url="git@github.com:example/repo.git",
         default_branch="main",
     ).id
-
-
-# ── set_collaboration ───────────────────────────────────────────────────
-
-
-def test_set_collaboration_enables_and_bumps_revision(
-    project_store: SqlAlchemyProjectStore,
-) -> None:
-    """Enabling with the current revision flips the switch and bumps to 1."""
-    project_store.create(_uid("p1"), "P", "alice@example.com")
-    updated = project_store.set_collaboration(
-        _uid("p1"), user_id="alice@example.com", enabled=True, expected_revision=0
-    )
-    assert updated is not None
-    assert updated.collaboration_enabled is True
-    assert updated.collaboration_revision == 1
-    assert updated.updated_at is not None
-
-
-def test_set_collaboration_stale_revision_conflicts(
-    project_store: SqlAlchemyProjectStore,
-) -> None:
-    """A second writer holding the old revision gets ``CONFLICT``."""
-    project_store.create(_uid("p1"), "P", "alice@example.com")
-    project_store.set_collaboration(
-        _uid("p1"), user_id="alice@example.com", enabled=True, expected_revision=0
-    )
-    with pytest.raises(OmnigentError) as exc:
-        project_store.set_collaboration(
-            _uid("p1"), user_id="alice@example.com", enabled=False, expected_revision=0
-        )
-    assert exc.value.code == ErrorCode.CONFLICT
-    # The winner's write stands.
-    got = project_store.get(_uid("p1"), user_id="alice@example.com")
-    assert got is not None
-    assert (got.collaboration_enabled, got.collaboration_revision) == (True, 1)
-
-
-def test_set_collaboration_missing_returns_none(
-    project_store: SqlAlchemyProjectStore,
-) -> None:
-    """An unknown project returns ``None``, like ``update``."""
-    assert (
-        project_store.set_collaboration(
-            _uid("nope"), user_id="alice@example.com", enabled=True, expected_revision=0
-        )
-        is None
-    )
-
-
-def test_set_collaboration_scoped_to_owner(project_store: SqlAlchemyProjectStore) -> None:
-    """A non-owner cannot flip another user's switch."""
-    project_store.create(_uid("p1"), "P", "alice@example.com")
-    assert (
-        project_store.set_collaboration(
-            _uid("p1"), user_id="bob@example.com", enabled=True, expected_revision=0
-        )
-        is None
-    )
-    assert (
-        project_store.get(_uid("p1"), user_id="alice@example.com").collaboration_enabled is False
-    )
-
-
-def test_new_projects_start_uncollaborative(project_store: SqlAlchemyProjectStore) -> None:
-    """The migrated columns default to disabled / revision 0."""
-    project = project_store.create(_uid("p1"), "P", "alice@example.com")
-    assert project.collaboration_enabled is False
-    assert project.collaboration_revision == 0
 
 
 # ── repositories ────────────────────────────────────────────────────────

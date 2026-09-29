@@ -274,6 +274,7 @@ _FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
 #: ``_ROUTED_SPAWN_ALLOWED_TOOLS`` gate.
 _ROUTED_SPAWN_APPROVED_TOOLS: tuple[str, ...] = (
     "sys_session_create",
+    "sys_session_open",
     "sys_agent_list",
     "sys_session_send",
     "sys_read_inbox",

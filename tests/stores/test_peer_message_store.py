@@ -116,6 +116,36 @@ def test_find_unreplied_returns_newest(store: SqlAlchemyPeerMessageStore) -> Non
     assert store.find_unreplied(sender, _uid("other")) is None
 
 
+def test_find_sent_matches_ref_or_id_within_window(store: SqlAlchemyPeerMessageStore) -> None:
+    """``find_sent`` matches ref or record id, newest first, any state."""
+    sender, receiver = _uid("fs-sender"), _uid("fs-receiver")
+    older = store.create(
+        _record(
+            "fs1",
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            ref="corr-fs",
+            created_at=100,
+        )
+    )
+    newer = store.create(
+        _record(
+            "fs2",
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            ref="corr-fs",
+            created_at=200,
+            state="delivered",
+        )
+    )
+    assert store.find_sent(sender, receiver, "corr-fs", 0).id == newer.id  # type: ignore[union-attr]
+    assert store.find_sent(sender, receiver, "corr-fs", 150).id == newer.id  # type: ignore[union-attr]
+    assert store.find_sent(sender, receiver, "corr-fs", 201) is None
+    assert store.find_sent(sender, receiver, older.id, 0).id == older.id  # type: ignore[union-attr]
+    assert store.find_sent(receiver, sender, "corr-fs", 0) is None
+    assert store.find_sent(sender, receiver, "missing", 0) is None
+
+
 def test_count_for_ref(store: SqlAlchemyPeerMessageStore) -> None:
     """``count_for_ref`` counts exactly the records carrying the ref."""
     ref = "corr-1"

@@ -368,7 +368,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-    from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
     from omnigent.stores.comment_store.sqlalchemy_store import (
         SqlAlchemyCommentStore,
     )
@@ -413,7 +412,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     project_store = SqlAlchemyProjectStore(database_url)
     project_repository_store = SqlAlchemyProjectRepositoryStore(database_url)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(database_url)
-    assignment_store = SqlAlchemyAssignmentStore(database_url)
     peer_message_store = SqlAlchemyPeerMessageStore(database_url)
     user_preferences_store = SqlAlchemyUserPreferencesStore(database_url)
     host_model_catalog_cache_store = HostModelCatalogCacheStore(database_url)
@@ -526,7 +524,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         project_store=project_store,
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
-        assignment_store=assignment_store,
         peer_message_store=peer_message_store,
         auth_provider=auth_provider,
         account_store=account_store,

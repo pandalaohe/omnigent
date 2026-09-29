@@ -30,15 +30,6 @@ from omnigent.tools.builtins.agents import (
     SysAgentGetTool,
     SysAgentListTool,
 )
-from omnigent.tools.builtins.assignments import (
-    SysAssignmentCancelTool,
-    SysAssignmentCompleteTool,
-    SysAssignmentDispatchTool,
-    SysAssignmentGetTool,
-    SysAssignmentListTool,
-    SysAssignmentReadMessagesTool,
-    SysAssignmentSendTool,
-)
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -65,6 +56,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskUpdateTool,
 )
 from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
+from omnigent.tools.builtins.session_open import SysSessionOpenTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
@@ -94,13 +86,6 @@ __all__ = [
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
-    "SysAssignmentCancelTool",
-    "SysAssignmentCompleteTool",
-    "SysAssignmentDispatchTool",
-    "SysAssignmentGetTool",
-    "SysAssignmentListTool",
-    "SysAssignmentReadMessagesTool",
-    "SysAssignmentSendTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysListModelsTool",
@@ -115,6 +100,7 @@ __all__ = [
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
     "SysSessionListTool",
+    "SysSessionOpenTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",

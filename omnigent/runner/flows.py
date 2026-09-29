@@ -323,8 +323,8 @@ def _step_refusal(tool: str, ctx: FlowContext) -> str | None:
         tool,
         ctx.agent_spec,
         ctx.effective_harness,
-        project_assignments_enabled=_td._project_assignments_enabled_for(ctx.conversation_id),
         peer_messaging_enabled=_td._peer_messaging_enabled_for(ctx.conversation_id),
+        session_open_enabled=_td._session_open_enabled_for(ctx.conversation_id),
     )
 
 

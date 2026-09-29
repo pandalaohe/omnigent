@@ -4467,7 +4467,6 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
-    from omnigent.stores.assignment_store.sqlalchemy_store import SqlAlchemyAssignmentStore
     from omnigent.stores.global_instructions_store.sqlalchemy_store import (
         SqlAlchemyGlobalInstructionsStore,
     )
@@ -4484,9 +4483,6 @@ def server(
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
-    from omnigent.stores.session_handoff_store.sqlalchemy_store import (
-        SqlAlchemySessionHandoffStore,
-    )
 
     agent_store = SqlAlchemyAgentStore(db_uri, conv_db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -4499,9 +4495,7 @@ def server(
     project_store = SqlAlchemyProjectStore(db_uri)
     project_repository_store = SqlAlchemyProjectRepositoryStore(db_uri)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(db_uri)
-    assignment_store = SqlAlchemyAssignmentStore(db_uri)
     peer_message_store = SqlAlchemyPeerMessageStore(db_uri)
-    session_handoff_store = SqlAlchemySessionHandoffStore(db_uri)
     user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
     host_model_catalog_cache_store = HostModelCatalogCacheStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
@@ -4694,9 +4688,7 @@ def server(
         project_store=project_store,
         project_repository_store=project_repository_store,
         project_host_binding_store=project_host_binding_store,
-        assignment_store=assignment_store,
         peer_message_store=peer_message_store,
-        session_handoff_store=session_handoff_store,
         auth_provider=auth_provider,
         host_store=host_store,
         host_model_catalog_cache_store=host_model_catalog_cache_store,

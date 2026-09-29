@@ -75,6 +75,7 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
     local_single_user_enabled,
 )
@@ -89,6 +90,9 @@ from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -230,6 +234,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     UpdateSessionRequest,
 )
+from omnigent.server.session_open_rate import admit_open
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -697,9 +702,6 @@ def register_core_routes(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
-                    project_assignments_enabled=request.app.state.feature_flags.enabled(
-                        Feature.PROJECT_ASSIGNMENTS
-                    ),
                     peer_messaging_enabled=peer_messaging_enabled,
                     global_instructions=global_instructions,
                 )
@@ -714,6 +716,50 @@ def register_core_routes(
                     exc_info=True,
                 )
         return init_body
+
+    async def _admit_child_create(
+        request: Request,
+        *,
+        user_id: str | None,
+        parent_session_id: str | None,
+        sub_agent_name: str | None,
+    ) -> None:
+        """Refuse a child create when the owner's open-rate window is full.
+
+        An unnamed child create is an open (D7), so it spends the parent
+        owner's open-rate budget before any row is written. Named
+        sub-agent dispatch (``sub_agent_name`` set) is not an open and
+        does not count.
+
+        :param request: The create request (for ``app.state``).
+        :param user_id: Authenticated caller, or ``None``.
+        :param parent_session_id: The child's parent, or ``None`` for a
+            top-level create (never counted).
+        :param sub_agent_name: Named sub-agent dispatch, or ``None``.
+        :raises HTTPException: 429 with the settings refusal text.
+        """
+        if parent_session_id is None or sub_agent_name is not None:
+            return
+        # Authorize the caller on the parent before charging its owner's
+        # window: a forged parent link must not spend the real owner's
+        # budget, and must be refused before the rate can mask the 403/404.
+        if permission_store is not None:
+            await _require_access(
+                user_id,
+                parent_session_id,
+                LEVEL_READ,
+                permission_store,
+                conversation_store,
+            )
+        owner: str | None = None
+        if permission_store is not None:
+            owner = await asyncio.to_thread(
+                _get_session_owner_id, parent_session_id, permission_store
+            )
+        owner = owner or user_id or RESERVED_USER_LOCAL
+        refusal_text = await asyncio.to_thread(admit_open, request.app.state, owner)
+        if refusal_text is not None:
+            raise HTTPException(status_code=429, detail=refusal_text)
 
     @router.post(
         "/sessions",
@@ -803,6 +849,12 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        await _admit_child_create(
+            request,
+            user_id=user_id,
+            parent_session_id=body.parent_session_id,
+            sub_agent_name=body.sub_agent_name,
+        )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -1069,6 +1121,16 @@ def register_core_routes(
                     parsed_metadata = parsed_metadata.model_copy(
                         update={"project_id": parent_project_id}
                     )
+
+        # The multipart shape has no sub_agent_name, so any child bundle
+        # create is an open and spends the parent owner's rate budget. The
+        # parent is authorized above, so a forged link cannot charge it.
+        await _admit_child_create(
+            request,
+            user_id=user_id,
+            parent_session_id=parsed_metadata.parent_session_id,
+            sub_agent_name=None,
+        )
 
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host

@@ -5487,9 +5487,6 @@ async def _ensure_runner_session_initialized(
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                     archive_states=archive_states,
-                    project_assignments_enabled=resolve_feature_flags().enabled(
-                        Feature.PROJECT_ASSIGNMENTS
-                    ),
                     peer_messaging_enabled=resolve_feature_flags().enabled(
                         Feature.SESSION_PEER_MESSAGING
                     ),
@@ -10143,7 +10140,7 @@ async def _create_session_from_existing_agent(
         to the runner.
     :param artifact_store: Optional binary content store for the same.
     :param calling_path_label: The create path named in a refused calling
-        default, e.g. ``"hand-off"`` for the receiver create.
+        default, e.g. ``"session_create"``.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``

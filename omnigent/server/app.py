@@ -98,7 +98,6 @@ from omnigent.server.performance_metrics import (
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
-from omnigent.server.routes.assignments import create_assignments_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.calling_defaults import create_calling_defaults_router
 from omnigent.server.routes.comments import create_comments_router
@@ -157,7 +156,6 @@ from omnigent.stores import (
     ConversationStore,
     FileStore,
 )
-from omnigent.stores.assignment_store import AssignmentStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
@@ -174,7 +172,6 @@ from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_repository_store import ProjectRepositoryStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
-from omnigent.stores.session_handoff_store import SessionHandoffStore
 
 _logger = logging.getLogger(__name__)
 
@@ -1407,9 +1404,7 @@ def create_app(
     project_store: ProjectStore | None = None,
     project_repository_store: ProjectRepositoryStore | None = None,
     project_host_binding_store: ProjectHostBindingStore | None = None,
-    assignment_store: AssignmentStore | None = None,
     peer_message_store: PeerMessageStore | None = None,
-    session_handoff_store: SessionHandoffStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     host_model_catalog_cache_store: HostModelCatalogCacheStore | None = None,
@@ -1478,14 +1473,10 @@ def create_app(
     :param project_host_binding_store: Store for a project's per-host
         directory bindings. Mounts the collaboration router only together
         with ``project_store`` and ``project_repository_store``.
-    :param assignment_store: Store for assignments, attempts and messages.
-        Mounts the assignments router only together with ``project_store``,
-        ``project_repository_store`` and ``conversation_store``.
     :param peer_message_store: Store for durable session peer-message
         records. Wired onto ``app.state`` and into the peer-message
         routes; ``None`` leaves ``POST .../peer-messages`` failing
         with a clear 500.
-    :param session_handoff_store: Store for durable session hand-off records.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1691,7 +1682,6 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
-        project_assignments_enabled=resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS),
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -1777,42 +1767,6 @@ def create_app(
 
         set_runner_router(runner_router)
         await archive_close_coordinator.start()
-
-        from omnigent.server.feature_flags import Feature
-
-        assignment_coordinator = None
-        if (
-            resolved_feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS)
-            and assignment_store is not None
-            and project_store is not None
-            and project_repository_store is not None
-            and project_host_binding_store is not None
-            and host_store is not None
-        ):
-            from omnigent.server.assignments import AssignmentCoordinator
-
-            assignment_coordinator = AssignmentCoordinator(
-                assignment_store=assignment_store,
-                project_store=project_store,
-                repository_store=project_repository_store,
-                binding_store=project_host_binding_store,
-                host_store=host_store,
-                host_registry=host_registry,
-                conversation_store=conversation_store,
-                permission_store=permission_store,
-                runner_router=runner_router,
-                tunnel_registry=tunnel_registry,
-                runner_exit_reports=runner_exit_reports,
-                file_store=file_store,
-                artifact_store=artifact_store,
-                runner_session_initializer=runner_session_initializer,
-                agent_store=agent_store,
-                agent_cache=agent_cache,
-                preferences_store=user_preferences_store,
-                catalog_store=host_model_catalog_cache_store,
-            )
-            await assignment_coordinator.start()
-        app_inst.state.assignment_coordinator = assignment_coordinator
 
         # Wake a blocked sub-agent's immediate parent: hooks
         # ``pending_elicitations.record_publish`` to post a ``[System: …]``
@@ -2084,8 +2038,6 @@ def create_app(
             if cli_retention_coordinator is not None:
                 await cli_retention_coordinator.shutdown()
             await archive_close_coordinator.shutdown()
-            if assignment_coordinator is not None:
-                await assignment_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -2117,13 +2069,11 @@ def create_app(
     # diagnostics can verify that the production app wires the route
     # and WSTunnelTransport to the same session registry.
     app.state.peer_message_store = peer_message_store
-    app.state.session_handoff_store = session_handoff_store
     app.state.project_host_binding_store = project_host_binding_store
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.cli_retention_coordinator = cli_retention_coordinator
     app.state.archive_close_coordinator = archive_close_coordinator
-    app.state.assignment_coordinator = None
     app.state.cli_release_intent_store = cli_release_intent_store
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
@@ -3626,7 +3576,6 @@ def create_app(
             background_title_coordinator=background_title_coordinator,
             feature_flags=resolved_feature_flags,
             peer_message_store=peer_message_store,
-            session_handoff_store=session_handoff_store,
             app_state=app.state,
             # Lets the native hook routes read the session owner's
             # approval-timeout setting; absent → defaults.
@@ -3903,33 +3852,6 @@ def create_app(
             ),
             prefix="/v1",
             tags=["projects"],
-        )
-
-    # Assignment dispatch and lifecycle. Mounted only when the assignment
-    # store, the project store, the repository store and the conversation
-    # store are wired; creation and refresh additionally gate on
-    # Feature.PROJECT_ASSIGNMENTS, while every other route stays served so
-    # in-flight work can finish after the switch goes off.
-    if (
-        assignment_store is not None
-        and project_store is not None
-        and project_repository_store is not None
-        and conversation_store is not None
-    ):
-        app.include_router(
-            create_assignments_router(
-                assignment_store,
-                project_store,
-                project_repository_store,
-                conversation_store=conversation_store,
-                agent_store=agent_store,
-                permission_store=permission_store,
-                auth_provider=auth_provider,
-                host_store=host_store,
-                feature_flags=resolved_feature_flags,
-            ),
-            prefix="/v1",
-            tags=["assignments"],
         )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
@@ -4382,9 +4304,9 @@ def create_app(
             if cli_retention_coordinator is not None:
                 cli_retention_coordinator.trigger(host_id)
             archive_close_coordinator.trigger_pending(host_id=host_id)
-            coordinator = getattr(app.state, "assignment_coordinator", None)
-            if coordinator is not None and host_registry.get(host_id) is not None:
-                coordinator.trigger_host(host_id)
+            pending = getattr(app.state, "pending_session_opens", None)
+            if pending is not None and host_registry.get(host_id) is not None:
+                pending.trigger(host_id)
 
         app.include_router(
             create_host_tunnel_router(

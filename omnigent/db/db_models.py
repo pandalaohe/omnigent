@@ -863,8 +863,7 @@ class SqlProject(OmnigentBase):
     collaboration_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
-    # Bumped by every collaboration-config change; an assignment records the
-    # value it was created against.
+    # Bumped by every collaboration-config change.
     collaboration_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
@@ -2014,13 +2013,12 @@ class SqlProjectRepository(OmnigentBase):
     :param project_id: The project this repository is registered on (relates
         to ``projects.id``). No DB foreign key (Rule R032); cleanup on
         project deletion is application-owned.
-    :param name: Stable identity used by assignments; unique per project.
+    :param name: Stable identity; unique per project.
     :param remote_url: The shared remote. Carries no credentials.
     :param default_branch: The repository's default branch name.
     :param context_manifest_path: Repo-relative path of the project-context
         manifest, e.g. ``".agents/project/manifest.json"``.
-    :param revision: Bumped on any change; assignments pin the value they
-        were created against.
+    :param revision: Bumped on any change.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if
         the row has never been updated.
@@ -2092,8 +2090,7 @@ class SqlProjectHostBinding(OmnigentBase):
     :param workspace: Absolute path as the host canonicalised it, never as
         typed. Host-native syntax is preserved (POSIX, Windows drive, UNC).
     :param enabled: Disabled bindings are skipped at claim time.
-    :param revision: Bumped on any change; assignments pin the value they
-        started against.
+    :param revision: Bumped on any change.
     :param path_verified_at: Unix epoch seconds of the last successful
         ``host.stat``, or ``None`` if never verified.
     :param created_at: Unix epoch seconds at row creation.
@@ -2192,9 +2189,10 @@ class SqlAssignment(OmnigentBase):
     """
     SQLAlchemy model for the ``assignments`` table.
 
-    One unit of work handed to one ``(host, agent)`` destination. Artifacts
-    and context move by git; the row stores pointers, addressing and state,
-    never file content.
+    The assignment feature is retired; the table is retained for its
+    existing rows. One unit of work handed to one ``(host, agent)``
+    destination. Artifacts and context move by git; the row stores
+    pointers, addressing and state, never file content.
 
     :param id: Caller-generated UUID primary key (see :class:`Uuid16`),
         stable across retries so a retried create is recognised.
@@ -2242,8 +2240,8 @@ class SqlAssignment(OmnigentBase):
         comparison is made on.
     :param state: Lifecycle state — ``preparing``/``waiting``/``starting``/
         ``running``/``publishing``/``stopping``/``succeeded``/``failed``/
-        ``cancelled``/``expired``/``interrupted``. See
-        ``omnigent.entities.assignment.is_legal_transition``.
+        ``cancelled``/``expired``/``interrupted``. The transition helper
+        module was deleted with the retired assignment feature.
     :param wait_reason: The visible reason while ``waiting``.
     :param next_check_at: Unix epoch seconds when the coordinator may look
         at this row again, or ``None``.
@@ -2351,8 +2349,9 @@ class SqlAssignmentAttempt(OmnigentBase):
     """
     SQLAlchemy model for the ``assignment_attempts`` table.
 
-    One execution attempt of an assignment. At most one ``active`` attempt
-    per assignment; liveness is observed server-side via
+    The assignment feature is retired; the table is retained for its
+    existing rows. One execution attempt of an assignment. At most one
+    ``active`` attempt per assignment; liveness is observed server-side via
     ``lease_expires_at``, which the coordinator writes.
 
     :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
@@ -2432,9 +2431,10 @@ class SqlAssignmentMessage(OmnigentBase):
     """
     SQLAlchemy model for the ``assignment_messages`` table.
 
-    Append-only, assignment-scoped messages: the cross-tree channel between
-    the sending and receiving sessions. Reads are cursor-based and
-    repeatable; reading never consumes.
+    The assignment feature is retired; the table is retained for its
+    existing rows. Append-only, assignment-scoped messages: the cross-tree
+    channel between the sending and receiving sessions. Reads are
+    cursor-based and repeatable; reading never consumes.
 
     :param id: UUID primary key (see :class:`Uuid16`), surfaced as a bare
         32-char hex string (no dashes).

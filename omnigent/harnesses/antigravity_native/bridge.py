@@ -340,6 +340,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
+    "sys_session_open",
     "sys_session_send",
     "sys_session_unarchive",
     "sys_terminal_close",
