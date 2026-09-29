@@ -362,6 +362,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    effective_host_id,
 )
 from omnigent.server.runner_session_init import (
     RunnerSessionInitializer,
@@ -10546,10 +10547,15 @@ async def _create_session_from_existing_agent(
     child_project_id: str | None = parent_project.id if parent_project is not None else None
     if body.parent_session_id is not None and parent_conv is not None:
         inherited_runner_id = parent_conv.runner_id
-        if body.host_id is not None and body.host_id != parent_conv.host_id:
+        if body.host_id is not None and body.host_id != effective_host_id(
+            conversation_store, parent_conv
+        ):
             # Cross-host member child (SCC06 F2b): the parent's runner
             # cannot serve the member's host. Leave it unbound so the
-            # create route's host launch starts a runner on that host.
+            # create route's host launch starts a runner on that host. The
+            # parent's effective host is its nearest host-bound ancestor:
+            # a hostless-row parent still shares its root's runner, so a
+            # child that names that same host stays on it.
             inherited_runner_id = None
         # Defense-in-depth: don't inherit a runner the caller doesn't own.
         if inherited_runner_id is not None and user_id is not None and runner_router is not None:

@@ -1636,6 +1636,33 @@ def _ancestor_session_ids(
     return ancestors
 
 
+def effective_host_id(
+    conv_store: ConversationStore,
+    conv: Conversation,
+) -> str | None:
+    """
+    Return the first non-null host id at or above *conv*.
+
+    A sub-agent row usually carries no host binding of its own: it runs on
+    the runner its nearest host-bound ancestor is pinned to. Affinity and
+    cross-host decisions must use this effective host rather than the raw
+    row value, or a hostless-row parent under a host-bound root reads as a
+    different host from the child that names that same host.
+
+    :param conv_store: Store used to read conversation ancestor rows.
+    :param conv: Conversation whose effective host is resolved.
+    :returns: The effective host id, or ``None`` when no host is bound at
+        or above *conv* (a hostless local runner).
+    """
+    if conv.host_id is not None:
+        return conv.host_id
+    for ancestor_id in _ancestor_session_ids(conv_store, conv.id):
+        ancestor = conv_store.get_conversation(ancestor_id)
+        if ancestor is not None and ancestor.host_id is not None:
+            return ancestor.host_id
+    return None
+
+
 def _publish_elicitation_request_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
@@ -12440,6 +12467,7 @@ __all__ = [
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "cleanup_worktree",
+    "effective_host_id",
     "effective_worktree",
     "prefetch_session_routing_catalogs",
 ]

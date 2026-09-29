@@ -244,3 +244,58 @@ async def test_same_host_child_keeps_the_single_child_runner_forward(
     assert len(route.forwarded) == 1
     _path, body = route.forwarded[0]
     assert "cross_host" not in body["data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_host", "expects_forward"),
+    [
+        (_LEAD_HOST, False),
+        (_MEMBER_HOST, True),
+    ],
+    ids=["same-effective-host", "different-host"],
+)
+async def test_effective_host_decides_cross_host_for_hostless_row_parent(
+    cross_host_route: _CrossHostRoute,
+    child_host: str,
+    expects_forward: bool,
+) -> None:
+    """A placed child of a hostless-row parent compares effective hosts.
+
+    The parent row carries no ``host_id`` of its own (a mirrored/native child
+    row), but the root is host-bound. A child that names that same host shares
+    the parent's runner and must not trigger a second-runner forward; a child
+    on another host must.
+    """
+    route = cross_host_route
+    root = route.store.create_conversation(
+        host_id=_LEAD_HOST,
+        workspace="/lead/ws",
+        runner_id="runner_lead",
+    )
+    hostless_parent = route.store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=root.id,
+        runner_id="runner_lead",
+    )
+    child = route.store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=hostless_parent.id,
+        host_id=child_host,
+        workspace="/placed/ws",
+        runner_id="runner_placed",
+    )
+
+    response = await route.client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_status", "data": {"status": "idle", "output": "result"}},
+    )
+
+    assert response.status_code == 202, response.text
+    if expects_forward:
+        assert route.waited_for == [hostless_parent.id]
+        assert len(route.forwarded) == 2
+    else:
+        assert route.waited_for == []
+        assert len(route.forwarded) == 1
+        assert "cross_host" not in route.forwarded[0][1]["data"]
