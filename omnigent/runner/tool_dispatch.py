@@ -5520,6 +5520,7 @@ async def _execute_timer_set(
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
+    collab_governed: bool = True,
 ) -> str:
     """
     Schedule a timer that fires after a delay.
@@ -5529,6 +5530,9 @@ async def _execute_timer_set(
     :param server_client: httpx client for persisting firings.
     :param conversation_id: Session the timer belongs to, e.g.
         ``"conv_abc123"``.
+    :param collab_governed: ``False`` when the spec grants timers itself
+        (``timers: true``); only timers exposed through the collaboration
+        flag follow the collaboration settings.
     :returns: JSON string with ``timer_id`` and ``status``.
     """
     from omnigent.runner import app as _app
@@ -5539,7 +5543,7 @@ async def _execute_timer_set(
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
-    if not await flows.read_flow_timer_enabled(server_client, conversation_id):
+    if collab_governed and not await flows.read_flow_timer_enabled(server_client, conversation_id):
         return json.dumps({"error": flows.FLOW_TIMER_OFF_ERROR})
 
     timer_id = f"timer_{uuid.uuid4().hex}"
@@ -5551,6 +5555,7 @@ async def _execute_timer_set(
             repeat=repeat,
             note=note,
             server_client=server_client,
+            collab_governed=collab_governed,
         ),
         name=f"timer-{timer_id}",
     )
@@ -5574,6 +5579,7 @@ async def _timer_loop(
     repeat: bool,
     note: str | None,
     server_client: httpx.AsyncClient,
+    collab_governed: bool = True,
 ) -> None:
     """
     Background loop: sleep then fire timer notifications.
@@ -5584,6 +5590,7 @@ async def _timer_loop(
     :param repeat: Loop indefinitely when True.
     :param note: Optional note echoed in firing text.
     :param server_client: httpx client for persistence.
+    :param collab_governed: Whether the collaboration settings apply.
     """
     from omnigent.runner import app as _app
 
@@ -5591,7 +5598,9 @@ async def _timer_loop(
         while True:
             await asyncio.sleep(seconds)
             # Settings row ``flow_timer_enabled`` turned off → stop, no wake.
-            if not await flows.read_flow_timer_enabled(server_client, conversation_id):
+            if collab_governed and not await flows.read_flow_timer_enabled(
+                server_client, conversation_id
+            ):
                 break
             text = f"[System: timer {timer_id} fired]"
             if note:
@@ -8452,6 +8461,13 @@ async def execute_tool(
                     args,
                     server_client=server_client,
                     conversation_id=conversation_id,
+                    # Upstream's own switch: a ``timers: true`` spec ignores ours. With
+                    # no spec (unresolved), only the collab flag can have exposed them.
+                    collab_governed=(
+                        not agent_spec.timers
+                        if agent_spec is not None
+                        else _peer_messaging_enabled_for(conversation_id)
+                    ),
                 )
             else:
                 output = await _execute_timer_cancel(
