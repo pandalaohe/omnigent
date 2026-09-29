@@ -4446,6 +4446,118 @@ async def _fetch_peer_reply_text(
     return {"peer_id": reply_peer_id, "text": text if isinstance(text, str) else None}
 
 
+async def _is_descendant(
+    server_client: httpx.AsyncClient,
+    caller_id: str,
+    target_snapshot: _JsonObject,
+) -> bool:
+    """Whether the target session is a descendant of the caller (D1).
+
+    The target's root must match the caller's root (when both name one), then
+    the target's parent chain is walked with metadata-only GETs until the
+    caller is found, the root is reached, or a session repeats. There is no
+    hop cap: the tree is finite and the walk stops at the root.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param caller_id: The calling session id.
+    :param target_snapshot: The target session's snapshot.
+    :returns: ``True`` when the target is strictly below the caller.
+    """
+    caller = await _session_snapshot(server_client, caller_id)
+    if caller is None:
+        return False
+    target_root = _optional_string(target_snapshot.get("root_conversation_id"))
+    caller_root = _optional_string(caller.get("root_conversation_id")) or caller_id
+    if target_root is not None and target_root != caller_root:
+        return False
+    seen: set[str] = set()
+    parent_id = _optional_string(target_snapshot.get("parent_session_id"))
+    while parent_id is not None and parent_id not in seen:
+        if parent_id == caller_id:
+            return True
+        seen.add(parent_id)
+        parent = await _fetch_session_metadata(server_client, parent_id)
+        if parent is None:
+            return False
+        parent_id = _optional_string(parent.get("parent_session_id"))
+    return False
+
+
+async def _send_to_descendant_session(
+    target_session_id: str,
+    message: str,
+    *,
+    server_client: httpx.AsyncClient,
+    snap_data: _JsonObject,
+    created_by: str | None,
+) -> str:
+    """Post to a descendant without tracking it on the caller (D1).
+
+    The result returns to the target's direct parent, so the caller gets no
+    work entry (one entry per child id would steal the middle session's) and
+    no flow note.
+
+    :param target_session_id: The descendant session id.
+    :param message: The message text to post.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param snap_data: The target's snapshot.
+    :param created_by: Human actor, if known.
+    :returns: A JSON handle naming the direct parent the result returns to.
+    """
+    if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
+        return json.dumps(
+            {
+                "error": "session_closed",
+                "conversation_id": target_session_id,
+                "message": "target sub-agent session is closed; create a new session to continue.",
+            }
+        )
+    display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
+    parsed = _parse_session_title(display_title)
+    agent_label = (
+        parsed.agent
+        or _optional_string(snap_data.get("sub_agent_name"))
+        or _optional_string(snap_data.get("agent_name"))
+        or "agent"
+    )
+    instance_title = parsed.title if parsed.title is not None else (display_title or "")
+    parent_id = _optional_string(snap_data.get("parent_session_id")) or "unknown"
+    try:
+        msg_resp = await _post_child_message_event(
+            server_client,
+            target_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
+        )
+    except httpx.HTTPError as exc:
+        return (
+            f"Error: sys_session_send failed to send message to descendant "
+            f"{target_session_id!r}: {type(exc).__name__}: {exc}"
+        )
+    if msg_resp.status_code >= 400:
+        return (
+            f"Error: sys_session_send failed to send message to descendant "
+            f"{target_session_id!r}: {msg_resp.status_code} {msg_resp.text[:200]}"
+        )
+    return json.dumps(
+        {
+            "task_id": target_session_id,
+            "handle_id": target_session_id,
+            "conversation_id": target_session_id,
+            "kind": "sub_agent",
+            "agent": agent_label,
+            "title": instance_title,
+            "status": "running",
+            "parent_session_id": parent_id,
+            "message": (
+                f"Message sent to descendant sub-agent {agent_label} title "
+                f"{instance_title!r} ({target_session_id}); the result returns to "
+                f"its parent {parent_id}, not to you. Read that session to collect it."
+            ),
+        }
+    )
+
+
 async def _send_to_existing_session(
     target_session_id: str,
     message: str,
@@ -4462,16 +4574,17 @@ async def _send_to_existing_session(
     """
     Post a message to an existing direct-child session, return a handle.
 
-    The by-session-id mode of ``sys_session_send``. **Child-only**: the
+    The by-session-id mode of ``sys_session_send``. **Tree-only**: the
     target must be a direct child of the caller (its
-    ``parent_session_id`` equals ``conversation_id``), so a caller can
-    only drive sessions inside its own subtree — never a sibling or an
-    unrelated session it merely has access to. Looks the target up to
-    verify parentage (404 → ``session_not_found``; wrong parent or
-    denied read → ``session_out_of_tree``), registers the child→parent
-    fan-out and work mappings, posts the message, and returns a
-    ``running`` handle immediately — the completion lands in the parent's
-    ``sys_read_inbox`` queue, matching named-mode send.
+    ``parent_session_id`` equals ``conversation_id``) or, with the live
+    collaboration switch on, a descendant reachable by walking the target's
+    parent chain up to the caller. A descendant post is untracked — its
+    result returns to its own parent — while a sibling or unrelated session
+    is still refused. Looks the target up to verify the relationship (404 →
+    ``session_not_found``; out of tree → ``session_out_of_tree``), registers
+    the child→parent fan-out and work mappings for a direct child, posts the
+    message, and returns a ``running`` handle immediately — the completion
+    lands in the parent's ``sys_read_inbox`` queue, matching named-mode send.
 
     The child's ``(agent, title)`` identity, carried by the handle, the
     launching tool result, and the completion wake notice, comes from
@@ -4507,6 +4620,19 @@ async def _send_to_existing_session(
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
     if snap_data.get("parent_session_id") != conversation_id:
+        # A descendant is reachable before the peer / out-of-tree branch: the
+        # mother drives any session in its own tree, but never a sibling
+        # (D1). The live master switch gates the new surface.
+        if await _runner_app._collab_enabled_live(
+            server_client, conversation_id
+        ) and await _is_descendant(server_client, conversation_id, snap_data):
+            return await _send_to_descendant_session(
+                target_session_id,
+                message,
+                server_client=server_client,
+                snap_data=snap_data,
+                created_by=created_by,
+            )
         if peer_messaging_enabled:
             return await _send_peer_message(
                 target_session_id,
@@ -4522,8 +4648,8 @@ async def _send_to_existing_session(
                 "error": "session_out_of_tree",
                 "conversation_id": target_session_id,
                 "message": (
-                    "target is not a direct child of the calling session; "
-                    "sys_session_send by session_id is child-only."
+                    "target is not a direct child or descendant of the calling "
+                    "session; sys_session_send by session_id is tree-only."
                 ),
             }
         )

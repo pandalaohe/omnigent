@@ -88,8 +88,11 @@ async def test_flag_off_keeps_child_only_error() -> None:
     """Without the flag a non-child target still fails ``session_out_of_tree``."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == f"/v1/sessions/{_TARGET}"
-        return httpx.Response(200, json=_snapshot(parent="conv_other"))
+        # The descendant probe reads the caller and its chain; only the
+        # target matters here, so everything else is not found.
+        if request.url.path == f"/v1/sessions/{_TARGET}":
+            return httpx.Response(200, json=_snapshot(parent="conv_other"))
+        return httpx.Response(404, json={"error": "not found"})
 
     async with _client(handler) as client:
         out = json.loads(
@@ -322,6 +325,12 @@ async def test_reply_poll_replied() -> None:
             )
         if request.url.path == "/v1/peer-messages/peer_reply1":
             return httpx.Response(200, json=_record("delivered", text="got it"))
+        if request.url.path in (
+            f"/v1/sessions/{_CALLER}",
+            f"/v1/sessions/{_CALLER}/collab-settings",
+            "/v1/sessions/conv_other",
+        ):
+            return httpx.Response(404, json={"error": "not found"})
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
     async with _client(handler) as client:
@@ -545,6 +554,11 @@ async def test_flag_read_from_session_cache(monkeypatch: pytest.MonkeyPatch) -> 
             return httpx.Response(200, json=_send_response())
         if request.method == "GET" and request.url.path == f"/v1/sessions/{_CALLER}":
             return httpx.Response(200, json={"labels": {}})
+        if request.url.path in (
+            f"/v1/sessions/{_CALLER}/collab-settings",
+            "/v1/sessions/conv_other",
+        ):
+            return httpx.Response(404, json={"error": "not found"})
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
     from omnigent.runner.app import _session_inboxes_ref as _inboxes_ref
@@ -579,6 +593,11 @@ async def test_peer_opts_reach_peer_route_by_id(monkeypatch: pytest.MonkeyPatch)
             return httpx.Response(200, json=_send_response())
         if request.method == "GET" and request.url.path == f"/v1/sessions/{_CALLER}":
             return httpx.Response(200, json={"labels": {}})
+        if request.url.path in (
+            f"/v1/sessions/{_CALLER}/collab-settings",
+            "/v1/sessions/conv_other",
+        ):
+            return httpx.Response(404, json={"error": "not found"})
         raise AssertionError(f"unexpected {request.method} {request.url.path}")
 
     import asyncio as _asyncio

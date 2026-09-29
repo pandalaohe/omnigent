@@ -13784,3 +13784,204 @@ def test_format_async_task_item_renders_placement_label() -> None:
         }
     )
     assert "worker:phase-a [fn · ~/projects/app] returned: done" in line
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_session_id_reaches_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grandchild is sendable; the mother tracks nothing and the middle entry stays.
+
+    One work entry per child id means registering the grandchild on the
+    mother would steal the middle session's entry, so the descendant post is
+    plain and reports that the result returns to the middle session.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_mother":
+            return httpx.Response(
+                200, json={"id": "conv_mother", "root_conversation_id": "conv_mother"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_mother/collab-settings":
+            return httpx.Response(200, json={"enabled": True})
+        if request.method == "GET" and path == "/v1/sessions/conv_grandchild":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_grandchild",
+                    "title": "worker:deep",
+                    "parent_session_id": "conv_middle",
+                    "root_conversation_id": "conv_mother",
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_middle":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_middle",
+                    "parent_session_id": "conv_mother",
+                    "root_conversation_id": "conv_mother",
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_grandchild/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    middle_entry = runner_app.register_subagent_work(
+        parent_session_id="conv_mother",
+        child_session_id="conv_middle",
+        agent="worker",
+        title="middle",
+    )
+    middle_work_id = middle_entry.work_id
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_grandchild", "args": "dig deeper"}),
+                server_client=server_client,
+                conversation_id="conv_mother",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+            grandchild_entry = runner_app.get_subagent_work("conv_grandchild")
+            intact = runner_app.get_subagent_work("conv_middle")
+    finally:
+        runner_app.unregister_subagent_work("conv_middle")
+        runner_app._session_inboxes_ref.pop("conv_mother", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_grandchild"
+    assert payload["parent_session_id"] == "conv_middle"
+    assert "the result returns to its parent conv_middle" in payload["message"]
+    assert len(event_posts) == 1
+    assert event_posts[0]["data"]["content"][0]["text"] == "dig deeper"
+    assert grandchild_entry is None, "a descendant send must not register work on the mother"
+    assert intact is not None and intact.work_id == middle_work_id
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_session_id_rejects_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling stays refused: the walk reaches the shared root, not the caller."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling_a":
+            return httpx.Response(
+                200, json={"id": "conv_sibling_a", "root_conversation_id": "conv_root"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling_a/collab-settings":
+            return httpx.Response(200, json={"enabled": True})
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling_b":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_sibling_b",
+                    "title": "worker:other",
+                    "parent_session_id": "conv_root",
+                    "root_conversation_id": "conv_root",
+                    "status": "idle",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_root":
+            return httpx.Response(
+                200, json={"id": "conv_root", "root_conversation_id": "conv_root"}
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_sibling_b/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_sibling_b", "args": "hi sibling"}),
+                server_client=server_client,
+                conversation_id="conv_sibling_a",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_sibling_a", None)
+
+    assert json.loads(output)["error"] == "session_out_of_tree"
+    assert event_posts == [], "a sibling send must not post"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_descendant_refused_when_switch_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the live collab switch off a descendant is out of tree again."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_off_mother":
+            return httpx.Response(
+                200, json={"id": "conv_off_mother", "root_conversation_id": "conv_off_mother"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_off_mother/collab-settings":
+            return httpx.Response(200, json={"enabled": False})
+        if request.method == "GET" and path == "/v1/sessions/conv_off_grandchild":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_off_grandchild",
+                    "parent_session_id": "conv_off_middle",
+                    "root_conversation_id": "conv_off_mother",
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions/conv_off_grandchild/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_off_grandchild", "args": "hello"}),
+                server_client=server_client,
+                conversation_id="conv_off_mother",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop("conv_off_mother", None)
+
+    assert json.loads(output)["error"] == "session_out_of_tree"
+    assert event_posts == []
