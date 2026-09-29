@@ -11243,10 +11243,27 @@ def _effective_placement(conv: Conversation, inherited: Placement) -> Placement:
     return Placement(host_id, inherited.cwd, inherited.git_branch)
 
 
+class _FetchedAgentStore:
+    """
+    Agent store serving one already-fetched row.
+
+    The harness resolver still runs per conversation, but
+    :func:`_child_summary_identity` memoises the bound agent row across one
+    list call; the resolver receives this shim so it reads that row instead
+    of hitting the store once per child.
+    """
+
+    def __init__(self, agent: Agent | None) -> None:
+        self._agent = agent
+
+    def get(self, _agent_id: str) -> Agent | None:
+        return self._agent
+
+
 def _child_summary_identity(
     conv: Conversation,
     agent_store: AgentStore | None,
-    memo: dict[str, str | None],
+    memo: dict[str, Agent | None],
 ) -> tuple[str | None, str | None]:
     """
     Resolve a child's agent name and harness for its rail summary.
@@ -11254,31 +11271,34 @@ def _child_summary_identity(
     The agent row read is memoised by ``agent_id`` across one list call —
     many children can share one bound agent. The harness is resolved per
     conversation because it can differ within one agent row through
-    ``harness_override`` or a bundled sub-agent's own executor.
+    ``harness_override`` or a bundled sub-agent's own executor; it reads the
+    memoised row so the row fetch does not repeat.
 
     :param conv: Child conversation row.
     :param agent_store: Store for the bound agent row; ``None`` falls back
         to the runtime global, matching :func:`_resolve_harness`.
-    :param memo: Per-call cache mapping ``agent_id`` to its agent name.
+    :param memo: Per-call cache mapping ``agent_id`` to its agent row.
     :returns: ``(agent_name, harness)``; either half is ``None`` when it
         cannot be resolved. Any resolution failure degrades to
         ``(None, None)`` rather than failing the list.
     """
     try:
-        agent_name: str | None = None
+        agent: Agent | None = None
         if conv.agent_id is not None:
-            if conv.agent_id in memo:
-                agent_name = memo[conv.agent_id]
-            else:
+            if conv.agent_id not in memo:
                 resolved_store = agent_store
                 if resolved_store is None:
                     from omnigent.runtime._globals import _agent_store
 
                     resolved_store = _agent_store
-                agent = resolved_store.get(conv.agent_id) if resolved_store is not None else None
-                agent_name = agent.name if agent is not None else None
-                memo[conv.agent_id] = agent_name
-        return agent_name, _resolve_harness(conv, agent_store=agent_store)
+                memo[conv.agent_id] = (
+                    resolved_store.get(conv.agent_id) if resolved_store is not None else None
+                )
+            agent = memo[conv.agent_id]
+        return (
+            agent.name if agent is not None else None,
+            _resolve_harness(conv, agent_store=_FetchedAgentStore(agent)),
+        )
     except Exception:  # noqa: BLE001 — display fields must not fail the list
         _logger.debug(
             "Could not resolve child summary identity",

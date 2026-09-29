@@ -47,14 +47,28 @@ function titleSuffix(title: string | null | undefined): string | null {
 }
 
 /**
+ * The name half of a title, for rows without a server-parsed
+ * ``session_name``. A user-added ``ui:<agent>:<label>`` title carries the
+ * bound agent in its middle segment, which is not part of the label.
+ */
+function titleLabel(title: string | null | undefined): string | null {
+  if (!title) return null;
+  if (title.startsWith("ui:")) {
+    const colon = title.indexOf(":", "ui:".length);
+    if (colon !== -1) return title.slice(colon + 1) || null;
+  }
+  return titleSuffix(title);
+}
+
+/**
  * Primary label for a child row / the child page header.
  *
  * Native sub-agent wrappers keep the server-resolved ``tool`` (the Task
  * description / nickname / role) — their ``session_name`` is an opaque
  * correlation id. A session snapshot has no ``tool``, so the vendor label
  * helpers and the title head stand in for it. Everything else prefers the
- * name the mother gave the child (``session_name``, else the title suffix)
- * over the auto-generated task summary.
+ * name the mother gave the child (``session_name``, else the title's
+ * label) over the auto-generated task summary.
  */
 export function childPrimaryLabel(child: ChildSessionLike): string {
   // User-added rows use the reserved "ui:<agent>:<name>" title sentinel;
@@ -73,7 +87,7 @@ export function childPrimaryLabel(child: ChildSessionLike): string {
   }
   return (
     child.session_name ??
-    titleSuffix(child.title) ??
+    titleLabel(child.title) ??
     child.title ??
     child.task_summary ??
     child.tool ??

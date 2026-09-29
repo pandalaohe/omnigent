@@ -11,6 +11,7 @@ import {
   readApprovalTimeoutPreferences,
   writeApprovalTimeoutPreferences,
 } from "./approvalTimeoutPreferences";
+import { patchHostColor } from "./hostColorPreferences";
 
 beforeEach(() => {
   localStorage.clear();
@@ -342,6 +343,40 @@ describe("user preference synchronization", () => {
       expect.objectContaining({
         method: "PATCH",
         body: JSON.stringify({ value: { version: 1, showCodexRateLimits: true } }),
+      }),
+    );
+  });
+
+  it("coalesces host colour picks into one union patch with reset nulls", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    patchHostColor("h1", "blue");
+    patchHostColor("h2", "green");
+    await vi.advanceTimersByTimeAsync(251);
+
+    const hostColorPatches = fetcher.mock.calls.filter(
+      ([url]) => url === "/v1/me/preferences/host_colors",
+    );
+    expect(hostColorPatches).toHaveLength(1);
+    expect(fetcher).toHaveBeenLastCalledWith(
+      "/v1/me/preferences/host_colors",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ value: { h1: "blue", h2: "green" } }),
+      }),
+    );
+
+    // A pick then a reset of the same host must still carry every key this
+    // page changed, with the reset as an explicit null.
+    patchHostColor("h3", "red");
+    patchHostColor("h3", null);
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(fetcher.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ value: { h1: "blue", h2: "green", h3: null } }),
       }),
     );
   });

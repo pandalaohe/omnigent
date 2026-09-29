@@ -29,13 +29,18 @@ export function readHostColorPreferences(): HostColorPreferences {
   }
 }
 
+// Every host this page session changed, latest pick or null reset. The sync
+// queue replaces a namespace's pending patch, so each call resends the union;
+// an already-sent key is idempotent under the server's shallow merge.
+const changedHostColors = new Map<string, HostColorKey | null>();
+
 /**
  * Set or clear one host's colour.
  *
- * The Server sync is a ONE-KEY patch: ``patch_namespace`` shallow-merges the
- * top-level map, so concurrent edits of different hosts never overwrite each
- * other, and a reset is an explicit ``null`` for that key. The localStorage
- * mirror keeps the full map for offline reads.
+ * The Server sync patch carries every host key this page changed, each with
+ * its latest value: ``patch_namespace`` shallow-merges the top-level map, so
+ * a repeated key is idempotent and a reset travels as an explicit ``null``.
+ * The localStorage mirror keeps the full map for offline reads.
  */
 export function patchHostColor(hostId: string, key: HostColorKey | null): void {
   if (typeof window === "undefined") return;
@@ -49,5 +54,6 @@ export function patchHostColor(hostId: string, key: HostColorKey | null): void {
     // Storage denial or quota exhaustion must not break the settings page.
   }
   window.dispatchEvent(new Event(HOST_COLORS_CHANGED_EVENT));
-  queueUserPreferencePatch("host_colors", { [hostId]: key });
+  changedHostColors.set(hostId, key);
+  queueUserPreferencePatch("host_colors", Object.fromEntries(changedHostColors));
 }

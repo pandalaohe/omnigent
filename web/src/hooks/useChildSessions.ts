@@ -198,7 +198,8 @@ export function childSessionsQueryKey(conversationId: string): readonly unknown[
  * rendered, every ancestor's child list is already cached, so
  * membership here means "the rail listed this session under that
  * root" and the root can be held steady while the target's snapshot
- * loads.
+ * loads. The past zone's infinite-query cache counts too: a row the
+ * rail shows under Past is still one of the root's descendants.
  *
  * @param queryClient - The app QueryClient holding child-session caches.
  * @param rootId - Root session whose cached tree to walk, e.g. ``"conv_root"``.
@@ -216,8 +217,12 @@ export function cachedTreeContains(
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: string[] = [];
     for (const id of frontier) {
-      const children = queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(id));
-      if (!children) continue;
+      const active = queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(id)) ?? [];
+      const past = queryClient.getQueryData<{ pages: ChildSessionsPage[] }>([
+        ...childSessionsQueryKey(id),
+        "past",
+      ]);
+      const children = [...active, ...(past?.pages.flatMap((page) => page.data) ?? [])];
       for (const child of children) {
         if (child.id === targetId) return true;
         next.push(child.id);
@@ -304,6 +309,7 @@ async function fetchChildSessionPage(
  */
 export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
   const all: ChildSessionInfo[] = [];
+  const requested = new Set<string>();
   let after: string | null = null;
   for (;;) {
     // Each page's cursor comes from the previous response — inherently serial.
@@ -311,6 +317,11 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     const page = await fetchChildSessionPage(sessionId, { zone: "active", limit: 100, after });
     all.push(...page.data);
     if (!page.has_more || page.last_id === null) return all;
+    // A cursor the server already served would loop forever (A → B → A …).
+    if (requested.has(page.last_id)) {
+      throw new Error(`Malformed child-session pagination: repeated cursor ${page.last_id}`);
+    }
+    requested.add(page.last_id);
     after = page.last_id;
   }
 }

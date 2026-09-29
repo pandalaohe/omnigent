@@ -11300,7 +11300,7 @@ async def _child_session_summaries_from_conversations(
         inherited = _inherited_placement(conv_store, parent_session_id)
         from omnigent.runtime._globals import _agent_store
 
-        memo: dict[str, str | None] = {}
+        memo: dict[str, Agent | None] = {}
         summaries: list[ChildSessionSummary] = []
         for child in children:
             agent_name, harness = _child_summary_identity(child, _agent_store, memo)

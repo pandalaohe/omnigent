@@ -139,4 +139,14 @@ describe("childPrimaryLabel", () => {
       }),
     ).toBe("jimmy");
   });
+
+  it("labels a ui-sentinel snapshot by its user label, not the agent segment", () => {
+    expect(
+      childPrimaryLabel({
+        id: "x",
+        title: "ui:claude-native-ui:jimmy",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+    ).toBe("jimmy");
+  });
 });

@@ -3015,6 +3015,49 @@ async def test_child_sessions_harness_resolved_per_conversation(
     assert by_id[overridden.id]["agent_name"] == "mixed-harness-agent"
 
 
+async def test_child_sessions_shared_agent_row_read_once_per_list(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Twenty children on one agent read its row once, not per child.
+
+    The harness still resolves per conversation (``harness_override`` lives
+    on the child row), so a per-``agent_id`` harness cache would be wrong;
+    only the agent row fetch is shared across the list call.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param monkeypatch: Pytest patcher for the agent-store read counter.
+    """
+    from omnigent.runtime._globals import _agent_store
+
+    assert _agent_store is not None
+    parent = await _create_parent_session(client, "memo-parent")
+    agent = await create_test_agent(client, name="memo-agent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    for index in range(20):
+        _seed_child(
+            conv_store=conv_store,
+            parent_id=parent["id"],
+            title=f"researcher:memo-{index}",
+            agent_id=agent["id"],
+        )
+
+    reads: list[str] = []
+    original_get = _agent_store.get
+
+    def counting_get(agent_id: str, *args: Any, **kwargs: Any) -> Any:
+        reads.append(agent_id)
+        return original_get(agent_id, *args, **kwargs)
+
+    monkeypatch.setattr(_agent_store, "get", counting_get)
+    resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert resp.status_code == 200
+    assert len(resp.json()["data"]) == 20
+    assert reads.count(agent["id"]) == 1
+
+
 async def test_child_status_fan_out_keeps_placement(
     client: httpx.AsyncClient,
     db_uri: str,

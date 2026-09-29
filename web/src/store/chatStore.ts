@@ -7428,9 +7428,9 @@ function applyTerminalDeleted(sessionId: string, resourceId: string): void {
  * never inserted (a partial patch would materialize a row missing every
  * field it did not carry, and a status edge for an archived child would
  * resurrect it) — the active key is invalidated so the list refetches.
- * An archive delta removes the row locally and invalidates the past key;
- * an unarchive delta for an absent row invalidates the prefix key, which
- * refreshes both zones.
+ * An archive delta removes the row locally and invalidates the prefix key,
+ * which cancels an in-flight active refetch and refreshes the past zone; an
+ * unarchive delta for an absent row uses the same prefix invalidation.
  */
 function applyChildSessionUpdated(
   parentId: string,
@@ -7506,13 +7506,14 @@ function applyChildSessionUpdated(
     return;
   }
   if (patch.archived === true) {
-    // Archived: leave the active list now; the past zone refetches in the
-    // background.
+    // Archived: leave the active list now. The prefix invalidation cancels a
+    // list fetch already in flight (it would otherwise land the row again)
+    // and refetches both zones.
     queryClient.setQueryData<ChildSessionInfo[]>(
       key,
       current.filter((c) => c.id !== childId),
     );
-    queryClient.invalidateQueries({ queryKey: [...key, "past"] });
+    queryClient.invalidateQueries({ queryKey: key });
     return;
   }
   const next = [...current];

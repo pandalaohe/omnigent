@@ -17,7 +17,7 @@
 
 import type * as IdentityModule from "@/lib/identity";
 
-import { type InfiniteData, QueryClient } from "@tanstack/react-query";
+import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type {
@@ -9376,7 +9376,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       });
     });
 
-    it("removes an archived child from the active list and invalidates the past zone", () => {
+    it("removes an archived child from the active list and invalidates the prefix key", () => {
       client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
         {
           id: "conv_child1",
@@ -9406,9 +9406,61 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
         [],
       );
-      expect(spy).toHaveBeenCalledWith({
-        queryKey: [...childSessionsQueryKey("conv_parent"), "past"],
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_parent") });
+    });
+
+    it("cancels an in-flight active refetch that would restore an archived child", async () => {
+      // The list query may already be refetching when the archive delta
+      // arrives; that response still holds the child. Prefix invalidation
+      // cancels it and refetches from the server (which has moved the child
+      // to the past zone), instead of letting the stale pages land last.
+      const key = childSessionsQueryKey("conv_parent");
+      const staleRow: ChildSessionInfo = {
+        id: "conv_child1",
+        title: "researcher:auth",
+        task_summary: null,
+        tool: "researcher",
+        session_name: "auth",
+        current_task_status: "completed",
+        busy: false,
+        last_message_preview: "done",
+        pending_elicitations_count: 0,
+      };
+      let calls = 0;
+      let resolveFirst!: (rows: ChildSessionInfo[]) => void;
+      const queryFn = vi.fn(() => {
+        calls += 1;
+        if (calls === 1) {
+          return new Promise<ChildSessionInfo[]>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        // Server truth after the archive: the child is gone from active.
+        return Promise.resolve([]);
       });
+      const observer = new QueryObserver<ChildSessionInfo[]>(client, { queryKey: key, queryFn });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.waitFor(() => expect(calls).toBe(1));
+      client.setQueryData<ChildSessionInfo[]>(key, [staleRow]);
+
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: {
+          id: "conv_child1",
+          archived: true,
+          archived_at: 1_700_000_000,
+          busy: false,
+          last_message_preview: "done",
+        },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(key)).toEqual([]);
+
+      resolveFirst([staleRow]);
+      await vi.waitFor(() => expect(calls).toBe(2));
+      expect(client.getQueryData<ChildSessionInfo[]>(key)).toEqual([]);
+      unsubscribe();
     });
 
     it("does not resurrect an archived child on a later status delta", () => {

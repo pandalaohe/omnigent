@@ -4,7 +4,13 @@ import type { PropsWithChildren } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { fetchChildSessions, useChildSessions } from "./useChildSessions";
+import {
+  cachedTreeContains,
+  childSessionsQueryKey,
+  fetchChildSessions,
+  MAX_TREE_DEPTH,
+  useChildSessions,
+} from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -49,6 +55,18 @@ describe("useChildSessions", () => {
 
     expect(result.current.children).toEqual([]);
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("cachedTreeContains", () => {
+  it("counts a child cached only in the past zone as a tree member", () => {
+    const client = new QueryClient();
+    client.setQueryData(childSessionsQueryKey("root"), [wireChild("mid")]);
+    client.setQueryData([...childSessionsQueryKey("mid"), "past"], {
+      pages: [{ data: [wireChild("archived")] }],
+    });
+
+    expect(cachedTreeContains(client, "root", "archived", MAX_TREE_DEPTH)).toBe(true);
   });
 });
 
@@ -135,6 +153,26 @@ describe("fetchChildSessions", () => {
     );
 
     await expect(fetchChildSessions("conv_parent")).rejects.toThrow(/pagination/i);
+  });
+
+  it("throws on a cursor cycle instead of paging forever", async () => {
+    // Self-contained: the shared fetch mock keeps earlier tests' calls.
+    fetchMock.mockReset();
+    const cyclePage = (cursor: string) =>
+      jsonResponse({
+        object: "list",
+        data: [wireChild(cursor)],
+        has_more: true,
+        last_id: cursor,
+      });
+    fetchMock
+      .mockResolvedValueOnce(cyclePage("A"))
+      .mockResolvedValueOnce(cyclePage("B"))
+      .mockResolvedValueOnce(cyclePage("A"))
+      .mockImplementation(() => Promise.resolve(cyclePage("B")));
+
+    await expect(fetchChildSessions("conv_parent")).rejects.toThrow(/pagination/i);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("throws when a page claims more without a cursor", async () => {
