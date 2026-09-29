@@ -12,7 +12,7 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { CodexPersistMode, RememberScope, Response } from "./types";
+import type { CodexPersistMode, ElicitationSource, RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -695,6 +695,23 @@ export interface ElicitationBlock {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /**
+   * Non-blocking card kind — ``"question"`` (async question) or
+   * ``"approval"`` (deferred approval). Absent/null for blocking cards,
+   * which park the session until a verdict. The composer's Send lock
+   * ignores any card that carries one.
+   */
+  asyncKind?: "question" | "approval" | null;
+  /** Free markdown shown above an async question form. */
+  context?: string | null;
+  /** Short id of a deferred approval card, shown in its pill. */
+  approvalRef?: string | null;
+  /** System-stamped provenance of a card mirrored from a child session. */
+  source?: ElicitationSource | null;
+  /** Tool a deferred approval gates, when known. */
+  toolName?: string | null;
+  /** Working directory the gated action would run in, when known. */
+  cwd?: string | null;
 }
 
 /** Union of all block types. */

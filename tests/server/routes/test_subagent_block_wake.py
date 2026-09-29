@@ -186,7 +186,7 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # The notice names the child + echoes the approval reason so the
         # parent agent can surface it without re-fetching the child.
         assert call.text.startswith("[System:")
-        assert "codex/demo" in call.text
+        assert "sub-agent demo is blocked awaiting human approval" in call.text
         assert "git fetch" in call.text
 
         # Resolving the block sends the woken parent a follow-up through

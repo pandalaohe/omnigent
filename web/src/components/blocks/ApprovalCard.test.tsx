@@ -237,6 +237,59 @@ describe("ApprovalCard — Claude permission interrupt", () => {
   });
 });
 
+describe("ApprovalCard — async card", () => {
+  const props = {
+    elicitationId: "elic_async",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"git status"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("shows the 不挡路 pill with the approval ref on a deferred approval", () => {
+    render(<ApprovalCard {...props} asyncKind="approval" approvalRef="a123456" />);
+
+    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("不挡路 · #a123456");
+  });
+
+  it("hides the interrupt control on an async card but keeps Reject", () => {
+    // An async card never parks a turn, so there is nothing to interrupt;
+    // a blocking card with the same props still offers it (see the
+    // interrupt describe above).
+    render(<ApprovalCard {...props} asyncKind="question" interruptible />);
+
+    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("不挡路");
+    expect(screen.queryByRole("button", { name: "Reject & interrupt" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^reject$/i })).toBeDefined();
+  });
+
+  it("hides the question form's interrupt control on an async card", () => {
+    render(
+      <ApprovalCard
+        {...props}
+        asyncKind="question"
+        interruptible
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Which framework?",
+              header: "",
+              options: [{ label: "React" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId("ask-user-question-form")).toBeDefined();
+    expect(screen.queryByTestId("ask-user-question-abort")).toBeNull();
+  });
+});
+
 describe("ApprovalCard — approve & switch to auto mode", () => {
   const props = {
     elicitationId: "elic_auto",
@@ -1715,5 +1768,70 @@ describe("ApprovalCard — prompt expired", () => {
     );
 
     expect(screen.queryByTestId("approval-card")).toBeNull();
+  });
+});
+
+describe("ApprovalCard — mirrored source line", () => {
+  const props = {
+    elicitationId: "elic_child",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+  const source = {
+    sessionId: "child1",
+    label: "auth-fix",
+    agent: "Claude Code",
+    host: "laptop",
+    cwd: "/repo/worktrees/auth-fix",
+  };
+
+  it("names the child, agent, host and cwd on a mirrored card", () => {
+    render(<ApprovalCard {...props} targetSessionId="child1" source={source} />);
+
+    const line = screen.getByTestId("approval-card-source");
+    expect(line.textContent).toBe(
+      "来自子会话 auth-fix· Claude Code @ laptop· /repo/worktrees/auth-fix",
+    );
+    // The cwd keeps its full path in a tooltip for narrow cards.
+    expect(screen.getByTitle("/repo/worktrees/auth-fix").textContent).toBe(
+      "/repo/worktrees/auth-fix",
+    );
+  });
+
+  it("shows no source line on a top-level card even when a source rides along", () => {
+    render(<ApprovalCard {...props} source={source} />);
+
+    expect(screen.queryByTestId("approval-card-source")).toBeNull();
+  });
+
+  it("omits every unresolved provenance part", () => {
+    render(
+      <ApprovalCard
+        {...props}
+        targetSessionId="child1"
+        source={{ sessionId: "child1", label: "worker" }}
+      />,
+    );
+
+    expect(screen.getByTestId("approval-card-source").textContent).toBe("来自子会话 worker");
+  });
+
+  it("keeps the source line on a responded mirrored card", () => {
+    render(
+      <ApprovalCard
+        {...props}
+        status="responded"
+        response={{ action: "accept" }}
+        targetSessionId="child1"
+        source={source}
+      />,
+    );
+
+    expect(screen.getByTestId("approval-card-source").textContent).toContain("来自子会话 auth-fix");
   });
 });

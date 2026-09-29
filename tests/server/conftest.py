@@ -441,6 +441,12 @@ def _reset_elicitation_state() -> Iterator[None]:
     yield
     pending_elicitations.reset_for_tests()
     _elicitation_registry.reset_for_tests()
+    # The mirrored-card source resolver is wired per app startup and
+    # closes over that app's stores; drop it so a later test in the same
+    # worker never resolves through a torn-down database.
+    from omnigent.server.routes._sessions import helpers as _session_helpers
+
+    _session_helpers._elicitation_source_resolver = None
     # Presence is likewise module-global (keyed by conversation/user)
     # with pending leave-grace timers that would fire into later tests.
     presence.reset_for_tests()

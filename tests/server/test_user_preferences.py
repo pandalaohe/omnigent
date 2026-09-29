@@ -593,6 +593,42 @@ def test_read_approval_timeout_clamps_and_defaults_invalid_fields(db_uri: str) -
     assert read_approval_timeout(store, "null@example.com") == default
 
 
+def test_read_approval_timeout_reads_and_defaults_async_approvals(db_uri: str) -> None:
+    """The async-approval switch: explicit False reads back; any gap is True."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    default = ApprovalTimeout(timeout_s=3000.0, stop_turn=True)
+    assert default.async_approvals is True
+
+    store.patch_namespace(
+        "off@example.com",
+        "approval_timeout",
+        {"timeoutMinutes": 10, "stopTurn": False, "asyncApprovals": False},
+    )
+    assert read_approval_timeout(store, "off@example.com") == ApprovalTimeout(
+        timeout_s=600.0,
+        stop_turn=False,
+        async_approvals=False,
+    )
+
+    store.patch_namespace(
+        "on@example.com",
+        "approval_timeout",
+        {"asyncApprovals": True},
+    )
+    on = read_approval_timeout(store, "on@example.com")
+    assert on.async_approvals is True
+    assert on == default
+
+    store.patch_namespace(
+        "garbage@example.com",
+        "approval_timeout",
+        {"asyncApprovals": "yes"},
+    )
+    garbage = read_approval_timeout(store, "garbage@example.com")
+    assert garbage.async_approvals is True
+    assert garbage == default
+
+
 def test_read_approval_timeout_tolerates_bad_rows_and_shapes() -> None:
     """S15: a corrupt row or malformed value never fails a hook."""
     default = ApprovalTimeout(timeout_s=3000.0, stop_turn=True)

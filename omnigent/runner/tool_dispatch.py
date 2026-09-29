@@ -74,6 +74,7 @@ from omnigent.server.session_open_rate import (
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.tools.builtins.ask_user import AskUserAsyncTool
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -470,6 +471,12 @@ _BROWSER_TOOLS = BROWSER_TOOL_NAMES
 # server_client. See omnigent/tools/builtins/panel.py for the schema class.
 _PANEL_TOOLS = frozenset({OpenInPanelTool.name()})
 
+# Priority 5o: ask_user_async — the detached question card. Runner dispatch
+# POSTs to the server's async-questions route, which parks the elicitation
+# and returns at once; the answer arrives later as a system message. Same
+# schema-only / server_client posture as the panel tool.
+_ASK_USER_TOOLS = frozenset({AskUserAsyncTool.name()})
+
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
 # runner never severs the still-open POST before the server returns either the
@@ -526,6 +533,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # native sessions see only this surface, and ToolManager auto-registers
     # the framework-owned schema for every spec.
     | _PANEL_TOOLS
+    # ``ask_user_async`` rides the relay for the same reason, but the relay
+    # drops it for codex-native sessions, which have their own async question
+    # tool (see the codex-native relay assembly in runner/app.py).
+    | _ASK_USER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
@@ -600,6 +611,7 @@ def build_native_relay_tool_schemas(
         SysAgentGetTool,
         SysAgentListTool,
     )
+    from omnigent.tools.builtins.ask_user import AskUserAsyncTool
     from omnigent.tools.builtins.list_comments import ListCommentsTool
     from omnigent.tools.builtins.spawn import (
         SysSessionGetHistoryTool,
@@ -655,6 +667,7 @@ def build_native_relay_tool_schemas(
             SysAddPolicyTool,
             SysPolicyRegistryTool,
             OpenInPanelTool,
+            AskUserAsyncTool,
         ):
             fallback_schema = _string_object_dict(_cls().get_schema())
             if fallback_schema is None:
@@ -989,6 +1002,9 @@ _ALL_LOCAL_TOOLS = (
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
     | _PANEL_TOOLS
+    # Same for the async question tool: the runner owns the POST that parks
+    # the elicitation, so the call must never be relayed upstream.
+    | _ASK_USER_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -6525,6 +6541,60 @@ async def _open_in_panel_via_rest(
     return f"Asked the web UI to open {path} ({viewers} viewer(s) connected)"
 
 
+async def _ask_user_async_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Post a non-blocking question card to the session's own stream.
+
+    Posts to the server's ``async-questions`` route, which validates the
+    shape, parks the elicitation detached from this call, and answers with
+    the card's ids at once. The user's answer arrives later as a synthetic
+    user message; every failure becomes a tool-result envelope so a bad
+    payload cannot abort the harness session.
+    """
+    if server_client is None:
+        return json.dumps({"error": "ask_user_async requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "ask_user_async requires a session id"})
+    questions = args.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return json.dumps({"error": "ask_user_async requires a non-empty 'questions' list"})
+    body: _JsonObject = {"questions": questions}
+    context = args.get("context")
+    if isinstance(context, str) and context:
+        body["context"] = context
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/async-questions",
+            json=body,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"ask_user_async failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"ask_user_async returned {response.status_code}",
+                "detail": response.text[:200],
+            }
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"ask_user_async returned invalid JSON: {exc}"})
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "ask_user_async returned a non-object response"})
+    qid = payload.get("qid")
+    if not isinstance(qid, str) or not qid:
+        return json.dumps({"error": "ask_user_async response omitted the question id"})
+    return (
+        f"Question card #{qid} posted; the answer will arrive later as a "
+        "new user message. Continue your work."
+    )
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -9175,6 +9245,12 @@ async def execute_tool(
             )
         elif tool_name in _PANEL_TOOLS:
             output = await _open_in_panel_via_rest(
+                args,
+                conversation_id,
+                server_client,
+            )
+        elif tool_name in _ASK_USER_TOOLS:
+            output = await _ask_user_async_via_rest(
                 args,
                 conversation_id,
                 server_client,

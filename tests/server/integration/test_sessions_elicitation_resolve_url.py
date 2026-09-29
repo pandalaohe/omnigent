@@ -45,6 +45,8 @@ from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.app import create_app
+from omnigent.server.routes import sessions as sessions_route
+from omnigent.server.user_preferences_store import ApprovalTimeout
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -60,6 +62,25 @@ from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _blocking_approvals_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the blocking park; deferral has its own suite.
+
+    The server default is on, which would turn the eligible Bash and Codex
+    command calls here into deferred parks. Pin the setting off so this
+    module keeps asserting one parked request → one resolved verdict.
+    """
+    monkeypatch.setattr(
+        sessions_route,
+        "read_approval_timeout",
+        lambda store, owner: ApprovalTimeout(
+            timeout_s=3000.0,
+            stop_turn=True,
+            async_approvals=False,
+        ),
+    )
 
 
 # ── Policy callable used by public /policies/evaluate coverage ─────
@@ -1040,6 +1061,121 @@ async def test_child_claude_permission_bubbles_to_parent_and_declines(
             hook_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await hook_task
+        pending_elicitations.reset_for_tests()
+
+
+async def test_grandchild_approval_source_stamp_on_streams_and_snapshots(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A grandchild approval names its child, agent, host and cwd.
+
+    Scenario 12: the source stamp rides both ancestor live streams and
+    both ancestor snapshots (cold load), while the grandchild's own event
+    stays the original, unmodified one. The snapshot case removes the
+    ancestor index copies the live mirror recorded, forcing the
+    descendant-walk stamp path. The app lifespan is entered so the
+    startup-wired source resolver is exercised end to end.
+
+    :param app: The app fixture, entered for its lifespan side effects.
+    :param client: The test HTTP client.
+    :param db_uri: Test database URI.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(client, "test-grandchild-source")
+    root_id = await _create_session(client, agent["id"])
+    parent_id = _create_child_session(
+        db_uri, parent_id=root_id, agent_id=agent["id"], title="mid:parent"
+    )
+    grandchild = SqlAlchemyConversationStore(db_uri).create_conversation(
+        kind="sub_agent",
+        title="codex:auth-fix",
+        parent_conversation_id=parent_id,
+        agent_id=agent["id"],
+        sub_agent_name="auth-fix",
+        host_id="a" * 32,
+        workspace="/repo/worktree",
+    )
+
+    root_drain: asyncio.Task[dict[str, Any]] | None = None
+    parent_drain: asyncio.Task[dict[str, Any]] | None = None
+    own_drain: asyncio.Task[dict[str, Any]] | None = None
+    hook_task: asyncio.Task[httpx.Response] | None = None
+    try:
+        async with app.router.lifespan_context(app):
+            root_subscribed = asyncio.Event()
+            parent_subscribed = asyncio.Event()
+            own_subscribed = asyncio.Event()
+            root_drain = asyncio.create_task(
+                _drain_until_elicitation_event(root_id, subscribed=root_subscribed)
+            )
+            parent_drain = asyncio.create_task(
+                _drain_until_elicitation_event(parent_id, subscribed=parent_subscribed)
+            )
+            own_drain = asyncio.create_task(
+                _drain_until_elicitation_event(grandchild.id, subscribed=own_subscribed)
+            )
+            await asyncio.gather(
+                root_subscribed.wait(),
+                parent_subscribed.wait(),
+                own_subscribed.wait(),
+            )
+
+            hook_task = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{grandchild.id}/hooks/permission-request",
+                    json=_claude_permission_payload("Bash"),
+                )
+            )
+            root_event, parent_event, own_event = await asyncio.gather(
+                root_drain, parent_drain, own_drain
+            )
+
+            expected_source = {
+                "session_id": grandchild.id,
+                "label": "auth-fix",
+                "agent": agent["name"],
+                "host": "a" * 32,
+                "cwd": "/tmp/cwd",
+            }
+            for event in (root_event, parent_event):
+                assert event["params"]["target_session_id"] == grandchild.id
+                assert event["params"]["source"] == expected_source
+            # The child's own event is the original: no target, no source.
+            assert own_event["params"].get("target_session_id") is None
+            assert own_event["params"].get("source") is None
+            elicitation_id = root_event["elicitation_id"]
+
+            # Cold load: forcing the descendant walk (drop the live-mirror
+            # copies recorded under the ancestors) still stamps both snapshots.
+            pending_elicitations.resolve(root_id, elicitation_id)
+            pending_elicitations.resolve(parent_id, elicitation_id)
+            for session_id in (root_id, parent_id):
+                snapshot = await client.get(f"/v1/sessions/{session_id}")
+                assert snapshot.status_code == 200, snapshot.text
+                pending = [
+                    entry
+                    for entry in snapshot.json()["pending_elicitations"]
+                    if entry.get("elicitation_id") == elicitation_id
+                ]
+                assert len(pending) == 1, snapshot.text
+                assert pending[0]["params"]["source"] == expected_source
+
+            verdict = await client.post(
+                f"/v1/sessions/{grandchild.id}/elicitations/{elicitation_id}/resolve",
+                json={"action": "accept"},
+            )
+            assert verdict.status_code == 202, verdict.text
+            assert (await hook_task).status_code == 200
+    finally:
+        for task in (root_drain, parent_drain, own_drain, hook_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         pending_elicitations.reset_for_tests()
 
 

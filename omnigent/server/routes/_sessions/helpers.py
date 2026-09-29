@@ -1579,10 +1579,112 @@ async def _apply_liveness_to_items(
             item.background_activity_count = 0
 
 
+def _elicitation_source_label(conv: Conversation) -> str:
+    """
+    Derive the human label for a mirrored card's source line.
+
+    Priority: the background task summary, then the declared sub-agent
+    name, then the part of the title after its ``<agent>:`` prefix —
+    the same suffix the sidebar shows. Falls back to the session id so
+    the card always names something.
+
+    :param conv: The conversation that owns the elicitation.
+    :returns: A label like ``"auth-refactor"`` or the session id.
+    """
+    if conv.task_summary:
+        return conv.task_summary
+    if conv.sub_agent_name:
+        return conv.sub_agent_name
+    title = conv.title or ""
+    if ":" in title:
+        suffix = title.partition(":")[2].partition(":closed:")[0]
+        if suffix:
+            return suffix
+    return conv.id
+
+
+# Agent/host naming for mirrored cards. Wired once at server startup;
+# without it ``elicitation_source`` still stamps the store-free fields.
+_elicitation_source_resolver: Callable[[Conversation], dict[str, str]] | None = None
+
+
+def elicitation_source(conv: Conversation, params: dict[str, Any]) -> dict[str, str]:
+    """
+    Build the system-stamped provenance of a mirrored elicitation card.
+
+    Store-free fields — session id, label, and cwd when the card or the
+    session has one — are always resolved; the agent and host names are
+    added when the startup-wired resolver can read them (see
+    :func:`configure_elicitation_source_resolver`). The child's own
+    event is never stamped — only the ancestor mirror copies.
+
+    :param conv: The conversation that owns the elicitation.
+    :param params: The elicitation's ``params`` dict.
+    :returns: A ``{session_id, label, agent?, host?, cwd?}`` mapping.
+    """
+    source: dict[str, str] = {
+        "session_id": conv.id,
+        "label": _elicitation_source_label(conv),
+    }
+    for candidate in (params.get("cwd"), conv.worktree, conv.workspace):
+        if isinstance(candidate, str) and candidate:
+            source["cwd"] = candidate
+            break
+    resolver = _elicitation_source_resolver
+    if resolver is not None:
+        # Display-only: a dead store must never break the card path.
+        with contextlib.suppress(Exception):
+            source.update(resolver(conv))
+    return source
+
+
+def configure_elicitation_source_resolver(
+    agent_store: AgentStore,
+    host_store: HostStore | None,
+    agent_cache: AgentCache,
+) -> None:
+    """
+    Wire the stores used to name a mirrored card's child agent and host.
+
+    Called once at server startup beside
+    :func:`configure_subagent_block_notifier`. The agent is the native
+    display name for the session's harness (e.g. ``"Claude Code"``),
+    falling back to the bound agent's name; the host is the registered
+    host name, falling back to the raw host id.
+
+    :param agent_store: Store for the conversation's bound agent row.
+    :param host_store: Store for the conversation's host name; ``None``
+        when the server has no host store.
+    :param agent_cache: Cache for loading the agent spec that declares
+        the harness.
+    :returns: None.
+    """
+    global _elicitation_source_resolver
+
+    def _resolve(conv: Conversation) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        native = native_coding_agent_for_harness(
+            _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+        )
+        if native is not None:
+            resolved["agent"] = native.display_name
+        elif conv.agent_id:
+            agent = agent_store.get(conv.agent_id)
+            if agent is not None and agent.name:
+                resolved["agent"] = agent.name
+        if conv.host_id:
+            host = host_store.get_host(conv.host_id) if host_store is not None else None
+            resolved["host"] = host.name if host is not None and host.name else conv.host_id
+        return resolved
+
+    _elicitation_source_resolver = _resolve
+
+
 def _targeted_elicitation_event(
     event: dict[str, Any],
     *,
     target_session_id: str,
+    source: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Return an elicitation event annotated with its resolution target.
@@ -1591,28 +1693,36 @@ def _targeted_elicitation_event(
     chat stream. The mirrored card is rendered in the ancestor
     conversation, but the harness Future still belongs to the child.
     ``target_session_id`` tells clients which session's resolve URL
-    should receive the verdict.
+    should receive the verdict; ``source`` carries the system-stamped
+    provenance the ancestor card displays.
 
     :param event: Original ``response.elicitation_request`` event,
         e.g. ``{"type": "response.elicitation_request",
         "elicitation_id": "elicit_abc", "params": {...}}``.
     :param target_session_id: Session that owns the parked
         elicitation, e.g. ``"conv_child123"``.
+    :param source: Precomputed provenance from
+        :func:`elicitation_source`, or ``None`` to omit it.
     :returns: A shallow event copy with a copied ``params`` dict
-        carrying ``target_session_id``.
+        carrying ``target_session_id`` and ``source``.
     """
+    stamp: dict[str, Any] = {"target_session_id": target_session_id}
+    if source:
+        stamp["source"] = source
     mirrored = dict(event)
     params = event.get("params")
     if isinstance(params, dict):
-        mirrored["params"] = {**params, "target_session_id": target_session_id}
+        mirrored["params"] = {**params, **stamp}
     else:
-        mirrored["params"] = {"target_session_id": target_session_id}
+        mirrored["params"] = stamp
     return mirrored
 
 
 def _ancestor_session_ids(
     conv_store: ConversationStore,
     session_id: str,
+    *,
+    conversation: Conversation | None = None,
 ) -> list[str]:
     """
     Return ancestor session ids for a session, nearest parent first.
@@ -1620,12 +1730,14 @@ def _ancestor_session_ids(
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
+    :param conversation: Pre-loaded conversation for ``session_id``, when
+        the caller already read it (saves a duplicate lookup).
     :returns: Ancestor ids in parent-to-root order. Empty when the
         session is top-level or missing.
     """
     ancestors: list[str] = []
     seen = {session_id}
-    current = conv_store.get_conversation(session_id)
+    current = conversation if conversation is not None else conv_store.get_conversation(session_id)
     while current is not None and current.parent_conversation_id is not None:
         parent_id = current.parent_conversation_id
         if parent_id in seen:
@@ -1671,13 +1783,28 @@ def _publish_elicitation_request_to_ancestors(
     """
     Mirror a child elicitation request into each ancestor stream.
 
+    The source stamp is computed once from one read of the child
+    conversation and shared by every ancestor's copy; the child's own
+    event is never modified.
+
     :param conv_store: Store used to discover ancestor sessions.
     :param session_id: Child session that owns the elicitation,
         e.g. ``"conv_child123"``.
     :param event: Original ``response.elicitation_request`` event.
     """
-    mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
+    params = event.get("params")
+    child = conv_store.get_conversation(session_id)
+    source = (
+        elicitation_source(child, params if isinstance(params, dict) else {})
+        if child is not None
+        else None
+    )
+    mirrored = _targeted_elicitation_event(
+        event,
+        target_session_id=session_id,
+        source=source,
+    )
+    for ancestor_id in _ancestor_session_ids(conv_store, session_id, conversation=child):
         session_stream.publish(ancestor_id, mirrored)
 
 
@@ -1777,12 +1904,26 @@ def _pending_elicitation_snapshot_for_session(
     }
     for child in _descendant_sessions(conv_store, conv.id):
         for event in pending_elicitations.snapshot_for(child.id):
+            params = event.get("params")
+            if isinstance(params, dict) and params.get("async_kind") == "question":
+                # Async question cards are scoped to their own session and
+                # never mirrored into ancestors, live or on cold load.
+                continue
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue
             if isinstance(elicitation_id, str):
                 seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+            events.append(
+                _targeted_elicitation_event(
+                    event,
+                    target_session_id=child.id,
+                    source=elicitation_source(
+                        child,
+                        params if isinstance(params, dict) else {},
+                    ),
+                )
+            )
     return events
 
 
@@ -12638,7 +12779,9 @@ __all__ = [
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "cleanup_worktree",
+    "configure_elicitation_source_resolver",
     "effective_host_id",
     "effective_worktree",
+    "elicitation_source",
     "prefetch_session_routing_catalogs",
 ]

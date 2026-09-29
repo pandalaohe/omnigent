@@ -33,6 +33,7 @@ import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, SquareIcon, XIcon } from 
 import { type ChangeEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 /**
  * Map from question id/text → either a single selected label
@@ -44,6 +45,12 @@ interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
+  /**
+   * Free markdown the producer wants shown above the questions — the
+   * async card's recap, report paths, or links. Rendered through the
+   * same markdown stack as a chat message, so links are clickable.
+   */
+  context?: string | null;
   /**
    * Decline the question AND cut the turn it blocks, leaving the session
    * alive — the web equivalent of Ctrl+C at the terminal. Plain `onReject`
@@ -95,6 +102,7 @@ export function AskUserQuestionForm({
   questions,
   onSubmit,
   onReject,
+  context,
   onAbort,
 }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
@@ -244,6 +252,12 @@ export function AskUserQuestionForm({
           </span>
         )}
       </div>
+
+      {context && (
+        <div className="text-ui text-foreground" data-testid="ask-user-question-context">
+          <FilePathAwareMessageResponse>{context}</FilePathAwareMessageResponse>
+        </div>
+      )}
 
       <fieldset
         key={currentKey}

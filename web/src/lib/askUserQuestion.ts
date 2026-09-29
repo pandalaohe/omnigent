@@ -56,6 +56,8 @@ export interface ClaudeQuestion {
 
 export interface AskUserQuestionPayload {
   questions: ClaudeQuestion[];
+  /** Free markdown shown above the questions, when the producer sent one. */
+  context?: string;
 }
 
 /**
@@ -69,13 +71,33 @@ export interface AskUserQuestionPayload {
  * when the payload is missing or doesn't have the top-level
  * ``questions`` array — the caller falls back to parsing the
  * (truncated) ``content_preview`` JSON string.
+ *
+ * Every entry is normalized: a missing ``options`` becomes ``[]``
+ * (free-text-only questions — the async card supports them), and a
+ * missing ``header`` / ``multiSelect`` becomes ``""`` / ``false``.
+ * A ``context`` string on the payload is kept.
  */
 export function castAskUserQuestionPayload(
   raw: Record<string, unknown> | null | undefined,
 ): AskUserQuestionPayload | null {
   if (!raw) return null;
   if (!Array.isArray(raw.questions)) return null;
-  return raw as unknown as AskUserQuestionPayload;
+  const questions: ClaudeQuestion[] = [];
+  for (const entry of raw.questions) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const rec = entry as Record<string, unknown>;
+    questions.push({
+      ...(typeof rec.id === "string" && rec.id ? { id: rec.id } : {}),
+      question: typeof rec.question === "string" ? rec.question : "",
+      header: typeof rec.header === "string" ? rec.header : "",
+      options: Array.isArray(rec.options) ? (rec.options as ClaudeQuestionOption[]) : [],
+      multiSelect: rec.multiSelect === true,
+    });
+  }
+  return {
+    questions,
+    ...(typeof raw.context === "string" ? { context: raw.context } : {}),
+  };
 }
 
 const PREVIEW_PREFIX = "AskUserQuestion(";

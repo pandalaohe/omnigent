@@ -50,10 +50,44 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
+from omnigent.server.routes._sessions.approval_grants import approval_grants
+from omnigent.server.routes.sessions import routes_hooks as hooks_routes
 from omnigent.server.user_preferences_store import ApprovalTimeout
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
+
+_BLOCKING_APPROVAL_TIMEOUT = ApprovalTimeout(
+    timeout_s=3000.0,
+    stop_turn=True,
+    async_approvals=False,
+)
+
+
+@pytest.fixture(autouse=True)
+def _blocking_approvals_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the blocking path unless a test opts into deferral.
+
+    The server default is on; these tests predate deferral and assert the
+    blocking behaviour, so pin the owner's setting off here. Deferred tests
+    re-patch it on through :func:`_patch_approval_timeout`.
+    """
+    monkeypatch.setattr(
+        sessions_route,
+        "read_approval_timeout",
+        lambda store, owner: _BLOCKING_APPROVAL_TIMEOUT,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_approval_grants() -> None:
+    """Keep the process-wide grant registry out of every test's state."""
+    approval_grants.clear()
+    yield
+    approval_grants.clear()
 
 
 async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
@@ -162,6 +196,7 @@ def _patch_approval_timeout(
     *,
     timeout_s: float,
     stop_turn: bool,
+    async_approvals: bool = False,
 ) -> None:
     """
     Pin the approval-timeout setting the hook routes read.
@@ -172,12 +207,18 @@ def _patch_approval_timeout(
     :param monkeypatch: Fixture isolating the patch.
     :param timeout_s: Budget the reader should return.
     :param stop_turn: Switch value the reader should return.
+    :param async_approvals: Deferral switch value the reader should
+        return; the module default is off so blocking tests stay blocking.
     :returns: None.
     """
     monkeypatch.setattr(
         sessions_route,
         "read_approval_timeout",
-        lambda store, owner: ApprovalTimeout(timeout_s=timeout_s, stop_turn=stop_turn),
+        lambda store, owner: ApprovalTimeout(
+            timeout_s=timeout_s,
+            stop_turn=stop_turn,
+            async_approvals=async_approvals,
+        ),
     )
 
 
@@ -231,6 +272,105 @@ def _shorten_timeout_deadline(elicitation_id: str, *, in_s: float) -> None:
         stop_enabled=snapshot.stop_enabled,
         stop=snapshot.stop,
         created_at=snapshot.created_at,
+    )
+
+
+class _DeliveryRecorder:
+    """Record deferred-approval deliveries instead of posting them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        conversation_store: Any,
+        runner_router: Any,
+    ) -> bool:
+        self.calls.append((session_id, text))
+        return True
+
+
+async def _wait_until(predicate: Any, *, timeout_s: float = 3.0) -> None:
+    """
+    Spin until ``predicate()`` is truthy or the budget elapses.
+
+    :param predicate: Zero-arg callable checked between sleeps.
+    :param timeout_s: Maximum seconds to wait.
+    :returns: None.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while not predicate():
+        if asyncio.get_event_loop().time() >= deadline:
+            raise AssertionError("condition not met before timeout")
+        await asyncio.sleep(0.01)
+
+
+async def _next_elicitation(
+    collector: Any,
+    *,
+    timeout_s: float = 3.0,
+) -> dict[str, Any]:
+    """
+    Drain a stream collector until an elicitation request event arrives.
+
+    :param collector: Collector from
+        :func:`tests.server.helpers.start_session_stream_collector`.
+    :param timeout_s: Maximum seconds to wait.
+    :returns: The ``response.elicitation_request`` event dict.
+    """
+    async with asyncio.timeout(timeout_s):
+        while True:
+            event = await collector.next_event(timeout_s)
+            if event.get("type") == "response.elicitation_request":
+                return event
+    raise AssertionError("no elicitation request event arrived")
+
+
+async def _drain_until_quiet(collector: Any, *, quiet_s: float = 0.15) -> None:
+    """
+    Drain a stream collector until no event arrives for a quiet window.
+
+    An accepted card publishes its ``response.elicitation_resolved`` once
+    from the events path and once from the park's own cleanup, so tests
+    that assert a later call publishes nothing must first consume both.
+
+    :param collector: Collector from
+        :func:`tests.server.helpers.start_session_stream_collector`.
+    :param quiet_s: Seconds of silence that end the drain.
+    :returns: None.
+    """
+    while True:
+        try:
+            await collector.next_event(quiet_s)
+        except TimeoutError:
+            return
+
+
+def _aid_for(event: dict[str, Any]) -> str:
+    """
+    Derive the card's short approval reference from its event.
+
+    :param event: The published elicitation request event.
+    :returns: ``"a" + first 6 hex of the elicitation id``.
+    """
+    return "a" + event["elicitation_id"].removeprefix("elicit_")[:6]
+
+
+async def _enable_async_approvals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Turn the owner's async-approvals setting on for one test.
+
+    :param monkeypatch: Fixture isolating the patch.
+    :returns: None.
+    """
+    _patch_approval_timeout(
+        monkeypatch,
+        timeout_s=3000.0,
+        stop_turn=True,
+        async_approvals=True,
     )
 
 
@@ -363,6 +503,46 @@ async def test_permission_request_hook_bash_cancel_interrupts_claude(
         "behavior": "deny",
         "interrupt": True,
     }
+
+
+async def test_permission_request_hook_bash_carries_full_command(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A Bash permission card carries the full command for the mother notice.
+
+    ``content_preview`` is hard-capped, so the hook stamps the verbatim
+    command as the ``command`` extra; a non-Bash tool gets no such extra
+    even when its ``tool_input`` happens to carry a ``command`` field.
+    """
+    agent = await create_test_agent(client, "test-permission-bash-command")
+    session_id = await _create_session(client, agent["id"])
+
+    command = "pnpm exec vitest run " + "x" * 1500
+    payload = await _claude_permission_payload("Bash")
+    payload["tool_input"] = {"command": command}
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"]["command"] == command
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    assert (await hook_task).status_code == 200
+
+    write_payload = await _claude_permission_payload("Write")
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=write_payload)
+    )
+    event = await drain_task
+    assert "command" not in event["params"]
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    assert (await hook_task).status_code == 200
 
 
 @pytest.mark.parametrize("tool_name", ["Bash", "Write", "AskUserQuestion", "ExitPlanMode"])
@@ -3562,6 +3742,67 @@ async def test_codex_async_question_decline_skips_the_interrupt(
     assert forwarded == []
 
 
+async def test_codex_async_question_is_not_mirrored_to_ancestors(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Codex async question is scoped to its own session.
+
+    The card carries ``async_kind="question"`` and never mirrors into an
+    ancestor: the parent stream and snapshot stay clean, and a decline does
+    not forward an interrupt. Codex's own answer-to-message path is
+    unchanged.
+    """
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> None:
+        forwarded.append(args[2])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-codex-async-question-scope")
+    parent_id = await _create_session(client, agent["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="codex:asks",
+        parent_conversation_id=parent_id,
+        agent_id=agent["id"],
+    )
+
+    parent_collector = await start_session_stream_collector(parent_id)
+    try:
+        drain_task = asyncio.create_task(_drain_until_elicitation(child.id))
+        await asyncio.sleep(0.05)
+        hook_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{child.id}/hooks/codex-elicitation-request",
+                json=_codex_async_question_payload(),
+            )
+        )
+
+        event = await drain_task
+        assert event["params"]["async_kind"] == "question"
+
+        await parent_collector.assert_no_event(0.2)
+        snapshot = await client.get(f"/v1/sessions/{parent_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["pending_elicitations"] == []
+
+        verdict = await _post_approval(client, child.id, event["elicitation_id"], "decline")
+        assert verdict.status_code == 202, verdict.text
+        resp = await hook_task
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"answers": {}}
+        assert forwarded == []
+    finally:
+        await parent_collector.stop()
+
+
 async def test_codex_request_user_input_decline_still_interrupts(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -5516,3 +5757,588 @@ async def test_antigravity_elicitation_hook_rejects_non_dict_body(
         json=["not", "a", "dict"],
     )
     assert resp.status_code == 400, resp.text
+
+
+# ── Deferred ("deny now, approve later") approvals ──────────────────────────
+
+
+async def test_deferred_bash_approval_returns_at_once_and_mirrors(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S5: with async approvals on, a Bash request returns deny + pending at
+    once and the card is parked detached with ``async_kind=approval`` and
+    ``approval_ref`` on its own and the parent stream; it is not stamped
+    ``interruptible``.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-deferred-bash")
+    parent_id = await _create_session(client, agent["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="claude:deferred",
+        parent_conversation_id=parent_id,
+        agent_id=agent["id"],
+    )
+
+    parent_collector = await start_session_stream_collector(parent_id)
+    child_collector = await start_session_stream_collector(child.id)
+    try:
+        payload = await _claude_permission_payload("Bash")
+        payload["tool_input"] = {"command": "pnpm vitest"}
+        resp = await client.post(
+            f"/v1/sessions/{child.id}/hooks/permission-request",
+            json=payload,
+        )
+        assert resp.status_code == 200, resp.text
+        decision = resp.json()["hookSpecificOutput"]["decision"]
+        assert decision["behavior"] == "deny"
+        assert "interrupt" not in decision
+        assert "Approval pending" in decision["message"]
+        assert "has NOT run" in decision["message"]
+        assert "This is not a refusal" in decision["message"]
+
+        event = await _next_elicitation(child_collector)
+        aid = _aid_for(event)
+        assert f"#{aid}" in decision["message"]
+        params = event["params"]
+        assert params["async_kind"] == "approval"
+        assert params["approval_ref"] == aid
+        assert params.get("interruptible") is None
+
+        mirrored = await _next_elicitation(parent_collector)
+        assert mirrored["params"]["async_kind"] == "approval"
+        assert mirrored["params"]["approval_ref"] == aid
+        assert mirrored["params"]["target_session_id"] == child.id
+
+        verdict = await _post_approval(
+            client,
+            child.id,
+            event["elicitation_id"],
+            "decline",
+            content={"feedback": "not now"},
+        )
+        assert verdict.status_code == 202, verdict.text
+        await _wait_until(lambda: bool(delivered.calls))
+        text = delivered.calls[-1][1]
+        assert f"[System: approval #{aid} denied by the user" in text
+        assert "Feedback: not now" in text
+    finally:
+        await parent_collector.stop()
+        await child_collector.stop()
+
+
+async def test_deferred_grant_runs_once_and_remember_survives(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S6: accepting stores a single-use grant. The same Bash re-issued with
+    a different description returns allow with no new card and carries the
+    verdict's remember flag as an ``addRules`` update; a third identical
+    call prompts again.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-deferred-grant")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/permission-request"
+    try:
+        payload = await _claude_permission_payload("Bash")
+        payload["tool_input"] = {"command": "pnpm vitest", "description": "first"}
+        first = await client.post(url, json=payload)
+        assert first.status_code == 200, first.text
+        assert first.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        event = await _next_elicitation(collector)
+        aid = _aid_for(event)
+
+        accept = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"remember": True},
+        )
+        assert accept.status_code == 202, accept.text
+        await _wait_until(lambda: bool(delivered.calls))
+        assert f"[System: approval #{aid} granted: re-run Bash(" in delivered.calls[-1][1]
+        await _drain_until_quiet(collector)
+
+        # Same command, new description: description drift must not break
+        # the match, and the stored remember flag must still apply.
+        again = await _claude_permission_payload("Bash")
+        again["tool_input"] = {"command": "pnpm vitest", "description": "second"}
+        second = await client.post(url, json=again)
+        assert second.status_code == 200, second.text
+        decision = second.json()["hookSpecificOutput"]["decision"]
+        assert decision["behavior"] == "allow"
+        assert decision["updatedPermissions"] == [
+            {
+                "type": "addRules",
+                "rules": [{"toolName": "Bash"}],
+                "behavior": "allow",
+                "destination": "session",
+            }
+        ]
+        await collector.assert_no_event(0.2)
+
+        # The grant is single use: the same call prompts again.
+        third = await client.post(url, json=payload)
+        assert third.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        third_event = await _next_elicitation(collector)
+        assert third_event["elicitation_id"] != event["elicitation_id"]
+        assert third_event["params"]["approval_ref"] != aid
+    finally:
+        await collector.stop()
+
+
+async def test_deferred_changed_command_prompts_again(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S7: an approved command grants only that command. A different command
+    opens a new deferred card instead of running.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-deferred-changed")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/permission-request"
+    try:
+        payload = await _claude_permission_payload("Bash")
+        payload["tool_input"] = {"command": "pnpm vitest"}
+        first = await client.post(url, json=payload)
+        assert first.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        event = await _next_elicitation(collector)
+        accept = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+        assert accept.status_code == 202, accept.text
+        await _wait_until(lambda: bool(delivered.calls))
+        await _drain_until_quiet(collector)
+
+        changed = await _claude_permission_payload("Bash")
+        changed["tool_input"] = {"command": "pnpm test"}
+        second = await client.post(url, json=changed)
+        assert second.status_code == 200, second.text
+        assert second.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        second_event = await _next_elicitation(collector)
+        assert second_event["elicitation_id"] != event["elicitation_id"]
+    finally:
+        await collector.stop()
+
+
+async def test_deferred_decline_posts_feedback_without_grant(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S8: a decline with feedback posts the denial text carrying the
+    feedback and stores no grant, so the same call re-prompts.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-deferred-decline")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/permission-request"
+    try:
+        payload = await _claude_permission_payload("Bash")
+        payload["tool_input"] = {"command": "pnpm vitest"}
+        first = await client.post(url, json=payload)
+        assert first.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        event = await _next_elicitation(collector)
+        aid = _aid_for(event)
+        decline = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "decline",
+            content={"feedback": "run make instead"},
+        )
+        assert decline.status_code == 202, decline.text
+        await _wait_until(lambda: bool(delivered.calls))
+        text = delivered.calls[-1][1]
+        assert text == (
+            f"[System: approval #{aid} denied by the user: do not run "
+            'Bash({"command": "pnpm vitest"}). Feedback: run make instead]'
+        )
+        await _drain_until_quiet(collector)
+
+        second = await client.post(url, json=payload)
+        assert second.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        second_event = await _next_elicitation(collector)
+        assert second_event["elicitation_id"] != event["elicitation_id"]
+    finally:
+        await collector.stop()
+
+
+async def test_deferred_skips_ask_user_question(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S9: AskUserQuestion needs ``updatedInput`` on the verdict, so it keeps
+    the blocking park even with async approvals on.
+    """
+    await _enable_async_approvals(monkeypatch)
+
+    agent = await create_test_agent(client, "test-deferred-ask")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("AskUserQuestion")
+    payload["tool_input"] = {
+        "questions": [
+            {
+                "question": "Continue?",
+                "header": "Next",
+                "multiSelect": False,
+                "options": [{"label": "Yes"}],
+            }
+        ]
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    assert event["params"].get("async_kind") is None
+    assert event["params"]["interruptible"] is True
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"Continue?": "Yes"},
+    )
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert decision["updatedInput"]["answers"] == {"Continue?": "Yes"}
+
+
+async def test_deferred_setting_off_keeps_blocking(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S9: with the async-approvals setting off, an eligible Bash keeps
+    today's blocking park and interruptible card.
+    """
+    _patch_approval_timeout(
+        monkeypatch,
+        timeout_s=3000.0,
+        stop_turn=True,
+        async_approvals=False,
+    )
+
+    agent = await create_test_agent(client, "test-deferred-off")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Bash")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    assert event["params"].get("async_kind") is None
+    assert event["params"]["interruptible"] is True
+
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
+async def test_deferred_async_approvals_stay_claude_only(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Kimi / Devin drop the deny message, so their hook keeps blocking even
+    with the owner's async-approvals setting on.
+    """
+    await _enable_async_approvals(monkeypatch)
+
+    agent = await create_test_agent(
+        client,
+        "test-deferred-kimi-blocking",
+        executor={"type": "omnigent", "config": {"harness": "kimi-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Bash")
+    payload["_omnigent_elicitation_id"] = "elicit_kimi_" + "0" * 32
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"].get("async_kind") is None
+    assert event["params"].get("approval_ref") is None
+    assert not hook_task.done()
+
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+
+def _codex_command_payload(
+    request_id: int | str,
+    command: str | list[str],
+    *,
+    cwd: str = "/repo/app",
+) -> dict[str, Any]:
+    """
+    Build a Codex command approval envelope.
+
+    :param request_id: JSON-RPC request id.
+    :param command: Raw protocol command (string or argv list).
+    :param cwd: Working directory reported by the request.
+    :returns: Codex command approval payload.
+    """
+    return {
+        "id": request_id,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+            "threadId": "thread_deferred",
+            "turnId": "turn_deferred",
+            "itemId": f"item_{request_id}",
+            "command": command,
+            "cwd": cwd,
+            "reason": "run the suite",
+        },
+    }
+
+
+async def test_codex_command_approval_defers_and_grants(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S10: a Codex command approval declines at once with no interrupt and
+    posts the pending notice; accepting grants the re-issued command
+    without a second card.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> None:
+        forwarded.append(args[2])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+
+    agent = await create_test_agent(client, "test-codex-deferred")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/codex-elicitation-request"
+    payload = _codex_command_payload(31, ["pnpm", "vitest"])
+    try:
+        resp = await client.post(url, json=payload)
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"decision": "decline"}
+        assert forwarded == []
+
+        event = await _next_elicitation(collector)
+        aid = _aid_for(event)
+        params = event["params"]
+        assert params["async_kind"] == "approval"
+        assert params["approval_ref"] == aid
+        assert params["command"] == "pnpm vitest"
+        await _wait_until(lambda: bool(delivered.calls))
+        pending = delivered.calls[-1][1]
+        assert pending.startswith(f"Approval pending (#{aid}): shell(pnpm vitest)")
+        assert "has NOT run" in pending
+
+        accept = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+        assert accept.status_code == 202, accept.text
+        await _wait_until(lambda: any("granted" in text for _, text in delivered.calls))
+        await _drain_until_quiet(collector)
+
+        again = await client.post(url, json=payload)
+        assert again.status_code == 200, again.text
+        assert again.json() == {"decision": "accept"}
+        assert forwarded == []
+        await collector.assert_no_event(0.2)
+    finally:
+        await collector.stop()
+
+
+async def test_codex_command_grant_replays_remembered_amendment(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A grant stored with an execpolicy amendment re-issues the structured
+    ``acceptWithExecpolicyAmendment`` decision instead of a bare accept.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-codex-deferred-remember")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/codex-elicitation-request"
+    amendment = ["pnpm", "vitest"]
+
+    def _remember_payload(request_id: int) -> dict[str, Any]:
+        payload = _codex_command_payload(request_id, ["pnpm", "vitest"])
+        payload["params"]["availableDecisions"] = [
+            "accept",
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": amendment}},
+            "decline",
+        ]
+        return payload
+
+    try:
+        first = await client.post(url, json=_remember_payload(61))
+        assert first.json() == {"decision": "decline"}
+        event = await _next_elicitation(collector)
+        accept = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"execpolicy_amendment": amendment},
+        )
+        assert accept.status_code == 202, accept.text
+        await _wait_until(lambda: any("granted" in text for _, text in delivered.calls))
+        await _drain_until_quiet(collector)
+
+        second = await client.post(url, json=_remember_payload(62))
+        assert second.status_code == 200, second.text
+        assert second.json() == {
+            "decision": {
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": amendment,
+                }
+            }
+        }
+        await collector.assert_no_event(0.2)
+    finally:
+        await collector.stop()
+
+
+async def test_codex_file_change_approval_stays_blocking(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S11: file-change approvals carry no re-issuable content, so they stay
+    blocking even with async approvals on; a decline still interrupts.
+    """
+    await _enable_async_approvals(monkeypatch)
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> None:
+        forwarded.append(args[2])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+
+    agent = await create_test_agent(client, "test-codex-file-change")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": 41,
+        "method": "item/fileChange/requestApproval",
+        "params": {
+            "threadId": "thread_deferred",
+            "turnId": "turn_deferred",
+            "itemId": "item_patch",
+            "grantRoot": "/repo/app",
+            "reason": "write the file",
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+    event = await drain_task
+    assert event["params"].get("async_kind") is None
+
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"decision": "decline"}
+    assert forwarded == [{"type": "interrupt"}]
+
+
+async def test_codex_argv_grant_key_keeps_boundaries(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    S19: an argv grant matches the exact argv. A re-issue whose
+    space-joined display preview is identical but whose boundaries differ
+    does not hit the grant and opens a new deferred card.
+    """
+    await _enable_async_approvals(monkeypatch)
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    agent = await create_test_agent(client, "test-codex-argv-key")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    url = f"/v1/sessions/{session_id}/hooks/codex-elicitation-request"
+    try:
+        granted = _codex_command_payload(51, ["printf", "%s", "a b"])
+        first = await client.post(url, json=granted)
+        assert first.json() == {"decision": "decline"}
+        event = await _next_elicitation(collector)
+        accept = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+        assert accept.status_code == 202, accept.text
+        await _wait_until(lambda: any("granted" in text for _, text in delivered.calls))
+        await _drain_until_quiet(collector)
+
+        # Same display preview ("printf %s a b") but a different argv.
+        colliding = _codex_command_payload(52, ["printf", "%s", "a", "b"])
+        second = await client.post(url, json=colliding)
+        assert second.status_code == 200, second.text
+        assert second.json() == {"decision": "decline"}
+        second_event = await _next_elicitation(collector)
+        assert second_event["elicitation_id"] != event["elicitation_id"]
+        assert second_event["params"]["command"] == "printf %s a b"
+    finally:
+        await collector.stop()

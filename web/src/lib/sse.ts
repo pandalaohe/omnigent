@@ -77,6 +77,7 @@ import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type {
   BackgroundTaskInfo,
   CodexPersistMode,
+  ElicitationSource,
   ErrorInfo,
   ModelUsage,
   RememberScope,
@@ -1068,6 +1069,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const cwd = p.cwd;
     const reason = p.reason;
     const execPolicyAmendment = p.execpolicy_amendment;
+    // Async card extras. `async_kind` marks a card that never parks the
+    // session (async question / deferred approval); the rest carry the
+    // question context and the mirrored-card source stamp.
+    const asyncKindRaw = p.async_kind;
+    const asyncKind =
+      asyncKindRaw === "question" || asyncKindRaw === "approval" ? asyncKindRaw : null;
+    const context = typeof p.context === "string" && p.context ? p.context : null;
+    const approvalRef =
+      typeof p.approval_ref === "string" && p.approval_ref ? p.approval_ref : null;
+    const source = parseElicitationSource(p.source);
+    const toolName = typeof p.tool_name === "string" && p.tool_name ? p.tool_name : null;
     // claude-native edit-tool prompts stamp this so the ApprovalCard
     // offers the "Accept & allow all edits" button (switches the
     // session to acceptEdits mode on accept).
@@ -1153,6 +1165,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       allowAutoMode,
       rememberScope,
       codexPersistModes,
+      asyncKind,
+      context,
+      approvalRef,
+      source,
+      toolName,
+      cwd: typeof cwd === "string" && cwd ? cwd : null,
     } satisfies ElicitationRequest;
   }
 
@@ -1187,6 +1205,32 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
 
   // Unknown event — skip gracefully for forward-compatibility.
   return null;
+}
+
+/**
+ * Parse the system-stamped `source` extra on a mirrored elicitation.
+ *
+ * The server always stamps `session_id` and a resolved `label`; the
+ * agent / host / cwd are omitted when they can't be resolved. A
+ * malformed source yields `null` rather than dropping the whole card —
+ * the card still renders, just without provenance.
+ *
+ * @param raw - The raw `source` value off the elicitation params.
+ */
+function parseElicitationSource(raw: unknown): ElicitationSource | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const sessionId = rec.session_id;
+  const label = rec.label;
+  if (typeof sessionId !== "string" || !sessionId) return null;
+  if (typeof label !== "string") return null;
+  return {
+    sessionId,
+    label,
+    ...(typeof rec.agent === "string" && rec.agent ? { agent: rec.agent } : {}),
+    ...(typeof rec.host === "string" && rec.host ? { host: rec.host } : {}),
+    ...(typeof rec.cwd === "string" && rec.cwd ? { cwd: rec.cwd } : {}),
+  };
 }
 
 function parseSessionResource(raw: unknown): SessionResource | null {

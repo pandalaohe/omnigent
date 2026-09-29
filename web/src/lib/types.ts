@@ -37,6 +37,21 @@ export interface RememberScope {
 export type CodexPersistMode = "session" | "always";
 
 /**
+ * System-stamped provenance of a mirrored elicitation card: which
+ * session asked, what it is called, and (when resolvable) its agent,
+ * host, and working directory. Stamped by the server on cards mirrored
+ * into an ancestor's stream/snapshot; shared by the elicitation event
+ * (`events.ts`), the reduced block (`blocks.ts`), and the ApprovalCard.
+ */
+export interface ElicitationSource {
+  sessionId: string;
+  label: string;
+  agent?: string;
+  host?: string;
+  cwd?: string;
+}
+
+/**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
  * POST time (the transcript forwarder is the single writer), so the

@@ -57,7 +57,7 @@ import {
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { CodexPersistMode, RememberScope } from "@/lib/types";
+import type { CodexPersistMode, ElicitationSource, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
@@ -67,6 +67,38 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+
+/**
+ * Provenance line for a card mirrored from a child session:
+ * `来自子会话 <label> · <agent> @ <host> · <cwd>`, dropping the parts
+ * that could not be resolved. The cwd is monospace and carries the full
+ * path in its `title` so a narrow card can truncate visually.
+ */
+function ElicitationSourceLine({ source }: { source: ElicitationSource }) {
+  const provenance: string[] = [];
+  if (source.agent && source.host) provenance.push(`${source.agent} @ ${source.host}`);
+  else if (source.agent) provenance.push(source.agent);
+  else if (source.host) provenance.push(source.host);
+  return (
+    <p
+      data-testid="approval-card-source"
+      className="flex flex-wrap items-baseline gap-x-1.5 text-sm text-muted-foreground"
+    >
+      <span>来自子会话 {source.label}</span>
+      {provenance.map((part) => (
+        <span key={part}>· {part}</span>
+      ))}
+      {source.cwd && (
+        <span>
+          ·{" "}
+          <code className="font-mono" title={source.cwd}>
+            {source.cwd}
+          </code>
+        </span>
+      )}
+    </p>
+  );
+}
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -181,6 +213,28 @@ interface ApprovalCardProps {
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
   /**
+   * Session whose resolve endpoint should receive the verdict when the
+   * card was mirrored from a child session; null/undefined targets the
+   * active session.
+   */
+  targetSessionId?: string | null;
+  /**
+   * Non-blocking card kind — ``"question"`` (async question) or
+   * ``"approval"`` (deferred approval). Shows the ``不挡路`` pill and
+   * hides the interrupt control: the session it popped in keeps going.
+   */
+  asyncKind?: "question" | "approval" | null;
+  /** Free markdown shown above an async question form. */
+  context?: string | null;
+  /** Short id of a deferred approval card, shown in its pill. */
+  approvalRef?: string | null;
+  /** System-stamped provenance of a card mirrored from a child session. */
+  source?: ElicitationSource | null;
+  /** Tool a deferred approval gates, when known. */
+  toolName?: string | null;
+  /** Working directory the gated action would run in, when known. */
+  cwd?: string | null;
+  /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
    * The Inbox page passes its own handler because its cards belong to
@@ -209,12 +263,20 @@ export function ApprovalCard({
   allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
+  asyncKind,
+  context,
+  approvalRef,
+  targetSessionId,
+  source,
   onSubmit,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
   const scopedConversationId = useContext(ConversationScopeContext);
+  // Mirrored child cards carry a source stamp; show it only when the card
+  // is actually a mirror (targetSessionId set), never on a top-level card.
+  const showSource = Boolean(targetSessionId && source);
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
@@ -232,9 +294,10 @@ export function ApprovalCard({
   // Abort the elicitation and the turn it blocks. Offered only where the
   // producer stamped ``interruptible`` (its cancel verdict stops the turn with
   // no further model request) and only on the in-chat path: the Inbox renders
-  // cards for other sessions behind its own submitter.
+  // cards for other sessions behind its own submitter. An async card never
+  // blocks a turn, so there is nothing to interrupt.
   const abortTurn =
-    onSubmit === undefined && interruptible
+    onSubmit === undefined && interruptible && !asyncKind
       ? () => {
           void useChatStore
             .getState()
@@ -585,6 +648,7 @@ export function ApprovalCard({
     // for the same reason: purposeful content instead of the raw ask.
     const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
     const hasBody =
+      showSource ||
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
@@ -604,6 +668,7 @@ export function ApprovalCard({
         </AlertTitle>
         {hasBody && (
           <AlertDescription className="flex flex-col gap-1 text-sm">
+            {showSource && source && <ElicitationSourceLine source={source} />}
             {isCodexCommandApproval ? (
               <>
                 {codexCommand.reason && <span>{codexCommand.reason}</span>}
@@ -680,8 +745,17 @@ export function ApprovalCard({
         {showPhase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
           <span className="text-muted-foreground text-sm">({phase})</span>
         )}
+        {asyncKind && (
+          <span
+            data-testid="approval-card-async-pill"
+            className="rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+          >
+            不挡路{approvalRef ? ` · #${approvalRef}` : ""}
+          </span>
+        )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
+        {showSource && source && <ElicitationSourceLine source={source} />}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>
@@ -698,6 +772,7 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
+            context={context ?? askPayload.context}
             onAbort={abortTurn}
           />
         ) : isCodexCommandApproval ? (
@@ -778,6 +853,7 @@ export function ElicitationCard({
   return (
     <ApprovalCard
       elicitationId={item.elicitationId}
+      targetSessionId={item.targetSessionId}
       message={item.message}
       phase={item.phase}
       policyName={item.policyName}
@@ -794,6 +870,12 @@ export function ElicitationCard({
       allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
+      asyncKind={item.asyncKind}
+      context={item.context}
+      approvalRef={item.approvalRef}
+      source={item.source}
+      toolName={item.toolName}
+      cwd={item.cwd}
       onSubmit={onSubmit}
     />
   );

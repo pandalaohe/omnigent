@@ -1774,12 +1774,20 @@ def create_app(
         # fresh app instance doesn't inherit a prior run's observer (matters
         # for multi-app test setups).
         from omnigent.server.routes.sessions import (
+            configure_elicitation_source_resolver,
             configure_subagent_block_notifier,
         )
 
         _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
             conversation_store,
             runner_router,
+        )
+        # Name the child, agent, host and cwd on cards mirrored into an
+        # ancestor's stream/snapshot (and in the parent's wake notice).
+        configure_elicitation_source_resolver(
+            agent_store,
+            host_store,
+            agent_cache,
         )
 
         from omnigent.runner.resource_registry import (
@@ -2031,9 +2039,13 @@ def create_app(
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
             # provider lifetime cap — see the hook's docstring).
-            from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+            from omnigent.server.routes.sessions import (
+                cancel_detached_elicitation_tasks,
+                cancel_managed_launch_tasks,
+            )
 
             await cancel_managed_launch_tasks()
+            await cancel_detached_elicitation_tasks()
             await background_title_coordinator.shutdown()
             if cli_retention_coordinator is not None:
                 await cli_retention_coordinator.shutdown()

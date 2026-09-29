@@ -9,6 +9,7 @@ import pytest
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
 from omnigent.runner.app import _format_subagent_wake_notice
 from omnigent.runtime.prompt import (
+    CHILD_SESSION_QUESTION_INSTRUCTION,
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
@@ -16,6 +17,7 @@ from omnigent.runtime.prompt import (
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
+    child_session_question_instruction,
     history_to_input_items,
     native_startup_instructions,
     raw_author_instructions,
@@ -548,6 +550,28 @@ def test_native_startup_instructions_worktree_then_global_last() -> None:
         f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
         f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{worktree_line}\n\nGlobal notice"
     )
+
+
+def test_child_question_instruction_with_peers_sends_to_the_mother() -> None:
+    """A child with peer messaging sends the decision to its mother and moves on."""
+    text = child_session_question_instruction(peer_messaging_enabled=True)
+
+    assert text.startswith(CHILD_SESSION_QUESTION_INSTRUCTION)
+    assert "Do not show question cards to the user yourself." in text
+    assert "`sys_session_send`" in text
+    assert "then continue other work or end your turn" in text
+    assert "her reply arrives as a new message" in text
+
+
+def test_child_question_instruction_without_peers_ends_the_turn() -> None:
+    """A child without peer messaging makes the question its final output."""
+    text = child_session_question_instruction(peer_messaging_enabled=False)
+
+    assert text.startswith(CHILD_SESSION_QUESTION_INSTRUCTION)
+    assert "Do not show question cards to the user yourself." in text
+    assert "sys_session_send" not in text
+    assert "as your final output" in text
+    assert "your mother receives it as your result" in text
 
 
 def test_child_session_quiet_instruction_only_for_children() -> None:

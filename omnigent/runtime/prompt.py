@@ -28,6 +28,47 @@ PEER_SESSION_GRANT: str = (
     "normal ones; anything your rules reserve for your user still needs your user."
 )
 
+# A child session's questions go to its mother, never a card in the child's
+# own page; the wording depends on whether the child can message her.
+CHILD_SESSION_QUESTION_INSTRUCTION = (
+    "You are a child session of another Omnigent session (your mother). Do not "
+    "show question cards to the user yourself."
+)
+
+_CHILD_SESSION_QUESTION_PEER_ON = (
+    "When you need a user decision, send the question, its options, the context "
+    "and any links to your mother with `sys_session_send`, then continue other "
+    "work or end your turn; her reply arrives as a new message."
+)
+
+_CHILD_SESSION_QUESTION_PEER_OFF = (
+    "When you need a user decision, end your turn with the question, options, "
+    "context and links as your final output; your mother receives it as your "
+    "result."
+)
+
+
+def child_session_question_instruction(peer_messaging_enabled: bool) -> str:
+    """
+    The children-only question guidance for a session's startup prompt.
+
+    :param peer_messaging_enabled: Whether the child can reach its mother
+        with ``sys_session_send``.
+    :returns: :data:`CHILD_SESSION_QUESTION_INSTRUCTION` plus the wording
+        matching the child's peer-messaging state.
+    """
+    return " ".join(
+        (
+            CHILD_SESSION_QUESTION_INSTRUCTION,
+            (
+                _CHILD_SESSION_QUESTION_PEER_ON
+                if peer_messaging_enabled
+                else _CHILD_SESSION_QUESTION_PEER_OFF
+            ),
+        )
+    )
+
+
 # Shape of the wake notice the runner posts into a parent session when a
 # dispatched sub-agent finishes (``omnigent.runner.app._format_subagent_wake_notice``).
 # Quoted verbatim wherever the model is told what to expect, so the notice

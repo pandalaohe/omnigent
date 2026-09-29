@@ -6,6 +6,7 @@ export const APPROVAL_TIMEOUT_CHANGED_EVENT = "omnigent:approval-timeout-changed
 /** Server-side defaults, mirrored here so an absent key means "server default". */
 export const DEFAULT_APPROVAL_TIMEOUT_MINUTES = 50;
 export const DEFAULT_STOP_TURN_ON_TIMEOUT = true;
+export const DEFAULT_ASYNC_APPROVALS = true;
 export const MIN_APPROVAL_TIMEOUT_MINUTES = 1;
 /** Kept under the host-side hook/bridge client budgets (24 h minus a margin). */
 export const MAX_APPROVAL_TIMEOUT_MINUTES = 1380;
@@ -15,11 +16,17 @@ export interface ApprovalTimeoutPreferences {
   timeoutMinutes: number;
   /** ON: the deadline stops the turn; OFF: the native flow runs at the deadline. */
   stopTurn: boolean;
+  /**
+   * ON: an eligible approval tells the agent it is pending and returns at
+   * once; the timeout fields above do not apply to it.
+   */
+  asyncApprovals: boolean;
 }
 
 const DEFAULT_PREFERENCES: ApprovalTimeoutPreferences = {
   timeoutMinutes: DEFAULT_APPROVAL_TIMEOUT_MINUTES,
   stopTurn: DEFAULT_STOP_TURN_ON_TIMEOUT,
+  asyncApprovals: DEFAULT_ASYNC_APPROVALS,
 };
 
 function normalizeTimeoutMinutes(value: unknown): number {
@@ -37,6 +44,7 @@ function normalizePreferences(value: unknown): ApprovalTimeoutPreferences {
   return {
     timeoutMinutes: normalizeTimeoutMinutes(candidate.timeoutMinutes),
     stopTurn: candidate.stopTurn !== false,
+    asyncApprovals: candidate.asyncApprovals !== false,
   };
 }
 
@@ -55,7 +63,8 @@ export function writeApprovalTimeoutPreferences(preferences: ApprovalTimeoutPref
   const normalized = normalizePreferences(preferences);
   const isDefault =
     normalized.timeoutMinutes === DEFAULT_APPROVAL_TIMEOUT_MINUTES &&
-    normalized.stopTurn === DEFAULT_STOP_TURN_ON_TIMEOUT;
+    normalized.stopTurn === DEFAULT_STOP_TURN_ON_TIMEOUT &&
+    normalized.asyncApprovals === DEFAULT_ASYNC_APPROVALS;
   try {
     if (isDefault) window.localStorage.removeItem(APPROVAL_TIMEOUT_STORAGE_KEY);
     else window.localStorage.setItem(APPROVAL_TIMEOUT_STORAGE_KEY, JSON.stringify(normalized));

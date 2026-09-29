@@ -220,6 +220,10 @@ class ToolManager:
         # auto-registered so any agent can open a file in the user's web
         # preview panel without the spec opting in.
         self._register_panel_tools()
+        # The async question card is framework-owned and always registered:
+        # it has no cross-session function, so it sits outside the peer
+        # messaging master switch.
+        self._register_ask_user_tools()
 
     def _register_policy_tools(self) -> None:
         """
@@ -654,6 +658,20 @@ class ToolManager:
         from omnigent.tools.builtins.panel import OpenInPanelTool
 
         self._tools[OpenInPanelTool.name()] = OpenInPanelTool()
+
+    def _register_ask_user_tools(self) -> None:
+        """
+        Auto-register ``ask_user_async``.
+
+        Framework-owned and always available so any agent can post a
+        question card that does not block its turn. The class is
+        schema-only; execution lives in the runner dispatch
+        (``omnigent/runner/tool_dispatch.py``), which needs the runner's
+        ``server_client`` that ``ToolContext`` does not carry.
+        """
+        from omnigent.tools.builtins.ask_user import AskUserAsyncTool
+
+        self._tools[AskUserAsyncTool.name()] = AskUserAsyncTool()
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """

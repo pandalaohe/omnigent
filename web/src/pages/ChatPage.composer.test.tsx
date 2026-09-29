@@ -3318,6 +3318,40 @@ describe("Composer pending elicitation", () => {
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("status update please", undefined);
   });
+
+  it("keeps Send enabled for an own async question card", () => {
+    // An async question never parks the turn, so its card must not lock
+    // Send the way a blocking card does (see the first test in this
+    // describe for the blocking case).
+    useChatStore.setState({
+      conversationId: "conv_async_question",
+      blocks: [elicitationBlock({ asyncKind: "question" })],
+    });
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+
+    expect(ta.placeholder).not.toBe("Respond to the pending request above to continue");
+    fireEvent.change(ta, { target: { value: "carry on" } });
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("carry on", undefined);
+  });
+
+  it("keeps Send enabled for an own deferred approval", () => {
+    useChatStore.setState({
+      conversationId: "conv_async_approval",
+      blocks: [elicitationBlock({ asyncKind: "approval", approvalRef: "a123456" })],
+    });
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const ta = textarea();
+
+    fireEvent.change(ta, { target: { value: "carry on" } });
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("carry on", undefined);
+  });
 });
 
 describe("Composer reply quotes", () => {

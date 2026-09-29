@@ -13,6 +13,7 @@ import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 import type {
   BackgroundTaskInfo,
   CodexPersistMode,
+  ElicitationSource,
   ErrorInfo,
   ModelUsage,
   RememberScope,
@@ -282,6 +283,29 @@ export interface ElicitationRequest {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /**
+   * Non-blocking card kind. ``"question"`` is the ``ask_user_async`` /
+   * Codex async question card; ``"approval"`` is a deferred approval
+   * (deny now, approve later). Both return control to the agent at once
+   * and never lock the session; absent/null for blocking cards.
+   */
+  asyncKind?: "question" | "approval" | null;
+  /**
+   * Free markdown shown above an async question form — the recap,
+   * report paths, or links the agent wants the user to decide on.
+   */
+  context?: string | null;
+  /**
+   * Short id (``a<hex>``) identifying a deferred approval card, echoed in
+   * the system message that carries the eventual verdict.
+   */
+  approvalRef?: string | null;
+  /** System-stamped provenance when the card is mirrored from a child session. */
+  source?: ElicitationSource | null;
+  /** Tool a deferred approval gates, when known. */
+  toolName?: string | null;
+  /** Working directory the gated action would run in, when known. */
+  cwd?: string | null;
 }
 
 /**

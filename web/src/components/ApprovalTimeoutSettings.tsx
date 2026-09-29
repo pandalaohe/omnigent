@@ -62,6 +62,22 @@ export function ApprovalTimeoutSettings() {
           className="shrink-0"
         />
       </div>
+      <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
+        <div>
+          <span className="text-sm font-medium text-foreground">审批不挡路</span>
+          <p className="mt-1 text-xs text-muted-foreground">
+            先告诉 agent 这一步在等批准，批准后它重新执行；开启时不适用上方的超时设置。
+          </p>
+        </div>
+        <Switch
+          aria-label="审批不挡路"
+          checked={preferences.asyncApprovals}
+          onCheckedChange={(enabled) =>
+            writeApprovalTimeoutPreferences({ ...preferences, asyncApprovals: enabled })
+          }
+          className="shrink-0"
+        />
+      </div>
     </section>
   );
 }
