@@ -208,6 +208,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
     _deferred_elicitation_clear_tasks,
+    _detached_elicitation_tasks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _llm_response_denied_turns,
@@ -625,8 +626,158 @@ async def _persist_approval_timeout_notice(
         _publish_external_conversation_item(session_id, persisted[0])
 
 
+#: Error code for the persisted "the answer never landed" notice.
+_UNDELIVERED_ANSWER_CODE = "answer_undelivered"
+
+
+def _delivery_reference(text: str) -> str | None:
+    """
+    Extract the ``#<id>`` correlation token from a system delivery message.
+
+    :param text: The ``[System: …]`` message, e.g. ``"[System: answers
+        to your question card #q1a2b3c]"``.
+    :returns: The token including ``#``, e.g. ``"#q1a2b3c"``, or ``None``.
+    """
+    match = re.search(r"#([A-Za-z0-9]+)", text)
+    return f"#{match.group(1)}" if match is not None else None
+
+
+async def _persist_undelivered_answer_notice(
+    session_id: str,
+    text: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist + publish the notice replacing an answer that could not land.
+
+    Uses the same stable-id dedupe as
+    :func:`_persist_approval_timeout_notice` so a retried delivery cannot
+    append a second notice for the same reference.
+
+    :param session_id: Session/conversation identifier.
+    :param text: The undelivered ``[System: …]`` message, used for the
+        notice's correlation reference.
+    :param conversation_store: Store for the durable append.
+    """
+    reference = _delivery_reference(text)
+    subject = f"Answer to {reference}" if reference is not None else "An answer"
+    message = f"{subject} could not be delivered; re-ask."
+    notice_key = f"{_UNDELIVERED_ANSWER_CODE}:{reference or text}"
+    stable_id = hashlib.sha256(notice_key.encode()).hexdigest()[:32]
+    item = NewConversationItem(
+        type="error",
+        response_id=generate_task_id(),
+        data=ErrorData(
+            source="harness",
+            code=_UNDELIVERED_ANSWER_CODE,
+            message=message,
+            level="info",
+        ),
+        stable_id=stable_id,
+    )
+    try:
+        persisted = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist undelivered-answer notice for session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if persisted and not persisted[0].deduplicated:
+        _publish_external_conversation_item(session_id, persisted[0])
+
+
+#: Backoff schedule for a verdict that could not be delivered.
+_DELIVER_RETRY_BACKOFFS_S: tuple[float, ...] = (2.0, 5.0, 15.0, 30.0, 60.0)
+#: Steady interval once the schedule above is exhausted.
+_DELIVER_RETRY_INTERVAL_S = 120.0
+#: Hard ceiling on the whole retry window.
+_DELIVER_RETRY_MAX_S = 1800.0
+
+
+async def _delivery_retry_sleep(seconds: float) -> None:
+    """
+    Indirection over :func:`asyncio.sleep` for the delivery retry backoff.
+
+    :param seconds: Seconds to sleep, e.g. ``120.0``.
+    :returns: None.
+    """
+    await asyncio.sleep(seconds)
+
+
+async def _deliver_with_retry(
+    session_id: str,
+    text: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> bool:
+    """
+    Post one system message, retrying until it lands or the window elapses.
+
+    ``_post_system_message`` is best-effort and returns ``False`` when no
+    runner is bound, so a verdict that arrives while the runner is
+    reconnecting would otherwise be lost. Retries follow the backoff
+    ``_DELIVER_RETRY_BACKOFFS_S`` then ``_DELIVER_RETRY_INTERVAL_S`` for at
+    most ``_DELIVER_RETRY_MAX_S``; on final failure a visible transcript
+    notice is persisted so the loss is legible.
+
+    :param session_id: Session/conversation identifier.
+    :param text: The ``[System: …]`` message carrying its ``#<id>``.
+    :param conversation_store: Store used to resolve the runner and to
+        persist the final-failure notice.
+    :param runner_router: Router used to resolve the session's bound runner.
+    :returns: ``True`` when the message was dispatched, else ``False``.
+    """
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        try:
+            delivered = await _post_system_message(
+                session_id,
+                text,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+        except Exception:  # noqa: BLE001
+            # Broad: a delivery failure must never crash the background
+            # verdict handler.
+            _logger.warning(
+                "Failed to deliver system message to session %s (attempt %d)",
+                session_id,
+                attempt + 1,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            delivered = False
+        if delivered:
+            return True
+        attempt += 1
+        if attempt <= len(_DELIVER_RETRY_BACKOFFS_S):
+            delay = _DELIVER_RETRY_BACKOFFS_S[attempt - 1]
+        else:
+            delay = _DELIVER_RETRY_INTERVAL_S
+        if time.monotonic() - started + delay > _DELIVER_RETRY_MAX_S:
+            break
+        await _delivery_retry_sleep(delay)
+    _logger.warning(
+        "System message undelivered after %d attempt(s) for session %s",
+        attempt,
+        session_id,
+        extra={"session_id": session_id},
+    )
+    await _persist_undelivered_answer_notice(session_id, text, conversation_store)
+    return False
+
+
 async def _publish_and_wait_for_harness_elicitation(
-    request: Request,
+    request: Request | None,
     *,
     session_id: str,
     params: ElicitationRequestParams,
@@ -669,7 +820,8 @@ async def _publish_and_wait_for_harness_elicitation(
     timeout/disconnect behaviour byte for byte.
 
     :param request: FastAPI request object so upstream disconnect can
-        be detected.
+        be detected. ``None`` for a detached park (no HTTP request
+        attached): the disconnect leg is dropped.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param params: Elicitation params to publish.
     :param timeout_s: Maximum wait in seconds, e.g. ``300.0``. Ignored
@@ -753,11 +905,17 @@ async def _publish_and_wait_for_harness_elicitation(
                 session_id,
                 event_payload,
             )
-        disconnect_task = asyncio.create_task(
-            _poll_request_disconnect(request),
-        )
+        disconnect_task: asyncio.Task[Any] | None = None
+        if request is not None:
+            disconnect_task = asyncio.create_task(
+                _poll_request_disconnect(request),
+            )
         resolved_elsewhere_task = asyncio.create_task(parked.resolved_elsewhere.wait())
-        race_tasks = (disconnect_task, resolved_elsewhere_task)
+        race_tasks: tuple[asyncio.Task[Any], ...] = (
+            (disconnect_task, resolved_elsewhere_task)
+            if disconnect_task is not None
+            else (resolved_elsewhere_task,)
+        )
         stop_callback: Callable[[], Awaitable[ElicitationResult | None]] | None = None
         try:
             if timeout_snapshot is not None:
@@ -910,6 +1068,72 @@ async def _publish_and_wait_for_harness_elicitation(
                     settled_action,
                     settled_reason,
                 )
+
+
+def start_detached_elicitation(
+    session_id: str,
+    params: ElicitationRequestParams,
+    *,
+    conversation_store: ConversationStore | None,
+    on_result: Callable[[ElicitationResult | None], Awaitable[None]],
+    timeout_s: float = 86400.0,
+) -> str:
+    """
+    Park an elicitation with no HTTP request attached and return immediately.
+
+    Runs :func:`_publish_and_wait_for_harness_elicitation` with
+    ``request=None`` (no disconnect leg) in a background task held in a
+    module-level strong-ref set until it settles. The web verdict is
+    delivered to ``on_result`` — including ``None`` on timeout — after
+    the park ends. Tasks are cancelled at lifespan teardown.
+
+    :param session_id: Session the card belongs to, e.g.
+        ``"conv_abc123"``.
+    :param params: Elicitation params to publish.
+    :param conversation_store: Optional store used to mirror the card
+        into ancestor streams. ``None`` keeps it scoped to ``session_id``.
+    :param on_result: Coroutine invoked with the verdict, or ``None``
+        when the wait expired / was severed without one.
+    :param timeout_s: Maximum wait in seconds before
+        ``on_result(None)``; defaults to one day.
+    :returns: The minted elicitation id, e.g. ``"elicit_abc123"``.
+    """
+    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+
+    async def _park_and_report() -> None:
+        result = await _publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=session_id,
+            params=params,
+            timeout_s=timeout_s,
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+        )
+        await on_result(result)
+
+    task = asyncio.create_task(_park_and_report())
+    _detached_elicitation_tasks.add(task)
+    task.add_done_callback(_detached_elicitation_tasks.discard)
+    return elicitation_id
+
+
+async def cancel_detached_elicitation_tasks() -> None:
+    """
+    Cancel and await every in-flight detached elicitation park.
+
+    Lifespan-teardown hook: a parked card has no request to sever, so
+    without this it would outlive the ASGI shutdown and die wherever the
+    loop teardown happens to kill it. Pending cards are lost, which is
+    the accepted restart tradeoff (same as every other elicitation).
+
+    :returns: None once every task has settled.
+    """
+    tasks = list(_detached_elicitation_tasks)
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _schedule_deferred_elicitation_clear(
@@ -9198,6 +9422,92 @@ async def _evaluate_input_policy(
     }
 
 
+async def _post_system_message(
+    session_id: str,
+    text: str,
+    *,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> bool:
+    """
+    Deliver a synthetic ``[System: …]`` user message to a session's runner.
+
+    Posts to the session's ``POST /v1/sessions/{id}/events`` — the same
+    path the runner's terminal-completion wake uses, so it starts a
+    continuation turn (idle session) or coalesces with pending input
+    (busy session). Best-effort: a missing session, missing runner, or
+    transport error is logged and swallowed (a dropped message is no
+    worse than the pre-fix baseline), but the *outcome* is reported back
+    so callers can retry or release a debounce.
+
+    :param session_id: Session id to inject into, e.g.
+        ``"conv_parent123"``.
+    :param text: The ``[System: …]`` text to inject.
+    :param conversation_store: Used to load the :class:`Conversation`
+        and persist the synthetic user message item.
+    :param runner_router: Router used to resolve the session's bound
+        runner. ``None`` in in-process setups (the runtime singleton is
+        consulted as a fallback).
+    :returns: ``True`` when the message was dispatched to the runner;
+        ``False`` when delivery could not happen (session gone, no runner
+        bound, or the forward raised a transport error).
+    """
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
+        # Session vanished between publish and delivery (cascading-delete race).
+        _logger.debug(
+            "system message: session %s missing; dropping message",
+            session_id,
+        )
+        return False
+    runner_client = await _get_runner_client(session_id, runner_router)
+    if runner_client is None:
+        # WARNING (not DEBUG): an unbound session is the transient-miss case
+        # retried by callers — surface it rather than burying it as routine.
+        _logger.warning(
+            "system message: no runner bound for session %s; dropping message",
+            session_id,
+        )
+        return False
+    # Ensure the session's SSE relay is live so the wake turn's output is
+    # persisted (parity with post_event).
+    _ensure_runner_relay(
+        session_id,
+        conv.runner_id,
+        runner_client,
+        conversation_store,
+    )
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    )
+    try:
+        # None args: a system notice carries no agent/files/artifacts; the runner
+        # recomputes has_mcp_servers from the session's cached spec.
+        await _dispatch_session_event_to_runner(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            runner_client,
+            agent_name=None,
+            file_store=None,
+            artifact_store=None,
+            runner_router=runner_router,
+        )
+    except (httpx.HTTPError, OmnigentError):
+        _logger.warning(
+            "system message POST failed for session=%s",
+            session_id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 async def _wake_parent_for_blocked_child(
     parent_id: str,
     child: Conversation,
@@ -9209,16 +9519,14 @@ async def _wake_parent_for_blocked_child(
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
 
-    Posts the ``[System: …]`` notice as a synthetic user message to the
-    parent's ``POST /v1/sessions/{id}/events`` — the same path the runner's
-    terminal-completion wake uses, so it starts a continuation turn (idle
-    parent) or coalesces with pending input (busy parent). Best-effort: a
-    missing parent, missing runner, or transport error is logged and swallowed
-    (a dropped wake is no worse than the pre-fix no-wake baseline), but the
+    Delegates to :func:`_post_system_message`, which posts the
+    ``[System: …]`` notice as a synthetic user message to the parent's
+    ``POST /v1/sessions/{id}/events``. Best-effort: a missing parent,
+    missing runner, or transport error is logged and swallowed, but the
     *outcome* is reported back so the notifier can release its per-block
     debounce and let a later publish retry rather than silencing the block.
 
-    :param parent_id: Parent session id, e.g. ``\"conv_parent123\"``.
+    :param parent_id: Parent session id, e.g. ``"conv_parent123"``.
     :param child: The blocked child :class:`Conversation`; used only for its
         label/id in the notice and logs.
     :param notice: The ``[System: …]`` text to inject into the parent.
@@ -9231,63 +9539,13 @@ async def _wake_parent_for_blocked_child(
         ``False`` when delivery could not happen (parent gone, no runner bound,
         or the forward raised a transport error).
     """
-    parent_conv = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
-    if parent_conv is None:
-        # Parent vanished between publish and wake (cascading-delete race).
-        _logger.debug(
-            "subagent block notifier: parent %s missing; dropping wake for %s",
-            parent_id,
-            child.id,
-        )
-        return False
-    runner_client = await _get_runner_client(parent_id, runner_router)
-    if runner_client is None:
-        # WARNING (not DEBUG): an unbound parent is the transient-miss case the
-        # notifier retries — surface it rather than burying it as routine.
-        _logger.warning(
-            "subagent block notifier: no runner bound for parent %s; dropping wake for %s",
-            parent_id,
-            child.id,
-        )
-        return False
-    # Ensure the parent's SSE relay is live so the wake turn's output is
-    # persisted (parity with post_event).
-    _ensure_runner_relay(
+    del child
+    return await _post_system_message(
         parent_id,
-        parent_conv.runner_id,
-        runner_client,
-        conversation_store,
+        notice,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
     )
-    body = SessionEventInput(
-        type="message",
-        data={
-            "role": "user",
-            "content": [{"type": "input_text", "text": notice}],
-        },
-    )
-    try:
-        # None args: a system notice carries no agent/files/artifacts; the runner
-        # recomputes has_mcp_servers from the parent's cached spec.
-        await _dispatch_session_event_to_runner(
-            parent_id,
-            parent_conv,
-            body,
-            conversation_store,
-            runner_client,
-            agent_name=None,
-            file_store=None,
-            artifact_store=None,
-            runner_router=runner_router,
-        )
-    except (httpx.HTTPError, OmnigentError):
-        _logger.warning(
-            "subagent block wake POST failed for parent=%s child=%s",
-            parent_id,
-            child.id,
-            exc_info=True,
-        )
-        return False
-    return True
 
 
 def configure_subagent_block_notifier(
@@ -12544,6 +12802,7 @@ __all__ = [
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
+    "_deliver_with_retry",
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
@@ -12582,6 +12841,7 @@ __all__ = [
     "_persist_native_cumulative_usage",
     "_persist_native_terminal_failure",
     "_persist_session_event",
+    "_post_system_message",
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
@@ -12600,6 +12860,8 @@ __all__ = [
     "_wait_for_archive_idle",
     "_wait_for_host_bound_runner_client",
     "_wake_parent_for_blocked_child",
+    "cancel_detached_elicitation_tasks",
     "configure_subagent_block_notifier",
     "ensure_runner_connected",
+    "start_detached_elicitation",
 ]

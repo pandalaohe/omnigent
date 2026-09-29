@@ -94,10 +94,12 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     HarnessTimeoutPolicy,
+    _deliver_with_retry,
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
+    start_detached_elicitation,
 )
 from omnigent.server.schemas import (
     ElicitationRequestParams,
@@ -118,6 +120,84 @@ from omnigent.stores.permission_store import PermissionStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+def _normalize_async_question_options(
+    options_raw: Any,
+    index: int,
+) -> list[dict[str, Any]]:
+    """
+    Validate + normalize one async question's options.
+
+    :param options_raw: The ``options`` field from the request body, or
+        ``None`` for a free-text question.
+    :param index: Question index, used to name the offending field.
+    :returns: Normalized options, each ``{label, description?}``.
+    :raises OmnigentError: 400 when an option is not an object with a
+        non-empty string ``label``.
+    """
+    if options_raw is None:
+        return []
+    if not isinstance(options_raw, list):
+        raise OmnigentError(
+            f"questions[{index}].options must be an array when present.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    options: list[dict[str, Any]] = []
+    for option_index, option_raw in enumerate(options_raw):
+        if not isinstance(option_raw, dict):
+            raise OmnigentError(
+                f"questions[{index}].options[{option_index}] must be an object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        label = option_raw.get("label")
+        if not isinstance(label, str) or not label:
+            raise OmnigentError(
+                f"questions[{index}].options[{option_index}].label must be a non-empty string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        option: dict[str, Any] = {"label": label}
+        description = option_raw.get("description")
+        if description is not None and not isinstance(description, str):
+            raise OmnigentError(
+                f"questions[{index}].options[{option_index}].description must "
+                "be a string when present.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if description:
+            option["description"] = description
+        options.append(option)
+    return options
+
+
+def _format_async_question_answers(
+    questions: list[dict[str, Any]],
+    content: dict[str, Any] | None,
+    qid: str,
+) -> str:
+    """
+    Render the ``[System: …]`` answer message for one accepted card.
+
+    :param questions: Normalized questions the card asked.
+    :param content: MCP ``ElicitResult.content`` from the web form, keyed
+        by question text; ``None`` when the verdict carried none.
+    :param qid: The card's short correlation id, e.g. ``"q1a2b3c"``.
+    :returns: The header line plus one ``<question> → <answer>`` line per
+        question; multi-select answers are joined by ``"; "``.
+    """
+    lines = [f"[System: answers to your question card #{qid}]"]
+    answers = content or {}
+    for question in questions:
+        text = question["question"]
+        answer = answers.get(text)
+        if isinstance(answer, list):
+            rendered = "; ".join(str(item) for item in answer)
+        elif answer is None:
+            rendered = ""
+        else:
+            rendered = str(answer)
+        lines.append(f"{text} → {rendered}")
+    return "\n".join(lines)
 
 
 def _approval_timeout_owner(
@@ -258,6 +338,163 @@ def register_hooks_routes(
             _sf.read_approval_timeout,
             user_preferences_store,
             owner,
+        )
+
+    # ── POST /sessions/{session_id}/async-questions ─
+
+    @router.post(
+        "/sessions/{session_id}/async-questions",
+        # Runner tool → server route — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+        # CSRF hardening: body is parsed via request.json(); require a JSON
+        # Content-Type so a cross-site text/plain request can't reach it.
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def post_async_questions(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """
+        Post a non-blocking question card to a session's own stream.
+
+        The ``ask_user_async`` runner tool POSTs here. The card is
+        published on ``session_id`` only (never mirrored to ancestors),
+        validated shape-only — a non-empty ``questions`` list, each with a
+        non-empty string ``question`` and well-formed optional fields — and
+        parked with no HTTP request attached, so the caller returns at once
+        and the user's answer arrives later as a system user message.
+
+        :param request: FastAPI request carrying ``{questions, context?}``.
+        :param session_id: Omnigent conversation id from the URL path.
+        :returns: ``200`` with ``{elicitation_id, qid}``.
+        :raises OmnigentError: 400 on a shape violation, 404 if the
+            session does not exist.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in async-questions body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "async-questions body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        questions_raw = payload.get("questions")
+        if not isinstance(questions_raw, list) or not questions_raw:
+            raise OmnigentError(
+                "async-questions body requires a non-empty 'questions' list.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        questions: list[dict[str, Any]] = []
+        for index, entry in enumerate(questions_raw):
+            if not isinstance(entry, dict):
+                raise OmnigentError(
+                    f"questions[{index}] must be an object.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            question_text = entry.get("question")
+            if not isinstance(question_text, str) or not question_text:
+                raise OmnigentError(
+                    f"questions[{index}].question must be a non-empty string.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            header = entry.get("header")
+            if header is not None and not isinstance(header, str):
+                raise OmnigentError(
+                    f"questions[{index}].header must be a string when present.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            multi_select = entry.get("multiSelect")
+            if multi_select is not None and not isinstance(multi_select, bool):
+                raise OmnigentError(
+                    f"questions[{index}].multiSelect must be a boolean when present.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            questions.append(
+                {
+                    "question": question_text,
+                    "header": header or "",
+                    "options": _normalize_async_question_options(entry.get("options"), index),
+                    "multiSelect": multi_select is True,
+                }
+            )
+        context = payload.get("context")
+        if context is not None and not isinstance(context, str):
+            raise OmnigentError(
+                "async-questions 'context' must be a string when present.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        native_agent = native_coding_agent_for_harness(harness) or (
+            native_coding_agent_for_wrapper_label(conv.labels.get("omnigent.wrapper"))
+        )
+        asking_name = native_agent.display_name if native_agent is not None else "Agent"
+        vendor = (
+            _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
+            if native_agent is not None
+            else "omnigent"
+        )
+        extras: dict[str, Any] = {
+            "ask_user_question": {"questions": questions},
+            "async_kind": "question",
+        }
+        if context:
+            extras["context"] = context
+        params = ElicitationRequestParams(
+            mode="form",
+            message=f"{asking_name} has questions",
+            requestedSchema=None,
+            url=None,
+            phase="async_question",
+            policy_name=f"{vendor}_async_question",
+            **extras,
+        )
+        qid = ""
+
+        async def _on_result(result: ElicitationResult | None) -> None:
+            """
+            Deliver the card's verdict to the asking session.
+
+            :param result: Web verdict, or ``None`` when the park expired
+                or was severed; ``None`` posts nothing.
+            :returns: None.
+            """
+            if result is None:
+                return
+            if result.action == "accept":
+                text = _format_async_question_answers(questions, result.content, qid)
+            else:
+                text = f"[System: the user dismissed question card #{qid} without answering.]"
+            await _deliver_with_retry(
+                session_id,
+                text,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+            )
+
+        elicitation_id = start_detached_elicitation(
+            session_id,
+            params,
+            conversation_store=None,
+            on_result=_on_result,
+        )
+        qid = "q" + elicitation_id.removeprefix("elicit_")[:6]
+        return Response(
+            content=json.dumps({"elicitation_id": elicitation_id, "qid": qid}),
+            media_type="application/json",
         )
 
     @router.post(
@@ -1309,7 +1546,8 @@ def register_hooks_routes(
             session_id=session_id,
             params=codex_request.params,
             timeout_s=timeout_s,
-            conversation_store=conversation_store,
+            # Async cards stay in their own session: no ancestor mirror.
+            conversation_store=None if is_async_question else conversation_store,
             elicitation_id=codex_elicitation_id(
                 session_id,
                 codex_request.method,

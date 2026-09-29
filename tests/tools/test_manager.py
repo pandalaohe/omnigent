@@ -95,6 +95,10 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # (framework-owned) like the browser tools. Schema-only;
         # runner-dispatched.
         "open_in_panel",
+        # The async question card is framework-owned too: registered
+        # unconditionally (it has no cross-session function). Schema-only;
+        # runner-dispatched.
+        "ask_user_async",
     }
 )
 
@@ -129,6 +133,40 @@ def test_session_rename_is_registered_for_every_agent() -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
 
     assert "sys_session_rename" in names
+
+
+def test_ask_user_async_is_registered_for_every_agent() -> None:
+    """The async question tool sits outside every spec / peer-messaging gate."""
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "ask_user_async" in names
+
+
+def test_ask_user_async_schema_has_no_count_or_length_caps() -> None:
+    """Questions are bounded only by 'non-empty' — no caps beyond the body limit."""
+    schemas = ToolManager(_make_spec()).get_tool_schemas()
+    function = next(
+        schema["function"] for schema in schemas if schema["function"]["name"] == "ask_user_async"
+    )
+    parameters = function["parameters"]
+    assert parameters["required"] == ["questions"]
+    questions = parameters["properties"]["questions"]
+    assert questions["minItems"] == 1
+    assert "maxItems" not in questions
+    item = questions["items"]
+    assert item["required"] == ["question"]
+    assert set(item["properties"]) == {"question", "header", "options", "multiSelect"}
+    assert set(parameters["properties"]) == {"questions", "context"}
+
+
+def test_ask_user_async_rides_the_native_relay_and_no_spec_fallback() -> None:
+    """Native harnesses see the card both with a spec and without one."""
+    from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+
+    with_spec = {schema["name"] for schema in build_native_relay_tool_schemas(_make_spec())}
+    assert "ask_user_async" in with_spec
+    fallback = {schema["name"] for schema in build_native_relay_tool_schemas(None)}
+    assert "ask_user_async" in fallback
 
 
 @pytest.fixture()

@@ -163,6 +163,11 @@ class SubagentBlockNotifier:
         # No id → can't be matched by its resolve, so never arm.
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
+        params = event.get("params")
+        if isinstance(params, dict) and params.get("async_kind") == "question":
+            # Async question cards never block their session, so there is
+            # no block to escalate to the parent.
+            return
         event_type = event.get("type")
         if event_type == _STALE_TYPE:
             with self._lock:

@@ -1750,6 +1750,11 @@ def _pending_elicitation_snapshot_for_session(
     }
     for child in _descendant_sessions(conv_store, conv.id):
         for event in pending_elicitations.snapshot_for(child.id):
+            params = event.get("params")
+            if isinstance(params, dict) and params.get("async_kind") == "question":
+                # Async question cards are scoped to their own session and
+                # never mirrored into ancestors, live or on cold load.
+                continue
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue

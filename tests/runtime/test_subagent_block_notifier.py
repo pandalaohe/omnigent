@@ -909,6 +909,38 @@ async def test_observe_ignores_non_elicitation_events(
 
 
 @pytest.mark.asyncio
+async def test_observe_ignores_async_question_events(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    An async question card is not a block: it never wakes the parent.
+
+    Async cards answer outside the asking turn and are scoped to their
+    own session, so the parent must not be told a child is blocked and
+    the debounce must not arm for them.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:asks", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+    event = _request_event("elicit_async_question", "Agent has questions")
+    event["params"]["async_kind"] = "question"
+
+    notifier.observe(child.id, event)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert dispatch.calls == []
+    assert elicitation_armed(notifier, "elicit_async_question") is False
+
+
+@pytest.mark.asyncio
 async def test_observe_retries_then_releases_arm_when_dispatch_raises(
     conv_store: SqlAlchemyConversationStore,
     caplog: pytest.LogCaptureFixture,

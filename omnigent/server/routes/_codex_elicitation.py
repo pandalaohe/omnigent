@@ -617,6 +617,11 @@ def _codex_tool_request_user_input_params(
         extras["turn_id"] = turn_id
     if isinstance(item_id, str) and item_id:
         extras["item_id"] = item_id
+    if params.get("omnigentAsyncQuestion"):
+        # Async questions answer outside the turn that asked them: the
+        # server scopes them to their own session and never treats them
+        # as a block.
+        extras["async_kind"] = "question"
     return ElicitationRequestParams(
         mode="form",
         message="Codex needs input",

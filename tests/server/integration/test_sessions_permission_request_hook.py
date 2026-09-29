@@ -51,6 +51,9 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.user_preferences_store import ApprovalTimeout
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
@@ -3560,6 +3563,67 @@ async def test_codex_async_question_decline_skips_the_interrupt(
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"answers": {}}
     assert forwarded == []
+
+
+async def test_codex_async_question_is_not_mirrored_to_ancestors(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Codex async question is scoped to its own session.
+
+    The card carries ``async_kind="question"`` and never mirrors into an
+    ancestor: the parent stream and snapshot stay clean, and a decline does
+    not forward an interrupt. Codex's own answer-to-message path is
+    unchanged.
+    """
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> None:
+        forwarded.append(args[2])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-codex-async-question-scope")
+    parent_id = await _create_session(client, agent["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="codex:asks",
+        parent_conversation_id=parent_id,
+        agent_id=agent["id"],
+    )
+
+    parent_collector = await start_session_stream_collector(parent_id)
+    try:
+        drain_task = asyncio.create_task(_drain_until_elicitation(child.id))
+        await asyncio.sleep(0.05)
+        hook_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{child.id}/hooks/codex-elicitation-request",
+                json=_codex_async_question_payload(),
+            )
+        )
+
+        event = await drain_task
+        assert event["params"]["async_kind"] == "question"
+
+        await parent_collector.assert_no_event(0.2)
+        snapshot = await client.get(f"/v1/sessions/{parent_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["pending_elicitations"] == []
+
+        verdict = await _post_approval(client, child.id, event["elicitation_id"], "decline")
+        assert verdict.status_code == 202, verdict.text
+        resp = await hook_task
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"answers": {}}
+        assert forwarded == []
+    finally:
+        await parent_collector.stop()
 
 
 async def test_codex_request_user_input_decline_still_interrupts(

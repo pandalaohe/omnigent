@@ -9712,6 +9712,14 @@ def create_runner_app(
             peer_messaging_enabled=peer_for_relay,
             session_open_enabled=open_for_relay,
         )
+        if _session_harness_name(session_id) == _CODEX_NATIVE_HARNESS:
+            # Codex has its own async question tool; the Omnigent card would
+            # duplicate it in the app-server's relay surface.
+            from omnigent.tools.builtins.ask_user import AskUserAsyncTool
+
+            relay_schemas = [
+                schema for schema in relay_schemas if schema.get("name") != AskUserAsyncTool.name()
+            ]
 
         _captured_session_id = session_id
 

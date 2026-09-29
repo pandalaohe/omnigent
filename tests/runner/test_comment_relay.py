@@ -388,6 +388,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_os_edit",
         "sys_os_shell",
         "open_in_panel",
+        "ask_user_async",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"

@@ -2031,9 +2031,13 @@ def create_app(
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
             # provider lifetime cap — see the hook's docstring).
-            from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+            from omnigent.server.routes.sessions import (
+                cancel_detached_elicitation_tasks,
+                cancel_managed_launch_tasks,
+            )
 
             await cancel_managed_launch_tasks()
+            await cancel_detached_elicitation_tasks()
             await background_title_coordinator.shutdown()
             if cli_retention_coordinator is not None:
                 await cli_retention_coordinator.shutdown()
