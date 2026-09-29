@@ -176,6 +176,7 @@ class ArchiveCloseCoordinator:
         root_id = key[1]
         from omnigent.server.routes import sessions as _sessions_facade
 
+        idle_waited = False
         while True:
             root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
             if root is None:
@@ -195,6 +196,16 @@ class ArchiveCloseCoordinator:
                 (root.archived_at or 0) + _sessions_facade._ARCHIVE_STOP_UNDO_GRACE_S - time.time()
             )
             if remaining <= 0:
+                # A stop_when_idle archive holds the teardown until the whole
+                # tree has been idle for the settle window. Wait once per
+                # expansion, then re-read the row (the wait's own re-reads
+                # honour a mid-wait unarchive) and re-apply the guards above.
+                if not idle_waited and _sessions_facade._archive_idle_deferred(root):
+                    await _sessions_facade._wait_for_archive_idle(
+                        root_id, self._conversation_store
+                    )
+                    idle_waited = True
+                    continue
                 break
             await asyncio.sleep(remaining)
         now = int(time.time())

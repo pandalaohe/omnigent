@@ -21,7 +21,10 @@ from omnigent.server.cli_retention import (
     CliRetentionHostLeaseBusy,
     CliRetentionHostLeaseLost,
 )
-from omnigent.stores.conversation_store import ConversationArchiveClosingError
+from omnigent.stores.conversation_store import (
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ConversationArchiveClosingError,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 
@@ -1229,3 +1232,53 @@ async def test_archive_intent_completes_when_runner_acks_stop(db_uri: str) -> No
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_expand_archive_root_honours_the_idle_deferral_label(db_uri: str) -> None:
+    """A matching deferral label makes expansion await the idle wait once."""
+    conversations = SqlAlchemyConversationStore(db_uri)
+    intents = CliReleaseIntentStore(db_uri)
+    deferred = conversations.create_conversation()
+    deferred_archived = conversations.update_conversation(
+        deferred.id, archived=True, close_cli_on_archive=True
+    )
+    assert deferred_archived is not None
+    conversations.set_labels(
+        deferred.id,
+        {
+            ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: str(deferred_archived.archive_revision),
+        },
+    )
+    plain = conversations.create_conversation()
+    plain_archived = conversations.update_conversation(
+        plain.id, archived=True, close_cli_on_archive=True
+    )
+    assert plain_archived is not None
+    conversations.set_labels(plain.id, {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: "999"})
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    waited: list[tuple[str, object]] = []
+
+    async def _recording_wait(session_id: str, store: object) -> None:
+        waited.append((session_id, store))
+
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_UnconnectedRunnerRouter(),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    with patch.object(sessions_facade, "_wait_for_archive_idle", _recording_wait):
+        await coordinator._expand_archive_root((current_workspace_id(), deferred.id))
+        await coordinator._expand_archive_root((current_workspace_id(), plain.id))
+
+    # Only the root whose label names its own current revision waited.
+    assert waited == [(deferred.id, conversations)]
+    for root in (deferred, plain):
+        settled = conversations.get_conversation(root.id)
+        assert settled is not None
+        assert settled.archive_close_completed_revision == settled.archive_revision

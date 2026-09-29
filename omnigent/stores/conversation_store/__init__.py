@@ -195,6 +195,11 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Server-reserved label whose value is the archive revision whose teardown
+# waits for the whole session tree to go idle before it is torn down. It
+# matches only its own revision, so unarchive or re-archive voids it.
+ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY = "omnigent.archive_stop_when_idle"
+
 # New-session id an archived session was continued into (``POST
 # /v1/sessions/{sid}/continue``). The archived row keeps the pointer so a
 # repeat continue returns the same session instead of minting another one.

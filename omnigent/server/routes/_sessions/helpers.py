@@ -300,6 +300,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     PINNED_LABEL_KEY,
@@ -10350,6 +10351,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {ARCHIVED_AT_LABEL_KEY!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The archive idle-deferral marker is written by the archive transition
+    # only; a client write would let a caller pin a teardown to an arbitrary
+    # revision or forge one for another owner's session.
+    if ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY!r} is server-internal and cannot be "
+            "set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Pins are per-user: the client may only write the bare canonical
     # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
     # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting
@@ -11207,6 +11217,7 @@ def _child_session_summary_from_conversation(
         session_name=session_name,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        archived=bool(conv.archived),
         # agent_id comes from the conversation row; agent_name and task_id
         # are no longer available from the (removed) tasks table.
         agent_id=conv.agent_id,

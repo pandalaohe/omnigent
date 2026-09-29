@@ -901,6 +901,10 @@ class ChildSessionSummary(BaseModel):
     :param created_at: Unix epoch timestamp of child creation.
     :param updated_at: Unix epoch timestamp of the child's most
         recent update.
+    :param archived: ``True`` when the child session is archived.
+        Archived children are excluded from the default listing; the
+        ``include_archived`` query parameter surfaces them so callers
+        can tell a freed name from a merely hidden one.
     :param agent_id: Agent id recorded on the latest task,
         e.g. ``"ag_abc123"``. ``None`` if the child has no tasks
         yet (rare — ``_spawn_one`` creates a task atomically with
@@ -969,6 +973,7 @@ class ChildSessionSummary(BaseModel):
     kind: str = "sub_agent"
     created_at: int
     updated_at: int
+    archived: bool = False
     agent_id: str | None = None
     agent_name: str | None = None
     current_task_id: str | None = None

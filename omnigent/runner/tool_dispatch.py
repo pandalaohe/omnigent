@@ -1473,6 +1473,7 @@ async def _list_child_sessions(
     limit: int = 100,
     tool: str | None = None,
     session_name: str | None = None,
+    include_archived: bool = False,
 ) -> list[_JsonObject] | str:
     """
     Fetch child-session summaries for a parent session.
@@ -1484,12 +1485,16 @@ async def _list_child_sessions(
         children whose title is ``"{tool}:{session_name}"``
         server-side.
     :param session_name: See ``tool``.
+    :param include_archived: When ``True``, archived children are
+        returned too (each row carries ``archived``).
     :returns: List of child summary dicts, or an error string.
     """
     params: dict[str, str | int] = {"limit": limit, "order": "desc"}
     if tool and session_name:
         params["tool"] = tool
         params["session_name"] = session_name
+    if include_archived:
+        params["include_archived"] = "true"
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}/child_sessions",
         params=params,
@@ -1526,7 +1531,8 @@ async def _find_existing_child_session(
     :param agent: Sub-agent name, e.g. ``"claude"``.
     :param title: Caller-chosen child title, e.g. ``"issue-1756"``.
     :returns: Matching child summary, ``None`` when absent, or an error
-        string when the server lookup failed.
+        string when the server lookup failed or the matching child is
+        archived (its name is taken but cannot be woken).
     """
     children = await _list_child_sessions(
         server_client=server_client,
@@ -1534,6 +1540,7 @@ async def _find_existing_child_session(
         limit=1,
         tool=agent,
         session_name=title,
+        include_archived=True,
     )
     if isinstance(children, str):
         return children
@@ -1548,6 +1555,18 @@ async def _find_existing_child_session(
         session_title = title_value if isinstance(title_value, str) else None
         if is_session_closed(labels, session_title):
             continue
+        if child.get("archived") is True:
+            return json.dumps(
+                {
+                    "error": "session_archived",
+                    "conversation_id": child.get("id"),
+                    "message": (
+                        "this (agent, title) sub-agent session is archived; "
+                        "unarchive it with sys_session_unarchive to continue, "
+                        "or sys_session_close it to free the name."
+                    ),
+                }
+            )
         return child
     return None
 
@@ -6210,11 +6229,19 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        archived = args.get("archived", "exclude")
+        if archived not in ("exclude", "include", "only"):
+            return json.dumps(
+                {"error": "sys_session_list 'archived' must be one of exclude, include, only"}
+            )
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            {
+                "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+                "archived": archived,
+            },
         )
         if isinstance(window, str):
             return window
@@ -6226,6 +6253,7 @@ async def _execute_session_query_tool(
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
+            archived=archived,
         )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
@@ -7103,6 +7131,7 @@ async def _session_list_via_rest(
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
+    archived: str = "exclude",
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -7112,9 +7141,10 @@ async def _session_list_via_rest(
     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
     permission-bounded list of every session the caller can access, each
     annotated with status + runner connectivity, optionally filtered by
-    ``agent_name`` — see :func:`_collect_global_sessions`. Both are
-    best-effort: a failure in either view yields an empty list for it
-    rather than failing the whole call.
+    ``agent_name`` and by the archived view — see
+    :func:`_collect_global_sessions`. Both are best-effort: a failure in
+    either view yields an empty list for it rather than failing the whole
+    call.
 
     :param conversation_id: The caller session id, e.g. ``"conv_root1"``.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -7123,6 +7153,9 @@ async def _session_list_via_rest(
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
+    :param archived: Archived-session view for the global list —
+        ``"exclude"`` (default), ``"include"``, or ``"only"``. Joins the
+        cursor's filter set so a cursor cannot be replayed under another view.
     :returns: The legacy complete JSON result while it fits, otherwise a
         bounded page with continuation metadata.
     """
@@ -7135,6 +7168,7 @@ async def _session_list_via_rest(
             agent_name,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
+            archived=archived,
         )
     )
     return _bounded_discovery_result(
@@ -7143,7 +7177,10 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters={
+            "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+            "archived": archived,
+        },
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -7486,13 +7523,14 @@ async def _collect_global_sessions(
     *,
     after: str | None,
     limit: int,
+    archived: str = "exclude",
 ) -> _DiscoveryPage:
     """
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id, project_id,
-    workspace, updated_at, last_message_preview}``.
+    workspace, updated_at, last_message_preview, archived, archived_at}``.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -7504,6 +7542,9 @@ async def _collect_global_sessions(
         non-empty string.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param archived: ``"exclude"`` (default) lists live sessions only,
+        ``"include"`` adds archived rows, and ``"only"`` lists archived
+        rows exclusively.
     :returns: Projected global session entries and continuation metadata.
     """
     params: dict[str, str | int] = {
@@ -7512,6 +7553,10 @@ async def _collect_global_sessions(
         "visibility": "all",
         "include_preview": 1,
     }
+    if archived == "include":
+        params["include_archived"] = "true"
+    elif archived == "only":
+        params["visibility"] = "archived"
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:
@@ -7550,6 +7595,8 @@ async def _collect_global_sessions(
                 "worktree": r.get("worktree"),
                 "updated_at": r.get("updated_at"),
                 "last_message_preview": r.get("last_message_preview"),
+                "archived": r.get("archived"),
+                "archived_at": r.get("archived_at"),
             }
             for r in rows
         ],

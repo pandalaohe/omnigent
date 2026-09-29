@@ -615,7 +615,9 @@ class SysSessionListTool(Tool):
             "sys_session_get_info, read the full transcript via "
             "sys_session_get_history, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "sessions running that agent. Pass archived='include' or "
+            "'only' to surface archived sessions in the global list. Calls "
+            "without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -654,6 +656,15 @@ class SysSessionListTool(Tool):
                             "description": (
                                 "Optional maximum rows returned from 'sessions'. "
                                 "Omit it to keep the complete result while it fits."
+                            ),
+                        },
+                        "archived": {
+                            "type": "string",
+                            "enum": ["exclude", "include", "only"],
+                            "description": (
+                                "Optional: archived sessions in the global "
+                                "'sessions' list — 'exclude' (default), "
+                                "'include', or 'only'."
                             ),
                         },
                         "cursor": {

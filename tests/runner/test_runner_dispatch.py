@@ -7328,6 +7328,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "worktree": None,
             "updated_at": None,
             "last_message_preview": None,
+            "archived": None,
+            "archived_at": None,
         },
         {
             "session_id": "s2",
@@ -7342,6 +7344,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "worktree": None,
             "updated_at": None,
             "last_message_preview": None,
+            "archived": None,
+            "archived_at": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
