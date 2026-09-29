@@ -129,6 +129,7 @@ import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
+import { SessionCollabSettings } from "@/components/SessionCollabSettings";
 import {
   MobileSessionTitleSetting,
   SessionNavigationSettings,
@@ -391,6 +392,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "agents" && <AgentsSettings />}
       {section === "calling-defaults" && <CallingDefaultsSettingsSection />}
+      {section === "session-collab" && <SessionCollabSettingsSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
@@ -2400,6 +2402,17 @@ function CallingDefaultsSettingsSection() {
       description="Model and reasoning effort defaults per host and harness. Projects can override them per host."
     >
       <CallingDefaultsSection />
+    </Section>
+  );
+}
+
+function SessionCollabSettingsSection() {
+  return (
+    <Section
+      title="Session collaboration"
+      description="How your agents work with other sessions, hosts and agents."
+    >
+      <SessionCollabSettings />
     </Section>
   );
 }

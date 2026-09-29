@@ -627,14 +627,17 @@ def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
     default = CollabSettings()
     assert read_collab_settings(None, "alice@example.com") == default
     assert read_collab_settings(store, None) == default
-    assert read_collab_settings(store, "alice@example.com") == default
+    empty = read_collab_settings(store, "alice@example.com")
+    assert empty == default
+    assert empty.open_rate_count == 10
+    assert empty.open_rate_window_s == 60
 
     store.patch_namespace("alice@example.com", "agent_badges", {"enabled": False})
     assert read_collab_settings(store, "alice@example.com") == default
 
 
-def test_read_collab_settings_reads_all_twelve_fields(db_uri: str) -> None:
-    """All twelve camelCase fields load; unknown keys are ignored."""
+def test_read_collab_settings_reads_all_eleven_fields(db_uri: str) -> None:
+    """All eleven camelCase fields load; unknown keys are ignored."""
     store = SqlAlchemyUserPreferencesStore(db_uri)
     store.patch_namespace(
         "all@example.com",
@@ -650,7 +653,6 @@ def test_read_collab_settings_reads_all_twelve_fields(db_uri: str) -> None:
             "senderRateWindowSeconds": 1200,
             "duplicateWindowSeconds": 300,
             "undeliveredTtlSeconds": 7200,
-            "defaultInbound": "refuse",
             "flowTimerEnabled": False,
             "unexpectedKey": {"nested": True},
         },
@@ -666,7 +668,6 @@ def test_read_collab_settings_reads_all_twelve_fields(db_uri: str) -> None:
         sender_rate_window_s=1200,
         duplicate_window_s=300,
         undelivered_ttl_s=7200,
-        default_inbound="refuse",
         flow_timer_enabled=False,
     )
 
@@ -681,11 +682,6 @@ def test_read_collab_settings_reads_all_twelve_fields(db_uri: str) -> None:
         ("openRateCount", -1, "open_rate_count"),
         ("openRateCount", "5", "open_rate_count"),
         ("openRateCount", 5.5, "open_rate_count"),
-        ("defaultInbound", "Accept", "default_inbound"),
-        ("defaultInbound", "", "default_inbound"),
-        ("defaultInbound", True, "default_inbound"),
-        ("defaultInbound", 1, "default_inbound"),
-        ("defaultInbound", None, "default_inbound"),
     ],
 )
 def test_read_collab_settings_falls_back_per_field(
@@ -701,23 +697,6 @@ def test_read_collab_settings_falls_back_per_field(
     settings = read_collab_settings(store, "field@example.com")
     assert settings.relay_depth_max == 12
     assert getattr(settings, attribute) == getattr(CollabSettings(), attribute)
-
-
-@pytest.mark.parametrize("stored", ["hold", "refuse"])
-def test_read_collab_settings_reads_default_inbound(db_uri: str, stored: str) -> None:
-    """Each peer-inbound disposition other than the accept default sticks."""
-    store = SqlAlchemyUserPreferencesStore(db_uri)
-    store.patch_namespace("inbound@example.com", "session_collab", {"defaultInbound": stored})
-    assert read_collab_settings(store, "inbound@example.com").default_inbound == stored
-
-
-def test_read_collab_settings_default_inbound_missing_key_is_accept(db_uri: str) -> None:
-    """A session_collab object without defaultInbound still reads as accept."""
-    store = SqlAlchemyUserPreferencesStore(db_uri)
-    store.patch_namespace("inbound@example.com", "session_collab", {"relayDepthMax": 12})
-    settings = read_collab_settings(store, "inbound@example.com")
-    assert settings.default_inbound == "accept"
-    assert settings.relay_depth_max == 12
 
 
 def test_read_collab_settings_tolerates_bad_rows_and_shapes() -> None:

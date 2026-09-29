@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   singleUser: false,
   isAdmin: false,
   customizeEnabled: true,
+  sessionCollabEnabled: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -30,7 +31,10 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { customize: mocks.customizeEnabled },
+    features: {
+      customize: mocks.customizeEnabled,
+      session_peer_messaging: mocks.sessionCollabEnabled,
+    },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -65,6 +69,7 @@ beforeEach(() => {
   mocks.singleUser = false;
   mocks.isAdmin = false;
   mocks.customizeEnabled = true;
+  mocks.sessionCollabEnabled = false;
 });
 afterEach(cleanup);
 
@@ -168,6 +173,20 @@ describe("settingsNavGroups", () => {
         .find((i) => i.id === "integrations");
     expect(item(false)).toBeUndefined();
     expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
+  });
+
+  it("includes Session collaboration right after Calling defaults only when peer messaging is on", () => {
+    // 7th arg is sessionCollabEnabled (the `session_peer_messaging` feature).
+    const generalIds = (sessionCollabEnabled: boolean) =>
+      (
+        settingsNavGroups(false, false, false, false, false, false, sessionCollabEnabled).find(
+          (group) => group.title === "General",
+        )?.items ?? []
+      ).map((item) => item.id);
+    expect(generalIds(false)).not.toContain("session-collab");
+    const withCollab = generalIds(true);
+    expect(withCollab).toContain("session-collab");
+    expect(withCollab.indexOf("session-collab")).toBe(withCollab.indexOf("calling-defaults") + 1);
   });
 });
 
@@ -343,6 +362,19 @@ describe("SettingsSidebarBody", () => {
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
     expect(screen.queryByTestId("settings-nav-global-instructions")).toBeNull();
   });
+
+  it("shows the Session collaboration nav item only with the peer-messaging feature", () => {
+    renderBody();
+    expect(screen.queryByTestId("settings-nav-session-collab")).toBeNull();
+
+    cleanup();
+    mocks.sessionCollabEnabled = true;
+    renderBody();
+    expect(screen.getByTestId("settings-nav-session-collab")).toHaveAttribute(
+      "href",
+      "/settings/session-collab",
+    );
+  });
 });
 
 describe("useSettingsRoute", () => {
@@ -476,6 +508,19 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/customize/skills")).toEqual({
       inSettings: true,
       section: "general",
+    });
+  });
+
+  it("gates the session-collab deep link on the peer-messaging feature", () => {
+    expect(routeHook("/settings/session-collab")).toEqual({
+      inSettings: true,
+      section: "general",
+    });
+
+    mocks.sessionCollabEnabled = true;
+    expect(routeHook("/settings/session-collab")).toEqual({
+      inSettings: true,
+      section: "session-collab",
     });
   });
 

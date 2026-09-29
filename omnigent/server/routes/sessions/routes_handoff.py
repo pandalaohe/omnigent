@@ -60,6 +60,7 @@ from omnigent.server.routes.sessions.routes_peer import (
     effective_owner_id,
 )
 from omnigent.server.schemas import ProjectSessionCreateRequest, SessionGitOptions
+from omnigent.server.session_collab import require_collab_enabled
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
 
@@ -292,6 +293,7 @@ def register_handoff_routes(
     host_store = getattr(app_state, "host_store", None)
     binding_store = getattr(app_state, "project_host_binding_store", None)
     sweeper = getattr(app_state, "peer_sweeper", None)
+    prefs_store = getattr(app_state, "user_preferences_store", None)
 
     async def get_record(hid: str) -> SessionHandoff:
         if not _store_id(hid):
@@ -813,6 +815,7 @@ def register_handoff_routes(
         )
         if owner is None:
             return _problem("refused", "not_same_owner")
+        await asyncio.to_thread(require_collab_enabled, prefs_store, owner)
         project_owner = owner if permission_store else request_user_id
         source = body.model_dump()
         digest = hashlib.sha256(
