@@ -165,7 +165,7 @@ export function PeerHeldPanel({ sessionId, open, onOpenChange }: PeerHeldPanelPr
               {record.state === "held" && record.reason != null && (
                 <p className="text-sm text-muted-foreground" data-testid="peer-held-reason">
                   {record.reason === "relay_limit"
-                    ? "Paused: automatic relay chain passed 30 hops without you. Release to continue."
+                    ? "Paused: automatic relay chain passed your relay depth limit without you. Release to continue."
                     : record.reason}
                 </p>
               )}

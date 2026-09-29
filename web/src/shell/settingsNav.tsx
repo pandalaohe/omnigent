@@ -40,6 +40,7 @@ export type SettingsSectionId =
   | "agents"
   | "appearance"
   | "calling-defaults"
+  | "session-collab"
   | "customize"
   | "general"
   | "git"
@@ -68,6 +69,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "agents",
   "appearance",
   "calling-defaults",
+  "session-collab",
   "customize",
   "general",
   "git",
@@ -117,6 +119,7 @@ export function settingsNavGroups(
   isSingleUser = false,
   integrationsEnabled = false,
   customizeEnabled = false,
+  sessionCollabEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
@@ -129,6 +132,16 @@ export function settingsNavGroups(
     { id: "runtime-resources", label: "Runtime & resources", icon: CpuIcon },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
+  // Gated on the `session_peer_messaging` release feature; slots right after
+  // Calling defaults when enabled.
+  if (sessionCollabEnabled) {
+    const afterCallingDefaults = general.findIndex((item) => item.id === "calling-defaults") + 1;
+    general.splice(afterCallingDefaults, 0, {
+      id: "session-collab",
+      label: "Session collaboration",
+      icon: UsersIcon,
+    });
+  }
   // WIP: gated behind the `customize` release feature. Slots after Appearance.
   if (customizeEnabled) {
     general.splice(2, 0, {
@@ -231,8 +244,11 @@ export function useSettingsRoute(): {
     !(singleUser && (next === "members" || next === "sharing")) &&
     // Customize is WIP behind the `customize` release feature; a deep link to
     // it while disabled falls back to the default section rather than an empty
-    // page. Keeps content, nav, and header in agreement on availability.
-    !(next === "customize" && !isFeatureEnabled(info, "customize"));
+    // page. Session collaboration is gated the same way on
+    // `session_peer_messaging`. Keeps content, nav, and header in agreement on
+    // availability.
+    !(next === "customize" && !isFeatureEnabled(info, "customize")) &&
+    !(next === "session-collab" && !isFeatureEnabled(info, "session_peer_messaging"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   if (section !== "customize") return { inSettings: true, section };
   const sub = segments[idx + 2];
@@ -281,6 +297,7 @@ export function SettingsSidebarBody({
   const isAdmin = useIsAdmin();
   const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
   const customizeEnabled = isFeatureEnabled(info, "customize");
+  const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
@@ -289,6 +306,7 @@ export function SettingsSidebarBody({
     isSingleUserMode(info),
     integrationsEnabled,
     customizeEnabled,
+    sessionCollabEnabled,
   );
 
   return (
