@@ -2516,10 +2516,11 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
+    """Prune removes only provably-dead-owner dirs held past the 70-day window."""
     import os
     import subprocess
     import sys
+    import time
 
     root = tmp_path / "antigravity-native"
     root.mkdir(parents=True)
@@ -2529,7 +2530,18 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     dead.wait()
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    dead_marker = dead_dir / "owner.pid"
+    dead_marker.write_text(str(dead.pid), encoding="utf-8")
+    now = time.time()
+    expired_at = now - 71 * 24 * 60 * 60
+    os.utime(dead_marker, (expired_at, expired_at))
+
+    held_dir = root / "heldowner"
+    held_dir.mkdir()
+    held_marker = held_dir / "owner.pid"
+    held_marker.write_text(str(dead.pid), encoding="utf-8")
+    held_at = now - 8 * 24 * 60 * 60
+    os.utime(held_marker, (held_at, held_at))
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
@@ -2542,5 +2554,6 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
 
     assert pruned == 1
     assert not dead_dir.exists()
+    assert held_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()

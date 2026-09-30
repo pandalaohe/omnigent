@@ -957,3 +957,105 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("activity_age_days", "expect_pruned", "expect_trimmed"),
+    [
+        (8, 0, True),
+        (6, 0, False),
+        (71, 1, True),
+    ],
+)
+def test_prune_orphaned_bridge_dirs_trims_caches_before_whole_dir_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    activity_age_days: int,
+    expect_pruned: int,
+    expect_trimmed: bool,
+) -> None:
+    """Caches are trimmed at 7 days; the whole bridge is kept until 70 days."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    outside = tmp_path / "outside"
+    plugin_target = outside / "plugin-cache"
+    plugin_target.mkdir(parents=True)
+    (plugin_target / "plugin.txt").write_text("plugin", encoding="utf-8")
+    auth_target = outside / "auth.json"
+    auth_target.write_text("auth", encoding="utf-8")
+
+    dead_dir = root / "deadowner"
+    codex_home = dead_dir / "codex-home"
+    rollout = (
+        codex_home / "sessions" / "2026" / "09" / "09" / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    state = dead_dir / "state.json"
+    state.write_text('{"session_id":"conv_dead"}\n', encoding="utf-8")
+    policy = dead_dir / "policy_hook.json"
+    policy.write_text('{"ap_server_url":"http://127.0.0.1:8787"}\n', encoding="utf-8")
+    config = codex_home / "config.toml"
+    config.write_text('model = "gpt-5.4"\n', encoding="utf-8")
+    kept_files = (
+        codex_home / "state_5.sqlite",
+        codex_home / "thread_history_1.sqlite",
+        codex_home / "session_index.jsonl",
+    )
+    for kept_file in kept_files:
+        kept_file.write_text("kept", encoding="utf-8")
+    trimmed_files = (
+        codex_home / "models_cache.json",
+        codex_home / "logs_2.sqlite",
+        codex_home / "logs_2.sqlite-wal",
+    )
+    for trimmed_file in trimmed_files:
+        trimmed_file.write_text("cache", encoding="utf-8")
+    cache_dir = codex_home / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "x.json").write_text("cache", encoding="utf-8")
+    skills_dir = codex_home / "skills" / ".system"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "s.md").write_text("skill", encoding="utf-8")
+    plugins_dir = codex_home / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "cache").symlink_to(plugin_target, target_is_directory=True)
+    auth_link = codex_home / "auth.json"
+    auth_link.symlink_to(auth_target)
+
+    aged_at = now - activity_age_days * 24 * 60 * 60
+    os.utime(owner_marker, (aged_at, aged_at))
+    os.utime(rollout, (aged_at, aged_at))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == expect_pruned
+
+    if expect_pruned:
+        assert not dead_dir.exists()
+    else:
+        assert dead_dir.exists()
+        assert owner_marker.read_text(encoding="utf-8") == "999999"
+        assert state.read_text(encoding="utf-8") == '{"session_id":"conv_dead"}\n'
+        assert policy.exists()
+        assert rollout.read_text(encoding="utf-8") == '{"type":"session_meta"}\n'
+        assert config.exists()
+        for kept_file in kept_files:
+            assert kept_file.exists()
+        assert auth_link.is_symlink()
+        assert auth_target.read_text(encoding="utf-8") == "auth"
+        for trimmed_file in trimmed_files:
+            assert trimmed_file.exists() != expect_trimmed
+        assert cache_dir.exists() != expect_trimmed
+        assert (skills_dir / "s.md").exists() != expect_trimmed
+        assert plugins_dir.exists() != expect_trimmed
+        assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+        assert dead_dir.exists()
+
+    assert (plugin_target / "plugin.txt").read_text(encoding="utf-8") == "plugin"
+    assert auth_target.read_text(encoding="utf-8") == "auth"

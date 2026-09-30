@@ -8,6 +8,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import stat
 import sys
 import tempfile
@@ -79,7 +80,12 @@ _MCP_CONFIG_FILE = "bridge.json"
 # whereas ``state.json`` mutates on every turn/thread change.
 _POLICY_HOOK_FILE = "policy_hook.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
-_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_ORPHAN_RETENTION_SECONDS = native_bridge_common.ORPHAN_RETENTION_SECONDS
+_ORPHAN_CACHE_TRIM_SECONDS = 7 * 24 * 60 * 60
+#: Regenerable ``codex-home`` entries safe to drop from a resumable bridge.
+_ORPHAN_CACHE_TRIM_NAMES = frozenset(
+    {"cache", "models_cache.json", "plugins", "shell_snapshots", "skills", "tmp"}
+)
 
 
 def _codex_composer_interactive(pane: str) -> bool:
@@ -212,10 +218,11 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove inactive codex-native bridge dirs whose owner is provably dead.
 
     A runner restart is a normal Codex resume boundary, so owner death alone
-    cannot imply that the local rollout is disposable. Keep the whole bridge
-    for 7 days after its latest bridge preparation or rollout activity, then
-    remove it intact.
-    Explicit session deletion remains immediate. Global maintenance calls this via
+    cannot imply that the local rollout is disposable. Once a bridge has been
+    inactive for 7 days its regenerable ``codex-home`` caches are trimmed in
+    place so the rollout stays resumable, and the whole bridge is removed only
+    after 70 days without activity. Explicit session deletion remains immediate.
+    Global maintenance calls this via
     ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs pruned.
@@ -226,25 +233,27 @@ def prune_orphaned_bridge_dirs() -> int:
     )
 
 
-def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
-    """Return whether a dead-owner Codex bridge has been inactive for 7 days."""
-    activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+def _codex_newest_activity_time(bridge_dir: Path) -> float | None:
+    """Return the newest owner-marker or rollout mtime, or ``None`` when unknown.
+
+    :param bridge_dir: Dead-owner Codex bridge directory.
+    :returns: Newest activity mtime, or ``None`` when it cannot be established.
+    """
     owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
     try:
-        if owner_marker.stat().st_mtime > activity_cutoff:
-            return False
+        newest = owner_marker.stat().st_mtime
     except OSError:
-        return False
+        return None
 
     sessions_dir = bridge_dir / "codex-home" / "sessions"
     try:
         sessions_mode = sessions_dir.stat().st_mode
     except FileNotFoundError:
-        return True
+        return newest
     except OSError:
-        return False
+        return None
     if not stat.S_ISDIR(sessions_mode):
-        return False
+        return None
 
     scan_failed = False
 
@@ -262,15 +271,58 @@ def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
                     continue
                 rollout = Path(directory) / filename
                 try:
-                    if rollout.stat().st_mtime > activity_cutoff:
-                        return False
+                    rollout_mtime = rollout.stat().st_mtime
                 except FileNotFoundError:
                     continue
                 except OSError:
-                    return False
+                    return None
+                if rollout_mtime > newest:
+                    newest = rollout_mtime
     except OSError:
+        return None
+    return None if scan_failed else newest
+
+
+def _trim_codex_orphan_caches(bridge_dir: Path) -> None:
+    """Remove regenerable ``codex-home`` caches from an inactive bridge dir."""
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    if codex_home.is_symlink() or not codex_home.is_dir():
+        return
+    try:
+        entries = list(codex_home.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name not in _ORPHAN_CACHE_TRIM_NAMES and not entry.name.startswith("logs_"):
+            continue
+        if entry.is_symlink():
+            continue
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink()
+        except OSError:
+            continue
+
+
+def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner Codex bridge is past whole-dir retention.
+
+    Retiring a bridge is two-stage: caches are trimmed in place once it has
+    been inactive for :data:`_ORPHAN_CACHE_TRIM_SECONDS`, and the directory is
+    reclaimed whole at :data:`_ORPHAN_RETENTION_SECONDS`. A bridge whose
+    activity time cannot be established is always kept.
+    """
+    newest = _codex_newest_activity_time(bridge_dir)
+    if newest is None:
         return False
-    return not scan_failed
+    now = time.time()
+    if newest <= now - _ORPHAN_RETENTION_SECONDS:
+        return True
+    if newest <= now - _ORPHAN_CACHE_TRIM_SECONDS:
+        _trim_codex_orphan_caches(bridge_dir)
+    return False
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
