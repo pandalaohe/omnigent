@@ -57,7 +57,7 @@ import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
-import { RailAgentBadge, childAgentDisplay } from "@/components/RailAgentBadge";
+import { RailAgentBadge, childAgentDisplay, useChildAgentBadge } from "@/components/RailAgentBadge";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -129,6 +129,7 @@ function sessionLike(session: Session | null, fallbackId: string): ChildSessionL
     sub_agent_name: session?.subAgentName,
     agent_name: session?.agentName,
     agent_id: session?.agentId,
+    agent_template_id: session?.agentTemplateId,
     harness: session?.harness,
     host_id: session?.hostId,
     labels: session?.labels ?? {},
@@ -368,11 +369,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         Add agent
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
-        <MainRow
-          rootSessionId={rootSessionId}
-          isActive={conversationId === rootSessionId}
-          hostNameFor={hostNameFor}
-        />
+        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
         <li
           data-testid="subagent-active-zone"
           className="flex items-center gap-2 border-b bg-muted/40 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase"
@@ -886,10 +883,9 @@ function ChildTooltipContent({ child, hostName }: { child: ChildSessionInfo; hos
  * parent-children tree.
  *
  * The leading icon doubles as the agent-kind indicator (a brand glyph for
- * native wrappers/harnesses, the generic bot otherwise); the badge carries
- * the host colour. Sub-agent rows nest below with their own icons, so the
- * "main vs sub-agent" distinction is carried by position and the
- * indentation gutter rather than a pill.
+ * native wrappers/harnesses, the generic bot otherwise). Sub-agent rows nest
+ * below with their own icons, so the "main vs sub-agent" distinction is
+ * carried by position and the indentation gutter rather than a pill.
  */
 // Cap matches the server's child-session preview so the main row reads
 // consistently with the child rows (CSS truncates to one line regardless;
@@ -933,17 +929,11 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-function MainRow({
-  rootSessionId,
-  isActive,
-  hostNameFor,
-}: {
-  rootSessionId: string;
-  isActive: boolean;
-  hostNameFor: (hostId: string | null | undefined) => string;
-}) {
+function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
+  const child = sessionLike(session, rootSessionId);
+  const showBadge = useChildAgentBadge(child) != null;
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
   // TerminalFirstContext to decide a session is claude/codex-native.
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
@@ -977,20 +967,19 @@ function MainRow({
       >
         <div className="flex w-full items-center gap-1">
           <Icon className={rowIconClassName(Icon)} />
-          <RailAgentBadge
-            child={sessionLike(session, rootSessionId)}
-            hostName={hostNameFor(session?.hostId)}
-          />
+          <RailAgentBadge child={child} />
           <span className="shrink-0 truncate text-sm font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
         </div>
         {preview && (
-          // Indented to align with the title text above: 14px icon + 4px gap
-          // + 22px badge + 4px gap.
+          // Aligned with the title: 14px icon + 4px gap, plus the 20px badge + 4px gap when configured.
           <p
             data-testid="subagent-main-preview"
-            className="truncate pl-[44px] text-sm text-muted-foreground"
+            className={cn(
+              "truncate text-sm text-muted-foreground",
+              showBadge ? "pl-[42px]" : "pl-[18px]",
+            )}
           >
             {preview}
           </p>
@@ -1038,6 +1027,7 @@ function SubagentRow({
   const status = childStatus(child);
   const search = sessionNavigationSearch(useLocation().search);
   const mirror = isHarnessSubagent(child);
+  const showBadge = useChildAgentBadge(child) != null;
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const hostName = hostNameFor(child.host_id);
@@ -1117,7 +1107,7 @@ function SubagentRow({
                   />
                 )}
                 <Icon className={rowIconClassName(Icon)} />
-                {!mirror && <RailAgentBadge child={child} hostName={hostName} />}
+                {showBadge && <RailAgentBadge child={child} />}
                 <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
                 {child.routed_model ? (
                   // Model the intelligent router picked for this sub-agent — the
@@ -1135,12 +1125,11 @@ function SubagentRow({
                 <StatusIndicator {...status} />
               </div>
               {secondary && (
-                // Aligned with the title above: mirror rows need the 22px
-                // connector + icon gutter; real rows add the 22px badge.
+                // Aligned with the title: 22px connector + icon gutter, plus the 20px badge + 4px gap when configured.
                 <p
                   className={cn(
                     "truncate text-sm text-muted-foreground",
-                    mirror ? "pl-[22px]" : "pl-[48px]",
+                    showBadge ? "pl-[46px]" : "pl-[22px]",
                   )}
                 >
                   {secondary}
@@ -1219,6 +1208,7 @@ function PastChildRow({
   const search = sessionNavigationSearch(useLocation().search);
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
+  const showBadge = useChildAgentBadge(child) != null;
   const hostName = hostNameFor(child.host_id);
   const archivedLabel = formatArchivedTime(child.archived_at);
   const isActive = conversationId === child.id;
@@ -1238,15 +1228,20 @@ function PastChildRow({
           >
             <div className="flex w-full items-center gap-1">
               <Icon className={rowIconClassName(Icon)} />
-              <RailAgentBadge child={child} hostName={hostName} />
+              <RailAgentBadge child={child} />
               <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
               <span className="flex-1" />
               {archivedLabel && (
                 <span className="shrink-0 text-[11px] text-muted-foreground">{archivedLabel}</span>
               )}
             </div>
-            {/* Aligned with the title above: 14px icon + 4px gap + 22px badge + 4px gap. */}
-            <p className="truncate pl-[44px] text-xs text-muted-foreground">
+            {/* Aligned with the title: 14px icon + 4px gap, plus the 20px badge + 4px gap when configured. */}
+            <p
+              className={cn(
+                "truncate text-xs text-muted-foreground",
+                showBadge ? "pl-[42px]" : "pl-[18px]",
+              )}
+            >
               {hostName} · {cwdLabel}
             </p>
           </Link>

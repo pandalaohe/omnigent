@@ -345,6 +345,8 @@ describe("SubagentsPanel", () => {
     expect(screen.getByTestId("subagent-main-preview")).toHaveTextContent(
       "Hello! How can I help you today?",
     );
+    // No configured badge → the preview sits in the 14px icon + 4px gap gutter.
+    expect(screen.getByTestId("subagent-main-preview")).toHaveClass("pl-[18px]");
   });
 
   it("omits the main-row preview when the root has no message yet", () => {
@@ -741,7 +743,7 @@ describe("SubagentsPanel", () => {
     expect(within(codexRow).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("resolves the badge vendor from the child's harness or bound agent name", () => {
+  it("renders no badge for a child whose agent has no configured badge", () => {
     mockChildTree({
       conv_root: [
         childInfo({ id: "conv_harness", tool: "auth-auditor", harness: "codex-native" }),
@@ -752,14 +754,12 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     expect(
-      within(childRow(container, "conv_harness")).getByTestId("rail-agent-badge"),
-    ).toHaveTextContent("CX");
-    expect(
-      within(childRow(container, "conv_agent")).getByTestId("rail-agent-badge"),
-    ).toHaveTextContent("CC");
+      within(childRow(container, "conv_harness")).queryByTestId("rail-agent-badge"),
+    ).toBeNull();
+    expect(within(childRow(container, "conv_agent")).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("uses the configured agent badge label, except for bundled members", () => {
+  it("uses the configured agent badge, except for bundled members", () => {
     localStorage.setItem(
       "omnigent:agent-badge-preferences",
       JSON.stringify({
@@ -771,8 +771,8 @@ describe("SubagentsPanel", () => {
     mockChildTree({
       conv_root: [
         childInfo({ id: "conv_rv", tool: "reviewer", agent_id: "ag_rv" }),
-        // A bundled member's configured row belongs to the bundle, so the
-        // member's own name decides its letters.
+        // A bundled member's bound row belongs to the bundle, so the bundle's
+        // configured badge never lands on the member's row.
         childInfo({
           id: "conv_member",
           tool: "reviewer",
@@ -787,12 +787,10 @@ describe("SubagentsPanel", () => {
     expect(
       within(childRow(container, "conv_rv")).getByTestId("rail-agent-badge"),
     ).toHaveTextContent("RV");
-    expect(
-      within(childRow(container, "conv_member")).getByTestId("rail-agent-badge"),
-    ).toHaveTextContent("RE");
+    expect(within(childRow(container, "conv_member")).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("uses a user-picked host colour on the badge and an automatic one otherwise", () => {
+  it("uses a user-picked host colour on the row bar and an automatic one otherwise", () => {
     localStorage.setItem("omnigent:host-colors", JSON.stringify({ "host-1": "purple" }));
     mockChildTree({
       conv_root: [
@@ -803,21 +801,25 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    const picked = within(childRow(container, "conv_h1")).getByTestId("rail-agent-badge");
-    expect(picked.style.getPropertyValue("--host-color-light")).toBe("#8250df");
-    expect(picked.style.getPropertyValue("--host-color-dark")).toBe("#a371f7");
-    expect(picked).toHaveClass("host-color");
     // Real ACTIVE-zone rows carry the host colour bar, driven by the same var.
     const row = childRow(container, "conv_h1");
     expect(row).toHaveClass("host-color");
     expect(row.style.boxShadow).toContain("inset 3px 0 0 var(--host-color)");
     expect(row.style.getPropertyValue("--host-color-light")).toBe("#8250df");
-    const automatic = within(childRow(container, "conv_h2")).getByTestId("rail-agent-badge");
+    const automatic = childRow(container, "conv_h2");
     expect(automatic.style.getPropertyValue("--host-color-light")).not.toBe("");
     expect(automatic.style.getPropertyValue("--host-color-light")).not.toBe("#8250df");
   });
 
-  it("does not infer a native vendor from the tool name alone", () => {
+  it("never invents a badge from the tool name", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_custom: { label: "CU", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
     mockChildTree({
       conv_root: [
         childInfo({
@@ -826,6 +828,7 @@ describe("SubagentsPanel", () => {
           task_summary: null,
           tool: "codex",
           session_name: "custom-review",
+          agent_id: "ag_custom",
         }),
       ],
     });
@@ -833,9 +836,8 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const badge = within(childRow(container, "conv_custom")).getByTestId("rail-agent-badge");
-    // No wrapper/harness/agent row: the display name is the raw tool, so the
-    // letters are its initials rather than the Codex vendor badge.
-    expect(badge).toHaveTextContent("CO");
+    // The configured row for the bound agent decides, not the "codex" tool name.
+    expect(badge).toHaveTextContent("CU");
     expect(badge).toHaveAttribute("title", "codex");
   });
 
@@ -1406,10 +1408,18 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "c_done").className.split(/\s+/)).not.toContain("opacity-60");
   });
 
-  it("uses the agent name's initials for non-native child rows", () => {
+  it("shows the configured badge on a child row and nothing without one", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_explore: { label: "EX", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
     mockChildTree({
       conv_parent: [
-        childInfo({ id: "c_explore", tool: "Explore", busy: true }),
+        childInfo({ id: "c_explore", tool: "Explore", agent_id: "ag_explore", busy: true }),
         childInfo({ id: "c_code", tool: "frontend_engineer", busy: true }),
       ],
     });
@@ -1419,9 +1429,37 @@ describe("SubagentsPanel", () => {
     expect(
       within(childRow(container, "c_explore")).getByTestId("rail-agent-badge"),
     ).toHaveTextContent("EX");
-    expect(within(childRow(container, "c_code")).getByTestId("rail-agent-badge")).toHaveTextContent(
-      "FR",
+    expect(within(childRow(container, "c_code")).queryByTestId("rail-agent-badge")).toBeNull();
+  });
+
+  it("indents the secondary line past a badge and closes the gap without one", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_badged: { label: "BD", borderColor: "#123456", textColor: "theme" } },
+      }),
     );
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "c_badged",
+          tool: "reviewer",
+          agent_id: "ag_badged",
+          last_message_preview: "Working.",
+        }),
+        childInfo({ id: "c_plain", tool: "reviewer", last_message_preview: "Idle." }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const badged = childRow(container, "c_badged");
+    expect(within(badged).getByTestId("rail-agent-badge")).toBeInTheDocument();
+    expect(badged.querySelector("p")).toHaveClass("pl-[46px]");
+    // Without a badge the secondary line sits in the 22px connector + icon gutter.
+    expect(childRow(container, "c_plain").querySelector("p")).toHaveClass("pl-[22px]");
   });
 
   it("strips session-scoped search params from rail navigation hrefs", () => {
@@ -1866,6 +1904,14 @@ describe("SubagentsPanel", () => {
   });
 
   it("orders the brand icon before the badge before the title, and gives mirrors no badge", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_real: { label: "RA", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
     mockChildTree({
       conv_root: [
         childInfo({
@@ -1873,12 +1919,15 @@ describe("SubagentsPanel", () => {
           title: "researcher:auth",
           tool: "researcher",
           session_name: "auth",
+          agent_id: "ag_real",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
         }),
+        // Mirrors never wear a badge, even when the bound row is configured.
         childInfo({
           id: "mirror",
           title: "Explore:a1",
           tool: "Explore",
+          agent_id: "ag_real",
           labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
       ],
@@ -1981,7 +2030,15 @@ describe("SubagentsPanel", () => {
     expect(tooltip).toHaveTextContent("Investigate auth");
   });
 
-  it("shows a badge on the main row for the root agent", () => {
+  it("shows the configured badge on the main row for the root agent", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_root: { label: "RT", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
       session: {
@@ -1993,7 +2050,18 @@ describe("SubagentsPanel", () => {
         createdAt: 0,
         title: null,
         labels: { "omnigent.wrapper": "claude-code-native-ui" },
-        items: [],
+        items: [
+          {
+            id: "i1",
+            type: "message",
+            response_id: "r1",
+            status: "completed",
+            data: {
+              role: "assistant",
+              content: [{ type: "output_text", text: "Hello!" }],
+            },
+          },
+        ],
         pendingElicitations: [],
         permissionLevel: 4,
         parentSessionId: null,
@@ -2007,7 +2075,39 @@ describe("SubagentsPanel", () => {
 
     expect(
       within(screen.getByTestId("subagent-main-row")).getByTestId("rail-agent-badge"),
-    ).toHaveTextContent("CC");
+    ).toHaveTextContent("RT");
+    // The badge pushes the preview out of the icon-only gutter.
+    expect(screen.getByTestId("subagent-main-preview")).toHaveClass("pl-[42px]");
+  });
+
+  it("shows the configured badge on a past row", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_past: { label: "PA", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    pastState.children = [
+      childInfo({
+        id: "past-1",
+        title: "researcher:old",
+        session_name: "old",
+        tool: "researcher",
+        agent_id: "ag_past",
+        archived: true,
+        archived_at: 1_700_000_000,
+      }),
+    ];
+
+    renderPanel({ rootSessionId: "conv_root" });
+    fireEvent.click(screen.getByTestId("subagent-past-zone"));
+
+    expect(
+      within(screen.getByTestId("subagent-past-row")).getByTestId("rail-agent-badge"),
+    ).toHaveTextContent("PA");
   });
 
   it("keeps the past zone collapsed until expanded, then pages 20 at a time", () => {

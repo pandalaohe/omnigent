@@ -647,6 +647,7 @@ export function AppShell() {
       sub_agent_name: activeSession.subAgentName,
       agent_name: activeSession.agentName,
       agent_id: activeSession.agentId,
+      agent_template_id: activeSession.agentTemplateId,
       harness: activeSession.harness,
       host_id: activeSession.effectiveHostId ?? null,
       labels: activeSession.labels,

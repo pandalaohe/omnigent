@@ -2,18 +2,17 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_AGENT_BADGE_PREFERENCES,
+  writeAgentBadgePreferences,
   type AgentBadgePreferences,
+  type AgentBadgeValue,
 } from "@/lib/agentBadgePreferences";
-import { HOST_COLORS } from "@/lib/hostColors";
-import { childAgentBadgeLetters, childAgentDisplay, RailAgentBadge } from "./RailAgentBadge";
+import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
+import { childAgentBadge, childAgentDisplay, RailAgentBadge } from "./RailAgentBadge";
 
-function badgePreferences(label: string): AgentBadgePreferences {
-  return {
-    version: 1,
-    enabled: true,
-    entries: { ag_1: { label, borderColor: "#123456", textColor: "theme" } },
-  };
+const CONFIGURED: AgentBadgeValue = { label: "RV", borderColor: "#123456", textColor: "theme" };
+
+function preferences(entries: Record<string, AgentBadgeValue>): AgentBadgePreferences {
+  return { version: 1, enabled: true, entries };
 }
 
 beforeEach(() => localStorage.clear());
@@ -41,58 +40,97 @@ describe("childAgentDisplay", () => {
   });
 });
 
-describe("childAgentBadgeLetters", () => {
-  it("uses a configured badge label for a directly bound agent", () => {
-    expect(childAgentBadgeLetters({ id: "x", agent_id: "ag_1" }, badgePreferences("RV"))).toBe(
-      "RV",
+describe("childAgentBadge", () => {
+  const prefs = preferences({
+    tmpl_1: { label: "T1", borderColor: "#111111", textColor: "theme" },
+    tmpl_2: { label: "T2", borderColor: "#222222", textColor: "theme" },
+    ag_1: { label: "A1", borderColor: "#333333", textColor: "theme" },
+  });
+
+  it("keys a directly bound agent by template label, then template id, then agent id", () => {
+    const bound = {
+      id: "x",
+      labels: { [AGENT_TEMPLATE_LABEL]: "tmpl_1" },
+      agent_template_id: "tmpl_2",
+      agent_id: "ag_1",
+    };
+
+    expect(childAgentBadge(bound, prefs)?.label).toBe("T1");
+    expect(childAgentBadge({ ...bound, labels: {} }, prefs)?.label).toBe("T2");
+    expect(childAgentBadge({ ...bound, labels: {}, agent_template_id: null }, prefs)?.label).toBe(
+      "A1",
     );
   });
 
-  it("does not apply the bundle's configured badge to a bundled member", () => {
-    expect(
-      childAgentBadgeLetters(
-        { id: "x", agent_id: "ag_1", sub_agent_name: "researcher" },
-        badgePreferences("RV"),
-      ),
-    ).toBe("RE");
+  it("returns null for an unconfigured or absent agent", () => {
+    expect(childAgentBadge({ id: "x", agent_id: "ag_other" }, prefs)).toBeNull();
+    expect(childAgentBadge({ id: "x" }, prefs)).toBeNull();
   });
 
-  it("falls back to product initials, then the display name's initials", () => {
-    const claude = childAgentBadgeLetters(
-      { id: "x", labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" } },
-      DEFAULT_AGENT_BADGE_PREFERENCES,
-    );
-    expect(claude).toBe("CC");
+  it("returns null for a bundled member even when its bound row is configured", () => {
     expect(
-      childAgentBadgeLetters({ id: "x", harness: "codex-native" }, DEFAULT_AGENT_BADGE_PREFERENCES),
-    ).toBe("CX");
-    expect(
-      childAgentBadgeLetters({ id: "x", tool: "reviewer" }, DEFAULT_AGENT_BADGE_PREFERENCES),
-    ).toBe("RE");
-    expect(childAgentBadgeLetters({ id: "x" }, DEFAULT_AGENT_BADGE_PREFERENCES)).toBe("?");
+      childAgentBadge({ id: "x", agent_id: "ag_1", sub_agent_name: "researcher" }, prefs),
+    ).toBeNull();
   });
 });
 
 describe("RailAgentBadge", () => {
-  it("renders the letters, the display title and the automatic host colour", () => {
-    render(<RailAgentBadge child={{ id: "x", tool: "reviewer" }} hostName="TMB" />);
+  it("renders the configured badge exactly as AgentBadge draws it", () => {
+    writeAgentBadgePreferences(
+      preferences({ ag_1: { label: "RV", borderColor: "#123456", textColor: "#e9d5ff" } }),
+    );
+    render(<RailAgentBadge child={{ id: "x", tool: "reviewer", agent_id: "ag_1" }} />);
 
     const badge = screen.getByTestId("rail-agent-badge");
-    expect(badge).toHaveTextContent("RE");
+    expect(badge).toHaveTextContent("RV");
     expect(badge).toHaveAttribute("title", "reviewer");
-    const automatic = HOST_COLORS.find(
-      (entry) => entry.hex === badge.style.getPropertyValue("--host-color-light"),
-    );
-    expect(automatic).toBeDefined();
-    expect(badge.style.getPropertyValue("--host-color-dark")).toBe(automatic!.darkHex);
+    expect(badge).toHaveClass("border-2", "size-5", "rounded-[5px]");
+    expect(badge).not.toHaveClass("host-color");
+    expect(badge).toHaveStyle({ borderColor: "#123456", color: "#e9d5ff" });
+    expect(badge.style.getPropertyValue("--host-color-light")).toBe("");
+    expect(badge.style.backgroundColor).toBe("");
   });
 
-  it("prefers the user's host colour pick", () => {
-    localStorage.setItem("omnigent:host-colors", JSON.stringify({ host_1: "purple" }));
-    render(<RailAgentBadge child={{ id: "x", tool: "reviewer", host_id: "host_1" }} />);
+  it("follows the theme foreground for a theme text colour", () => {
+    writeAgentBadgePreferences(preferences({ ag_1: CONFIGURED }));
+    render(<RailAgentBadge child={{ id: "x", agent_id: "ag_1" }} />);
 
-    const badge = screen.getByTestId("rail-agent-badge");
-    expect(badge.style.getPropertyValue("--host-color-light")).toBe("#8250df");
-    expect(badge.style.getPropertyValue("--host-color-dark")).toBe("#a371f7");
+    expect(screen.getByTestId("rail-agent-badge").style.color).toBe("var(--foreground)");
+  });
+
+  it("renders nothing when the child's agent has no configured badge", () => {
+    render(
+      <>
+        <RailAgentBadge
+          child={{ id: "claude", labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" } }}
+        />
+        <RailAgentBadge child={{ id: "codex", harness: "codex-native" }} />
+        <RailAgentBadge child={{ id: "tool", tool: "reviewer" }} />
+      </>,
+    );
+
+    expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
+  });
+
+  it("renders nothing for a bundled member even when its bound row is configured", () => {
+    writeAgentBadgePreferences(preferences({ ag_1: CONFIGURED }));
+    render(<RailAgentBadge child={{ id: "x", agent_id: "ag_1", sub_agent_name: "researcher" }} />);
+
+    expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
+  });
+
+  it("renders nothing for a harness sub-agent mirror even when its bound row is configured", () => {
+    const prefs = preferences({ ag_1: CONFIGURED });
+    const mirror = {
+      id: "claude",
+      agent_id: "ag_1",
+      labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+    };
+    writeAgentBadgePreferences(prefs);
+
+    expect(childAgentBadge(mirror, prefs)).toBeNull();
+    render(<RailAgentBadge child={mirror} />);
+
+    expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
   });
 });

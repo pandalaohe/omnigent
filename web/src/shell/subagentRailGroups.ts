@@ -19,6 +19,7 @@ export interface ChildSessionLike {
   sub_agent_name?: string | null;
   agent_name?: string | null;
   agent_id?: string | null;
+  agent_template_id?: string | null;
   harness?: string | null;
   host_id?: string | null;
   labels?: Record<string, string>;
