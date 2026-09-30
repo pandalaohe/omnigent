@@ -249,10 +249,10 @@ describe("ApprovalCard — async card", () => {
     response: null,
   };
 
-  it("shows the 不挡路 pill with the approval ref on a deferred approval", () => {
+  it("shows the Async pill with the approval ref on a deferred approval", () => {
     render(<ApprovalCard {...props} asyncKind="approval" approvalRef="a123456" />);
 
-    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("不挡路 · #a123456");
+    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("Async · #a123456");
   });
 
   it("hides the interrupt control on an async card but keeps Reject", () => {
@@ -261,7 +261,7 @@ describe("ApprovalCard — async card", () => {
     // interrupt describe above).
     render(<ApprovalCard {...props} asyncKind="question" interruptible />);
 
-    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("不挡路");
+    expect(screen.getByTestId("approval-card-async-pill").textContent).toBe("Async");
     expect(screen.queryByRole("button", { name: "Reject & interrupt" })).toBeNull();
     expect(screen.getByRole("button", { name: /^reject$/i })).toBeDefined();
   });

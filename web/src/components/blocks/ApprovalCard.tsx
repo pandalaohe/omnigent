@@ -220,7 +220,7 @@ interface ApprovalCardProps {
   targetSessionId?: string | null;
   /**
    * Non-blocking card kind — ``"question"`` (async question) or
-   * ``"approval"`` (deferred approval). Shows the ``不挡路`` pill and
+   * ``"approval"`` (deferred approval). Shows the ``Async`` pill and
    * hides the interrupt control: the session it popped in keeps going.
    */
   asyncKind?: "question" | "approval" | null;
@@ -750,7 +750,7 @@ export function ApprovalCard({
             data-testid="approval-card-async-pill"
             className="rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
           >
-            不挡路{approvalRef ? ` · #${approvalRef}` : ""}
+            Async{approvalRef ? ` · #${approvalRef}` : ""}
           </span>
         )}
       </AlertTitle>

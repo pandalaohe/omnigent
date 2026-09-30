@@ -64,13 +64,14 @@ export function ApprovalTimeoutSettings() {
       </div>
       <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
         <div>
-          <span className="text-sm font-medium text-foreground">审批不挡路</span>
+          <span className="text-sm font-medium text-foreground">Async Approvals</span>
           <p className="mt-1 text-xs text-muted-foreground">
-            先告诉 agent 这一步在等批准，批准后它重新执行；开启时不适用上方的超时设置。
+            Tell the agent the call is waiting for approval; it re-runs the call once approved. The
+            timeout settings above do not apply while this is on.
           </p>
         </div>
         <Switch
-          aria-label="审批不挡路"
+          aria-label="Async Approvals"
           checked={preferences.asyncApprovals}
           onCheckedChange={(enabled) =>
             writeApprovalTimeoutPreferences({ ...preferences, asyncApprovals: enabled })

@@ -17,7 +17,7 @@ describe("ApprovalTimeoutSettings", () => {
     expect(
       screen.getByRole("switch", { name: "Stop the turn when the timeout expires" }),
     ).toBeChecked();
-    expect(screen.getByRole("switch", { name: "审批不挡路" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "Async Approvals" })).toBeChecked();
     expect(localStorage.getItem(APPROVAL_TIMEOUT_STORAGE_KEY)).toBeNull();
   });
 
@@ -43,7 +43,7 @@ describe("ApprovalTimeoutSettings", () => {
 
   it("persists switching non-blocking approvals off", async () => {
     render(<ApprovalTimeoutSettings />);
-    const toggle = screen.getByRole("switch", { name: "审批不挡路" });
+    const toggle = screen.getByRole("switch", { name: "Async Approvals" });
 
     fireEvent.click(toggle);
 
