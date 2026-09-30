@@ -21,17 +21,19 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import Agent
+from omnigent.entities import Agent, ProjectHostBinding
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server import session_open_rate
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.routes._host_worktree import WorktreeProxyError
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes.sessions import routes_open
 from omnigent.server.routes.sessions.routes_open import register_open_routes
 from omnigent.server.routes.sessions.routes_peer import register_peer_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -418,139 +420,136 @@ async def test_read_shared_session_agent_of_another_owner_refused(
     assert data["reason"] == "agent_not_found"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("archived", [False, True])
-async def test_directory_in_use_counts_archived(open_env: dict[str, Any], archived: bool) -> None:
-    """An occupied directory refuses; an archived holder still counts."""
-    env = open_env
-    holder = env["conversations"].create_conversation(
+def _patch_worktrees(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict[str, Any]] | None = None,
+    error: Exception | None = None,
+) -> list[str]:
+    """Stub the host worktree listing and record the requested repo paths."""
+    seen: list[str] = []
+
+    async def _list(*, host_registry: Any, host_conn: Any, repo_path: str) -> Any:
+        seen.append(repo_path)
+        if error is not None:
+            raise error
+        return rows if rows is not None else []
+
+    monkeypatch.setattr(routes_open, "list_worktrees_on_host", _list)
+    return seen
+
+
+def _holder(env: dict[str, Any], title: str, **overrides: Any) -> Any:
+    """Create one live top-level session in the project root."""
+    conv = env["conversations"].create_conversation(
         agent_id=env["agent_id"],
-        title="holder",
+        title=title,
         host_id=HOST_ID,
         workspace="/repo",
         runner_id=token_bound_runner_id(secrets.token_hex(16)),
+        **overrides,
     )
-    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
-    if archived:
-        env["conversations"].update_conversation(holder.id, archived=True)
-    async with await _client(env) as client:
-        data = await _post(client, env["sender"].id, env["sender_token"])
-    assert data["state"] == "refused"
-    assert data["reason"] == "directory_in_use"
-    assert "from_ref" in data["message"]
-    assert {"id": holder.id, "name": "holder"} in data["candidates"]
+    env["permissions"].grant(ALICE, conv.id, LEVEL_OWNER)
+    return conv
 
 
 @pytest.mark.asyncio
-async def test_closed_session_does_not_occupy(
+async def test_occupied_root_opens_and_lists_shared_with(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A closed session leaves the directory free for a no-ref open."""
+    """A shared root opens; ``shared_with`` lists the live holder only."""
     env = open_env
-    holder = env["conversations"].create_conversation(
-        agent_id=env["agent_id"],
-        title="closed-holder",
-        host_id=HOST_ID,
-        workspace="/repo",
-        runner_id=token_bound_runner_id(secrets.token_hex(16)),
-    )
-    env["conversations"].set_labels(holder.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    live = _holder(env, "live-holder")
+    archived = _holder(env, "archived-holder")
+    env["conversations"].update_conversation(archived.id, archived=True)
+    closed = _holder(env, "closed-holder")
+    env["conversations"].set_labels(closed.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+    side = _holder(env, "side-chat")
+    env["conversations"].set_labels(side.id, {SIDE_CHAT_LABEL_KEY: "true"})
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"])
+    assert data["state"] == "opened"
+    assert data["shared_with"] == [{"id": live.id, "name": "live-holder"}]
+    assert "shared_with_total" not in data
+    assert captured["body"].git is None
+
+
+@pytest.mark.asyncio
+async def test_shared_with_caps_at_ten_with_total(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """More than ten holders cap ``shared_with`` and report the full count."""
+    env = open_env
+    holders = [_holder(env, f"holder-{index}") for index in range(12)]
     _patch_create(env, monkeypatch)
     async with await _client(env) as client:
         data = await _post(client, env["sender"].id, env["sender_token"])
     assert data["state"] == "opened"
+    assert len(data["shared_with"]) == 10
+    assert data["shared_with_total"] == len(holders)
+    assert data["session_id"] not in {item["id"] for item in data["shared_with"]}
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_root_opens_both_succeed(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two root opens in flight at once both create their sessions."""
+    env = open_env
+    gate, captured = _patch_create_gated(env, monkeypatch)
+    async with await _client(env) as client:
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{env['sender'].id}/open",
+                json=_body(),
+                headers=_headers(env["sender_token"]),
+            )
+        )
+        assert await _wait_for(lambda: captured["calls"] == 1)
+        second = await asyncio.wait_for(
+            _post(client, env["sender"].id, env["sender_token"]), timeout=5
+        )
+        gate.set()
+        response = await first
+    assert response.status_code == 200
+    assert response.json()["state"] == "opened"
+    assert second["state"] == "opened"
+    assert second["session_id"] != response.json()["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_shared_with_omitted_for_a_new_branch_worktree(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A from_ref/branch open cuts a fresh worktree, so nothing is shared."""
+    env = open_env
+    _holder(env, "root-holder")
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], from_ref="main")
+    assert data["state"] == "opened"
+    assert data["shared_with"] == []
+    assert "shared_with_total" not in data
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("from_ref", ["", "   "])
-async def test_blank_from_ref_counts_as_no_ref(
+async def test_blank_from_ref_opens_plain(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, from_ref: str
 ) -> None:
-    """A blank ``from_ref`` does not dodge the directory check."""
+    """A blank ``from_ref`` is no ref: a plain root open with no worktree."""
     env = open_env
-    holder = env["conversations"].create_conversation(
-        agent_id=env["agent_id"],
-        title="holder",
-        host_id=HOST_ID,
-        workspace="/repo",
-        runner_id=token_bound_runner_id(secrets.token_hex(16)),
-    )
-    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
-    _patch_create(env, monkeypatch)
+    captured = _patch_create(env, monkeypatch)
     async with await _client(env) as client:
         data = await _post(client, env["sender"].id, env["sender_token"], from_ref=from_ref)
-    assert data["state"] == "refused"
-    assert data["reason"] == "directory_in_use"
+    assert data["state"] == "opened"
+    assert captured["body"].git is None
+    assert captured["body"].workspace == "/repo"
 
 
 @pytest.mark.asyncio
-async def test_stalled_open_reserves_the_root(
-    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A no-ref open still creating refuses a second root open meanwhile."""
-    env = open_env
-    gate, captured = _patch_create_gated(env, monkeypatch)
-    async with await _client(env) as client:
-        first = asyncio.create_task(
-            client.post(
-                f"/v1/sessions/{env['sender'].id}/open",
-                json=_body(),
-                headers=_headers(env["sender_token"]),
-            )
-        )
-        assert await _wait_for(lambda: captured["calls"] == 1)
-        sid = captured["sids"][0]
-        second = await asyncio.wait_for(
-            _post(client, env["sender"].id, env["sender_token"]), timeout=5
-        )
-        assert second["state"] == "refused"
-        assert second["reason"] == "directory_in_use"
-        assert f"{sid} (opening)" in second["message"]
-        assert {"id": sid, "name": f"opening {sid[:8]}"} in second["candidates"]
-        gate.set()
-        response = await first
-        assert response.status_code == 200
-        first_data = response.json()
-        assert first_data["state"] == "opened"
-        assert first_data["session_id"] == sid
-        third = await _post(client, env["sender"].id, env["sender_token"])
-    assert third["state"] == "refused"
-    assert third["reason"] == "directory_in_use"
-    assert {"id": sid, "name": "opened"} in third["candidates"]
-    assert all(not candidate["name"].startswith("opening ") for candidate in third["candidates"])
-
-
-@pytest.mark.asyncio
-async def test_stalled_open_does_not_block_a_worktree_open(
-    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stalled no-ref open does not hold the lock for a from_ref open."""
-    env = open_env
-    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
-    gate, captured = _patch_create_gated(env, monkeypatch)
-    async with await _client(env) as client:
-        first = asyncio.create_task(
-            client.post(
-                f"/v1/sessions/{env['sender'].id}/open",
-                json=_body(),
-                headers=_headers(env["sender_token"]),
-            )
-        )
-        assert await _wait_for(lambda: captured["calls"] == 1)
-        worktree = await asyncio.wait_for(
-            _post(client, env["sender"].id, env["sender_token"], from_ref="main"), timeout=5
-        )
-        assert worktree["state"] == "opened"
-        gate.set()
-        response = await first
-    assert response.status_code == 200
-    first_data = response.json()
-    assert first_data["state"] == "opened"
-    assert first_data["session_id"] != worktree["session_id"]
-
-
-@pytest.mark.asyncio
-async def test_failed_create_releases_the_reservation(
+async def test_failed_create_does_not_block_a_later_open(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A create that raises before writing a row frees the root and drops the grant."""
@@ -572,7 +571,7 @@ async def test_failed_create_releases_the_reservation(
 async def test_failed_create_after_row_keeps_the_session_owned(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A create that fails after persisting leaves the row owned and occupying."""
+    """A create that fails after persisting leaves the row owned."""
     env = open_env
     captured = _patch_create(env, monkeypatch, error=Exception("boom"), persist_before_error=True)
     async with await _client(env) as client:
@@ -582,18 +581,13 @@ async def test_failed_create_after_row_keeps_the_session_owned(
         sid = captured["kwargs"]["conversation_id"]
         assert env["conversations"].get_conversation(sid) is not None
         assert env["permissions"].get(ALICE, sid) is not None
-        second = await _post(client, env["sender"].id, env["sender_token"])
-    assert second["state"] == "refused"
-    assert second["reason"] == "directory_in_use"
-    assert sid in second["message"]
-    assert {"id": sid, "name": "opened"} in second["candidates"]
 
 
 @pytest.mark.asyncio
-async def test_stalled_pending_fire_reserves_the_root(
+async def test_pending_fire_into_an_occupied_root_opens(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fire that is still creating refuses a second root open meanwhile."""
+    """A waiting root open fires even though a session took the directory."""
     env = open_env
     env["online"]["on"] = False
     lines: list[str] = []
@@ -602,22 +596,14 @@ async def test_stalled_pending_fire_reserves_the_root(
         lines.append(line)
 
     monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
-    gate, captured = _patch_create_gated(env, monkeypatch)
+    _patch_create(env, monkeypatch)
     async with await _client(env) as client:
         waiting = await _post(client, env["sender"].id, env["sender_token"], wait_for_host=True)
-        sid = waiting["session_id"]
-        env["online"]["on"] = True
-        env["app"].state.pending_session_opens.trigger(HOST_ID)
-        assert await _wait_for(lambda: captured["calls"] == 1)
-        refused = await asyncio.wait_for(
-            _post(client, env["sender"].id, env["sender_token"]), timeout=5
-        )
-        assert refused["state"] == "refused"
-        assert refused["reason"] == "directory_in_use"
-        assert f"{sid} (opening)" in refused["message"]
-        assert {"id": sid, "name": f"opening {sid[:8]}"} in refused["candidates"]
-        gate.set()
-        assert await _wait_for(lambda: len(lines) == 1)
+    sid = waiting["session_id"]
+    _holder(env, "holder")
+    env["online"]["on"] = True
+    env["app"].state.pending_session_opens.trigger(HOST_ID)
+    assert await _wait_for(lambda: len(lines) == 1)
     assert lines == [f"[System: session {sid} opened on host {HOST_NAME}]"]
 
 
@@ -735,6 +721,255 @@ async def test_create_failure_surfaces_branch_exists(
 
 
 @pytest.mark.asyncio
+async def test_workspace_joins_a_listed_worktree(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace matching a listed worktree binds with its branch."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    captured = _patch_create(env, monkeypatch)
+    seen = _patch_worktrees(
+        monkeypatch,
+        rows=[
+            {
+                "path": "/repo/.worktrees/task",
+                "branch": "task/fix",
+                "is_main": False,
+                "detached": False,
+            },
+            {"path": "/repo", "branch": "main", "is_main": True, "detached": False},
+        ],
+    )
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], workspace="/repo/.worktrees/task"
+        )
+    assert data["state"] == "opened"
+    assert seen == ["/repo"]
+    body = captured["body"]
+    assert body.workspace == "/repo/.worktrees/task"
+    assert body.git is not None
+    assert body.git.branch_name == "task/fix"
+    assert body.git.existing_worktree is True
+    assert data["shared_with"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"path": "/repo/.worktrees/other", "branch": "other", "is_main": False}],
+        [{"path": "/repo/sub", "branch": "", "is_main": False, "detached": True}],
+    ],
+    ids=["no-matching-path", "detached-head"],
+)
+async def test_workspace_not_a_worktree_places_plainly(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]
+) -> None:
+    """A subdirectory or detached worktree gets no git options."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    _patch_worktrees(monkeypatch, rows=rows)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], workspace="/repo/sub")
+    assert data["state"] == "opened"
+    assert captured["body"].workspace == "/repo/sub"
+    assert captured["body"].git is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_listing_failure_places_plainly(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host listing failure falls back to plain placement, never a refusal."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    _patch_worktrees(monkeypatch, error=WorktreeProxyError("listing failed"))
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], workspace="/repo/sub")
+    assert data["state"] == "opened"
+    assert captured["body"].workspace == "/repo/sub"
+    assert captured["body"].git is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", ["/elsewhere", "relative/dir"])
+async def test_workspace_outside_the_project_refused(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, workspace: str
+) -> None:
+    """A workspace outside (or not inside) the root is a needs_input problem."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], workspace=workspace)
+    assert data["state"] == "needs_input"
+    assert data["reason"] == "workspace_outside_project"
+    assert "body" not in captured, "a placement refusal must not create a session"
+
+
+@pytest.mark.asyncio
+async def test_workspace_dotdot_traversal_refused(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that only escapes the root after lexical normalisation is refused."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], workspace="/repo/../outside"
+        )
+    assert data["state"] == "needs_input"
+    assert data["reason"] == "workspace_outside_project"
+    assert "body" not in captured, "a placement refusal must not create a session"
+
+
+@pytest.mark.asyncio
+async def test_workspace_dotdot_segments_normalised(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-root workspace reaches create and worktree matching without ``..``."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    seen = _patch_worktrees(
+        monkeypatch,
+        rows=[
+            {"path": "/repo/task", "branch": "task/fix", "is_main": False, "detached": False},
+        ],
+    )
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], workspace="/repo/sub/../task"
+        )
+    assert data["state"] == "opened"
+    assert seen == ["/repo"]
+    assert captured["body"].workspace == "/repo/task"
+    assert captured["body"].git is not None
+    assert captured["body"].git.branch_name == "task/fix"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", ["/opt/work", "/opt/work/sub"])
+async def test_trailing_slash_root_contains_itself_and_subdirs(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, workspace: str
+) -> None:
+    """A root with a trailing slash still accepts the root and its subdirectories."""
+    env = open_env
+    env["projects"].create(
+        uuid.uuid4().hex,
+        "Trailing",
+        ALICE,
+        {"host_id": HOST_ID, "workspace": "/opt/work/"},
+    )
+    captured = _patch_create(env, monkeypatch)
+    _patch_worktrees(monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            project="Trailing",
+            workspace=workspace,
+        )
+    assert data["state"] == "opened"
+    assert captured["body"].workspace == workspace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("companion", [{"branch": "task/fix"}, {"from_ref": "main"}])
+async def test_workspace_with_a_branch_refused(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, companion: dict[str, Any]
+) -> None:
+    """workspace and branch/from_ref are exclusive directions."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], workspace="/repo/sub", **companion
+        )
+    assert data["state"] == "needs_input"
+    assert data["reason"] == "workspace_with_branch"
+    assert "workspace joins an existing directory" in data["message"]
+    assert "body" not in captured
+
+
+@pytest.mark.asyncio
+async def test_branch_alone_cuts_a_new_branch_worktree(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """branch alone rides SessionGitOptions with no base."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], branch="task/fix")
+    assert data["state"] == "opened"
+    git = captured["body"].git
+    assert git is not None
+    assert git.branch_name == "task/fix"
+    assert git.base_branch is None
+    assert git.existing_worktree is False
+
+
+@pytest.mark.asyncio
+async def test_branch_with_from_ref_uses_it_as_the_base(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """branch + from_ref branches the new branch from that ref."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            branch="task/fix",
+            from_ref="release/1.2",
+        )
+    assert data["state"] == "opened"
+    git = captured["body"].git
+    assert git is not None
+    assert git.branch_name == "task/fix"
+    assert git.base_branch == "release/1.2"
+
+
+@pytest.mark.asyncio
+async def test_branch_on_a_binding_only_root_needs_an_entry(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binding-supplied root cannot cut a worktree without an entry."""
+    env = open_env
+    binding = ProjectHostBinding(
+        "b1", env["project"].id, HOST_ID, "primary", "repo", "/bound", 1, 1, is_primary=True
+    )
+
+    async def _bindings(*_args: Any, **_kwargs: Any) -> list[Any]:
+        return [binding]
+
+    monkeypatch.setattr(routes_open, "load_bindings", _bindings)
+    _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], branch="task/fix")
+    assert data["state"] == "needs_input"
+    assert data["reason"] == "no_entry_for_worktree"
+
+
+@pytest.mark.asyncio
+async def test_branch_exists_reason_and_join_hint(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing branch is reported with the workspace join hint."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    _patch_create(env, monkeypatch, error=Exception("branch already exists"))
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], branch="task/fix")
+    assert data["state"] == "failed"
+    assert data["reason"] == "branch_exists"
+    assert "pass workspace=" in data["message"]
+
+
+@pytest.mark.asyncio
 async def test_first_message_is_a_peer_send(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -783,94 +1018,6 @@ async def test_waiting_open_fires_on_host_trigger(
     env["app"].state.pending_session_opens.trigger(HOST_ID)
     assert await _wait_for(lambda: len(lines) == 1)
     assert lines == [f"[System: session {sid} opened on host {HOST_NAME}]"]
-
-
-@pytest.mark.asyncio
-async def test_pending_from_ref_fires_despite_an_occupied_root(
-    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A waiting ``from_ref`` open opens although a session holds the root."""
-    env = open_env
-    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
-    holder = env["conversations"].create_conversation(
-        agent_id=env["agent_id"],
-        title="holder",
-        host_id=HOST_ID,
-        workspace="/repo",
-        runner_id=token_bound_runner_id(secrets.token_hex(16)),
-    )
-    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
-    env["online"]["on"] = False
-    lines: list[str] = []
-
-    async def notify_line(_sender_id: str, line: str) -> None:
-        lines.append(line)
-
-    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
-    _patch_create(env, monkeypatch)
-    async with await _client(env) as client:
-        waiting = await _post(
-            client, env["sender"].id, env["sender_token"], from_ref="main", wait_for_host=True
-        )
-    assert waiting["state"] == "waiting_for_host"
-    sid = waiting["session_id"]
-    env["online"]["on"] = True
-    env["app"].state.pending_session_opens.trigger(HOST_ID)
-    assert await _wait_for(lambda: len(lines) == 1)
-    assert lines == [f"[System: session {sid} opened on host {HOST_NAME}]"]
-
-
-@pytest.mark.asyncio
-async def test_pending_without_from_ref_fails_when_the_root_fills(
-    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A waiting no-ref open fails ``directory_in_use`` on fire re-check."""
-    env = open_env
-    env["online"]["on"] = False
-    lines: list[str] = []
-
-    async def notify_line(_sender_id: str, line: str) -> None:
-        lines.append(line)
-
-    monkeypatch.setattr(env["app"].state.peer_sweeper, "notify_line", notify_line)
-    _patch_create(env, monkeypatch)
-    async with await _client(env) as client:
-        waiting = await _post(client, env["sender"].id, env["sender_token"], wait_for_host=True)
-    sid = waiting["session_id"]
-    holder = env["conversations"].create_conversation(
-        agent_id=env["agent_id"],
-        title="holder",
-        host_id=HOST_ID,
-        workspace="/repo",
-        runner_id=token_bound_runner_id(secrets.token_hex(16)),
-    )
-    env["permissions"].grant(ALICE, holder.id, LEVEL_OWNER)
-    env["online"]["on"] = True
-    env["app"].state.pending_session_opens.trigger(HOST_ID)
-    assert await _wait_for(lambda: len(lines) == 1)
-    assert lines == [
-        f"[System: session {sid} could not open on host {HOST_NAME}: directory_in_use]"
-    ]
-
-
-@pytest.mark.asyncio
-async def test_pending_from_ref_does_not_block_an_immediate_root_open(
-    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A waiting ``from_ref`` entry leaves the root free for a no-ref open."""
-    env = open_env
-    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
-    env["online"]["on"] = False
-    async with await _client(env) as client:
-        waiting = await _post(
-            client, env["sender"].id, env["sender_token"], from_ref="main", wait_for_host=True
-        )
-        assert waiting["state"] == "waiting_for_host"
-        env["online"]["on"] = True
-        _patch_create(env, monkeypatch)
-        data = await _post(client, env["sender"].id, env["sender_token"])
-    assert data["state"] == "opened"
-    assert data["session_id"] != waiting["session_id"]
 
 
 @pytest.mark.asyncio

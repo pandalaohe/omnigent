@@ -7,10 +7,8 @@ from dataclasses import replace
 import pytest
 
 from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry
-from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.project_placement import (
     HostRoot,
-    bindings_apply,
     checkout_on_host,
     default_host,
     host_roots,
@@ -39,29 +37,20 @@ def _entry(host_id: str, workspace: str = "/entry") -> ProjectHostEntry:
     return ProjectHostEntry("p1", host_id, workspace, 1)
 
 
-def test_binding_precedes_config_with_flag_on() -> None:
+def test_binding_precedes_config_without_a_flag() -> None:
+    """A primary enabled binding is the root whenever the project has no entries."""
     project = _project()
     binding = _binding("h1")
-    on = FeatureFlags(frozenset({Feature.PROJECT_ASSIGNMENTS}))
-    assert bindings_apply(project, on)
-    assert root_on_host(project, [binding], "h1", gates_on=True).workspace == "/binding"
-    assert root_on_host(project, [binding], "h1", gates_on=False).workspace == "/config"
-    # The retired per-project switch no longer gates bindings: the flag alone
-    # decides.
-    assert not bindings_apply(project, FeatureFlags())
-    assert (
-        root_on_host(project, [replace(binding, enabled=False)], "h1", gates_on=True).workspace
-        == "/config"
-    )
-    assert (
-        root_on_host(project, [replace(binding, is_primary=False)], "h1", gates_on=True).workspace
-        == "/config"
-    )
+    assert root_on_host(project, [binding], "h1").workspace == "/binding"
+    # No binding supplies a root: the config host stays the legacy fallback.
+    assert root_on_host(project, [], "h1").workspace == "/config"
+    assert root_on_host(project, [replace(binding, enabled=False)], "h1").workspace == "/config"
+    assert root_on_host(project, [replace(binding, is_primary=False)], "h1").workspace == "/config"
 
 
 def test_roots_and_default_host_obey_eligibility_and_sandbox_sentinel() -> None:
     project = _project(host_id=None)
-    roots = host_roots(project, [_binding("h1"), replace(_binding("h2"), id="b2")], gates_on=True)
+    roots = host_roots(project, [_binding("h1"), replace(_binding("h2"), id="b2")])
     assert [root.host_id for root in roots] == ["h1", "h2"]
     assert (
         default_host(project, roots, eligible_host_ids=frozenset({"h1"})).reason == "single_root"
@@ -73,7 +62,7 @@ def test_roots_and_default_host_obey_eligibility_and_sandbox_sentinel() -> None:
         == "h9"
     )
     sandbox = _project(host_id="__sandbox__")
-    assert host_roots(sandbox, [], gates_on=False) == []
+    assert host_roots(sandbox, []) == []
     assert default_host(sandbox, roots).reason == "none"
 
 
@@ -113,15 +102,13 @@ async def test_loaders_filter_deleted_and_foreign_hosts() -> None:
 
 
 def test_entry_outranks_binding_and_config_with_checkout() -> None:
-    """An entry is the root regardless of gates; the binding stays the checkout."""
+    """An entry is the root; the binding stays the checkout."""
     project = _project(workspace="/config")
     binding = _binding("h1", "/binding")
     entries = [_entry("h1", "/entry")]
-    root = root_on_host(project, [binding], "h1", gates_on=True, entries=entries)
+    root = root_on_host(project, [binding], "h1", entries=entries)
     assert root == HostRoot("h1", "/entry", "entry", "/binding")
-    # Entries are not gated: collaboration off changes nothing.
-    assert root_on_host(project, [binding], "h1", gates_on=False, entries=entries) == root
-    roots = host_roots(project, [binding], gates_on=True, entries=entries)
+    roots = host_roots(project, [binding], entries=entries)
     assert roots == [root]
 
 
@@ -130,9 +117,8 @@ def test_entry_hosts_only_and_no_fallback_after_removal() -> None:
     project = _project(workspace="/config")
     binding = _binding("h1", "/binding")
     entries = [_entry("h2", "/other")]
-    assert root_on_host(project, [binding], "h1", gates_on=True, entries=entries) is None
-    assert root_on_host(project, [binding], "h1", gates_on=False, entries=entries) is None
-    assert host_roots(project, [binding], gates_on=True, entries=entries) == [
+    assert root_on_host(project, [binding], "h1", entries=entries) is None
+    assert host_roots(project, [binding], entries=entries) == [
         HostRoot("h2", "/other", "entry", "/other")
     ]
 
@@ -142,19 +128,19 @@ def test_entries_keep_sandbox_and_legacy_paths_intact() -> None:
     project = _project(workspace="/config")
     binding = _binding("h1", "/binding")
     entries = [_entry("h1", "/entry")]
-    assert root_on_host(project, [binding], "__sandbox__", gates_on=True, entries=entries) is None
-    assert host_roots(project, [binding], gates_on=True, entries=entries) == [
+    assert root_on_host(project, [binding], "__sandbox__", entries=entries) is None
+    assert host_roots(project, [binding], entries=entries) == [
         HostRoot("h1", "/entry", "entry", "/binding")
     ]
-    legacy = root_on_host(project, [binding], "h1", gates_on=True)
+    legacy = root_on_host(project, [binding], "h1")
     assert (legacy.workspace, legacy.source, legacy.checkout) == (
         "/binding",
         "binding",
         "/binding",
     )
-    config = root_on_host(project, [binding], "h1", gates_on=False)
-    assert (config.workspace, config.source, config.checkout) == ("/config", "config", "/binding")
-    assert root_on_host(project, [], "__sandbox__", gates_on=False) is None
+    config = root_on_host(project, [replace(binding, enabled=False)], "h1")
+    assert (config.workspace, config.source, config.checkout) == ("/config", "config", None)
+    assert root_on_host(project, [], "__sandbox__") is None
 
 
 # ── R-CHECKOUT ──────────────────────────────────────────────────────────

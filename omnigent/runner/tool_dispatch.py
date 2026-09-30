@@ -2824,7 +2824,8 @@ def _session_open_enabled_for(conversation_id: str | None) -> bool:
 def _peer_send_opts_from_args(args: _JsonObject) -> _PeerSendOpts:
     """Extract and validate the peer-only ``sys_session_send`` options.
 
-    ``correlation_id`` (≤ 64 chars), ``wait_seconds`` (0–3600) and
+    ``correlation_id`` (≤ 64 chars), ``wait_seconds`` (≥ 0, capped by the
+    owner's undelivered-message lifetime on the server) and
     ``wait_for_reply_seconds`` (0–600) ride top-level alongside
     ``session_id``; named (agent, title) sends reject them and child
     sends reject them once the peer branch is out of reach.
@@ -2847,8 +2848,8 @@ def _peer_send_opts_from_args(args: _JsonObject) -> _PeerSendOpts:
         opts.present = True
         if isinstance(raw_wait, bool) or not isinstance(raw_wait, int):
             raise ValueError("'wait_seconds' must be an integer when provided")
-        if raw_wait < 0 or raw_wait > 3600:
-            raise ValueError("'wait_seconds' must be between 0 and 3600")
+        if raw_wait < 0:
+            raise ValueError("'wait_seconds' must be a non-negative integer")
         opts.wait_seconds = raw_wait
     raw_reply_wait = args.get("wait_for_reply_seconds")
     if raw_reply_wait is not None:
@@ -4856,6 +4857,10 @@ class _CreatePlacement:
 def _worktree_options(worktree: object) -> tuple[_JsonObject | None, str | None]:
     """Validate a ``worktree`` argument into ``SessionGitOptions`` wire fields.
 
+    ``existing: true`` binds the child to the worktree already at the
+    workspace (or the caller's cwd) instead of cutting a new one; ``base``
+    cannot be combined with it (an existing worktree has no base to fork).
+
     :param worktree: The raw argument, e.g.
         ``{"branch": "fix-auth", "base": "main"}``.
     :returns: ``(git_body, error)``; ``git_body`` is ``None`` when absent.
@@ -4864,17 +4869,25 @@ def _worktree_options(worktree: object) -> tuple[_JsonObject | None, str | None]
         return None, None
     if not isinstance(worktree, dict):
         return None, "'worktree' must be an object with a non-empty 'branch'"
-    extra = sorted(set(worktree) - {"branch", "base"})
+    extra = sorted(set(worktree) - {"branch", "base", "existing"})
     if extra:
         return None, f"unexpected 'worktree' field: {extra[0]}"
     branch = worktree.get("branch")
     if not isinstance(branch, str) or not branch.strip():
         return None, "'worktree.branch' must be a non-empty string"
-    git: _JsonObject = {"branch_name": branch.strip()}
+    existing = worktree.get("existing")
+    if existing is not None and not isinstance(existing, bool):
+        return None, "'worktree.existing' must be a boolean"
     base = worktree.get("base")
     if base is not None:
         if not isinstance(base, str) or not base.strip():
             return None, "'worktree.base' must be a non-empty string"
+    if existing:
+        if base is not None:
+            return None, "'worktree.base' cannot be combined with 'worktree.existing'"
+        return {"branch_name": branch.strip(), "existing_worktree": True}, None
+    git: _JsonObject = {"branch_name": branch.strip()}
+    if base is not None:
         git["base_branch"] = base.strip()
     return git, None
 
@@ -5386,6 +5399,8 @@ _SESSION_OPEN_ALLOWED_ARGS = frozenset(
         "reasoning_effort",
         "message",
         "from_ref",
+        "workspace",
+        "branch",
         "wait_for_host",
         "title",
     }

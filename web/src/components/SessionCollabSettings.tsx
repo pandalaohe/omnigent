@@ -29,7 +29,8 @@ const HINTS = {
     "A relay chain of messages between sessions longer than this is held until you release it.",
   pairRate: "Messages past this rate between one pair of sessions wait in a queue.",
   senderRate: "The same limit applied per sending session across all of its receivers.",
-  duplicate: "An identical message to the same session inside this window is dropped.",
+  duplicate:
+    "An identical message on the same thread to the same session is dropped while the earlier copy is still undelivered, or inside this window.",
   undelivered: "A queued or held message not delivered within this time expires.",
   flowTimer: "Lets agents run timed flows and timed wake-ups.",
   keepWarm:

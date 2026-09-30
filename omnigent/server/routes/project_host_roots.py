@@ -11,7 +11,6 @@ from fastapi import APIRouter, Request
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.project_placement import (
-    bindings_apply,
     default_host,
     host_roots,
     load_bindings,
@@ -50,7 +49,6 @@ def create_project_host_roots_router(
         roots = host_roots(
             project,
             bindings,
-            gates_on=bindings_apply(project, request.app.state.feature_flags),
             entries=entries,
         )
         eligible = await load_eligible_host_ids(

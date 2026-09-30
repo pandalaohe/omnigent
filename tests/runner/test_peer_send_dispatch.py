@@ -753,3 +753,15 @@ async def test_grant_gate_admits_async_peer_send_when_flag_on(
     bg_task, _evt = tasks[handle["handle_id"]]
     await bg_task
     assert inbox.get_nowait()["status"] == "completed"
+
+
+def test_wait_seconds_accepts_an_unbounded_non_negative_integer() -> None:
+    """The dispatcher no longer caps ``wait_seconds``; the server does."""
+    opts = tool_dispatch._peer_send_opts_from_args({"wait_seconds": 10_000_000})
+    assert opts.wait_seconds == 10_000_000
+
+
+def test_wait_seconds_negative_rejected() -> None:
+    """A negative wait fails fast with the non-negative message."""
+    with pytest.raises(ValueError, match="non-negative integer"):
+        tool_dispatch._peer_send_opts_from_args({"wait_seconds": -1})

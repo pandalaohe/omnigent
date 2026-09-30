@@ -143,7 +143,10 @@ def test_peer_options_present_with_bounds() -> None:
     """``correlation_id`` / ``wait_seconds`` / ``wait_for_reply_seconds`` ranges."""
     props = _top_properties()
     assert props["correlation_id"]["maxLength"] == 64
-    assert (props["wait_seconds"]["minimum"], props["wait_seconds"]["maximum"]) == (0, 3600)
+    assert props["wait_seconds"]["minimum"] == 0
+    # The server caps wait_seconds at the owner's undelivered-message
+    # lifetime, so the schema advertises no upper bound.
+    assert "maximum" not in props["wait_seconds"]
     assert props["wait_seconds"]["default"] == 0
     assert (
         props["wait_for_reply_seconds"]["minimum"],
@@ -175,3 +178,23 @@ def test_by_id_description_mentions_peer_when_flagged() -> None:
     assert "peer messaging is enabled" not in plain
     peer = _build_sys_session_send_schema({}, peer_enabled=True)["function"]["description"]
     assert "peer messaging is enabled" in peer
+
+
+def test_worktree_schema_advertises_bind_mode() -> None:
+    """``worktree.existing`` joins a worktree; the description states the split."""
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    schema = SysSessionCreateTool().get_schema()
+    worktree = schema["function"]["parameters"]["properties"]["worktree"]
+    assert worktree["properties"]["existing"] == {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Join the existing worktree at 'workspace' (or your working "
+            "directory) whose checked-out branch is 'branch' instead of "
+            "cutting a new one; the branch is recorded. Not with 'base'."
+        ),
+    }
+    assert "existing=true" in worktree["properties"]["branch"]["description"]
+    assert "existing: true" in worktree["description"]
+    assert "existing: true" in schema["function"]["description"]
