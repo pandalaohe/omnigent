@@ -8251,6 +8251,18 @@
             "description": "One-line excerpt of the session's newest visible message. Filled only when the request asked with `include_preview=true` (default `false`, and never for callers that don't ask); `None` otherwise or when the session has no visible messages.",
             "title": "Last Message Preview"
           },
+          "last_message_tail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tail excerpt (up to 400 chars, line breaks kept) of the newest assistant message. Filled only when the request asked with `include_preview=true`; `None` otherwise or when no assistant message carries text.",
+            "title": "Last Message Tail"
+          },
           "last_task_error": {
             "anyOf": [
               {
@@ -14935,7 +14947,7 @@
             }
           },
           {
-            "description": "When `True`, fill `last_message_preview` with an excerpt of the session's newest visible message (one batched items read). The web chat never sets it; orchestrating callers use it to peek at a peer session without fetching the transcript.",
+            "description": "When `True`, fill `last_message_preview` with an excerpt of the session's newest visible message and `last_message_tail` with the end of its newest assistant message (one batched items read). The web chat never sets it; orchestrating callers use it to peek at a peer session without fetching the transcript.",
             "in": "query",
             "name": "include_preview",
             "required": false,

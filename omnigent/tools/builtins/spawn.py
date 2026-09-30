@@ -799,7 +799,10 @@ class SysSessionGetInfoTool(Tool):
             "Global read — any session you can access. Pass session_id to "
             "target one session, or session_ids (up to 20) to describe many "
             'in one call as {"sessions": [...]} with per-item errors; omit '
-            "both to describe your own. Metadata only — "
+            "both to describe your own. The batch form omits "
+            "configured_harnesses unless include_host_readiness is true. "
+            "Each item carries last_message_tail — the end of the newest "
+            "assistant reply. Metadata only — "
             "use sys_session_get_history for the conversation transcript, "
             "including a peer's full history."
         )
@@ -810,7 +813,8 @@ class SysSessionGetInfoTool(Tool):
 
         :returns: Dict with ``"type": "function"`` and a
             ``"function"`` sub-dict; ``session_id`` / ``session_ids`` are
-            optional and mutually exclusive.
+            optional and mutually exclusive, and ``include_host_readiness``
+            opts the batch form into host readiness.
         """
         return {
             "type": "function",
@@ -844,6 +848,14 @@ class SysSessionGetInfoTool(Tool):
                                 "per id — an unknown or inaccessible id "
                                 "yields an error item instead of failing the "
                                 "call. Mutually exclusive with session_id."
+                            ),
+                        },
+                        "include_host_readiness": {
+                            "type": "boolean",
+                            "description": (
+                                "Attach the bound host's harness readiness "
+                                "map (configured_harnesses). Default: true "
+                                "for a single session, false with session_ids."
                             ),
                         },
                     },

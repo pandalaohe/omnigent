@@ -9184,20 +9184,17 @@ async def test_sys_session_get_info_many_reports_per_item_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_many_keeps_each_items_host_readiness() -> None:
+async def test_sys_session_get_info_many_omits_host_readiness_without_flag() -> None:
     """
-    Sessions on different hosts each report their own ``host_id`` and
-    configured harness readiness; the runner and host lookups are per item,
-    not folded across the batch. Without that, an item would show another
-    session's host readiness and mislead the orchestrator about where a
-    session can run.
+    The batch form omits ``configured_harnesses`` and never calls
+    ``GET /v1/hosts/{id}`` unless the caller opts in. A supervisor reading
+    many children must not fan out one readiness probe per item; runner
+    connectivity stays per item. The opt-in path is covered by
+    ``test_sys_session_get_info_many_keeps_each_items_host_readiness``.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
-    readiness = {
-        "host_1": {"claude-native": True},
-        "host_2": {"codex-native": False},
-    }
+    host_calls: list[str] = []
     online = {"runner_1": True, "runner_2": False}
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -9223,8 +9220,8 @@ async def test_sys_session_get_info_many_keeps_each_items_host_readiness() -> No
                 ),
             )
         if path.startswith("/v1/hosts/"):
-            host_id = path.rsplit("/", 1)[-1]
-            return httpx.Response(200, json={"configured_harnesses": readiness[host_id]})
+            host_calls.append(path)
+            return httpx.Response(200, json={"configured_harnesses": {}})
         if path.startswith("/v1/runners/") and path.endswith("/status"):
             runner_id = path.split("/")[3]
             return httpx.Response(200, json={"online": online[runner_id]})
@@ -9243,11 +9240,63 @@ async def test_sys_session_get_info_many_keeps_each_items_host_readiness() -> No
 
     by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
     assert by_id["conv_a"]["host_id"] == "host_1"
-    assert by_id["conv_a"]["configured_harnesses"] == {"claude-native": True}
-    assert by_id["conv_a"]["runner_online"] is True
     assert by_id["conv_b"]["host_id"] == "host_2"
-    assert by_id["conv_b"]["configured_harnesses"] == {"codex-native": False}
+    assert "configured_harnesses" not in by_id["conv_a"]
+    assert "configured_harnesses" not in by_id["conv_b"]
+    assert by_id["conv_a"]["runner_online"] is True
     assert by_id["conv_b"]["runner_online"] is False
+    assert host_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_many_keeps_each_items_host_readiness() -> None:
+    """
+    With ``include_host_readiness: true`` the batch form keeps each item's
+    own ``configured_harnesses``; the host lookups are per item, not folded
+    across the batch. Without that, an item would show another session's
+    host readiness and mislead the orchestrator about where a session can
+    run.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    readiness = {
+        "host_1": {"claude-native": True},
+        "host_2": {"codex-native": False},
+    }
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_a":
+            return httpx.Response(
+                200,
+                json=_session_info_snapshot("conv_a", host_id="host_1"),
+            )
+        if path == "/v1/sessions/conv_b":
+            return httpx.Response(
+                200,
+                json=_session_info_snapshot("conv_b", host_id="host_2"),
+            )
+        if path.startswith("/v1/hosts/"):
+            host_id = path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json={"configured_harnesses": readiness[host_id]})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps(
+                {"session_ids": ["conv_a", "conv_b"], "include_host_readiness": True}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert by_id["conv_a"]["configured_harnesses"] == {"claude-native": True}
+    assert by_id["conv_b"]["configured_harnesses"] == {"codex-native": False}
 
 
 @pytest.mark.asyncio
@@ -9341,6 +9390,47 @@ async def test_sys_session_get_info_rejects_bad_multi_args_without_server_call(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({"session_id": "conv_a", "include_host_readiness": "yes"}, id="single"),
+        pytest.param({"session_ids": ["conv_a"], "include_host_readiness": 1}, id="multi"),
+    ],
+)
+async def test_sys_session_get_info_rejects_non_bool_host_readiness(
+    arguments: dict[str, Any],
+) -> None:
+    """A non-bool ``include_host_readiness`` is rejected before any HTTP call.
+
+    Accepting a truthy string/int would let a malformed flag silently choose
+    the readiness behavior instead of surfacing the caller's typo.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(500, json={"error": "unexpected server call"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert requests == []
+    assert json.loads(output) == {
+        "error": "sys_session_get_info 'include_host_readiness' must be a boolean"
+    }
+
+
+@pytest.mark.asyncio
 async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> None:
     """
     The single-id form stays a flat object: existing keys unchanged, the new
@@ -9364,6 +9454,7 @@ async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> 
                 total_cost_usd=0.5,
                 last_task_error={"code": "executor_error", "message": "boom"},
                 last_message_preview="latest words",
+                last_message_tail="final words",
             ),
         )
 
@@ -9390,6 +9481,7 @@ async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> 
     assert info["context_used_fraction"] == 0.25
     assert info["last_error"] == {"code": "executor_error", "message": "boom"}
     assert info["last_message_preview"] == "latest words"
+    assert info["last_message_tail"] == "final words"
     assert info["running_since"] == 1980
     assert info["running_seconds"] == 20
     assert info["idle_seconds"] == 10
