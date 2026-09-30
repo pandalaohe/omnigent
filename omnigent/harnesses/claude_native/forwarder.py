@@ -45,6 +45,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
+    read_user_auto_compact_window,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -860,6 +861,8 @@ class _ForwardDedupeState:
     :param usage: Last ``message.usage`` snapshot POSTed via
         ``external_session_usage``, or ``None`` if none yet.
     :param context_window: Last context-window POSTed, or ``None``.
+    :param auto_compact_token_limit: Last auto-compaction window POSTed,
+        or ``None``.
     :param observed_model: Last VERBATIM model seen (statusLine or
         transcript), sticky across polls (the incremental window often
         carries no fresh ``message.model``), e.g.
@@ -903,6 +906,7 @@ class _ForwardDedupeState:
     # fresh one every poll.
     pending_usage: dict[str, float] | None = None
     context_window: int | None = None
+    auto_compact_token_limit: int | None = None
     provider_usage_limits: dict[str, object] | None = None
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
@@ -6587,6 +6591,11 @@ async def _post_forward_side_channel_updates(
             resolved_context_window is not None
             and resolved_context_window != dedupe.context_window
         )
+        auto_compact_token_limit = await asyncio.to_thread(read_user_auto_compact_window)
+        auto_compact_changed = (
+            auto_compact_token_limit is not None
+            and auto_compact_token_limit != dedupe.auto_compact_token_limit
+        )
         raw_provider_usage_limits = (
             status_state.get("provider_usage_limits") if status_state is not None else None
         )
@@ -6615,7 +6624,9 @@ async def _post_forward_side_channel_updates(
         # carrying the newly completed call — then reads as unchanged. Gating the
         # span on them drops that call's tokens for good: nothing retries, and by
         # the next post ``result.latest_usage`` has moved to the following call.
-        usage_post_needed = usage_changed or window_changed or provider_limits_changed
+        usage_post_needed = (
+            usage_changed or window_changed or provider_limits_changed or auto_compact_changed
+        )
         if usage_post_needed or record_token_usage is not None:
             try:
                 await _post_external_session_usage(
@@ -6623,6 +6634,9 @@ async def _post_forward_side_channel_updates(
                     session_id=session_id,
                     usage=posted_usage if usage_post_needed else None,
                     context_window=resolved_context_window if usage_post_needed else None,
+                    auto_compact_token_limit=(
+                        auto_compact_token_limit if usage_post_needed else None
+                    ),
                     provider_usage_limits=(provider_usage_limits if usage_post_needed else None),
                     token_usage=record_token_usage,
                 )
@@ -6630,6 +6644,8 @@ async def _post_forward_side_channel_updates(
                     dedupe.usage = posted_usage
                 if window_changed:
                     dedupe.context_window = resolved_context_window
+                if auto_compact_changed:
+                    dedupe.auto_compact_token_limit = auto_compact_token_limit
                 if provider_limits_changed:
                     dedupe.provider_usage_limits = provider_usage_limits
                 if record_token_usage is not None:
@@ -7262,16 +7278,18 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
+    auto_compact_token_limit: int | None = None,
     provider_usage_limits: dict[str, object] | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
     """
     Post one ``external_session_usage`` event to the Sessions API.
 
-    At least one of ``usage`` / ``context_window`` / ``provider_usage_limits`` must be set for
-    the request to go out; with none of them the request is skipped (the server would 400 it).
-    ``token_usage`` alone is still honoured — the span is recorded and nothing is POSTed, which
-    is how a completed API call whose statusLine gauge never moved still reaches the backend.
+    At least one of ``usage`` / ``context_window`` / ``auto_compact_token_limit`` /
+    ``provider_usage_limits`` must be set for the request to go out; with none of them the
+    request is skipped (the server would 400 it). ``token_usage`` alone is still honoured — the
+    span is recorded and nothing is POSTed, which is how a completed API call whose statusLine
+    gauge never moved still reaches the backend.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -7280,6 +7298,8 @@ async def _post_external_session_usage(
         cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
+    :param auto_compact_token_limit: Harness auto-compaction window in
+        tokens, or ``None`` to leave the server's persisted value untouched.
     :param token_usage: One API call's final token counters to record on the
         span as ``gen_ai.usage.*``, e.g. ``{"input_tokens": 1523,
         "output_tokens": 847}``. ``None`` records no token attributes. Pass
@@ -7292,6 +7312,8 @@ async def _post_external_session_usage(
         payload.update(usage)
     if context_window is not None:
         payload["context_window"] = context_window
+    if auto_compact_token_limit is not None:
+        payload["auto_compact_token_limit"] = auto_compact_token_limit
     if provider_usage_limits is not None:
         payload["provider_usage_limits"] = provider_usage_limits
     if not payload and token_usage is None:

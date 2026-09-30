@@ -7240,15 +7240,20 @@ async def _session_get_info_via_rest(
     Runner connectivity is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when the
     lookup fails or no runner is bound); host readiness is likewise
-    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
-    intentionally omitted — that is what ``sys_session_get_history`` returns.
+    best-effort via ``GET /v1/hosts/{id}``, and per item only when
+    ``args["include_host_readiness"]`` allows it (default ``True`` for the
+    single-session form, ``False`` for the ``session_ids`` form, so a
+    supervisor reading many children does not fan out one host-readiness
+    GET per item). The full transcript is intentionally omitted — that is
+    what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
     (the server denied the read, so from the caller's vantage the target is
     one it may not see).
 
     :param args: Parsed tool arguments; optional ``session_id`` or
-        ``session_ids`` (mutually exclusive).
+        ``session_ids`` (mutually exclusive), plus optional bool
+        ``include_host_readiness``.
     :param conversation_id: The caller's own session id, used as the default
         target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -7256,13 +7261,21 @@ async def _session_get_info_via_rest(
         error object on a bad argument combination.
     """
     raw_single = args.get("session_id")
+    raw_host_readiness = args.get("include_host_readiness")
+    if raw_host_readiness is not None and not isinstance(raw_host_readiness, bool):
+        return json.dumps(
+            {"error": "sys_session_get_info 'include_host_readiness' must be a boolean"}
+        )
     if "session_ids" not in args:
+        include_host_readiness = True if raw_host_readiness is None else raw_host_readiness
         target = raw_single or conversation_id
         if not isinstance(target, str) or not target:
             return json.dumps(
                 {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
             )
-        item = await _session_info_item(target, server_client)
+        item = await _session_info_item(
+            target, server_client, include_host_readiness=include_host_readiness
+        )
         error = item.get("error")
         if error is None:
             return json.dumps(item)
@@ -7278,6 +7291,7 @@ async def _session_get_info_via_rest(
             {"error": "sys_session_get_info: pass session_id or session_ids, not both"}
         )
     raw_many = args.get("session_ids")
+    include_host_readiness = False if raw_host_readiness is None else raw_host_readiness
     invalid_ids_rule = (
         "sys_session_get_info: 'session_ids' must be a non-empty list of "
         f"non-empty strings (max {_SESSION_INFO_MAX_IDS})"
@@ -7300,7 +7314,12 @@ async def _session_get_info_via_rest(
         if value not in targets:
             targets.append(value)
     items = await asyncio.gather(
-        *(_session_info_item(target, server_client) for target in targets)
+        *(
+            _session_info_item(
+                target, server_client, include_host_readiness=include_host_readiness
+            )
+            for target in targets
+        )
     )
     return json.dumps({"sessions": list(items)})
 
@@ -7359,12 +7378,20 @@ def _session_info_context_fraction(tokens: object, window: object) -> float | No
     return None
 
 
-async def _session_info_item(target: str, server_client: httpx.AsyncClient) -> _JsonObject:
+async def _session_info_item(
+    target: str,
+    server_client: httpx.AsyncClient,
+    *,
+    include_host_readiness: bool = True,
+) -> _JsonObject:
     """
     Project one session's snapshot into a ``sys_session_get_info`` item.
 
     :param target: Session/conversation id to describe.
     :param server_client: HTTP client pointed at the Omnigent server.
+    :param include_host_readiness: When ``True``, attach the bound host's
+        ``configured_harnesses`` map; when ``False``, skip the host lookup
+        entirely and omit the key.
     :returns: The metadata item, or an ``{"error", "session_id"}`` object
         (``session_not_found`` / ``access_denied`` / ``lookup_failed: …`` /
         non-200 status).
@@ -7399,14 +7426,19 @@ async def _session_info_item(target: str, server_client: httpx.AsyncClient) -> _
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
-    snap_host_id = _optional_string(snap.get("host_id"))
-    runner_online, configured_harnesses = await asyncio.gather(
-        _runner_online_or_none(snap_runner_id, server_client),
-        _host_harnesses_or_none(snap_host_id, server_client),
-    )
+    configured_harnesses: _JsonObject | None = None
+    if include_host_readiness:
+        snap_host_id = _optional_string(snap.get("host_id"))
+        runner_online, configured_harnesses = await asyncio.gather(
+            _runner_online_or_none(snap_runner_id, server_client),
+            _host_harnesses_or_none(snap_host_id, server_client),
+        )
+    else:
+        runner_online = await _runner_online_or_none(snap_runner_id, server_client)
     context_tokens = snap.get("last_total_tokens")
     context_window = snap.get("context_window")
-    return {
+    auto_compact_token_limit = snap.get("auto_compact_token_limit")
+    item: _JsonObject = {
         "session_id": snap.get("id"),
         "status": snap.get("status"),
         # Persisted conversation activity is distinct from lifecycle
@@ -7424,7 +7456,6 @@ async def _session_info_item(target: str, server_client: httpx.AsyncClient) -> _
         "runner_id": snap.get("runner_id"),
         "runner_online": runner_online,
         "host_id": snap.get("host_id"),
-        "configured_harnesses": configured_harnesses,
         "parent_session_id": snap.get("parent_session_id"),
         "sub_agent_name": snap.get("sub_agent_name"),
         "reasoning_effort": snap.get("reasoning_effort"),
@@ -7451,14 +7482,22 @@ async def _session_info_item(target: str, server_client: httpx.AsyncClient) -> _
         "running_seconds": _session_info_duration(as_of, snap.get("running_since")),
         "as_of": as_of,
         "last_message_preview": snap.get("last_message_preview"),
+        "last_message_tail": snap.get("last_message_tail"),
         "archived": snap.get("archived"),
         "archived_at": snap.get("archived_at"),
         "total_cost_usd": snap.get("total_cost_usd"),
         "context_tokens": context_tokens,
         "context_window": context_window,
         "context_used_fraction": _session_info_context_fraction(context_tokens, context_window),
+        "auto_compact_token_limit": auto_compact_token_limit,
+        "compact_used_fraction": _session_info_context_fraction(
+            context_tokens, auto_compact_token_limit
+        ),
         "last_error": snap.get("last_task_error"),
     }
+    if include_host_readiness:
+        item["configured_harnesses"] = configured_harnesses
+    return item
 
 
 def _omnigent_error_message(resp: httpx.Response) -> str | None:
@@ -8237,6 +8276,99 @@ async def _session_list_via_rest(
     )
 
 
+async def _rename_descendant_session_via_rest(
+    target_id: str,
+    title: str,
+    *,
+    caller_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """Retitle another session in the caller's subtree through the server API.
+
+    :param target_id: The descendant session to retitle, e.g. ``"conv_child"``.
+    :param title: The normalized title proposal, already length-checked.
+    :param caller_id: The calling session's own id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON ``{"renamed": true, ...}`` on success; otherwise a JSON
+        refusal (``session_not_found``, ``access_denied``, ``not_descendant``,
+        ``session_closed``, ``title_taken``) or error object.
+    """
+    try:
+        target_response = await server_client.get(
+            f"/v1/sessions/{target_id}",
+            params=_SESSION_METADATA_PARAMS,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if target_response.status_code == 404:
+        return json.dumps({"renamed": False, "title": None, "reason": "session_not_found"})
+    if target_response.status_code in (401, 403):
+        return json.dumps({"renamed": False, "title": None, "reason": "access_denied"})
+    if target_response.status_code != 200:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {target_response.status_code}",
+                "detail": target_response.text[:200],
+            }
+        )
+    try:
+        target_payload = target_response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    target_snapshot = _string_object_dict(target_payload)
+    if target_snapshot is None:
+        return json.dumps({"error": "sys_session_rename returned malformed session data"})
+    parent_id = _optional_string(target_snapshot.get("parent_session_id"))
+    if parent_id is None or not await _is_descendant(server_client, caller_id, target_snapshot):
+        return json.dumps({"renamed": False, "title": None, "reason": "not_descendant"})
+    raw_title = _optional_string(target_snapshot.get("title"))
+    if is_session_closed(_string_mapping(target_snapshot.get("labels")), raw_title):
+        return json.dumps({"renamed": False, "title": None, "reason": "session_closed"})
+    # The prefix is kept and siblings are checked because the (parent, title)
+    # pair is the child's continuation address for sys_session_send.
+    display_title = title_without_closed_marker(raw_title) or ""
+    parsed = _parse_session_title(display_title)
+    prefix = ""
+    if parsed.agent is not None:
+        head, _, tail = display_title.partition(":")
+        prefix = f"ui:{parsed.agent}:" if head == "ui" and ":" in tail else f"{parsed.agent}:"
+    full_title = f"{prefix}{title}" if prefix and not title.startswith(prefix) else title
+    # The route caps at limit=1000, so this sibling check is best-effort:
+    # the server does not enforce title uniqueness at write time.
+    children = await _list_child_sessions(
+        server_client=server_client,
+        conversation_id=parent_id,
+        limit=1000,
+        include_archived=True,
+    )
+    if isinstance(children, str):
+        return json.dumps({"error": children})
+    for child in children:
+        if child.get("id") != target_id and child.get("title") == full_title:
+            return json.dumps({"renamed": False, "title": None, "reason": "title_taken"})
+    try:
+        patch = await server_client.patch(
+            f"/v1/sessions/{target_id}",
+            json={"title": full_title},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if patch.status_code == 404:
+        return json.dumps({"renamed": False, "title": None, "reason": "session_not_found"})
+    if patch.status_code in (401, 403):
+        return json.dumps({"renamed": False, "title": None, "reason": "access_denied"})
+    if patch.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {patch.status_code}",
+                "detail": patch.text[:200],
+            }
+        )
+    return json.dumps({"renamed": True, "title": full_title, "reason": None})
+
+
 async def _rename_current_session_via_rest(
     args: _JsonObject,
     conversation_id: str | None,
@@ -8264,6 +8396,18 @@ async def _rename_current_session_via_rest(
     normalized_title = " ".join(title.split())
     if len(normalized_title) < 2:
         return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    session_id = args.get("session_id")
+    if session_id is not None and session_id != conversation_id:
+        if not isinstance(session_id, str) or not session_id:
+            return json.dumps(
+                {"error": "sys_session_rename requires a non-empty string 'session_id'"}
+            )
+        return await _rename_descendant_session_via_rest(
+            session_id,
+            normalized_title,
+            caller_id=conversation_id,
+            server_client=server_client,
+        )
     # Only a top-level session may rename itself: a sub-agent's title is its
     # (parent, title) continuation address for sys_session_send, so a child
     # rename would corrupt sibling addressing. Refuse explicitly, matching

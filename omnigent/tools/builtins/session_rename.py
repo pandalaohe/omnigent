@@ -1,4 +1,4 @@
-"""Tool for explicitly renaming the current session."""
+"""Tool for explicitly renaming the current session or one of its descendants."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from omnigent.tools.base import Tool
 
 
 class SysSessionRenameTool(Tool):
-    """Schema-only tool that renames the calling session."""
+    """Schema-only tool that renames the calling session or a descendant."""
 
     @classmethod
     def name(cls) -> str:
@@ -26,7 +26,8 @@ class SysSessionRenameTool(Tool):
             "requirements, use 3-6 words, action-first. Strip filler. "
             "Never copy a conversational question or greeting verbatim. "
             "The rename is silent and can be updated again as the work evolves. "
-            "Sub-agent sessions cannot rename themselves (returns not_top_level)."
+            "Sub-agent sessions cannot rename themselves (not_top_level), but a "
+            "session can retitle its own descendants with session_id."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -48,7 +49,17 @@ class SysSessionRenameTool(Tool):
                             ),
                             "minLength": 2,
                             "maxLength": DEFAULT_GENERATED_TITLE_MAX_CHARS,
-                        }
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "Retitle one of your own sub-agent sessions (child or deeper) "
+                                "instead of yourself. Its agent address prefix is kept; a "
+                                "sibling with the same title is refused (title_taken); a "
+                                "closed session is refused (session_closed); a session "
+                                "outside your subtree is refused (not_descendant)."
+                            ),
+                        },
                     },
                     "required": ["title"],
                     "additionalProperties": False,

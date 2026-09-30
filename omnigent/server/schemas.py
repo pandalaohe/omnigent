@@ -2403,6 +2403,10 @@ class SessionResponse(BaseModel):
         ``include_preview=true`` (default ``false``, and never for callers
         that don't ask); ``None`` otherwise or when the session has no
         visible messages.
+    :param last_message_tail: Tail excerpt (up to 400 chars, line breaks
+        kept) of the newest assistant message. Filled only when the
+        request asked with ``include_preview=true``; ``None`` otherwise
+        or when no assistant message carries text.
     """
 
     id: str
@@ -2487,6 +2491,7 @@ class SessionResponse(BaseModel):
     project_id: str | None = None
     running_since: int | None = None
     last_message_preview: str | None = None
+    last_message_tail: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):

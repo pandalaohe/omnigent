@@ -7743,6 +7743,39 @@ def read_user_effort_level() -> str | None:
     return None
 
 
+def read_user_auto_compact_window() -> int | None:
+    """
+    Return the user's configured Claude Code auto-compact window, if any.
+
+    Read the ``env`` object of ``~/.claude/settings.json`` first — Claude
+    Code applies those over the environment it inherits — then
+    ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` in the runner's environment.
+
+    :returns: The configured positive token count, or ``None`` when unset,
+        unreadable, or malformed (fail-soft, never blocks launch).
+    """
+    candidates: list[object] = []
+    try:
+        parsed = json.loads(_USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        settings_env = parsed.get("env")
+        if isinstance(settings_env, dict):
+            candidates.append(settings_env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"))
+    candidates.append(os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"))
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip().isdigit():
+            continue
+        try:
+            value = int(candidate.strip())
+        except ValueError:  # ``isdigit`` accepts digit chars ``int`` rejects
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _usage_from_transcript_entry(entry: _JsonObject) -> dict[str, int] | None:
     """
     Extract token-usage from one Claude assistant transcript entry.

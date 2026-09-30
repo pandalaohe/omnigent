@@ -87,6 +87,21 @@ def _clear_spawn_tool_use_id_cache() -> Iterator[None]:
     forwarder._SPAWN_TOOL_USE_ID_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_auto_compact_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep ambient auto-compaction settings out of the suite.
+
+    The forwarder posts the user's ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` (from
+    the real ``~/.claude/settings.json`` or the shell) as a usage field, so a
+    developer who set it would add a POST to every exact-request assertion.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: None)
+
+
 def test_provider_usage_limits_post_only_on_change_or_refresh() -> None:
     baseline: dict[str, object] = {
         "provider": "Claude",
@@ -14269,6 +14284,106 @@ async def test_forward_available_items_posts_usage_once_after_items_on_normal_ba
     )
     usage_index = next(i for i, r in enumerate(requests) if r["type"] == "external_session_usage")
     assert item_index < usage_index
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_posts_auto_compact_window_once_and_on_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The user's auto-compaction window posts on first sight and on change.
+
+    The window comes from the user's settings / environment, not the
+    statusLine gauge, so it rides the usage post without re-posting a steady
+    value every poll.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "u1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    # No statusLine state, so the auto-compaction window is the only value
+    # that can trigger the usage post — each payload proves the trigger.
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _bridge: None)
+    window = {"value": 400_000}
+    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: window["value"])
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for value in (400_000, 400_000, 300_000, 300_000):
+            window["value"] = value
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_auto_compact",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+    usage_posts = [r for r in requests if r["type"] == "external_session_usage"]
+    assert [post["data"] for post in usage_posts] == [
+        {"auto_compact_token_limit": 400_000},
+        {"auto_compact_token_limit": 300_000},
+    ]
+    assert dedupe.auto_compact_token_limit == 300_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limit,expected_data",
+    [
+        pytest.param(
+            200_000,
+            {"context_tokens": 10, "auto_compact_token_limit": 200_000},
+            id="set",
+        ),
+        pytest.param(None, {"context_tokens": 10}, id="unset"),
+    ],
+)
+async def test_post_session_usage_auto_compact_window_key_is_conditional(
+    limit: int | None,
+    expected_data: dict[str, int],
+) -> None:
+    """An unset limit must send no key, leaving the persisted value untouched."""
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://omnigent.test"
+    ) as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"context_tokens": 10},
+            auto_compact_token_limit=limit,
+        )
+
+    assert requests[0]["data"] == expected_data
 
 
 @pytest.mark.asyncio

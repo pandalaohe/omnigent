@@ -37,6 +37,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    ConversationItem,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -151,6 +152,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _grant_default_public,
     _invalidate_runner_backed_snapshot_state,
+    _latest_assistant_tail,
     _latest_message_preview,
     _member_hosts_from_library_agent,
     _member_snapshot_labels,
@@ -1574,9 +1576,11 @@ def register_core_routes(
             server.
         :param include_preview: When ``True``, fill
             ``last_message_preview`` with an excerpt of the session's
-            newest visible message (one batched items read). The web
-            chat never sets it; orchestrating callers use it to peek at
-            a peer session without fetching the transcript.
+            newest visible message and ``last_message_tail`` with the
+            end of its newest assistant message (one batched items
+            read). The web chat never sets it; orchestrating callers use
+            it to peek at a peer session without fetching the
+            transcript.
         :returns: The matching :class:`SessionResponse`.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -1608,8 +1612,25 @@ def register_core_routes(
             request=request,
         )
         if include_preview:
-            previews = await _message_previews_for([session_id])
-            snapshot.last_message_preview = previews.get(session_id)
+            latest_items = (await _latest_message_items_for([session_id])).get(session_id, [])
+            snapshot.last_message_preview = _latest_message_preview(latest_items)
+            tail = _latest_assistant_tail(latest_items)
+            if tail is None and len(latest_items) >= 10:
+                # Ten newer user/meta turns can fill the 10-newest window and
+                # hide the latest assistant reply; one deeper read recovers it.
+                try:
+                    deeper = await asyncio.to_thread(
+                        conversation_store.list_items,
+                        session_id,
+                        type="message",
+                        order="desc",
+                        limit=100,
+                    )
+                except Exception:
+                    deeper = None
+                if deeper is not None:
+                    tail = _latest_assistant_tail(deeper.data)
+            snapshot.last_message_tail = tail
         return snapshot
 
     @router.get(
@@ -2107,20 +2128,23 @@ def register_core_routes(
             return {}
         return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
 
-    async def _message_previews_for(
+    async def _latest_message_items_for(
         conv_ids: list[str],
-    ) -> dict[str, str | None]:
+    ) -> dict[str, list[ConversationItem]]:
         """
-        Batch-fetch one message preview excerpt per session.
+        Batch-fetch newest-first message items per session.
 
         One batched ``list_latest_message_items_for_conversations`` read
-        serves the whole page; previews are computed with the shared
-        ``_latest_message_preview`` excerpt function. Sessions without
-        visible messages map to ``None``.
+        serves the whole page (per-row ``list_items`` would be N+1
+        traffic); stores without that method fall back to one
+        ``list_items`` read per session. Shared by the preview and tail
+        excerpt computations.
 
         :param conv_ids: Session ids on the current page,
             e.g. ``["conv_abc123"]``.
-        :returns: Map from session id to its preview excerpt.
+        :returns: Map from session id to its newest-first message items,
+            ``[]`` where a per-session read failed and ``{}`` when the
+            batch read fails outright.
         """
         if not conv_ids:
             return {}
@@ -2131,7 +2155,7 @@ def register_core_routes(
                 10,
             )
         except (AttributeError, TypeError):
-            per_row: dict[str, str | None] = {}
+            per_row: dict[str, list[ConversationItem]] = {}
             for conv_id in conv_ids:
                 try:
                     items = await asyncio.to_thread(
@@ -2142,13 +2166,33 @@ def register_core_routes(
                         limit=10,
                     )
                 except Exception:
-                    per_row[conv_id] = None
+                    per_row[conv_id] = []
                     continue
-                per_row[conv_id] = _latest_message_preview(items.data)
+                per_row[conv_id] = items.data
             return per_row
         except Exception:
             return {}
-        return {conv_id: _latest_message_preview(batched.get(conv_id, [])) for conv_id in conv_ids}
+        return {conv_id: batched.get(conv_id, []) for conv_id in conv_ids}
+
+    async def _message_previews_for(
+        conv_ids: list[str],
+    ) -> dict[str, str | None]:
+        """
+        Batch-fetch one message preview excerpt per session.
+
+        Previews are computed with the shared ``_latest_message_preview``
+        excerpt function over the newest-first items from
+        ``_latest_message_items_for``. Sessions without visible
+        messages map to ``None``.
+
+        :param conv_ids: Session ids on the current page,
+            e.g. ``["conv_abc123"]``.
+        :returns: Map from session id to its preview excerpt.
+        """
+        latest_items = await _latest_message_items_for(conv_ids)
+        return {
+            conv_id: _latest_message_preview(latest_items.get(conv_id, [])) for conv_id in conv_ids
+        }
 
     # ── WS /sessions/updates ────────────────────────────────────
 

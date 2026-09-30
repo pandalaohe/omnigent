@@ -146,6 +146,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _APPROVAL_TYPE,
+    _ASSISTANT_TAIL_LIMIT,
     _CHILD_PREVIEW_LIMIT,
     _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
     _CLAUDE_NATIVE_EDIT_TOOLS,
@@ -11318,6 +11319,47 @@ def _latest_message_preview(
         # Trim to one char less than the limit so the trailing ellipsis
         # keeps the field at ``limit_chars`` total.
         return collapsed[: max(0, limit_chars - 1)].rstrip() + "…"
+    return None
+
+
+def _latest_assistant_tail(
+    items: list[ConversationItem],
+    limit_chars: int = _ASSISTANT_TAIL_LIMIT,
+) -> str | None:
+    """
+    Return the end of the newest assistant message from newest-first items.
+
+    Powers ``sys_session_get_info``'s supervision excerpt: a caller
+    reading many child sessions sees how each newest assistant reply
+    concluded without fetching the transcript. Unlike
+    :func:`_latest_message_preview`, line breaks are kept so the tail
+    stays readable. Hidden meta messages carry durable runner context
+    and must never be shown.
+
+    :param items: Newest-first message items for one conversation.
+    :param limit_chars: Max excerpt length in characters, e.g. ``400``.
+    :returns: The stripped message tail, prefixed with ``"…"`` when
+        truncated, or ``None`` when no visible assistant message carries
+        text.
+    """
+    for item in items:
+        if not isinstance(item.data, MessageData) or item.data.is_meta:
+            continue
+        if item.data.role != "assistant":
+            continue
+        parts: list[str] = []
+        for block in item.data.content:
+            text = block.get("text")
+            if block.get("type") == "output_text" and isinstance(text, str):
+                parts.append(text)
+        tail = "\n".join(parts).strip()
+        if not tail:
+            continue
+        if len(tail) <= limit_chars:
+            return tail
+        # Trim to one char less than the limit so the leading ellipsis
+        # keeps the field at ``limit_chars`` total.
+        return "…" + tail[-(limit_chars - 1) :].lstrip()
     return None
 
 
