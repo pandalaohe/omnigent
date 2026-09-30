@@ -23,6 +23,7 @@ import io
 import itertools
 import json
 import tarfile
+import time
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -178,6 +179,49 @@ async def test_child_sessions_404_for_nonexistent_session(
     """Route returns 404 when the parent session does not exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/child_sessions")
     assert resp.status_code == 404
+
+
+async def test_child_sessions_expose_warm_state_from_the_keep_warm_label(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The child list carries the keep-warm pill derived from the label."""
+    parent = await _create_parent_session(client, "warm-state-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    now = int(time.time())
+    warm = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:warm",
+        harness_override="claude-native",
+    )
+    cold = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:cold",
+        harness_override="claude-native",
+    )
+    unlabeled = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:unlabeled",
+        harness_override="claude-native",
+    )
+    conv_store.set_labels(
+        warm.id,
+        {"omnigent.keep_warm": json.dumps({"s": "w", "t": now - 100, "w": now + 3600})},
+    )
+    conv_store.set_labels(
+        cold.id,
+        {"omnigent.keep_warm": json.dumps({"s": "p", "why": "fail", "t": now - 100})},
+    )
+
+    resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions?limit=100")
+    assert resp.status_code == 200, resp.text
+    by_id = {row["id"]: row for row in resp.json()["data"]}
+    assert by_id[warm.id]["warm_state"] == "warm"
+    assert by_id[cold.id]["warm_state"] == "cold"
+    assert by_id[unlabeled.id]["warm_state"] is None
 
 
 async def test_replayed_unverified_native_child_is_not_busy_and_live_activity_restores_it(

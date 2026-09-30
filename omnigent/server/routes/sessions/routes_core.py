@@ -205,6 +205,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _spawn_archive_fence,
     _spawn_archive_stop,
     _spawn_archive_unfence,
     _validate_session_model_selection,
@@ -3237,10 +3238,32 @@ def register_core_routes(
 
         assert conv is not None
         close_on_archive = False
+        archive_stop_when_idle = False
         if body.archived is True and not conv.archived:
             # Resolve the Host policy before the row mutation so the archive
             # transition and its close request commit atomically below.
             close_on_archive = True
+            # A target with a parent or sub-sessions also defers the teardown:
+            # its tree may be mid-turn (D5 / D4). Any retained child row
+            # counts — the teardown walks the same genealogy.
+            archive_stop_when_idle = body.stop_when_idle or conv.parent_conversation_id is not None
+            if not archive_stop_when_idle:
+                try:
+                    children = (
+                        await asyncio.to_thread(
+                            conversation_store.list_child_conversation_ids_by_parent,
+                            [session_id],
+                        )
+                    ).get(session_id)
+                except Exception:  # a failed lookup counts as no children.
+                    _logger.warning(
+                        "Could not list children of %s for the archive deferral; "
+                        "treating it as childless",
+                        session_id,
+                        exc_info=True,
+                    )
+                else:
+                    archive_stop_when_idle = bool(children)
             if conv.host_id is not None:
                 host_store = getattr(request.app.state, "host_store", None)
                 if host_store is not None:
@@ -3281,9 +3304,7 @@ def register_core_routes(
         # conditionally so fakes with explicit signatures see only the kwargs
         # they define.
         archive_stop_when_idle_kwargs: dict[str, Any] = (
-            {"archive_stop_when_idle": True}
-            if body.archived is True and body.stop_when_idle
-            else {}
+            {"archive_stop_when_idle": True} if archive_stop_when_idle else {}
         )
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
@@ -3324,6 +3345,16 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
+            if archive_stop_when_idle:
+                # D5 / D4: a deferred teardown leaves the runner's start gate
+                # open, so fence new turns on the whole tree now — whether or
+                # not this host stops runners on archive.
+                _spawn_archive_fence(
+                    session_id,
+                    updated.archive_revision,
+                    conversation_store,
+                    runner_router,
+                )
             # Defer the stop now that the flag is committed, so a request
             # rejected after this point can't leave a live runner on a session
             # that ends up archived. Detached, not awaited: the response must

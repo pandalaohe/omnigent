@@ -173,6 +173,13 @@ class CollabSettings:
     :param duplicate_window_s: Window for suppressing duplicate payloads.
     :param undelivered_ttl_s: Lifetime of undelivered messages in seconds.
     :param flow_timer_enabled: Whether collaboration flow timers are on.
+    :param keep_warm_enabled: Whether idle active-zone children are kept
+        warm. Off by default.
+    :param keep_warm_claude_interval_s: Keep-warm interval for Claude Code
+        children, in seconds.
+    :param keep_warm_codex_interval_s: Keep-warm interval for Codex children,
+        in seconds.
+    :param keep_warm_max_s: Longest keep-warm run per child, in seconds.
     """
 
     enabled: bool = True
@@ -186,6 +193,10 @@ class CollabSettings:
     duplicate_window_s: int = 600
     undelivered_ttl_s: int = 86400
     flow_timer_enabled: bool = True
+    keep_warm_enabled: bool = False
+    keep_warm_claude_interval_s: int = 3300
+    keep_warm_codex_interval_s: int = 1500
+    keep_warm_max_s: int = 28800
 
 
 _CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
@@ -193,7 +204,7 @@ _CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
 # Stored JSON keys are camelCase because the web client writes them. The third
 # entry names how the stored value is read: ``bool`` takes a JSON boolean and
 # ``positive_int`` an int of at least 1 (never a bool). One table keeps all
-# eleven mappings in a single place.
+# fifteen mappings in a single place.
 _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("enabled", "enabled", "bool"),
     ("openRateCount", "open_rate_count", "positive_int"),
@@ -206,7 +217,36 @@ _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("duplicateWindowSeconds", "duplicate_window_s", "positive_int"),
     ("undeliveredTtlSeconds", "undelivered_ttl_s", "positive_int"),
     ("flowTimerEnabled", "flow_timer_enabled", "bool"),
+    ("childKeepWarmEnabled", "keep_warm_enabled", "bool"),
+    ("childKeepWarmClaudeIntervalSeconds", "keep_warm_claude_interval_s", "positive_int"),
+    ("childKeepWarmCodexIntervalSeconds", "keep_warm_codex_interval_s", "positive_int"),
+    ("childKeepWarmMaxSeconds", "keep_warm_max_s", "positive_int"),
 )
+
+# Keep-warm windows as stored (seconds). The web enforces the same ranges, but
+# the reader takes any positive int, so the sweeper works on clamped values.
+KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_S = (300, 3540)
+KEEP_WARM_CODEX_INTERVAL_BOUNDS_S = (300, 1740)
+KEEP_WARM_MAX_BOUNDS_S = (3600, 172800)
+
+
+def clamp_keep_warm(settings: CollabSettings) -> tuple[int, int, int]:
+    """
+    Clamp the keep-warm windows to their supported bounds, in seconds.
+
+    :param settings: Resolved collaboration settings.
+    :returns: ``(claude_interval_s, codex_interval_s, max_s)``.
+    """
+
+    def _clamped(value: int, bounds: tuple[int, int]) -> int:
+        low, high = bounds
+        return min(max(value, low), high)
+
+    return (
+        _clamped(settings.keep_warm_claude_interval_s, KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_S),
+        _clamped(settings.keep_warm_codex_interval_s, KEEP_WARM_CODEX_INTERVAL_BOUNDS_S),
+        _clamped(settings.keep_warm_max_s, KEEP_WARM_MAX_BOUNDS_S),
+    )
 
 
 def _parse_collab_value(kind: _CollabFieldKind, raw: Any) -> Any | None:

@@ -170,9 +170,11 @@ async def test_condition_met_wakes_once_with_the_matching_result(
     assert summary["ticks"] == 3
     assert summary["results"][0]["output"] == '{"status": "idle"}'
     assert server.wakes[0]["data"]["is_meta"] is True
-    # No model is involved: the only server traffic is settings, policy and one wake.
+    # No model is involved: the only server traffic is settings, the archive
+    # admission check, policy and one wake.
     assert {path.rsplit("/", 1)[-1] for _m, path in server.requests} == {
         "collab-settings",
+        _SESSION,
         "evaluate",
         "events",
     }
@@ -418,6 +420,35 @@ async def test_policy_denial_stops_before_the_step_and_wakes(
     summary = server.wake_summary()
     assert summary["reason"] == "policy_denied"
     assert summary["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_self_archived_session_ends_the_run_before_its_next_tick(
+    server: _FakeServer, scripted: list[str]
+) -> None:
+    """A snapshot that shows the session archived ends the run with no wake."""
+    from omnigent.runner import app as runner_app
+
+    scripted.append("x")
+    async with _client(server) as client:
+        started = await _start(client, {"steps": _STEP, "every_s": 0.1, "times": 50})
+        run = flows._session_flows[_SESSION][started["flow_id"]]
+        for _ in range(100):
+            if run.ticks >= 1:
+                break
+            await asyncio.sleep(0.01)
+        # The next admission check sees the session archived: end, no wake.
+        server.sessions[_SESSION]["archived"] = True
+        for _ in range(100):
+            if not flows._session_flows.get(_SESSION):
+                break
+            await asyncio.sleep(0.02)
+    assert run.reason == "archived"
+    assert run.detail == "the session was archived"
+    assert run.ticks == 1
+    assert server.wakes == []
+    assert flows._session_flows == {}
+    assert started["flow_id"] not in runner_app._session_timers.get(_SESSION, {})
 
 
 @pytest.mark.asyncio

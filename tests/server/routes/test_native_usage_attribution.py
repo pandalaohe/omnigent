@@ -232,6 +232,59 @@ def _conversation_point_reads(statements: list[str]) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_flush_stores_the_last_cache_label_from_forwarder_fields(db_uri: str) -> None:
+    """The claude-native forwarder's last-call split reaches one label.
+
+    ``omnigent.last_cache`` is the keep-warm sweeper's cache-miss probe:
+    ``"<read>,<creation>,<observed_at>"``. The three fields are optional —
+    an older forwarder omits them — and a malformed value must be ignored
+    rather than rejecting the whole usage post.
+    """
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="last-cache", agent_id=_AGENT_ID)
+
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage",
+            data={
+                "context_tokens": 40,
+                "last_cache_read_input_tokens": 30,
+                "last_cache_creation_input_tokens": 5,
+                "last_usage_observed_at": 1727000000,
+            },
+        ),
+        store,
+    )
+    stored = store.get_conversation(conv.id)
+    assert stored is not None
+    assert stored.labels["omnigent.last_cache"] == "30,5,1727000000"
+
+    # Malformed fields are dropped, not fatal; the label keeps its old value.
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage",
+            data={
+                "context_tokens": 41,
+                "last_cache_read_input_tokens": -1,
+                "last_cache_creation_input_tokens": "5",
+                "last_usage_observed_at": 1.5,
+            },
+        ),
+        store,
+    )
+    stored = store.get_conversation(conv.id)
+    assert stored is not None
+    assert stored.labels["omnigent.last_cache"] == "30,5,1727000000"
+
+
+@pytest.mark.asyncio
 async def test_flush_with_stale_row_keeps_monotonic_clamp(db_uri: str) -> None:
     """A stale caller-held row must not weaken the forged-low-report clamp.
 

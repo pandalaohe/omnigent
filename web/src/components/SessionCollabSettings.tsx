@@ -32,6 +32,13 @@ const HINTS = {
   duplicate: "An identical message to the same session inside this window is dropped.",
   undelivered: "A queued or held message not delivered within this time expires.",
   flowTimer: "Lets agents run timed flows and timed wake-ups.",
+  keepWarm:
+    "Sends idle Claude Code and Codex children in the active zone a short quiet turn so their prompt cache stays warm.",
+  keepWarmClaude:
+    "A Claude Code child takes a quiet keep-warm turn after this long without a real turn.",
+  keepWarmCodex: "A Codex child takes a quiet keep-warm turn after this long without a real turn.",
+  keepWarmMax:
+    "Warming stops this long after the child's last real turn; its next real turn restarts the clock.",
 };
 
 interface NumericFieldProps {
@@ -291,6 +298,61 @@ export function SessionCollabSettings() {
             className="shrink-0"
           />
         </SettingRow>
+      </div>
+
+      <h2 className="mt-3 text-ui font-medium">Keeping children warm</h2>
+      <div className="rounded-xl border border-border bg-card p-4">
+        <SettingRow label="Keep idle children warm" hint={HINTS.keepWarm}>
+          <Switch
+            aria-label="Keep idle children warm"
+            checked={preferences.childKeepWarmEnabled}
+            disabled={disabled}
+            onCheckedChange={(childKeepWarmEnabled) => update({ childKeepWarmEnabled })}
+            className="shrink-0"
+          />
+        </SettingRow>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <SettingRow label="Claude keep-warm interval" hint={HINTS.keepWarmClaude}>
+            <NumericField
+              ariaLabel="Claude keep-warm interval in minutes"
+              value={preferences.childKeepWarmClaudeIntervalSeconds / 60}
+              min={SESSION_COLLAB_BOUNDS.childKeepWarmClaudeIntervalSeconds.min / 60}
+              max={SESSION_COLLAB_BOUNDS.childKeepWarmClaudeIntervalSeconds.max / 60}
+              disabled={disabled}
+              onCommit={(minutes) => update({ childKeepWarmClaudeIntervalSeconds: minutes * 60 })}
+            />
+            <span className="text-sm text-muted-foreground">min</span>
+          </SettingRow>
+        </div>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <SettingRow label="Codex keep-warm interval" hint={HINTS.keepWarmCodex}>
+            <NumericField
+              ariaLabel="Codex keep-warm interval in minutes"
+              value={preferences.childKeepWarmCodexIntervalSeconds / 60}
+              min={SESSION_COLLAB_BOUNDS.childKeepWarmCodexIntervalSeconds.min / 60}
+              max={SESSION_COLLAB_BOUNDS.childKeepWarmCodexIntervalSeconds.max / 60}
+              disabled={disabled}
+              onCommit={(minutes) => update({ childKeepWarmCodexIntervalSeconds: minutes * 60 })}
+            />
+            <span className="text-sm text-muted-foreground">min</span>
+          </SettingRow>
+        </div>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <SettingRow label="Longest keep-warm run" hint={HINTS.keepWarmMax}>
+            <NumericField
+              ariaLabel="Longest keep-warm run in hours"
+              value={preferences.childKeepWarmMaxSeconds / 3600}
+              min={SESSION_COLLAB_BOUNDS.childKeepWarmMaxSeconds.min / 3600}
+              max={SESSION_COLLAB_BOUNDS.childKeepWarmMaxSeconds.max / 3600}
+              disabled={disabled}
+              onCommit={(hours) => update({ childKeepWarmMaxSeconds: hours * 3600 })}
+            />
+            <span className="text-sm text-muted-foreground">hours</span>
+          </SettingRow>
+        </div>
       </div>
 
       <h2 className="mt-3 text-ui font-medium">Host colours</h2>

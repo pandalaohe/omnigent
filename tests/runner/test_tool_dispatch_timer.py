@@ -194,3 +194,82 @@ async def test_timer_delivery_logs_http_error_status(caplog: pytest.LogCaptureFi
         and result["timer_id"] in record.getMessage()
         for record in caplog.records
     )
+
+
+class _SessionArchiveResponder:
+    """Mock transport: settings read plus a session snapshot and fire POSTs."""
+
+    def __init__(self, *, archived: bool) -> None:
+        self.archived = archived
+        self.posts = 0
+        self.session_gets = 0
+        self.get_seen = asyncio.Event()
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/collab-settings"):
+            return httpx.Response(200, json={"enabled": True, "flow_timer_enabled": True})
+        if request.method == "GET" and path == "/v1/sessions/conv_timer":
+            self.session_gets += 1
+            self.get_seen.set()
+            return httpx.Response(200, json={"id": "conv_timer", "archived": self.archived})
+        if request.method == "POST" and path.endswith("/events"):
+            self.posts += 1
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+
+@pytest.mark.asyncio
+async def test_repeating_timer_stops_before_posting_when_self_archived() -> None:
+    """A self-archived snapshot ends the repeating timer without a fire POST."""
+    from omnigent.runner import app as runner_app
+
+    responder = _SessionArchiveResponder(archived=True)
+    transport = httpx.MockTransport(responder)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as server_client:
+        output = await execute_tool(
+            tool_name="sys_timer_set",
+            arguments=json.dumps({"seconds": 0.05, "repeat": True}),
+            conversation_id="conv_timer",
+            server_client=server_client,
+        )
+        result = json.loads(output)
+        assert result["status"] == "scheduled"
+        await asyncio.wait_for(responder.get_seen.wait(), timeout=1.0)
+        for _ in range(100):
+            if not runner_app._session_timers.get("conv_timer"):
+                break
+            await asyncio.sleep(0.02)
+
+    assert responder.posts == 0
+    assert responder.session_gets == 1
+    assert runner_app._session_timers.get("conv_timer", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_repeating_timer_keeps_its_schedule_when_only_an_ancestor_archived() -> None:
+    """An ancestor-only archive leaves the child's own schedule in place."""
+    from omnigent.runner import app as runner_app
+
+    responder = _SessionArchiveResponder(archived=False)
+    transport = httpx.MockTransport(responder)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as server_client:
+        output = await execute_tool(
+            tool_name="sys_timer_set",
+            arguments=json.dumps({"seconds": 0.05, "repeat": True}),
+            conversation_id="conv_timer",
+            server_client=server_client,
+        )
+        result = json.loads(output)
+        for _ in range(200):
+            if responder.posts >= 2:
+                break
+            await asyncio.sleep(0.02)
+        running = result["timer_id"] in runner_app._session_timers.get("conv_timer", {})
+        runner_app.cancel_timer("conv_timer", result["timer_id"])
+
+    assert responder.posts >= 2
+    assert responder.session_gets >= 2
+    assert running is True

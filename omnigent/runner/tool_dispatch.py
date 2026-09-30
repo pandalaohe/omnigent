@@ -6247,6 +6247,11 @@ async def _timer_loop(
                 server_client, conversation_id
             ):
                 break
+            # D5: the session itself archived ends the schedule before its
+            # next wake; the finally below drops the registry entry. An
+            # ancestor-only archive keeps the schedule.
+            if await flows.session_self_archived(server_client, conversation_id):
+                break
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
@@ -8313,9 +8318,10 @@ async def _session_archive_via_rest(
     access, applies the 8-second undo window and the Host's stop-on-archive
     policy. A target that is the caller or its ancestor is archived with
     ``stop_when_idle`` so the teardown waits for the caller's turn to end;
-    the server applies it only on a real archive transition, so the intent is
-    sent on every archive PATCH rather than decided from a snapshot that a
-    concurrent unarchive could make stale.
+    the server also forces that deferral for any target with a parent or
+    sub-sessions. It applies the flag only on a real archive transition, so
+    the intent is sent on every archive PATCH rather than decided from a
+    snapshot that a concurrent unarchive could make stale.
 
     :param tool_name: ``"sys_session_archive"`` or ``"sys_session_unarchive"``.
     :param args: Parsed tool arguments; ``session_id`` (optional for archive,
@@ -8357,11 +8363,14 @@ async def _session_archive_via_rest(
     result: _JsonObject = {"archived": archive, "session_id": target_id}
     if archive:
         # The Host policy is applied server-side and not echoed back, so the
-        # stop is stated as conditional rather than promised.
+        # stop is stated as conditional rather than promised. A target the
+        # caller did not mark still defers server-side when it has a parent
+        # or sub-sessions, so both timings are named.
         result["runner_stop"] = (
             "if its host stops runners on archive: after your current turn ends"
             if stop_when_idle
-            else "if its host stops runners on archive: after the 8-second undo window"
+            else "if its host stops runners on archive: after the 8-second undo window, "
+            "or — if it has a parent or sub-sessions — once its current turn has ended"
         )
         result["undo"] = "sys_session_unarchive, or Unarchive in the web Archive list"
     return json.dumps(result)

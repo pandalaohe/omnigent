@@ -1246,6 +1246,22 @@
             "format": "int64",
             "title": "Updated At",
             "type": "integer"
+          },
+          "warm_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "warm",
+                  "cold"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the child's provider prompt cache is being kept warm (`\"warm\"` / `\"cold\"`), read from its `omnigent.keep_warm` label without a settings read. `None` when the child has no label, is archived, or runs an unsupported harness.",
+            "title": "Warm State"
           }
         },
         "required": [
@@ -10147,7 +10163,7 @@
           },
           "stop_when_idle": {
             "default": false,
-            "description": "Only meaningful alongside `archived: true`. When `True` the archive teardown, after the undo window, also waits (bounded) until the session tree leaves the running state. Set by an agent archiving its own session or an ancestor, whose turn would otherwise be cut. Default `False` keeps the web archive's timing.",
+            "description": "Only meaningful alongside `archived: true`. When `True` the archive teardown, after the undo window, also waits (bounded) until the session tree leaves the running state. The server also applies it on its own to any archive whose target has a parent or at least one child, so a whole tree finishes its admitted turns; the tool still sends it for the caller or an ancestor, whose turn would otherwise be cut. Default `False` keeps the timing of a parentless, childless archive.",
             "title": "Stop When Idle",
             "type": "boolean"
           },

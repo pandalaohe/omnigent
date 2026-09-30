@@ -2009,9 +2009,17 @@ def create_app(
         if peer_sweeper is not None:
             await peer_sweeper.start(app_inst)
 
+        child_keep_warm = getattr(app_inst.state, "child_keep_warm", None)
+        if child_keep_warm is not None:
+            await child_keep_warm.start(app_inst)
+
         try:
             yield
         finally:
+            # Keep-warm stops first: its notices post through the peer
+            # sweeper, so that sweeper must still be alive while it drains.
+            if child_keep_warm is not None:
+                await child_keep_warm.shutdown()
             if peer_sweeper is not None:
                 await peer_sweeper.shutdown()
             if managed_sandbox_reaper is not None:

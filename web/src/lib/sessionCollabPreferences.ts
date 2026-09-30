@@ -17,6 +17,10 @@ export interface SessionCollabPreferences {
   duplicateWindowSeconds: number;
   undeliveredTtlSeconds: number;
   flowTimerEnabled: boolean;
+  childKeepWarmEnabled: boolean;
+  childKeepWarmClaudeIntervalSeconds: number;
+  childKeepWarmCodexIntervalSeconds: number;
+  childKeepWarmMaxSeconds: number;
 }
 
 export type SessionCollabNumericField =
@@ -28,7 +32,10 @@ export type SessionCollabNumericField =
   | "senderRateCount"
   | "senderRateWindowSeconds"
   | "duplicateWindowSeconds"
-  | "undeliveredTtlSeconds";
+  | "undeliveredTtlSeconds"
+  | "childKeepWarmClaudeIntervalSeconds"
+  | "childKeepWarmCodexIntervalSeconds"
+  | "childKeepWarmMaxSeconds";
 
 /** Accepted range per numeric field, in the stored unit (seconds for windows). */
 export const SESSION_COLLAB_BOUNDS: Record<
@@ -44,6 +51,9 @@ export const SESSION_COLLAB_BOUNDS: Record<
   senderRateWindowSeconds: { min: 60, max: 86400 },
   duplicateWindowSeconds: { min: 1, max: 86400 },
   undeliveredTtlSeconds: { min: 60, max: 604800 },
+  childKeepWarmClaudeIntervalSeconds: { min: 300, max: 3540 },
+  childKeepWarmCodexIntervalSeconds: { min: 300, max: 1740 },
+  childKeepWarmMaxSeconds: { min: 3600, max: 172800 },
 };
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
@@ -58,6 +68,10 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   duplicateWindowSeconds: 600,
   undeliveredTtlSeconds: 86400,
   flowTimerEnabled: true,
+  childKeepWarmEnabled: false,
+  childKeepWarmClaudeIntervalSeconds: 3300,
+  childKeepWarmCodexIntervalSeconds: 1500,
+  childKeepWarmMaxSeconds: 28800,
 };
 
 function normalizeInteger(value: unknown, field: SessionCollabNumericField): number {
@@ -93,6 +107,19 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
       raw.flowTimerEnabled,
       SESSION_COLLAB_DEFAULTS.flowTimerEnabled,
     ),
+    childKeepWarmEnabled: normalizeBoolean(
+      raw.childKeepWarmEnabled,
+      SESSION_COLLAB_DEFAULTS.childKeepWarmEnabled,
+    ),
+    childKeepWarmClaudeIntervalSeconds: normalizeInteger(
+      raw.childKeepWarmClaudeIntervalSeconds,
+      "childKeepWarmClaudeIntervalSeconds",
+    ),
+    childKeepWarmCodexIntervalSeconds: normalizeInteger(
+      raw.childKeepWarmCodexIntervalSeconds,
+      "childKeepWarmCodexIntervalSeconds",
+    ),
+    childKeepWarmMaxSeconds: normalizeInteger(raw.childKeepWarmMaxSeconds, "childKeepWarmMaxSeconds"),
   };
 }
 

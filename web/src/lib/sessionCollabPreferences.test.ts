@@ -18,9 +18,43 @@ afterEach(() => {
 describe("session collab preferences", () => {
   it("defaults to the server defaults with nothing stored", () => {
     expect(SESSION_COLLAB_DEFAULTS.openRateCount).toBe(10);
+    expect(SESSION_COLLAB_DEFAULTS.childKeepWarmEnabled).toBe(false);
+    expect(SESSION_COLLAB_DEFAULTS.childKeepWarmClaudeIntervalSeconds).toBe(3300);
+    expect(SESSION_COLLAB_DEFAULTS.childKeepWarmCodexIntervalSeconds).toBe(1500);
+    expect(SESSION_COLLAB_DEFAULTS.childKeepWarmMaxSeconds).toBe(28800);
     expect(readSessionCollabPreferences()).toEqual(SESSION_COLLAB_DEFAULTS);
     expect(readSessionCollabPreferences().openRateCount).toBe(10);
     expect(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY)).toBeNull();
+  });
+
+  it("keeps the keep-warm fields in range and drops out-of-range ones", () => {
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        childKeepWarmEnabled: true,
+        childKeepWarmClaudeIntervalSeconds: 3000,
+        childKeepWarmCodexIntervalSeconds: 1740,
+        childKeepWarmMaxSeconds: 3600,
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual({
+      ...SESSION_COLLAB_DEFAULTS,
+      childKeepWarmEnabled: true,
+      childKeepWarmClaudeIntervalSeconds: 3000,
+      childKeepWarmCodexIntervalSeconds: 1740,
+      childKeepWarmMaxSeconds: 3600,
+    });
+
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        childKeepWarmEnabled: "yes",
+        childKeepWarmClaudeIntervalSeconds: 99999,
+        childKeepWarmCodexIntervalSeconds: 299,
+        childKeepWarmMaxSeconds: 172801,
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual(SESSION_COLLAB_DEFAULTS);
   });
 
   it("treats a non-object payload as all-defaults", () => {

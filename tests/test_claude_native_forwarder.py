@@ -11427,6 +11427,65 @@ def test_usage_from_status_state_omits_cost_when_absent() -> None:
     assert "cumulative_cost_usd" not in result
 
 
+def test_usage_from_status_state_carries_last_call_cache_split() -> None:
+    """
+    The statusLine's cache split rides along as ``last_cache_*`` fields.
+
+    The keep-warm sweeper ties a cache reading to a ping turn through these
+    fields; both keys must be present on every post, 0 when the statusLine
+    reported no cache activity.
+    """
+    state = {
+        "context_window_size": 1_000_000,
+        "current_usage": {
+            "input_tokens": 6,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 400,
+            "cache_creation_input_tokens": 30,
+        },
+    }
+    result = forwarder._usage_from_status_state(state)
+    assert result is not None
+    assert result["last_cache_read_input_tokens"] == 400
+    assert result["last_cache_creation_input_tokens"] == 30
+
+    bare = forwarder._usage_from_status_state(
+        {"context_window_size": 1_000_000, "current_usage": {"input_tokens": 6}}
+    )
+    assert bare is not None
+    assert bare["last_cache_read_input_tokens"] == 0
+    assert bare["last_cache_creation_input_tokens"] == 0
+
+
+def test_usage_with_last_cache_split_rewrites_transcript_cache_keys() -> None:
+    """
+    The transcript fallback's conditional cache keys become the ``last_*`` pair.
+
+    :func:`bridge._usage_from_transcript_entry` only emits the raw
+    ``cache_*`` keys when nonzero, so the forwarder must fill both
+    ``last_*`` fields and drop the raw spelling.
+    """
+    mapped = forwarder._usage_with_last_cache_split(
+        {
+            "context_tokens": 40,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 5,
+        }
+    )
+    assert mapped["last_cache_read_input_tokens"] == 30
+    assert mapped["last_cache_creation_input_tokens"] == 5
+    assert "cache_read_input_tokens" not in mapped
+    assert "cache_creation_input_tokens" not in mapped
+
+    bare = forwarder._usage_with_last_cache_split(
+        {"context_tokens": 10, "input_tokens": 10, "output_tokens": 2}
+    )
+    assert bare["last_cache_read_input_tokens"] == 0
+    assert bare["last_cache_creation_input_tokens"] == 0
+
+
 @pytest.fixture
 def otel_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     """
@@ -14196,6 +14255,173 @@ async def test_forward_available_items_posts_usage_once_after_items_on_normal_ba
     )
     usage_index = next(i for i, r in enumerate(requests) if r["type"] == "external_session_usage")
     assert item_index < usage_index
+
+
+@pytest.mark.asyncio
+async def test_usage_post_stamps_last_usage_observed_at_and_keeps_it_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    One cache reading carries one observation stamp, retries included.
+
+    The keep-warm sweeper ties a Claude reading to its ping turn through
+    ``last_usage_observed_at``. An unchanged usage must not re-post every
+    poll, a changed one stamps once, and a failed POST's retry must keep
+    the original stamp instead of minting a fresh one each poll.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "u1",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    status_state: dict[str, object] = {
+        "context_window_size": 150_000,
+        "current_usage": {
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 4,
+            "cache_creation_input_tokens": 2,
+        },
+    }
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _bridge: status_state)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(forwarder.time, "time", lambda: clock["now"])
+
+    fail_usage = {"on": False}
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if body["type"] == "external_session_usage" and fail_usage["on"]:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    dedupe = forwarder._ForwardDedupeState()
+
+    async def _poll(client: httpx.AsyncClient) -> forwarder.TranscriptForwardState:
+        return await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_keep_warm",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Poll 1 at t=1000: the first usage snapshot posts with its stamp.
+        state = await _poll(client)
+        # Poll 2 at t=1060: only time passes — no new usage POST.
+        clock["now"] = 1_060.0
+        state = await _poll(client)
+        # Poll 3 at t=2000: the counters moved; the stamped POST fails.
+        status_state["current_usage"] = {
+            "input_tokens": 20,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 8,
+            "cache_creation_input_tokens": 3,
+        }
+        fail_usage["on"] = True
+        clock["now"] = 2_000.0
+        state = await _poll(client)
+        # Poll 4 at t=3000: the same counters retry with the SAME stamp.
+        fail_usage["on"] = False
+        clock["now"] = 3_000.0
+        state = await _poll(client)
+
+    usage_posts = [r for r in requests if r["type"] == "external_session_usage"]
+    assert [p["data"]["last_usage_observed_at"] for p in usage_posts] == [1000, 2000, 2000]
+    first = usage_posts[0]["data"]
+    assert first["last_cache_read_input_tokens"] == 4
+    assert first["last_cache_creation_input_tokens"] == 2
+    # 20 + 8 + 3 on the retried snapshot.
+    assert usage_posts[-1]["data"]["context_tokens"] == 31
+
+
+@pytest.mark.asyncio
+async def test_usage_post_from_transcript_fallback_carries_last_cache_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The transcript fallback posts the same three ``last_*`` fields.
+
+    Before the statusLine fires, ``latest_usage`` is the only usage source;
+    the server's ``omnigent.last_cache`` label must still be writable, so
+    the fallback maps its conditional ``cache_*`` keys onto the ``last_*``
+    pair and stamps the observation time.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "u1",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "cache_read_input_tokens": 30,
+                        "cache_creation_input_tokens": 5,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _bridge: None)
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_fallback",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    usage_post = next(r for r in requests if r["type"] == "external_session_usage")
+    assert usage_post["data"]["last_cache_read_input_tokens"] == 30
+    assert usage_post["data"]["last_cache_creation_input_tokens"] == 5
+    assert usage_post["data"]["last_usage_observed_at"] > 0
 
 
 @pytest.mark.asyncio
