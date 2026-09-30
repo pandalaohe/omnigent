@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,164 @@ def test_threaded_idle_watcher_reports_terminal_exit(
     assert reports[0].attributes["consecutive_probe_failures"] == 3
     assert reports[0].attributes["pane_output_seen"] is False
     assert reports[0].attributes["shutdown_requested"] is False
+
+
+def test_threaded_idle_watcher_skips_pane_probe_within_cadence(tmp_path: Path) -> None:
+    """A cadence callable throttles the pane probe while on_tick keeps firing.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    probes = {"n": 0}
+    ticks = {"n": 0}
+
+    def _capture() -> str:
+        probes["n"] += 1
+        return "steady frame"
+
+    def _on_tick() -> None:
+        ticks["n"] += 1
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance.pane_pid_sync = lambda: os.getpid()  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_tick=_on_tick,
+        poll_interval_s=0.01,
+        pane_probe_interval_s=lambda: 10.0,
+    )
+    try:
+        deadline = time.monotonic() + 3.0
+        while ticks["n"] < 10 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert ticks["n"] >= 10
+        assert probes["n"] == 1
+    finally:
+        instance._stop_idle_watcher_thread()
+
+
+def test_threaded_idle_watcher_probes_every_tick_when_pane_pid_is_dead(tmp_path: Path) -> None:
+    """A dead pane pid forces the full probe so the exit is still seen.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    probe_count = {"n": 0}
+
+    def _capture() -> str:
+        probe_count["n"] += 1
+        return "steady frame"
+
+    child = subprocess.Popen(["true"])
+    child.wait()
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance.pane_pid_sync = lambda: child.pid  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_tick=lambda: None,
+        poll_interval_s=0.01,
+        pane_probe_interval_s=lambda: 10.0,
+    )
+    try:
+        deadline = time.monotonic() + 3.0
+        while probe_count["n"] < 10 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert probe_count["n"] >= 10
+    finally:
+        instance._stop_idle_watcher_thread()
+
+
+def test_threaded_idle_watcher_probes_every_tick_when_cadence_is_none(tmp_path: Path) -> None:
+    """A cadence callable returning ``None`` keeps probing every tick.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    probe_count = {"n": 0}
+
+    def _capture() -> str:
+        probe_count["n"] += 1
+        return "steady frame"
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance.pane_pid_sync = lambda: os.getpid()  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_tick=lambda: None,
+        poll_interval_s=0.01,
+        pane_probe_interval_s=lambda: None,
+    )
+    try:
+        deadline = time.monotonic() + 3.0
+        while probe_count["n"] < 10 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert probe_count["n"] >= 10
+    finally:
+        instance._stop_idle_watcher_thread()
+
+
+def test_threaded_idle_watcher_resumes_probing_on_client_interaction(tmp_path: Path) -> None:
+    """A web client interaction ends the probe skip so repaints stay discounted.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    probe_count = {"n": 0}
+    interacted = threading.Event()
+
+    def _capture() -> str:
+        probe_count["n"] += 1
+        return "steady frame"
+
+    def _on_tick() -> None:
+        if probe_count["n"] >= 1 and not interacted.is_set():
+            instance.note_client_interaction()
+            interacted.set()
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance.pane_pid_sync = lambda: os.getpid()  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_tick=_on_tick,
+        poll_interval_s=0.01,
+        pane_probe_interval_s=lambda: 10.0,
+    )
+    try:
+        assert interacted.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while probe_count["n"] < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert probe_count["n"] >= 2
+    finally:
+        instance._stop_idle_watcher_thread()
 
 
 async def test_async_idle_watcher_logs_correlated_probe_diagnostics(

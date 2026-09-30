@@ -129,6 +129,12 @@ _CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS = 1.0
 # don't 5x the capture-pane subprocess load on every terminal.
 _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS = 0.2
 
+# Pane-probe cadence (seconds) once Claude's status file owns the session
+# status: 1s while the file says running (matching the one-pulse-per-second
+# activity throttle) and 5s otherwise. A dead pane pid still forces a probe.
+_CLAUDE_NATIVE_BUSY_PANE_PROBE_INTERVAL_SECONDS = 1.0
+_CLAUDE_NATIVE_QUIET_PANE_PROBE_INTERVAL_SECONDS = 5.0
+
 # Minimum wall-clock interval (seconds) between consecutive
 # ``session.terminal.activity`` emissions for a single terminal. The
 # claude-native agent terminal polls its pane every 200ms
@@ -1443,18 +1449,26 @@ class SessionResourceRegistry:
         # than replacing it — the file is written only on a value *change*, so
         # it cannot be trusted to re-assert a status it already holds. Built
         # only for the claude-native role; other native roles stay PTY-only.
+        file_status: dict[str, str | None] = {"value": None}
+
+        def _on_file_status(
+            status: str,
+            blocked_on: str | None = None,
+            background_task_count: int | None = None,
+        ) -> None:
+            file_status["value"] = status
+            _publish_status(
+                status,
+                blocked_on,
+                background_task_count,
+                record_activity=True,
+            )
+
         status_poller = (
             self._build_claude_native_status_poller(
                 session_id=session_id,
                 instance=instance,
-                on_status=lambda status, blocked_on=None, background_task_count=None: (
-                    _publish_status(
-                        status,
-                        blocked_on,
-                        background_task_count,
-                        record_activity=True,
-                    )
-                ),
+                on_status=_on_file_status,
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1462,6 +1476,13 @@ class SessionResourceRegistry:
         if status_poller is not None:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
+
+        def _pane_probe_interval() -> float | None:
+            if not _file_owns_status():
+                return None
+            if file_status["value"] == "running":
+                return _CLAUDE_NATIVE_BUSY_PANE_PROBE_INTERVAL_SECONDS
+            return _CLAUDE_NATIVE_QUIET_PANE_PROBE_INTERVAL_SECONDS
 
         native_input_ready = False
 
@@ -1620,6 +1641,7 @@ class SessionResourceRegistry:
             on_tick=_on_tick,
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
+            pane_probe_interval_s=_pane_probe_interval if status_poller is not None else None,
             replace=replace,
         )
 

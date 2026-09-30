@@ -380,9 +380,11 @@ async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: object | None = None,
         replace: bool = False,
     ) -> None:
         del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del pane_probe_interval_s
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -552,9 +554,11 @@ async def test_required_terminal_exit_lets_the_harness_report_its_own_failure(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: object | None = None,
         replace: bool = False,
     ) -> None:
         del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del pane_probe_interval_s
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
