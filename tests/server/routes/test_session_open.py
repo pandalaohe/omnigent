@@ -808,6 +808,46 @@ async def test_workspace_outside_the_project_refused(
 
 
 @pytest.mark.asyncio
+async def test_workspace_dotdot_traversal_refused(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that only escapes the root after lexical normalisation is refused."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], workspace="/repo/../outside"
+        )
+    assert data["state"] == "needs_input"
+    assert data["reason"] == "workspace_outside_project"
+    assert "body" not in captured, "a placement refusal must not create a session"
+
+
+@pytest.mark.asyncio
+async def test_workspace_dotdot_segments_normalised(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-root workspace reaches create and worktree matching without ``..``."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    seen = _patch_worktrees(
+        monkeypatch,
+        rows=[
+            {"path": "/repo/task", "branch": "task/fix", "is_main": False, "detached": False},
+        ],
+    )
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], workspace="/repo/sub/../task"
+        )
+    assert data["state"] == "opened"
+    assert seen == ["/repo"]
+    assert captured["body"].workspace == "/repo/task"
+    assert captured["body"].git is not None
+    assert captured["body"].git.branch_name == "task/fix"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("companion", [{"branch": "task/fix"}, {"from_ref": "main"}])
 async def test_workspace_with_a_branch_refused(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, companion: dict[str, Any]

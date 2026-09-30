@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
+import posixpath
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -88,6 +90,18 @@ class SessionOpenRequest(BaseModel):
         if value is None:
             return None
         return value.strip() or None
+
+    @field_validator("workspace")
+    @classmethod
+    def _normalize_workspace(cls, value: str | None) -> str | None:
+        """:returns: the workspace with lexical ``.``/``..`` segments resolved."""
+        if value is None:
+            return None
+        if _is_windows_absolute_path(value):
+            return ntpath.normpath(value)
+        if value.startswith("/"):
+            return posixpath.normpath(value)
+        return value
 
 
 def _problem(
