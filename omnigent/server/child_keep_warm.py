@@ -243,10 +243,11 @@ def warm_state_from_label(
     """
     Derive the rail pill state from a child's keep-warm label.
 
-    No settings read: an archived child, an unsupported harness, or no
-    label reads ``None``. A warm label stays ``warm`` while the child is
-    busy (its next turn will touch the prompt anyway) or the window has not
-    passed; anything else is ``cold``.
+    No settings read: an archived child, an unsupported harness, or an idle
+    child with no label reads ``None``. A busy child is ``warm`` whatever the
+    label says (its running turn touches the provider cache); an idle child
+    reads the label — a warm state inside its window is ``warm``, anything
+    else ``cold``.
 
     :param raw: The ``omnigent.keep_warm`` label value, or ``None``.
     :param archived: Whether the child row itself is archived.
@@ -257,10 +258,12 @@ def warm_state_from_label(
     """
     if archived or harness not in _SUPPORTED_HARNESSES:
         return None
+    if busy:
+        return "warm"
     state = _WarmState.parse(raw)
     if state is None:
         return None
-    if state.s == "w" and (busy or (state.w is not None and now <= state.w)):
+    if state.s == "w" and state.w is not None and now <= state.w:
         return "warm"
     return "cold"
 

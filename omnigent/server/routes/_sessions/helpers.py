@@ -78,6 +78,7 @@ from omnigent.member_snapshot import (
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
+    NATIVE_CODING_AGENTS,
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
@@ -5012,8 +5013,11 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
         parent_id = conv.parent_conversation_id
         resolved_status = status
         if resolved_status is None:
+            live = _session_status_cache.get(conv.id)
             terminal_status = conv.labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
-            if terminal_status == "failed":
+            if _live_run_supersedes_terminal(conv, live):
+                resolved_status = live
+            elif terminal_status == "failed":
                 resolved_status = "failed"
             elif terminal_status in {"completed", "stopped", "killed"}:
                 resolved_status = "idle"
@@ -11521,6 +11525,43 @@ def _child_summary_identity(
         return None, None
 
 
+def _is_harness_subagent_mirror(conv: Conversation) -> bool:
+    """
+    Return whether a row mirrors a native harness's own sub-agent.
+
+    A mirror row tracks a one-shot sub-agent inside another CLI's
+    transcript (e.g. a Claude Agent-tool child), not a reusable Omnigent
+    session: its ``omnigent.wrapper`` label carries the harness's
+    ``subagent_wrapper_label``.
+
+    :param conv: Conversation row to inspect.
+    :returns: ``True`` when the row's wrapper label matches a native
+        agent's sub-agent wrapper label; ``False`` when missing.
+    """
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if not wrapper:
+        return False
+    return any(agent.subagent_wrapper_label == wrapper for agent in NATIVE_CODING_AGENTS)
+
+
+def _live_run_supersedes_terminal(conv: Conversation, live_status: str | None) -> bool:
+    """
+    Return whether a session's newer live run outranks its terminal label.
+
+    A reusable child's newer turn beats the terminal label its last
+    dispatch left, because the relayed runner running edge does not clear
+    that label. A harness sub-agent mirror is one-shot, so its label stays
+    authoritative. The persisted ``conv.live_status`` is never passed as
+    *live_status*: it can be stale after a Server restart.
+
+    :param conv: Conversation row to inspect.
+    :param live_status: Live in-memory status, e.g. ``"running"``, or
+        ``None`` when the cache has no entry.
+    :returns: ``True`` when a live run should supersede a terminal label.
+    """
+    return live_status in ("running", "waiting") and not _is_harness_subagent_mirror(conv)
+
+
 def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
@@ -11623,14 +11664,17 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # A structured terminal label is stronger than quarantine and transient
-    # cache/live state, including when an old conflicted row contains both.
+    # A terminal label is stronger than quarantine and transient cache/live
+    # state for a one-shot harness sub-agent mirror; a reusable child's live
+    # run beats the label its last dispatch left.
     durable_status = labels.get(_SUBAGENT_TERMINAL_STATUS_LABEL_KEY)
-    if durable_status in ("completed", "failed", "stopped", "killed"):
+    live = cached_status if cached_status is not None else _session_status_cache.get(conv.id)
+    if durable_status in ("completed", "failed", "stopped", "killed") and not (
+        _live_run_supersedes_terminal(conv, live)
+    ):
         cached_status = durable_status
     else:
-        if cached_status is None:
-            cached_status = _session_status_cache.get(conv.id)
+        cached_status = live
         if cached_status is None and conv.live_status in ("idle", "running", "waiting", "failed"):
             cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
@@ -11718,6 +11762,8 @@ def _warm_state_from_label(
     from omnigent.db.utils import now_epoch
     from omnigent.server.child_keep_warm import KEEP_WARM_LABEL, warm_state_from_label
 
+    if _is_harness_subagent_mirror(conv):
+        return None
     return warm_state_from_label(
         conv.labels.get(KEEP_WARM_LABEL),
         archived=bool(conv.archived),
