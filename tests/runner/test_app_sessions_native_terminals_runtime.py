@@ -878,7 +878,9 @@ async def test_auto_create_codex_terminal_child_question_line(
             parent_session_id=parent_session_id,
         )
 
+    # runner.app copies its globals over the orchestration attribute at launch time.
     monkeypatch.setattr(orchestration_mod, "_codex_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(runner_app_mod, "_codex_native_launch_config", _fake_launch_config)
 
     captured: dict[str, Any] = {}
 

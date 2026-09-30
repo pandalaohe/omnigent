@@ -3568,6 +3568,217 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
     assert "created_by" not in event_posts[1]
 
 
+@pytest.mark.asyncio
+async def test_sys_session_send_existing_offline_child_relaunches_and_reposts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline child's refused by-id message relaunches the runner and reposts."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_BY_ID_CHILD_READY_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_POLL_S", 0.0)
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    message_posts: list[dict[str, Any]] = []
+    retry_posts: list[dict[str, Any]] = []
+    liveness_reads = 0
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal liveness_reads
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_child":
+            if request.url.params.get("include_liveness") == "true":
+                liveness_reads += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_offline_child",
+                    "parent_session_id": "conv_parent_offline",
+                    "title": "worker:auth",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_offline_child":
+            return httpx.Response(200, json={"ok": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_offline_child/events"
+        ):
+            body = json.loads(request.content)
+            if body["type"] == "retry_session":
+                retry_posts.append(body)
+                return httpx.Response(
+                    200,
+                    json={"queued": False, "recovered": True, "recovery": "runner_relaunched"},
+                )
+            message_posts.append(body)
+            if len(message_posts) == 1:
+                # History only while the runner is offline: no turn runs.
+                return httpx.Response(202, json={"queued": True, "forwarded": False})
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_offline_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_offline",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_offline_child")
+            runner_app._session_inboxes_ref.pop("conv_parent_offline", None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching"
+    assert len(message_posts) == 2, "the refused message must be reposted after recovery"
+    assert len(retry_posts) == 1
+    assert retry_posts[0] == {"type": "retry_session", "data": {}}
+    assert liveness_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_existing_offline_child_reports_relaunch_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused runner relaunch surfaces as a send failure and never reposts."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_BY_ID_CHILD_READY_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_POLL_S", 0.0)
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    message_posts: list[dict[str, Any]] = []
+    retry_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_offline_stuck":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_offline_stuck",
+                    "parent_session_id": "conv_parent_offline_stuck",
+                    "title": "worker:auth",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_offline_stuck":
+            return httpx.Response(200, json={"ok": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_offline_stuck/events"
+        ):
+            body = json.loads(request.content)
+            if body["type"] == "retry_session":
+                retry_posts.append(body)
+                return httpx.Response(
+                    503,
+                    json={"error": "RUNNER_UNAVAILABLE", "message": "no runner available"},
+                )
+            message_posts.append(body)
+            return httpx.Response(202, json={"queued": True, "forwarded": False})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_offline_stuck", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_offline_stuck",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_offline_stuck")
+            runner_app._session_inboxes_ref.pop("conv_parent_offline_stuck", None)
+
+    assert output.startswith("Error: failed to send message to child:")
+    assert "503" in output
+    assert len(message_posts) == 1, "a refused relaunch must not trigger another message post"
+    assert len(retry_posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_in_flight_child_waits_runner_without_relaunch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-flight child's refused message waits for its online runner, no relaunch."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_BY_ID_CHILD_READY_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_POLL_S", 0.0)
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    message_posts: list[dict[str, Any]] = []
+    retry_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_inflight_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_inflight_child",
+                    "parent_session_id": "conv_parent_inflight",
+                    "title": "worker:auth",
+                    "status": "running",
+                    "runner_online": True,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_inflight_child":
+            return httpx.Response(200, json={"ok": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_inflight_child/events"
+        ):
+            body = json.loads(request.content)
+            if body["type"] == "retry_session":
+                retry_posts.append(body)
+                return httpx.Response(200, json={"queued": False, "recovered": True})
+            message_posts.append(body)
+            if len(message_posts) == 1:
+                return httpx.Response(202, json={"queued": True, "forwarded": False})
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_inflight_child", "args": "steer"}),
+                server_client=server_client,
+                conversation_id="conv_parent_inflight",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_inflight_child")
+            runner_app._session_inboxes_ref.pop("conv_parent_inflight", None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert len(message_posts) == 2
+    assert retry_posts == [], "an online runner needs no relaunch"
+
+
 def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
     """
     Build a parent-spec stub declaring one ``worker`` sub-agent.

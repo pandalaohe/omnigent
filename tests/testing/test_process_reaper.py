@@ -8,6 +8,8 @@ no server, no daemon.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import time
@@ -17,8 +19,11 @@ import psutil
 import pytest
 
 from omnigent.testing.process_reaper import (
+    OWNER_MARKER_NAME,
     find_leaked_omnigent_processes,
     reap_leaked_omnigent_processes,
+    sweep_dead_owner_dirs,
+    write_owner_marker,
 )
 
 # A child that lives until reaped. The argv embeds marker tokens so the
@@ -198,3 +203,124 @@ def test_reap_escalates_to_kill(data_dir: Path) -> None:
 def test_reap_with_no_leaks_returns_empty(data_dir: Path) -> None:
     """No attributed processes → no-op, empty report."""
     assert reap_leaked_omnigent_processes(data_dir, timeout=1) == ([], [])
+
+
+# ── dead-owner sweep ─────────────────────────────────────────
+
+
+def _dead_owner_marker(directory: Path) -> subprocess.Popen:
+    """Mark *directory* owned by a freshly killed child, and return it."""
+    owner = _spawn(_SLEEP_CHILD, "omnigent-owner")
+    try:
+        write_owner_marker(directory, pid=owner.pid)
+    except BaseException:
+        _kill_quietly(owner)
+        raise
+    _kill_quietly(owner)
+    return owner
+
+
+def test_sweep_reaps_and_removes_dead_owner_dir(tmp_path: Path) -> None:
+    """A dead owner's dir is swept: its leak is reaped and the dir removed."""
+    d = tmp_path / "omnigent-pytest-dead"
+    d.mkdir()
+    owner = _dead_owner_marker(d)
+    leak: subprocess.Popen | None = None
+    try:
+        leak = _spawn(
+            _SLEEP_CHILD,
+            "omnigent-leak",
+            env={"OMNIGENT_DATA_DIR": str(d), "PATH": "/usr/bin:/bin"},
+        )
+        swept, reaped, survivors = sweep_dead_owner_dirs(tmp_path, "omnigent-pytest-", timeout=5)
+        assert swept == [d]
+        assert any("omnigent-leak" in cmd for cmd in reaped)
+        leak.wait(timeout=10)
+        assert not d.exists()
+        assert survivors == []
+    finally:
+        if leak is not None:
+            _kill_quietly(leak)
+        _kill_quietly(owner)
+
+
+@pytest.mark.posix_only
+def test_sweep_reaps_resolved_spelling_of_symlinked_root(tmp_path: Path) -> None:
+    """A symlinked root is swept for leaks carrying the resolved data-dir path.
+
+    conftest resolves its data dir (``/tmp`` → ``/private/tmp`` on macOS), so
+    a leak's ``OMNIGENT_DATA_DIR`` names the resolved spelling while the swept
+    entry is the unresolved one; both spellings must be reaped.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    d = real / "omnigent-pytest-dead"
+    d.mkdir()
+    owner = _dead_owner_marker(d)
+    leak: subprocess.Popen | None = None
+    try:
+        leak = _spawn(
+            _SLEEP_CHILD,
+            "omnigent-leak",
+            env={"OMNIGENT_DATA_DIR": str(d.resolve()), "PATH": "/usr/bin:/bin"},
+        )
+        sweep_dead_owner_dirs(link, "omnigent-pytest-", timeout=5)
+        leak.wait(timeout=10)
+        assert not d.exists()
+    finally:
+        if leak is not None:
+            _kill_quietly(leak)
+        _kill_quietly(owner)
+
+
+def test_sweep_keeps_dir_owned_by_live_process(tmp_path: Path) -> None:
+    """A live owner's dir is kept, and its processes are left running."""
+    d = tmp_path / "omnigent-pytest-live"
+    d.mkdir()
+    write_owner_marker(d)
+    leak = _spawn(
+        _SLEEP_CHILD,
+        "omnigent-leak",
+        env={"OMNIGENT_DATA_DIR": str(d), "PATH": "/usr/bin:/bin"},
+    )
+    try:
+        swept, _reaped, _survivors = sweep_dead_owner_dirs(tmp_path, "omnigent-pytest-", timeout=5)
+        assert swept == []
+        assert leak.poll() is None
+        assert d.exists()
+    finally:
+        _kill_quietly(leak)
+
+
+def test_sweep_keeps_dir_without_owner_marker(tmp_path: Path) -> None:
+    """A dir with no marker is never swept (a concurrent run may be mid-start)."""
+    d = tmp_path / "omnigent-pytest-nomarker"
+    d.mkdir()
+    assert sweep_dead_owner_dirs(tmp_path, "omnigent-pytest-") == ([], [], [])
+    assert d.exists()
+
+
+def test_sweep_treats_reused_pid_as_dead(tmp_path: Path) -> None:
+    """A marker whose pid exists with a different create time is a reused pid."""
+    d = tmp_path / "omnigent-pytest-reused"
+    d.mkdir()
+    (d / OWNER_MARKER_NAME).write_text(
+        json.dumps({"pid": os.getpid(), "create_time": 0.0}), encoding="utf-8"
+    )
+    swept, _reaped, _survivors = sweep_dead_owner_dirs(tmp_path, "omnigent-pytest-")
+    assert swept == [d]
+    assert not d.exists()
+
+
+def test_sweep_ignores_dead_owner_dir_without_prefix(tmp_path: Path) -> None:
+    """A dead owner's dir whose name lacks the prefix is left alone."""
+    d = tmp_path / "other-prefix-dead"
+    d.mkdir()
+    owner = _dead_owner_marker(d)
+    try:
+        assert sweep_dead_owner_dirs(tmp_path, "omnigent-pytest-") == ([], [], [])
+        assert d.exists()
+    finally:
+        _kill_quietly(owner)

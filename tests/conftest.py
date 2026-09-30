@@ -17,6 +17,26 @@ try:
 except ImportError:
     _resource = None  # type: ignore[assignment]
 
+# An agent session's shell carries its host-launched runner's identity and log
+# wiring (set by omnigent/host/connect.py `_build_runner_env` /
+# `_spawn_runner_proc`); test servers would otherwise write into that session's
+# real runner log and connect marker. Drop those inherited variables.
+_INHERITED_RUNNER_ENV_PREFIX = "OMNIGENT_RUNNER_"
+_INHERITED_RUNNER_ENV_NAMES = frozenset(
+    {
+        "OMNIGENT_PROCESS_LOG_FILE",
+        "OMNIGENT_HARNESS_TMP_PARENT",
+        "OMNIGENT_USER_ID",
+        "OMNIGENT_HOST_ID",
+        "OMNIGENT_HOST_NAME",
+        "OMNIGENT_INFERENCE_CONFIG",
+        "RUNNER_SERVER_URL",
+    }
+)
+for _name in list(os.environ):
+    if _name.startswith(_INHERITED_RUNNER_ENV_PREFIX) or _name in _INHERITED_RUNNER_ENV_NAMES:
+        del os.environ[_name]
+
 # Establish test data isolation before importing any Omnigent modules. This
 # deliberately replaces ambient state; subprocesses inherit the safe override.
 _TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
@@ -63,7 +83,42 @@ os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
 from omnigent.db.utils import _engine_cache, _engine_lock, get_or_create_engine  # noqa: E402
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry  # noqa: E402
+from omnigent.testing.process_reaper import sweep_dead_owner_dirs, write_owner_marker  # noqa: E402
 from tests import _model_pools  # noqa: E402
+
+write_owner_marker(_TEST_OMNIGENT_DATA_DIR)
+
+
+def _sweep_orphans_of_dead_runs() -> None:
+    """Sweep data dirs owned by pytest runs that died without cleanup.
+
+    pytest-timeout's ``os._exit`` and SIGKILL skip ``pytest_unconfigure``, so
+    the data dir and spawned Omnigent processes of a previous run linger
+    until the next run's sweep. A dir owned by a live run — another session,
+    another worktree, or a sibling xdist worker, each of which owns its own
+    dir — is kept because its owner pid is alive; only a provably dead owner
+    makes a dir sweepable (see :func:`sweep_dead_owner_dirs`).
+
+    Set ``OMNIGENT_TEST_ORPHAN_SWEEP=0`` to opt out while developing the
+    sweep itself.
+    """
+    if os.environ.get("OMNIGENT_TEST_ORPHAN_SWEEP") == "0":
+        return
+    roots = [(Path(tempfile.gettempdir()), "omnigent-pytest-")]
+    if os.name != "nt":
+        # The bench root/prefix mirror BenchEnvironment._tmp in
+        # dev/benchmarks/omnigent/environment.py; its /tmp root is POSIX-only
+        # (on Windows ``Path("/tmp")`` is drive-less).
+        roots.append((Path("/tmp"), "omni-bench-"))
+    for root, prefix in roots:
+        _swept, reaped, survivors = sweep_dead_owner_dirs(root, prefix)
+        for cmdline in reaped:
+            print(f"\nreaped orphan of a dead pytest run: {cmdline}", file=sys.stderr)
+        for cmdline in survivors:
+            print(f"\nUNREAPED orphan survived SIGKILL: {cmdline}", file=sys.stderr)
+
+
+_sweep_orphans_of_dead_runs()
 
 pytest_plugins = ["tests._token_usage"]
 

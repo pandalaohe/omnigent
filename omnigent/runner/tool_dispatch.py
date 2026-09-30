@@ -1818,7 +1818,7 @@ async def _send_to_in_flight_child(
     # Post first — before any register/stamp — so a failure leaves the live
     # turn's tracking untouched (nothing to roll back, never a teardown).
     try:
-        msg_resp = await _post_child_message_event(
+        msg_resp = await _post_child_message_recovering(
             server_client,
             child_session_id,
             content=[{"type": "input_text", "text": message}],
@@ -1829,10 +1829,10 @@ async def _send_to_in_flight_child(
             f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
             f"{type(exc).__name__}: {exc}"
         )
-    if msg_resp.status_code >= 400:
+    if not _message_post_accepted(msg_resp):
         return (
             f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
-            f"{msg_resp.status_code} {msg_resp.text[:200]}"
+            f"{_undelivered_child_message_error(msg_resp)}"
         )
 
     flows.note_child_dispatch(conversation_id, child_session_id)
@@ -1970,6 +1970,18 @@ _HOST_NAME_CACHE: dict[str, str] = {}
 # these to stay fast.
 _REMOTE_CHILD_READY_TIMEOUT_S = 120.0
 _REMOTE_CHILD_READY_POLL_S = 3.0
+
+# How long a by-id send to an existing child waits for its runner after the
+# message POST was refused, and the budget for the retry_session POST that
+# relaunches the runner server-side (host-bound grace + launch +
+# _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S + session init). Tests patch the
+# wait to stay fast.
+_BY_ID_CHILD_READY_TIMEOUT_S = 30.0
+_RETRY_SESSION_TIMEOUT = httpx.Timeout(120.0, connect=30.0)
+
+# Must cover the server relaunching an offline receiver:
+# grace + launch + _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S + init.
+_PEER_SEND_TIMEOUT_S = 120.0
 
 
 async def _fetch_session_metadata(
@@ -4194,11 +4206,12 @@ async def _send_peer_message(
 ) -> str:
     """Send a chat-style message to a non-child session via the peer route.
 
-    POSTs ``/v1/sessions/{target}/peer-messages`` (30 s budget) and maps the
-    route's disposition to the peer tool result. The route owns guard,
-    ownership and true-state truth; this branch only translates its answer
-    into the tool contract. ``wait_for_reply_seconds`` polls the record for
-    a reply without holding any dispatch lock.
+    POSTs ``/v1/sessions/{target}/peer-messages`` (120 s budget covering the
+    server relaunching an offline receiver) and maps the route's disposition
+    to the peer tool result. The route owns guard, ownership and true-state
+    truth; this branch only translates its answer into the tool contract.
+    ``wait_for_reply_seconds`` polls the record for a reply without holding
+    any dispatch lock.
 
     :param target_session_id: The receiving session id.
     :param message: The user message text to post.
@@ -4220,7 +4233,7 @@ async def _send_peer_message(
         resp = await server_client.post(
             f"/v1/sessions/{target_session_id}/peer-messages",
             json=body,
-            timeout=30.0,
+            timeout=_PEER_SEND_TIMEOUT_S,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
@@ -4542,7 +4555,7 @@ async def _send_to_descendant_session(
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
     parent_id = _optional_string(snap_data.get("parent_session_id")) or "unknown"
     try:
-        msg_resp = await _post_child_message_event(
+        msg_resp = await _post_child_message_recovering(
             server_client,
             target_session_id,
             content=[{"type": "input_text", "text": message}],
@@ -4553,10 +4566,10 @@ async def _send_to_descendant_session(
             f"Error: sys_session_send failed to send message to descendant "
             f"{target_session_id!r}: {type(exc).__name__}: {exc}"
         )
-    if msg_resp.status_code >= 400:
+    if not _message_post_accepted(msg_resp):
         return (
             f"Error: sys_session_send failed to send message to descendant "
-            f"{target_session_id!r}: {msg_resp.status_code} {msg_resp.text[:200]}"
+            f"{target_session_id!r}: {_undelivered_child_message_error(msg_resp)}"
         )
     return json.dumps(
         {
@@ -4783,7 +4796,7 @@ async def _send_to_existing_session(
     )
 
     try:
-        msg_resp = await _post_child_message_event(
+        msg_resp = await _post_child_message_recovering(
             server_client,
             target_session_id,
             content=[{"type": "input_text", "text": message}],
@@ -4792,10 +4805,10 @@ async def _send_to_existing_session(
     except httpx.HTTPError as exc:
         await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
-    if msg_resp.status_code >= 400:
+    if not _message_post_accepted(msg_resp):
         await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return (
-            f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
+            f"Error: failed to send message to child: {_undelivered_child_message_error(msg_resp)}"
         )
 
     if remote_child:
@@ -5017,6 +5030,18 @@ def _message_post_needs_runner_wait(resp: httpx.Response) -> bool:
     return isinstance(payload, dict) and payload.get("forwarded") is False
 
 
+def _undelivered_child_message_error(resp: httpx.Response) -> str:
+    """Render why a child message POST never reached a runner.
+
+    :param resp: The final message POST response.
+    :returns: The stored-but-undelivered description for a 2xx refusal,
+        otherwise the status and a short body preview.
+    """
+    if resp.status_code < 400:
+        return "the message was stored but not delivered: the session's runner did not come online"
+    return f"{resp.status_code} {resp.text[:200]}"
+
+
 async def _wait_for_runner_online(
     server_client: httpx.AsyncClient,
     child_session_id: str,
@@ -5084,6 +5109,51 @@ async def _post_created_child_message(
             if _message_post_accepted(resp):
                 return None
     return f"{resp.status_code} {resp.text[:200]}"
+
+
+async def _post_child_message_recovering(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    content: list[_JsonObject],
+    created_by: str | None,
+) -> httpx.Response:
+    """Post a child message, relaunching an offline runner and reposting once.
+
+    The server refuses a native-terminal child whose runner is offline with a
+    2xx ``{"queued": true, "forwarded": false}`` (history only, no turn) or a
+    503. Both mean no runner consumed the message, so this posts the same
+    ``retry_session`` event the web UI's "Resume session" action uses, waits
+    for the relaunched runner, and reposts once. Any other rejection is
+    returned untouched.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param session_id: The existing child session id.
+    :param content: The message content blocks.
+    :param created_by: Human actor that sent the message, if known.
+    :returns: The accepted repost, or the last refused/error response.
+    """
+    resp = await _post_child_message_event(
+        server_client, session_id, content=content, created_by=created_by
+    )
+    if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
+        return resp
+    if await _wait_for_runner_online(
+        server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
+    ):
+        return await _post_child_message_event(
+            server_client, session_id, content=content, created_by=created_by
+        )
+    retry = await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+        timeout=_RETRY_SESSION_TIMEOUT,
+    )
+    if retry.status_code >= 400:
+        return retry
+    return await _post_child_message_event(
+        server_client, session_id, content=content, created_by=created_by
+    )
 
 
 def _build_session_create_body(
@@ -10801,6 +10871,28 @@ async def _evaluate_async_tool_call_policy(
     return False
 
 
+def _notify_async_result(
+    conversation_id: str | None,
+    handle_id: str,
+    target_tool: str,
+    status: str,
+) -> None:
+    """Wake the dispatching session after an async result lands in its inbox.
+
+    :param conversation_id: The dispatching session id, or ``None``.
+    :param handle_id: Async task handle, e.g. ``"handle_a1b2c3"``.
+    :param target_tool: The dispatched tool name.
+    :param status: The inbox item status, e.g. ``"failed"``.
+    """
+    if conversation_id is None:
+        return
+    from omnigent.runner import app as _runner_app
+
+    waker = _runner_app._async_result_waker
+    if waker is not None:
+        waker(conversation_id, handle_id, target_tool, status)
+
+
 def _spawn_async_tool(
     args: _JsonObject,
     *,
@@ -10900,6 +10992,7 @@ def _spawn_async_tool(
                             "output": result,
                         }
                     )
+                    _notify_async_result(conversation_id, handle_id, target_tool, "failed")
                     return result
 
             # Race the tool execution against the cancel event.
@@ -10947,14 +11040,16 @@ def _spawn_async_tool(
             for fut in pending:
                 fut.cancel()
             result = execution_task.result()
+            status = "failed" if flows._step_error(result) is not None else "completed"
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,
                     "tool_name": target_tool,
-                    "status": "completed",
+                    "status": status,
                     "output": result,
                 }
             )
+            _notify_async_result(conversation_id, handle_id, target_tool, status)
             return result
         except asyncio.CancelledError:
             session_inbox.put_nowait(
@@ -10976,6 +11071,7 @@ def _spawn_async_tool(
                     "output": str(exc),
                 }
             )
+            _notify_async_result(conversation_id, handle_id, target_tool, "failed")
             return f"Error: {exc}"
         finally:
             session_async_tasks.pop(handle_id, None)
