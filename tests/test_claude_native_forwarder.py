@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import io
 import json
 import logging
 import os
@@ -16739,6 +16740,20 @@ def test_tool_use_ids_in_transcript_parses_like_a_full_scan(tmp_path: Path) -> N
     }
 
 
+def _count_file_opens(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every path opened through either name of the builtin ``open``."""
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(io, "open", _spy_open)
+    monkeypatch.setattr(builtins, "open", _spy_open)
+    return opened
+
+
 def test_tool_use_ids_in_transcript_does_not_reread_an_unchanged_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -16749,20 +16764,14 @@ def test_tool_use_ids_in_transcript_does_not_reread_an_unchanged_file(
     first = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
     assert first == {"toolu_parent"}
 
-    opened: list[str] = []
-    real_open = builtins.open
-
-    def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-        opened.append(str(file))
-        return real_open(file, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", _spy_open)
+    opened = _count_file_opens(monkeypatch)
     second = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
     assert second == first
     assert opened == []
     second.add("toolu_mutated")
     third = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
     assert third == {"toolu_parent"}
+    assert opened == []
 
 
 def test_tool_use_ids_in_transcript_reads_only_appended_bytes(
@@ -16841,6 +16850,27 @@ def test_tool_use_ids_in_transcript_waits_for_a_trailing_newline(
     }
 
 
+def test_tool_use_ids_in_transcript_skips_rereading_an_unterminated_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged unterminated tail is answered without reopening the file."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_first")])
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_spawn_tool_use_record(tool_use_id="toolu_partial")))
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+
+    opened = _count_file_opens(monkeypatch)
+    for _ in range(3):
+        assert forwarder._tool_use_ids_in_transcript(
+            transcript_path, include_sidechains=False
+        ) == {"toolu_first"}
+    assert opened == []
+
+
 def test_tool_use_ids_in_transcript_resets_on_truncation_and_replacement(
     tmp_path: Path,
 ) -> None:
@@ -16871,6 +16901,59 @@ def test_tool_use_ids_in_transcript_resets_on_truncation_and_replacement(
     }
 
 
+def test_tool_use_ids_in_transcript_resets_on_same_inode_regrow(tmp_path: Path) -> None:
+    """A same-inode truncate-and-regrow past the old size drops stale ids."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_old")])
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_old"
+    }
+    old_size = transcript_path.stat().st_size
+
+    with transcript_path.open("w", encoding="utf-8") as handle:
+        handle.write("")
+    _write_jsonl_rows(
+        transcript_path,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_bash", "name": "Bash"}],
+                },
+            },
+            _spawn_tool_use_record(tool_use_id="toolu_new"),
+        ],
+    )
+    assert transcript_path.stat().st_size > old_size
+
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_new"
+    }
+
+
+def test_tool_use_ids_in_transcript_resets_on_equal_length_rewrite(tmp_path: Path) -> None:
+    """A same-size same-inode rewrite still replaces the parsed ids."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_old")])
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_old"
+    }
+    old_size = transcript_path.stat().st_size
+
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_new")])
+    rewritten = transcript_path.stat()
+    assert rewritten.st_size == old_size
+    os.utime(
+        transcript_path,
+        ns=(rewritten.st_atime_ns, rewritten.st_mtime_ns + 1_000_000_000),
+    )
+
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_new"
+    }
+
+
 def test_subagent_parents_by_tool_use_stops_rereading_on_repeat(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -16892,14 +16975,7 @@ def test_subagent_parents_by_tool_use_stops_rereading_on_repeat(
     first = forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir)
     assert first == {"toolu_parent_spawn": None, "toolu_child_spawn": "child"}
 
-    opened: list[str] = []
-    real_open = builtins.open
-
-    def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-        opened.append(str(file))
-        return real_open(file, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", _spy_open)
+    opened = _count_file_opens(monkeypatch)
     for _ in range(50):
         owners = forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir)
     assert opened == []

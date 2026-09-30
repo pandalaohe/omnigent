@@ -3518,6 +3518,9 @@ class _SpawnToolUseIdCursor:
 
     st_dev: int
     st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    fingerprint: str | None
     offset: int
     tool_use_ids: set[str]
 
@@ -3604,22 +3607,35 @@ def _tool_use_ids_in_transcript(
 ) -> set[str]:
     """Return sub-agent spawn tool-use ids owned by one transcript."""
     cache_key = (str(transcript_path), include_sidechains)
-    try:
-        file_stat = os.stat(transcript_path)
-    except OSError:
-        with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
-            _SPAWN_TOOL_USE_ID_CACHE.pop(cache_key, None)
-        return set()
+    # One lock covers stat, compare, read, and update: reads parse only the
+    # appended bytes, and serializing them keeps offset and ids coherent
+    # without a second window where eviction or reset could interleave.
     with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+        try:
+            file_stat = os.stat(transcript_path)
+        except OSError:
+            _SPAWN_TOOL_USE_ID_CACHE.pop(cache_key, None)
+            return set()
         cursor = _SPAWN_TOOL_USE_ID_CACHE.get(cache_key)
-        if (
-            cursor is None
-            or (cursor.st_dev, cursor.st_ino) != (file_stat.st_dev, file_stat.st_ino)
-            or file_stat.st_size < cursor.offset
-        ):
+        identity = (file_stat.st_dev, file_stat.st_ino)
+        observation = (file_stat.st_size, file_stat.st_mtime_ns)
+        if cursor is not None and (cursor.st_dev, cursor.st_ino) == identity:
+            observation_changed = (cursor.st_size, cursor.st_mtime_ns) != observation
+            if observation_changed and (
+                file_stat.st_size < cursor.offset
+                or _jsonl_cursor_fingerprint(transcript_path, cursor.offset) != cursor.fingerprint
+            ):
+                # A same-inode rewrite changed the already-parsed prefix.
+                cursor.offset = 0
+                cursor.tool_use_ids = set()
+        else:
+            observation_changed = True
             cursor = _SpawnToolUseIdCursor(
                 st_dev=file_stat.st_dev,
                 st_ino=file_stat.st_ino,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                fingerprint=None,
                 offset=0,
                 tool_use_ids=set(),
             )
@@ -3627,36 +3643,19 @@ def _tool_use_ids_in_transcript(
         _SPAWN_TOOL_USE_ID_CACHE.move_to_end(cache_key)
         while len(_SPAWN_TOOL_USE_ID_CACHE) > _SPAWN_TOOL_USE_ID_CACHE_MAX:
             _SPAWN_TOOL_USE_ID_CACHE.popitem(last=False)
-        if file_stat.st_size == cursor.offset:
+        if not observation_changed:
             return set(cursor.tool_use_ids)
-        start_offset = cursor.offset
 
-    read_ids, consumed_offset = _read_spawn_tool_use_ids_from(
-        transcript_path,
-        start_offset,
-        include_sidechains=include_sidechains,
-    )
-
-    with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
-        cursor = _SPAWN_TOOL_USE_ID_CACHE.get(cache_key)
-        if cursor is None:
-            cursor = _SpawnToolUseIdCursor(
-                st_dev=file_stat.st_dev,
-                st_ino=file_stat.st_ino,
-                offset=consumed_offset,
-                tool_use_ids=set(read_ids),
-            )
-            _SPAWN_TOOL_USE_ID_CACHE[cache_key] = cursor
-        elif (cursor.st_dev, cursor.st_ino) != (file_stat.st_dev, file_stat.st_ino):
-            # The file was replaced while we read; keep the newer cursor.
-            return set(cursor.tool_use_ids) | read_ids
-        else:
-            cursor.tool_use_ids.update(read_ids)
-            if cursor.offset == start_offset:
-                cursor.offset = consumed_offset
-        _SPAWN_TOOL_USE_ID_CACHE.move_to_end(cache_key)
-        while len(_SPAWN_TOOL_USE_ID_CACHE) > _SPAWN_TOOL_USE_ID_CACHE_MAX:
-            _SPAWN_TOOL_USE_ID_CACHE.popitem(last=False)
+        read_ids, consumed_offset = _read_spawn_tool_use_ids_from(
+            transcript_path,
+            cursor.offset,
+            include_sidechains=include_sidechains,
+        )
+        cursor.tool_use_ids.update(read_ids)
+        cursor.offset = consumed_offset
+        cursor.st_size = file_stat.st_size
+        cursor.st_mtime_ns = file_stat.st_mtime_ns
+        cursor.fingerprint = _jsonl_cursor_fingerprint(transcript_path, consumed_offset)
         return set(cursor.tool_use_ids)
 
 
