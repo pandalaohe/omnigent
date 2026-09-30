@@ -273,3 +273,42 @@ async def test_tail_null_without_assistant_message(
     body = resp.json()
     assert body["last_message_tail"] is None
     assert body["last_message_preview"] == "hello from the peer session"
+
+
+async def test_tail_survives_more_than_ten_newer_user_messages(
+    client: httpx.AsyncClient, seeded: dict[str, str], db_uri: str
+) -> None:
+    """An assistant reply pushed out of the 10-newest window still yields a tail."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.append(
+        seeded["with_text"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_assistant",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "the buried assistant reply"}],
+                ),
+            ),
+            *[
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_followup_{index}",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": f"follow-up {index}"}],
+                    ),
+                )
+                for index in range(10)
+            ],
+        ],
+    )
+    resp = await client.get(
+        f"/v1/sessions/{seeded['with_text']}", params={"include_preview": "true"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["last_message_tail"] == "the buried assistant reply"
+    assert body["last_message_preview"] == "follow-up 9"

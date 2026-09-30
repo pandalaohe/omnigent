@@ -56,7 +56,8 @@ class SysSessionRenameTool(Tool):
                                 "Retitle one of your own sub-agent sessions (child or deeper) "
                                 "instead of yourself. Its agent address prefix is kept; a "
                                 "sibling with the same title is refused (title_taken); a "
-                                "session outside your subtree is refused (not_descendant)."
+                                "closed session is refused (session_closed); a session "
+                                "outside your subtree is refused (not_descendant)."
                             ),
                         },
                     },

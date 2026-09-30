@@ -7416,6 +7416,7 @@ async def _session_info_item(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
+    configured_harnesses: _JsonObject | None = None
     if include_host_readiness:
         snap_host_id = _optional_string(snap.get("host_id"))
         runner_online, configured_harnesses = await asyncio.gather(
@@ -8280,7 +8281,7 @@ async def _rename_descendant_session_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON ``{"renamed": true, ...}`` on success; otherwise a JSON
         refusal (``session_not_found``, ``access_denied``, ``not_descendant``,
-        ``title_taken``) or error object.
+        ``session_closed``, ``title_taken``) or error object.
     """
     try:
         target_response = await server_client.get(
@@ -8311,20 +8312,24 @@ async def _rename_descendant_session_via_rest(
     parent_id = _optional_string(target_snapshot.get("parent_session_id"))
     if parent_id is None or not await _is_descendant(server_client, caller_id, target_snapshot):
         return json.dumps({"renamed": False, "title": None, "reason": "not_descendant"})
+    raw_title = _optional_string(target_snapshot.get("title"))
+    if is_session_closed(_string_mapping(target_snapshot.get("labels")), raw_title):
+        return json.dumps({"renamed": False, "title": None, "reason": "session_closed"})
     # The prefix is kept and siblings are checked because the (parent, title)
     # pair is the child's continuation address for sys_session_send.
-    display_title = (
-        title_without_closed_marker(_optional_string(target_snapshot.get("title"))) or ""
-    )
+    display_title = title_without_closed_marker(raw_title) or ""
     parsed = _parse_session_title(display_title)
     prefix = ""
     if parsed.agent is not None:
         head, _, tail = display_title.partition(":")
         prefix = f"ui:{parsed.agent}:" if head == "ui" and ":" in tail else f"{parsed.agent}:"
     full_title = f"{prefix}{title}" if prefix and not title.startswith(prefix) else title
+    # The route caps at limit=1000, so this sibling check is best-effort:
+    # the server does not enforce title uniqueness at write time.
     children = await _list_child_sessions(
         server_client=server_client,
         conversation_id=parent_id,
+        limit=1000,
         include_archived=True,
     )
     if isinstance(children, str):
@@ -8340,6 +8345,10 @@ async def _rename_descendant_session_via_rest(
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if patch.status_code == 404:
+        return json.dumps({"renamed": False, "title": None, "reason": "session_not_found"})
+    if patch.status_code in (401, 403):
+        return json.dumps({"renamed": False, "title": None, "reason": "access_denied"})
     if patch.status_code >= 400:
         return json.dumps(
             {

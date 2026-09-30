@@ -353,6 +353,143 @@ async def test_session_rename_refuses_title_taken_by_sibling() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_rename_sibling_check_requests_the_route_maximum() -> None:
+    """The sibling scan asks for the route's 1000-row max.
+
+    The safe title is only withheld by the mock unless the request asks for
+    ``limit=1000``, so the refusal proves the widened scan was requested.
+    """
+    child_list_requests: list[httpx.Request] = []
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_current",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_current/child_sessions":
+            child_list_requests.append(request)
+            data = [{"id": "conv_child", "title": "researcher:auth"}]
+            if request.url.params.get("limit") == "1000":
+                data.append({"id": "conv_other", "title": "researcher:newlabel"})
+            return httpx.Response(200, json={"data": data})
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "newlabel", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {"renamed": False, "title": None, "reason": "title_taken"}
+    assert [request.url.params.get("limit") for request in child_list_requests] == ["1000"]
+    assert patch_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"title": "researcher:auth:closed:conv_child"},
+        {"title": "researcher:auth", "labels": {"omnigent.closed": "true"}},
+    ],
+    ids=["legacy-title-marker", "closed-label"],
+)
+async def test_session_rename_refuses_closed_child(snapshot: dict[str, object]) -> None:
+    """A closed descendant must not drop its marker and reopen via rename."""
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={"id": "conv_child", "parent_session_id": "conv_current", **snapshot},
+            )
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "new label", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {"renamed": False, "title": None, "reason": "session_closed"}
+    assert patch_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("patch_status", "reason"),
+    [(404, "session_not_found"), (403, "access_denied")],
+)
+async def test_session_rename_patch_refusal_keeps_structured_reason(
+    patch_status: int,
+    reason: str,
+) -> None:
+    """A refused descendant PATCH maps to the same typed reasons as the GET."""
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_current",
+                },
+            )
+        if request.method == "GET" and path.endswith("/child_sessions"):
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_child", "title": "researcher:auth"}]}
+            )
+        if request.method == "PATCH":
+            patch_requests.append(request)
+            return httpx.Response(patch_status, text="refused")
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "new label", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {"renamed": False, "title": None, "reason": reason}
+    assert len(patch_requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_session_rename_does_not_double_the_address_prefix() -> None:
     patch_requests: list[httpx.Request] = []
 

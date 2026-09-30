@@ -1614,7 +1614,23 @@ def register_core_routes(
         if include_preview:
             latest_items = (await _latest_message_items_for([session_id])).get(session_id, [])
             snapshot.last_message_preview = _latest_message_preview(latest_items)
-            snapshot.last_message_tail = _latest_assistant_tail(latest_items)
+            tail = _latest_assistant_tail(latest_items)
+            if tail is None and len(latest_items) >= 10:
+                # Ten newer user/meta turns can fill the 10-newest window and
+                # hide the latest assistant reply; one deeper read recovers it.
+                try:
+                    deeper = await asyncio.to_thread(
+                        conversation_store.list_items,
+                        session_id,
+                        type="message",
+                        order="desc",
+                        limit=100,
+                    )
+                except Exception:
+                    deeper = None
+                if deeper is not None:
+                    tail = _latest_assistant_tail(deeper.data)
+            snapshot.last_message_tail = tail
         return snapshot
 
     @router.get(
