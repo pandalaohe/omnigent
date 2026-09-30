@@ -175,6 +175,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
+    _message_text,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -305,6 +306,10 @@ _retry_recovery_tasks: WorkspaceScopedCache[str, asyncio.Task[dict[str, bool | s
     WorkspaceScopedCache()
 )
 _interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
+
+# Leading text of the runner's sub-agent wake notice
+# (``omnigent.runner.app._format_subagent_wake_notice``).
+_SUBAGENT_WAKE_PREFIX = "[System: sub-agent"
 
 
 async def _deliver_interrupt_once(session_id: str, runner_router: RunnerRouter | None) -> None:
@@ -1045,7 +1050,48 @@ def register_events_routes(
             require_init_success=require_init_success,
         )
 
-    from omnigent.server.routes.sessions.routes_peer import register_peer_routes
+    async def _subagent_wake_successor(
+        request: Request,
+        session_id: str,
+        body: SessionEventInput,
+    ) -> str:
+        """Return the successor a runner-posted sub-agent wake must reach.
+
+        Only a runner-authenticated post (tunnel token bound to the addressed
+        session or to its successor — the rotation clears the old binding) of
+        a wake-notice text is redirected; any other post keeps today's path,
+        as does a cycle in the succession chain.
+
+        :param request: The incoming request carrying the tunnel header.
+        :param session_id: The session the event was addressed to.
+        :param body: The validated event.
+        :returns: The successor id, or *session_id* when not redirected.
+        """
+        if body.type != "message" or body.data.get("role", "user") != "user":
+            return session_id
+        content = body.data.get("content")
+        text = _message_text(content) if isinstance(content, list) else None
+        if text is None or not text.startswith(_SUBAGENT_WAKE_PREFIX):
+            return session_id
+        addressed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if addressed is None:
+            return session_id
+        successor_id = await asyncio.to_thread(
+            resolve_succeeded_by, conversation_store, session_id
+        )
+        if successor_id == session_id:
+            return session_id
+        if _has_runner_created_by_authority(request, addressed):
+            return successor_id
+        successor = await asyncio.to_thread(conversation_store.get_conversation, successor_id)
+        if successor is not None and _has_runner_created_by_authority(request, successor):
+            return successor_id
+        return session_id
+
+    from omnigent.server.routes.sessions.routes_peer import (
+        register_peer_routes,
+        resolve_succeeded_by,
+    )
 
     peer = register_peer_routes(
         router,
@@ -1185,6 +1231,7 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        session_id = await _subagent_wake_successor(request, session_id, body)
         user_id, conv = await _authorized_conversation(
             request, session_id, acting_user_id=acting_user_id
         )

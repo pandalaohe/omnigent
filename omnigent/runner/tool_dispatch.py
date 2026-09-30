@@ -4334,11 +4334,13 @@ async def _send_peer_message(
                 ),
             }
         )
+    redirected_to = payload.get("redirected_to")
+    redirected_id = redirected_to if isinstance(redirected_to, str) and redirected_to else None
     receiver = _string_object_dict(payload.get("receiver")) or {}
     result: _JsonObject = {
         "peer": True,
         "peer_id": payload.get("peer_id"),
-        "conversation_id": target_session_id,
+        "conversation_id": redirected_id or target_session_id,
         "title": receiver.get("title"),
         "agent": receiver.get("agent_name"),
         "disposition": disposition,
@@ -4348,6 +4350,8 @@ async def _send_peer_message(
             "runner_online": receiver.get("runner_online"),
         },
     }
+    if redirected_id is not None:
+        result["redirected_to"] = redirected_id
     if reason_text is not None:
         result["reason"] = reason_text
     reply_to = payload.get("reply_to")

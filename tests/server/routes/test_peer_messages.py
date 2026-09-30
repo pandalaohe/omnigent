@@ -44,6 +44,7 @@ from omnigent.server.routes.sessions.routes_peer import (
     register_peer_routes,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SUCCEEDED_BY_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -1840,3 +1841,161 @@ async def test_strict_init_failure_rejected(peer_env: dict[str, Any]) -> None:
     assert result["reason"].startswith("init_failed: The recovered runner")
     assert peer_env["peer_store"].get(result["peer_id"]).state == "failed"
     assert peer_env["post_kwargs"][-1]["require_init_success"] is True
+
+
+# ── succession redirect ─────────────────────────────────────────────
+
+
+def _successor(peer_env: dict[str, Any], *, title: str, owner: str = ALICE) -> Any:
+    """Create an owned top-level session for a succession chain."""
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    conv = conv_store.create_conversation(title=title, agent_id=AGENT_ID, runner_id="rsucc")
+    peer_env["perm_store"].grant(owner, conv.id, LEVEL_OWNER)
+    return conv
+
+
+async def test_redirected_send_reaches_the_successor(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """A send to ``old`` is recorded and delivered to ``new``."""
+    sender = peer_env["sender"]
+    old = _successor(peer_env, title="old")
+    new = _successor(peer_env, title="new")
+    peer_env["conv_store"].set_labels(old.id, {SUCCEEDED_BY_LABEL_KEY: new.id})
+    resp = await peer_client.post(
+        f"/v1/sessions/{old.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"r-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert resp.status_code == 200, resp.text
+    assert body["disposition"] == "delivered", resp.text
+    assert body["redirected_to"] == new.id
+    assert body["receiver"]["id"] == new.id
+    assert peer_env["fake"].calls[0]["session_id"] == new.id
+    stored = peer_env["peer_store"].get(body["peer_id"])
+    assert stored is not None
+    assert stored.receiver_session_id == new.id
+
+
+async def test_redirect_follows_a_two_hop_chain(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """``old -> mid -> end`` resolves to the end, not the intermediate."""
+    sender = peer_env["sender"]
+    old = _successor(peer_env, title="hop-old")
+    mid = _successor(peer_env, title="hop-mid")
+    end = _successor(peer_env, title="hop-end")
+    conv_store = peer_env["conv_store"]
+    conv_store.set_labels(old.id, {SUCCEEDED_BY_LABEL_KEY: mid.id})
+    conv_store.set_labels(mid.id, {SUCCEEDED_BY_LABEL_KEY: end.id})
+    resp = await peer_client.post(
+        f"/v1/sessions/{old.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"r2-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert body["disposition"] == "delivered", resp.text
+    assert body["redirected_to"] == end.id
+    assert peer_env["fake"].calls[0]["session_id"] == end.id
+
+
+async def test_redirect_loop_is_refused(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """An A <-> B cycle redirects nowhere and does not hang."""
+    sender = peer_env["sender"]
+    a = _successor(peer_env, title="loop-a")
+    b = _successor(peer_env, title="loop-b")
+    conv_store = peer_env["conv_store"]
+    conv_store.set_labels(a.id, {SUCCEEDED_BY_LABEL_KEY: b.id})
+    conv_store.set_labels(b.id, {SUCCEEDED_BY_LABEL_KEY: a.id})
+    resp = await peer_client.post(
+        f"/v1/sessions/{a.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"loop-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert body["disposition"] == "delivered", resp.text
+    assert "redirected_to" not in body
+    assert peer_env["fake"].calls[0]["session_id"] == a.id
+
+
+async def test_redirect_refuses_when_the_final_target_is_archived(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """The archived check runs on the resolved target, with redirected_to."""
+    sender = peer_env["sender"]
+    old = _successor(peer_env, title="arch-old")
+    new = _successor(peer_env, title="arch-new")
+    conv_store = peer_env["conv_store"]
+    conv_store.set_labels(old.id, {SUCCEEDED_BY_LABEL_KEY: new.id})
+    conv_store.update_conversation(new.id, archived=True)
+    resp = await peer_client.post(
+        f"/v1/sessions/{old.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"arch-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert body["disposition"] == "failed", resp.text
+    assert body["reason"] == "closed"
+    assert body["redirected_to"] == new.id
+    assert peer_env["fake"].calls == []
+
+
+async def test_redirect_refuses_on_the_final_targets_owner(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """Ownership is enforced on the final target, not the addressed session."""
+    sender = peer_env["sender"]
+    old = _successor(peer_env, title="own-old")
+    new = _successor(peer_env, title="own-new", owner=BOB)
+    peer_env["conv_store"].set_labels(old.id, {SUCCEEDED_BY_LABEL_KEY: new.id})
+    resp = await peer_client.post(
+        f"/v1/sessions/{old.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"own-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert body["disposition"] == "refused", resp.text
+    assert body["reason"] == "not_same_owner"
+    assert body["redirected_to"] == new.id
+    assert peer_env["fake"].calls == []
+
+
+async def test_redirected_reply_marks_the_successor_thread(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """Reply matching runs against the final receiver, not the addressed id."""
+    sender = peer_env["sender"]
+    old = _successor(peer_env, title="reply-old")
+    new = _successor(peer_env, title="reply-new")
+    peer_env["conv_store"].set_labels(old.id, {SUCCEEDED_BY_LABEL_KEY: new.id})
+    thread = f"thread-{uuid.uuid4().hex}"
+    earlier = peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=new.id,
+            receiver_session_id=sender.id,
+            ref=thread,
+            text="question",
+            state="delivered",
+            created_at=1,
+            expires_at=2,
+        )
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{old.id}/peer-messages",
+        json={
+            "sender_session_id": sender.id,
+            "text": f"answer-{uuid.uuid4().hex}",
+            "correlation_id": thread,
+        },
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert body["disposition"] == "delivered", resp.text
+    assert body["reply_to"] == earlier.id
+    replied = peer_env["peer_store"].get(earlier.id)
+    assert replied is not None
+    assert replied.replied_at is not None

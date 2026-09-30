@@ -66,7 +66,11 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.user_preferences_store import read_collab_settings
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import PROJECT_LABEL_KEY, SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SUCCEEDED_BY_LABEL_KEY,
+)
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
@@ -97,6 +101,9 @@ _PEER_INBOUND_REFUSE = "refuse"
 # re-hold it while the receiver's inbound policy is still ``hold``.
 _PEER_RELEASED_REASON = "released"
 _OWNER_CHAIN_MAX_HOPS = 32
+# A succession chain is at most a few rotations deep; the bound only stops a
+# cyclic map from looping forever.
+_SUCCESSOR_MAX_HOPS = 8
 
 _WS_COLLAPSE_RE = re.compile(r"\s+")
 
@@ -652,6 +659,42 @@ def _top_level_ancestor(
     return current
 
 
+def resolve_succeeded_by(
+    conversation_store: ConversationStore,
+    session_id: str,
+) -> str:
+    """Follow ``omnigent.succeeded_by`` links to the final successor.
+
+    At most ``_SUCCESSOR_MAX_HOPS`` links are followed. A cycle is refused:
+    the original id is returned so callers behave as today, and the cycle is
+    logged. A missing session or an absent label ends the walk.
+
+    :param conversation_store: Store used for the session reads.
+    :param session_id: The addressed session.
+    :returns: The final successor id, or *session_id* on no/looping chain.
+    """
+    current = session_id
+    seen = {session_id}
+    for _ in range(_SUCCESSOR_MAX_HOPS):
+        conv = conversation_store.get_conversation(current)
+        if conv is None:
+            return current
+        successor = (conv.labels or {}).get(SUCCEEDED_BY_LABEL_KEY)
+        if not successor:
+            return current
+        if successor in seen:
+            _logger.warning(
+                "Session succession loop at %s -> %s; not redirecting",
+                current,
+                successor,
+                extra={"session_id": session_id},
+            )
+            return session_id
+        seen.add(successor)
+        current = successor
+    return current
+
+
 def effective_owner_id(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -1033,11 +1076,14 @@ def register_peer_routes(
             wait_seconds=wait_seconds,
         )
         async with _PEER_ADMISSION._lock_for(sender.id):
+            target_id = await asyncio.to_thread(
+                resolve_succeeded_by, conversation_store, receiver_id
+            )
             try:
-                return await _send_peer_message_locked(
+                result = await _send_peer_message_locked(
                     request,
                     sender,
-                    receiver_id,
+                    target_id,
                     body,
                     peer_id=peer_id,
                     deferred_until=deferred_until,
@@ -1050,13 +1096,16 @@ def register_peer_routes(
                 existing = await asyncio.to_thread(peer_message_store.get, peer_id)
                 if existing is None:
                     raise
-                return {
+                result = {
                     "disposition": "existing",
                     "peer_id": existing.id,
                     "ref": existing.ref,
                     "state": existing.state,
                     "reason": existing.reason,
                 }
+            if target_id != receiver_id:
+                result["redirected_to"] = target_id
+            return result
 
     async def _send_peer_message_locked(
         request: Request,
@@ -1747,4 +1796,5 @@ __all__ = [
     "format_peer_back_notice",
     "format_peer_envelope",
     "register_peer_routes",
+    "resolve_succeeded_by",
 ]
