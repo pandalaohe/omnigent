@@ -1477,6 +1477,38 @@ async def _wait_for_archive_idle(
         await asyncio.sleep(_facade._ARCHIVE_IDLE_POLL_S)
 
 
+def _runner_has_live_session(conversation_store: ConversationStore, runner_id: str) -> bool:
+    """Whether a session bound to ``runner_id`` is neither archived nor under an archived ancestor.
+
+    Archive flags only the archived root's row, and children share their parent's runner, so
+    one archived subtree must not tear down a runner the rest of its tree still uses.
+    """
+    archived_by_id: dict[str, bool] = {}
+
+    def _archived(conversation: Any) -> bool:
+        chain: list[str] = []
+        node = conversation
+        result = False
+        while node is not None and node.id not in chain:
+            if node.id in archived_by_id:
+                result = archived_by_id[node.id]
+                break
+            chain.append(node.id)
+            if node.archived:
+                result = True
+                break
+            parent_id = node.parent_conversation_id
+            node = conversation_store.get_conversation(parent_id) if parent_id else None
+        for conversation_id in chain:
+            archived_by_id[conversation_id] = result
+        return result
+
+    return any(
+        not _archived(conversation)
+        for conversation in conversation_store.list_conversations_by_runner_id(runner_id)
+    )
+
+
 async def _archive_stop_one(
     target_id: str,
     conversation: Any,
@@ -1745,6 +1777,14 @@ async def _archive_stop(
         if binding in stopped_bindings:
             continue
         stopped_bindings.add(binding)
+        try:
+            runner_in_use = await asyncio.to_thread(
+                _runner_has_live_session, conversation_store, conv.runner_id
+            )
+        except Exception:  # noqa: BLE001 - never stop a runner not proven unused.
+            runner_in_use = True
+        if runner_in_use:
+            continue
         _intentional_stop_sessions.add(target_id)
         try:
             delivered = await _facade._stop_session_host_runner(
