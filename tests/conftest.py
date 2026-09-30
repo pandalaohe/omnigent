@@ -104,12 +104,13 @@ def _sweep_orphans_of_dead_runs() -> None:
     """
     if os.environ.get("OMNIGENT_TEST_ORPHAN_SWEEP") == "0":
         return
-    for root, prefix in (
-        (Path(tempfile.gettempdir()), "omnigent-pytest-"),
+    roots = [(Path(tempfile.gettempdir()), "omnigent-pytest-")]
+    if os.name != "nt":
         # The bench root/prefix mirror BenchEnvironment._tmp in
-        # dev/benchmarks/omnigent/environment.py.
-        (Path("/tmp"), "omni-bench-"),
-    ):
+        # dev/benchmarks/omnigent/environment.py; its /tmp root is POSIX-only
+        # (on Windows ``Path("/tmp")`` is drive-less).
+        roots.append((Path("/tmp"), "omni-bench-"))
+    for root, prefix in roots:
         _swept, reaped, survivors = sweep_dead_owner_dirs(root, prefix)
         for cmdline in reaped:
             print(f"\nreaped orphan of a dead pytest run: {cmdline}", file=sys.stderr)

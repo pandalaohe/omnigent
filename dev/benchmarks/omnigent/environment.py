@@ -221,10 +221,11 @@ class BenchEnvironment:
     # ── lifecycle ────────────────────────────────────────────
 
     async def __aenter__(self) -> BenchEnvironment:
-        # A failure after _start spawned children must still stop them and
-        # remove the temp dir.
+        # Stop what _start spawned on failure, or when this await is cancelled
+        # while _start is still running: never _stop before _start finishes.
+        start = asyncio.get_running_loop().run_in_executor(None, self._start)
         try:
-            await asyncio.to_thread(self._start)
+            await asyncio.shield(start)
             # A request event hook injects the simulated client↔server network
             # delay before each request leaves the benchmark process. Registered
             # only when a delay is set so the zero-delay default path is untouched.
@@ -252,6 +253,8 @@ class BenchEnvironment:
                     "/mock/set_fallback", {"key": _POLICY_LLM_KEY, "text": _POLICY_ALLOW}
                 )
         except BaseException:
+            if not start.done():
+                await asyncio.wait([start])
             await self.__aexit__(None, None, None)
             raise
         return self

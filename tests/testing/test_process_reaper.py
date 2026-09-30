@@ -244,6 +244,37 @@ def test_sweep_reaps_and_removes_dead_owner_dir(tmp_path: Path) -> None:
         _kill_quietly(owner)
 
 
+@pytest.mark.posix_only
+def test_sweep_reaps_resolved_spelling_of_symlinked_root(tmp_path: Path) -> None:
+    """A symlinked root is swept for leaks carrying the resolved data-dir path.
+
+    conftest resolves its data dir (``/tmp`` → ``/private/tmp`` on macOS), so
+    a leak's ``OMNIGENT_DATA_DIR`` names the resolved spelling while the swept
+    entry is the unresolved one; both spellings must be reaped.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    d = real / "omnigent-pytest-dead"
+    d.mkdir()
+    owner = _dead_owner_marker(d)
+    leak: subprocess.Popen | None = None
+    try:
+        leak = _spawn(
+            _SLEEP_CHILD,
+            "omnigent-leak",
+            env={"OMNIGENT_DATA_DIR": str(d.resolve()), "PATH": "/usr/bin:/bin"},
+        )
+        sweep_dead_owner_dirs(link, "omnigent-pytest-", timeout=5)
+        leak.wait(timeout=10)
+        assert not d.exists()
+    finally:
+        if leak is not None:
+            _kill_quietly(leak)
+        _kill_quietly(owner)
+
+
 def test_sweep_keeps_dir_owned_by_live_process(tmp_path: Path) -> None:
     """A live owner's dir is kept, and its processes are left running."""
     d = tmp_path / "omnigent-pytest-live"

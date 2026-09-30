@@ -244,6 +244,11 @@ def sweep_dead_owner_dirs(
     and whose owner marker proves the owner gone, reap processes attributed
     to the dir and remove it.
 
+    Reaping tries every distinct spelling of the entry (``entry`` and its
+    ``resolve()``) because a process's recorded ``OMNIGENT_DATA_DIR`` may be
+    the resolved spelling on macOS (``/tmp`` → ``/private/tmp``) while its
+    command line carries the unresolved one.
+
     Safety rule: the liveness of the recorded owner decides, never age. A
     directory without a marker is kept — a concurrent run may be between
     ``mkdtemp`` and its marker write — and a live owner (another session or
@@ -271,7 +276,19 @@ def sweep_dead_owner_dirs(
                 continue
             if not _owner_is_dead(entry):
                 continue
-            entry_reaped, entry_survivors = reap_leaked_omnigent_processes(entry, timeout=timeout)
+            spellings = [entry]
+            with contextlib.suppress(OSError, RuntimeError):
+                resolved = entry.resolve()
+                if resolved != entry:
+                    spellings.append(resolved)
+            entry_reaped: list[str] = []
+            entry_survivors: list[str] = []
+            for spelling in spellings:
+                spelling_reaped, spelling_survivors = reap_leaked_omnigent_processes(
+                    spelling, timeout=timeout
+                )
+                entry_reaped.extend(spelling_reaped)
+                entry_survivors.extend(spelling_survivors)
             shutil.rmtree(entry, ignore_errors=True)
             swept.append(entry)
             reaped.extend(entry_reaped)
