@@ -12,10 +12,7 @@ import { Sparkline } from "@/components/Sparkline";
 import { Button } from "@/components/ui/button";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import {
-  type HealthCheckNotice,
-  useStartHealthCheck,
-} from "@/hooks/useStartHealthCheck";
+import { type HealthCheckNotice, useStartHealthCheck } from "@/hooks/useStartHealthCheck";
 import {
   useSystemHistory,
   useSystemStatus,
@@ -324,7 +321,7 @@ function ProcessRows({
           <tr data-depth={depth}>
             <td className="py-1 pr-3" style={{ paddingLeft: `${depth * 16 + 4}px` }}>
               <span
-                className="font-mono text-xs"
+                className="block truncate font-mono text-xs"
                 title={
                   node.row.role === "folded"
                     ? node.row.name
@@ -336,16 +333,24 @@ function ProcessRows({
             </td>
             <td className="py-1 pr-3 text-xs text-muted-foreground">
               {node.row.session_id !== null ? (
-                <Link to={`/c/${node.row.session_id}`} className="underline">
+                <Link
+                  to={`/c/${node.row.session_id}`}
+                  className="block truncate underline"
+                  title={sessionLabel(node.row.session_id, sessionTitles)}
+                >
                   {sessionLabel(node.row.session_id, sessionTitles)}
                 </Link>
               ) : (
                 "—"
               )}
             </td>
-            <td className="py-1 pr-3 text-right tabular-nums">{formatPct(node.cpu)}</td>
-            <td className="py-1 pr-3 text-right tabular-nums">{formatBytes(node.rss)}</td>
-            <td className="py-1 text-right tabular-nums">
+            <td className="py-1 pr-3 text-right whitespace-nowrap tabular-nums">
+              {formatPct(node.cpu)}
+            </td>
+            <td className="py-1 pr-3 text-right whitespace-nowrap tabular-nums">
+              {formatBytes(node.rss)}
+            </td>
+            <td className="py-1 text-right whitespace-nowrap tabular-nums">
               {formatUptime(node.row.started_at)}
             </td>
           </tr>
@@ -367,20 +372,29 @@ function ProcessTree({
 }) {
   const roots = buildProcessTree(processes);
   return (
-    <table className="w-full" data-testid="process-tree">
-      <thead>
-        <tr className="text-xs text-muted-foreground">
-          <th className="py-1 pr-3 text-left font-medium">Process</th>
-          <th className="py-1 pr-3 text-left font-medium">Session</th>
-          <th className="py-1 pr-3 text-right font-medium">CPU</th>
-          <th className="py-1 pr-3 text-right font-medium">Memory</th>
-          <th className="py-1 text-right font-medium">Uptime</th>
-        </tr>
-      </thead>
-      <tbody>
-        <ProcessRows nodes={roots} sessionTitles={sessionTitles} />
-      </tbody>
-    </table>
+    <div className="max-h-80 overflow-auto" data-testid="process-tree-scroll">
+      <table className="w-full table-fixed" data-testid="process-tree">
+        <colgroup>
+          <col />
+          <col />
+          <col className="w-16" />
+          <col className="w-20" />
+          <col className="w-16" />
+        </colgroup>
+        <thead>
+          <tr className="text-xs text-muted-foreground">
+            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-left font-medium">Process</th>
+            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-left font-medium">Session</th>
+            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-right font-medium">CPU</th>
+            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-right font-medium">Memory</th>
+            <th className="sticky top-0 z-10 bg-card py-1 text-right font-medium">Uptime</th>
+          </tr>
+        </thead>
+        <tbody>
+          <ProcessRows nodes={roots} sessionTitles={sessionTitles} />
+        </tbody>
+      </table>
+    </div>
   );
 }
 

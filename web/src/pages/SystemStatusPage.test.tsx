@@ -281,6 +281,33 @@ describe("SystemStatusPage", () => {
     expect(sessionLink).toHaveAttribute("href", "/c/conv_hot");
   });
 
+  it("keeps a long session id inside a fixed-layout table in a scroll container", () => {
+    const sessionId = "0123456789abcdef0123456789abcdef";
+    const view = makeView({ server: false });
+    const snapshot = view.hosts[0].last_snapshot;
+    if (snapshot === null) throw new Error("host_1 is expected to have a snapshot");
+    snapshot.processes[0].session_id = sessionId;
+    mocks.status.current = {
+      data: view,
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "View processes" }));
+
+    const scroll = screen.getByTestId("process-tree-scroll");
+    const tree = screen.getByTestId("process-tree");
+    expect(scroll).toContainElement(tree);
+    expect(tree).toHaveClass("table-fixed");
+
+    // No sidebar title for this id, so the id itself is the label and tooltip.
+    const sessionLink = within(tree).getByRole("link", { name: sessionId });
+    expect(sessionLink).toHaveAttribute("title", sessionId);
+    expect(sessionLink).toHaveAttribute("href", `/c/${sessionId}`);
+  });
+
   it("labels process rows by role and keeps the OS name and pid in the title", () => {
     mocks.status.current = {
       data: makeView({ server: false }),
