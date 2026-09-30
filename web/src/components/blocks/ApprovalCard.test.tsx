@@ -1795,7 +1795,7 @@ describe("ApprovalCard — mirrored source line", () => {
 
     const line = screen.getByTestId("approval-card-source");
     expect(line.textContent).toBe(
-      "来自子会话 auth-fix· Claude Code @ laptop· /repo/worktrees/auth-fix",
+      "From child session auth-fix· Claude Code @ laptop· /repo/worktrees/auth-fix",
     );
     // The cwd keeps its full path in a tooltip for narrow cards.
     expect(screen.getByTitle("/repo/worktrees/auth-fix").textContent).toBe(
@@ -1818,7 +1818,9 @@ describe("ApprovalCard — mirrored source line", () => {
       />,
     );
 
-    expect(screen.getByTestId("approval-card-source").textContent).toBe("来自子会话 worker");
+    expect(screen.getByTestId("approval-card-source").textContent).toBe(
+      "From child session worker",
+    );
   });
 
   it("keeps the source line on a responded mirrored card", () => {
@@ -1832,6 +1834,8 @@ describe("ApprovalCard — mirrored source line", () => {
       />,
     );
 
-    expect(screen.getByTestId("approval-card-source").textContent).toContain("来自子会话 auth-fix");
+    expect(screen.getByTestId("approval-card-source").textContent).toContain(
+      "From child session auth-fix",
+    );
   });
 });
