@@ -375,6 +375,15 @@ async def _phase_rekey(
         for item in body.get("dropped") or []:
             if isinstance(item, dict):
                 dropped.append(item)
+        # A later runner's failure must not lose what an earlier runner
+        # already cancelled: a retry calls that runner again, which has
+        # nothing left to drop. Persist each report on the same phase.
+        receipt = await _advance(
+            receipt,
+            "moved",
+            conversation_store=conversation_store,
+            dropped=dropped,
+        )
     return await _advance(
         receipt,
         "rekeyed",
@@ -773,8 +782,15 @@ def _schedule_retry(
     _retry_attempts[receipt_id] = attempt + 1
     delay = _RETRY_BACKOFFS_S[attempt]
 
+    task: asyncio.Task[None] | None = None
+
     async def _retry() -> None:
         await asyncio.sleep(delay)
+        # A failure inside ``_resume_one`` calls ``_schedule_retry`` again,
+        # which would find this still-running task and only bump the counter.
+        # Dropping the entry first lets it schedule the next bounded attempt.
+        if task is not None and _retry_tasks.get(receipt_id) is task:
+            _retry_tasks.pop(receipt_id, None)
         await _resume_one(
             receipt_id,
             conversation_store=conversation_store,

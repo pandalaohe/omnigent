@@ -1054,7 +1054,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         body: SessionEventInput,
-    ) -> str:
+    ) -> str | None:
         """Return the successor a runner-posted sub-agent wake must reach.
 
         Only a runner-authenticated post (tunnel token bound to the addressed
@@ -1065,7 +1065,9 @@ def register_events_routes(
         :param request: The incoming request carrying the tunnel header.
         :param session_id: The session the event was addressed to.
         :param body: The validated event.
-        :returns: The successor id, or *session_id* when not redirected.
+        :returns: The successor id, *session_id* when not redirected, or
+            ``None`` when the redirect applies but the successor has not
+            released its held delivery yet (do not dispatch).
         """
         if body.type != "message" or body.data.get("role", "user") != "user":
             return session_id
@@ -1081,12 +1083,23 @@ def register_events_routes(
         )
         if successor_id == session_id:
             return session_id
-        if _has_runner_created_by_authority(request, addressed):
-            return successor_id
-        successor = await asyncio.to_thread(conversation_store.get_conversation, successor_id)
-        if successor is not None and _has_runner_created_by_authority(request, successor):
-            return successor_id
-        return session_id
+        authorized = _has_runner_created_by_authority(request, addressed)
+        if not authorized:
+            successor = await asyncio.to_thread(conversation_store.get_conversation, successor_id)
+            authorized = successor is not None and _has_runner_created_by_authority(
+                request, successor
+            )
+        if not authorized:
+            return session_id
+        receipt = await asyncio.to_thread(
+            conversation_store.get_succession, session_id, successor_id
+        )
+        if receipt is not None and receipt.phase in ("moved", "rekeyed", "opened"):
+            # Re-key has not released the successor yet: the result this wake
+            # announces is held for it, and its own release wakes it after the
+            # opening exists. Dispatching now would start its turn first.
+            return None
+        return successor_id
 
     from omnigent.server.routes.sessions.routes_peer import (
         register_peer_routes,
@@ -1231,7 +1244,10 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        session_id = await _subagent_wake_successor(request, session_id, body)
+        successor_id = await _subagent_wake_successor(request, session_id, body)
+        if successor_id is None:
+            return {"queued": False}
+        session_id = successor_id
         user_id, conv = await _authorized_conversation(
             request, session_id, acting_user_id=acting_user_id
         )

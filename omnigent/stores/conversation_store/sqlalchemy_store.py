@@ -4744,6 +4744,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         old_id: str,
         new_id: str,
         receipt_id: str,
+        *,
+        reverse_of: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Move old's still-unarchived direct children and their subtrees under new.
 
@@ -4756,6 +4758,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param old_id: Top-level session whose children move.
         :param new_id: Top-level successor session.
         :param receipt_id: Pre-generated id for the receipt row.
+        :param reverse_of: When ``True`` this move reverses an existing link
+            (``new_id.succeeded_by == old_id``); the forward pair is removed
+            in the same transaction, and only once the move is known to
+            proceed, so a refusal leaves it intact.
         :returns: ``(direct_ids, moved_ids)``.
         :raises SuccessionRefusedError: With ``code`` ``same_session``,
             ``not_found``, ``not_top_level``, ``target_archived`` or
@@ -4866,6 +4872,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(root_conversation_id=new_id)
             )
+            if reverse_of:
+                # Undo: drop the forward pair only now, when the inverse move
+                # has passed every refusal; a refused move must keep it.
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == new_id,
+                        SqlConversationLabel.key == SUCCEEDED_BY_LABEL_KEY,
+                        SqlConversationLabel.value == old_id,
+                    )
+                )
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == old_id,
+                        SqlConversationLabel.key == SUCCEEDS_LABEL_KEY,
+                        SqlConversationLabel.value == new_id,
+                    )
+                )
             _upsert_labels(ap_sess, old_id, {SUCCEEDED_BY_LABEL_KEY: new_id}, now)
             _upsert_labels(ap_sess, new_id, {SUCCEEDS_LABEL_KEY: old_id}, now)
             ap_sess.add(
@@ -4958,34 +4983,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         return run_write_transaction(
             self._conv_session_immediate,
             "update_succession",
-            write,
-        )
-
-    def clear_succession_link(self, old_id: str, new_id: str) -> None:
-        """Remove the succession labels when they still name this exact pair."""
-        workspace_id = current_workspace_id()
-
-        def write(session: Session) -> None:
-            session.execute(
-                delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == workspace_id,
-                    SqlConversationLabel.conversation_id == old_id,
-                    SqlConversationLabel.key == SUCCEEDED_BY_LABEL_KEY,
-                    SqlConversationLabel.value == new_id,
-                )
-            )
-            session.execute(
-                delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == workspace_id,
-                    SqlConversationLabel.conversation_id == new_id,
-                    SqlConversationLabel.key == SUCCEEDS_LABEL_KEY,
-                    SqlConversationLabel.value == old_id,
-                )
-            )
-
-        run_write_transaction(
-            self._conv_session_immediate,
-            "clear_succession_link",
             write,
         )
 

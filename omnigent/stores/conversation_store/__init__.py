@@ -1172,6 +1172,8 @@ class ConversationStore(ABC):
         old_id: str,
         new_id: str,
         receipt_id: str,
+        *,
+        reverse_of: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Move old's still-unarchived direct children and their subtrees under new.
 
@@ -1185,6 +1187,10 @@ class ConversationStore(ABC):
         :param old_id: Top-level session whose children move.
         :param new_id: Top-level successor session.
         :param receipt_id: Pre-generated id for the receipt row.
+        :param reverse_of: When ``True`` this move reverses an existing link
+            (``new_id.succeeded_by == old_id``); the forward pair is removed
+            in the same transaction, and only once the move is known to
+            proceed, so a refusal leaves it intact.
         :returns: ``(direct_ids, moved_ids)`` — the kept direct children and
             every moved session (kept children plus their descendants).
         :raises SuccessionRefusedError: With ``code`` ``same_session``,
@@ -1230,16 +1236,6 @@ class ConversationStore(ABC):
         :param fields: Column updates, e.g. ``phase="rekeyed"``.
         :returns: ``True`` when the row was updated, ``False`` when the
             phase no longer matched or the receipt is missing.
-        """
-        ...
-
-    @abstractmethod
-    def clear_succession_link(self, old_id: str, new_id: str) -> None:
-        """Remove the succession labels when they still name this exact pair.
-
-        Deletes ``succeeded_by`` from ``old_id`` only when its value equals
-        ``new_id`` and ``succeeds`` from ``new_id`` only when its value equals
-        ``old_id``, so a later succession's link is never clobbered.
         """
         ...
 

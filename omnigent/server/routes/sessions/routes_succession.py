@@ -201,7 +201,7 @@ def register_succession_routes(
         a parent and without live children is a ``noop`` — ordinary rotations
         must keep today's behaviour. Undo is the same call reversed: when the
         target still points back at the caller via ``omnigent.succeeded_by``,
-        the link is cleared first and the move writes the inverse.
+        the move transaction clears the forward pair and writes the inverse.
         """
         user_id = _get_user_id(request, auth_provider)
         old_conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -229,14 +229,9 @@ def register_succession_routes(
         )
 
         # Undo (D10): the target succeeded the caller, so this call reverses
-        # that succession. Clearing the forward pointer first keeps the
-        # redirect from looping while the inverse move writes its own link.
-        if target_conversation.labels.get(SUCCEEDED_BY_LABEL_KEY) == session_id:
-            await asyncio.to_thread(
-                conversation_store.clear_succession_link,
-                target_id,
-                session_id,
-            )
+        # that succession. The store swaps the link inside the move
+        # transaction, so a refused move leaves the forward pointer intact.
+        reverse_of = target_conversation.labels.get(SUCCEEDED_BY_LABEL_KEY) == session_id
 
         if old_conversation.parent_conversation_id is not None:
             return {"status": "noop"}
@@ -250,6 +245,7 @@ def register_succession_routes(
                     session_id,
                     target_id,
                     receipt_id,
+                    reverse_of=reverse_of,
                 )
             except SuccessionRefusedError as exc:
                 raise OmnigentError(

@@ -200,6 +200,41 @@ async def test_succession_rekeys_children_onto_new_parent(
 
 
 @pytest.mark.asyncio
+async def test_moved_grandchild_work_stays_parented_by_its_own_parent(
+    _clean_succession_state: None,
+) -> None:
+    """A grandchild in the moved set keeps its parent; only old's entries re-key."""
+    runner_app._session_inboxes_ref[OLD_SESSION_ID] = asyncio.Queue()
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    child_id = "conv_child_A"
+    grandchild_id = "conv_grandchild_A1"
+    runner_app.register_subagent_work(
+        parent_session_id=OLD_SESSION_ID,
+        child_session_id=child_id,
+        agent="reviewer",
+        title="A",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=child_id,
+        child_session_id=grandchild_id,
+        agent="reviewer",
+        title="A1",
+    )
+    app, _server_client = _build_runner()
+    async with _runner_client(app) as client:
+        resp = await _post_succession(client, moved_ids=[child_id, grandchild_id])
+
+    assert resp.status_code == 200
+    child_entry = runner_app.get_subagent_work(child_id)
+    grandchild_entry = runner_app.get_subagent_work(grandchild_id)
+    assert child_entry is not None and child_entry.parent_session_id == NEW_SESSION_ID
+    assert grandchild_entry is not None and grandchild_entry.parent_session_id == child_id
+    assert [entry.child_session_id for entry in runner_app.list_subagent_work(child_id)] == [
+        grandchild_id
+    ]
+
+
+@pytest.mark.asyncio
 async def test_late_registration_after_succession_lands_under_new_parent(
     _clean_succession_state: None,
 ) -> None:

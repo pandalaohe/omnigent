@@ -2258,49 +2258,46 @@ def register_subagent_work(
 def _rekey_subagent_work_for_succession(
     old_parent_id: str,
     new_parent_id: str,
-    moved_ids: Sequence[str],
 ) -> None:
     """
     Move this runner's delivery state for a rotated session onto its successor.
 
-    Every work entry the server moved (its child is in *moved_ids*) and any
-    entry still parented by *old_parent_id* is re-parented so a later result
-    reaches the successor instead of the retired session.
+    Only work entries currently parented by *old_parent_id* re-key. A
+    grandchild the server also moved belongs to its own moved parent and keeps
+    it, so its result reaches that parent rather than the successor; a late
+    registration against the stale parent is rewritten at registration through
+    ``_succeeded_parents``.
 
     :param old_parent_id: The retired parent session, e.g. ``"conv_old123"``.
     :param new_parent_id: Its successor, e.g. ``"conv_new456"``.
-    :param moved_ids: Every session the server moved under the successor.
     """
-    child_ids = set(moved_ids)
-    child_ids.update(_subagent_work_by_parent.get(old_parent_id, set()))
-    for child_id in child_ids:
-        # A drained child left the work index, but its retained result key and
-        # origin are still owned by the old parent; follow the successor so a
-        # later per-parent teardown cannot drop the new mother's state.
-        if _subagent_retained_state_parents.get(child_id) == old_parent_id:
-            _subagent_retained_state_parents[child_id] = new_parent_id
+    for child_id in list(_subagent_work_by_parent.get(old_parent_id, set())):
         entry = _subagent_work_by_child.get(child_id)
-        if entry is None or entry.parent_session_id == new_parent_id:
+        if entry is None or entry.parent_session_id != old_parent_id:
             continue
-        prior_parent_id = entry.parent_session_id
-        siblings = _subagent_work_by_parent.get(prior_parent_id)
+        siblings = _subagent_work_by_parent.get(old_parent_id)
         if siblings is not None:
             siblings.discard(child_id)
             if not siblings:
-                _subagent_work_by_parent.pop(prior_parent_id, None)
+                _subagent_work_by_parent.pop(old_parent_id, None)
         entry.parent_session_id = new_parent_id
         _subagent_work_by_parent.setdefault(new_parent_id, set()).add(child_id)
-        if _subagent_retained_state_parents.get(child_id) == prior_parent_id:
+    # A drained child left the work index, but its retained result key and
+    # fan-out metadata are still owned by the old parent; follow the successor
+    # so a later per-parent teardown cannot drop the new mother's state.
+    for child_id, parent_id in list(_subagent_retained_state_parents.items()):
+        if parent_id == old_parent_id:
             _subagent_retained_state_parents[child_id] = new_parent_id
-        meta = _child_session_parents.get(child_id)
-        if meta is not None:
-            register_child_session(
-                child_id,
-                parent_session_id=new_parent_id,
-                title=meta.title,
-                tool=meta.tool,
-                session_name=meta.session_name,
-            )
+    for child_id, meta in list(_child_session_parents.items()):
+        if meta.parent_id != old_parent_id:
+            continue
+        register_child_session(
+            child_id,
+            parent_session_id=new_parent_id,
+            title=meta.title,
+            tool=meta.tool,
+            session_name=meta.session_name,
+        )
 
 
 def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -12856,7 +12853,7 @@ def create_runner_app(
         # re-hold a successor that no later release would drain.
         first_call = _succeeded_parents.get(session_id) != target_session_id
         _succeeded_parents[session_id] = target_session_id
-        _rekey_subagent_work_for_succession(session_id, target_session_id, moved_ids)
+        _rekey_subagent_work_for_succession(session_id, target_session_id)
         if first_call and target_session_id in _session_inboxes:
             # Hold the successor's delivery until the server posts the opening
             # message: the retired session's queued items move here first, and

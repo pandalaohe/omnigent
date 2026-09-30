@@ -271,37 +271,3 @@ def test_list_unfinished_successions_omits_done(
 
     unfinished = conversation_store.list_unfinished_successions()
     assert [receipt.id for receipt in unfinished] == ["rcpt-b"]
-
-
-def test_clear_succession_link_only_removes_the_matching_pair(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """Undo clears the forward pointer, but never a later succession's link."""
-    old = conversation_store.create_conversation(title="old")
-    _child(conversation_store, old.id, "A")
-    new = conversation_store.create_conversation(title="new")
-    _move(conversation_store, old.id, new.id)
-    assert (
-        conversation_store.update_succession("rcpt-1", expected_phase="moved", phase="done")
-        is True
-    )
-
-    conversation_store.clear_succession_link(old.id, new.id)
-
-    old_row = conversation_store.get_conversation(old.id)
-    assert old_row is not None
-    assert SUCCEEDED_BY_LABEL_KEY not in old_row.labels
-    new_row = conversation_store.get_conversation(new.id)
-    assert new_row is not None
-    assert SUCCEEDS_LABEL_KEY not in new_row.labels
-
-    conversation_store.set_labels(old.id, {SUCCEEDED_BY_LABEL_KEY: "other"})
-    conversation_store.set_labels(new.id, {SUCCEEDS_LABEL_KEY: "other"})
-    conversation_store.clear_succession_link(old.id, new.id)
-
-    old_row = conversation_store.get_conversation(old.id)
-    assert old_row is not None
-    assert old_row.labels[SUCCEEDED_BY_LABEL_KEY] == "other"
-    new_row = conversation_store.get_conversation(new.id)
-    assert new_row is not None
-    assert new_row.labels[SUCCEEDS_LABEL_KEY] == "other"

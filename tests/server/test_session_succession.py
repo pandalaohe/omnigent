@@ -9,6 +9,7 @@ the receipt through ``rekeyed → opened → released → cards_closed → archi
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -59,6 +60,7 @@ class _FakeRunnerClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any] | None]] = []
         self.succession_status = 200
+        self.succession_failures = 0
         self.release_failures = 0
         self.dropped: list[dict[str, Any]] = []
 
@@ -72,6 +74,9 @@ class _FakeRunnerClient:
         del timeout
         self.posts.append((url, json))
         if url.endswith("/succession"):
+            if self.succession_failures > 0:
+                self.succession_failures -= 1
+                return httpx.Response(503, json={"error": "busy"})
             if self.succession_status == 409:
                 return httpx.Response(409, json={"error": "target_not_ready"})
             if self.succession_status >= 400:
@@ -363,6 +368,46 @@ async def test_succession_calls_every_distinct_runner_with_the_full_move(
         assert release_posts == [f"/v1/sessions/{new}/succession/release"], runner_id
 
 
+async def test_succession_later_runner_failure_keeps_earlier_dropped_inventory(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later runner's failure must not lose an earlier runner's dropped list."""
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", ())
+    monkeypatch.setattr(succession_module, "_retry_attempts", {})
+    monkeypatch.setattr(succession_module, "_retry_tasks", {})
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    _create(store, parent=old, title="remote", runner_id=RUNNER_ID_B)
+    item = {"kind": "timer", "id": "timer_1", "label": "wake"}
+    first_runner = runners.for_runner(RUNNER_ID)
+    first_runner.dropped = [item]
+    second_runner = runners.for_runner(RUNNER_ID_B)
+    second_runner.succession_failures = 1
+
+    first = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new},
+    )
+    assert first.status_code == 200
+    assert first.json()["phase"] == "moved"
+    receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.dropped == [item]
+
+    # The runner is done cancelling: its retry answers nothing new.
+    first_runner.dropped = []
+    second = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new},
+    )
+    assert second.status_code == 200
+    assert second.json()["status"] == "done"
+    receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.dropped == [item]
+
+
 async def test_succession_without_handover_or_questions_does_not_wake(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
@@ -451,6 +496,37 @@ async def test_succession_target_not_ready_stays_moved_then_resumes(
     assert second.status_code == 200
     assert second.json()["status"] == "done"
     receipt = store.get_succession(old, new)
+    assert receipt is not None and receipt.phase == "done"
+
+
+async def test_succession_retry_that_fails_again_keeps_retrying(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-process retry that fails schedules the next attempt until done."""
+    monkeypatch.setattr(succession_module, "_RETRY_BACKOFFS_S", (0.01, 0.01, 0.01, 0.01))
+    monkeypatch.setattr(succession_module, "_retry_attempts", {})
+    monkeypatch.setattr(succession_module, "_retry_tasks", {})
+    old = _create(store, title="mother")
+    new = _create(store, title="successor")
+    _create(store, parent=old, title="A")
+    runner.release_failures = 3
+
+    first = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new},
+    )
+    assert first.status_code == 200
+    assert first.json()["phase"] == "opened"
+
+    receipt = None
+    for _ in range(300):
+        receipt = store.get_succession(old, new)
+        if receipt is not None and receipt.phase == "done":
+            break
+        await asyncio.sleep(0.02)
     assert receipt is not None and receipt.phase == "done"
 
 
@@ -587,6 +663,34 @@ async def test_succession_undo_flips_links_and_children(
     assert moved_back is not None
     assert moved_back.parent_conversation_id == old
     assert moved_back.root_conversation_id == old
+
+
+async def test_succession_refused_undo_keeps_the_forward_link(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+) -> None:
+    """A refused inverse move must leave the forward labels intact."""
+    old = _create(store, title="A")
+    new = _create(store, title="B")
+    _create(store, parent=old, title="child")
+
+    first = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new},
+    )
+    assert first.status_code == 200 and first.json()["status"] == "done"
+
+    undo = await client.post(
+        f"/v1/sessions/{new}/succession",
+        json={"target_session_id": old},
+    )
+    assert undo.status_code == 409
+
+    old_row = store.get_conversation(old)
+    new_row = store.get_conversation(new)
+    assert old_row is not None and old_row.labels[SUCCEEDED_BY_LABEL_KEY] == new
+    assert new_row is not None and new_row.labels[SUCCEEDS_LABEL_KEY] == old
 
 
 async def test_succession_retargets_queued_peer_mail(
