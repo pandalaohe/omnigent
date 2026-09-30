@@ -19057,7 +19057,7 @@
     },
     "/v1/sessions/{session_id}/succession": {
       "post": {
-        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop` \u2014 ordinary rotations\nmust keep today's behaviour. Undo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe link is cleared first and the move writes the inverse.",
+        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop` \u2014 ordinary rotations\nmust keep today's behaviour. Undo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe move transaction clears the forward pair and writes the inverse.",
         "operationId": "start_session_succession_v1_sessions__session_id__succession_post",
         "parameters": [
           {

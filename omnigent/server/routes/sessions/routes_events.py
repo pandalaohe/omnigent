@@ -273,6 +273,7 @@ from omnigent.stores.conversation_store import (
     DELETION_CLAIM_HEARTBEAT_INTERVAL_S,
     DELETION_CLAIM_STALE_AFTER_S,
     RUNNER_LIVENESS_TTL_S,
+    SUCCEEDED_BY_LABEL_KEY,
     ConversationArchiveClosingError,
     runner_seen_is_fresh,
 )
@@ -1091,10 +1092,25 @@ def register_events_routes(
             )
         if not authorized:
             return session_id
-        receipt = await asyncio.to_thread(
-            conversation_store.get_succession, session_id, successor_id
-        )
-        if receipt is not None and receipt.phase in ("moved", "rekeyed", "opened"):
+
+        def _chain_has_pre_release_link() -> bool:
+            current = session_id
+            for _ in range(_SUCCESSOR_MAX_HOPS):
+                if current == successor_id:
+                    return False
+                conv = conversation_store.get_conversation(current)
+                link = (
+                    (conv.labels or {}).get(SUCCEEDED_BY_LABEL_KEY) if conv is not None else None
+                )
+                if not link:
+                    return False
+                receipt = conversation_store.get_succession(current, link)
+                if receipt is not None and receipt.phase in ("moved", "rekeyed", "opened"):
+                    return True
+                current = link
+            return False
+
+        if await asyncio.to_thread(_chain_has_pre_release_link):
             # Re-key has not released the successor yet: the result this wake
             # announces is held for it, and its own release wakes it after the
             # opening exists. Dispatching now would start its turn first.
@@ -1102,6 +1118,7 @@ def register_events_routes(
         return successor_id
 
     from omnigent.server.routes.sessions.routes_peer import (
+        _SUCCESSOR_MAX_HOPS,
         register_peer_routes,
         resolve_succeeded_by,
     )

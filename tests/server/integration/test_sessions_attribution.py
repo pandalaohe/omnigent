@@ -698,6 +698,61 @@ async def test_post_event_wake_before_successor_release_is_not_dispatched(
 
 
 @pytest.mark.asyncio
+async def test_post_event_wake_held_when_a_later_chain_link_is_pre_release(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake crossing ``old -> mid -> new`` holds on a pre-release link.
+
+    Only the ``mid -> new`` receipt is pre-release; the ``old -> mid``
+    receipt is done, so the pair lookup against the final successor finds
+    no receipt and the wake must not reach ``new``.
+    """
+    from omnigent.runner.app import _format_subagent_wake_notice
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    old_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    mid_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    new_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.create_conversation(parent_conversation_id=old_id, title="A")
+    conv_store.reassign_live_children(old_id, mid_id, "rcpt-ab")
+    assert conv_store.update_succession("rcpt-ab", expected_phase="moved", phase="done") is True
+    conv_store.reassign_live_children(mid_id, new_id, "rcpt-bc")
+    assert conv_store.update_succession("rcpt-bc", expected_phase="moved", phase="rekeyed") is True
+    runner_headers = _bind_runner(db_uri, new_id)
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=1
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{old_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": notice}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+
+    for session_id in (old_id, mid_id, new_id):
+        items = await asyncio.to_thread(conv_store.list_items, session_id)
+        assert items.data == []
+
+
+@pytest.mark.asyncio
 async def test_post_event_plain_message_to_a_succeeded_session_is_unchanged(
     auth_client: httpx.AsyncClient,
     db_uri: str,
