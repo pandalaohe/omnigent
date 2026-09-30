@@ -9490,23 +9490,31 @@ async def test_sys_session_get_info_single_shape_unchanged_with_new_fields() -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "last_total_tokens,context_window,expected_fraction",
+    "last_total_tokens,context_window,auto_compact_token_limit,"
+    "expected_fraction,expected_compact_fraction",
     [
-        pytest.param(50000, None, None, id="missing-window"),
-        pytest.param(50000, 0, None, id="zero-window"),
-        pytest.param(0, 200000, 0.0, id="zero-tokens"),
+        pytest.param(50000, None, None, None, None, id="missing-window"),
+        pytest.param(50000, 0, None, None, None, id="zero-window"),
+        pytest.param(0, 200000, None, 0.0, None, id="zero-tokens"),
+        pytest.param(50_000, None, 100_000, None, 0.5, id="compact-without-window"),
+        pytest.param(50_000, 200_000, 300_000, 0.25, 0.167, id="compact-limit"),
+        pytest.param(50_000, 200_000, 0, 0.25, None, id="zero-compact-limit"),
     ],
 )
 async def test_sys_session_get_info_context_fraction(
     last_total_tokens: int,
     context_window: int | None,
+    auto_compact_token_limit: int | None,
     expected_fraction: float | None,
+    expected_compact_fraction: float | None,
 ) -> None:
     """
     ``context_used_fraction`` needs a positive window, and zero tokens is a
     valid reading: a missing (or zero) window leaves the fraction ``None`` —
     a fabricated 0 or a divide error would both misreport context pressure —
-    while 0 tokens over a real window is exactly ``0.0``.
+    while 0 tokens over a real window is exactly ``0.0``. The
+    ``compact_used_fraction`` compares against the harness-reported
+    auto-compaction window instead, so it is ``None`` when that is absent.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -9517,6 +9525,7 @@ async def test_sys_session_get_info_context_fraction(
                 "conv_ctx",
                 last_total_tokens=last_total_tokens,
                 context_window=context_window,
+                auto_compact_token_limit=auto_compact_token_limit,
             ),
         )
 
@@ -9535,6 +9544,8 @@ async def test_sys_session_get_info_context_fraction(
     assert info["context_tokens"] == last_total_tokens
     assert info["context_window"] == context_window
     assert info["context_used_fraction"] == expected_fraction
+    assert info["auto_compact_token_limit"] == auto_compact_token_limit
+    assert info["compact_used_fraction"] == expected_compact_fraction
 
 
 @pytest.mark.asyncio

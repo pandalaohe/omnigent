@@ -8044,6 +8044,79 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     assert claude_native_bridge.read_user_effort_level() is None
 
 
+def test_read_user_auto_compact_window_prefers_settings_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settings ``env`` value wins over the inherited shell variable."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "123000"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "456000")
+    assert claude_native_bridge.read_user_auto_compact_window() == 123000
+
+
+def test_read_user_auto_compact_window_uses_environment_when_settings_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a settings value, the claude child's inherited env is read."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", " 456000 ")
+    assert claude_native_bridge.read_user_auto_compact_window() == 456000
+
+
+@pytest.mark.parametrize(
+    "settings_payload",
+    [
+        pytest.param({}, id="settings-without-env"),
+        pytest.param({"env": {}}, id="env-without-key"),
+        pytest.param({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": ""}}, id="empty"),
+        pytest.param({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "0"}}, id="zero"),
+        pytest.param({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "abc"}}, id="non-digit"),
+        pytest.param({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "12.5"}}, id="non-integer"),
+        pytest.param({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": 1000}}, id="non-string"),
+    ],
+)
+def test_read_user_auto_compact_window_none_when_missing_or_invalid(
+    settings_payload: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a positive digit string counts; every other value reads as unset."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps(settings_payload), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    assert claude_native_bridge.read_user_auto_compact_window() is None
+
+
+def test_read_user_auto_compact_window_invalid_settings_value_falls_back_to_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unusable settings value defers to the inherited shell variable."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "not-a-number"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "300000")
+    assert claude_native_bridge.read_user_auto_compact_window() == 300000
+
+
+def test_read_user_auto_compact_window_malformed_settings_falls_back_to_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unparseable settings JSON must not hide a valid shell variable."""
+    settings = tmp_path / "settings.json"
+    settings.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "300000")
+    assert claude_native_bridge.read_user_auto_compact_window() == 300000
+
+
 # ---------------------------------------------------------------------------
 # launch_model storage and retrieval
 # ---------------------------------------------------------------------------

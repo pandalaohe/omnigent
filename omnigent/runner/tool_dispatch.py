@@ -7426,6 +7426,7 @@ async def _session_info_item(
         runner_online = await _runner_online_or_none(snap_runner_id, server_client)
     context_tokens = snap.get("last_total_tokens")
     context_window = snap.get("context_window")
+    auto_compact_token_limit = snap.get("auto_compact_token_limit")
     item: _JsonObject = {
         "session_id": snap.get("id"),
         "status": snap.get("status"),
@@ -7477,6 +7478,10 @@ async def _session_info_item(
         "context_tokens": context_tokens,
         "context_window": context_window,
         "context_used_fraction": _session_info_context_fraction(context_tokens, context_window),
+        "auto_compact_token_limit": auto_compact_token_limit,
+        "compact_used_fraction": _session_info_context_fraction(
+            context_tokens, auto_compact_token_limit
+        ),
         "last_error": snap.get("last_task_error"),
     }
     if include_host_readiness:
