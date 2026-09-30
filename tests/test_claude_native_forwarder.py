@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
 import json
 import logging
@@ -71,6 +72,18 @@ def _allow_tmp_path_as_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _clear_spawn_tool_use_id_cache() -> Iterator[None]:
+    """
+    Drop the process-local spawn-id cursor cache between tests.
+
+    :returns: None.
+    """
+    forwarder._SPAWN_TOOL_USE_ID_CACHE.clear()
+    yield
+    forwarder._SPAWN_TOOL_USE_ID_CACHE.clear()
 
 
 def test_provider_usage_limits_post_only_on_change_or_refresh() -> None:
@@ -16666,3 +16679,250 @@ async def test_timed_out_batch_is_split_not_dropped(
     updated = checkpoint.state.subagents["split"]
     assert updated.byte_offset == 30
     assert updated.seen_source_ids == tuple(item.source_id for item in items)
+
+
+def _spawn_tool_use_record(
+    *,
+    tool_use_id: str,
+    is_sidechain: bool = False,
+    tool_name: str = "Agent",
+) -> dict[str, Any]:
+    """Build the assistant row carrying one spawn ``tool_use`` block."""
+    return {
+        "isSidechain": is_sidechain,
+        "type": "assistant",
+        "uuid": f"spawn-record-{tool_use_id}",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": tool_name,
+                    "input": {"description": "test"},
+                }
+            ],
+        },
+    }
+
+
+def _write_jsonl_rows(path: Path, rows: list[Any]) -> None:
+    """Write JSONL rows, allowing deliberately invalid raw string lines."""
+    lines = [row if isinstance(row, str) else json.dumps(row) for row in rows]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_tool_use_ids_in_transcript_parses_like_a_full_scan(tmp_path: Path) -> None:
+    """Parent lanes exclude sidechains; child lanes include them."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(
+        transcript_path,
+        [
+            _spawn_tool_use_record(tool_use_id="toolu_parent"),
+            _spawn_tool_use_record(tool_use_id="toolu_side", is_sidechain=True),
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_bash", "name": "Bash"}],
+                },
+            },
+            "not-json",
+        ],
+    )
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_parent"
+    }
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=True) == {
+        "toolu_parent",
+        "toolu_side",
+    }
+
+
+def test_tool_use_ids_in_transcript_does_not_reread_an_unchanged_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged file is answered from the cache without opening it."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_parent")])
+    first = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
+    assert first == {"toolu_parent"}
+
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _spy_open)
+    second = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
+    assert second == first
+    assert opened == []
+    second.add("toolu_mutated")
+    third = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
+    assert third == {"toolu_parent"}
+
+
+def test_tool_use_ids_in_transcript_reads_only_appended_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later call consumes just the bytes appended since the cursor."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_first")])
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    appended = (json.dumps(_spawn_tool_use_record(tool_use_id="toolu_second")) + "\n").encode(
+        "utf-8"
+    )
+    with transcript_path.open("ab") as handle:
+        handle.write(appended)
+
+    reads: list[int] = []
+    real_open = builtins.open
+
+    class _ReadingHandle:
+        """Context-manager proxy that records how many bytes were read."""
+
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _ReadingHandle:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._handle.close()
+
+        def seek(self, offset: int) -> int:
+            return self._handle.seek(offset)
+
+        def read(self, *args: Any) -> bytes:
+            data = self._handle.read(*args)
+            reads.append(len(data))
+            return data
+
+    def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(file, *args, **kwargs)
+        if str(file) == str(transcript_path):
+            return _ReadingHandle(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", _spy_open)
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first",
+        "toolu_second",
+    }
+    assert reads == [len(appended)]
+
+
+def test_tool_use_ids_in_transcript_waits_for_a_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    """A partial trailing line is parsed only once its newline arrives."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_first")])
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    partial = json.dumps(_spawn_tool_use_record(tool_use_id="toolu_partial"))
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(partial)
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first",
+        "toolu_partial",
+    }
+
+
+def test_tool_use_ids_in_transcript_resets_on_truncation_and_replacement(
+    tmp_path: Path,
+) -> None:
+    """Rewriting smaller or swapping the inode drops stale spawn ids."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(
+        transcript_path,
+        [
+            _spawn_tool_use_record(tool_use_id="toolu_old_one"),
+            _spawn_tool_use_record(tool_use_id="toolu_old_two"),
+        ],
+    )
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_old_one",
+        "toolu_old_two",
+    }
+
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_new")])
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_new"
+    }
+
+    replacement = tmp_path / "replacement.jsonl"
+    _write_jsonl_rows(replacement, [_spawn_tool_use_record(tool_use_id="toolu_replaced")])
+    os.replace(replacement, transcript_path)
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_replaced"
+    }
+
+
+def test_subagent_parents_by_tool_use_stops_rereading_on_repeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orphan meta leaves repeat scans stat-only, never a re-read."""
+    transcript_path = tmp_path / "session.jsonl"
+    subagents_dir = tmp_path / "session" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_parent_spawn")])
+    _write_jsonl_rows(
+        subagents_dir / "agent-child.jsonl",
+        [_spawn_tool_use_record(tool_use_id="toolu_child_spawn", is_sidechain=True)],
+    )
+    _write_jsonl_rows(subagents_dir / "agent-orphan.jsonl", [])
+    (subagents_dir / "agent-orphan.meta.json").write_text(
+        json.dumps({"toolUseId": "toolu_orphan"}), encoding="utf-8"
+    )
+
+    first = forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir)
+    assert first == {"toolu_parent_spawn": None, "toolu_child_spawn": "child"}
+
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _spy_open)
+    for _ in range(50):
+        owners = forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir)
+    assert opened == []
+    assert owners == first
+
+
+def test_spawn_tool_use_id_cache_evicts_the_least_recently_used(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Touching a cursor keeps it alive; the stale entry is evicted first."""
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE_MAX", 2)
+    paths: list[Path] = []
+    for index in range(3):
+        path = tmp_path / f"session-{index}.jsonl"
+        _write_jsonl_rows(path, [_spawn_tool_use_record(tool_use_id=f"toolu_{index}")])
+        paths.append(path)
+
+    forwarder._tool_use_ids_in_transcript(paths[0], include_sidechains=False)
+    forwarder._tool_use_ids_in_transcript(paths[1], include_sidechains=False)
+    forwarder._tool_use_ids_in_transcript(paths[0], include_sidechains=False)
+    forwarder._tool_use_ids_in_transcript(paths[2], include_sidechains=False)
+
+    assert (str(paths[0]), False) in forwarder._SPAWN_TOOL_USE_ID_CACHE
+    assert (str(paths[1]), False) not in forwarder._SPAWN_TOOL_USE_ID_CACHE
+    assert (str(paths[2]), False) in forwarder._SPAWN_TOOL_USE_ID_CACHE
