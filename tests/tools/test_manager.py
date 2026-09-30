@@ -65,6 +65,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
+        "sys_session_handover",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -133,6 +134,12 @@ def test_session_rename_is_registered_for_every_agent() -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
 
     assert "sys_session_rename" in names
+
+
+def test_session_handover_is_registered_for_every_agent() -> None:
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "sys_session_handover" in names
 
 
 def test_ask_user_async_is_registered_for_every_agent() -> None:

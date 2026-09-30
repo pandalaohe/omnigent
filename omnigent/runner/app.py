@@ -1937,6 +1937,26 @@ _session_member_entries: dict[str, dict[str, dict[str, Any]]] = {}
 _member_turn_stamps: dict[str, int] = {}
 _member_turn_counter = itertools.count(1)
 
+# Sessions whose ``sys_session_handover`` asked for a rotation. Armed when the
+# tool dispatches; consumed by the native idle edge, which types /clear into
+# the session's terminal. No retry: a failure leaves the label for a manual
+# /clear.
+_pending_rotations: set[str] = set()
+
+
+def record_pending_rotation(session_id: str) -> None:
+    """Arm a turn-end rotation for *session_id*."""
+    _pending_rotations.add(session_id)
+
+
+def pop_pending_rotation(session_id: str) -> bool:
+    """Consume and report whether *session_id* has an armed rotation."""
+    if session_id not in _pending_rotations:
+        return False
+    _pending_rotations.discard(session_id)
+    return True
+
+
 # The one runtime follow-up's text, composed and recognized in one place: the
 # runner must never parse its own ``[System: …]`` posts for mentions, and the
 # member follow-up must bind the obligations it names to its own turn.
@@ -6347,6 +6367,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _pending_rotations.discard(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -8307,7 +8328,14 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
-    async def _handle_claude_native_compact(conv_id: str) -> Response:
+    async def _handle_claude_native_slash_command(
+        conv_id: str,
+        command: str,
+        *,
+        error_code: str,
+        context: str,
+    ) -> Response:
+        """Type one slash command into a live claude-native pane."""
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
@@ -8323,27 +8351,42 @@ def create_runner_app(
             await asyncio.to_thread(
                 inject_slash_command,
                 bridge_dir,
-                command="/compact",
+                command=command,
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "claude_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native compact"),
+                    "error": error_code,
+                    "detail": _client_safe_error_detail(exc, context=context),
                 },
             )
         return Response(status_code=200)
 
-    async def _handle_codex_native_compact(conv_id: str) -> Response:
+    async def _handle_claude_native_compact(conv_id: str) -> Response:
+        return await _handle_claude_native_slash_command(
+            conv_id,
+            "/compact",
+            error_code="claude_native_compact_failed",
+            context="claude-native compact",
+        )
+
+    async def _handle_codex_native_slash_command(
+        conv_id: str,
+        command: str,
+        *,
+        error_code: str,
+        context: str,
+    ) -> Response:
+        """Type one slash command into a live codex pane."""
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
+                    "error": error_code,
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
@@ -8352,16 +8395,119 @@ def create_runner_app(
         target = instance.tmux_target
 
         try:
-            await asyncio.to_thread(_inject_codex_compact, socket_path, target)
+            await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, command)
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                    "error": error_code,
+                    "detail": _client_safe_error_detail(exc, context=context),
                 },
             )
         return Response(status_code=200)
+
+    async def _handle_codex_native_compact(conv_id: str) -> Response:
+        return await _handle_codex_native_slash_command(
+            conv_id,
+            "/compact",
+            error_code="codex_native_compact_failed",
+            context="codex-native compact",
+        )
+
+    async def _run_pending_rotation(conv_id: str) -> None:
+        """Type ``/clear`` for a session whose handover asked for rotation.
+
+        The server is the source of truth: a session archived (or rotated)
+        since the request must not be cleared again, and the label is the
+        request's durable record. Any failure is logged and never retried —
+        the label stays and the user can ``/clear`` by hand.
+        """
+        from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                params=_SESSION_METADATA_PARAMS,
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 - a failed read just skips the rotation.
+            _logger.warning(
+                "Pending rotation could not read session %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return
+        if resp.status_code != 200:
+            _logger.warning(
+                "Pending rotation read of session %s returned %d",
+                conv_id,
+                resp.status_code,
+                extra={"session_id": conv_id},
+            )
+            return
+        try:
+            snapshot = resp.json()
+        except ValueError:
+            return
+        if not isinstance(snapshot, dict) or snapshot.get("archived") is True:
+            return
+        labels = snapshot.get("labels")
+        if not isinstance(labels, dict) or not labels.get(ROTATE_REQUESTED_LABEL_KEY):
+            return
+        harness = snapshot.get("harness")
+        if not isinstance(harness, str) or not harness:
+            harness = _session_harness_name(conv_id)
+        try:
+            if harness == "claude-native":
+                response = await _handle_claude_native_slash_command(
+                    conv_id,
+                    "/clear",
+                    error_code="claude_native_clear_failed",
+                    context="claude-native clear",
+                )
+            elif harness == "codex-native":
+                response = await _handle_codex_native_slash_command(
+                    conv_id,
+                    "/clear",
+                    error_code="codex_native_clear_failed",
+                    context="codex-native clear",
+                )
+            else:
+                _logger.warning(
+                    "Pending rotation: unsupported harness %r for session %s",
+                    harness,
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                return
+        except Exception:  # noqa: BLE001 - no retry; the label remains for a manual clear.
+            _logger.warning(
+                "Pending rotation /clear failed for session %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return
+        if response.status_code >= 400:
+            _logger.warning(
+                "Pending rotation /clear was refused for session %s (status %d)",
+                conv_id,
+                response.status_code,
+                extra={"session_id": conv_id},
+            )
+
+    def _schedule_pending_rotation(session_id: str) -> None:
+        """Consume an armed rotation at the session's native idle edge."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if not pop_pending_rotation(session_id):
+            return
+        task = loop.create_task(_run_pending_rotation(session_id))
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
 
     async def _handle_opencode_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
@@ -8553,14 +8699,14 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
-    def _inject_codex_compact(socket_path: str, target: str) -> None:
-        # Typing "/compact" opens Codex's slash-command popup, which draws
+    def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        # Typing a slash command opens Codex's slash-command popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
@@ -12271,6 +12417,7 @@ def create_runner_app(
                     # A native lead's turn end is the forwarder's idle edge, the
                     # counterpart of _on_proxy_stream_end for non-native leads.
                     _handle_member_turn_end(conversation_id)
+                    _schedule_pending_rotation(conversation_id)
             if isinstance(data, dict) and data.get("cross_host") is True:
                 # A cross-host child's terminal edge is delivered through the
                 # PARENT's runner; this runner gets it as a mirror only, for

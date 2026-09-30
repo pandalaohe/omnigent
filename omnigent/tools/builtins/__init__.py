@@ -56,6 +56,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskUpdateTool,
 )
 from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
+from omnigent.tools.builtins.session_handover import SysSessionHandoverTool
 from omnigent.tools.builtins.session_open import SysSessionOpenTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -99,6 +100,7 @@ __all__ = [
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
+    "SysSessionHandoverTool",
     "SysSessionListTool",
     "SysSessionOpenTool",
     "SysSessionRenameTool",

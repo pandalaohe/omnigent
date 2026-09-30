@@ -1063,6 +1063,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         peer_message_store=peer_message_store,
+        agent_store=agent_store,
     )
 
     return router

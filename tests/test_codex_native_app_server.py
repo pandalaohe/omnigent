@@ -303,14 +303,19 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
 # test: a comprehension over ``_FRAMEWORK_APPROVED_TOOLS`` passes no matter what
 # is added to it, so it can never catch the approval surface growing.
 #
-# A plain codex session pre-approves exactly the one tool the framework calls
-# unprompted on any session. Any Smart Routing session — pinned harness or auto
-# — additionally pre-approves the four its routed spawns run on: discover the
-# agent, start the routed child, deliver the task, collect the result. Nobody is
-# watching for an approval prompt in the middle of a spawn.
-_PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
+# A plain codex session pre-approves the two tools whose prompt would land on
+# nobody: the rename, and the handover a session uses to request its own
+# turn-end rotation. Any Smart Routing session — pinned harness or auto —
+# additionally pre-approves the four its routed spawns run on: discover the
+# agent, start the routed child, deliver the task, collect the result. Nobody
+# is watching for an approval prompt in the middle of a spawn.
+_PLAIN_TOOL_APPROVALS = {
+    "sys_session_rename": {"approval_mode": "approve"},
+    "sys_session_handover": {"approval_mode": "approve"},
+}
 _ROUTED_TOOL_APPROVALS = {
     "sys_session_rename": {"approval_mode": "approve"},
+    "sys_session_handover": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
     "sys_session_open": {"approval_mode": "approve"},
     "sys_agent_list": {"approval_mode": "approve"},

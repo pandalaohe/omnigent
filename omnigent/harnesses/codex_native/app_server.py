@@ -259,10 +259,14 @@ def _remove_toml_table(text: str, table_name: str) -> str:
     return "".join(kept).rstrip()
 
 
-#: Omnigent tools the framework calls on every session's behalf, pre-approved
-#: so codex never raises an interactive prompt for them. The rename keeps a
-#: session's title current, which the framework does unprompted on any session.
-_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+#: Omnigent tools the framework pre-approves so codex never raises an
+#: interactive prompt for them: the rename keeps a session's title current on
+#: any session, and the handover asks for a turn-end rotation whose prompt
+#: would land with nobody watching the terminal.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_rename",
+    "sys_session_handover",
+)
 
 #: Additionally pre-approved for an auto-harness Smart Routing session, whose
 #: spawns the router may move onto the counterpart harness family: these four

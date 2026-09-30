@@ -378,6 +378,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_history",
         "sys_session_get_info",
         "sys_session_rename",
+        "sys_session_handover",
         "sys_agent_list",
         "sys_agent_get",
         "sys_agent_download",

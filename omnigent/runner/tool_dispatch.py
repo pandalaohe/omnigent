@@ -94,6 +94,7 @@ from omnigent.tools.builtins.os_env import (
 )
 from omnigent.tools.builtins.panel import OpenInPanelTool
 from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
+from omnigent.tools.builtins.session_handover import SysSessionHandoverTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -330,7 +331,7 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
-_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name(), SysSessionHandoverTool.name()})
 
 # Priority 5f.0b: Archive / unarchive any session the user owns, over the same
 # owner-gated PATCH /v1/sessions/{id} the web archive uses.
@@ -661,6 +662,7 @@ def build_native_relay_tool_schemas(
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysSessionHandoverTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -8338,6 +8340,63 @@ async def _rename_current_session_via_rest(
     return json.dumps({"renamed": True, "title": updated_title, "reason": None})
 
 
+async def _session_handover_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Record a handover note through the server API.
+
+    The note is metadata for the next session, never a prerequisite for the
+    user's turn, so every failure becomes a tool-result envelope. A successful
+    rotation request also arms the runner's idle-edge ``/clear``.
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_session_handover requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "sys_session_handover requires a session id"})
+    handover = args.get("handover")
+    if not isinstance(handover, str) or not handover.strip():
+        return json.dumps({"error": "sys_session_handover requires a non-empty string 'handover'"})
+    rotate = args.get("rotate", True)
+    if not isinstance(rotate, bool):
+        return json.dumps({"error": "sys_session_handover requires a boolean 'rotate'"})
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/handover",
+            json={"handover": handover, "rotate": rotate},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_handover failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_handover returned {response.status_code}",
+                "detail": response.text[:200],
+            }
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_handover returned invalid JSON: {exc}"})
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "sys_session_handover returned a non-object response"})
+    item_id = payload.get("item_id")
+    if not isinstance(item_id, str) or not item_id:
+        return json.dumps({"error": "sys_session_handover response omitted the handover item id"})
+    recorded_rotate = payload.get("rotate")
+    if not isinstance(recorded_rotate, bool):
+        return json.dumps({"error": "sys_session_handover response omitted the rotate flag"})
+    result: _JsonObject = {"recorded": True, "item_id": item_id, "rotate": recorded_rotate}
+    if recorded_rotate:
+        from omnigent.runner.app import record_pending_rotation
+
+        record_pending_rotation(conversation_id)
+        result["note"] = "The session will continue in a new session when this turn ends."
+    return json.dumps(result)
+
+
 # Bound on the caller-ancestry walk; deeper trees fail safe to "in lineage".
 _ARCHIVE_LINEAGE_MAX_HOPS = 32
 
@@ -9200,11 +9259,18 @@ async def execute_tool(
                 conversation_id=conversation_id,
             )
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
-            output = await _rename_current_session_via_rest(
-                args,
-                conversation_id,
-                server_client,
-            )
+            if tool_name == SysSessionHandoverTool.name():
+                output = await _session_handover_via_rest(
+                    args,
+                    conversation_id,
+                    server_client,
+                )
+            else:
+                output = await _rename_current_session_via_rest(
+                    args,
+                    conversation_id,
+                    server_client,
+                )
         elif tool_name in _SESSION_ARCHIVE_TOOLS:
             if not _peer_messaging_enabled_for(conversation_id):
                 return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
