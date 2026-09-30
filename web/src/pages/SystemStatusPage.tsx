@@ -487,11 +487,19 @@ const ProcessTree = memo(function ProcessTree({
         </colgroup>
         <thead>
           <tr className="text-xs text-muted-foreground">
-            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-left font-medium">Process</th>
-            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-left font-medium">Session</th>
-            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-right font-medium">CPU</th>
-            <th className="sticky top-0 z-10 bg-card py-1 pr-3 text-right font-medium">Memory</th>
-            <th className="sticky top-0 z-10 bg-card py-1 text-right font-medium">Uptime</th>
+            <th className="sticky top-0 z-10 bg-card-solid py-1 pr-3 text-left font-medium">
+              Process
+            </th>
+            <th className="sticky top-0 z-10 bg-card-solid py-1 pr-3 text-left font-medium">
+              Session
+            </th>
+            <th className="sticky top-0 z-10 bg-card-solid py-1 pr-3 text-right font-medium">
+              CPU
+            </th>
+            <th className="sticky top-0 z-10 bg-card-solid py-1 pr-3 text-right font-medium">
+              Memory
+            </th>
+            <th className="sticky top-0 z-10 bg-card-solid py-1 text-right font-medium">Uptime</th>
           </tr>
         </thead>
         <tbody>
