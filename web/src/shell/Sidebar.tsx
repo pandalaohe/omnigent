@@ -1,4 +1,5 @@
 import { AgentBadge } from "@/components/AgentBadge";
+import { copyText } from "@/lib/clipboard";
 import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
@@ -37,6 +38,7 @@ import {
   ClockIcon,
   CircleAlertIcon,
   CircleStopIcon,
+  CopyIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderInputIcon,
@@ -3892,6 +3894,18 @@ function ConversationMenuItems({
       <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
         <GitForkIcon className="size-3.5" />
         Fork
+      </C.Item>
+      <C.Item
+        data-testid="copy-session-id"
+        onSelect={() => {
+          void copyText(conversation.id).then(
+            () => showToast("Session ID copied"),
+            () => showToast("Couldn't copy the session ID"),
+          );
+        }}
+      >
+        <CopyIcon className="size-3.5" />
+        Copy session ID
       </C.Item>
       {isOwner ? (
         <C.Item
