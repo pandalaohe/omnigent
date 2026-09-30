@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -3511,41 +3512,156 @@ async def _publish_subagent_status(
         await checkpoint.put(entry)
 
 
+@dataclass
+class _SpawnToolUseIdCursor:
+    """Incremental read position and parse result for one transcript."""
+
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    fingerprint: str | None
+    offset: int
+    tool_use_ids: set[str]
+
+
+# Parent correlation re-scans every tick while an orphan sub-agent meta stays
+# unresolved, so parse each transcript only once per appended byte.
+_SPAWN_TOOL_USE_ID_CACHE_MAX = 256
+_SPAWN_TOOL_USE_ID_CACHE: OrderedDict[tuple[str, bool], _SpawnToolUseIdCursor] = OrderedDict()
+_SPAWN_TOOL_USE_ID_CACHE_LOCK = threading.Lock()
+
+
+def _spawn_tool_use_ids_in_record(
+    record: object,
+    *,
+    include_sidechains: bool,
+) -> set[str]:
+    """Return the spawn tool-use ids carried by one decoded transcript record."""
+    if not isinstance(record, dict):
+        return set()
+    if record.get("isSidechain") is True and not include_sidechains:
+        return set()
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return set()
+    content = message.get("content")
+    if not isinstance(content, list):
+        return set()
+    tool_use_ids: set[str] = set()
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
+            continue
+        tool_use_id = block.get("id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            tool_use_ids.add(tool_use_id)
+    return tool_use_ids
+
+
+def _read_spawn_tool_use_ids_from(
+    transcript_path: Path,
+    start_offset: int,
+    *,
+    include_sidechains: bool,
+) -> tuple[set[str], int] | None:
+    """
+    Parse complete newline-terminated records appended after ``start_offset``.
+
+    Bytes past the last newline stay unconsumed so a partial trailing line is
+    retried by the next call, mirroring ``_read_complete_jsonl_records``.
+
+    :param transcript_path: JSONL transcript to read.
+    :param start_offset: Byte offset where reading begins, e.g. ``0``.
+    :param include_sidechains: Whether sidechain records count as owners.
+    :returns: Spawn tool-use ids plus the offset just past the consumed
+        bytes, or ``None`` when the read failed and must be retried.
+    """
+    try:
+        with open(transcript_path, "rb") as handle:
+            handle.seek(start_offset)
+            tail = handle.read()
+    except OSError:
+        return None
+    consumed_length = tail.rfind(b"\n") + 1
+    if consumed_length <= 0:
+        return set(), start_offset
+    tool_use_ids: set[str] = set()
+    for raw_line in tail[:consumed_length].split(b"\n"):
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        tool_use_ids.update(
+            _spawn_tool_use_ids_in_record(record, include_sidechains=include_sidechains)
+        )
+    return tool_use_ids, start_offset + consumed_length
+
+
 def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
 ) -> set[str]:
     """Return sub-agent spawn tool-use ids owned by one transcript."""
-    try:
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return set()
-    tool_use_ids: set[str] = set()
-    for line in lines:
+    cache_key = (str(transcript_path), include_sidechains)
+    # One lock covers stat, compare, read, and update: reads parse only the
+    # appended bytes, and serializing them keeps offset and ids coherent
+    # without a second window where eviction or reset could interleave.
+    with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
         try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        if record.get("isSidechain") is True and not include_sidechains:
-            continue
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
-                continue
-            tool_use_id = block.get("id")
-            if isinstance(tool_use_id, str) and tool_use_id:
-                tool_use_ids.add(tool_use_id)
-    return tool_use_ids
+            file_stat = os.stat(transcript_path)
+        except OSError:
+            _SPAWN_TOOL_USE_ID_CACHE.pop(cache_key, None)
+            return set()
+        cursor = _SPAWN_TOOL_USE_ID_CACHE.get(cache_key)
+        identity = (file_stat.st_dev, file_stat.st_ino)
+        observation = (file_stat.st_size, file_stat.st_mtime_ns)
+        if cursor is not None and (cursor.st_dev, cursor.st_ino) == identity:
+            observation_changed = (cursor.st_size, cursor.st_mtime_ns) != observation
+            if observation_changed and (
+                file_stat.st_size < cursor.offset
+                or _jsonl_cursor_fingerprint(transcript_path, cursor.offset) != cursor.fingerprint
+            ):
+                # A same-inode rewrite changed the already-parsed prefix.
+                cursor.offset = 0
+                cursor.tool_use_ids = set()
+        else:
+            observation_changed = True
+            # No observation until a read succeeds, so a failed first read retries.
+            cursor = _SpawnToolUseIdCursor(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino,
+                st_size=-1,
+                st_mtime_ns=-1,
+                fingerprint=None,
+                offset=0,
+                tool_use_ids=set(),
+            )
+            _SPAWN_TOOL_USE_ID_CACHE[cache_key] = cursor
+        _SPAWN_TOOL_USE_ID_CACHE.move_to_end(cache_key)
+        while len(_SPAWN_TOOL_USE_ID_CACHE) > _SPAWN_TOOL_USE_ID_CACHE_MAX:
+            _SPAWN_TOOL_USE_ID_CACHE.popitem(last=False)
+        if not observation_changed:
+            return set(cursor.tool_use_ids)
+
+        read_result = _read_spawn_tool_use_ids_from(
+            transcript_path,
+            cursor.offset,
+            include_sidechains=include_sidechains,
+        )
+        if read_result is None:
+            return set(cursor.tool_use_ids)
+        read_ids, consumed_offset = read_result
+        cursor.tool_use_ids.update(read_ids)
+        cursor.offset = consumed_offset
+        cursor.st_size = file_stat.st_size
+        cursor.st_mtime_ns = file_stat.st_mtime_ns
+        cursor.fingerprint = _jsonl_cursor_fingerprint(transcript_path, consumed_offset)
+        return set(cursor.tool_use_ids)
 
 
 def _subagent_parents_by_tool_use(
