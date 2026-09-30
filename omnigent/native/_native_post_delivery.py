@@ -12,14 +12,19 @@ use to decide whether a failed POST is safe to retry.
 
 :func:`post_session_event_with_retry` is the shared retry loop extracted from
 the codex/antigravity forwarders so a single implementation is maintained.
+
+:func:`post_session_succession` is the best-effort succession starter both
+native forwarders call after rotating a session away.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import time
+import urllib.parse
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -234,6 +239,73 @@ async def post_external_session_status(
         json={"type": "external_session_status", "data": data},
     )
     resp.raise_for_status()
+
+
+# The old native session has already rotated away by the time succession is
+# requested, so the caller cannot wait: a slow or refused request is dropped.
+# The server keeps one receipt per (old, new) pair, making retries safe.
+_SUCCESSION_MAX_ATTEMPTS = 3
+_SUCCESSION_RETRY_DELAYS_S = (1.0, 2.0)
+_SUCCESSION_REQUEST_TIMEOUT_S = 60.0
+
+
+async def post_session_succession(
+    client: httpx.AsyncClient,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+) -> None:
+    """
+    Ask the server to move a rotated-away session's live children to its successor.
+
+    Best-effort by design: the native rotation has already happened, so every
+    failure is logged and swallowed. Transport errors (including timeouts) and
+    5xx retry up to :data:`_SUCCESSION_MAX_ATTEMPTS`; a 4xx (including a 409
+    refusal such as a title clash) is permanent and not retried.
+
+    :param client: Omnigent HTTP client.
+    :param old_session_id: Rotated-away session id, e.g. ``"conv_old"``.
+    :param new_session_id: Replacement session id, e.g. ``"conv_new"``.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        return
+    url = f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}/succession"
+    payload = {"target_session_id": new_session_id}
+    for attempt in range(1, _SUCCESSION_MAX_ATTEMPTS + 1):
+        try:
+            response = await client.post(
+                url,
+                json=payload,
+                timeout=_SUCCESSION_REQUEST_TIMEOUT_S,
+            )
+        except httpx.TransportError as exc:
+            _logger.warning(
+                "session succession attempt %d/%d failed; old=%s new=%s error=%r",
+                attempt,
+                _SUCCESSION_MAX_ATTEMPTS,
+                old_session_id,
+                new_session_id,
+                exc,
+            )
+            if attempt >= _SUCCESSION_MAX_ATTEMPTS:
+                return
+            await asyncio.sleep(_SUCCESSION_RETRY_DELAYS_S[attempt - 1])
+            continue
+        if response.status_code < 400:
+            return
+        _logger.warning(
+            "session succession attempt %d/%d failed; old=%s new=%s status=%s body=%s",
+            attempt,
+            _SUCCESSION_MAX_ATTEMPTS,
+            old_session_id,
+            new_session_id,
+            response.status_code,
+            response.text,
+        )
+        if response.status_code < 500 or attempt >= _SUCCESSION_MAX_ATTEMPTS:
+            return
+        await asyncio.sleep(_SUCCESSION_RETRY_DELAYS_S[attempt - 1])
 
 
 async def post_session_event_with_retry(
