@@ -35,14 +35,17 @@ vi.mock("@/hooks/useStartHealthCheck", () => ({
   useStartHealthCheck: () => mocks.healthCheck.current,
 }));
 
-vi.mock("@/hooks/useSidebarData", () => ({
-  useLoadedConversations: () => ({
+// One stable reference, like the real query cache: a fresh object per render
+// would defeat the page's memoized process tree.
+vi.mock("@/hooks/useSidebarData", () => {
+  const loaded = {
     data: {
       pages: [{ data: [{ id: "conv_hot", title: "Fix login timeout" }] }],
     },
     isLoading: false,
-  }),
-}));
+  };
+  return { useLoadedConversations: () => loaded };
+});
 
 import { SystemStatusPage } from "./SystemStatusPage";
 
