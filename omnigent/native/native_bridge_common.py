@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +44,8 @@ _logger = logging.getLogger(__name__)
 
 OWNER_PID_FILENAME = "owner.pid"
 _LOCK_DIR_NAME = ".locks"
+#: A dead-owner bridge dir may hold a resumable session, so it is kept this long.
+ORPHAN_RETENTION_SECONDS = 70 * 24 * 60 * 60
 
 
 def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
@@ -90,6 +93,38 @@ def write_owner_pid_marker(bridge_dir: Path) -> None:
         (bridge_dir / OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
 
 
+def orphan_retention_expired(bridge_dir: Path) -> bool:
+    """
+    Return whether a dead-owner bridge dir is past the 70-day retention.
+
+    True only when every file under *bridge_dir* was last modified at or
+    before the cutoff. Symlinks are lstat'ed, never followed. Fails closed
+    (keeps the directory) whenever a file's activity cannot be established.
+
+    :param bridge_dir: Per-session bridge directory to evaluate.
+    :returns: ``True`` when the directory may be reclaimed.
+    """
+    cutoff = time.time() - ORPHAN_RETENTION_SECONDS
+    scan_failed = False
+
+    def _record_scan_failure(_error: OSError) -> None:
+        nonlocal scan_failed
+        scan_failed = True
+
+    for directory, _subdirs, filenames in os.walk(
+        bridge_dir,
+        onerror=_record_scan_failure,
+        followlinks=False,
+    ):
+        for filename in filenames:
+            try:
+                if os.lstat(Path(directory) / filename).st_mtime > cutoff:
+                    return False
+            except OSError:
+                return False
+    return not scan_failed
+
+
 def prune_orphaned_dirs(
     bridge_root: Path,
     *,
@@ -118,8 +153,9 @@ def prune_orphaned_dirs(
     :param bridge_root: The harness's bridge root, e.g.
         ``~/.omnigent/codex-native``.
     :param should_prune: Optional harness-specific eligibility predicate called
-        only after the owner is proven dead. ``None`` removes every dead-owner
-        directory.
+        only after the owner is proven dead. The predicate runs under the
+        directory's cleanup lock, so it may also trim the directory in place
+        before answering. ``None`` removes every dead-owner directory.
     :returns: The number of orphaned bridge dirs removed.
     """
     if not bridge_root.exists():

@@ -4,8 +4,9 @@ Per-session codex-native directories under ``~/.omnigent/codex-native/`` are
 created when a host-bound ``codex-native-ui`` session launches. A session whose
 host/runner dies uncleanly leaves bridge credentials, sockets, and hook state
 behind alongside the ``codex-home`` rollout that Codex needs to resume the
-original thread. Host restart must retain recent bridges, then reclaim the
-whole directory after 7 days of inactivity.
+original thread. Host restart must retain recent bridges, trim regenerable
+caches after 7 days of inactivity, and reclaim the whole directory after
+70 days.
 
 This test drives the real user journey: connect a host, create a
 codex-native session on it (the per-session dir appears), kill the host

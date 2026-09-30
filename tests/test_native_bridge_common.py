@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -131,6 +132,25 @@ def test_prune_retains_entry_reclaimed_during_eligibility_check(
 
     assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_reclaim) == 0
     assert bridge_dir.exists()
+
+
+def test_orphan_retention_expired_uses_newest_nested_file(tmp_path: Path) -> None:
+    """A recent nested file keeps the dir; aging it lets retention expire."""
+    bridge_dir = tmp_path / "bridge-root" / "held"
+    nested = bridge_dir / "nested"
+    nested.mkdir(parents=True)
+    marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    marker.write_text("999999", encoding="utf-8")
+    recent = nested / "session.json"
+    recent.write_text("fresh", encoding="utf-8")
+    aged_at = time.time() - native_bridge_common.ORPHAN_RETENTION_SECONDS - 60
+    os.utime(marker, (aged_at, aged_at))
+
+    assert native_bridge_common.orphan_retention_expired(bridge_dir) is False
+
+    os.utime(recent, (aged_at, aged_at))
+
+    assert native_bridge_common.orphan_retention_expired(bridge_dir) is True
 
 
 def test_reap_invokes_prune_for_every_native_agent(monkeypatch: pytest.MonkeyPatch) -> None:

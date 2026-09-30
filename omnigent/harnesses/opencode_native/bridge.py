@@ -344,7 +344,8 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove opencode-native bridge dirs whose owner process is provably dead.
+    Remove opencode-native bridge dirs whose owner process is provably dead and
+    whose newest file is at least 70 days old.
 
     Delegates to the shared sweep against this harness's bridge root; the
     global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
@@ -353,7 +354,10 @@ def prune_orphaned_bridge_dirs() -> int:
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=native_bridge_common.orphan_retention_expired,
+    )
 
 
 def write_relay_bridge_config(bridge_dir: Path) -> None:
