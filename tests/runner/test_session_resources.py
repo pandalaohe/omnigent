@@ -1573,6 +1573,8 @@ class _WatcherCapture:
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
         passed, or ``None`` for the module default.
+    :param pane_probe_interval_s: The pane-probe cadence callable the
+        registry passed, or ``None`` when probing every tick.
     """
 
     started: bool = False
@@ -1582,6 +1584,7 @@ class _WatcherCapture:
     on_tick: Callable[[], None] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
+    pane_probe_interval_s: Callable[[], float | None] | None = None
     replace: bool = False
 
 
@@ -1617,6 +1620,7 @@ def _make_capturing_instance(
         on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: Callable[[], float | None] | None = None,
         replace: bool = False,
     ) -> None:
         capture.started = True
@@ -1626,6 +1630,7 @@ def _make_capturing_instance(
         capture.on_tick = on_tick
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
+        capture.pane_probe_interval_s = pane_probe_interval_s
         capture.replace = replace
 
     # Instance attribute shadows the bound method, so the registry's call

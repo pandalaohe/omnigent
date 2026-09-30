@@ -1979,6 +1979,7 @@ class TerminalInstance:
         on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: Callable[[], float | None] | None = None,
         replace: bool = False,
     ) -> None:
         """
@@ -2029,6 +2030,10 @@ class TerminalInstance:
             ``0.2`` for the claude-native status watcher (snappier
             running/idle transitions). ``None`` uses the module default
             :data:`_IDLE_POLL_INTERVAL_SECONDS`.
+        :param pane_probe_interval_s: Optional callable returning the
+            per-tick pane-probe cadence in seconds, e.g. ``5.0`` once an
+            out-of-band status source owns the session. ``None`` — the
+            parameter or the callable's return value — probes every tick.
         :param replace: When ``True``, replace any existing threaded watcher
             so callbacks can be rebound after terminal ownership transfer.
         :raises RuntimeError: When the instance is not currently
@@ -2058,6 +2063,7 @@ class TerminalInstance:
                 "on_tick": on_tick,
                 "idle_threshold_s": idle_threshold_s,
                 "poll_interval_s": poll_interval_s,
+                "pane_probe_interval_s": pane_probe_interval_s,
             },
             name=f"terminal-idle-{self.name}-{self.session_key}",
             daemon=True,
@@ -2074,6 +2080,7 @@ class TerminalInstance:
         on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: Callable[[], float | None] | None = None,
     ) -> None:
         """
         Sync polling loop driving an :class:`_IdleDetector`.
@@ -2104,10 +2111,18 @@ class TerminalInstance:
         :param poll_interval_s: Seconds between polls, e.g. ``0.2`` for the
             claude-native status watcher. ``None`` uses the module default
             :data:`_IDLE_POLL_INTERVAL_SECONDS`.
+        :param pane_probe_interval_s: Optional callable returning the
+            per-tick pane-probe cadence in seconds (see
+            :meth:`start_idle_watcher_thread`); ``None`` probes every tick.
         """
         detector = _IdleDetector(idle_threshold_s=idle_threshold_s)
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         consecutive_capture_failures = 0
+        # Monotonic time of the last successful probe, and the pane pid
+        # fetched after it. Both stay unset until a probe confirms a live
+        # pane, so a skipped tick never masks a pending exit.
+        last_probe_at: float | None = None
+        pane_pid: int | None = None
         self._probe_failures.clear()
         while True:
             # ``Event.wait`` doubles as the poll-interval sleep, so
@@ -2119,6 +2134,10 @@ class TerminalInstance:
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
                 return
+            if self._pane_probe_can_wait(pane_probe_interval_s, last_probe_at, pane_pid):
+                if on_tick is not None and not self._fire_watch_callback(on_tick, "tick"):
+                    return
+                continue
             try:
                 snapshot = self._capture_pane_for_idle_or_none()
             except _TmuxProcessStartError as exc:
@@ -2173,6 +2192,9 @@ class TerminalInstance:
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
                 return
+            last_probe_at = time.monotonic()
+            if pane_probe_interval_s is not None and pane_pid is None:
+                pane_pid = self.pane_pid_sync()
             # Per-tick out-of-band status hook (e.g. claude-native reading
             # Claude's sessions/<pid>.json). Fired after the exit checks so
             # it never runs for a dead pane, and before the pane diff so an
@@ -2202,6 +2224,47 @@ class TerminalInstance:
                 and not self._fire_watch_callback(on_idle, "idle")
             ):
                 return
+
+    def _pane_probe_can_wait(
+        self,
+        pane_probe_interval_s: Callable[[], float | None] | None,
+        last_probe_at: float | None,
+        pane_pid: int | None,
+    ) -> bool:
+        """
+        Whether this tick may skip the pane capture + pane-death probes.
+
+        Only a successful earlier probe (live pane, pid recorded) and a
+        caller-provided cadence unthrottle a skip; any uncertainty — a
+        missing cadence, a failed lookup, an elapsed interval, a recent web
+        interaction, or a dead pane process — falls back to probing.
+
+        :param pane_probe_interval_s: Caller cadence callable, or ``None``.
+        :param last_probe_at: Monotonic time of the last successful probe,
+            or ``None`` before one.
+        :param pane_pid: Pane pid recorded after the last successful probe,
+            or ``None`` before one.
+        :returns: ``True`` when the pane probe can be skipped this tick.
+        """
+        if pane_probe_interval_s is None or last_probe_at is None or pane_pid is None:
+            return False
+        try:
+            interval = pane_probe_interval_s()
+        except Exception:  # noqa: BLE001 - a broken cadence must not stop the watcher.
+            logger.debug(
+                "Pane probe cadence lookup failed for terminal %s:%s",
+                self.name,
+                self.session_key,
+                exc_info=True,
+            )
+            return False
+        if interval is None:
+            return False
+        if time.monotonic() - last_probe_at >= interval:
+            return False
+        if self.client_interaction_within(_CLIENT_INTERACTION_WINDOW_SECONDS):
+            return False
+        return _process_alive(pane_pid)
 
     def _capture_pane_for_idle_or_none(self) -> str | None:
         """

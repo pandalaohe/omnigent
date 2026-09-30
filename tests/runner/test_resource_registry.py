@@ -483,9 +483,10 @@ async def _observe_native_agent_terminal_and_capture(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, pane_probe_interval_s, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
@@ -600,6 +601,7 @@ async def _observe_native_with_fake_poller(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: object | None = None,
         replace: bool = False,
     ) -> None:
         del idle_threshold_s, poll_interval_s, replace
@@ -607,12 +609,32 @@ async def _observe_native_with_fake_poller(
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
         callbacks["on_tick"] = on_tick
+        callbacks["pane_probe_interval_s"] = pane_probe_interval_s
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     await registry.observe_required_terminal(
         session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
     )
     return callbacks, statuses, background_counts, pollers, registry
+
+
+@pytest.mark.asyncio
+async def test_claude_native_pane_probe_interval_follows_file_status(tmp_path: Path) -> None:
+    """The pane probe cadence follows the status file: busy 1s, quiet 5s."""
+    callbacks, _statuses, _counts, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_probe_cadence"
+    )
+    interval = callbacks["pane_probe_interval_s"]
+    assert callable(interval)
+    assert interval() is None
+    poller = pollers[0]
+    poller.active = True
+    poller.emit("running")
+    assert interval() == 1.0
+    poller.emit("idle")
+    assert interval() == 5.0
+    poller.retire()
+    assert interval() is None
 
 
 @pytest.mark.asyncio
@@ -1758,9 +1780,10 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        pane_probe_interval_s: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, pane_probe_interval_s, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit

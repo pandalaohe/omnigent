@@ -27,6 +27,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import forwarder
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import (
@@ -12207,45 +12208,297 @@ def test_cumulative_cost_from_status_state(
     assert forwarder._cumulative_cost_from_status_state(state) == expected
 
 
+def _cost_transcript_entry(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    request_id: str | None = None,
+    model: str = "m",
+) -> dict[str, Any]:
+    """
+    Build one assistant transcript record with a usage block.
+
+    :param input_tokens: Non-cached input tokens for the usage block.
+    :param output_tokens: Output tokens for the usage block.
+    :param request_id: Top-level ``requestId`` to stamp, or ``None`` to
+        omit it.
+    :param model: ``message.model`` to stamp.
+    :returns: A decoded transcript record dict.
+    """
+    entry: dict[str, Any] = {
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        }
+    }
+    if request_id is not None:
+        entry["requestId"] = request_id
+    return entry
+
+
+def _append_cost_transcript(path: Path, entries: list[dict[str, Any]]) -> None:
+    """
+    Append decoded transcript records as newline-terminated JSONL.
+
+    :param path: Destination JSONL path.
+    :param entries: Decoded record dicts to append.
+    :returns: None.
+    """
+    with path.open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry) + "\n")
+
+
 def test_transcript_cost_size_cached_recomputes_only_on_growth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    The cost is recomputed only when the transcript's byte size changes.
+    An unchanged transcript is not read again; a grown one is.
 
     Guards the per-poll optimization: an unchanged transcript must not be
-    re-parsed every 0.25s tick, but a grown one must be re-priced.
+    re-parsed every 0.25s tick, but a grown one must be read from its
+    previous offset rather than from the start.
     """
-    calls: list[Path] = []
+    reads: list[int] = []
 
-    def fake_compute(path: Path, *, include_sidechains: bool) -> float | None:
-        calls.append(path)
-        return float(path.stat().st_size)
+    def fake_accumulate(
+        path: Path,
+        ledger: object,
+        *,
+        byte_offset: int,
+        start_line: int,
+        include_sidechains: bool,
+    ) -> tuple[int, int]:
+        del ledger, include_sidechains
+        reads.append(byte_offset)
+        return path.stat().st_size, start_line
 
-    monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
+    monkeypatch.setattr(forwarder, "accumulate_transcript_cost", fake_accumulate)
+    monkeypatch.setattr(forwarder, "price_transcript_cost_ledger", lambda ledger: 3.0)
     cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
     path = tmp_path / "t.jsonl"
     path.write_text("abc", encoding="utf-8")  # 3 bytes
     assert forwarder._transcript_cost_size_cached(
         path, include_sidechains=True, cache=cache
     ) == pytest.approx(3.0)
-    # Second call at the same size → served from cache, no recompute.
+    assert reads == [0]
+    # Second call at the same size → served from cache, no read.
     assert forwarder._transcript_cost_size_cached(
         path, include_sidechains=True, cache=cache
     ) == pytest.approx(3.0)
-    assert len(calls) == 1
-    # File grows → recompute.
+    assert reads == [0]
+    # File grows → read only the appended bytes.
     path.write_text("abcdef", encoding="utf-8")  # 6 bytes
     assert forwarder._transcript_cost_size_cached(
         path, include_sidechains=True, cache=cache
-    ) == pytest.approx(6.0)
-    assert len(calls) == 2
-    # Missing file → None, no recompute attempt recorded as a priced call.
+    ) == pytest.approx(3.0)
+    assert reads == [0, 3]
+    # Missing file → None, no read.
     assert (
         forwarder._transcript_cost_size_cached(
             tmp_path / "missing.jsonl", include_sidechains=True, cache=cache
         )
         is None
+    )
+    assert reads == [0, 3]
+
+
+def test_transcript_cost_size_cached_parses_only_appended_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The incremental total equals a full re-parse and resumes at the cursor.
+
+    A record reusing an earlier ``requestId`` with larger usage must replace
+    the earlier price, so the append-only ledger stays equivalent to the
+    whole-file computation.
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "t.jsonl"
+    _append_cost_transcript(
+        path,
+        [
+            _cost_transcript_entry(input_tokens=2, output_tokens=3, request_id="req_A"),
+            _cost_transcript_entry(input_tokens=1, output_tokens=1, request_id="req_B"),
+            _cost_transcript_entry(input_tokens=4, output_tokens=0),
+        ],
+    )
+    cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
+    first_size = path.stat().st_size
+    first = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert first is not None
+
+    _append_cost_transcript(
+        path,
+        [
+            _cost_transcript_entry(input_tokens=5, output_tokens=5, request_id="req_A"),
+            _cost_transcript_entry(input_tokens=3, output_tokens=1, request_id="req_C"),
+        ],
+    )
+    offsets: list[int] = []
+    real_read = claude_native_bridge._read_complete_jsonl_records
+
+    def spy_read(p: Path, *, byte_offset: int, start_line: int, **kwargs: Any) -> Any:
+        offsets.append(byte_offset)
+        return real_read(p, byte_offset=byte_offset, start_line=start_line, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_read_complete_jsonl_records", spy_read)
+    second = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert offsets == [first_size]
+    assert second == pytest.approx(
+        claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    )
+    assert second is not None and second > first
+
+
+def test_transcript_cost_size_cached_ignores_partial_appended_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A half-written trailing line is billed only once its newline lands."""
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "t.jsonl"
+    _append_cost_transcript(
+        path,
+        [_cost_transcript_entry(input_tokens=2, output_tokens=3, request_id="req_A")],
+    )
+    cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
+    stable = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert stable is not None
+
+    entry = _cost_transcript_entry(input_tokens=7, output_tokens=7, request_id="req_B")
+    line = (json.dumps(entry) + "\n").encode("utf-8")
+    cut = len(line) // 2
+    with path.open("ab") as handle:
+        handle.write(line[:cut])
+    assert forwarder._transcript_cost_size_cached(
+        path, include_sidechains=True, cache=cache
+    ) == pytest.approx(stable)
+
+    with path.open("ab") as handle:
+        handle.write(line[cut:])
+    completed = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert completed == pytest.approx(
+        claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    )
+    assert completed is not None and completed > stable
+
+
+def test_transcript_cost_size_cached_reparses_rewritten_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An in-place rewrite discards the cursor; a new inode starts fresh too."""
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "t.jsonl"
+    _append_cost_transcript(
+        path,
+        [_cost_transcript_entry(input_tokens=2, output_tokens=3, request_id="req_A")],
+    )
+    cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
+    assert (
+        forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+        is not None
+    )
+
+    # Same inode, different earlier usage, longer body.
+    rewritten_payload = (
+        json.dumps(_cost_transcript_entry(input_tokens=100, output_tokens=100, request_id="req_A"))
+        + "\n"
+        + json.dumps(_cost_transcript_entry(input_tokens=5, output_tokens=5, request_id="req_B"))
+        + "\n"
+    )
+    with path.open("r+b") as handle:
+        handle.write(rewritten_payload.encode("utf-8"))
+    rewritten = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert rewritten == pytest.approx(
+        claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    )
+
+    # New inode via atomic replace.
+    replacement = tmp_path / "replacement.jsonl"
+    _append_cost_transcript(
+        replacement,
+        [_cost_transcript_entry(input_tokens=9, output_tokens=9, request_id="req_C")],
+    )
+    os.replace(replacement, path)
+    replaced = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert replaced == pytest.approx(
+        claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    )
+
+
+def test_transcript_cost_size_cached_reprices_after_provider_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider-config change re-prices the already-parsed prefix."""
+
+    def provider_config(input_per_million: float) -> dict[str, Any]:
+        return {
+            "providers": {
+                "anthropic-local": {
+                    "kind": "local",
+                    "default": True,
+                    "anthropic": {
+                        "base_url": "http://anthropic.local/v1",
+                        "api_key": "test",
+                        "pricing": {
+                            "input_per_million": input_per_million,
+                            "output_per_million": 0.0,
+                        },
+                    },
+                }
+            }
+        }
+
+    active_config = provider_config(1.0)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: active_config)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "t.jsonl"
+    _append_cost_transcript(
+        path,
+        [
+            _cost_transcript_entry(
+                input_tokens=1_000_000,
+                output_tokens=0,
+                request_id="req_A",
+                model="self-hosted",
+            )
+        ],
+    )
+    cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
+    assert forwarder._transcript_cost_size_cached(
+        path, include_sidechains=True, cache=cache
+    ) == pytest.approx(1.0)
+
+    active_config = provider_config(2.0)
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    _append_cost_transcript(
+        path,
+        [
+            _cost_transcript_entry(
+                input_tokens=1_000_000,
+                output_tokens=0,
+                request_id="req_B",
+                model="self-hosted",
+            )
+        ],
+    )
+    total = forwarder._transcript_cost_size_cached(path, include_sidechains=True, cache=cache)
+    assert total == pytest.approx(4.0)
+    assert total == pytest.approx(
+        claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
     )
 
 
@@ -12269,10 +12522,16 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
 
     per_path_cost = {parent: 0.10, sub_path: 0.55}
 
-    def fake_compute(path: Path, *, include_sidechains: bool) -> float | None:
+    def fake_size_cached(
+        path: Path,
+        *,
+        include_sidechains: bool,
+        cache: dict[Path, forwarder._TranscriptCostCacheEntry],
+    ) -> float | None:
+        del include_sidechains, cache
         return per_path_cost.get(path)
 
-    monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
+    monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", fake_size_cached)
     entries = [forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")]
 
     # S stale ($0.005) < C (0.10 + 0.55 = 0.65) → C wins (mid-run).

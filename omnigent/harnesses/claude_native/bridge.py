@@ -50,7 +50,7 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -3493,6 +3493,132 @@ def _transcript_model_pricing(
     return pricing
 
 
+@dataclass
+class TranscriptCostLedger:
+    """Append-only usage and priced cost for one transcript.
+
+    The forwarder keeps one ledger per transcript and folds appended bytes
+    into it (see :func:`accumulate_transcript_cost`), so a growing file is
+    never re-parsed in full. Usage is kept per ``requestId`` (last priceable
+    record per id wins) so a re-price after a provider-config change can
+    recompute without the file.
+    """
+
+    usage_by_request: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
+    cost_by_request: dict[str, float] = field(default_factory=dict)
+    pricing_fingerprint: bytes | None = None
+    unkeyed_records: int = 0
+
+
+def accumulate_transcript_cost(
+    transcript_path: Path,
+    ledger: TranscriptCostLedger,
+    *,
+    byte_offset: int,
+    start_line: int,
+    include_sidechains: bool,
+) -> tuple[int, int]:
+    """
+    Fold newly appended transcript records into a cost ledger.
+
+    Applies the same record filters as
+    :func:`compute_transcript_cumulative_cost` and stores each record's
+    usage under its ``requestId``, keyed by model. The last priceable
+    record per id wins; a repeated key drops any cost computed for it.
+
+    :param transcript_path: Path to a Claude transcript JSONL.
+    :param ledger: Ledger to update in place.
+    :param byte_offset: Byte offset where reading should begin.
+    :param start_line: Count of complete records before *byte_offset*.
+    :param include_sidechains: Whether to include ``isSidechain`` records.
+    :returns: ``(new_byte_offset, new_line_cursor)`` after the last
+        complete record.
+    """
+    read_result = _read_complete_jsonl_records(
+        transcript_path,
+        byte_offset=byte_offset,
+        start_line=start_line,
+    )
+    for record in read_result.records:
+        if record.text is None:
+            continue
+        try:
+            entry = json.loads(record.text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if not include_sidechains and entry.get("isSidechain") is True:
+            continue
+        usage = _usage_from_transcript_entry(entry)
+        if usage is None:
+            continue
+        model = _model_from_transcript_entry(entry)
+        if model is None:
+            continue
+        request_id = entry.get("requestId")
+        if not isinstance(request_id, str) or not request_id:
+            request_id = f"__no_request_id_{ledger.unkeyed_records}"
+            ledger.unkeyed_records += 1
+        models = ledger.usage_by_request.setdefault(request_id, {})
+        models.pop(model, None)
+        models[model] = usage
+        ledger.cost_by_request.pop(request_id, None)
+    return (read_result.byte_offset, read_result.line_cursor)
+
+
+def price_transcript_cost_ledger(ledger: TranscriptCostLedger) -> float | None:
+    """
+    Price a ledger's unpriced usage under the current provider config.
+
+    The provider-config digest keys the already-priced entries: when it
+    changes, every entry is re-priced so a rate change is not masked by a
+    stale total. Models whose pricing is unavailable stay unpriced so a
+    later call can retry them.
+
+    :param ledger: Ledger to price in place.
+    :returns: Total USD cost, or ``None`` when no entry could be priced.
+    """
+    from omnigent.llms.context_window import compute_llm_cost
+    from omnigent.onboarding.provider_config import load_config
+
+    provider_config = load_config()
+    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
+    if ledger.pricing_fingerprint != provider_config_fingerprint:
+        ledger.cost_by_request.clear()
+        ledger.pricing_fingerprint = provider_config_fingerprint
+    pricing_by_model: dict[str, ModelPricing | None] = {}
+    total_cost = 0.0
+    priced_any = False
+    for request_id, models in ledger.usage_by_request.items():
+        stored_cost = ledger.cost_by_request.get(request_id)
+        if stored_cost is not None:
+            total_cost += stored_cost
+            priced_any = True
+            continue
+        for position, (model, usage) in enumerate(reversed(models.items())):
+            if model not in pricing_by_model:
+                pricing_by_model[model] = _transcript_model_pricing(
+                    model,
+                    provider_config=provider_config,
+                    provider_config_fingerprint=provider_config_fingerprint,
+                )
+            pricing = pricing_by_model[model]
+            if pricing is None:
+                continue
+            cost = compute_llm_cost(usage, pricing)
+            # Only the newest model's cost is stored; an older fallback is
+            # recomputed next call so a newly priced newest model wins then.
+            if position == 0:
+                ledger.cost_by_request[request_id] = cost
+            total_cost += cost
+            priced_any = True
+            break
+    if not priced_any:
+        return None
+    return total_cost
+
+
 def compute_transcript_cumulative_cost(
     transcript_path: Path,
     *,
@@ -3541,55 +3667,15 @@ def compute_transcript_cumulative_cost(
         for every model present) — distinct from ``0.0``, which means
         priced messages summed to zero.
     """
-    read_result = _read_complete_jsonl_records(
+    ledger = TranscriptCostLedger()
+    accumulate_transcript_cost(
         transcript_path,
+        ledger,
         byte_offset=0,
         start_line=0,
+        include_sidechains=include_sidechains,
     )
-    from omnigent.llms.context_window import compute_llm_cost
-    from omnigent.onboarding.provider_config import load_config
-
-    provider_config = load_config()
-    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
-
-    # Per-``requestId`` cost (USD); last priceable record per id wins so a
-    # response written across multiple transcript records is counted once.
-    cost_by_request: dict[str, float] = {}
-    # Counter minting unique keys for records lacking a ``requestId`` so
-    # they each count once instead of collapsing onto a shared key.
-    no_request_id_index = 0
-    for record in read_result.records:
-        if record.text is None:
-            continue
-        try:
-            entry = json.loads(record.text)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        if not include_sidechains and entry.get("isSidechain") is True:
-            continue
-        usage = _usage_from_transcript_entry(entry)
-        if usage is None:
-            continue
-        model = _model_from_transcript_entry(entry)
-        if model is None:
-            continue
-        pricing = _transcript_model_pricing(
-            model,
-            provider_config=provider_config,
-            provider_config_fingerprint=provider_config_fingerprint,
-        )
-        if pricing is None:
-            continue
-        request_id = entry.get("requestId")
-        if not isinstance(request_id, str) or not request_id:
-            request_id = f"__no_request_id_{no_request_id_index}"
-            no_request_id_index += 1
-        cost_by_request[request_id] = compute_llm_cost(usage, pricing)
-    if not cost_by_request:
-        return None
-    return sum(cost_by_request.values())
+    return price_transcript_cost_ledger(ledger)
 
 
 def count_hook_events(bridge_dir: Path) -> int:

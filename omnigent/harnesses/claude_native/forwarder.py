@@ -30,8 +30,10 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    TranscriptCostLedger,
     TranscriptReadResult,
-    compute_transcript_cumulative_cost,
+    accumulate_transcript_cost,
+    price_transcript_cost_ledger,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -1002,22 +1004,37 @@ def _provider_usage_limits_should_post(
     return elapsed < 0 or elapsed >= _PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S
 
 
-@dataclass(frozen=True)
+@dataclass
 class _TranscriptCostCacheEntry:
     """
-    Cached cumulative-cost computation for one transcript file.
+    Append-only cost cursor for one transcript file.
 
-    The cost is recomputed only when the file's byte size changes, so the
-    forwarder doesn't re-parse an unchanged transcript on every (0.25s)
-    poll. Append-only JSONL makes byte size a sound cache key.
+    Holds the read position and priced ledger so a grown transcript parses
+    only its appended bytes; a size-keyed recompute would re-parse the whole
+    file on every (0.25s) poll.
 
-    :param size: File size in bytes when ``cost_usd`` was computed,
-        e.g. ``81920``.
-    :param cost_usd: Cumulative USD cost computed from the transcript at
-        that size, or ``None`` when nothing could be priced.
+    :param st_dev: Device id of the transcript when it was last read.
+    :param st_ino: Inode of the transcript when it was last read.
+    :param st_size: File size in bytes when it was last read.
+    :param st_mtime_ns: Modification time in nanoseconds when it was last
+        read.
+    :param offset: Byte offset after the last complete record parsed.
+    :param line_cursor: Count of complete records parsed before *offset*.
+    :param fingerprint: Hash of the bytes before *offset*, for stale-cursor
+        detection, or ``None`` until the first successful read.
+    :param ledger: Accumulated usage and priced cost for the parsed prefix.
+    :param cost_usd: Last priced cumulative USD cost, or ``None`` when
+        nothing could be priced.
     """
 
-    size: int
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    offset: int
+    line_cursor: int
+    fingerprint: str | None
+    ledger: TranscriptCostLedger
     cost_usd: float | None
 
 
@@ -4297,37 +4314,69 @@ def _transcript_cost_size_cached(
     cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> float | None:
     """
-    Cumulative transcript cost, recomputed only when the file grows.
+    Cumulative transcript cost, parsing only the appended bytes.
 
-    Wraps :func:`compute_transcript_cumulative_cost` with a per-process
-    size-keyed cache so an unchanged transcript isn't re-parsed every
-    poll. On a forwarder restart the cache starts empty and the first
-    call recomputes from the full file, so the estimate is correct across
+    Keeps an append-only cursor per transcript so an unchanged file isn't
+    read every poll. On a forwarder restart the cache starts empty and the
+    first call parses the whole file, so the estimate is correct across
     restarts (unlike an in-memory running sum, which would lose the
     pre-restart portion).
 
     :param transcript_path: Transcript JSONL path.
-    :param include_sidechains: Forwarded to
-        :func:`compute_transcript_cumulative_cost` — ``False`` for a
-        parent transcript (sub-agent records are sidechains counted
-        elsewhere), ``True`` for a sub-agent's own transcript.
+    :param include_sidechains: ``False`` for a parent transcript (sub-agent
+        records are sidechains counted elsewhere), ``True`` for a
+        sub-agent's own transcript.
     :param cache: Per-session cache mapping transcript path to its last
-        computed :class:`_TranscriptCostCacheEntry`. Mutated in place.
+        :class:`_TranscriptCostCacheEntry`. Mutated in place.
     :returns: Cumulative USD cost, or ``None`` when nothing is priceable
         (missing file included).
     """
     try:
-        size = transcript_path.stat().st_size
+        file_stat = os.stat(transcript_path)
     except OSError:
+        cache.pop(transcript_path, None)
         return None
-    cached = cache.get(transcript_path)
-    if cached is not None and cached.size == size:
-        return cached.cost_usd
-    cost = compute_transcript_cumulative_cost(
-        transcript_path, include_sidechains=include_sidechains
+    observation = (file_stat.st_size, file_stat.st_mtime_ns)
+    entry = cache.get(transcript_path)
+    if entry is not None and (
+        (entry.st_dev, entry.st_ino) != (file_stat.st_dev, file_stat.st_ino)
+        or file_stat.st_size < entry.offset
+        or (
+            observation != (entry.st_size, entry.st_mtime_ns)
+            and _jsonl_cursor_fingerprint(transcript_path, entry.offset) != entry.fingerprint
+        )
+    ):
+        # The parsed prefix is gone or no longer starts the file: restart.
+        entry = None
+    if entry is None:
+        entry = _TranscriptCostCacheEntry(
+            st_dev=file_stat.st_dev,
+            st_ino=file_stat.st_ino,
+            st_size=-1,
+            st_mtime_ns=-1,
+            offset=0,
+            line_cursor=0,
+            fingerprint=None,
+            ledger=TranscriptCostLedger(),
+            cost_usd=None,
+        )
+        cache[transcript_path] = entry
+    if observation == (entry.st_size, entry.st_mtime_ns):
+        return entry.cost_usd
+    offset, line_cursor = accumulate_transcript_cost(
+        transcript_path,
+        entry.ledger,
+        byte_offset=entry.offset,
+        start_line=entry.line_cursor,
+        include_sidechains=include_sidechains,
     )
-    cache[transcript_path] = _TranscriptCostCacheEntry(size=size, cost_usd=cost)
-    return cost
+    entry.offset = offset
+    entry.line_cursor = line_cursor
+    entry.st_size = file_stat.st_size
+    entry.st_mtime_ns = file_stat.st_mtime_ns
+    entry.fingerprint = _jsonl_cursor_fingerprint(transcript_path, offset)
+    entry.cost_usd = price_transcript_cost_ledger(entry.ledger)
+    return entry.cost_usd
 
 
 def _session_cost_estimate(
@@ -4357,7 +4406,7 @@ def _session_cost_estimate(
         (only these have an ``agent-<id>.jsonl`` on disk to price).
     :param status_cost: ``S`` — the statusLine total, or ``None`` when
         not captured yet.
-    :param cost_cache: Per-session size-keyed transcript cost cache,
+    :param cost_cache: Per-session transcript cost cursor cache,
         mutated in place.
     :returns: ``max(S, C)`` in USD, or ``None`` when neither source
         yields a priceable cost.
@@ -4438,7 +4487,7 @@ async def _forward_session_cost(
     :param dedupe: Carries ``posted_cost`` (display ``S``) and
         ``posted_policy_cost`` (``max(S, C)``) so steady values aren't
         re-POSTed each poll; mutated in place on a successful post.
-    :param cost_cache: Per-session size-keyed transcript cost cache,
+    :param cost_cache: Per-session transcript cost cursor cache,
         mutated in place.
     :returns: None.
     """
