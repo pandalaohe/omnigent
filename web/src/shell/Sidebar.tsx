@@ -489,10 +489,10 @@ function useActiveNavItem(): {
   };
 }
 
-// Green / amber / red, mirroring the finding levels. The dot's accessible
-// name carries the level; the count is plain text next to it.
-const SYSTEM_STATUS_DOT_CLASS: Record<SystemStatusLevel, string> = {
-  ok: "bg-emerald-500",
+// Amber / red, mirroring the finding levels; an ok summary renders no
+// trailing indicator at all. The dot's accessible name carries the level;
+// the count is plain text next to it.
+const SYSTEM_STATUS_DOT_CLASS: Record<Exclude<SystemStatusLevel, "ok">, string> = {
   amber: "bg-amber-500",
   red: "bg-red-500",
 };
@@ -524,25 +524,27 @@ function SystemStatusPrimaryNavLink({
       componentId="sidebar.system_status"
       testId="system-status-nav"
       trailing={
-        <span className="ml-auto flex items-center gap-1.5">
-          <span
-            data-testid="system-status-dot"
-            role="img"
-            aria-label={`System status: ${level}`}
-            className={cn("size-2 shrink-0 rounded-full", SYSTEM_STATUS_DOT_CLASS[level])}
-          />
-          {count > 0 && (
+        level === "ok" ? undefined : (
+          <span className="ml-auto flex items-center gap-1.5">
             <span
-              data-testid="system-status-count"
-              className={cn(
-                "text-10 font-medium tabular-nums",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            >
-              {count}
-            </span>
-          )}
-        </span>
+              data-testid="system-status-dot"
+              role="img"
+              aria-label={`System status: ${level}`}
+              className={cn("size-2 shrink-0 rounded-full", SYSTEM_STATUS_DOT_CLASS[level])}
+            />
+            {count > 0 && (
+              <span
+                data-testid="system-status-count"
+                className={cn(
+                  "text-10 font-medium tabular-nums",
+                  active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+                )}
+              >
+                {count}
+              </span>
+            )}
+          </span>
+        )
       }
     />
   );

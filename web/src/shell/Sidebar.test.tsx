@@ -76,7 +76,7 @@ const {
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
   useHostsMock: vi.fn(),
   // Summary for the "System status" nav indicator; undefined renders the
-  // default ok/green dot with no count.
+  // default ok state with no trailing indicator.
   systemStatusSummaryRef: {
     current: undefined as
       { revision: number; level: "ok" | "amber" | "red"; findings: { id: string }[] } | undefined,
@@ -1272,6 +1272,17 @@ describe("Sidebar session list", () => {
     expect(within(nav).getByText("System status")).toBeInTheDocument();
     expect(within(nav).getByTestId("system-status-dot")).toHaveClass("bg-amber-500");
     expect(within(nav).getByTestId("system-status-count")).toHaveTextContent("2");
+  });
+
+  it("renders no System status dot or count while the summary is ok", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    systemStatusSummaryRef.current = { revision: 1, level: "ok", findings: [] };
+    renderSidebar();
+
+    const nav = screen.getByTestId("system-status-nav");
+    expect(nav).toHaveAttribute("href", "/system");
+    expect(within(nav).queryByTestId("system-status-dot")).toBeNull();
+    expect(within(nav).queryByTestId("system-status-count")).toBeNull();
   });
 
   it("hides Canvas navigation while the release feature is off", () => {
