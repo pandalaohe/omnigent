@@ -181,6 +181,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_cache,
     _session_status_from_cache,
     _set_read_state,
+    _strip_succession_operation_labels,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_session_workspace,
@@ -1108,6 +1109,7 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
+        _strip_succession_operation_labels(parsed_metadata.labels)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 

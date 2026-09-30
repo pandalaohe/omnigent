@@ -35,6 +35,13 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store import (
+    HANDOVER_ITEM_LABEL_KEY,
+    ROTATE_REQUESTED_LABEL_KEY,
+    SUCCEEDED_BY_LABEL_KEY,
+    SUCCEEDS_LABEL_KEY,
+    SUCCESSION_OPERATION_LABEL_KEYS,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -457,3 +464,50 @@ def test_create_session_with_ordinary_labels_succeeds(
     conv = conversation_store.get_conversation(resp.json()["id"])
     assert conv is not None
     assert conv.labels["team"] == "ml"
+
+
+def test_create_session_strips_succession_operation_labels(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+) -> None:
+    """A rotation client copies the old session's labels wholesale. The
+    per-operation succession labels are stripped from a create body rather
+    than failing the reserved-key check (a copied ``succeeded_by`` would
+    redirect the new session's traffic), while PATCH refuses a direct write."""
+    conversation_store = stores[0]
+    _seed_session(stores)  # ensures ag_test exists
+    app = _multi_user_app(stores)
+
+    resp = TestClient(app).post(
+        "/v1/sessions",
+        json={
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
+            "labels": {
+                SUCCEEDED_BY_LABEL_KEY: "0" * 32,
+                SUCCEEDS_LABEL_KEY: "0" * 32,
+                HANDOVER_ITEM_LABEL_KEY: "item-1",
+                ROTATE_REQUESTED_LABEL_KEY: "1",
+                "team": "ml",
+            },
+        },
+        # Sentinel Origin: first-party client past the require_trusted_origin guard.
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    conv = conversation_store.get_conversation(session_id)
+    assert conv is not None
+    for key in SUCCESSION_OPERATION_LABEL_KEYS:
+        assert key not in conv.labels
+    assert conv.labels["team"] == "ml"
+
+    patch = TestClient(app).patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {SUCCEEDED_BY_LABEL_KEY: "forged"}},
+        # Sentinel Origin: first-party client past the require_trusted_origin guard.
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    assert patch.status_code == 400
+    assert patch.json()["error"]["code"] == "invalid_input"
+    conv = conversation_store.get_conversation(session_id)
+    assert conv is not None
+    assert SUCCEEDED_BY_LABEL_KEY not in conv.labels

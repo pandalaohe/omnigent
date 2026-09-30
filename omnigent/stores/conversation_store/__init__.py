@@ -205,6 +205,25 @@ ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY = "omnigent.archive_stop_when_idle"
 # repeat continue returns the same session instead of minting another one.
 CONTINUED_TO_LABEL_KEY = "omnigent.continued_to"
 
+# Succession operation labels. The move transaction writes ``succeeded_by``
+# (old → new) and ``succeeds`` (new → old); ``handover_item`` and
+# ``rotate_requested`` are per-rotation facts a session records for itself.
+# They describe ONE operation, but rotation clients copy the old session's
+# labels wholesale into every replacement, so the create route strips them
+# from any create body instead of letting a copy read as a fresh fact.
+SUCCEEDED_BY_LABEL_KEY = "omnigent.succeeded_by"
+SUCCEEDS_LABEL_KEY = "omnigent.succeeds"
+HANDOVER_ITEM_LABEL_KEY = "omnigent.handover_item"
+ROTATE_REQUESTED_LABEL_KEY = "omnigent.rotate_requested"
+SUCCESSION_OPERATION_LABEL_KEYS = frozenset(
+    {
+        SUCCEEDED_BY_LABEL_KEY,
+        SUCCEEDS_LABEL_KEY,
+        HANDOVER_ITEM_LABEL_KEY,
+        ROTATE_REQUESTED_LABEL_KEY,
+    }
+)
+
 # Per-session secret keying artifact-link tokens; server-internal (never
 # client-settable, never shown to viewers). Deleting or rotating it revokes
 # every link of the session.
@@ -366,6 +385,35 @@ class ArchivedConversationFacets:
     agent_ids: list[str]
 
 
+@dataclass(frozen=True)
+class SessionSuccession:
+    """One succession receipt with its JSON payloads decoded.
+
+    :param direct_ids: Direct children of the old session moved.
+    :param moved_ids: Every session moved — ``direct_ids`` plus all their
+        descendants.
+    :param opening: Prepared opening payload, or ``None`` before it is built.
+    :param opening_item_id: Id of the posted opening item, or ``None``.
+    :param dropped: Old session's runtime work that could not move, or ``None``.
+    :param questions: Open questions snapshotted before the old card closed,
+        or ``None``.
+    """
+
+    id: str
+    old_id: str
+    new_id: str
+    phase: str
+    direct_ids: list[str]
+    moved_ids: list[str]
+    opening: dict[str, Any] | None
+    opening_item_id: str | None
+    dropped: list[dict[str, Any]] | None
+    questions: list[dict[str, Any]] | None
+    error: str | None
+    created_at: int
+    updated_at: int
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -430,6 +478,19 @@ class NameAlreadyExistsError(Exception):
     builtins) can surface a clean ``name_already_exists`` tool
     error to the LLM.
     """
+
+
+class SuccessionRefusedError(ValueError):
+    """A child move was refused before any state changed.
+
+    ``code`` names the refusal — ``same_session``, ``not_found``,
+    ``not_top_level``, ``target_archived`` or ``title_clash`` — so the
+    caller can map it without parsing the message.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _is_addable_usage_increment(value: Any) -> bool:
@@ -1102,6 +1163,83 @@ class ConversationStore(ABC):
             unarchive). No effect outside a transition.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def reassign_live_children(
+        self,
+        old_id: str,
+        new_id: str,
+        receipt_id: str,
+    ) -> tuple[list[str], list[str]]:
+        """Move old's still-unarchived direct children and their subtrees under new.
+
+        One write transaction: lock ``new`` then ``old``, re-read each direct
+        child of ``old`` under its own lock and keep only the unarchived ones,
+        reparent them to ``new``, rewrite ``root_conversation_id`` across
+        their subtrees, write the succession labels and the receipt with
+        phase ``moved``. When no child is kept nothing is written and
+        ``([], [])`` is returned; refusals raise before any write.
+
+        :param old_id: Top-level session whose children move.
+        :param new_id: Top-level successor session.
+        :param receipt_id: Pre-generated id for the receipt row.
+        :returns: ``(direct_ids, moved_ids)`` — the kept direct children and
+            every moved session (kept children plus their descendants).
+        :raises SuccessionRefusedError: With ``code`` ``same_session``,
+            ``not_found``, ``not_top_level``, ``target_archived`` or
+            ``title_clash``.
+        """
+        ...
+
+    @abstractmethod
+    def get_succession(self, old_id: str, new_id: str) -> SessionSuccession | None:
+        """Return the receipt for one ``(old_id, new_id)`` pair, or ``None``."""
+        ...
+
+    @abstractmethod
+    def get_succession_by_id(self, receipt_id: str) -> SessionSuccession | None:
+        """Return the receipt by id, or ``None``."""
+        ...
+
+    @abstractmethod
+    def list_unfinished_successions(self, limit: int = 100) -> list[SessionSuccession]:
+        """Return receipts whose phase is not ``done``, oldest first."""
+        ...
+
+    @abstractmethod
+    def update_succession(
+        self,
+        receipt_id: str,
+        *,
+        expected_phase: str,
+        **fields: Any,
+    ) -> bool:
+        """Compare-and-set the receipt's phase and patch the given fields.
+
+        The update applies only while the stored phase still equals
+        ``expected_phase``, so two resumers cannot both advance one receipt.
+        ``phase`` (the new value), ``opening_item_id`` and ``error`` are
+        stored verbatim; ``opening``, ``dropped`` and ``questions`` accept
+        Python dicts/lists and are JSON-serialized. ``updated_at`` is always
+        refreshed.
+
+        :param receipt_id: Receipt row id.
+        :param expected_phase: Phase the receipt must still be in.
+        :param fields: Column updates, e.g. ``phase="rekeyed"``.
+        :returns: ``True`` when the row was updated, ``False`` when the
+            phase no longer matched or the receipt is missing.
+        """
+        ...
+
+    @abstractmethod
+    def clear_succession_link(self, old_id: str, new_id: str) -> None:
+        """Remove the succession labels when they still name this exact pair.
+
+        Deletes ``succeeded_by`` from ``old_id`` only when its value equals
+        ``new_id`` and ``succeeds`` from ``new_id`` only when its value equals
+        ``old_id``, so a later succession's link is never clobbered.
         """
         ...
 
