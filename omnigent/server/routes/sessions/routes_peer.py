@@ -498,12 +498,13 @@ class _PeerAdmission:
     ) -> None:
         """Release this request's reservation after a terminal outcome.
 
-        A duplicate verdict never held a reservation, and a delivered send
-        keeps its slot and text hash so an identical retry inside the
-        window still drops. A failed send removes its own slot by value
-        from both ledgers plus the text hash.
+        A duplicate verdict never held a reservation; a delivered or
+        uncertain send keeps its slot and text hash so an identical retry
+        inside the window still drops (an uncertain forward may have
+        landed). A failed send removes its own slot by value from both
+        ledgers plus the text hash.
         """
-        if verdict is not None and verdict in ("dropped:duplicate", "delivered"):
+        if verdict is not None and verdict in ("dropped:duplicate", "delivered", "uncertain"):
             return
         if slot is not None:
             pair_window = self._pair_sends.get((sender_id, receiver_id))
@@ -538,7 +539,6 @@ class PeerSend(Protocol):
         correlation_id: str | None,
         wait_seconds: int = 0,
         peer_id: str | None = None,
-        system: bool = False,
         deferred_until: int | None = None,
         require_init_success: bool = False,
         request: Request | None = None,
@@ -1013,13 +1013,12 @@ def register_peer_routes(
         correlation_id: str | None,
         wait_seconds: int = 0,
         peer_id: str | None = None,
-        system: bool = False,
         deferred_until: int | None = None,
         require_init_success: bool = False,
         request: Request | None = None,
         acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
     ) -> dict[str, Any]:
-        """Run S1 policy and delivery with optional system-message controls."""
+        """Run the S1 policy chain and delivery for one peer message."""
         if request is None:
             from omnigent.server.peer_sweeper import PeerSweeper
 
@@ -1038,7 +1037,6 @@ def register_peer_routes(
                     receiver_id,
                     body,
                     peer_id=peer_id,
-                    system=system,
                     deferred_until=deferred_until,
                     require_init_success=require_init_success,
                     acting_user_id=acting_user_id,
@@ -1064,7 +1062,6 @@ def register_peer_routes(
         body: PeerSendRequest,
         *,
         peer_id: str | None,
-        system: bool,
         deferred_until: int | None,
         require_init_success: bool,
         acting_user_id: Any,
@@ -1123,7 +1120,7 @@ def register_peer_routes(
         # A pending record never outlives the owner's undelivered-message
         # lifetime: an explicit wait_seconds is capped by it.
         effective_wait = min(body.wait_seconds, cfg.undelivered_ttl_s)
-        if not system and not cfg.enabled:
+        if not cfg.enabled:
             return {
                 "disposition": "refused",
                 "reason": "collab_disabled",
@@ -1166,26 +1163,21 @@ def register_peer_routes(
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
-        if system:
-            verdict, delay, slot = None, 0.0, None
-        else:
-            earlier_peer_id = _PEER_ADMISSION.pending_peer_id(
-                sender_id, receiver_id, body.correlation_id, body.text
-            )
-            earlier_undelivered = False
-            if earlier_peer_id is not None:
-                earlier = await asyncio.to_thread(peer_message_store.get, earlier_peer_id)
-                earlier_undelivered = (
-                    earlier is not None and earlier.state in _PEER_UNDELIVERED_STATES
-                )
-            verdict, delay, slot = _PEER_ADMISSION.reserve(
-                sender_id,
-                receiver_id,
-                body.text,
-                correlation_id=body.correlation_id,
-                limits=PeerLimits.from_settings(cfg),
-                earlier_undelivered=earlier_undelivered,
-            )
+        earlier_peer_id = _PEER_ADMISSION.pending_peer_id(
+            sender_id, receiver_id, body.correlation_id, body.text
+        )
+        earlier_undelivered = False
+        if earlier_peer_id is not None:
+            earlier = await asyncio.to_thread(peer_message_store.get, earlier_peer_id)
+            earlier_undelivered = earlier is not None and earlier.state in _PEER_UNDELIVERED_STATES
+        verdict, delay, slot = _PEER_ADMISSION.reserve(
+            sender_id,
+            receiver_id,
+            body.text,
+            correlation_id=body.correlation_id,
+            limits=PeerLimits.from_settings(cfg),
+            earlier_undelivered=earlier_undelivered,
+        )
         if verdict is not None:
             disposition, _, reason = verdict.partition(":")
             return {
@@ -1200,6 +1192,7 @@ def register_peer_routes(
         # so rounding only the delay could land the record before its slot.
         not_before = math.ceil(time.time() + delay) if delay > 0 else None
         terminal_verdict: str | None = None
+        uncertain = False
         record: SessionPeerMessage | None = None
         runner_online: bool | None = None
 
@@ -1269,7 +1262,7 @@ def register_peer_routes(
                 or receiver.archived_at is not None
             ):
                 terminal_verdict = "failed:closed"
-            if terminal_verdict is None and not system and depth > cfg.relay_depth_max:
+            if terminal_verdict is None and depth > cfg.relay_depth_max:
                 record = await _create_peer_record(
                     SessionPeerMessage(
                         id=peer_id or _new_record_id(body.correlation_id),
@@ -1427,21 +1420,11 @@ def register_peer_routes(
                 acting_user_id=acting_user_id,
                 require_init_success=require_init_success,
             )
-            # System sends keep an uncertain record in delivering so marker
-            # reconciliation can settle a forward that may have landed.
-            stored_state = (
-                "failed"
-                if result_state == "rejected" or (result_state == "uncertain" and not system)
-                else result_state
-            )
-            if stored_state == "uncertain":
-                return {
-                    "disposition": "uncertain",
-                    "reason": reason,
-                    "peer_id": record.id,
-                    "ref": record.ref,
-                    "receiver": _receiver_summary(receiver, runner_online=runner_online),
-                }
+            # An uncertain forward may have landed: store failed (as today)
+            # but release like a delivered send so the duplicate guard
+            # still drops an immediate identical retry.
+            uncertain = result_state == "uncertain"
+            stored_state = "failed" if result_state == "rejected" or uncertain else result_state
             await asyncio.to_thread(
                 peer_message_store.transition,
                 record.id,
@@ -1469,7 +1452,9 @@ def register_peer_routes(
         finally:
             if admitted:
                 outcome = terminal_verdict
-                if outcome is not None and outcome.startswith("failed:"):
+                if uncertain:
+                    outcome = "uncertain"
+                elif outcome is not None and outcome.startswith("failed:"):
                     outcome = "failed"
                 elif outcome is None:
                     outcome = "delivered"

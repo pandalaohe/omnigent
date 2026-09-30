@@ -6614,12 +6614,33 @@ def _session_query_client(
     )
 
 
+def test_child_rows_keep_plain_titles() -> None:
+    """A titled row without ":" surfaces with the title as its display name."""
+    from omnigent.runner.tool_dispatch import _child_rows_to_entries
+
+    rows = [
+        {"id": "c1", "title": "researcher:auth", "tool": "researcher", "session_name": "auth"},
+        {"id": "c2", "title": "Clean up the docs", "tool": None, "session_name": None},
+        {"id": "c3", "title": None, "tool": "researcher", "session_name": None},
+        {
+            "id": "c4",
+            "title": "work:done:closed:conv_dead",
+            "tool": "work",
+            "session_name": "done",
+        },
+    ]
+    assert _child_rows_to_entries(rows) == [
+        {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
+        {"agent": None, "title": "Clean up the docs", "conversation_id": "c2"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_session_list_maps_children_and_skips_closed() -> None:
     """
     ``sys_session_list`` maps ``child_sessions`` rows to
-    ``{agent, title, conversation_id}`` and drops closed and
-    colonless rows, matching ``SysSessionListTool``.
+    ``{agent, title, conversation_id}`` and drops closed rows, matching
+    ``SysSessionListTool``; a plain title keeps its own text.
     """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
@@ -6678,13 +6699,13 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # c3 (explicitly closed despite its mixed-type label map) and c5
+    # (legacy title tombstone) dropped; c4 (no colon) surfaces under its
+    # own title; the ui:-added child surfaces under its bound agent + label.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": "legacy-untyped", "title": "legacy-untyped", "conversation_id": "c4"},
     ]
 
 
@@ -13703,6 +13724,48 @@ async def test_sys_session_create_other_host_without_workspace_is_refused() -> N
 
     assert json.loads(output)["error"] == "workspace_required_on_other_host"
     assert bodies == [], "a placement refusal must not create the child"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_worktree_without_a_host_is_refused() -> None:
+    """A worktree with no effective host is refused before the create.
+
+    The server would answer 422 (git worktree creation requires host_id);
+    the runner refuses locally with a message the caller can fix.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_placement_caller":
+            return httpx.Response(200, json={"id": "conv_placement_caller"})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "git" in body and "host_id" not in body:
+                return httpx.Response(
+                    422, json={"detail": "git worktree creation requires host_id"}
+                )
+            return httpx.Response(201, json={"id": "conv_never"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_x", "title": "wt", "worktree": {"branch": "fix-auth"}}
+            ),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "worktree_requires_host", info
+    assert info["message"] == "a worktree needs a host; this session has none — pass 'host'"
+    assert bodies == [], "a worktree refusal must not create the child"
 
 
 @pytest.mark.asyncio

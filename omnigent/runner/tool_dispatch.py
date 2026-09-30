@@ -4966,6 +4966,15 @@ async def _resolve_create_placement(
             )
         target_host_id, target_host_name = resolved
 
+    if git is not None and target_host_id is None:
+        # The server cannot cut a worktree without a host to cut it on.
+        return None, json.dumps(
+            {
+                "error": "worktree_requires_host",
+                "message": "a worktree needs a host; this session has none — pass 'host'",
+            }
+        )
+
     same_host = host_arg is None or target_host_id == caller_host
     workspace_out = workspace_arg
     if workspace_out is None and git is not None:
@@ -6332,10 +6341,10 @@ async def _timer_loop(
                 server_client, conversation_id
             ):
                 break
-            # D5: the session itself archived ends the schedule before its
-            # next wake; the finally below drops the registry entry. An
-            # ancestor-only archive keeps the schedule.
-            if await flows.session_self_archived(server_client, conversation_id):
+            # D5: the session or an ancestor archived ends the schedule
+            # before its next wake; the finally below drops the registry
+            # entry.
+            if await flows.session_lineage_archived(server_client, conversation_id):
                 break
             text = f"[System: timer {timer_id} fired]"
             if note:
@@ -6817,6 +6826,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "max_cost_usd",
     "workspace",
     "host_id",
     "execution_target",
@@ -8469,8 +8479,9 @@ async def _collect_sub_agents(
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
 
     Returns ``[{"agent", "title", "conversation_id"}, ...]``, skipping
-    closed and titleless/colonless rows so they never re-surface to the
-    LLM. Includes the caller's own children and, when the caller is
+    closed and titleless rows so they never re-surface to the LLM; a
+    plainly titled child surfaces under its title. Includes the caller's
+    own children and, when the caller is
     itself a child (e.g. a user-added agent), its parent (surfaced as
     ``agent="main"``) and its siblings — so an added agent can still
     discover ``main`` and its session-mates. Best-effort: a failed
@@ -8643,9 +8654,11 @@ def _child_rows_to_entries(
     """
     Map ``child_sessions`` rows to ``sys_session_list`` entries.
 
-    Skips closed and titleless/colonless rows. The server already
-    parses ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused.
+    Skips closed and titleless rows. A title with a colon is a
+    ``<tool>:<name>`` pair the server already parsed — its ``tool`` /
+    ``session_name`` are reused (including the ``"ui:<agent>:<label>"``
+    form). A plain title (e.g. from ``sys_session_create``) is its own
+    display title, with the row's ``tool`` kept when one is set.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id"}, ...]``.
@@ -8654,12 +8667,12 @@ def _child_rows_to_entries(
     for row in rows:
         title = _optional_string(row.get("title"))
         labels = _string_mapping(row.get("labels"))
-        if not title or ":" not in title or is_session_closed(labels, title):
+        if not title or is_session_closed(labels, title):
             continue
         entries.append(
             {
                 "agent": _optional_string(row.get("tool")),
-                "title": _optional_string(row.get("session_name")),
+                "title": _optional_string(row.get("session_name")) if ":" in title else title,
                 "conversation_id": _optional_string(row.get("id")),
             }
         )

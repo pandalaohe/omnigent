@@ -184,35 +184,52 @@ async def read_flow_timer_enabled(server_client: httpx.AsyncClient, session_id: 
 # ── Session archive check ─────────────────────────────────────
 
 
-async def session_self_archived(server_client: httpx.AsyncClient, session_id: str) -> bool:
-    """
-    Whether a fresh session snapshot shows the session itself archived.
+_ARCHIVE_LINEAGE_MAX_HOPS = 32
 
-    Scheduled fires check this before posting: an archived session refuses
-    new events, so its timers and flows end instead of retrying a refused
-    post forever. An ancestor-only archive (D4) reads False and keeps
-    today's behaviour; any read failure does the same.
+
+async def session_lineage_archived(server_client: httpx.AsyncClient, session_id: str) -> bool:
+    """
+    Whether a fresh snapshot shows the session or an ancestor archived.
+
+    Scheduled fires check this before posting: an archived session — or one
+    under an archived ancestor — refuses new user work, so its timers and
+    flows end instead of retrying a refused post forever. Any read failure
+    reads as not archived (today's fail-open).
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param session_id: Session whose schedule is about to fire, e.g.
         ``"conv_abc123"``.
-    :returns: ``True`` only when the snapshot answers 200 with ``archived``
-        true.
+    :returns: ``True`` when any snapshot in the ``parent_session_id`` chain
+        answers 200 with ``archived`` true.
     """
+    current_id = session_id
+    seen: set[str] = set()
     try:
-        snapshot = await server_client.get(f"/v1/sessions/{session_id}", timeout=10.0)
-        if snapshot.status_code != 200:
-            return False
-        body = snapshot.json()
+        for _ in range(_ARCHIVE_LINEAGE_MAX_HOPS):
+            if current_id in seen:
+                return False
+            seen.add(current_id)
+            snapshot = await server_client.get(f"/v1/sessions/{current_id}", timeout=10.0)
+            if snapshot.status_code != 200:
+                return False
+            body = snapshot.json()
+            if not isinstance(body, dict):
+                return False
+            if body.get("archived") is True:
+                return True
+            parent_id = body.get("parent_session_id")
+            if not isinstance(parent_id, str) or not parent_id:
+                return False
+            current_id = parent_id
     except Exception:  # noqa: BLE001 — a failed check keeps today's behaviour
         _logger.warning(
-            "session archive check failed for %s; keeping today's behaviour",
+            "session archive lineage check failed for %s; keeping today's behaviour",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return False
-    return isinstance(body, dict) and body.get("archived") is True
+    return False
 
 
 # ── Stop condition ────────────────────────────────────────────
@@ -642,13 +659,13 @@ async def _run_flow(run: _FlowRun) -> None:
                     extra={"session_id": run.ctx.conversation_id},
                 )
                 break
-            # D5: the session itself archived ends the run before the next
-            # tick; the wake would be refused, so it is not posted.
-            if await session_self_archived(run.ctx.server_client, run.ctx.conversation_id):
+            # D5: the session or an ancestor archived ends the run before the
+            # next tick; the wake would be refused, so it is not posted.
+            if await session_lineage_archived(run.ctx.server_client, run.ctx.conversation_id):
                 run.reason = "archived"
-                run.detail = "the session was archived"
+                run.detail = "the session or an ancestor was archived"
                 _logger.info(
-                    "flow %s stopped: the session was archived",
+                    "flow %s stopped: the session or an ancestor was archived",
                     run.flow_id,
                     extra={"session_id": run.ctx.conversation_id},
                 )

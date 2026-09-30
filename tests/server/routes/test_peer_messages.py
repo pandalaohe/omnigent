@@ -808,6 +808,53 @@ async def test_other_omnigent_error_maps_not_ready(
         fake.error = None
 
 
+async def test_uncertain_delivery_keeps_the_duplicate_guard(
+    peer_env: dict[str, Any],
+) -> None:
+    """An uncertain result may have landed, so an identical retry still drops."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    text = f"uncertain-{uuid.uuid4().hex}"
+    fake.error = OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR)
+    try:
+        first = await peer_env["app"].state.peer_send(
+            sender=sender, receiver_id=receiver.id, text=text, correlation_id=None
+        )
+    finally:
+        fake.error = None
+    assert first["disposition"] == "failed", first
+    assert first["reason"] == "not_ready"
+    second = await peer_env["app"].state.peer_send(
+        sender=sender, receiver_id=receiver.id, text=text, correlation_id=None
+    )
+    assert second["disposition"] == "dropped", second
+    assert second["reason"] == "duplicate"
+
+
+async def test_certain_failure_lets_the_duplicate_retry_through(
+    peer_env: dict[str, Any],
+) -> None:
+    """A definite failure (nothing forwarded) frees the retry."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    text = f"offline-{uuid.uuid4().hex}"
+    fake.error = OmnigentError("gone", code=ErrorCode.RUNNER_UNAVAILABLE)
+    try:
+        first = await peer_env["app"].state.peer_send(
+            sender=sender, receiver_id=receiver.id, text=text, correlation_id=None
+        )
+    finally:
+        fake.error = None
+    assert first["disposition"] == "failed", first
+    assert first["reason"] == "offline"
+    second = await peer_env["app"].state.peer_send(
+        sender=sender, receiver_id=receiver.id, text=text, correlation_id=None
+    )
+    assert second["disposition"] == "delivered", second
+
+
 async def test_native_item_id_without_pending_id_is_not_ready(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
@@ -1548,10 +1595,10 @@ async def test_send_denied_for_unrelated_user(
     assert resp.status_code in (403, 404), resp.text
 
 
-async def test_relay_depth_limit_holds_but_system_sends_bypass(
+async def test_relay_depth_limit_holds(
     peer_env: dict[str, Any],
 ) -> None:
-    """T11: a depth-31 agent send is held(relay_limit); a system send is not."""
+    """T11: a depth-31 agent send is held(relay_limit)."""
     sender, receiver = peer_env["sender"], peer_env["receiver"]
     _seed_trigger_depth(peer_env, 30)
     result = await peer_env["app"].state.peer_send(
@@ -1566,16 +1613,6 @@ async def test_relay_depth_limit_holds_but_system_sends_bypass(
     assert held_record is not None
     assert held_record.state == "held"
     assert held_record.relay_depth == 31
-
-    system = await peer_env["app"].state.peer_send(
-        sender=sender,
-        receiver_id=receiver.id,
-        text=f"required result {uuid.uuid4().hex}",
-        correlation_id=None,
-        system=True,
-    )
-    assert system["disposition"] == "delivered"
-    assert peer_env["peer_store"].get(system["peer_id"]).relay_depth == 31
 
 
 async def test_release_resets_relay_depth(
@@ -1706,7 +1743,6 @@ async def test_peer_id_returns_existing_without_delivery(peer_env: dict[str, Any
         text="one",
         correlation_id=None,
         peer_id=peer_id,
-        system=True,
     )
     second = await send(
         sender=sender,
@@ -1714,7 +1750,6 @@ async def test_peer_id_returns_existing_without_delivery(peer_env: dict[str, Any
         text="other",
         correlation_id=None,
         peer_id=peer_id,
-        system=True,
     )
     assert first["peer_id"] == peer_id
     assert second == {
@@ -1735,9 +1770,8 @@ async def test_deferred_until_sets_queued_expiry(peer_env: dict[str, Any]) -> No
         result = await peer_env["app"].state.peer_send(
             sender=sender,
             receiver_id=receiver.id,
-            text="queued system",
+            text="queued deferred",
             correlation_id=None,
-            system=True,
             deferred_until=expiry,
         )
     finally:
@@ -1748,9 +1782,8 @@ async def test_deferred_until_sets_queued_expiry(peer_env: dict[str, Any]) -> No
     pending = await peer_env["app"].state.peer_send(
         sender=sender,
         receiver_id=receiver.id,
-        text="offline system",
+        text="offline deferred",
         correlation_id=None,
-        system=True,
         deferred_until=expiry,
     )
     assert pending["disposition"] == "pending"
@@ -1800,33 +1833,9 @@ async def test_strict_init_failure_rejected(peer_env: dict[str, Any]) -> None:
         receiver_id=receiver.id,
         text="strict",
         correlation_id=None,
-        system=True,
         require_init_success=True,
     )
     assert result["disposition"] == "failed"
     assert result["reason"].startswith("init_failed: The recovered runner")
     assert peer_env["peer_store"].get(result["peer_id"]).state == "failed"
     assert peer_env["post_kwargs"][-1]["require_init_success"] is True
-
-
-async def test_system_uncertain_keeps_delivering(
-    peer_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sender, receiver = peer_env["sender"], peer_env["receiver"]
-    probes = 0
-
-    def _native_at_delivery(_conv: Any) -> bool:
-        nonlocal probes
-        probes += 1
-        return probes >= 3
-
-    monkeypatch.setattr(peer_module, "_is_native_terminal_session", _native_at_delivery)
-    result = await peer_env["app"].state.peer_send(
-        sender=sender,
-        receiver_id=receiver.id,
-        text="uncertain system",
-        correlation_id=None,
-        system=True,
-    )
-    assert result["disposition"] == "uncertain"
-    assert peer_env["peer_store"].get(result["peer_id"]).state == "delivering"

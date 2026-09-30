@@ -444,8 +444,33 @@ async def test_self_archived_session_ends_the_run_before_its_next_tick(
                 break
             await asyncio.sleep(0.02)
     assert run.reason == "archived"
-    assert run.detail == "the session was archived"
+    assert run.detail == "the session or an ancestor was archived"
     assert run.ticks == 1
+    assert server.wakes == []
+    assert flows._session_flows == {}
+    assert started["flow_id"] not in runner_app._session_timers.get(_SESSION, {})
+
+
+@pytest.mark.asyncio
+async def test_archived_ancestor_ends_the_run_before_its_next_tick(
+    server: _FakeServer, scripted: list[str]
+) -> None:
+    """An ancestor-only archive ends the run with no tick and no wake."""
+    from omnigent.runner import app as runner_app
+
+    scripted.append("x")
+    server.sessions[_SESSION]["parent_session_id"] = "conv_archived_parent"
+    server.sessions["conv_archived_parent"] = {"id": "conv_archived_parent", "archived": True}
+    async with _client(server) as client:
+        started = await _start(client, {"steps": _STEP, "every_s": 0.1, "times": 50})
+        run = flows._session_flows[_SESSION][started["flow_id"]]
+        for _ in range(100):
+            if not flows._session_flows.get(_SESSION):
+                break
+            await asyncio.sleep(0.02)
+    assert run.reason == "archived"
+    assert run.detail == "the session or an ancestor was archived"
+    assert run.ticks == 0
     assert server.wakes == []
     assert flows._session_flows == {}
     assert started["flow_id"] not in runner_app._session_timers.get(_SESSION, {})
@@ -726,6 +751,30 @@ async def test_timer_firing_stops_on_row8_off_only_without_spec_timers(
         runner_app.cancel_timer(_SESSION, output["timer_id"])
     assert running is spec_timers
     assert (len(server.wakes) >= 2) is spec_timers
+
+
+@pytest.mark.asyncio
+async def test_timer_stops_when_an_ancestor_is_archived(server: _FakeServer) -> None:
+    """An ancestor-only archive stops the timer before its next wake."""
+    from omnigent.runner import app as runner_app
+
+    server.sessions[_SESSION]["parent_session_id"] = "conv_archived_parent"
+    server.sessions["conv_archived_parent"] = {"id": "conv_archived_parent", "archived": True}
+    async with _client(server) as client:
+        output = json.loads(
+            await execute_tool(
+                tool_name="sys_timer_set",
+                arguments=json.dumps({"seconds": 0.05, "repeat": True}),
+                server_client=client,
+                conversation_id=_SESSION,
+            )
+        )
+        assert output["status"] == "scheduled"
+        await asyncio.sleep(0.15)
+        running = output["timer_id"] in runner_app._session_timers.get(_SESSION, {})
+        runner_app.cancel_timer(_SESSION, output["timer_id"])
+    assert not running
+    assert server.wakes == []
 
 
 @pytest.mark.asyncio

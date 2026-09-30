@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import threading
+import types
 from typing import Any, cast
 
 import pytest
@@ -267,6 +268,24 @@ class _PostEventScript:
         return {"queued": True}
 
 
+class _FakePrefsStore:
+    """Preferences stub returning one ``session_collab`` namespace."""
+
+    def __init__(self, **collab: Any) -> None:
+        self.collab = collab
+
+    def get(self, owner: str) -> dict[str, Any]:
+        del owner
+        return {"settings": {"session_collab": self.collab}}
+
+
+def _app_with_collab(**collab: Any) -> Any:
+    """App-state stand-in whose preferences store carries *collab*."""
+    app = types.SimpleNamespace()
+    app.state = types.SimpleNamespace(user_preferences_store=_FakePrefsStore(**collab))
+    return app
+
+
 class _Harness:
     """One conversation store + sweeper wired with the fakes above."""
 
@@ -378,6 +397,48 @@ async def test_held_record_before_expiry_untouched(harness: _Harness) -> None:
     assert _row(harness.store, record.id).state == "held"
     assert harness.deliver.calls == []
     assert harness.post_event.calls == []
+
+
+@pytest.mark.parametrize("state", ["pending", "queued"])
+async def test_inbound_hold_transitions_deferred_records_to_held(state: str) -> None:
+    """A hold receiver's deferred record becomes held, like the inline path."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "hold"}))
+    record = h.seed_record(state=state)
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "held"
+    assert updated.reason is None
+    assert h.deliver.calls == []
+    assert h.post_event.calls == []
+
+
+async def test_master_switch_off_fails_deferred_record_with_notice() -> None:
+    """A disabled sender owner ends the record as failed(collab_disabled)."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    h.sweeper._app = _app_with_collab(enabled=False)
+    record = h.seed_record(state="pending")
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "failed"
+    assert updated.reason == "collab_disabled"
+    assert h.deliver.calls == []
+    assert "(collab_disabled)" in h.post_event.calls[0]["text"]
+
+
+async def test_master_switch_on_still_delivers() -> None:
+    """An enabled sender owner with no hold delivers as before."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    h.sweeper._app = _app_with_collab(enabled=True)
+    record = h.seed_record(state="pending")
+    await h.sweeper._tick()
+    assert _row(h.store, record.id).state == "delivered"
+    assert len(h.deliver.calls) == 1
 
 
 async def test_not_before_gates_delivery(harness: _Harness) -> None:

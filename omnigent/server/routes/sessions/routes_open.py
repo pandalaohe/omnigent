@@ -550,7 +550,6 @@ def register_open_routes(
                     receiver_id=sid,
                     text=body.message,
                     correlation_id=sid,
-                    system=False,
                     require_init_success=True,
                     request=request,
                     acting_user_id=owner,

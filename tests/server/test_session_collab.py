@@ -153,8 +153,8 @@ async def test_undelivered_ttl_is_per_owner(collab_env: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_master_off_refuses_sends_but_not_system(collab_env: dict[str, Any]) -> None:
-    """A disabled owner gets collab_disabled; a runtime notice still lands."""
+async def test_master_off_refuses_sends(collab_env: dict[str, Any]) -> None:
+    """A disabled owner gets collab_disabled."""
     sender, receiver = collab_env["sender"], collab_env["receiver"]
     collab_env["prefs_store"].patch_namespace(ALICE, SESSION_COLLAB, {"enabled": False})
 
@@ -168,15 +168,6 @@ async def test_master_off_refuses_sends_but_not_system(collab_env: dict[str, Any
     assert refused["reason"] == "collab_disabled"
     assert refused["peer_id"] is None
     assert refused["receiver"]["id"] == receiver.id
-
-    system = await collab_env["app"].state.peer_send(
-        sender=sender,
-        receiver_id=receiver.id,
-        text=f"required result {uuid.uuid4().hex}",
-        correlation_id=None,
-        system=True,
-    )
-    assert system["disposition"] == "delivered"
 
 
 # ── session_collab helpers ──────────────────────────────────────────
