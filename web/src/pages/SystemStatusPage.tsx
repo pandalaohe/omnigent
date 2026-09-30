@@ -5,7 +5,7 @@
 // A member receives `server: null` and only their own hosts — the page just
 // renders what the permission-filtered response contains.
 
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
@@ -48,6 +48,35 @@ function formatUptime(startedAt: number | null | undefined): string {
   }
   if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
   return "<1m";
+}
+
+/** Whether a sample is older than its freshness window. */
+function isStale(sampledAtMs: number, staleAfterS: number, nowMs: number): boolean {
+  return (nowMs - sampledAtMs) / 1000 > staleAfterS;
+}
+
+/** Coarse sample-age label: seconds under a minute, then minutes, then hours. */
+function formatAge(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  if (total < 60) return `${total} s`;
+  if (total < 3600) return `${Math.floor(total / 60)} min`;
+  return `${Math.floor(total / 3600)} h`;
+}
+
+/** Coarse elapsed-span label for sparkline axes; never reads "0 min". */
+function formatSpan(seconds: number): string {
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)} h`;
+  return `${Math.max(1, Math.floor(seconds / 60))} min`;
+}
+
+/** Wall clock in ms, refreshed every second so freshness labels age visibly. */
+function useSecondTick(): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return nowMs;
 }
 
 // The OS process name is "python" for most rows; show the role instead so the
@@ -93,6 +122,55 @@ function StatePill({ state }: { state: SystemHostState }) {
     >
       {STATE_LABELS[state]}
     </span>
+  );
+}
+
+// The server records one point per minute, so three missed points mean stale.
+const SERVER_STALE_AFTER_S = 180;
+
+/**
+ * Sample-age label for a card header: muted while fresh, amber once the
+ * sample is older than its window. The title is the sample's local time.
+ */
+function Freshness({
+  sampledAtMs,
+  staleAfterS,
+  nowMs,
+}: {
+  sampledAtMs: number;
+  staleAfterS: number;
+  nowMs: number;
+}) {
+  const age = (nowMs - sampledAtMs) / 1000;
+  const stale = isStale(sampledAtMs, staleAfterS, nowMs);
+  return (
+    <span
+      data-testid="freshness"
+      data-stale={stale ? "true" : undefined}
+      title={new Date(sampledAtMs).toLocaleString()}
+      className={cn(
+        "ml-auto text-xs tabular-nums",
+        stale ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
+      )}
+    >
+      {stale ? `Stale — last sample ${formatAge(age)} ago` : `Updated ${formatAge(age)} ago`}
+    </span>
+  );
+}
+
+/**
+ * First-point / now labels under a sparkline. Points are spaced by index, so
+ * no ticks in between: a middle label would lie over data gaps.
+ */
+function SparklineAxis({ firstT, nowMs }: { firstT: number; nowMs: number }) {
+  return (
+    <div
+      className="mt-1 flex justify-between text-[10px] text-muted-foreground"
+      data-testid="sparkline-axis"
+    >
+      <span>{formatSpan(nowMs / 1000 - firstT)} ago</span>
+      <span>now</span>
+    </div>
   );
 }
 
@@ -217,15 +295,20 @@ function HealthCheckNoticeBox({ notice }: { notice: HealthCheckNotice }) {
 function ServerCard({
   server,
   threshold,
+  nowMs,
 }: {
   server: SystemServerStatus;
   threshold: number | null;
+  nowMs: number;
 }) {
   const history = useSystemHistory("server");
   const point = server.last_point;
+  const entries = history.data ?? [];
   // The server target's points differ from a host's: CPU is `cpu`, not `cpu_avg`.
-  const points = (history.data ?? []).map((entry) => ("cpu" in entry ? entry.cpu : entry.cpu_avg));
+  const points = entries.map((entry) => ("cpu" in entry ? entry.cpu : entry.cpu_avg));
+  const firstEntry = entries[0];
   const failureRate = point !== null && point.req > 0 ? (point.err / point.req) * 100 : null;
+  const stale = point !== null && isStale(point.t * 1000, SERVER_STALE_AFTER_S, nowMs);
   return (
     <section className="rounded-lg border bg-card p-4" data-testid="system-status-server-card">
       <div className="mb-3 flex items-center gap-2">
@@ -233,6 +316,13 @@ function ServerCard({
         <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
           Online
         </span>
+        {point !== null && (
+          <Freshness
+            sampledAtMs={point.t * 1000}
+            staleAfterS={SERVER_STALE_AFTER_S}
+            nowMs={nowMs}
+          />
+        )}
       </div>
       {point === null ? (
         <p className="text-sm text-muted-foreground">Waiting for the first metrics tick.</p>
@@ -249,13 +339,17 @@ function ServerCard({
             />
             <Metric label="Open connections" value={String(point.websockets)} />
           </dl>
-          {points.length > 0 && (
-            <Sparkline
-              points={points}
-              threshold={threshold}
-              label="Server CPU, last 24 hours"
-              className="mt-3"
-            />
+          {points.length > 0 && firstEntry !== undefined && (
+            <>
+              <Sparkline
+                points={points}
+                threshold={threshold}
+                label="Server CPU, last 24 hours"
+                className="mt-3"
+                latest={stale ? "stale" : "live"}
+              />
+              <SparklineAxis firstT={firstEntry.t} nowMs={nowMs} />
+            </>
           )}
         </>
       )}
@@ -402,24 +496,35 @@ function HostCard({
   host,
   threshold,
   sessionTitles,
+  nowMs,
 }: {
   host: SystemStatusHost;
   threshold: number | null;
   sessionTitles: Map<string, string>;
+  nowMs: number;
 }) {
   const history = useSystemHistory(host.host_id);
   const [processesOpen, setProcessesOpen] = useState(false);
   const snapshot = host.last_snapshot;
   const machine = snapshot?.machine ?? null;
-  const points = (history.data ?? []).map((entry) =>
-    "cpu_avg" in entry ? entry.cpu_avg : entry.cpu,
-  );
+  const entries = history.data ?? [];
+  const points = entries.map((entry) => ("cpu_avg" in entry ? entry.cpu_avg : entry.cpu));
+  const firstEntry = entries[0];
   const name = host.name || host.host_id;
+  const sampledAtMs = snapshot === null ? Number.NaN : Date.parse(snapshot.sampled_at);
+  const hasSample = snapshot !== null && Number.isFinite(sampledAtMs);
+  const staleAfterS = snapshot === null ? 0 : 3 * snapshot.interval_s;
+  const stale = hasSample && isStale(sampledAtMs, staleAfterS, nowMs);
+  // Offline hosts say "Last seen …", so they carry no freshness label.
+  const showFreshness = hasSample && host.state === "online";
   return (
     <section className="rounded-lg border bg-card p-4" data-testid={`host-card-${host.host_id}`}>
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <h2 className="text-ui font-semibold">{name}</h2>
         <StatePill state={host.state} />
+        {showFreshness && (
+          <Freshness sampledAtMs={sampledAtMs} staleAfterS={staleAfterS} nowMs={nowMs} />
+        )}
       </div>
       {host.state === "offline" && (
         <p className="mb-3 text-sm text-muted-foreground">
@@ -449,13 +554,17 @@ function HostCard({
             />
             <Metric label="Load" value={formatLoad(machine.load1)} />
           </dl>
-          {points.length > 0 && (
-            <Sparkline
-              points={points}
-              threshold={threshold}
-              label={`${name} CPU, last 24 hours`}
-              className="mt-3"
-            />
+          {points.length > 0 && firstEntry !== undefined && (
+            <>
+              <Sparkline
+                points={points}
+                threshold={threshold}
+                label={`${name} CPU, last 24 hours`}
+                className="mt-3"
+                latest={hasSample ? (stale ? "stale" : "live") : undefined}
+              />
+              <SparklineAxis firstT={firstEntry.t} nowMs={nowMs} />
+            </>
           )}
         </>
       )}
@@ -517,6 +626,7 @@ function MonitorOverheadFooter({
 
 export function SystemStatusPage() {
   const isAdmin = useIsAdmin();
+  const nowMs = useSecondTick();
   const status = useSystemStatus({ live: true });
   // The thresholds are admin-only; members never see the bytes line.
   const settings = useSystemStatusSettings({ enabled: isAdmin });
@@ -590,7 +700,7 @@ export function SystemStatusPage() {
 
       {data.server !== null && (
         <div className="mt-4">
-          <ServerCard server={data.server} threshold={threshold} />
+          <ServerCard server={data.server} threshold={threshold} nowMs={nowMs} />
         </div>
       )}
 
@@ -605,6 +715,7 @@ export function SystemStatusPage() {
               host={host}
               threshold={threshold}
               sessionTitles={sessionTitles}
+              nowMs={nowMs}
             />
           ))}
         </div>

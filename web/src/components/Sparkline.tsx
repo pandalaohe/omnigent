@@ -15,9 +15,14 @@ interface SparklineProps {
   /** Accessible name; when omitted the chart is decorative. */
   label?: string;
   className?: string;
+  /**
+   * Renders a dot on the latest point when set: live (muted) or stale
+   * (amber). Omitted, the chart renders exactly as before.
+   */
+  latest?: "live" | "stale";
 }
 
-export function Sparkline({ points, threshold = null, label, className }: SparklineProps) {
+export function Sparkline({ points, threshold = null, label, className, latest }: SparklineProps) {
   if (points.length === 0) return null;
   // Scale from zero: a CPU/memory series that never nears its ceiling should
   // still read as "low", not as a full-height line.
@@ -29,14 +34,14 @@ export function Sparkline({ points, threshold = null, label, className }: Sparkl
       return `${x.toFixed(2)},${y(value)}`;
     })
     .join(" ");
-  return (
+  const chart = (
     <svg
       role={label ? "img" : undefined}
       aria-label={label}
       aria-hidden={label ? undefined : true}
       viewBox="0 0 100 100"
       preserveAspectRatio="none"
-      className={cn("h-10 w-full", className)}
+      className={cn("h-10 w-full", latest === undefined ? className : undefined)}
     >
       {threshold !== null && (
         <line
@@ -59,5 +64,21 @@ export function Sparkline({ points, threshold = null, label, className }: Sparkl
         vectorEffect="non-scaling-stroke"
       />
     </svg>
+  );
+  if (latest === undefined) return chart;
+  // The wrapper carries the caller's margins; the dot sits on the last point.
+  return (
+    <div className={cn("relative", className)}>
+      {chart}
+      <span
+        aria-hidden="true"
+        data-testid="sparkline-latest"
+        className={cn(
+          "absolute right-0 size-1.5 -translate-y-1/2 translate-x-1/2 rounded-full",
+          latest === "live" ? "bg-foreground/60" : "bg-amber-500",
+        )}
+        style={{ top: `${y(points[points.length - 1])}%` }}
+      />
+    </div>
   );
 }

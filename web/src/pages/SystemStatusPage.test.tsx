@@ -2,7 +2,7 @@
 // state variants, the expandable process tree with subtree totals and role
 // labels, and the measured monitor-overhead footer.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -213,7 +213,10 @@ beforeEach(() => {
   mocks.healthCheck.current = { start: vi.fn(), pending: false, notice: null };
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("SystemStatusPage", () => {
   it("renders findings, the server card, host states and the overhead footer", () => {
@@ -371,5 +374,97 @@ describe("SystemStatusPage", () => {
     mocks.isAdmin.current = true;
     renderPage();
     expect(screen.getAllByRole("button", { name: "Run health check" })).toHaveLength(2);
+  });
+
+  it("shows the host sample age while the snapshot is fresh", () => {
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
+    const nowMs = Date.now();
+    const view = makeView({ server: false });
+    const snapshot = view.hosts[0].last_snapshot;
+    if (snapshot === null) throw new Error("host_1 is expected to have a snapshot");
+    snapshot.sampled_at = new Date(nowMs - 4_000).toISOString();
+    snapshot.interval_s = 10;
+    mocks.status.current = { data: view, isLoading: false, isError: false, error: null };
+    mocks.history.set("host_1", [{ t: nowMs / 1000 - 40, cpu_avg: 10 }]);
+    renderPage();
+
+    const freshness = within(screen.getByTestId("host-card-host_1")).getByTestId("freshness");
+    expect(freshness).toHaveTextContent("Updated 4 s ago");
+    expect(freshness).not.toHaveAttribute("data-stale");
+  });
+
+  it("marks a stale host sample and its sparkline's latest point amber", () => {
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
+    const nowMs = Date.now();
+    const view = makeView({ server: false });
+    const snapshot = view.hosts[0].last_snapshot;
+    if (snapshot === null) throw new Error("host_1 is expected to have a snapshot");
+    snapshot.sampled_at = new Date(nowMs - 200_000).toISOString();
+    snapshot.interval_s = 10;
+    mocks.status.current = { data: view, isLoading: false, isError: false, error: null };
+    mocks.history.set("host_1", [
+      { t: nowMs / 1000 - 3_600, cpu_avg: 10 },
+      { t: nowMs / 1000 - 60, cpu_avg: 20 },
+    ]);
+    renderPage();
+
+    const hostCard = screen.getByTestId("host-card-host_1");
+    const freshness = within(hostCard).getByTestId("freshness");
+    expect(freshness).toHaveTextContent("Stale — last sample 3 min ago");
+    expect(freshness).toHaveAttribute("data-stale", "true");
+    expect(within(hostCard).getByTestId("sparkline-latest")).toHaveClass("bg-amber-500");
+  });
+
+  it("shows the server point's age in the server card", () => {
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
+    const nowMs = Date.now();
+    const view = makeView({ server: true });
+    if (view.server === null) throw new Error("the server card is expected");
+    view.server.last_point.t = nowMs / 1000 - 23;
+    mocks.status.current = { data: view, isLoading: false, isError: false, error: null };
+    renderPage();
+
+    const serverCard = screen.getByTestId("system-status-server-card");
+    expect(within(serverCard).getByTestId("freshness")).toHaveTextContent("Updated 23 s ago");
+  });
+
+  it("labels the host sparkline axis from its first history point", () => {
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
+    const nowMs = Date.now();
+    mocks.status.current = {
+      data: makeView({ server: false }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    mocks.history.set("host_1", [
+      { t: nowMs / 1000 - 3 * 3_600, cpu_avg: 10 },
+      { t: nowMs / 1000 - 60, cpu_avg: 20 },
+    ]);
+    renderPage();
+
+    const axis = within(screen.getByTestId("host-card-host_1")).getByTestId("sparkline-axis");
+    expect(axis).toHaveTextContent("3 h ago");
+    expect(axis).toHaveTextContent("now");
+  });
+
+  it("ages the freshness label as seconds tick by", () => {
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
+    const nowMs = Date.now();
+    const view = makeView({ server: false });
+    const snapshot = view.hosts[0].last_snapshot;
+    if (snapshot === null) throw new Error("host_1 is expected to have a snapshot");
+    snapshot.sampled_at = new Date(nowMs - 4_000).toISOString();
+    snapshot.interval_s = 10;
+    mocks.status.current = { data: view, isLoading: false, isError: false, error: null };
+    renderPage();
+
+    const freshness = within(screen.getByTestId("host-card-host_1")).getByTestId("freshness");
+    expect(freshness).toHaveTextContent("Updated 4 s ago");
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(freshness).toHaveTextContent("Updated 9 s ago");
   });
 });
