@@ -133,6 +133,13 @@ function collapseToggleFor(container: HTMLElement, childId: string): HTMLElement
   return toggle;
 }
 
+/** Expand the root's Subagents zone so its harness-mirror rows render. */
+function expandSubagentsZone(container: HTMLElement): void {
+  const header = container.querySelector<HTMLElement>('[data-testid="subagent-subagents-zone"]');
+  if (!header) throw new Error("subagents zone header not rendered");
+  fireEvent.click(header);
+}
+
 /** Point useChildSessions at an id-keyed tree of children. The panel
  *  fetches a list per rendered row (the tree levels), so ids absent
  *  from the map — every leaf the recursive rows probe — get no
@@ -666,6 +673,7 @@ describe("SubagentsPanel", () => {
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
+    expandSubagentsZone(container);
 
     const row = childRow(container, "conv_child");
     expect(within(row).getByText("auth-auditor")).toBeInTheDocument();
@@ -690,13 +698,14 @@ describe("SubagentsPanel", () => {
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
+    expandSubagentsZone(container);
 
     const row = childRow(container, "conv_child");
     expect(within(row).getByText("App Router Reviewer")).toBeInTheDocument();
     expect(within(row).queryByText("1eca7625-9d2f-4c6b-8a31-7f5e2c0d4b8a")).toBeNull();
   });
 
-  it("shows the native vendor's badge letters for native sub-agent children", () => {
+  it("renders native vendor sub-agent children as badge-less mirror rows", () => {
     mockChildTree({
       conv_root: [
         // Claude Task child: session_name is the opaque correlation id; the
@@ -722,13 +731,14 @@ describe("SubagentsPanel", () => {
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
+    expandSubagentsZone(container);
 
     const claudeRow = childRow(container, "conv_claude");
-    expect(within(claudeRow).getByTestId("rail-agent-badge")).toHaveTextContent("CC");
     expect(claudeRow).toHaveTextContent("wave-worker-696");
-    expect(
-      within(childRow(container, "conv_codex")).getByTestId("rail-agent-badge"),
-    ).toHaveTextContent("CX");
+    expect(within(claudeRow).queryByTestId("rail-agent-badge")).toBeNull();
+    const codexRow = childRow(container, "conv_codex");
+    expect(codexRow).toHaveTextContent("Summarize release notes");
+    expect(within(codexRow).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
   it("resolves the badge vendor from the child's harness or bound agent name", () => {
@@ -793,12 +803,18 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    expect(within(childRow(container, "conv_h1")).getByTestId("rail-agent-badge")).toHaveStyle({
-      borderColor: "#8250df",
-    });
+    const picked = within(childRow(container, "conv_h1")).getByTestId("rail-agent-badge");
+    expect(picked.style.getPropertyValue("--host-color-light")).toBe("#8250df");
+    expect(picked.style.getPropertyValue("--host-color-dark")).toBe("#a371f7");
+    expect(picked).toHaveClass("host-color");
+    // Real ACTIVE-zone rows carry the host colour bar, driven by the same var.
+    const row = childRow(container, "conv_h1");
+    expect(row).toHaveClass("host-color");
+    expect(row.style.boxShadow).toContain("inset 3px 0 0 var(--host-color)");
+    expect(row.style.getPropertyValue("--host-color-light")).toBe("#8250df");
     const automatic = within(childRow(container, "conv_h2")).getByTestId("rail-agent-badge");
-    expect(automatic.style.borderColor).not.toBe("");
-    expect(automatic.style.borderColor).not.toBe("rgb(130, 80, 223)");
+    expect(automatic.style.getPropertyValue("--host-color-light")).not.toBe("");
+    expect(automatic.style.getPropertyValue("--host-color-light")).not.toBe("#8250df");
   });
 
   it("does not infer a native vendor from the tool name alone", () => {
@@ -832,16 +848,18 @@ describe("SubagentsPanel", () => {
           task_summary: null,
           tool: "pi",
           session_name: "port-fix",
-          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
         }),
       ],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
+    // The full native wrapper is authoritative, so the row gets the Claude
+    // glyph even though the tool is exactly "pi".
     expect(
-      within(childRow(container, "conv_native_pi")).getByTestId("rail-agent-badge"),
-    ).toHaveTextContent("CC");
+      childRow(container, "conv_native_pi").querySelector('[data-icon="claude"]'),
+    ).not.toBeNull();
   });
 
   it("fetches child sessions without polling (push-driven via watch-set)", () => {
@@ -1538,6 +1556,7 @@ describe("SubagentsPanel", () => {
     });
 
     const { container } = renderPanel();
+    expandSubagentsZone(container);
 
     const described = childRow(container, "conv_described");
     expect(described).toHaveTextContent("wave-worker-696");
@@ -1817,6 +1836,95 @@ describe("SubagentsPanel", () => {
     expect(container.querySelector('[data-child-session-id="a"]')).not.toBeNull();
   });
 
+  it("splits harness mirrors into a collapsed Subagents zone outside ACTIVE", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "real", tool: "researcher", session_name: "auth" }),
+        childInfo({
+          id: "mirror",
+          title: "Explore:a1",
+          tool: "Explore",
+          busy: true,
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    // The mirror is not an ACTIVE child and is not rendered while collapsed.
+    expect(screen.getByTestId("subagent-active-zone")).toHaveTextContent("Active · 1");
+    expect(container.querySelector('[data-child-session-id="mirror"]')).toBeNull();
+    const header = screen.getByTestId("subagent-subagents-zone");
+    expect(header).toHaveTextContent("Subagents · 1");
+    expect(header).toHaveTextContent("1 running");
+    expect(header).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(childRow(container, "mirror")).toHaveAttribute("data-depth", "1");
+  });
+
+  it("orders the brand icon before the badge before the title, and gives mirrors no badge", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "real",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        }),
+        childInfo({
+          id: "mirror",
+          title: "Explore:a1",
+          tool: "Explore",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const realRow = childRow(container, "real");
+    const icon = realRow.querySelector('[data-icon="claude"]');
+    const badge = within(realRow).getByTestId("rail-agent-badge");
+    const title = within(realRow).getByText("auth");
+    expect(icon).not.toBeNull();
+    expect(icon!.compareDocumentPosition(badge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(badge.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    expandSubagentsZone(container);
+    const mirrorRow = childRow(container, "mirror");
+    expect(within(mirrorRow).queryByTestId("rail-agent-badge")).toBeNull();
+    // Mirrors carry neither the host bar nor its variables.
+    expect(mirrorRow.style.boxShadow).toBe("");
+    expect(mirrorRow).not.toHaveClass("host-color");
+  });
+
+  it("keeps a real child's own mirrors nested under it without a Subagents zone", () => {
+    mockChildTree({
+      conv_root: [childInfo({ id: "real", tool: "researcher", session_name: "auth" })],
+      real: [
+        childInfo({
+          id: "nested-mirror",
+          title: "Explore:a2",
+          tool: "Explore",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    // The root has no mirrors of its own, so no zone header — the nested
+    // mirror renders directly under its real parent.
+    expect(screen.queryByTestId("subagent-subagents-zone")).toBeNull();
+    const nested = childRow(container, "nested-mirror");
+    expect(nested).toHaveAttribute("data-depth", "2");
+    expect(within(nested).queryByTestId("rail-agent-badge")).toBeNull();
+  });
+
   it("renders warm/cold pills and zone counts only when warm_state is present", () => {
     mockChildTree({
       conv_parent: [
@@ -1828,12 +1936,12 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    expect(within(childRow(container, "w")).getByTestId("subagent-warm-state")).toHaveTextContent(
-      "Warm",
-    );
-    expect(within(childRow(container, "c")).getByTestId("subagent-warm-state")).toHaveTextContent(
-      "Cold",
-    );
+    const warmPill = within(childRow(container, "w")).getByTestId("subagent-warm-state");
+    expect(warmPill).toHaveTextContent("Warm");
+    expect(warmPill).toHaveClass("bg-warning/15", "text-warning");
+    const coldPill = within(childRow(container, "c")).getByTestId("subagent-warm-state");
+    expect(coldPill).toHaveTextContent("Cold");
+    expect(coldPill).toHaveClass("bg-session-active/15", "text-session-active");
     expect(within(childRow(container, "n")).queryByTestId("subagent-warm-state")).toBeNull();
     expect(screen.getByTestId("subagent-active-zone")).toHaveTextContent("warm 1 · cold 1");
   });

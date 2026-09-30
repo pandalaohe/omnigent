@@ -5,7 +5,7 @@ import math
 import time
 import unicodedata
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -849,6 +849,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        exclude_labels: Mapping[str, Sequence[str]] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -965,6 +966,13 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param exclude_labels: When set, drop conversations carrying any
+            of the given labels: a conversation is excluded when it has a
+            ``key``/``value`` pair matching one of the mapping's entries
+            (values are matched exactly, any one match suffices).
+            ``None`` or empty disables the filter. Lets callers hide a
+            category of children (e.g. harness sub-agent mirrors) without
+            the store knowing what the label means.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

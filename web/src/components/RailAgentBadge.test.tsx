@@ -80,23 +80,19 @@ describe("RailAgentBadge", () => {
     const badge = screen.getByTestId("rail-agent-badge");
     expect(badge).toHaveTextContent("RE");
     expect(badge).toHaveAttribute("title", "reviewer");
-    const automatic = HOST_COLORS.find((entry) => entry.hex === rgbToHex(badge.style.borderColor));
+    const automatic = HOST_COLORS.find(
+      (entry) => entry.hex === badge.style.getPropertyValue("--host-color-light"),
+    );
     expect(automatic).toBeDefined();
+    expect(badge.style.getPropertyValue("--host-color-dark")).toBe(automatic!.darkHex);
   });
 
   it("prefers the user's host colour pick", () => {
     localStorage.setItem("omnigent:host-colors", JSON.stringify({ host_1: "purple" }));
     render(<RailAgentBadge child={{ id: "x", tool: "reviewer", host_id: "host_1" }} />);
 
-    expect(screen.getByTestId("rail-agent-badge")).toHaveStyle({ borderColor: "#8250df" });
+    const badge = screen.getByTestId("rail-agent-badge");
+    expect(badge.style.getPropertyValue("--host-color-light")).toBe("#8250df");
+    expect(badge.style.getPropertyValue("--host-color-dark")).toBe("#a371f7");
   });
 });
-
-/** jsdom normalises inline styles to rgb(); map back to the palette hex. */
-function rgbToHex(value: string): string {
-  const match = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/.exec(value);
-  if (!match) return value.toLowerCase();
-  return `#${[1, 2, 3]
-    .map((index) => Number(match[index]).toString(16).padStart(2, "0"))
-    .join("")}`;
-}

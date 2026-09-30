@@ -6,17 +6,20 @@ import {
   HOST_COLORS,
   LOCAL_HOST_LABEL,
   hostColor,
+  hostColorStyle,
   hostDisplayName,
   isHostColorKey,
 } from "./hostColors";
 
 describe("hostColors", () => {
-  it("offers eight distinct palette keys and hexes", () => {
+  it("offers eight distinct palette keys and light/dark hexes", () => {
     expect(HOST_COLORS).toHaveLength(8);
     expect(new Set(HOST_COLORS.map((entry) => entry.key)).size).toBe(8);
     expect(new Set(HOST_COLORS.map((entry) => entry.hex)).size).toBe(8);
+    expect(new Set(HOST_COLORS.map((entry) => entry.darkHex)).size).toBe(8);
     for (const entry of HOST_COLORS) {
       expect(entry.hex).toMatch(/^#[0-9a-f]{6}$/i);
+      expect(entry.darkHex).toMatch(/^#[0-9a-f]{6}$/i);
       expect(isHostColorKey(entry.key)).toBe(true);
     }
     expect(isHostColorKey("chartreuse")).toBe(false);
@@ -27,6 +30,29 @@ describe("hostColors", () => {
     expect(hostColor("host-1", "TMB", { "host-1": "purple" })).toEqual({
       key: "purple",
       hex: "#8250df",
+      darkHex: "#a371f7",
+    });
+  });
+
+  it("never picks gray on the automatic path, but honors an explicit gray pick", () => {
+    for (let index = 0; index < 200; index++) {
+      const automatic = hostColor(`host-${index}`, `host-name-${index}`, {});
+      expect(automatic.key).not.toBe("gray");
+    }
+    // The name that hashes to gray's former slot must now resolve elsewhere.
+    expect(hostColor("host-1", "TMB", { "host-1": "gray" })).toEqual({
+      key: "gray",
+      hex: "#57606a",
+      darkHex: "#8b949e",
+    });
+  });
+
+  it("turns a palette entry into the per-theme host-colour style", () => {
+    const purple = HOST_COLORS.find((entry) => entry.key === "purple");
+    expect(purple).toBeDefined();
+    expect(hostColorStyle(purple!)).toEqual({
+      "--host-color-light": "#8250df",
+      "--host-color-dark": "#a371f7",
     });
   });
 

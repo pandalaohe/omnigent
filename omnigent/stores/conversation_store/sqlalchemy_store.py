@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any, Protocol, cast
 
@@ -3785,6 +3785,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        exclude_labels: Mapping[str, Sequence[str]] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -3856,6 +3857,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             can access but does NOT own — i.e. sessions shared with them
             by another user. Requires ``accessible_by`` to be set.
             ``False`` (default) disables the filter.
+        :param exclude_labels: When set, drop conversations carrying any
+            of the given labels: a conversation is excluded when it has a
+            ``key``/``value`` pair matching one of the mapping's entries
+            (values are matched exactly, any one match suffices).
+            ``None`` or empty disables the filter. Lets callers hide a
+            category of children (e.g. harness sub-agent mirrors) without
+            the store knowing what the label means.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -4256,6 +4264,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                         select(SqlConversationLabel.conversation_id).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
                             SqlConversationLabel.key == pinned_label_key(pinned_owner),
+                        )
+                    )
+                )
+            for exclude_key, exclude_values in (exclude_labels or {}).items():
+                # Labels are colocated on the AP DB, so an inline anti-join
+                # drops labelled conversations without a cross-DB prefetch.
+                stmt = stmt.where(
+                    ~SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == exclude_key,
+                            SqlConversationLabel.value.in_(exclude_values),
                         )
                     )
                 )

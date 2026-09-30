@@ -15469,7 +15469,7 @@
     },
     "/v1/sessions/{session_id}/child_sessions": {
       "get": {
-        "description": "List sub-agent (child) sessions under a parent session.\n\nReturns a page of `ChildSessionSummary` objects\nderived from child conversations (`kind=\"sub_agent\"`,\n`parent_conversation_id=session_id`) plus each child's\nlatest task. Powers the web / REPL debug surfaces' \"child\nsessions\" panel without parsing parent\n`function_call_output` JSON handles. Pagination contract\nmatches `list_session_items` so existing client code\ncan reuse the same cursor logic.\n\n**Returns:** A `PaginatedList` of `ChildSessionSummary` objects.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there; 400 if `zone` is combined with `include_archived=true`.",
+        "description": "List sub-agent (child) sessions under a parent session.\n\nReturns a page of `ChildSessionSummary` objects\nderived from child conversations (`kind=\"sub_agent\"`,\n`parent_conversation_id=session_id`) plus each child's\nlatest task. Powers the web / REPL debug surfaces' \"child\nsessions\" panel without parsing parent\n`function_call_output` JSON handles. Pagination contract\nmatches `list_session_items` so existing client code\ncan reuse the same cursor logic.\n\n**Returns:** A `PaginatedList` of `ChildSessionSummary` objects.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there; 400 if `zone` is combined with `include_archived=true` or an `exclude_label` entry is malformed.",
         "operationId": "list_child_sessions_v1_sessions__session_id__child_sessions_get",
         "parameters": [
           {
@@ -15602,6 +15602,20 @@
                 }
               ],
               "title": "Zone"
+            }
+          },
+          {
+            "description": "Repeatable `\"<key>=<value>\"` filter. Children carrying label `key` with exactly `value` are left out of the result. Any label key works in any zone, so callers can hide a category of children (e.g. harness sub-agent mirrors) without server-side knowledge of what the label means. A value missing `\"=\"` or with an empty key is rejected as invalid input.",
+            "in": "query",
+            "name": "exclude_label",
+            "required": false,
+            "schema": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "title": "Exclude Label",
+              "type": "array"
             }
           }
         ],

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -10,6 +10,7 @@ import {
   fetchChildSessions,
   MAX_TREE_DEPTH,
   useChildSessions,
+  usePastChildSessions,
 } from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
@@ -197,5 +198,23 @@ describe("fetchChildSessions", () => {
     } as Response);
 
     await expect(fetchChildSessions("conv_parent")).rejects.toThrow("500");
+  });
+});
+
+describe("usePastChildSessions", () => {
+  it("drops native subagent wrappers from the past page request", async () => {
+    // Self-contained: the shared fetch mock keeps earlier tests' calls.
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(
+      jsonResponse({ object: "list", data: [], has_more: false, last_id: null }),
+    );
+
+    renderHook(() => usePastChildSessions("conv_parent", true), { wrapper });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("zone=past");
+    // URL-encoded key=value pair for the Claude Task wrapper.
+    expect(url).toContain("exclude_label=omnigent.wrapper%3Dclaude-code-native-ui-subagent");
   });
 });

@@ -291,6 +291,15 @@ const BY_SUBAGENT_WRAPPER = new Map<string, NativeCodingAgentSpec>(
   ),
 );
 
+/**
+ * Every `omnigent.wrapper` value a harness stamps on the sub-agent children
+ * it spawns inside its own CLI. Derived from the registry so a new vendor row
+ * is covered without a second list.
+ */
+export const NATIVE_SUBAGENT_WRAPPER_LABELS: readonly string[] = NATIVE_CODING_AGENTS.flatMap(
+  (agent) => ("subagentWrapperLabel" in agent ? [agent.subagentWrapperLabel] : []),
+);
+
 // Reversed harness spellings that fold to a canonical native `harness`.
 // Mirrors omnigent.harness_aliases.NATIVE_HARNESSES on the server, which
 // accepts both the canonical and reversed native spellings (claude/codex
