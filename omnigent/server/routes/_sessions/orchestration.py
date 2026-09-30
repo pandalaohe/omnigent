@@ -1518,6 +1518,7 @@ async def _archive_stop_one(
     archive_scope_id: str | None = None,
     archive_revision: int | None = None,
     stop_host_runner: bool = True,
+    release_required: bool = False,
 ) -> bool:
     """Release one captured session binding for a durable target intent."""
     from omnigent.server.routes import sessions as _facade
@@ -1544,10 +1545,11 @@ async def _archive_stop_one(
                 timeout=10.0,
             )
             released = response.status_code < 400 or response.status_code == 404
-        elif conversation.runner_id is None or not stop_host_runner:
+        elif conversation.runner_id is None or (not stop_host_runner and not release_required):
             # Nothing addressable of this target's own is left: it either never had a
             # runner, or it does not own this binding's teardown. The last target on
-            # the runner still has to prove the runner is gone.
+            # the runner still has to prove the runner is gone. A runner a live session
+            # keeps is never stopped, so its targets must prove their own release.
             released = True
     except Exception:  # noqa: BLE001 - Host stop remains the captured-binding fallback.
         _logger.debug(
