@@ -377,9 +377,9 @@ function ProcessTree({
         <colgroup>
           <col />
           <col />
+          <col className="w-14" />
           <col className="w-16" />
-          <col className="w-20" />
-          <col className="w-16" />
+          <col className="w-14" />
         </colgroup>
         <thead>
           <tr className="text-xs text-muted-foreground">
