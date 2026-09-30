@@ -561,6 +561,7 @@ def test_child_question_instruction_with_peers_sends_to_the_mother() -> None:
     assert "`sys_session_send`" in text
     assert "then continue other work or end your turn" in text
     assert "her reply arrives as a new message" in text
+    assert "`redirected_to`" in text
 
 
 def test_child_question_instruction_without_peers_ends_the_turn() -> None:
@@ -572,6 +573,7 @@ def test_child_question_instruction_without_peers_ends_the_turn() -> None:
     assert "sys_session_send" not in text
     assert "as your final output" in text
     assert "your mother receives it as your result" in text
+    assert "redirected_to" not in text
 
 
 def test_child_session_quiet_instruction_only_for_children() -> None:
