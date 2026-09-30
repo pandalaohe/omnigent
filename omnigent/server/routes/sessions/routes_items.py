@@ -426,6 +426,7 @@ def register_items_routes(
         session_name: str | None = Query(default=None),
         include_archived: bool = Query(default=False),
         zone: str | None = Query(default=None, pattern="^(active|past)$"),
+        exclude_label: tuple[str, ...] = Query(default=()),
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -471,11 +472,19 @@ def register_items_routes(
             set. ``None`` (default) keeps the unzoned behaviour driven by
             ``include_archived``. ``zone`` together with
             ``include_archived=true`` is rejected as invalid input.
+        :param exclude_label: Repeatable ``"<key>=<value>"`` filter.
+            Children carrying label ``key`` with exactly ``value`` are
+            left out of the result. Any label key works in any zone, so
+            callers can hide a category of children (e.g. harness
+            sub-agent mirrors) without server-side knowledge of what the
+            label means. A value missing ``"="`` or with an empty key is
+            rejected as invalid input.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
             ``session_id``; 404 if no session exists there; 400 if
-            ``zone`` is combined with ``include_archived=true``.
+            ``zone`` is combined with ``include_archived=true`` or an
+            ``exclude_label`` entry is malformed.
         """
         user_id = _get_user_id(request, auth_provider)
         if zone is not None and include_archived:
@@ -483,6 +492,15 @@ def register_items_routes(
                 "zone cannot be combined with include_archived=true",
                 code=ErrorCode.INVALID_INPUT,
             )
+        exclude_labels: dict[str, list[str]] = {}
+        for entry in exclude_label:
+            key, separator, value = entry.partition("=")
+            if not separator or not key:
+                raise OmnigentError(
+                    f"invalid exclude_label {entry!r}: expected '<key>=<value>'",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            exclude_labels.setdefault(key, []).append(value)
         archived_only = False
         sort_by = "created_at"
         if zone == "active":
@@ -515,6 +533,7 @@ def register_items_routes(
             title=title_filter,
             include_archived=include_archived,
             archived_only=archived_only,
+            exclude_labels=exclude_labels,
         )
         if (
             (access.level is None or access.level >= LEVEL_OWNER)
@@ -526,6 +545,8 @@ def register_items_routes(
             and tool is None
             and session_name is None
             and zone != "past"
+            # The reconcile refresh re-lists children without the label filter.
+            and not exclude_labels
             and not page.has_more
         ):
             page = await _lazy_reconcile_native_children(

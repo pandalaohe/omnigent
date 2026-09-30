@@ -2,7 +2,7 @@ import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { agentBadgeFor, type AgentBadgePreferences } from "@/lib/agentBadgePreferences";
 import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
-import { hostColor } from "@/lib/hostColors";
+import { hostColor, hostColorStyle } from "@/lib/hostColors";
 import {
   nativeCodingAgentForAgentName,
   nativeCodingAgentForHarness,
@@ -79,10 +79,15 @@ export function RailAgentBadge({ child, hostId, hostName, className }: RailAgent
       data-testid="rail-agent-badge"
       title={display ?? undefined}
       className={cn(
-        "inline-flex h-4 min-w-[22px] shrink-0 items-center justify-center rounded-[4px] border-[1.5px] px-[3px] text-[10px] leading-none font-bold",
+        "host-color inline-flex h-4 min-w-[22px] shrink-0 items-center justify-center rounded-[4px] border px-[3px] text-[10px] leading-none font-bold",
         className,
       )}
-      style={{ borderColor: color.hex, color: color.hex }}
+      style={{
+        ...hostColorStyle(color),
+        borderColor: "var(--host-color)",
+        backgroundColor: "color-mix(in srgb, var(--host-color) 15%, transparent)",
+        color: "var(--host-color)",
+      }}
     >
       {childAgentBadgeLetters(child, badgePreferences)}
     </span>

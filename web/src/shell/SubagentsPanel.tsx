@@ -15,14 +15,23 @@
 // click opens it in a new tab, matching the sidebar's behavior.
 
 import { Fragment, lazy, Suspense, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import type { ComponentType, ReactNode, SVGProps } from "react";
 import {
+  BookOpenIcon,
+  BotIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CircleStopIcon,
+  Code2Icon,
+  CompassIcon,
+  CornerDownRightIcon,
+  FileTextIcon,
+  FlaskConicalIcon,
   ListIcon,
   NetworkIcon,
   PlusIcon,
+  ScanSearchIcon,
+  SearchIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
@@ -35,6 +44,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
+import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
+import { CodexIcon } from "@/components/icons/CodexIcon";
+import { CursorIcon } from "@/components/icons/CursorIcon";
+import { DevinIcon } from "@/components/icons/DevinIcon";
+import { GooseIcon } from "@/components/icons/GooseIcon";
+import { HermesIcon } from "@/components/icons/HermesIcon";
+import { KimiIcon } from "@/components/icons/KimiIcon";
+import { KiroIcon } from "@/components/icons/KiroIcon";
+import { NessieIcon } from "@/components/icons/NessieIcon";
+import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
+import { OttoIcon } from "@/components/icons/OttoIcon";
+import { PiIcon } from "@/components/icons/PiIcon";
 import { RailAgentBadge, childAgentDisplay } from "@/components/RailAgentBadge";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
@@ -49,8 +71,12 @@ import { useStopSession } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { useSession } from "@/hooks/useSession";
-import { hostColor, hostDisplayName } from "@/lib/hostColors";
-import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { hostColor, hostColorStyle, hostDisplayName } from "@/lib/hostColors";
+import {
+  nativeCodingAgentForSubagentWrapper,
+  nativeCodingAgentForWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { Session, SessionItem } from "@/lib/types";
@@ -113,6 +139,119 @@ function hostNameForHost(hostId: string | null | undefined, hosts: Map<string, H
   return hostDisplayName(hostId, hostId ? hosts.get(hostId) : undefined);
 }
 
+type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
+
+// Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
+const PI_AGENT_NAME = "pi";
+
+/**
+ * Map a sub-agent type label to a category icon so a mix of agents reads by
+ * role at a glance (Claude Code spawns many same-type "Explore" agents — the
+ * icon distinguishes roles; the preview line below distinguishes instances).
+ * Category icons are monochrome — the row applies the muted color; the
+ * fallback is the full-color Otto (starfish) mascot.
+ *
+ * @param tool - The agent type, e.g. ``"Explore"`` or ``"researcher"``;
+ *   ``null`` when the child carries no type.
+ * @returns An SVG icon component.
+ */
+export function iconForAgentType(tool: string | null): AgentRowIcon {
+  const t = (tool ?? "").toLowerCase();
+  if (t.includes("explore")) return SearchIcon;
+  if (t.includes("research")) return BookOpenIcon;
+  if (t.includes("plan") || t.includes("architect")) return CompassIcon;
+  if (t.includes("review")) return ScanSearchIcon;
+  if (t.includes("test")) return FlaskConicalIcon;
+  if (t.includes("doc") || t.includes("writ")) return FileTextIcon;
+  if (
+    t.includes("code") ||
+    t.includes("eng") ||
+    t.includes("dev") ||
+    t.includes("front") ||
+    t.includes("back")
+  ) {
+    return Code2Icon;
+  }
+  return OttoIcon;
+}
+
+/**
+ * Pick a brand glyph for coding child sessions when the summary carries
+ * enough identity metadata. Native children identify via their wrapper
+ * label (authoritative — a custom scaffold agent merely *named* "codex"
+ * must not get the Codex logo). Pi children are scaffold sessions with
+ * no wrapper label, so the exact agent name ``"pi"`` is the signal.
+ *
+ * Only full native sessions get the brand glyph. *Sub-agent* wrapper
+ * children (``…-subagent``) deliberately fall through to the role icons
+ * (and the Otto fallback) — a native session's sub-agents are all the
+ * same brand, so repeating the logo down the tree says nothing, while
+ * role icons distinguish what each one is doing.
+ *
+ * @param child - One child-session summary from the poll or stream.
+ * @returns The Claude/Codex/pi glyph component, or ``null`` for generic agents.
+ */
+function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
+  const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
+  if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
+  if (nativeAgent?.iconKind === "codex") return CodexIcon;
+  if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
+  if (nativeAgent?.iconKind === "pi") return PiIcon;
+  if (nativeAgent?.iconKind === "cursor") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return KiroIcon;
+  if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
+  if (nativeAgent?.iconKind === "goose") return GooseIcon;
+  if (nativeAgent?.iconKind === "kimi") return KimiIcon;
+  if (nativeAgent?.iconKind === "hermes") return HermesIcon;
+  if (nativeAgent?.iconKind === "devin") return DevinIcon;
+  // Exact match — substring checks would false-match names like "pipeline".
+  if (child.tool === PI_AGENT_NAME) return PiIcon;
+  return null;
+}
+
+/**
+ * Resolve a session's brand icon from its native-wrapper ``iconKind``
+ * (authoritative for native-terminal sessions) with a harness-substring
+ * fallback for plain SDK sessions that carry no wrapper label — e.g.
+ * ``omni --harness kimi``, whose ``harness: "kimi"`` would otherwise fall
+ * through to the generic bot. Mirrors ``iconForAgent`` in ``AgentCard.tsx``.
+ */
+function iconForWrapperOrHarness(
+  iconKind: string | undefined,
+  harness: string | null | undefined,
+  isNessie: boolean,
+): AgentRowIcon {
+  if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
+  if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
+  if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
+  if (iconKind === "cursor" || harness?.includes("cursor")) return CursorIcon;
+  if (iconKind === "kiro" || harness?.includes("kiro")) return KiroIcon;
+  if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
+  if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
+  if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
+  if (iconKind === "devin" || harness?.includes("devin")) return DevinIcon;
+  // Exact match — a substring check would false-match e.g. "openapi".
+  if (iconKind === "pi" || harness === "pi") return PiIcon;
+  if (isNessie) return NessieIcon;
+  return BotIcon;
+}
+
+/** Brand glyphs read in the Claude terracotta; every other glyph stays muted. */
+function rowIconClassName(Icon: AgentRowIcon): string {
+  return cn("size-3.5 shrink-0", Icon === ClaudeIcon ? "text-[#d97757]" : "text-muted-foreground");
+}
+
+/**
+ * A harness sub-agent mirror: a child spawned inside a native CLI (Claude
+ * Task tool, Codex collab thread, …). These render the upstream sub-agent row
+ * (role icon + connector, no badge / host colour / warm pill) and are split
+ * into the root's own "Subagents" zone rather than the ACTIVE zone.
+ */
+function isHarnessSubagent(child: ChildSessionInfo): boolean {
+  return nativeCodingAgentForSubagentWrapper(child.labels?.[WRAPPER_LABEL_KEY]) != null;
+}
+
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const { session: rootSession } = useSession(rootSessionId);
@@ -123,6 +262,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const [collapsedHosts, setCollapsedHosts] = useState<Record<string, boolean>>({});
   const [collapsedCwds, setCollapsedCwds] = useState<Record<string, boolean>>({});
   const [pastExpanded, setPastExpanded] = useState(false);
+  const [subagentsExpanded, setSubagentsExpanded] = useState(false);
   const [stopTarget, setStopTarget] = useState<StopTarget | null>(null);
   const past = usePastChildSessions(rootSessionId, pastExpanded);
   const toggleCollapsedRow = (id: string) => {
@@ -133,13 +273,28 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     [hosts],
   );
   const hostNameFor = (hostId: string | null | undefined) => hostNameForHost(hostId, hostsById);
-  const hostGroups = useMemo(
-    () => groupChildren(children, rootSession?.hostId ?? null),
-    [children, rootSession?.hostId],
+  // The root's own harness-subagent mirrors get their own collapsed zone;
+  // the ACTIVE zone, its counts, and the host/cwd grouping see real
+  // sessions only.
+  const sessionChildren = useMemo(
+    () => children.filter((child) => !isHarnessSubagent(child)),
+    [children],
   );
-  const warmCount = children.filter((child) => child.warm_state === "warm").length;
-  const coldCount = children.filter((child) => child.warm_state === "cold").length;
-  const showsWarmCounts = children.some((child) => child.warm_state != null);
+  const rootSubagents = useMemo(() => children.filter(isHarnessSubagent), [children]);
+  const hostGroups = useMemo(
+    () => groupChildren(sessionChildren, rootSession?.hostId ?? null),
+    [sessionChildren, rootSession?.hostId],
+  );
+  const warmCount = sessionChildren.filter((child) => child.warm_state === "warm").length;
+  const coldCount = sessionChildren.filter((child) => child.warm_state === "cold").length;
+  const showsWarmCounts = sessionChildren.some((child) => child.warm_state != null);
+  const subagentStatuses = rootSubagents.map(childStatus);
+  const runningSubagentCount = subagentStatuses.filter(
+    (status) => status.activity === "working" || status.activity === "launching",
+  ).length;
+  const awaitingSubagentCount = subagentStatuses.filter(
+    (status) => status.activity === "awaiting",
+  ).length;
   const recheckButton =
     rootSession != null &&
     isOwnerLevel(rootSession.permissionLevel) &&
@@ -222,7 +377,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
           data-testid="subagent-active-zone"
           className="flex items-center gap-2 border-b bg-muted/40 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase"
         >
-          <span>Active · {children.length}</span>
+          <span>Active · {sessionChildren.length}</span>
           {showsWarmCounts && (
             <span className="ml-auto font-normal normal-case">
               warm {warmCount} · cold {coldCount}
@@ -253,6 +408,53 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             hostNameFor={hostNameFor}
           />
         ))}
+        {rootSubagents.length > 0 && (
+          <>
+            <li className="mt-1 border-t">
+              <button
+                type="button"
+                data-testid="subagent-subagents-zone"
+                aria-expanded={subagentsExpanded}
+                onClick={() => setSubagentsExpanded((expanded) => !expanded)}
+                className="flex w-full items-center gap-2 bg-muted/40 px-2.5 py-1 text-left text-[11px] font-semibold tracking-wide text-muted-foreground uppercase hover:bg-accent/60"
+              >
+                <span>Subagents · {rootSubagents.length}</span>
+                <span className="ml-auto flex items-center gap-2 font-normal normal-case">
+                  {runningSubagentCount > 0 && (
+                    <span className="inline-flex items-center gap-1">
+                      <RunningDot />
+                      {runningSubagentCount} running
+                    </span>
+                  )}
+                  {awaitingSubagentCount > 0 && (
+                    <span className="rounded-full bg-warning/15 px-1.5 text-warning">
+                      {awaitingSubagentCount} needs response
+                    </span>
+                  )}
+                </span>
+                <ChevronRightIcon
+                  aria-hidden
+                  className={cn("size-3.5 transition-transform", subagentsExpanded && "rotate-90")}
+                />
+              </button>
+            </li>
+            {subagentsExpanded &&
+              rootSubagents.map((child) => (
+                <SubagentRow
+                  key={child.id}
+                  child={child}
+                  depth={1}
+                  conversationId={conversationId}
+                  collapsedRows={collapsedRows}
+                  onToggleCollapsed={toggleCollapsedRow}
+                  canStopChildren={rootSession != null && isOwnerLevel(rootSession.permissionLevel)}
+                  onRequestStop={(id, label) => setStopTarget({ id, label })}
+                  hostNameFor={hostNameFor}
+                  showHostBar={false}
+                />
+              ))}
+          </>
+        )}
         <PastZoneHeader
           expanded={pastExpanded}
           count={past.children.length}
@@ -331,7 +533,7 @@ function HostGroupRows({
   hostNameFor: (hostId: string | null | undefined) => string;
 }) {
   const colorPreferences = useHostColorPreferences();
-  const dotColor = hostColor(group.hostId, hostName, colorPreferences).hex;
+  const color = hostColor(group.hostId, hostName, colorPreferences);
   return (
     <>
       <li>
@@ -351,8 +553,8 @@ function HostGroupRows({
           <span
             aria-hidden
             data-testid="subagent-host-dot"
-            className="size-2 shrink-0 rounded-full"
-            style={{ backgroundColor: dotColor }}
+            className="host-color size-2 shrink-0 rounded-full"
+            style={{ ...hostColorStyle(color), backgroundColor: "var(--host-color)" }}
           />
           <span className="truncate">{hostName}</span>
           <span className="shrink-0 font-normal text-muted-foreground">{group.count}</span>
@@ -395,6 +597,7 @@ function HostGroupRows({
                     canStopChildren={canStopChildren}
                     onRequestStop={onRequestStop}
                     hostNameFor={hostNameFor}
+                    showHostBar
                   />
                 ))}
             </Fragment>
@@ -645,12 +848,17 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
 
 function WarmStatePill({ state }: { state: ChildSessionInfo["warm_state"] }) {
   if (state !== "warm" && state !== "cold") return null;
+  const warm = state === "warm";
   return (
     <span
       data-testid="subagent-warm-state"
-      className="shrink-0 rounded-full border border-border px-1.5 text-[10px] leading-4 text-muted-foreground"
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 rounded-full border border-transparent px-1.5 text-[10px] leading-4",
+        warm ? "bg-warning/15 text-warning" : "bg-session-active/15 text-session-active",
+      )}
     >
-      {state === "warm" ? "Warm" : "Cold"}
+      <span className={cn("size-1.5 rounded-full", warm ? "bg-warning" : "bg-session-active")} />
+      {warm ? "Warm" : "Cold"}
     </span>
   );
 }
@@ -677,9 +885,10 @@ function ChildTooltipContent({ child, hostName }: { child: ChildSessionInfo; hos
  * no children, so the rail is a complete navigation surface for the
  * parent-children tree.
  *
- * The badge doubles as the agent-kind indicator (letters = agent,
- * border = host); sub-agent rows nest below with their own badges, so
- * the "main vs sub-agent" distinction is carried by position and the
+ * The leading icon doubles as the agent-kind indicator (a brand glyph for
+ * native wrappers/harnesses, the generic bot otherwise); the badge carries
+ * the host colour. Sub-agent rows nest below with their own icons, so the
+ * "main vs sub-agent" distinction is carried by position and the
  * indentation gutter rather than a pill.
  */
 // Cap matches the server's child-session preview so the main row reads
@@ -740,6 +949,7 @@ function MainRow({
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const isNessie = session?.agentName === "nessie";
+  const Icon = iconForWrapperOrHarness(nativeAgent?.iconKind, session?.harness, isNessie);
   // Native wrappers show the product name (mirroring the sidebar) instead
   // of the spec's YAML name (e.g. "claude-native-ui"); other agents show
   // their agent name, with "main" only while the session loads or when it
@@ -766,6 +976,7 @@ function MainRow({
         )}
       >
         <div className="flex w-full items-center gap-1">
+          <Icon className={rowIconClassName(Icon)} />
           <RailAgentBadge
             child={sessionLike(session, rootSessionId)}
             hostName={hostNameFor(session?.hostId)}
@@ -775,10 +986,11 @@ function MainRow({
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
         </div>
         {preview && (
-          // Indented to align with the title text above: 22px badge + 4px gap.
+          // Indented to align with the title text above: 14px icon + 4px gap
+          // + 22px badge + 4px gap.
           <p
             data-testid="subagent-main-preview"
-            className="truncate pl-[26px] text-sm text-muted-foreground"
+            className="truncate pl-[44px] text-sm text-muted-foreground"
           >
             {preview}
           </p>
@@ -807,6 +1019,7 @@ function SubagentRow({
   canStopChildren,
   onRequestStop,
   hostNameFor,
+  showHostBar,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -818,12 +1031,18 @@ function SubagentRow({
   canStopChildren: boolean;
   onRequestStop: (id: string, label: string) => void;
   hostNameFor: (hostId: string | null | undefined) => string;
+  /** Whether this row may draw the host-colour bar (ACTIVE zone, real rows). */
+  showHostBar: boolean;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = sessionNavigationSearch(useLocation().search);
+  const mirror = isHarnessSubagent(child);
+  const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const hostName = hostNameFor(child.host_id);
+  const colorPreferences = useHostColorPreferences();
+  const hostEntry = hostColor(child.host_id, hostName, colorPreferences);
   const isActive = conversationId === child.id;
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
@@ -841,6 +1060,7 @@ function SubagentRow({
       status.activity === "awaiting" ||
       (status.activity === "unverified" && child.busy));
   const secondary = child.last_message_preview ?? child.task_summary;
+  const hostBar = showHostBar && !mirror;
   return (
     <>
       <li className="relative">
@@ -871,16 +1091,33 @@ function SubagentRow({
               data-child-session-id={child.id}
               data-depth={depth}
               // Left gutter (depth-stepped) nests this row under its parent.
-              style={{ paddingLeft: rowPaddingLeft(depth) }}
+              style={{
+                paddingLeft: rowPaddingLeft(depth),
+                ...(hostBar
+                  ? { ...hostColorStyle(hostEntry), boxShadow: "inset 3px 0 0 var(--host-color)" }
+                  : {}),
+              }}
               className={cn(
                 "flex w-full flex-col gap-0.5 py-2 text-left hover:bg-accent/60",
+                hostBar && "host-color",
                 canStop ? "pr-12" : "pr-2.5",
                 isActive && "bg-accent",
                 dim && "opacity-60 hover:opacity-100",
               )}
             >
               <div className="flex w-full items-center gap-1">
-                <RailAgentBadge child={child} hostName={hostName} />
+                {hasGrandchildren ? (
+                  <span aria-hidden="true" className="-ml-3 size-3 shrink-0" />
+                ) : (
+                  <CornerDownRightIcon
+                    // Decorative nesting connector — the role icon beside it
+                    // carries the meaning, so hide this from the a11y tree.
+                    aria-hidden="true"
+                    className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
+                  />
+                )}
+                <Icon className={rowIconClassName(Icon)} />
+                {!mirror && <RailAgentBadge child={child} hostName={hostName} />}
                 <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
                 {child.routed_model ? (
                   // Model the intelligent router picked for this sub-agent — the
@@ -894,13 +1131,20 @@ function SubagentRow({
                   </span>
                 ) : null}
                 <span className="flex-1" />
-                <WarmStatePill state={child.warm_state} />
+                {!mirror && <WarmStatePill state={child.warm_state} />}
                 <StatusIndicator {...status} />
               </div>
               {secondary && (
-                // Preview indented to align with the title text above:
-                // 22px badge + 4px gap.
-                <p className="truncate pl-[26px] text-sm text-muted-foreground">{secondary}</p>
+                // Aligned with the title above: mirror rows need the 22px
+                // connector + icon gutter; real rows add the 22px badge.
+                <p
+                  className={cn(
+                    "truncate text-sm text-muted-foreground",
+                    mirror ? "pl-[22px]" : "pl-[48px]",
+                  )}
+                >
+                  {secondary}
+                </p>
               )}
             </Link>
           </TooltipTrigger>
@@ -935,6 +1179,7 @@ function SubagentRow({
             canStopChildren={canStopChildren}
             onRequestStop={onRequestStop}
             hostNameFor={hostNameFor}
+            showHostBar={showHostBar}
           />
         ))}
     </>
@@ -972,6 +1217,7 @@ function PastChildRow({
   hostNameFor: (hostId: string | null | undefined) => string;
 }) {
   const search = sessionNavigationSearch(useLocation().search);
+  const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const hostName = hostNameFor(child.host_id);
   const archivedLabel = formatArchivedTime(child.archived_at);
@@ -991,6 +1237,7 @@ function PastChildRow({
             )}
           >
             <div className="flex w-full items-center gap-1">
+              <Icon className={rowIconClassName(Icon)} />
               <RailAgentBadge child={child} hostName={hostName} />
               <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
               <span className="flex-1" />
@@ -998,7 +1245,8 @@ function PastChildRow({
                 <span className="shrink-0 text-[11px] text-muted-foreground">{archivedLabel}</span>
               )}
             </div>
-            <p className="truncate pl-[26px] text-xs text-muted-foreground">
+            {/* Aligned with the title above: 14px icon + 4px gap + 22px badge + 4px gap. */}
+            <p className="truncate pl-[44px] text-xs text-muted-foreground">
               {hostName} · {cwdLabel}
             </p>
           </Link>

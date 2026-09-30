@@ -376,3 +376,149 @@ export const GroupedZones: Story = {
     await userEvent.click(pastHeader);
   },
 };
+
+// A real child session, Claude and Codex harness sub-agent mirrors, two hosts,
+// running / idle / done rows. Same data in both trees.
+const mixedWrapper = "omnigent.wrapper";
+const MIXED_MAC = "host-mac";
+const MIXED_FN = "host-fn";
+const MIXED_CWD = "/opt/work/omnigent/fork/omnigent-feature";
+
+const mixedHosts = [
+  { host_id: MIXED_MAC, name: "TerrenceMBP.local", owner: "u", status: "online" as const },
+  { host_id: MIXED_FN, name: "fn", owner: "u", status: "online" as const },
+];
+
+const mixedTree = {
+  "conversation-root": [
+    child({
+      id: "real-child",
+      title: "feature-rail",
+      session_name: "feature-rail",
+      agent_name: "claude-native-ui",
+      harness: "claude-native",
+      labels: { [mixedWrapper]: "claude-code-native-ui" },
+      host_id: MIXED_MAC,
+      cwd: MIXED_CWD,
+      busy: true,
+      warm_state: "warm",
+      created_at: 9,
+      last_message_preview: "Running the rail tests…",
+    }),
+    child({
+      id: "mirror-explore",
+      title: "Explore:a1b2c3",
+      tool: "Explore",
+      sub_agent_name: "Explore",
+      labels: {
+        [mixedWrapper]: "claude-code-native-ui-subagent",
+        "omnigent.claude_native.description": "find rail callers",
+      },
+      host_id: MIXED_MAC,
+      cwd: MIXED_CWD,
+      busy: true,
+      created_at: 8,
+      last_message_preview: "Searching web/src/shell…",
+    }),
+    child({
+      id: "mirror-review",
+      title: "reviewer:d4e5f6",
+      tool: "reviewer",
+      sub_agent_name: "reviewer",
+      labels: {
+        [mixedWrapper]: "claude-code-native-ui-subagent",
+        "omnigent.claude_native.description": "review rail diff",
+      },
+      host_id: MIXED_MAC,
+      cwd: MIXED_CWD,
+      current_task_status: "completed",
+      created_at: 7,
+      last_message_preview: "No blocking findings.",
+    }),
+    child({
+      id: "mirror-codex",
+      title: "worker:019a",
+      tool: "worker",
+      labels: { [mixedWrapper]: "codex-native-ui-subagent" },
+      host_id: MIXED_MAC,
+      cwd: MIXED_CWD,
+      created_at: 6,
+      last_message_preview: "Waiting for the next task.",
+    }),
+    child({
+      id: "real-child-fn",
+      title: "fn-repro",
+      session_name: "fn-repro",
+      agent_name: "codex-native-ui",
+      harness: "codex-native",
+      labels: { [mixedWrapper]: "codex-native-ui" },
+      host_id: MIXED_FN,
+      cwd: "/root/omnigent-dev",
+      warm_state: "cold",
+      created_at: 5,
+      last_message_preview: "Reproduced on fn.",
+    }),
+  ],
+  "real-child": [
+    child({
+      id: "grand-mirror",
+      title: "Plan:77aa",
+      tool: "Plan",
+      sub_agent_name: "Plan",
+      labels: {
+        [mixedWrapper]: "claude-code-native-ui-subagent",
+        "omnigent.claude_native.description": "plan rail fold",
+      },
+      host_id: MIXED_MAC,
+      cwd: MIXED_CWD,
+      current_task_status: "completed",
+      created_at: 4,
+    }),
+  ],
+};
+
+const mixedPast = [
+  child({
+    id: "past-child",
+    title: "status",
+    session_name: "status",
+    agent_name: "claude-native-ui",
+    harness: "claude-native",
+    labels: { [mixedWrapper]: "claude-code-native-ui" },
+    host_id: MIXED_MAC,
+    cwd: MIXED_CWD,
+    archived: true,
+    archived_at: archivedAt - 3600,
+  }),
+];
+
+export const MixedKinds: Story = {
+  args: { conversationId: "conversation-root" },
+  decorators: [
+    panelEnvironment({
+      activeId: "conversation-root",
+      session: rootSession({
+        agentName: "claude-native-ui",
+        labels: { [mixedWrapper]: "claude-code-native-ui" },
+        hostId: MIXED_MAC,
+        harness: "claude-native",
+        status: "running",
+      }),
+      hosts: mixedHosts,
+      tree: mixedTree,
+      past: mixedPast,
+    }),
+  ],
+  play: async ({ canvasElement }) => {
+    const subagentsHeader = canvasElement.querySelector<HTMLElement>(
+      '[data-testid="subagent-subagents-zone"]',
+    );
+    if (!subagentsHeader) throw new Error("Subagents zone header not found");
+    await userEvent.click(subagentsHeader);
+    const pastHeader = canvasElement.querySelector<HTMLElement>(
+      '[data-testid="subagent-past-zone"]',
+    );
+    if (!pastHeader) throw new Error("Past zone header not found");
+    await userEvent.click(pastHeader);
+  },
+};

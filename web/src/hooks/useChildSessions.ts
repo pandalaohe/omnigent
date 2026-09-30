@@ -1,5 +1,6 @@
 import { useInfiniteQuery, useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { NATIVE_SUBAGENT_WRAPPER_LABELS, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { setSessionParent } from "@/lib/sessionHost";
 import { isTempConvId } from "@/lib/tempConversationId";
 
@@ -269,14 +270,24 @@ interface UseChildSessionsResult {
  * Fetch one page of a parent's child sessions.
  *
  * ``after`` is the cursor (child id) to resume from; the page reports
- * ``has_more``/``last_id`` so the caller can continue.
+ * ``has_more``/``last_id`` so the caller can continue. ``excludeLabels``
+ * adds one ``exclude_label`` param per wrapper value so the server drops
+ * children carrying ``omnigent.wrapper`` = that value.
  */
 async function fetchChildSessionPage(
   sessionId: string,
-  params: { zone: "active" | "past"; limit: number; after?: string | null },
+  params: {
+    zone: "active" | "past";
+    limit: number;
+    after?: string | null;
+    excludeLabels?: readonly string[];
+  },
 ): Promise<ChildSessionsPage> {
   const query = new URLSearchParams({ zone: params.zone, limit: String(params.limit) });
   if (params.after) query.set("after", params.after);
+  for (const label of params.excludeLabels ?? []) {
+    query.append("exclude_label", `${WRAPPER_LABEL_KEY}=${label}`);
+  }
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions?${query.toString()}`,
   );
@@ -401,6 +412,7 @@ export function usePastChildSessions(
         zone: "past",
         limit: PAST_CHILD_SESSIONS_PAGE_SIZE,
         after: pageParam,
+        excludeLabels: NATIVE_SUBAGENT_WRAPPER_LABELS,
       }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) =>

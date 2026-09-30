@@ -295,6 +295,17 @@
   --tooltip-bg: #2a2440;
 }
 
+/* Host colours (see lib/hostColors.ts): an element that wants a host colour
+ * carries the palette entry's --host-color-light/--host-color-dark inline plus
+ * this class, which resolves the active tone per theme. */
+.host-color {
+  --host-color: var(--host-color-light);
+}
+
+.dark .host-color {
+  --host-color: var(--host-color-dark);
+}
+
 /* Main-sidebar item labels use the same text-ui semantic step as Appearance
  * content. Both read the desktop typography tokens derived from the size
  * selected in Settings. */
