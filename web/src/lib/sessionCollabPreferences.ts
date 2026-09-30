@@ -119,7 +119,10 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
       raw.childKeepWarmCodexIntervalSeconds,
       "childKeepWarmCodexIntervalSeconds",
     ),
-    childKeepWarmMaxSeconds: normalizeInteger(raw.childKeepWarmMaxSeconds, "childKeepWarmMaxSeconds"),
+    childKeepWarmMaxSeconds: normalizeInteger(
+      raw.childKeepWarmMaxSeconds,
+      "childKeepWarmMaxSeconds",
+    ),
   };
 }
 
