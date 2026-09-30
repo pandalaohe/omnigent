@@ -41,6 +41,7 @@ import yaml
 
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.testing.process_reaper import write_owner_marker
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -220,33 +221,42 @@ class BenchEnvironment:
     # ── lifecycle ────────────────────────────────────────────
 
     async def __aenter__(self) -> BenchEnvironment:
-        await asyncio.to_thread(self._start)
-        # A request event hook injects the simulated client↔server network
-        # delay before each request leaves the benchmark process. Registered
-        # only when a delay is set so the zero-delay default path is untouched.
-        event_hooks: dict[str, list[object]] = {}
-        if self.network_delay_ms > 0:
-            delay_s = self.network_delay_ms / 1000.0
+        # Stop what _start spawned on failure, or when this await is cancelled
+        # while _start is still running: never _stop before _start finishes.
+        start = asyncio.get_running_loop().run_in_executor(None, self._start)
+        try:
+            await asyncio.shield(start)
+            # A request event hook injects the simulated client↔server network
+            # delay before each request leaves the benchmark process. Registered
+            # only when a delay is set so the zero-delay default path is untouched.
+            event_hooks: dict[str, list[object]] = {}
+            if self.network_delay_ms > 0:
+                delay_s = self.network_delay_ms / 1000.0
 
-            async def _delay_request(_request: httpx.Request) -> None:
-                await asyncio.sleep(delay_s)
+                async def _delay_request(_request: httpx.Request) -> None:
+                    await asyncio.sleep(delay_s)
 
-            event_hooks["request"] = [_delay_request]
-        self.client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=300.0,
-            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-            event_hooks=event_hooks,  # type: ignore[arg-type]
-        )
-        # Start background resource sampler (server CPU + memory).
-        self._sampler_thread = threading.Thread(target=self._sample_resources, daemon=True)
-        self._sampler_thread.start()
-        if self.with_runner:
-            # ALLOW fallback so a server-side classifier call resolves against
-            # the mock (never api.openai.com) and returns a valid verdict.
-            await self._mock_post(
-                "/mock/set_fallback", {"key": _POLICY_LLM_KEY, "text": _POLICY_ALLOW}
+                event_hooks["request"] = [_delay_request]
+            self.client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=300.0,
+                headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+                event_hooks=event_hooks,  # type: ignore[arg-type]
             )
+            # Start background resource sampler (server CPU + memory).
+            self._sampler_thread = threading.Thread(target=self._sample_resources, daemon=True)
+            self._sampler_thread.start()
+            if self.with_runner:
+                # ALLOW fallback so a server-side classifier call resolves against
+                # the mock (never api.openai.com) and returns a valid verdict.
+                await self._mock_post(
+                    "/mock/set_fallback", {"key": _POLICY_LLM_KEY, "text": _POLICY_ALLOW}
+                )
+        except BaseException:
+            if not start.done():
+                await asyncio.wait([start])
+            await self.__aexit__(None, None, None)
+            raise
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -260,6 +270,7 @@ class BenchEnvironment:
     def _start(self) -> None:
         """Spawn the server (± mock + runner) and block until ready."""
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_owner_marker(self._tmp)
         artifact_dir = self._tmp / "artifacts"
         artifact_dir.mkdir(exist_ok=True)
 
