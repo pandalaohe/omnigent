@@ -70,7 +70,7 @@ import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
 /**
  * Provenance line for a card mirrored from a child session:
- * `来自子会话 <label> · <agent> @ <host> · <cwd>`, dropping the parts
+ * `From child session <label> · <agent> @ <host> · <cwd>`, dropping the parts
  * that could not be resolved. The cwd is monospace and carries the full
  * path in its `title` so a narrow card can truncate visually.
  */
@@ -84,7 +84,7 @@ function ElicitationSourceLine({ source }: { source: ElicitationSource }) {
       data-testid="approval-card-source"
       className="flex flex-wrap items-baseline gap-x-1.5 text-sm text-muted-foreground"
     >
-      <span>来自子会话 {source.label}</span>
+      <span>From child session {source.label}</span>
       {provenance.map((part) => (
         <span key={part}>· {part}</span>
       ))}
