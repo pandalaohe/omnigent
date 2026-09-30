@@ -3565,7 +3565,7 @@ def _read_spawn_tool_use_ids_from(
     start_offset: int,
     *,
     include_sidechains: bool,
-) -> tuple[set[str], int]:
+) -> tuple[set[str], int] | None:
     """
     Parse complete newline-terminated records appended after ``start_offset``.
 
@@ -3575,14 +3575,15 @@ def _read_spawn_tool_use_ids_from(
     :param transcript_path: JSONL transcript to read.
     :param start_offset: Byte offset where reading begins, e.g. ``0``.
     :param include_sidechains: Whether sidechain records count as owners.
-    :returns: Spawn tool-use ids plus the offset just past the consumed bytes.
+    :returns: Spawn tool-use ids plus the offset just past the consumed
+        bytes, or ``None`` when the read failed and must be retried.
     """
     try:
         with open(transcript_path, "rb") as handle:
             handle.seek(start_offset)
             tail = handle.read()
     except OSError:
-        return set(), start_offset
+        return None
     consumed_length = tail.rfind(b"\n") + 1
     if consumed_length <= 0:
         return set(), start_offset
@@ -3630,11 +3631,12 @@ def _tool_use_ids_in_transcript(
                 cursor.tool_use_ids = set()
         else:
             observation_changed = True
+            # No observation until a read succeeds, so a failed first read retries.
             cursor = _SpawnToolUseIdCursor(
                 st_dev=file_stat.st_dev,
                 st_ino=file_stat.st_ino,
-                st_size=file_stat.st_size,
-                st_mtime_ns=file_stat.st_mtime_ns,
+                st_size=-1,
+                st_mtime_ns=-1,
                 fingerprint=None,
                 offset=0,
                 tool_use_ids=set(),
@@ -3646,11 +3648,14 @@ def _tool_use_ids_in_transcript(
         if not observation_changed:
             return set(cursor.tool_use_ids)
 
-        read_ids, consumed_offset = _read_spawn_tool_use_ids_from(
+        read_result = _read_spawn_tool_use_ids_from(
             transcript_path,
             cursor.offset,
             include_sidechains=include_sidechains,
         )
+        if read_result is None:
+            return set(cursor.tool_use_ids)
+        read_ids, consumed_offset = read_result
         cursor.tool_use_ids.update(read_ids)
         cursor.offset = consumed_offset
         cursor.st_size = file_stat.st_size

@@ -16827,6 +16827,64 @@ def test_tool_use_ids_in_transcript_reads_only_appended_bytes(
     assert reads == [len(appended)]
 
 
+def test_tool_use_ids_in_transcript_retries_after_a_transient_read_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed incremental read is retried instead of caching its stale ids."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_first")])
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_spawn_tool_use_record(tool_use_id="toolu_second")) + "\n")
+
+    real_open = builtins.open
+    failed: list[bool] = []
+
+    def _failing_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if not failed and str(file) == str(transcript_path):
+            failed.append(True)
+            raise OSError("transient read failure")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _failing_open)
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    assert failed == [True]
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first",
+        "toolu_second",
+    }
+
+
+def test_tool_use_ids_in_transcript_retries_a_failed_first_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed first read leaves no observation, so the next call reads the file."""
+    transcript_path = tmp_path / "session.jsonl"
+    _write_jsonl_rows(transcript_path, [_spawn_tool_use_record(tool_use_id="toolu_first")])
+    real_open = builtins.open
+    failed: list[bool] = []
+
+    def _failing_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if not failed and str(file) == str(transcript_path):
+            failed.append(True)
+            raise OSError("transient read failure")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _failing_open)
+    first = forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False)
+    assert first == set()
+    assert failed == [True]
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+
+
 def test_tool_use_ids_in_transcript_waits_for_a_trailing_newline(
     tmp_path: Path,
 ) -> None:
