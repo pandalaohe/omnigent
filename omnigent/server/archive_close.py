@@ -568,15 +568,22 @@ class ArchiveCloseCoordinator:
             runner_id=intent.runner_id,
         )
         if intent.reason == "archive":
-            from omnigent.server.routes._sessions.orchestration import _archive_stop_one
+            from omnigent.server.routes._sessions.orchestration import (
+                _archive_stop_one,
+                _runner_has_live_session,
+            )
 
             stop_host_runner = False
+            runner_in_use = False
             if (
                 intent.archive_revision is not None
                 and intent.host_id is not None
                 and intent.runner_id is not None
             ):
-                stop_host_runner = await asyncio.to_thread(
+                runner_in_use = await asyncio.to_thread(
+                    _runner_has_live_session, self._conversation_store, intent.runner_id
+                )
+                stop_host_runner = not runner_in_use and await asyncio.to_thread(
                     self._intent_store.archive_binding_ready_to_stop,
                     root_session_id=intent.root_session_id,
                     revision=intent.archive_revision,
@@ -593,6 +600,7 @@ class ArchiveCloseCoordinator:
                 archive_scope_id=intent.root_session_id,
                 archive_revision=intent.archive_revision,
                 stop_host_runner=stop_host_runner,
+                release_required=runner_in_use,
             )
             if closed:
                 return "completed"

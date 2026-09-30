@@ -1477,6 +1477,38 @@ async def _wait_for_archive_idle(
         await asyncio.sleep(_facade._ARCHIVE_IDLE_POLL_S)
 
 
+def _runner_has_live_session(conversation_store: ConversationStore, runner_id: str) -> bool:
+    """Whether a session bound to ``runner_id`` is neither archived nor under an archived ancestor.
+
+    Archive flags only the archived root's row, and children share their parent's runner, so
+    one archived subtree must not tear down a runner the rest of its tree still uses.
+    """
+    archived_by_id: dict[str, bool] = {}
+
+    def _archived(conversation: Any) -> bool:
+        chain: list[str] = []
+        node = conversation
+        result = False
+        while node is not None and node.id not in chain:
+            if node.id in archived_by_id:
+                result = archived_by_id[node.id]
+                break
+            chain.append(node.id)
+            if node.archived:
+                result = True
+                break
+            parent_id = node.parent_conversation_id
+            node = conversation_store.get_conversation(parent_id) if parent_id else None
+        for conversation_id in chain:
+            archived_by_id[conversation_id] = result
+        return result
+
+    return any(
+        not _archived(conversation)
+        for conversation in conversation_store.list_conversations_by_runner_id(runner_id)
+    )
+
+
 async def _archive_stop_one(
     target_id: str,
     conversation: Any,
@@ -1486,6 +1518,7 @@ async def _archive_stop_one(
     archive_scope_id: str | None = None,
     archive_revision: int | None = None,
     stop_host_runner: bool = True,
+    release_required: bool = False,
 ) -> bool:
     """Release one captured session binding for a durable target intent."""
     from omnigent.server.routes import sessions as _facade
@@ -1512,10 +1545,11 @@ async def _archive_stop_one(
                 timeout=10.0,
             )
             released = response.status_code < 400 or response.status_code == 404
-        elif conversation.runner_id is None or not stop_host_runner:
+        elif conversation.runner_id is None or (not stop_host_runner and not release_required):
             # Nothing addressable of this target's own is left: it either never had a
             # runner, or it does not own this binding's teardown. The last target on
-            # the runner still has to prove the runner is gone.
+            # the runner still has to prove the runner is gone. A runner a live session
+            # keeps is never stopped, so its targets must prove their own release.
             released = True
     except Exception:  # noqa: BLE001 - Host stop remains the captured-binding fallback.
         _logger.debug(
@@ -1745,6 +1779,14 @@ async def _archive_stop(
         if binding in stopped_bindings:
             continue
         stopped_bindings.add(binding)
+        try:
+            runner_in_use = await asyncio.to_thread(
+                _runner_has_live_session, conversation_store, conv.runner_id
+            )
+        except Exception:  # noqa: BLE001 - never stop a runner not proven unused.
+            runner_in_use = True
+        if runner_in_use:
+            continue
         _intentional_stop_sessions.add(target_id)
         try:
             delivered = await _facade._stop_session_host_runner(

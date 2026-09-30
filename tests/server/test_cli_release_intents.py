@@ -379,9 +379,13 @@ async def test_shared_runner_stops_only_after_every_target_cli_released(
     bound_root = conversations.get_conversation(root.id)
     bound_child = conversations.get_conversation(child.id)
     assert bound_root is not None and bound_child is not None
+    archived = conversations.update_conversation(root.id, archived=True, close_cli_on_archive=True)
+    assert archived is not None
 
     intents = CliReleaseIntentStore(db_uri)
-    first, second = intents.ensure_archive_targets(root.id, 1, [bound_root, bound_child])
+    first, second = intents.ensure_archive_targets(
+        root.id, archived.archive_revision, [bound_root, bound_child]
+    )
     client = _RunnerClient()
     coordinator = ArchiveCloseCoordinator(
         conversation_store=conversations,
@@ -408,6 +412,158 @@ async def test_shared_runner_stops_only_after_every_target_cli_released(
         f"/v1/sessions/{root.id}/cli-retention/release",
         f"/v1/sessions/{child.id}/cli-retention/release",
     ]
+
+
+@pytest.mark.asyncio
+async def test_child_archive_keeps_runner_shared_with_live_parent_and_sibling(
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._sessions import common as _sessions_common
+
+    host_id = "a3b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b3b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    parent = conversations.create_conversation()
+    child_a = conversations.create_conversation(parent_conversation_id=parent.id)
+    child_b = conversations.create_conversation(parent_conversation_id=parent.id)
+    for conversation, name in (
+        (parent, "parent"),
+        (child_a, "child_a"),
+        (child_b, "child_b"),
+    ):
+        conversations.set_host_id(
+            conversation.id, host_id, workspace=f"/opt/work/omnigent/fork/{name}"
+        )
+        conversations.set_runner_id(conversation.id, runner_id)
+    archived_child = conversations.update_conversation(
+        child_a.id, archived=True, close_cli_on_archive=True
+    )
+    assert archived_child is not None
+    intents = CliReleaseIntentStore(db_uri)
+    client = _RunnerClient()
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_runner = AsyncMock(return_value="acked")
+    try:
+        with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_runner):
+            coordinator.trigger(child_a.id)
+            await coordinator.wait_for_idle()
+
+            stop_runner.assert_not_awaited()
+            assert [url for url, _payload in client.posts] == [
+                f"/v1/sessions/{child_a.id}/cli-retention/release",
+            ]
+            assert intents.archive_targets_complete(child_a.id, archived_child.archive_revision)
+            live_parent = conversations.get_conversation(parent.id)
+            live_sibling = conversations.get_conversation(child_b.id)
+            assert live_parent is not None and live_sibling is not None
+            assert live_parent.runner_id == runner_id and live_parent.archived is False
+            assert live_sibling.runner_id == runner_id and live_sibling.archived is False
+
+            archived_parent = conversations.update_conversation(
+                parent.id, archived=True, close_cli_on_archive=True
+            )
+            assert archived_parent is not None
+            coordinator.trigger(parent.id)
+            await coordinator.wait_for_idle()
+    finally:
+        _sessions_common._intentional_stop_sessions.discard(parent.id)
+        _sessions_common._intentional_stop_sessions.discard(child_a.id)
+        _sessions_common._intentional_stop_sessions.discard(child_b.id)
+
+    stop_runner.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hostless_child_archive_never_stops_parent_runner(
+    db_uri: str,
+) -> None:
+    host_id = "c3b2c3d4e5f61234567890abcdef0123"
+    runner_id = "d3b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    parent = conversations.create_conversation()
+    child = conversations.create_conversation(parent_conversation_id=parent.id)
+    conversations.set_host_id(parent.id, host_id, workspace="/opt/work/omnigent/fork/parent")
+    conversations.set_runner_id(parent.id, runner_id)
+    conversations.set_runner_id(child.id, runner_id)
+    archived_child = conversations.update_conversation(
+        child.id, archived=True, close_cli_on_archive=True
+    )
+    assert archived_child is not None
+    intents = CliReleaseIntentStore(db_uri)
+    client = _RunnerClient()
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_runner = AsyncMock(return_value="acked")
+    with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_runner):
+        coordinator.trigger(child.id)
+        await coordinator.wait_for_idle()
+
+    stop_runner.assert_not_awaited()
+    assert client.posts == [
+        (
+            f"/v1/sessions/{child.id}/cli-retention/release",
+            {
+                "reason": "archive",
+                "archive_scope_id": child.id,
+                "archive_revision": archived_child.archive_revision,
+            },
+        )
+    ]
+    assert intents.archive_targets_complete(child.id, archived_child.archive_revision)
+
+
+@pytest.mark.asyncio
+async def test_fallback_archive_stop_keeps_runner_shared_with_live_parent(
+    db_uri: str,
+) -> None:
+    host_id = "e3b2c3d4e5f61234567890abcdef0123"
+    runner_id = "f3b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    parent = conversations.create_conversation()
+    child = conversations.create_conversation(parent_conversation_id=parent.id)
+    for conversation, name in ((parent, "parent"), (child, "child")):
+        conversations.set_host_id(
+            conversation.id, host_id, workspace=f"/opt/work/omnigent/fork/{name}"
+        )
+        conversations.set_runner_id(conversation.id, runner_id)
+    conversations.update_conversation(child.id, archived=True, close_cli_on_archive=True)
+
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import orchestration
+
+    stop_host_runner = AsyncMock(return_value=True)
+    best_effort = AsyncMock()
+    with (
+        patch.object(sessions_facade, "_stop_session_host_runner", stop_host_runner),
+        patch.object(sessions_facade, "_best_effort_stop", best_effort),
+    ):
+        await orchestration._archive_stop(
+            child.id,
+            conversations,
+            _RunnerRouter(_RunnerClient(), online=True),
+            _Registry(),
+        )
+
+    stop_host_runner.assert_not_awaited()
 
 
 def test_host_pool_selection_lease_is_single_owner_without_touching_liveness(
@@ -1061,6 +1217,46 @@ async def test_shared_gone_runner_completes_non_owner_without_host_stop(
     settled = conversations.get_conversation(root.id)
     assert settled is not None
     assert settled.archive_close_completed_revision == settled.archive_revision == 1
+
+
+@pytest.mark.asyncio
+async def test_child_archive_on_disconnected_shared_runner_waits_for_its_release(
+    db_uri: str,
+) -> None:
+    host_id = "a5b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b5b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    parent = conversations.create_conversation()
+    child = conversations.create_conversation(parent_conversation_id=parent.id)
+    for conversation, name in ((parent, "parent"), (child, "child")):
+        conversations.set_host_id(
+            conversation.id, host_id, workspace=f"/opt/work/omnigent/fork/{name}"
+        )
+        conversations.set_runner_id(conversation.id, runner_id)
+    archived = conversations.update_conversation(
+        child.id, archived=True, close_cli_on_archive=True
+    )
+    assert archived is not None
+    bound_child = conversations.get_conversation(child.id)
+    assert bound_child is not None
+    intents = CliReleaseIntentStore(db_uri)
+    (intent,) = intents.ensure_archive_targets(child.id, archived.archive_revision, [bound_child])
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_UnconnectedRunnerRouter(),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+
+    from omnigent.server.routes import sessions as sessions_facade
+
+    stop_runner = AsyncMock(return_value="acked")
+    with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_runner):
+        assert await coordinator._execute_intent(intent) != "completed"
+
+    stop_runner.assert_not_awaited()
 
 
 @pytest.mark.asyncio
