@@ -28,7 +28,6 @@ from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.server.project_placement import (
-    bindings_apply,
     host_roots,
     load_bindings,
     load_eligible_host_ids,
@@ -38,9 +37,18 @@ from omnigent.server.project_placement import (
 )
 from omnigent.server.routes._auth_helpers import get_session_owner_id
 from omnigent.server.routes._auth_helpers import get_user_id as _get_user_id
+from omnigent.server.routes._host_worktree import (
+    WorktreeHostUnavailableError,
+    WorktreeProxyError,
+    list_worktrees_on_host,
+)
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.routes._sessions.orchestration import _create_session_from_existing_agent
+from omnigent.server.routes._workspace_validation import (
+    _is_subpath_of,
+    _is_windows_absolute_path,
+)
 from omnigent.server.routes.sessions.routes_peer import (
     PeerRoutes,
     _runner_authorized_for_sender,
@@ -55,11 +63,6 @@ from omnigent.util.session_lifecycle import is_session_closed, title_without_clo
 
 _logger = logging.getLogger(__name__)
 
-# Owner lock: two concurrent opens for one owner cannot both pass the
-# directory check. Process-local, like the open route's owner locks.
-# custom-lint: disable-next=workspace-scoped-cache -- owner lock; a key collision only serializes
-_OWNER_LOCKS: dict[str, asyncio.Lock] = {}
-
 
 class SessionOpenRequest(BaseModel):
     """Body of ``POST /sessions/{sender_id}/open``."""
@@ -73,13 +76,15 @@ class SessionOpenRequest(BaseModel):
     reasoning_effort: str | None = None
     message: str | None = Field(default=None, max_length=16000)
     from_ref: str | None = None
+    workspace: str | None = None
+    branch: str | None = Field(default=None, max_length=200)
     wait_for_host: bool = False
     title: str | None = Field(default=None, max_length=200)
 
-    @field_validator("from_ref")
+    @field_validator("from_ref", "workspace", "branch")
     @classmethod
-    def _blank_from_ref_is_none(cls, value: str | None) -> str | None:
-        """:returns: ``None`` for a blank or whitespace-only ``from_ref``."""
+    def _blank_ref_is_none(cls, value: str | None) -> str | None:
+        """:returns: ``None`` for a blank or whitespace-only value."""
         if value is None:
             return None
         return value.strip() or None
@@ -112,15 +117,6 @@ def _store_id(value: str) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _lock_for(owner: str) -> asyncio.Lock:
-    """Return the admission lock for one owner (event-loop-local)."""
-    lock = _OWNER_LOCKS.get(owner)
-    if lock is None:
-        lock = asyncio.Lock()
-        _OWNER_LOCKS[owner] = lock
-    return lock
 
 
 @dataclass
@@ -188,24 +184,6 @@ class PendingOpens:
         for entry in list(self._entries.values()):
             if entry.host_id == host_id:
                 self._schedule(self._claim_and_open(entry.sid))
-
-    def entries_for(self, host_id: str, root_workspace: str) -> list[_PendingOpen]:
-        """Return pending opens occupying *root_workspace* on *host_id*.
-
-        A pending open with ``from_ref`` lands in its own branch worktree,
-        not the root, so it does not occupy the directory.
-
-        :param host_id: Target host.
-        :param root_workspace: Target root directory.
-        :returns: Matching entries (for the directory-in-use check).
-        """
-        return [
-            entry
-            for entry in self._entries.values()
-            if entry.host_id == host_id
-            and entry.body.from_ref is None
-            and same_canonical_path(entry.root_workspace, root_workspace)
-        ]
 
     def _claim(self, sid: str) -> _PendingOpen | None:
         """Pop one entry, cancelling its timer; ``None`` when already claimed."""
@@ -297,7 +275,7 @@ def register_open_routes(
     :param router: The sessions router to register on.
     :param peer: Peer delivery callable from :func:`register_peer_routes`.
     :param project_store: Store for owner-scoped project lookup.
-    :param conversation_store: Store for sessions and occupancy.
+    :param conversation_store: Store for sessions.
     :param agent_store: Store for agent lookup.
     :param runner_router: Runner router, passed to the create orchestration.
     :param permission_store: Permission store, or ``None`` in single-user mode.
@@ -361,6 +339,95 @@ def register_open_routes(
         app = getattr(sweeper, "_app", None) or SimpleNamespace(state=app_state)
         return PeerSweeper._synthetic_request(session_id, app)
 
+    def _placement_problem(
+        body: SessionOpenRequest,
+        root: Any,
+        *,
+        state: str,
+        project_name: str,
+        host_name: str,
+    ) -> dict[str, Any] | None:
+        """Validate workspace / branch / from_ref against the resolved root.
+
+        :param body: The open request.
+        :param root: The resolved :class:`HostRoot`.
+        :param state: ``"needs_input"`` (immediate) or ``"failed"`` (fire).
+        :param project_name: Project display name for messages.
+        :param host_name: Host display name for messages.
+        :returns: The problem dict, or ``None`` when the placement is valid.
+        """
+        if body.workspace is not None:
+            if body.branch is not None or body.from_ref is not None:
+                return _problem(
+                    state,
+                    "workspace_with_branch",
+                    "workspace joins an existing directory; branch / from_ref "
+                    "cut a new one — pass one or the other.",
+                )
+            if not (
+                body.workspace.startswith("/") or _is_windows_absolute_path(body.workspace)
+            ) or not _is_subpath_of(body.workspace, root.workspace):
+                return _problem(
+                    state,
+                    "workspace_outside_project",
+                    f"Workspace {body.workspace!r} is not inside project "
+                    f"{project_name!r}'s directory {root.workspace!r} on host "
+                    f"{host_name!r}.",
+                )
+        if (body.from_ref or body.branch) and root.source != "entry":
+            return _problem(
+                state,
+                "no_entry_for_worktree",
+                f"Project {project_name!r} has no entry on host {host_name!r} for a "
+                "branch worktree; add one in the project settings first.",
+            )
+        return None
+
+    async def _bound_worktree_git(
+        *, host_id: str, workspace: str, repo_path: str
+    ) -> SessionGitOptions | None:
+        """Bind *workspace* to its listed worktree branch, when one matches.
+
+        A listing failure or a plain directory (subdirectory, detached HEAD,
+        or the repo itself for a non-worktree entry) leaves the caller to
+        place the session plainly in *workspace*.
+
+        :param host_id: Target host.
+        :param workspace: Absolute directory the session joins.
+        :param repo_path: Repository whose worktrees are listed.
+        :returns: Bind-mode git options, or ``None`` for plain placement.
+        """
+        if host_registry is None:
+            return None
+        host_conn = host_registry.get(host_id)
+        if host_conn is None:
+            return None
+        try:
+            worktrees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                repo_path=repo_path,
+            )
+        except (WorktreeHostUnavailableError, WorktreeProxyError) as exc:
+            _logger.warning(
+                "Session-open worktree listing failed; placing plainly in %s: %s",
+                workspace,
+                exc,
+                extra={"host_id": host_id},
+            )
+            return None
+        for row in worktrees:
+            branch = row.get("branch")
+            path = row.get("path")
+            if (
+                isinstance(branch, str)
+                and branch
+                and isinstance(path, str)
+                and same_canonical_path(path, workspace)
+            ):
+                return SessionGitOptions(branch_name=branch, existing_worktree=True)
+        return None
+
     async def _open_now(
         *,
         sid: str,
@@ -383,15 +450,23 @@ def register_open_routes(
             await asyncio.to_thread(permission_store.ensure_user, owner)
             await asyncio.to_thread(permission_store.grant, owner, sid, LEVEL_OWNER)
         try:
-            git = (
-                SessionGitOptions(branch_name=f"open-{sid[:8]}", base_branch=body.from_ref)
-                if body.from_ref
-                else None
-            )
+            workspace = root.workspace
+            git: SessionGitOptions | None = None
+            if body.workspace is not None:
+                workspace = body.workspace
+                git = await _bound_worktree_git(
+                    host_id=host_id,
+                    workspace=body.workspace,
+                    repo_path=root.checkout or root.workspace,
+                )
+            elif body.branch is not None:
+                git = SessionGitOptions(branch_name=body.branch, base_branch=body.from_ref)
+            elif body.from_ref is not None:
+                git = SessionGitOptions(branch_name=f"open-{sid[:8]}", base_branch=body.from_ref)
             create_body = ProjectSessionCreateRequest(
                 project_id=project.id,
                 host_id=host_id,
-                workspace=root.workspace,
+                workspace=workspace,
                 agent_id=agent.id,
                 git=git,
                 title=body.title,
@@ -419,7 +494,7 @@ def register_open_routes(
             detail = str(exc)
             reason = (
                 "branch_exists"
-                if body.from_ref and "already exists" in detail.lower()
+                if (body.from_ref or body.branch) and "already exists" in detail.lower()
                 else "create_failed"
             )
             if (
@@ -436,7 +511,10 @@ def register_open_routes(
                         exc_info=True,
                         extra={"session_id": sid},
                     )
-            return _problem("failed", reason, f"Could not open the session: {detail}")
+            message = f"Could not open the session: {detail}"
+            if reason == "branch_exists":
+                message += " To join that branch's worktree, pass workspace=<its directory>."
+            return _problem("failed", reason, message)
         _announce_session_added(owner, sid)
         first_message: dict[str, Any] | None = None
         if body.message:
@@ -462,7 +540,7 @@ def register_open_routes(
                     extra={"session_id": sid},
                 )
                 first_message = {"disposition": "failed", "reason": str(exc)}
-        return {
+        result: dict[str, Any] = {
             "state": "opened",
             "session_id": sid,
             "project": project.name,
@@ -473,7 +551,44 @@ def register_open_routes(
             "worktree": conv.worktree,
             "git_branch": conv.git_branch,
             "first_message": first_message,
+            "shared_with": [],
         }
+        if git is not None and not git.existing_worktree:
+            # The open cut a fresh branch worktree; nothing shares it yet.
+            return result
+        try:
+            landed_dir = conv.worktree or conv.workspace
+            if landed_dir:
+                others = await list_sessions(
+                    owned_by=owner if permission_store else None,
+                    host_id=host_id,
+                    include_archived=False,
+                )
+                shared = [
+                    other
+                    for other in others
+                    if other.id != sid
+                    and other.parent_conversation_id is None
+                    and not is_session_closed(other.labels, other.title)
+                    and SIDE_CHAT_LABEL_KEY not in (other.labels or {})
+                    and same_canonical_path(other.worktree or other.workspace or "", landed_dir)
+                ]
+                result["shared_with"] = [
+                    {
+                        "id": other.id,
+                        "name": title_without_closed_marker(other.title) or other.id,
+                    }
+                    for other in shared[:10]
+                ]
+                if len(shared) > 10:
+                    result["shared_with_total"] = len(shared)
+        except Exception:
+            _logger.warning(
+                "Session-open shared-with lookup failed",
+                exc_info=True,
+                extra={"session_id": sid},
+            )
+        return result
 
     async def open_pending(entry: _PendingOpen) -> dict[str, Any]:
         """Re-validate one waiting entry and open it (pending fire path)."""
@@ -497,7 +612,6 @@ def register_open_routes(
             return _problem("failed", "project_not_found", "The project is no longer available.")
         bindings = await load_bindings(binding_store, project.id)
         entries = await load_entries(binding_store, project.id)
-        gates_on = bindings_apply(project, flags)
         host = (
             await asyncio.to_thread(host_store.get_host, entry.host_id)
             if host_store is not None
@@ -507,19 +621,22 @@ def register_open_routes(
             return _problem(
                 "failed", "host_not_found", f"Host {entry.host_name} is no longer available."
             )
-        root = root_on_host(project, bindings, entry.host_id, gates_on=gates_on, entries=entries)
+        root = root_on_host(project, bindings, entry.host_id, entries=entries)
         if root is None:
             return _problem(
                 "failed",
                 "no_root",
                 f"Project {project.name!r} has no directory on host {entry.host_name!r}.",
             )
-        if entry.body.from_ref and root.source != "entry":
-            return _problem(
-                "failed",
-                "no_entry_for_worktree",
-                "The project has no entry on that host for a branch worktree.",
-            )
+        placement = _placement_problem(
+            entry.body,
+            root,
+            state="failed",
+            project_name=project.name,
+            host_name=entry.host_name,
+        )
+        if placement is not None:
+            return placement
         agent = (
             await asyncio.to_thread(agent_store.get, entry.agent_id)
             if agent_store is not None
@@ -548,35 +665,20 @@ def register_open_routes(
                 "agent_not_found",
                 "The agent belongs to another user's session.",
             )
-        async with _lock_for(entry.owner):
-            refusal = await _directory_refusal(
-                state="failed",
-                owner=entry.owner,
-                host_id=entry.host_id,
-                root_workspace=root.workspace,
-                from_ref=entry.body.from_ref,
-            )
-            if refusal is not None:
-                return refusal
-            if entry.body.from_ref is None:
-                in_flight[entry.sid] = (entry.host_id, root.workspace)
-        try:
-            return await _open_now(
-                sid=entry.sid,
-                owner=entry.owner,
-                create_user_id=entry.create_user_id,
-                sender=sender,
-                project=project,
-                host=host,
-                host_id=entry.host_id,
-                root=root,
-                agent=agent,
-                agent_name=public_agent_name(agent.name) or agent.name,
-                body=entry.body,
-                request=_synthetic_request(entry.sid),
-            )
-        finally:
-            in_flight.pop(entry.sid, None)
+        return await _open_now(
+            sid=entry.sid,
+            owner=entry.owner,
+            create_user_id=entry.create_user_id,
+            sender=sender,
+            project=project,
+            host=host,
+            host_id=entry.host_id,
+            root=root,
+            agent=agent,
+            agent_name=public_agent_name(agent.name) or agent.name,
+            body=entry.body,
+            request=_synthetic_request(entry.sid),
+        )
 
     async def _collab_enabled(owner: str) -> bool:
         """Whether *owner*'s session-collaboration master switch is on."""
@@ -590,68 +692,6 @@ def register_open_routes(
             return False
         return True
 
-    async def _occupied_sessions(*, owner: str, host_id: str, root_workspace: str) -> list[Any]:
-        """Non-closed top-level sessions sitting in *root_workspace*.
-
-        Archived sessions count (an archived runner may keep working);
-        closed sessions and side chats do not.
-        """
-        conversations = await list_sessions(
-            owned_by=owner if permission_store else None,
-            host_id=host_id,
-            include_archived=True,
-        )
-        return [
-            conv
-            for conv in conversations
-            if conv.parent_conversation_id is None
-            and not is_session_closed(conv.labels, conv.title)
-            and SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
-            and same_canonical_path(conv.worktree or conv.workspace or "", root_workspace)
-        ]
-
-    def _occupancy_candidates(
-        occupied: list[Any], pending: list[_PendingOpen], in_flight: list[str]
-    ) -> list[dict[str, str]]:
-        """Render occupied sessions, pending opens and reservations as choices."""
-        candidates = [
-            {
-                "id": conv.id,
-                "name": title_without_closed_marker(conv.title) or conv.id,
-            }
-            for conv in occupied
-        ]
-        candidates.extend(
-            {
-                "id": entry.sid,
-                "name": entry.body.title or f"pending open {entry.sid[:8]}",
-            }
-            for entry in pending
-        )
-        candidates.extend({"id": sid, "name": f"opening {sid[:8]}"} for sid in in_flight)
-        return candidates
-
-    def _directory_message(
-        occupied: list[Any],
-        pending: list[_PendingOpen],
-        in_flight: list[str],
-        root_workspace: str,
-    ) -> str:
-        """Human refusal text telling the agent to pass ``from_ref``."""
-        holders = ", ".join(
-            [
-                f"{conv.id} ({title_without_closed_marker(conv.title) or conv.id})"
-                for conv in occupied
-            ]
-            + [entry.sid for entry in pending]
-            + [f"{sid} (opening)" for sid in in_flight]
-        )
-        return (
-            f"Directory {root_workspace!r} is already used by another session "
-            f"({holders}). Pass from_ref to open the session in a new branch "
-            "worktree instead."
-        )
-
     entry_registry: PendingOpens
     existing_pending = getattr(app_state, "pending_session_opens", None)
     if isinstance(existing_pending, PendingOpens):
@@ -660,51 +700,6 @@ def register_open_routes(
         entry_registry = PendingOpens(app_state, open_entry=open_pending)
         if app_state is not None:
             app_state.pending_session_opens = entry_registry
-
-    # Opens that already passed admission but have not created their session
-    # yet: sid -> (host_id, root_workspace). Only no-ref opens reserve the
-    # root; a from_ref open lands in its own branch worktree.
-    in_flight: dict[str, tuple[str, str]] = {}
-
-    async def _directory_refusal(
-        *,
-        state: str,
-        owner: str,
-        host_id: str,
-        root_workspace: str,
-        from_ref: str | None,
-    ) -> dict[str, Any] | None:
-        """Refuse a root-directory open another session or opening holds.
-
-        A ``from_ref`` open lands in a fresh branch worktree, so it never
-        occupies the root and is always admitted.
-
-        :param state: ``"refused"`` or ``"failed"``.
-        :param owner: Session owner whose sessions and pending opens count.
-        :param host_id: Target host.
-        :param root_workspace: Target root directory.
-        :param from_ref: Branch worktree base, or ``None`` for the root.
-        :returns: The refusal dict, or ``None`` when the root is free.
-        """
-        if from_ref is not None:
-            return None
-        opening = [
-            sid
-            for sid, (reserved_host, reserved_root) in in_flight.items()
-            if reserved_host == host_id and same_canonical_path(reserved_root, root_workspace)
-        ]
-        occupied = await _occupied_sessions(
-            owner=owner, host_id=host_id, root_workspace=root_workspace
-        )
-        pending = entry_registry.entries_for(host_id, root_workspace)
-        if not occupied and not pending and not opening:
-            return None
-        return _problem(
-            state,
-            "directory_in_use",
-            _directory_message(occupied, pending, opening, root_workspace),
-            _occupancy_candidates(occupied, pending, opening),
-        )
 
     @router.post("/sessions/{sender_id}/open", include_in_schema=False, response_model=None)
     async def open_session(
@@ -757,8 +752,7 @@ def register_open_routes(
             project = matches[0]
         bindings = await load_bindings(binding_store, project.id)
         entries = await load_entries(binding_store, project.id)
-        gates_on = bindings_apply(project, flags)
-        roots = host_roots(project, bindings, gates_on=gates_on, entries=entries)
+        roots = host_roots(project, bindings, entries=entries)
         eligible = await load_eligible_host_ids(
             host_store, owner, (root.host_id for root in roots)
         )
@@ -791,7 +785,7 @@ def register_open_routes(
                 candidates,
             )
         host_id = host.host_id
-        root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
+        root = root_on_host(project, bindings, host_id, entries=entries)
         if root is None:
             return _problem(
                 "needs_input",
@@ -799,13 +793,15 @@ def register_open_routes(
                 f"Project {project.name!r} has no directory on host {host.name!r}.",
                 candidates,
             )
-        if body.from_ref and root.source != "entry":
-            return _problem(
-                "needs_input",
-                "no_entry_for_worktree",
-                f"Project {project.name!r} has no entry on host {host.name!r} for a "
-                "branch worktree; add one in the project settings first.",
-            )
+        placement = _placement_problem(
+            body,
+            root,
+            state="needs_input",
+            project_name=project.name,
+            host_name=host.name,
+        )
+        if placement is not None:
+            return placement
         agent = (
             await asyncio.to_thread(agent_store.get, body.agent)
             if agent_store and _store_id(body.agent)
@@ -874,75 +870,60 @@ def register_open_routes(
                 f"Agent {body.agent!r} belongs to another user's session.",
             )
         agent_name = public_agent_name(agent.name) or agent.name
-        async with _lock_for(owner):
-            refusal = await _directory_refusal(
-                state="refused",
-                owner=owner,
-                host_id=host_id,
-                root_workspace=root.workspace,
-                from_ref=body.from_ref,
-            )
-            if refusal is not None:
-                return refusal
-            refusal_text = await asyncio.to_thread(admit_open, app_state, owner)
-            if refusal_text is not None:
-                return _problem("refused", "open_rate", refusal_text)
-            host_online = host_registry is not None and host_registry.get(host_id) is not None
-            if not host_online:
-                if not body.wait_for_host:
-                    return _problem(
-                        "refused",
-                        "host_offline",
-                        f"Host {host.name!r} is offline. Retry with wait_for_host=true "
-                        "to open the session when it connects.",
-                    )
-                sid = uuid.uuid4().hex
-                settings = await asyncio.to_thread(
-                    read_collab_settings,
-                    getattr(app_state, "user_preferences_store", None),
-                    owner,
+        refusal_text = await asyncio.to_thread(admit_open, app_state, owner)
+        if refusal_text is not None:
+            return _problem("refused", "open_rate", refusal_text)
+        host_online = host_registry is not None and host_registry.get(host_id) is not None
+        if not host_online:
+            if not body.wait_for_host:
+                return _problem(
+                    "refused",
+                    "host_offline",
+                    f"Host {host.name!r} is offline. Retry with wait_for_host=true "
+                    "to open the session when it connects.",
                 )
-                entry_registry.register(
-                    _PendingOpen(
-                        sid=sid,
-                        owner=owner,
-                        create_user_id=create_user_id,
-                        sender_id=sender_id,
-                        host_id=host_id,
-                        host_name=host.name,
-                        project_id=project.id,
-                        root_workspace=root.workspace,
-                        agent_id=agent.id,
-                        body=body,
-                        created_at=int(time.time()),
-                    ),
-                    settings.undelivered_ttl_s,
-                )
-                return {
-                    "state": "waiting_for_host",
-                    "session_id": sid,
-                    "host_id": host_id,
-                    "host": host.name,
-                    "project": project.name,
-                    "agent": agent_name,
-                }
             sid = uuid.uuid4().hex
-            if body.from_ref is None:
-                in_flight[sid] = (host_id, root.workspace)
-        try:
-            return await _open_now(
-                sid=sid,
-                owner=owner,
-                create_user_id=create_user_id,
-                sender=sender,
-                project=project,
-                host=host,
-                host_id=host_id,
-                root=root,
-                agent=agent,
-                agent_name=agent_name,
-                body=body,
-                request=request,
+            settings = await asyncio.to_thread(
+                read_collab_settings,
+                getattr(app_state, "user_preferences_store", None),
+                owner,
             )
-        finally:
-            in_flight.pop(sid, None)
+            entry_registry.register(
+                _PendingOpen(
+                    sid=sid,
+                    owner=owner,
+                    create_user_id=create_user_id,
+                    sender_id=sender_id,
+                    host_id=host_id,
+                    host_name=host.name,
+                    project_id=project.id,
+                    root_workspace=root.workspace,
+                    agent_id=agent.id,
+                    body=body,
+                    created_at=int(time.time()),
+                ),
+                settings.undelivered_ttl_s,
+            )
+            return {
+                "state": "waiting_for_host",
+                "session_id": sid,
+                "host_id": host_id,
+                "host": host.name,
+                "project": project.name,
+                "agent": agent_name,
+            }
+        sid = uuid.uuid4().hex
+        return await _open_now(
+            sid=sid,
+            owner=owner,
+            create_user_id=create_user_id,
+            sender=sender,
+            project=project,
+            host=host,
+            host_id=host_id,
+            root=root,
+            agent=agent,
+            agent_name=agent_name,
+            body=body,
+            request=request,
+        )

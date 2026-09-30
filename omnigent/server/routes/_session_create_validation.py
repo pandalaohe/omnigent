@@ -29,7 +29,6 @@ from omnigent.sdk_permission_modes import CODEX_SDK_APPROVAL_MODES
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.project_placement import (
-    bindings_apply,
     checkout_on_host,
     default_host,
     host_roots,
@@ -257,7 +256,7 @@ async def resolve_project_session_create(
     user_id: str | None,
     project_store: ProjectStore | None,
     binding_store: ProjectHostBindingStore | None = None,
-    feature_flags: FeatureFlags | None = None,
+    feature_flags: FeatureFlags | None = None,  # noqa: ARG001 — bindings are no longer flag-gated
     host_store: HostStore | None = None,
     fill_host: bool = False,
     request: Request | None = None,
@@ -295,7 +294,6 @@ async def resolve_project_session_create(
     updates: dict[str, Any] = {}
     bindings: Any = []
     entries: Any = []
-    gates_on = False
     if project is not None:
         config = project.config
         # The legacy agent_id fill moved into the calling chain below; config
@@ -304,7 +302,6 @@ async def resolve_project_session_create(
             updates["git"] = config["git"]
         bindings = await load_bindings(binding_store, project.id)
         entries = await load_entries(binding_store, project.id)
-        gates_on = bindings_apply(project, feature_flags)
         if (
             fill_host
             and "host_id" not in fields_set
@@ -312,7 +309,7 @@ async def resolve_project_session_create(
             and body.parent_session_id is None
             and "host_type" not in fields_set
         ):
-            roots = host_roots(project, bindings, gates_on=gates_on, entries=entries)
+            roots = host_roots(project, bindings, entries=entries)
             eligible = await load_eligible_host_ids(
                 host_store, user_id, (root.host_id for root in roots)
             )
@@ -331,7 +328,7 @@ async def resolve_project_session_create(
         if "workspace" not in fields_set:
             host_id = updates.get("host_id", body.host_id)
             if host_id is not None:
-                root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
+                root = root_on_host(project, bindings, host_id, entries=entries)
                 if root is None:
                     raise OmnigentError(
                         f"Project '{project.name}' has no directory on host '{host_id}'. "

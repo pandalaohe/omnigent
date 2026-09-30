@@ -22,6 +22,7 @@ from omnigent.entities.conversation import (
     NewConversationItem,
 )
 from omnigent.server.routes.sessions.routes_peer import (
+    PEER_DUP_WINDOW,
     PEER_PAIR_LIMIT,
     PEER_PAIR_WINDOW_S,
     PEER_SENDER_LIMIT,
@@ -573,6 +574,58 @@ def test_reserve_duplicate_drops_without_slot() -> None:
         0.0,
         None,
     )
+
+
+def test_reserve_same_text_other_thread_admits() -> None:
+    """Same text on a different correlation id is a different send."""
+    admission = _PeerAdmission()
+    assert admission.reserve("s", "r", "same text", correlation_id="a", now=1000.0) == (
+        None,
+        0.0,
+        1000.0,
+    )
+    assert admission.reserve("s", "r", "same text", correlation_id="b", now=1000.5) == (
+        None,
+        0.0,
+        1000.5,
+    )
+
+
+def test_reserve_drops_past_the_window_while_undelivered() -> None:
+    """An identical send past the window drops while the earlier copy is live."""
+    admission = _PeerAdmission()
+    admission.reserve("s", "r", "same text", now=1000.0)
+    admission.note_record("s", "r", None, "same text", "peer-1")
+    assert admission.pending_peer_id("s", "r", None, "same text") == "peer-1"
+    after = 1000.0 + PEER_DUP_WINDOW + 1
+    assert admission.reserve("s", "r", "same text", now=after, earlier_undelivered=True) == (
+        "dropped:duplicate",
+        0.0,
+        None,
+    )
+
+
+def test_reserve_admits_past_the_window_once_delivered() -> None:
+    """Once the earlier copy settled, the window alone governs the resend."""
+    admission = _PeerAdmission()
+    admission.reserve("s", "r", "same text", now=1000.0)
+    admission.note_record("s", "r", None, "same text", "peer-1")
+    after = 1000.0 + PEER_DUP_WINDOW + 1
+    assert admission.reserve("s", "r", "same text", now=after, earlier_undelivered=False) == (
+        None,
+        0.0,
+        after,
+    )
+
+
+def test_note_record_is_a_noop_after_release() -> None:
+    """A released key is never rebound by a late note_record."""
+    admission = _PeerAdmission()
+    _v, _d, slot = admission.reserve("s", "r", "text", correlation_id="t", now=1000.0)
+    admission.release("s", "r", "text", correlation_id="t", verdict="failed", slot=slot)
+    admission.note_record("s", "r", "t", "text", "peer-1")
+    assert admission.pending_peer_id("s", "r", "t", "text") is None
+    assert admission.reserve("s", "r", "text", correlation_id="t", now=1000.1)[0] is None
 
 
 def test_release_removes_slot_by_value() -> None:

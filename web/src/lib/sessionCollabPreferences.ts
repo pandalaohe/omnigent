@@ -65,7 +65,7 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   pairRateWindowSeconds: 60,
   senderRateCount: 60,
   senderRateWindowSeconds: 600,
-  duplicateWindowSeconds: 600,
+  duplicateWindowSeconds: 60,
   undeliveredTtlSeconds: 86400,
   flowTimerEnabled: true,
   childKeepWarmEnabled: false,

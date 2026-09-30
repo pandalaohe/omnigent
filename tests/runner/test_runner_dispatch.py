@@ -13803,6 +13803,86 @@ async def test_sys_session_create_worktree_uses_caller_cwd() -> None:
     assert handle["workspace"] == "/repo/.worktrees/app/fix-auth"
 
 
+def test_worktree_options_bind_mode() -> None:
+    """``existing: true`` binds the worktree at the workspace instead of cutting."""
+    from omnigent.runner.tool_dispatch import _worktree_options
+
+    git, error = _worktree_options({"branch": "task/fix", "existing": True})
+    assert error is None
+    assert git == {"branch_name": "task/fix", "existing_worktree": True}
+
+
+def test_worktree_options_existing_with_base_rejected() -> None:
+    """Bind mode has no base to fork, so ``base`` with ``existing`` is invalid."""
+    from omnigent.runner.tool_dispatch import _worktree_options
+
+    git, error = _worktree_options({"branch": "task/fix", "existing": True, "base": "main"})
+    assert git is None
+    assert error == "'worktree.base' cannot be combined with 'worktree.existing'"
+
+
+def test_worktree_options_non_bool_existing_rejected() -> None:
+    """A non-bool ``existing`` is refused, not coerced."""
+    from omnigent.runner.tool_dispatch import _worktree_options
+
+    git, error = _worktree_options({"branch": "task/fix", "existing": "yes"})
+    assert git is None
+    assert error == "'worktree.existing' must be a boolean"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_worktree_bind_joins_the_workspace() -> None:
+    """{branch, existing} sends the bind body with the workspace unchanged."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+    handler = _create_placement_handler(
+        caller_body={
+            "id": "conv_placement_caller",
+            "host_id": "host_a",
+            "workspace": "/repo",
+        },
+        create_body_log=bodies,
+        create_response={
+            "id": "conv_bind",
+            "agent_name": "worker",
+            "status": "idle",
+            "host_id": "host_a",
+        },
+        child_metadata={
+            "id": "conv_bind",
+            "host_id": "host_a",
+            "workspace": "/repo/.worktrees/task",
+            "worktree": "/repo/.worktrees/task",
+            "git_branch": "task/fix",
+        },
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "bind",
+                    "workspace": "/repo/.worktrees/task",
+                    "worktree": {"branch": "task/fix", "existing": True},
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_placement_caller",
+        )
+
+    [body] = bodies
+    assert body["host_id"] == "host_a"
+    assert body["workspace"] == "/repo/.worktrees/task"
+    assert body["git"] == {"branch_name": "task/fix", "existing_worktree": True}
+    handle = json.loads(output)
+    assert handle["git_branch"] == "task/fix"
+
+
 @pytest.mark.asyncio
 async def test_sys_session_create_unknown_host_lists_known_names() -> None:
     """An unknown host is refused with the names that do exist."""

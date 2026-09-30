@@ -170,7 +170,9 @@ class CollabSettings:
     :param pair_rate_window_s: Pair-rate window in seconds.
     :param sender_rate_count: Messages one sender session may send per window.
     :param sender_rate_window_s: Sender-rate window in seconds.
-    :param duplicate_window_s: Window for suppressing duplicate payloads.
+    :param duplicate_window_s: Window for suppressing an identical retry
+        on the same thread; past it, a resend still drops while the
+        earlier copy is undelivered.
     :param undelivered_ttl_s: Lifetime of undelivered messages in seconds.
     :param flow_timer_enabled: Whether collaboration flow timers are on.
     :param keep_warm_enabled: Whether idle active-zone children are kept
@@ -190,7 +192,7 @@ class CollabSettings:
     pair_rate_window_s: int = 60
     sender_rate_count: int = 60
     sender_rate_window_s: int = 600
-    duplicate_window_s: int = 600
+    duplicate_window_s: int = 60
     undelivered_ttl_s: int = 86400
     flow_timer_enabled: bool = True
     keep_warm_enabled: bool = False

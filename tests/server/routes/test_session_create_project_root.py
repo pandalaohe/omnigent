@@ -715,7 +715,10 @@ async def test_host_roots_endpoint_is_owner_scoped_and_not_flag_gated(
     response = await client.get(f"/v1/projects/{project_id}/host-roots", headers=_headers())
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "roots": [{"host_id": "h1", "workspace": "/c", "source": "config", "checkout": None}],
+        "roots": [
+            {"host_id": "h1", "workspace": "/c", "source": "config", "checkout": None},
+            {"host_id": "h2", "workspace": "/b", "source": "binding", "checkout": "/b"},
+        ],
         "default_host_id": "h1",
         "default_host_reason": "config",
     }

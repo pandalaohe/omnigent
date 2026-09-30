@@ -149,6 +149,28 @@ async def test_executor_posts_open_route_and_returns_server_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_accepts_workspace_and_branch_args() -> None:
+    """``workspace`` and ``branch`` ride the allow-list and the POST body."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"state": "opened", "session_id": "conv_new"})
+
+    args = {
+        "project": "Target",
+        "host": "host-one",
+        "agent": "claude-native",
+        "workspace": "/repo/.worktrees/task",
+        "branch": "task/fix",
+    }
+    async with _client(handler) as client:
+        out = await _execute_session_open_tool(args, server_client=client, conversation_id=_CALLER)
+    assert json.loads(out)["state"] == "opened"
+    assert seen["body"] == args
+
+
+@pytest.mark.asyncio
 async def test_executor_returns_server_refusal_unchanged() -> None:
     """A server refusal body passes through byte-for-byte."""
 
@@ -156,9 +178,9 @@ async def test_executor_returns_server_refusal_unchanged() -> None:
         return httpx.Response(
             200,
             json={
-                "state": "refused",
-                "reason": "directory_in_use",
-                "message": "busy",
+                "state": "needs_input",
+                "reason": "workspace_outside_project",
+                "message": "outside",
                 "candidates": [],
             },
         )
@@ -169,7 +191,7 @@ async def test_executor_returns_server_refusal_unchanged() -> None:
             server_client=client,
             conversation_id=_CALLER,
         )
-    assert json.loads(out)["reason"] == "directory_in_use"
+    assert json.loads(out)["reason"] == "workspace_outside_project"
 
 
 @pytest.mark.asyncio

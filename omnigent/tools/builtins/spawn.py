@@ -386,12 +386,12 @@ def _build_sys_session_send_schema(
                     "wait_seconds": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": 3600,
                         "default": 0,
                         "description": (
                             "Peer mode only: how long a message to an "
                             "offline / not-ready receiver may wait before "
-                            "it fails; 0 = fail immediately."
+                            "it fails; 0 = fail immediately; capped at your "
+                            "undelivered-message lifetime setting (default 24 h)."
                         ),
                     },
                     "wait_for_reply_seconds": {
@@ -1055,7 +1055,10 @@ class SysSessionCreateTool(Tool):
             "registered host (id or exact name); `workspace` is the absolute "
             "directory there; `project_id` overrides the parent's project; "
             "`worktree` {branch, base} cuts a NEW branch worktree (base "
-            "defaults to the workspace's HEAD) and runs the child in it. "
+            "defaults to the current HEAD of the workspace, so from inside a "
+            "task worktree it branches off the task branch); {branch, "
+            "existing: true} joins an existing worktree instead (several "
+            "sessions may share one task worktree) and runs the child in it. "
             "Omit all of them to inherit your host, project and working tree "
             "(the result's `project_id` is null for No Project). Naming a "
             "different host requires a workspace or worktree there. A child's "
@@ -1195,8 +1198,10 @@ class SysSessionCreateTool(Tool):
                                 "branch": {
                                     "type": "string",
                                     "description": (
-                                        "New branch name for the child's "
-                                        "worktree, e.g. 'fix-auth'."
+                                        "Branch for the child's worktree: a "
+                                        "new branch, or with existing=true "
+                                        "the branch checked out in the "
+                                        "worktree you join, e.g. 'fix-auth'."
                                     ),
                                 },
                                 "base": {
@@ -1207,14 +1212,29 @@ class SysSessionCreateTool(Tool):
                                         "HEAD."
                                     ),
                                 },
+                                "existing": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": (
+                                        "Join the existing worktree at "
+                                        "'workspace' (or your working "
+                                        "directory) whose checked-out branch "
+                                        "is 'branch' instead of cutting a new "
+                                        "one; the branch is recorded. Not "
+                                        "with 'base'."
+                                    ),
+                                },
                             },
                             "required": ["branch"],
                             "additionalProperties": False,
                             "description": (
-                                "Placement (agent_id mode): cut a NEW "
-                                "branch worktree for the child and run it "
-                                "there. Without 'workspace', the worktree "
-                                "is cut from your working directory. The "
+                                "Placement (agent_id mode): {branch, base} "
+                                "cuts a NEW branch worktree for the child and "
+                                "runs it there; {branch, existing: true} joins "
+                                "an existing worktree instead (several "
+                                "sessions may share one task worktree). "
+                                "Without 'workspace', the worktree is cut from "
+                                "or joined at your working directory. The "
                                 "worktree is never removed automatically."
                             ),
                         },

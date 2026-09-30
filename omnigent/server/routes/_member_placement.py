@@ -17,7 +17,6 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.project_placement import (
-    bindings_apply,
     load_bindings,
     load_entries,
     root_on_host,
@@ -57,7 +56,7 @@ async def resolve_member_worktree_on_host(
     binding_store: Any,
     host_registry: Any,
     host_store: Any,
-    feature_flags: Any,
+    feature_flags: Any,  # noqa: ARG001 — retained in the call contract; bindings are no longer gated
 ) -> MemberWorktree:
     """
     Resolve *conversation*'s branch worktree on *host_id* for member dispatch.
@@ -82,7 +81,8 @@ async def resolve_member_worktree_on_host(
     :param host_registry: Live host tunnel registry, or ``None``.
     :param host_store: Persistent host registrations, used to authorize the
         target host before any host request.
-    :param feature_flags: Feature flags driving the placement gates.
+    :param feature_flags: Retained in the call contract; binding roots are
+        no longer feature-gated.
     :returns: The resolved :class:`MemberWorktree`.
     :raises HTTPException: 404 if the host is unknown; 403 if it is owned by a
         different user.
@@ -127,8 +127,7 @@ async def resolve_member_worktree_on_host(
         )
     bindings = await load_bindings(binding_store, project.id)
     entries = await load_entries(binding_store, project.id)
-    gates_on = bindings_apply(project, feature_flags)
-    root = root_on_host(project, bindings, host_id, gates_on=gates_on, entries=entries)
+    root = root_on_host(project, bindings, host_id, entries=entries)
     if root is None:
         raise OmnigentError(
             f"project {project.name!r} has no directory on host {host_id!r}; add "

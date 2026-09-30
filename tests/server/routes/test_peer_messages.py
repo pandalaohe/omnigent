@@ -1084,6 +1084,97 @@ async def test_concurrent_identical_sends_admit_once(
     assert dropped["reason"] == "duplicate"
 
 
+async def test_same_text_other_correlation_both_admitted(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """Identical text on different threads is not a duplicate."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    text = f"two-threads-{uuid.uuid4().hex}"
+    for correlation in ("thread-a", "thread-b"):
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={
+                "sender_session_id": sender.id,
+                "text": text,
+                "correlation_id": correlation,
+            },
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "delivered", resp.text
+
+
+async def test_duplicate_past_window_drops_while_first_is_pending(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """Past the window, an identical resend drops while the first is undelivered."""
+    sender = peer_env["sender"]
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    target = conv_store.create_conversation(
+        title=f"late-dup-{uuid.uuid4().hex[:6]}", agent_id=AGENT_ID, runner_id="rlate"
+    )
+    peer_env["perm_store"].grant(ALICE, target.id, LEVEL_OWNER)
+    peer_env["offline_ids"].add(target.id)
+    text = f"late-dup-{uuid.uuid4().hex}"
+
+    first = await peer_client.post(
+        f"/v1/sessions/{target.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": text, "wait_seconds": 30},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert first.json()["disposition"] == "pending", first.text
+    peer_id = first.json()["peer_id"]
+
+    admission = peer_module._PEER_ADMISSION
+    key = (sender.id, target.id, "", admission.normalize_text(text))
+    seen_at, bound = admission._pair_texts[key]
+    assert bound == peer_id
+    admission._pair_texts[key] = (seen_at - peer_module.PEER_DUP_WINDOW - 1, bound)
+
+    still_pending = await peer_client.post(
+        f"/v1/sessions/{target.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": text, "wait_seconds": 30},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert still_pending.json()["disposition"] == "dropped", still_pending.text
+    assert still_pending.json()["reason"] == "duplicate"
+
+    peer_env["peer_store"].transition(peer_id, "delivered", None, ("pending",))
+    admitted = await peer_client.post(
+        f"/v1/sessions/{target.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": text, "wait_seconds": 30},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert admitted.json()["disposition"] == "pending", admitted.text
+    assert admitted.json()["peer_id"] != peer_id
+
+
+async def test_wait_seconds_capped_at_the_undelivered_ttl(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
+) -> None:
+    """An over-long wait is capped at the owner's undelivered-message lifetime."""
+    sender = peer_env["sender"]
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    target = conv_store.create_conversation(
+        title=f"cap-{uuid.uuid4().hex[:6]}", agent_id=AGENT_ID, runner_id="rcap"
+    )
+    peer_env["perm_store"].grant(ALICE, target.id, LEVEL_OWNER)
+    peer_env["offline_ids"].add(target.id)
+    resp = await peer_client.post(
+        f"/v1/sessions/{target.id}/peer-messages",
+        json={
+            "sender_session_id": sender.id,
+            "text": f"cap-{uuid.uuid4().hex}",
+            "wait_seconds": 10_000_000,
+        },
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "pending", resp.text
+    record = peer_env["peer_store"].get(resp.json()["peer_id"])
+    assert record is not None
+    assert record.expires_at - record.created_at == 86400
+
+
 async def test_seven_distinct_concurrent_sends_delay_the_seventh(
     peer_env: dict[str, Any],
 ) -> None:

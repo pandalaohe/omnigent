@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Literal
 
 from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry
-from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes._workspace_validation import (
     _is_subpath_of,
     _is_windows_absolute_path,
@@ -45,21 +44,6 @@ class DefaultHost:
 
     host_id: str | None
     reason: Literal["config", "single_root", "ambiguous", "none"]
-
-
-def bindings_apply(
-    project: Project,  # noqa: ARG001 — kept for the per-project gate's call shape
-    feature_flags: FeatureFlags | None,
-) -> bool:
-    """Return whether binding roots are enabled for this project.
-
-    :param project: Project whose bindings are checked. Kept in the
-        signature so callers stay project-scoped once a per-project gate
-        returns.
-    :param feature_flags: Deployment feature snapshot, if available.
-    :returns: Whether the deployment's assignment flag is on.
-    """
-    return bool(feature_flags is not None and feature_flags.enabled(Feature.PROJECT_ASSIGNMENTS))
 
 
 def _entry_on_host(entries: Iterable[ProjectHostEntry], host_id: str) -> ProjectHostEntry | None:
@@ -104,7 +88,6 @@ def root_on_host(
     bindings: list[ProjectHostBinding],
     host_id: str,
     *,
-    gates_on: bool,
     entries: list[ProjectHostEntry] | None = None,
 ) -> HostRoot | None:
     """Return the project's root on one host, if configured.
@@ -113,12 +96,12 @@ def root_on_host(
     that host's entry when it exists, otherwise no root on that host (deleting
     an entry means "no directory on that host", never a silent fallback to a
     binding or the config). A project without entries keeps the legacy
-    binding → config resolution.
+    binding → config resolution; bindings supply roots whenever no entries
+    exist.
 
     :param project: Project whose root is resolved.
     :param bindings: Its per-host directory bindings.
     :param host_id: Target host.
-    :param gates_on: Whether bindings may supply roots.
     :param entries: Its per-host entries; empty for a project without entries.
     :returns: The preferred root, or ``None``.
     """
@@ -134,15 +117,14 @@ def root_on_host(
             "entry",
             checkout_on_host(bindings, entries, host_id),
         )
-    if gates_on:
-        for binding in bindings:
-            if binding.host_id == host_id and binding.is_primary and binding.enabled:
-                return HostRoot(
-                    host_id,
-                    binding.workspace,
-                    "binding",
-                    checkout_on_host(bindings, entries or [], host_id),
-                )
+    for binding in bindings:
+        if binding.host_id == host_id and binding.is_primary and binding.enabled:
+            return HostRoot(
+                host_id,
+                binding.workspace,
+                "binding",
+                checkout_on_host(bindings, entries or [], host_id),
+            )
     config = project.config
     workspace = config.get("workspace")
     if config.get("host_id") == host_id and isinstance(workspace, str) and workspace:
@@ -159,7 +141,6 @@ def host_roots(
     project: Project,
     bindings: list[ProjectHostBinding],
     *,
-    gates_on: bool,
     entries: list[ProjectHostEntry] | None = None,
 ) -> list[HostRoot]:
     """Return one preferred root for each configured host.
@@ -170,7 +151,6 @@ def host_roots(
 
     :param project: Project whose roots are resolved.
     :param bindings: Its per-host directory bindings.
-    :param gates_on: Whether bindings may supply roots.
     :param entries: Its per-host entries; empty for a project without entries.
     :returns: Preferred roots ordered by host id.
     """
@@ -179,25 +159,16 @@ def host_roots(
         return [
             root
             for host_id in sorted(host_ids)
-            if (
-                root := root_on_host(
-                    project, bindings, host_id, gates_on=gates_on, entries=entries
-                )
-            )
-            is not None
+            if (root := root_on_host(project, bindings, host_id, entries=entries)) is not None
         ]
-    host_ids = (
-        {binding.host_id for binding in bindings if binding.host_id != "__sandbox__"}
-        if gates_on
-        else set()
-    )
+    host_ids = {binding.host_id for binding in bindings if binding.host_id != "__sandbox__"}
     config_host_id = project.config.get("host_id")
     if isinstance(config_host_id, str) and config_host_id and config_host_id != "__sandbox__":
         host_ids.add(config_host_id)
     return [
         root
         for host_id in sorted(host_ids)
-        if (root := root_on_host(project, bindings, host_id, gates_on=gates_on)) is not None
+        if (root := root_on_host(project, bindings, host_id)) is not None
     ]
 
 

@@ -1485,7 +1485,7 @@ def test_session_create_schema_exposes_placement() -> None:
     worktree = properties["worktree"]
     assert worktree["type"] == "object"
     assert worktree["required"] == ["branch"]
-    assert set(worktree["properties"]) == {"branch", "base"}
+    assert set(worktree["properties"]) == {"branch", "base", "existing"}
     assert worktree["additionalProperties"] is False
     assert params["additionalProperties"] is False
 

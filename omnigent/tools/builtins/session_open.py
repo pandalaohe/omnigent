@@ -22,10 +22,14 @@ class SysSessionOpenTool(Tool):
     session; the new session's replies come back as peer messages, and
     ``sys_session_send`` drives it further.
 
-    ``from_ref`` opens the session in a new branch worktree created from
-    that ref on the target host. Commit AND push first — the target host
-    must be able to resolve or fetch the ref. A session may not open into
-    a directory another session already uses without ``from_ref``.
+    By default the session opens in the project's directory on that host,
+    which other sessions may share (commit by pathspec; do not switch
+    branches there). ``workspace`` joins an existing directory of the
+    project on that host, e.g. the task's worktree (its checked-out branch
+    is recorded). ``branch`` cuts a new branch worktree for a new task
+    direction, from ``from_ref`` or the checkout's current HEAD;
+    ``from_ref`` alone cuts ``open-<id>``. The result lists other live
+    sessions in the same directory as ``shared_with``.
 
     ``wait_for_host`` waits for an offline host (up to the
     undelivered-message lifetime setting) and returns a system line when
@@ -48,14 +52,18 @@ class SysSessionOpenTool(Tool):
             "deadline; it is an ordinary conversation. An optional message "
             "arrives as a peer message from you, and replies come back as peer "
             "messages (answer with sys_session_send; watch it with the session "
-            "tools). from_ref opens it in a new branch worktree created from "
-            "that ref on the target host — commit AND push first, because the "
-            "target host must be able to resolve or fetch the ref. Opening "
-            "into a directory another session already uses needs from_ref. "
-            "wait_for_host (default false) waits for an offline host (up to "
-            "the undelivered-message lifetime setting) and you get one system "
-            "line when it opens, fails or expires. Top-level sessions only. "
-            "Every open counts toward the open-rate setting."
+            "tools). By default it opens in the project's directory on that "
+            "host, which other sessions may share — commit by pathspec and do "
+            "not switch branches there. workspace joins an existing directory "
+            "of the project on that host, e.g. the task's worktree (its branch "
+            "is recorded). branch cuts a new branch worktree for a new task "
+            "direction, from from_ref or the checkout's current HEAD; from_ref "
+            "alone cuts open-<id>. The result lists other live sessions sharing "
+            "that directory as shared_with. wait_for_host (default false) waits "
+            "for an offline host (up to the undelivered-message lifetime "
+            "setting) and you get one system line when it opens, fails or "
+            "expires. Top-level sessions only. Every open counts toward the "
+            "open-rate setting."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -136,7 +144,28 @@ class SysSessionOpenTool(Tool):
                                 "Optional branch, tag or commit to create a "
                                 "new branch worktree from on the target host. "
                                 "Commit AND push it first; the target host "
-                                "must resolve or fetch it."
+                                "must resolve or fetch it. With 'branch' it "
+                                "is the new branch's base; alone it cuts "
+                                "open-<id>."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Optional absolute directory of the project on "
+                                "the target host to open the session in, e.g. "
+                                "an existing task worktree. Its checked-out "
+                                "branch is recorded. Not with 'branch' or "
+                                "'from_ref'."
+                            ),
+                        },
+                        "branch": {
+                            "type": "string",
+                            "maxLength": 200,
+                            "description": (
+                                "Optional new branch to cut a worktree for on "
+                                "the target host, from 'from_ref' or the "
+                                "checkout's current HEAD. Not with 'workspace'."
                             ),
                         },
                         "wait_for_host": {

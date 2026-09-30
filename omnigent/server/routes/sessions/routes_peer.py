@@ -80,11 +80,15 @@ PEER_PAIR_LIMIT = 6
 PEER_PAIR_WINDOW_S = 60
 PEER_SENDER_LIMIT = 60
 PEER_SENDER_WINDOW_S = 600
-PEER_DUP_WINDOW = 600
+PEER_DUP_WINDOW = 60
 PEER_RELAY_DEPTH_LIMIT = 30
 PEER_INPUT_LOOKBACK_ITEMS = 1000
 PEER_QUEUE_LIFETIME = 24 * 3600
 PEER_HOLD_LIFETIME = 24 * 3600
+
+# Record states in which a peer message has not reached the receiver yet:
+# an identical resend is still a duplicate while the earlier copy sits here.
+_PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
@@ -346,7 +350,7 @@ class _PeerAdmission:
         self._locks: dict[str, asyncio.Lock] = {}
         self._pair_sends: dict[tuple[str, str], list[float]] = {}
         self._sender_sends: dict[str, list[float]] = {}
-        self._pair_texts: dict[tuple[str, str, str], float] = {}
+        self._pair_texts: dict[tuple[str, str, str, str], tuple[float, str | None]] = {}
 
     def _lock_for(self, sender_id: str) -> asyncio.Lock:
         """Return the admission lock for one sender (event-loop-local)."""
@@ -361,41 +365,108 @@ class _PeerAdmission:
         """Collapse whitespace for duplicate comparison."""
         return _WS_COLLAPSE_RE.sub(" ", text).strip()
 
+    @staticmethod
+    def _text_key(
+        sender_id: str,
+        receiver_id: str,
+        correlation_id: str | None,
+        text: str,
+    ) -> tuple[str, str, str, str]:
+        """Return the duplicate-ledger key for one send.
+
+        Two sends are duplicate candidates only on the same thread: same
+        sender, receiver, correlation id and normalized text.
+        """
+        return (
+            sender_id,
+            receiver_id,
+            correlation_id or "",
+            _PeerAdmission.normalize_text(text),
+        )
+
+    def pending_peer_id(
+        self,
+        sender_id: str,
+        receiver_id: str,
+        correlation_id: str | None,
+        text: str,
+    ) -> str | None:
+        """Return the record id bound to this send's ledger entry, if any.
+
+        The route reads the record off-thread and passes the resulting
+        ``earlier_undelivered`` bool to :meth:`reserve`, so this stays a
+        sync, in-memory lookup under the sender's admission lock.
+        """
+        entry = self._pair_texts.get(self._text_key(sender_id, receiver_id, correlation_id, text))
+        return entry[1] if entry is not None else None
+
+    def note_record(
+        self,
+        sender_id: str,
+        receiver_id: str,
+        correlation_id: str | None,
+        text: str,
+        peer_id: str,
+    ) -> None:
+        """Bind the record a send created to its ledger entry.
+
+        A no-op when the key is gone (a failed send already released it),
+        so the ledger only ever tracks records that may still deliver.
+        """
+        key = self._text_key(sender_id, receiver_id, correlation_id, text)
+        entry = self._pair_texts.get(key)
+        if entry is None:
+            return
+        self._pair_texts[key] = (entry[0], peer_id)
+
     def reserve(
         self,
         sender_id: str,
         receiver_id: str,
         text: str,
         *,
+        correlation_id: str | None = None,
         limits: PeerLimits = DEFAULT_PEER_LIMITS,
         now: float | None = None,
+        earlier_undelivered: bool = False,
     ) -> tuple[str | None, float, float | None]:
         """Admit one send and return its verdict, delay, and slot.
 
-        Duplicate detection runs first, so an identical retry inside the
-        window drops instead of consuming budget. Otherwise the send is
-        always admitted: the slot is the earliest time at or after now (and
-        at or after the pair's last slot, FIFO per receiver) at which
-        neither window would hold more than its limit. The pair ledger is
-        per receiver, so a backlog to one receiver never delays sends to
-        another. Ledgers prune against the caller's current windows, so a
-        changed limit applies from the next send.
+        Duplicate detection runs first, so an identical retry drops instead
+        of consuming budget: inside ``dup_window_s`` of the earlier send, or
+        — after that window — while the earlier send's record is still
+        undelivered (the caller resolved that fact off-thread and passes it
+        as *earlier_undelivered*). Same text on a different correlation id
+        is a different send. Otherwise the send is always admitted: the slot
+        is the earliest time at or after now (and at or after the pair's
+        last slot, FIFO per receiver) at which neither window would hold
+        more than its limit. The pair ledger is per receiver, so a backlog
+        to one receiver never delays sends to another. Ledgers prune against
+        the caller's current windows, so a changed limit applies from the
+        next send.
 
         :param sender_id: The sending session.
         :param receiver_id: The receiving session.
         :param text: Raw message text.
+        :param correlation_id: The send's thread id, or ``None``.
         :param limits: The sender owner's admission budgets.
         :param now: Monotonic clock override for tests.
+        :param earlier_undelivered: Whether the ledger entry's record is
+            still undelivered (only consulted after the time window).
         :returns: ``("dropped:duplicate", 0.0, None)`` for a duplicate,
             else ``(None, delay_seconds, slot)``.
         """
         moment = time.monotonic() if now is None else now
         pair = (sender_id, receiver_id)
         normalized = self.normalize_text(text)
-        text_key = (sender_id, receiver_id, normalized)
-        seen_at = self._pair_texts.get(text_key)
-        if seen_at is not None and moment - seen_at < limits.dup_window_s:
-            return "dropped:duplicate", 0.0, None
+        text_key = (sender_id, receiver_id, correlation_id or "", normalized)
+        entry = self._pair_texts.get(text_key)
+        if entry is not None:
+            seen_at, peer_id = entry
+            if moment - seen_at < limits.dup_window_s:
+                return "dropped:duplicate", 0.0, None
+            if peer_id is not None and earlier_undelivered:
+                return "dropped:duplicate", 0.0, None
         pair_sends = [
             t for t in self._pair_sends.get(pair, []) if t > moment - limits.pair_window_s
         ]
@@ -412,7 +483,7 @@ class _PeerAdmission:
         sender_sends.sort()
         self._pair_sends[pair] = pair_sends
         self._sender_sends[sender_id] = sender_sends
-        self._pair_texts[text_key] = moment
+        self._pair_texts[text_key] = (moment, None)
         return None, slot - moment, slot
 
     def release(
@@ -421,6 +492,7 @@ class _PeerAdmission:
         receiver_id: str,
         text: str,
         *,
+        correlation_id: str | None = None,
         verdict: str | None = None,
         slot: float | None = None,
     ) -> None:
@@ -440,7 +512,10 @@ class _PeerAdmission:
             sender_window = self._sender_sends.get(sender_id)
             if sender_window and slot in sender_window:
                 sender_window.remove(slot)
-        self._pair_texts.pop((sender_id, receiver_id, self.normalize_text(text)), None)
+        self._pair_texts.pop(
+            (sender_id, receiver_id, correlation_id or "", self.normalize_text(text)),
+            None,
+        )
 
 
 _PEER_ADMISSION = _PeerAdmission()
@@ -513,7 +588,7 @@ class PeerSendRequest(BaseModel):
     sender_session_id: str = Field(min_length=1)
     text: str = Field(min_length=1, max_length=16000)
     correlation_id: str | None = Field(default=None, min_length=1, max_length=64)
-    wait_seconds: int = Field(default=0, ge=0, le=3600)
+    wait_seconds: int = Field(default=0, ge=0)
 
 
 class PeerActionRequest(BaseModel):
@@ -1045,6 +1120,9 @@ def register_peer_routes(
         cfg = await asyncio.to_thread(
             read_collab_settings, prefs_store, owner or RESERVED_USER_LOCAL
         )
+        # A pending record never outlives the owner's undelivered-message
+        # lifetime: an explicit wait_seconds is capped by it.
+        effective_wait = min(body.wait_seconds, cfg.undelivered_ttl_s)
         if not system and not cfg.enabled:
             return {
                 "disposition": "refused",
@@ -1091,11 +1169,22 @@ def register_peer_routes(
         if system:
             verdict, delay, slot = None, 0.0, None
         else:
+            earlier_peer_id = _PEER_ADMISSION.pending_peer_id(
+                sender_id, receiver_id, body.correlation_id, body.text
+            )
+            earlier_undelivered = False
+            if earlier_peer_id is not None:
+                earlier = await asyncio.to_thread(peer_message_store.get, earlier_peer_id)
+                earlier_undelivered = (
+                    earlier is not None and earlier.state in _PEER_UNDELIVERED_STATES
+                )
             verdict, delay, slot = _PEER_ADMISSION.reserve(
                 sender_id,
                 receiver_id,
                 body.text,
+                correlation_id=body.correlation_id,
                 limits=PeerLimits.from_settings(cfg),
+                earlier_undelivered=earlier_undelivered,
             )
         if verdict is not None:
             disposition, _, reason = verdict.partition(":")
@@ -1113,6 +1202,15 @@ def register_peer_routes(
         terminal_verdict: str | None = None
         record: SessionPeerMessage | None = None
         runner_online: bool | None = None
+
+        async def _create_peer_record(payload: SessionPeerMessage) -> SessionPeerMessage:
+            # Narrowed once at function entry; a nested closure loses it.
+            assert peer_message_store is not None
+            created = await asyncio.to_thread(peer_message_store.create, payload)
+            _PEER_ADMISSION.note_record(
+                sender_id, receiver_id, body.correlation_id, body.text, created.id
+            )
+            return created
 
         async def _queued_response_for_record(
             queued: SessionPeerMessage, runner_online: bool | None
@@ -1136,8 +1234,7 @@ def register_peer_routes(
             # checks above already returned/raised); a nested closure loses
             # the outer narrowing, so pyright needs this restated.
             assert peer_message_store is not None
-            queued = await asyncio.to_thread(
-                peer_message_store.create,
+            queued = await _create_peer_record(
                 SessionPeerMessage(
                     id=peer_id or _new_record_id(body.correlation_id),
                     sender_session_id=sender_id,
@@ -1173,8 +1270,7 @@ def register_peer_routes(
             ):
                 terminal_verdict = "failed:closed"
             if terminal_verdict is None and not system and depth > cfg.relay_depth_max:
-                record = await asyncio.to_thread(
-                    peer_message_store.create,
+                record = await _create_peer_record(
                     SessionPeerMessage(
                         id=peer_id or _new_record_id(body.correlation_id),
                         sender_session_id=sender_id,
@@ -1204,8 +1300,7 @@ def register_peer_routes(
                 terminal_verdict is None
                 and (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_HOLD
             ):
-                record = await asyncio.to_thread(
-                    peer_message_store.create,
+                record = await _create_peer_record(
                     SessionPeerMessage(
                         id=peer_id or _new_record_id(body.correlation_id),
                         sender_session_id=sender_id,
@@ -1234,14 +1329,13 @@ def register_peer_routes(
                 receiver_state, runner_online = await _true_state(receiver)
                 if receiver_state in ("offline", "not_ready"):
                     reason = receiver_state
-                    if body.wait_seconds == 0 and deferred_until is None:
+                    if effective_wait == 0 and deferred_until is None:
                         terminal_verdict = f"failed:{reason}"
                     else:
-                        pending_expiry = deferred_until or now + body.wait_seconds
+                        pending_expiry = deferred_until or now + effective_wait
                         if delay > 0:
                             pending_expiry += math.ceil(delay)
-                        record = await asyncio.to_thread(
-                            peer_message_store.create,
+                        record = await _create_peer_record(
                             SessionPeerMessage(
                                 id=peer_id or _new_record_id(body.correlation_id),
                                 sender_session_id=sender_id,
@@ -1269,8 +1363,7 @@ def register_peer_routes(
                             response["reply_to"] = reply_to
                         return response
                 if terminal_verdict is None and delay > 0:
-                    record = await asyncio.to_thread(
-                        peer_message_store.create,
+                    record = await _create_peer_record(
                         SessionPeerMessage(
                             id=peer_id or _new_record_id(body.correlation_id),
                             sender_session_id=sender_id,
@@ -1294,8 +1387,7 @@ def register_peer_routes(
                     terminal_verdict, record, body.correlation_id, receiver, runner_online
                 )
             assert record is None
-            delivering = await asyncio.to_thread(
-                peer_message_store.create,
+            delivering = await _create_peer_record(
                 SessionPeerMessage(
                     id=peer_id or _new_record_id(body.correlation_id),
                     sender_session_id=sender_id,
@@ -1382,7 +1474,12 @@ def register_peer_routes(
                 elif outcome is None:
                     outcome = "delivered"
                 _PEER_ADMISSION.release(
-                    sender_id, receiver_id, body.text, verdict=outcome, slot=slot
+                    sender_id,
+                    receiver_id,
+                    body.text,
+                    correlation_id=body.correlation_id,
+                    verdict=outcome,
+                    slot=slot,
                 )
             admitted = False
 
