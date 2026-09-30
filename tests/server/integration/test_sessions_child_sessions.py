@@ -25,6 +25,7 @@ import json
 import tarfile
 from dataclasses import dataclass
 from typing import Any, NoReturn
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -35,6 +36,7 @@ from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import set_runner_client
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
+from omnigent.server.routes.sessions import routes_items as routes_items_module
 from omnigent.stores.conversation_store import (
     sqlalchemy_store as sqlalchemy_store_module,
 )
@@ -3156,6 +3158,46 @@ async def test_child_sessions_exclude_label_drops_labelled_archived_child(
 
     assert resp.status_code == 200
     assert [row["id"] for row in resp.json()["data"]] == [kept.id]
+
+
+async def test_child_sessions_exclude_label_skips_native_lazy_reconcile(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A label-filtered read must not trigger the unfiltered reconcile refresh.
+
+    ``_lazy_reconcile_native_children`` re-lists children without
+    ``exclude_labels``, so invoking it from a filtered request would
+    resurrect children the caller asked to hide.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    parent = await _create_parent_session(client, "exclude-label-reconcile-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(parent["id"], {"omnigent.wrapper": "claude-code-native-ui"})
+    _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="Explore:hidden-by-filter",
+    )
+    calls: list[tuple[Any, ...]] = []
+
+    async def _spy(*args: Any, **_kwargs: Any) -> Any:
+        calls.append(args)
+        return args[2]
+
+    with patch.object(routes_items_module, "_lazy_reconcile_native_children", _spy):
+        unfiltered = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+        assert unfiltered.status_code == 200, unfiltered.text
+        assert len(calls) == 1
+
+        filtered = await client.get(
+            f"/v1/sessions/{parent['id']}/child_sessions",
+            params={"exclude_label": "omnigent.wrapper=claude-code-native-ui-subagent"},
+        )
+        assert filtered.status_code == 200, filtered.text
+        assert len(calls) == 1
 
 
 async def test_child_sessions_reject_malformed_exclude_label(

@@ -545,6 +545,8 @@ def register_items_routes(
             and tool is None
             and session_name is None
             and zone != "past"
+            # The reconcile refresh re-lists children without the label filter.
+            and not exclude_labels
             and not page.has_more
         ):
             page = await _lazy_reconcile_native_children(
