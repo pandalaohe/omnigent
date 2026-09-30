@@ -331,6 +331,8 @@ describe("SystemStatusPage", () => {
   });
 
   it("renders each row's uptime and names hosts in the overhead footer", () => {
+    // Uptime is minute-granular, so start on a minute boundary for exact labels.
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
     mocks.status.current = {
       data: makeView({ server: false }),
       isLoading: false,
@@ -356,6 +358,29 @@ describe("SystemStatusPage", () => {
     const overhead = screen.getByTestId("system-status-overhead");
     expect(overhead).toHaveTextContent("Laptop");
     expect(overhead).not.toHaveTextContent("host_1");
+  });
+
+  it("advances a process row's uptime once a minute despite the memoized tree", () => {
+    vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
+    const nowMs = Date.now();
+    const view = makeView({ server: false });
+    const snapshot = view.hosts[0].last_snapshot;
+    if (snapshot === null) throw new Error("host_1 is expected to have a snapshot");
+    snapshot.processes[0].started_at = nowMs / 1000 - 120;
+    mocks.status.current = { data: view, isLoading: false, isError: false, error: null };
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "View processes" }));
+    const tree = screen.getByTestId("process-tree");
+    const uptimeCell = (label: string) =>
+      within(tree).getByText(label).closest("tr")?.querySelector("td:last-child") as HTMLElement;
+
+    expect(uptimeCell("runner")).toHaveTextContent("2m");
+
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(uptimeCell("runner")).toHaveTextContent("3m");
   });
 
   it("offers Run health check to admins only", () => {

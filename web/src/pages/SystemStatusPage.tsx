@@ -37,9 +37,9 @@ function formatLoad(load1: number | null): string {
   return load1 === null ? "—" : load1.toFixed(1);
 }
 
-function formatUptime(startedAt: number | null | undefined): string {
+function formatUptime(startedAt: number | null | undefined, nowS: number): string {
   if (startedAt === null || startedAt === undefined) return "—";
-  const seconds = Date.now() / 1000 - startedAt;
+  const seconds = nowS - startedAt;
   if (seconds >= 86_400) {
     return `${Math.floor(seconds / 86_400)}d ${Math.floor((seconds % 86_400) / 3_600)}h`;
   }
@@ -402,10 +402,12 @@ function buildProcessTree(processes: SystemProcessRow[]): ProcessNode[] {
 function ProcessRows({
   nodes,
   sessionTitles,
+  nowS,
   depth = 0,
 }: {
   nodes: ProcessNode[];
   sessionTitles: Map<string, string>;
+  nowS: number;
   depth?: number;
 }) {
   return (
@@ -445,11 +447,16 @@ function ProcessRows({
               {formatBytes(node.rss)}
             </td>
             <td className="py-1 text-right whitespace-nowrap tabular-nums">
-              {formatUptime(node.row.started_at)}
+              {formatUptime(node.row.started_at, nowS)}
             </td>
           </tr>
           {node.children.length > 0 && (
-            <ProcessRows nodes={node.children} sessionTitles={sessionTitles} depth={depth + 1} />
+            <ProcessRows
+              nodes={node.children}
+              sessionTitles={sessionTitles}
+              nowS={nowS}
+              depth={depth + 1}
+            />
           )}
         </Fragment>
       ))}
@@ -457,13 +464,15 @@ function ProcessRows({
   );
 }
 
-// The page ticks every second; the tree only changes with a new snapshot.
+// The page ticks every second; the tree re-renders on a new snapshot or a new minute.
 const ProcessTree = memo(function ProcessTree({
   processes,
   sessionTitles,
+  nowS,
 }: {
   processes: SystemProcessRow[];
   sessionTitles: Map<string, string>;
+  nowS: number;
 }) {
   const roots = buildProcessTree(processes);
   return (
@@ -486,7 +495,7 @@ const ProcessTree = memo(function ProcessTree({
           </tr>
         </thead>
         <tbody>
-          <ProcessRows nodes={roots} sessionTitles={sessionTitles} />
+          <ProcessRows nodes={roots} sessionTitles={sessionTitles} nowS={nowS} />
         </tbody>
       </table>
     </div>
@@ -516,6 +525,8 @@ function HostCard({
   const hasSample = snapshot !== null && Number.isFinite(sampledAtMs);
   const staleAfterS = snapshot === null ? 0 : 3 * snapshot.interval_s;
   const stale = hasSample && isStale(sampledAtMs, staleAfterS, nowMs);
+  // Uptime labels change once a minute, so the memoized tree needs no second tick.
+  const uptimeNowS = Math.floor(nowMs / 60_000) * 60;
   // Offline hosts say "Last seen …", so they carry no freshness label.
   const showFreshness = hasSample && host.state === "online";
   return (
@@ -589,7 +600,11 @@ function HostCard({
               <p className="mb-1 text-xs text-muted-foreground">
                 omnigent processes · parent rows include their children · sorted by CPU
               </p>
-              <ProcessTree processes={snapshot.processes} sessionTitles={sessionTitles} />
+              <ProcessTree
+                processes={snapshot.processes}
+                sessionTitles={sessionTitles}
+                nowS={uptimeNowS}
+              />
             </div>
           )}
         </div>
