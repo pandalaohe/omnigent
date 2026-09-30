@@ -3356,6 +3356,31 @@ def _format_subagent_wake_notice(
     )
 
 
+def _format_async_result_wake_notice(
+    *,
+    handle_id: str,
+    tool_name: str,
+    status: str,
+    pending: int,
+) -> str:
+    """
+    Build the framework notice that wakes a session after an async tool finishes.
+
+    :param handle_id: Async task handle, e.g. ``"handle_a1b2c3"``.
+    :param tool_name: The dispatched tool name, e.g. ``"sys_os_shell"``.
+    :param status: Inbox item status, e.g. ``"completed"`` or ``"failed"``.
+    :param pending: Number of undrained items in the session's inbox, e.g. ``1``.
+    :returns: A ``[System: ...]`` notice string, e.g. ``"[System: async task
+        handle_a1b2c3 (sys_os_shell) finished (completed) — 1 result waiting in
+        inbox. Call sys_read_inbox to collect.]"``.
+    """
+    noun = "result" if pending == 1 else "results"
+    return (
+        f"[System: async task {handle_id} ({tool_name}) finished ({status}) — "
+        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
+    )
+
+
 # Max length of a child message preview mirrored to the parent stream.
 # Matches the server-side ``_latest_message_preview`` truncation so the
 # live runner-pushed preview and the snapshot preview look the same.
@@ -3622,6 +3647,11 @@ _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 # Module-level ref to _session_inboxes. Populated inside create_runner_app;
 # used by the sub-agent work registry to deliver completions to the parent.
 _session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
+
+# Module-level waker for local async-tool results. Populated inside
+# create_runner_app; read by tool_dispatch._notify_async_result so an idle
+# session wakes when a background result lands in its inbox.
+_async_result_waker: Callable[[str, str, str, str], None] | None = None
 
 # Module-level refs to the per-session release flags from the init snapshot.
 # Populated inside create_runner_app; read by tool_dispatch dispatch paths
@@ -6316,6 +6346,7 @@ def create_runner_app(
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
+        _last_async_result.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -9795,6 +9826,49 @@ def create_runner_app(
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)
 
+    # Latest async-result wake per parent. The stranded-wake rescue paths
+    # normally replay a sub-agent work entry; an inbox holding only async
+    # results has none, so they replay these recorded arguments instead.
+    _last_async_result: dict[str, tuple[str, str, str]] = {}
+
+    def _wake_for_async_result(
+        parent_id: str,
+        handle_id: str,
+        tool_name: str,
+        status: str,
+        *,
+        is_rewake: bool = False,
+    ) -> None:
+        _last_async_result[parent_id] = (handle_id, tool_name, status)
+        # Reuse the sub-agent wake path: an already-drained inbox needs no wake,
+        # and one pending wake covers every item queued behind it.
+        inbox = _session_inboxes.get(parent_id)
+        if inbox is None or inbox.empty():
+            return
+        if parent_id in _subagent_wake_pending:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        notice = _format_async_result_wake_notice(
+            handle_id=handle_id,
+            tool_name=tool_name,
+            status=status,
+            pending=inbox.qsize(),
+        )
+        if is_rewake and notice == _last_rewake_notice.get(parent_id):
+            return
+        _subagent_wake_pending.add(parent_id)
+        wake_task = loop.create_task(
+            _post_subagent_wake_notice(parent_id, notice, handle_id, None, is_rewake=is_rewake)
+        )
+        wake_task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(wake_task)
+
+    global _async_result_waker
+    _async_result_waker = _wake_for_async_result
+
     def _wake_for_delivered_result(entry: _SubagentWorkEntry) -> None:
         # A result for work a running flow dispatched is reported by the flow's
         # one end wake; re-wakes and stranded retries never consult the hold.
@@ -9810,6 +9884,7 @@ def create_runner_app(
             # re-wake no longer describes outstanding work; forget it or a
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
+            _last_async_result.pop(parent_session_id, None)
             _stranded_wake_parents.discard(parent_session_id)
         # A parent whose wake POST exhausted its retries has no pending flag,
         # but its inbox still holds an undelivered result — rescue it too.
@@ -9822,6 +9897,9 @@ def create_runner_app(
             return
         entries = list_subagent_work(parent_session_id)
         if not entries:
+            last_async = _last_async_result.get(parent_session_id)
+            if last_async is not None:
+                _wake_for_async_result(parent_session_id, *last_async, is_rewake=True)
             return
         latest = max(
             entries,
@@ -9847,6 +9925,9 @@ def create_runner_app(
                     continue
                 entries = list_subagent_work(parent_id)
                 if not entries:
+                    last_async = _last_async_result.get(parent_id)
+                    if last_async is not None:
+                        _wake_for_async_result(parent_id, *last_async)
                     continue
                 latest = max(
                     entries,

@@ -1467,6 +1467,145 @@ async def test_child_dispatched_by_a_running_flow_delivers_without_a_wake(
     assert (len(wakes), run.held_child_results) == ((0, 1) if flow_running else (1, 0))
 
 
+@pytest.mark.asyncio
+async def test_async_result_waker_posts_one_notice_when_inbox_holds_an_item(
+    _clean_subagent_registry: None,
+) -> None:
+    """An async result in the inbox wakes the session once; an empty inbox stays quiet."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(spec_version=1, name="worker")
+
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    )
+    create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    waker = runner_app._async_result_waker
+    assert waker is not None, "create_runner_app must install the async-result waker"
+
+    waker(PARENT_SESSION_ID, "handle_abc123", "sys_os_shell", "completed")
+    await asyncio.sleep(0.05)
+    assert server_client.posts == [], "an empty inbox must not be woken"
+
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID].put_nowait(
+        {"handle_id": "handle_abc123", "tool_name": "sys_os_shell", "status": "completed"}
+    )
+    waker(PARENT_SESSION_ID, "handle_abc123", "sys_os_shell", "completed")
+    for _ in range(200):
+        if server_client.posts:
+            break
+        await asyncio.sleep(0.01)
+
+    [event] = [
+        kwargs["json"]
+        for url, kwargs in server_client.posts
+        if url == f"/v1/sessions/{PARENT_SESSION_ID}/events"
+    ]
+    assert event["type"] == "message"
+    text = event["data"]["content"][0]["text"]
+    assert text.startswith("[System: async task"), text
+    assert "handle_abc123" in text
+    assert "sys_os_shell" in text
+    assert "completed" in text
+
+
+class _Transient503WakeServerClient(_SnapshotServerClient):
+    """Server client whose parent-event POST 503s a bounded number of times."""
+
+    def __init__(self, child_body: dict[str, Any], *, failures: int) -> None:
+        super().__init__(child_body)
+        self._failures = failures
+        self.statuses: list[int] = []
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        self.posts.append((url, kwargs))
+        if url == f"/v1/sessions/{PARENT_SESSION_ID}/events" and self._failures > 0:
+            self._failures -= 1
+            self.statuses.append(503)
+            return httpx.Response(
+                503,
+                request=httpx.Request("POST", f"http://runner.test{url}"),
+                json={"error": "runner unavailable"},
+            )
+        self.statuses.append(200)
+        return self._Response()
+
+
+@pytest.mark.asyncio
+async def test_async_result_waker_rewakes_stranded_parent_on_next_turn(
+    _clean_subagent_registry: None,
+    _no_wake_backoff: list[float],
+) -> None:
+    """A failed async-result wake is re-attempted when the next turn starts empty.
+
+    The parent inbox holds only an async result, so the stranded-wake rescue
+    paths find no sub-agent work entry to replay; without the recorded async
+    result the parent is never re-woken.
+    """
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(spec_version=1, name="worker")
+
+    server_client = _Transient503WakeServerClient(
+        _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
+        failures=runner_app._WAKE_POST_MAX_ATTEMPTS,
+    )
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    waker = runner_app._async_result_waker
+    assert waker is not None, "create_runner_app must install the async-result waker"
+
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    runner_app._session_inboxes_ref[PARENT_SESSION_ID].put_nowait(
+        {"handle_id": "handle_abc123", "tool_name": "sys_os_shell", "status": "completed"}
+    )
+    waker(PARENT_SESSION_ID, "handle_abc123", "sys_os_shell", "completed")
+    for _ in range(200):
+        if len(server_client.posts) >= runner_app._WAKE_POST_MAX_ATTEMPTS:
+            break
+        await asyncio.sleep(0.01)
+
+    assert server_client.statuses == [503] * runner_app._WAKE_POST_MAX_ATTEMPTS
+    assert len(_no_wake_backoff) == runner_app._WAKE_POST_MAX_ATTEMPTS - 1
+
+    await app.state.check_and_start_next_turn(PARENT_SESSION_ID)
+    for _ in range(200):
+        if len(server_client.posts) > runner_app._WAKE_POST_MAX_ATTEMPTS:
+            break
+        await asyncio.sleep(0.01)
+
+    assert server_client.statuses == [503] * runner_app._WAKE_POST_MAX_ATTEMPTS + [200]
+    last_url, last_kwargs = server_client.posts[-1]
+    assert last_url == f"/v1/sessions/{PARENT_SESSION_ID}/events"
+    text = last_kwargs["json"]["data"]["content"][0]["text"]
+    assert text.startswith("[System: async task"), text
+    assert "handle_abc123" in text
+
+    # The inbox stays undrained (no turn ever consumed it), so every later turn
+    # boundary finds the same stranded result. The rescue must not re-post the
+    # identical notice — otherwise an undrained result wakes the caller at every
+    # idle turn boundary forever.
+    posts_after_rescue = len(server_client.posts)
+    await app.state.check_and_start_next_turn(PARENT_SESSION_ID)
+    await app.state.check_and_start_next_turn(PARENT_SESSION_ID)
+    await asyncio.sleep(0.05)
+
+    assert len(server_client.posts) == posts_after_rescue
+    assert server_client.statuses == [503] * runner_app._WAKE_POST_MAX_ATTEMPTS + [200]
+
+
 def _assistant_item(item_id: str, text: str) -> dict[str, Any]:
     """Build a transcript item carrying the server item id and assistant text."""
     return {

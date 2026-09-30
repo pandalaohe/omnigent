@@ -138,6 +138,73 @@ async def test_sys_call_async_without_spec_is_not_gated(
     assert inbox.get_nowait()["status"] == "completed"
 
 
+async def test_sys_call_async_failure_result_is_failed_and_wakes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``Error:`` target result lands as ``failed`` and wakes the dispatcher."""
+    from omnigent.runner import app as runner_app
+
+    async def _fake_failure(**_kw: Any) -> str:
+        return "Error: boom"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fake_failure)
+    waker_calls: list[tuple[str, str, str, str]] = []
+
+    def _record_wake(*args: str) -> None:
+        waker_calls.append(args)
+
+    monkeypatch.setattr(runner_app, "_async_result_waker", _record_wake)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    handle = json.loads(
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": "{}"},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            **_spawn_kwargs(None),
+        )
+    )
+    await tasks[handle["handle_id"]][0]
+
+    item = inbox.get_nowait()
+    assert item["status"] == "failed"
+    assert item["output"] == "Error: boom"
+    assert waker_calls == [("conv_granted", handle["handle_id"], "sys_os_shell", "failed")]
+
+
+async def test_sys_call_async_success_result_wakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful target result lands as ``completed`` and wakes the dispatcher."""
+    from omnigent.runner import app as runner_app
+
+    async def _fake_success(**_kw: Any) -> str:
+        return json.dumps({"ran": True})
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fake_success)
+    waker_calls: list[tuple[str, str, str, str]] = []
+
+    def _record_wake(*args: str) -> None:
+        waker_calls.append(args)
+
+    monkeypatch.setattr(runner_app, "_async_result_waker", _record_wake)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    handle = json.loads(
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": "{}"},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            **_spawn_kwargs(None),
+        )
+    )
+    await tasks[handle["handle_id"]][0]
+
+    item = inbox.get_nowait()
+    assert item["status"] == "completed"
+    assert waker_calls == [("conv_granted", handle["handle_id"], "sys_os_shell", "completed")]
+
+
 async def test_execute_tool_refuses_ungranted_tool_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
