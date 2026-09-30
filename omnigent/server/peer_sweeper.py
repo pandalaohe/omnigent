@@ -43,6 +43,7 @@ from omnigent.server.routes.sessions.routes_peer import (
     _PEER_INBOUND_HOLD,
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
+    _PEER_RELEASED_REASON,
     effective_owner_id,
     format_peer_back_notice,
     is_reply_to_own,
@@ -296,11 +297,15 @@ class PeerSweeper:
                     record, "failed", "collab_disabled", receiver_title, self._app
                 )
             return
-        if record.state in ("pending", "queued") and (
-            (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_HOLD
+        if (
+            record.state in ("pending", "queued")
+            and record.reason != _PEER_RELEASED_REASON
+            and (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_HOLD
         ):
             # The receiver switched to hold after the send queued: hold it
-            # like the inline path would have, without a notice.
+            # like the inline path would have, without a notice. A record
+            # the user explicitly released carries the released marker and
+            # must deliver despite the still-held receiver policy.
             await asyncio.to_thread(
                 self._store.transition, record.id, "held", None, (record.state,)
             )
@@ -404,10 +409,17 @@ class PeerSweeper:
         Reverts to ``origin_state`` (the state the record came from,
         captured before the CAS to ``delivering``) so the next tick
         retries; posts no notice, since nothing terminal happened yet from
-        the sender's point of view.
+        the sender's point of view. A record carrying the user's release
+        marker keeps it: the store leaves the reason unchanged when passed
+        ``None``, and overwriting it with the revert cause would make the
+        next sweep re-hold a message the user explicitly released.
         """
         await asyncio.to_thread(
-            self._store.transition, record.id, origin_state, reason, ("delivering",)
+            self._store.transition,
+            record.id,
+            origin_state,
+            None if record.reason == _PEER_RELEASED_REASON else reason,
+            ("delivering",),
         )
         _logger.warning(
             "Peer sweeper reverted delivering record %s to %s (%s)",

@@ -414,6 +414,21 @@ async def test_inbound_hold_transitions_deferred_records_to_held(state: str) -> 
     assert h.post_event.calls == []
 
 
+async def test_released_record_delivers_despite_inbound_hold() -> None:
+    """A user-released record is not re-held while the receiver stays on hold."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "hold"}))
+    record = h.seed_record(state="held")
+    # The action route's release transition: held -> pending, reason "released".
+    assert h.store.transition(record.id, "pending", "released", ("held",), relay_depth=0)
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "delivered"
+    assert len(h.deliver.calls) == 1
+    assert "delivered" in h.post_event.calls[0]["text"]
+
+
 async def test_master_switch_off_fails_deferred_record_with_notice() -> None:
     """A disabled sender owner ends the record as failed(collab_disabled)."""
     h = _Harness()
@@ -488,6 +503,33 @@ async def test_busy_recheck_before_deliver_reverts_without_notice(harness: _Harn
     assert _row(harness.store, record.id).state == "pending"
     assert harness.deliver.calls == []
     assert harness.post_event.calls == []
+
+
+async def test_released_record_revert_keeps_marker_and_delivers_next_tick() -> None:
+    """A released record abandoned by the busy re-check keeps its marker.
+
+    The revert must not overwrite ``reason == "released"`` with the revert
+    cause, or the next sweep re-holds it under the receiver's hold policy.
+    """
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "hold"}))
+    record = h.seed_record(state="held")
+    assert h.store.transition(record.id, "pending", "released", ("held",), relay_depth=0)
+    # First tick: CAS to delivering, then the busy re-check abandons the attempt.
+    h.true_state.sequences["receiver"] = ["idle", "busy"]
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "pending"
+    assert updated.reason == "released"
+    assert h.deliver.calls == []
+
+    # Second tick: not re-held despite the receiver's hold policy; it delivers.
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "delivered"
+    assert len(h.deliver.calls) == 1
+    assert "delivered" in h.post_event.calls[0]["text"]
 
 
 async def test_transient_failure_retries_then_delivers(harness: _Harness) -> None:

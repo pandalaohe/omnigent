@@ -93,6 +93,9 @@ _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
 _PEER_INBOUND_REFUSE = "refuse"
+# Marker on a record the user released from hold: the sweeper must not
+# re-hold it while the receiver's inbound policy is still ``hold``.
+_PEER_RELEASED_REASON = "released"
 _OWNER_CHAIN_MAX_HOPS = 32
 
 _WS_COLLAPSE_RE = re.compile(r"\s+")
@@ -1630,7 +1633,12 @@ def register_peer_routes(
         peer_id: str,
         body: PeerActionRequest,
     ) -> dict[str, Any]:
-        """Release (held → pending) or refuse a held/pending/queued record."""
+        """Release (held → pending) or refuse a held/pending/queued record.
+
+        Release tags the record with ``reason == "released"``; the sweeper
+        reads that marker so a hold policy never re-holds an explicit
+        user release.
+        """
         if not flags.enabled(Feature.SESSION_PEER_MESSAGING):
             raise _session_not_found()
         if peer_message_store is None:
@@ -1653,7 +1661,7 @@ def register_peer_routes(
                 peer_message_store.transition,
                 peer_id,
                 "pending",
-                None,
+                _PEER_RELEASED_REASON,
                 ("held",),
                 relay_depth=0,
             )

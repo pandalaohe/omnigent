@@ -1511,6 +1511,7 @@ async def test_action_release_and_refuse_with_409(
         )
         assert released.status_code == 200, released.text
         assert released.json()["state"] == "pending"
+        assert released.json()["reason"] == "released"
         again = await peer_client.post(
             f"/v1/sessions/{receiver.id}/peer-messages/{peer_id}/action",
             json={"action": "release"},
