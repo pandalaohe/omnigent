@@ -1194,6 +1194,67 @@ async def test_child_status_edge_fans_out_to_parent_stream(
         session_stream.close(session["id"])
 
 
+async def test_child_status_none_path_prefers_live_run_over_terminal_label(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The fan-out's unresolved path reads a live run before a terminal label.
+
+    A reusable child kept the ``completed`` label of its last dispatch while
+    ``_session_status_cache`` reports its newer turn running, so the published
+    summary must be busy; a one-shot harness sub-agent mirror keeps its label.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions.helpers import _publish_child_status_to_parent
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    reusable = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:reusable",
+        agent_id=session["agent_id"],
+    )
+    mirror = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="claude-native-ui-subagent:mirror",
+        agent_id=session["agent_id"],
+    )
+    conv_store.set_labels(reusable.id, {"omnigent.subagent.terminal_status": "completed"})
+    conv_store.set_labels(
+        mirror.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.subagent.terminal_status": "completed",
+        },
+    )
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        sessions_module._session_status_cache[reusable.id] = "running"
+        sessions_module._session_status_cache[mirror.id] = "running"
+        _publish_child_status_to_parent(reusable.id, None)
+        _publish_child_status_to_parent(mirror.id, None)
+
+        updates: dict[str, dict[str, Any]] = {}
+        while len(updates) < 2:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                updates[event["child_session_id"]] = event
+        assert updates[reusable.id]["child"]["busy"] is True
+        assert updates[mirror.id]["child"]["busy"] is False
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(reusable.id, None)
+        sessions_module._session_status_cache.pop(mirror.id, None)
+        session_stream.close(session["id"])
+
+
 async def test_child_sessions_truncates_long_message_preview(
     client: httpx.AsyncClient,
     db_uri: str,

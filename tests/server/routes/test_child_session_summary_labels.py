@@ -14,7 +14,10 @@ import json
 import time
 
 from omnigent.entities import Conversation
-from omnigent.server.routes._sessions.common import _SUBAGENT_TERMINAL_STATUS_LABEL_KEY
+from omnigent.server.routes._sessions.common import (
+    _SUBAGENT_TERMINAL_STATUS_LABEL_KEY,
+    _session_status_cache,
+)
 from omnigent.server.routes._sessions.helpers import (
     _child_session_summary_from_conversation,
 )
@@ -84,9 +87,11 @@ def test_child_summary_derives_warm_state_from_the_keep_warm_label() -> None:
     now = int(time.time())
     keep_warm = "omnigent.keep_warm"
 
-    def _summary(labels: dict[str, str], *, harness: str | None) -> ChildSessionSummary:
+    def _summary(
+        labels: dict[str, str], *, harness: str | None, live_status: str | None = None
+    ) -> ChildSessionSummary:
         return _child_session_summary_from_conversation(
-            _child(labels), "conv_parent", None, harness=harness
+            _child(labels, live_status=live_status), "conv_parent", None, harness=harness
         )
 
     warm = json.dumps({"s": "w", "t": now - 100, "w": now + 3600})
@@ -102,6 +107,22 @@ def test_child_summary_derives_warm_state_from_the_keep_warm_label() -> None:
         busy, "conv_parent", None, harness="claude-native"
     )
     assert summary.warm_state == "warm"
+    # A running turn reads warm even with no label or a paused one; mirror
+    # rows and unsupported harnesses still read None.
+    assert _summary({}, harness="claude-native", live_status="running").warm_state == "warm"
+    assert (
+        _summary({keep_warm: paused}, harness="claude-native", live_status="running").warm_state
+        == "warm"
+    )
+    assert (
+        _summary(
+            {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+            harness="claude-native",
+            live_status="running",
+        ).warm_state
+        is None
+    )
+    assert _summary({}, harness="opencode-native", live_status="running").warm_state is None
     # No label, unsupported harness, and archived children read None.
     assert _summary({}, harness="claude-native").warm_state is None
     assert _summary({keep_warm: warm}, harness="opencode-native").warm_state is None
@@ -131,6 +152,49 @@ def test_child_summary_durable_terminal_precedes_live_status_on_cache_miss() -> 
         "conv_parent",
         None,
         cached_status=None,
+    )
+
+    assert summary.busy is False
+    assert summary.current_task_status == "completed"
+
+
+def test_child_summary_live_run_beats_durable_terminal_for_a_reusable_child() -> None:
+    """A reusable child's newer turn outranks its last dispatch's label."""
+    summary = _child_session_summary_from_conversation(
+        _child({_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "completed"}),
+        "conv_parent",
+        None,
+        cached_status="running",
+    )
+
+    assert summary.busy is True
+    assert summary.current_task_status == "in_progress"
+
+
+def test_child_summary_live_run_beats_durable_terminal_from_the_status_cache() -> None:
+    conv = _child({_SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "completed"})
+    _session_status_cache[conv.id] = "running"
+    try:
+        summary = _child_session_summary_from_conversation(conv, "conv_parent", None)
+    finally:
+        _session_status_cache.pop(conv.id, None)
+
+    assert summary.busy is True
+    assert summary.current_task_status == "in_progress"
+
+
+def test_child_summary_durable_terminal_holds_for_a_harness_subagent_mirror() -> None:
+    """A mirror row is one-shot, so its terminal label stays authoritative."""
+    summary = _child_session_summary_from_conversation(
+        _child(
+            {
+                "omnigent.wrapper": "claude-code-native-ui-subagent",
+                _SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "completed",
+            }
+        ),
+        "conv_parent",
+        None,
+        cached_status="running",
     )
 
     assert summary.busy is False

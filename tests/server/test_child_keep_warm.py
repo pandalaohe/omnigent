@@ -1174,6 +1174,15 @@ async def test_warm_state_from_label_derives_the_pill() -> None:
         warm_state_from_label(paused, archived=False, harness="claude-native", busy=False, now=now)
         == "cold"
     )
+    # A busy child is warm whatever the label says or when there is none.
+    assert (
+        warm_state_from_label(None, archived=False, harness="claude-native", busy=True, now=now)
+        == "warm"
+    )
+    assert (
+        warm_state_from_label(paused, archived=False, harness="claude-native", busy=True, now=now)
+        == "warm"
+    )
     assert (
         warm_state_from_label(None, archived=False, harness="claude-native", busy=False, now=now)
         is None
@@ -1184,6 +1193,14 @@ async def test_warm_state_from_label_derives_the_pill() -> None:
     )
     assert (
         warm_state_from_label(warm, archived=False, harness="opencode-native", busy=False, now=now)
+        is None
+    )
+    assert (
+        warm_state_from_label(warm, archived=True, harness="claude-native", busy=True, now=now)
+        is None
+    )
+    assert (
+        warm_state_from_label(warm, archived=False, harness="opencode-native", busy=True, now=now)
         is None
     )
 
