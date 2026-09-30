@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import threading
+import types
 from typing import Any, cast
 
 import pytest
@@ -267,6 +268,24 @@ class _PostEventScript:
         return {"queued": True}
 
 
+class _FakePrefsStore:
+    """Preferences stub returning one ``session_collab`` namespace."""
+
+    def __init__(self, **collab: Any) -> None:
+        self.collab = collab
+
+    def get(self, owner: str) -> dict[str, Any]:
+        del owner
+        return {"settings": {"session_collab": self.collab}}
+
+
+def _app_with_collab(**collab: Any) -> Any:
+    """App-state stand-in whose preferences store carries *collab*."""
+    app = types.SimpleNamespace()
+    app.state = types.SimpleNamespace(user_preferences_store=_FakePrefsStore(**collab))
+    return app
+
+
 class _Harness:
     """One conversation store + sweeper wired with the fakes above."""
 
@@ -380,6 +399,63 @@ async def test_held_record_before_expiry_untouched(harness: _Harness) -> None:
     assert harness.post_event.calls == []
 
 
+@pytest.mark.parametrize("state", ["pending", "queued"])
+async def test_inbound_hold_transitions_deferred_records_to_held(state: str) -> None:
+    """A hold receiver's deferred record becomes held, like the inline path."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "hold"}))
+    record = h.seed_record(state=state)
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "held"
+    assert updated.reason is None
+    assert h.deliver.calls == []
+    assert h.post_event.calls == []
+
+
+async def test_released_record_delivers_despite_inbound_hold() -> None:
+    """A user-released record is not re-held while the receiver stays on hold."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "hold"}))
+    record = h.seed_record(state="held")
+    # The action route's release transition: held -> pending, reason "released".
+    assert h.store.transition(record.id, "pending", "released", ("held",), relay_depth=0)
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "delivered"
+    assert len(h.deliver.calls) == 1
+    assert "delivered" in h.post_event.calls[0]["text"]
+
+
+async def test_master_switch_off_fails_deferred_record_with_notice() -> None:
+    """A disabled sender owner ends the record as failed(collab_disabled)."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    h.sweeper._app = _app_with_collab(enabled=False)
+    record = h.seed_record(state="pending")
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "failed"
+    assert updated.reason == "collab_disabled"
+    assert h.deliver.calls == []
+    assert "(collab_disabled)" in h.post_event.calls[0]["text"]
+
+
+async def test_master_switch_on_still_delivers() -> None:
+    """An enabled sender owner with no hold delivers as before."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    h.sweeper._app = _app_with_collab(enabled=True)
+    record = h.seed_record(state="pending")
+    await h.sweeper._tick()
+    assert _row(h.store, record.id).state == "delivered"
+    assert len(h.deliver.calls) == 1
+
+
 async def test_not_before_gates_delivery(harness: _Harness) -> None:
     """A queued record waits for its slot, then delivers on a later tick."""
     record = harness.seed_record(state="queued", not_before=harness._now + 30)
@@ -427,6 +503,33 @@ async def test_busy_recheck_before_deliver_reverts_without_notice(harness: _Harn
     assert _row(harness.store, record.id).state == "pending"
     assert harness.deliver.calls == []
     assert harness.post_event.calls == []
+
+
+async def test_released_record_revert_keeps_marker_and_delivers_next_tick() -> None:
+    """A released record abandoned by the busy re-check keeps its marker.
+
+    The revert must not overwrite ``reason == "released"`` with the revert
+    cause, or the next sweep re-holds it under the receiver's hold policy.
+    """
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver", labels={"peer_inbound": "hold"}))
+    record = h.seed_record(state="held")
+    assert h.store.transition(record.id, "pending", "released", ("held",), relay_depth=0)
+    # First tick: CAS to delivering, then the busy re-check abandons the attempt.
+    h.true_state.sequences["receiver"] = ["idle", "busy"]
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "pending"
+    assert updated.reason == "released"
+    assert h.deliver.calls == []
+
+    # Second tick: not re-held despite the receiver's hold policy; it delivers.
+    await h.sweeper._tick()
+    updated = _row(h.store, record.id)
+    assert updated.state == "delivered"
+    assert len(h.deliver.calls) == 1
+    assert "delivered" in h.post_event.calls[0]["text"]
 
 
 async def test_transient_failure_retries_then_delivers(harness: _Harness) -> None:

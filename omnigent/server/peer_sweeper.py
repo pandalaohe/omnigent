@@ -40,13 +40,16 @@ from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes.sessions.routes_peer import (
+    _PEER_INBOUND_HOLD,
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
+    _PEER_RELEASED_REASON,
     effective_owner_id,
     format_peer_back_notice,
     is_reply_to_own,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.user_preferences_store import read_collab_settings
 from omnigent.stores import ConversationStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
@@ -254,30 +257,59 @@ class PeerSweeper:
                         record, "refused_by_user", "receiver_refuses", receiver_title, self._app
                     )
                 return
-        if self._permission_store is not None:
-            sender = await asyncio.to_thread(
-                self._conversation_store.get_conversation, record.sender_session_id
+        sender = await asyncio.to_thread(
+            self._conversation_store.get_conversation, record.sender_session_id
+        )
+        sender_owner = (
+            effective_owner_id(sender, self._conversation_store, self._permission_store)
+            if sender is not None
+            else None
+        )
+        if self._permission_store is not None and sender is not None:
+            receiver_owner = effective_owner_id(
+                receiver, self._conversation_store, self._permission_store
             )
-            if sender is not None:
-                sender_owner = effective_owner_id(
-                    sender, self._conversation_store, self._permission_store
+            if sender_owner is None or sender_owner != receiver_owner:
+                moved = await asyncio.to_thread(
+                    self._store.transition,
+                    record.id,
+                    "failed",
+                    "not_same_owner",
+                    (record.state,),
                 )
-                receiver_owner = effective_owner_id(
-                    receiver, self._conversation_store, self._permission_store
-                )
-                if sender_owner is None or sender_owner != receiver_owner:
-                    moved = await asyncio.to_thread(
-                        self._store.transition,
-                        record.id,
-                        "failed",
-                        "not_same_owner",
-                        (record.state,),
+                if moved:
+                    await self._notify_for(
+                        record, "failed", "not_same_owner", receiver_title, self._app
                     )
-                    if moved:
-                        await self._notify_for(
-                            record, "failed", "not_same_owner", receiver_title, self._app
-                        )
-                    return
+                return
+        # Re-check the sender owner's master switch: it may have gone off
+        # after the send queued, and the record can then never deliver.
+        prefs_store = getattr(getattr(self._app, "state", None), "user_preferences_store", None)
+        settings = await asyncio.to_thread(
+            read_collab_settings, prefs_store, sender_owner or RESERVED_USER_LOCAL
+        )
+        if not settings.enabled:
+            moved = await asyncio.to_thread(
+                self._store.transition, record.id, "failed", "collab_disabled", (record.state,)
+            )
+            if moved:
+                await self._notify_for(
+                    record, "failed", "collab_disabled", receiver_title, self._app
+                )
+            return
+        if (
+            record.state in ("pending", "queued")
+            and record.reason != _PEER_RELEASED_REASON
+            and (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_HOLD
+        ):
+            # The receiver switched to hold after the send queued: hold it
+            # like the inline path would have, without a notice. A record
+            # the user explicitly released carries the released marker and
+            # must deliver despite the still-held receiver policy.
+            await asyncio.to_thread(
+                self._store.transition, record.id, "held", None, (record.state,)
+            )
+            return
         if record.state == "held":
             # Held records only expire (above) or get released by the
             # action route (held -> pending); the sweeper never delivers
@@ -377,10 +409,17 @@ class PeerSweeper:
         Reverts to ``origin_state`` (the state the record came from,
         captured before the CAS to ``delivering``) so the next tick
         retries; posts no notice, since nothing terminal happened yet from
-        the sender's point of view.
+        the sender's point of view. A record carrying the user's release
+        marker keeps it: the store leaves the reason unchanged when passed
+        ``None``, and overwriting it with the revert cause would make the
+        next sweep re-hold a message the user explicitly released.
         """
         await asyncio.to_thread(
-            self._store.transition, record.id, origin_state, reason, ("delivering",)
+            self._store.transition,
+            record.id,
+            origin_state,
+            None if record.reason == _PEER_RELEASED_REASON else reason,
+            ("delivering",),
         )
         _logger.warning(
             "Peer sweeper reverted delivering record %s to %s (%s)",

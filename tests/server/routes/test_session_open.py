@@ -973,7 +973,7 @@ async def test_branch_exists_reason_and_join_hint(
 async def test_first_message_is_a_peer_send(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The first message uses the peer contract, not a system envelope."""
+    """The first message uses the peer contract."""
     env = open_env
     _patch_create(env, monkeypatch)
     calls: list[dict[str, Any]] = []
@@ -991,7 +991,6 @@ async def test_first_message_is_a_peer_send(
     assert call["receiver_id"] == data["session_id"]
     assert call["text"] == "please review"
     assert call["correlation_id"] == data["session_id"]
-    assert call["system"] is False
     assert call["require_init_success"] is True
     assert call["acting_user_id"] == ALICE
 

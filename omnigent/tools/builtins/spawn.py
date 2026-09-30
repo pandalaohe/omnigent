@@ -1918,12 +1918,6 @@ class SysSessionCloseTool(Tool):
     items remain in the store and can still be read by id (e.g. via
     the server REST API). User-input write paths reject closed
     children, and the ``(parent, title)`` lookup path is closed off.
-
-    Refuses to tombstone a session whose child has a non-terminal
-    task in flight (returns ``sub_agent_busy``) — closing during a
-    live turn would leave a running child orphaned from the
-    parent's tracking. The LLM should wait for the in-flight task
-    to drain (or call ``sys_cancel_task``) before closing.
     """
 
     @classmethod
@@ -1939,9 +1933,8 @@ class SysSessionCloseTool(Tool):
             "spawn tree so future sys_session_send calls with the "
             "same (agent, title) create a fresh child rather than "
             "continuing this one. Returns session_not_found if "
-            "conversation_id is unknown, session_out_of_tree if it "
-            "isn't part of the caller's tree, or sub_agent_busy if "
-            "the child has a non-terminal task in flight."
+            "conversation_id is unknown, or session_out_of_tree if it "
+            "isn't part of the caller's tree."
         )
 
     def get_schema(self) -> dict[str, Any]:

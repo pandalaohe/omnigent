@@ -108,6 +108,28 @@ async def test_create_posts_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_forwards_cost_cap() -> None:
+    """``max_cost_usd`` reaches the create POST instead of being dropped."""
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(
+            {
+                "name": "nightly",
+                "prompt": "go",
+                "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                "agent_id": "ag_1",
+                "max_cost_usd": 2.5,
+            }
+        ),
+        server_client=client,
+        conversation_id="conv_caller",
+    )
+    _, _, body = client.calls[0]
+    assert body["max_cost_usd"] == 2.5
+
+
+@pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
