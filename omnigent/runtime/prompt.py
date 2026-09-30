@@ -38,7 +38,10 @@ CHILD_SESSION_QUESTION_INSTRUCTION = (
 _CHILD_SESSION_QUESTION_PEER_ON = (
     "When you need a user decision, send the question, its options, the context "
     "and any links to your mother with `sys_session_send`, then continue other "
-    "work or end your turn; her reply arrives as a new message."
+    "work or end your turn; her reply arrives as a new message. "
+    "Your mother may hand you over to a successor session; when a "
+    "`sys_session_send` result carries `redirected_to`, that session is your "
+    "mother from then on."
 )
 
 _CHILD_SESSION_QUESTION_PEER_OFF = (
