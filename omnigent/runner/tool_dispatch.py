@@ -8260,6 +8260,91 @@ async def _session_list_via_rest(
     )
 
 
+async def _rename_descendant_session_via_rest(
+    target_id: str,
+    title: str,
+    *,
+    caller_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """Retitle another session in the caller's subtree through the server API.
+
+    :param target_id: The descendant session to retitle, e.g. ``"conv_child"``.
+    :param title: The normalized title proposal, already length-checked.
+    :param caller_id: The calling session's own id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON ``{"renamed": true, ...}`` on success; otherwise a JSON
+        refusal (``session_not_found``, ``access_denied``, ``not_descendant``,
+        ``title_taken``) or error object.
+    """
+    try:
+        target_response = await server_client.get(
+            f"/v1/sessions/{target_id}",
+            params=_SESSION_METADATA_PARAMS,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if target_response.status_code == 404:
+        return json.dumps({"renamed": False, "title": None, "reason": "session_not_found"})
+    if target_response.status_code in (401, 403):
+        return json.dumps({"renamed": False, "title": None, "reason": "access_denied"})
+    if target_response.status_code != 200:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {target_response.status_code}",
+                "detail": target_response.text[:200],
+            }
+        )
+    try:
+        target_payload = target_response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    target_snapshot = _string_object_dict(target_payload)
+    if target_snapshot is None:
+        return json.dumps({"error": "sys_session_rename returned malformed session data"})
+    parent_id = _optional_string(target_snapshot.get("parent_session_id"))
+    if parent_id is None or not await _is_descendant(server_client, caller_id, target_snapshot):
+        return json.dumps({"renamed": False, "title": None, "reason": "not_descendant"})
+    # The prefix is kept and siblings are checked because the (parent, title)
+    # pair is the child's continuation address for sys_session_send.
+    display_title = (
+        title_without_closed_marker(_optional_string(target_snapshot.get("title"))) or ""
+    )
+    parsed = _parse_session_title(display_title)
+    prefix = ""
+    if parsed.agent is not None:
+        head, _, tail = display_title.partition(":")
+        prefix = f"ui:{parsed.agent}:" if head == "ui" and ":" in tail else f"{parsed.agent}:"
+    full_title = f"{prefix}{title}" if prefix and not title.startswith(prefix) else title
+    children = await _list_child_sessions(
+        server_client=server_client,
+        conversation_id=parent_id,
+        include_archived=True,
+    )
+    if isinstance(children, str):
+        return json.dumps({"error": children})
+    for child in children:
+        if child.get("id") != target_id and child.get("title") == full_title:
+            return json.dumps({"renamed": False, "title": None, "reason": "title_taken"})
+    try:
+        patch = await server_client.patch(
+            f"/v1/sessions/{target_id}",
+            json={"title": full_title},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if patch.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {patch.status_code}",
+                "detail": patch.text[:200],
+            }
+        )
+    return json.dumps({"renamed": True, "title": full_title, "reason": None})
+
+
 async def _rename_current_session_via_rest(
     args: _JsonObject,
     conversation_id: str | None,
@@ -8287,6 +8372,18 @@ async def _rename_current_session_via_rest(
     normalized_title = " ".join(title.split())
     if len(normalized_title) < 2:
         return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    session_id = args.get("session_id")
+    if session_id is not None and session_id != conversation_id:
+        if not isinstance(session_id, str) or not session_id:
+            return json.dumps(
+                {"error": "sys_session_rename requires a non-empty string 'session_id'"}
+            )
+        return await _rename_descendant_session_via_rest(
+            session_id,
+            normalized_title,
+            caller_id=conversation_id,
+            server_client=server_client,
+        )
     # Only a top-level session may rename itself: a sub-agent's title is its
     # (parent, title) continuation address for sys_session_send, so a child
     # rename would corrupt sibling addressing. Refuse explicitly, matching

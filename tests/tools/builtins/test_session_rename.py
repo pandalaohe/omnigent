@@ -9,7 +9,7 @@ def test_session_rename_schema_is_self_scoped() -> None:
 
     assert schema["name"] == "sys_session_rename"
     assert schema["parameters"]["required"] == ["title"]
-    assert set(schema["parameters"]["properties"]) == {"title"}
+    assert set(schema["parameters"]["properties"]) == {"title", "session_id"}
     assert (
         schema["parameters"]["properties"]["title"]["maxLength"]
         == DEFAULT_GENERATED_TITLE_MAX_CHARS

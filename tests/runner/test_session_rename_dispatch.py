@@ -168,6 +168,302 @@ async def test_session_rename_refuses_child_sessions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_rename_retitles_direct_child_with_address_prefix() -> None:
+    """A parent retitles its child; the child's agent address prefix is kept."""
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_current",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith(
+            "/v1/sessions/conv_current/child_sessions"
+        ):
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_child", "title": "researcher:auth"}]}
+            )
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "new label", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {
+        "renamed": True,
+        "title": "researcher:new label",
+        "reason": None,
+    }
+    assert len(patch_requests) == 1
+    assert patch_requests[0].method == "PATCH"
+    assert patch_requests[0].url.path == "/v1/sessions/conv_child"
+    assert json.loads(patch_requests[0].content) == {"title": "researcher:new label"}
+
+
+@pytest.mark.asyncio
+async def test_session_rename_retitles_grandchild() -> None:
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and path == "/v1/sessions/conv_grand":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_grand",
+                    "title": "worker:task",
+                    "parent_session_id": "conv_mid",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_mid":
+            return httpx.Response(
+                200, json={"id": "conv_mid", "parent_session_id": "conv_current"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_mid/child_sessions":
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_grand", "title": "worker:task"}]}
+            )
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "renamed task", "session_id": "conv_grand"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {
+        "renamed": True,
+        "title": "worker:renamed task",
+        "reason": None,
+    }
+    assert len(patch_requests) == 1
+    assert patch_requests[0].url.path == "/v1/sessions/conv_grand"
+    assert json.loads(patch_requests[0].content) == {"title": "worker:renamed task"}
+
+
+@pytest.mark.asyncio
+async def test_session_rename_refuses_unrelated_session() -> None:
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_current":
+            return httpx.Response(
+                200, json={"id": "conv_current", "parent_session_id": "conv_parent"}
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_sibling":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_sibling",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_parent",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_parent":
+            return httpx.Response(200, json={"id": "conv_parent", "parent_session_id": None})
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "new label", "session_id": "conv_sibling"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {
+        "renamed": False,
+        "title": None,
+        "reason": "not_descendant",
+    }
+    assert patch_requests == []
+
+
+@pytest.mark.asyncio
+async def test_session_rename_refuses_title_taken_by_sibling() -> None:
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_current",
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_current/child_sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "conv_child", "title": "researcher:auth"},
+                        {"id": "conv_other", "title": "researcher:newlabel"},
+                    ]
+                },
+            )
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "newlabel", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {"renamed": False, "title": None, "reason": "title_taken"}
+    assert patch_requests == []
+
+
+@pytest.mark.asyncio
+async def test_session_rename_does_not_double_the_address_prefix() -> None:
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_current",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith(
+            "/v1/sessions/conv_current/child_sessions"
+        ):
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_child", "title": "researcher:auth"}]}
+            )
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "researcher:newlabel", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {
+        "renamed": True,
+        "title": "researcher:newlabel",
+        "reason": None,
+    }
+    assert json.loads(patch_requests[0].content) == {"title": "researcher:newlabel"}
+
+
+@pytest.mark.asyncio
+async def test_session_rename_replaces_a_no_colon_title_whole() -> None:
+    patch_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_current":
+            return httpx.Response(200, json={"id": "conv_current", "parent_session_id": None})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={"id": "conv_child", "title": "auth", "parent_session_id": "conv_current"},
+            )
+        if request.method == "GET" and request.url.path.endswith(
+            "/v1/sessions/conv_current/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": [{"id": "conv_child", "title": "auth"}]})
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "new label", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {"renamed": True, "title": "new label", "reason": None}
+    assert json.loads(patch_requests[0].content) == {"title": "new label"}
+
+
+@pytest.mark.asyncio
+async def test_session_rename_with_own_session_id_uses_self_path() -> None:
+    rename_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        probe = _top_level_session_handler(request)
+        if probe is not None:
+            return probe
+        rename_requests.append(request)
+        return httpx.Response(
+            200, json={"renamed": True, "reason": None, **json.loads(request.content)}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_rename",
+            arguments=json.dumps({"title": "Debug auth timeout", "session_id": "conv_current"}),
+            server_client=server_client,
+            conversation_id="conv_current",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert json.loads(output) == {
+        "renamed": True,
+        "title": "Debug auth timeout",
+        "reason": None,
+    }
+    assert [request.method for request in rename_requests] == ["POST"]
+    assert rename_requests[0].url.path == "/v1/sessions/conv_current/agent-title"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "info_payload",
     [
