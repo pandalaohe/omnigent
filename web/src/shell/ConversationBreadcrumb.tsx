@@ -246,7 +246,7 @@ export function ConversationBreadcrumb({
             /
           </span>
           <span className="flex min-w-0 items-center gap-1.5">
-            <RailAgentBadge child={childSession} hostName={childHostName} />
+            <RailAgentBadge child={childSession} />
             <span
               data-testid="breadcrumb-child-label"
               className="truncate font-semibold text-foreground"

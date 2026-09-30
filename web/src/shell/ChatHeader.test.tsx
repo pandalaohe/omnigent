@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -151,6 +151,8 @@ afterEach(() => {
   isAndroidShellMock.mockReturnValue(false);
   isMobileMock.mockReturnValue(false);
 });
+
+beforeEach(() => localStorage.clear());
 
 describe("ChatHeader — deployed Share presentation", () => {
   it("matches the compact Vercel action", () => {
@@ -441,7 +443,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.queryByText("general-purpose")).toBeNull();
   });
 
-  it("shows the child's badge, own name and placement chip when the snapshot is known", () => {
+  it("shows the child's own name and placement chip, and no unconfigured badge", () => {
     renderHeader({
       sidebarOpen: true,
       conversationId: "child-9",
@@ -462,6 +464,63 @@ describe("ChatHeader — conversation breadcrumb", () => {
     const chip = screen.getByTestId("breadcrumb-child-placement");
     expect(chip).toHaveTextContent("researcher @ TMB · ~/projects/x/y/z");
     expect(chip).toHaveAttribute("title", "/Users/u/projects/x/y/z");
+    expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
+  });
+
+  it("shows the child's configured agent badge", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_child: { label: "CH", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "SCC10",
+      titleLinkTo: "/c/parent-123",
+      childSession: {
+        id: "child-9",
+        title: "researcher:auth",
+        agent_name: "researcher",
+        agent_id: "ag_child",
+        host_id: "h1",
+        labels: {},
+      },
+    });
+
+    expect(screen.getByTestId("rail-agent-badge")).toHaveTextContent("CH");
+  });
+
+  it("shows no badge for a harness sub-agent mirror even when its bound agent is configured", () => {
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { ag_child: { label: "CH", borderColor: "#123456", textColor: "theme" } },
+      }),
+    );
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "SCC10",
+      titleLinkTo: "/c/parent-123",
+      childSession: {
+        id: "child-9",
+        title: "general-purpose:abc",
+        agent_name: "claude-native-ui",
+        agent_id: "ag_child",
+        host_id: "h1",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      },
+    });
+
+    expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
   });
 
   it("copies the full child cwd when the placement chip is clicked", () => {
