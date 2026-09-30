@@ -1768,6 +1768,20 @@ def create_app(
         set_runner_router(runner_router)
         await archive_close_coordinator.start()
 
+        # Best-effort succession resume: a crash between phases leaves a
+        # receipt the startup pass advances. Never awaited, so a slow runner
+        # round-trip cannot delay boot.
+        from omnigent.server.session_succession import resume_unfinished_successions
+
+        succession_resume_task = asyncio.create_task(
+            resume_unfinished_successions(
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                peer_message_store=peer_message_store,
+            ),
+            name="succession-startup-resume",
+        )
+
         # Wake a blocked sub-agent's immediate parent: hooks
         # ``pending_elicitations.record_publish`` to post a ``[System: …]``
         # notice to the parent's ``/events``. Uninstalled at teardown so a
@@ -2032,6 +2046,14 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            succession_resume_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await succession_resume_task
+            for _succession_task in list(_succession_resume_tasks):
+                _succession_task.cancel()
+            for _succession_task in list(_succession_resume_tasks):
+                with suppress(asyncio.CancelledError):
+                    await _succession_task
             if system_status_tick_task is not None:
                 system_status_tick_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -3882,6 +3904,8 @@ def create_app(
     # sleep-wake reconnects) that re-register within the grace never
     # flap their sessions to failed.
     _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+    # Detached succession resumes started by a runner (re)connect.
+    _succession_resume_tasks: set[asyncio.Task[None]] = set()
 
     def _cancel_disconnect_grace(runner_id: str) -> None:
         """Cancel and forget the pending disconnect-grace timer, if any."""
@@ -4231,6 +4255,26 @@ def create_app(
                     )
                 else:
                     cli_retention_coordinator.trigger(host_id)
+
+        # A succession whose successor was waiting for this runner (the
+        # ``target_not_ready`` gate) resumes now. Detached so the connect
+        # handshake never waits on a store scan.
+        from omnigent.server.session_succession import resume_successions_for_runner
+
+        async def _resume_successions_for_runner() -> None:
+            await resume_successions_for_runner(
+                runner_id,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                peer_message_store=peer_message_store,
+            )
+
+        _succession_task = asyncio.create_task(
+            _resume_successions_for_runner(),
+            name=f"succession-resume-{runner_id}",
+        )
+        _succession_resume_tasks.add(_succession_task)
+        _succession_task.add_done_callback(_succession_resume_tasks.discard)
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None

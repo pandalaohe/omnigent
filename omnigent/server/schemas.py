@@ -2784,6 +2784,21 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
+class SessionSuccessionRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/succession``.
+
+    Starts (or resumes) handing the caller session's live children to the
+    target session.
+
+    :param target_session_id: The successor session that takes the caller's
+        live children, e.g. ``"conv_abc123"``. Must be a top-level session
+        the caller can edit.
+    """
+
+    target_session_id: str = Field(min_length=1)
+
+
 class SessionForkRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
