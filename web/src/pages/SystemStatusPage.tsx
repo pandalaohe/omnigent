@@ -5,7 +5,7 @@
 // A member receives `server: null` and only their own hosts — the page just
 // renders what the permission-filtered response contains.
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
@@ -457,7 +457,8 @@ function ProcessRows({
   );
 }
 
-function ProcessTree({
+// The page ticks every second; the tree only changes with a new snapshot.
+const ProcessTree = memo(function ProcessTree({
   processes,
   sessionTitles,
 }: {
@@ -490,7 +491,7 @@ function ProcessTree({
       </table>
     </div>
   );
-}
+});
 
 function HostCard({
   host,

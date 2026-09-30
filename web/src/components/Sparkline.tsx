@@ -66,7 +66,9 @@ export function Sparkline({ points, threshold = null, label, className, latest }
     </svg>
   );
   if (latest === undefined) return chart;
-  // The wrapper carries the caller's margins; the dot sits on the last point.
+  // The wrapper carries the caller's margins; the dot sits on the last point,
+  // which the polyline centers (single point) or ends at the right edge.
+  const lastX = points.length === 1 ? 50 : 100;
   return (
     <div className={cn("relative", className)}>
       {chart}
@@ -74,10 +76,10 @@ export function Sparkline({ points, threshold = null, label, className, latest }
         aria-hidden="true"
         data-testid="sparkline-latest"
         className={cn(
-          "absolute right-0 size-1.5 -translate-y-1/2 translate-x-1/2 rounded-full",
+          "absolute size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full",
           latest === "live" ? "bg-foreground/60" : "bg-amber-500",
         )}
-        style={{ top: `${y(points[points.length - 1])}%` }}
+        style={{ top: `${y(points[points.length - 1])}%`, left: `${lastX}%` }}
       />
     </div>
   );
