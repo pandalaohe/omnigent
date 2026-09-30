@@ -23,10 +23,17 @@ Entry point: :func:`reap_leaked_omnigent_processes`.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 import psutil
+
+# Name of the file recording which pytest process owns a data dir, so a
+# later run can tell an abandoned dir from one a concurrent run owns.
+OWNER_MARKER_NAME = "pytest-owner.json"
 
 # Grace between SIGTERM and SIGKILL: long enough for a daemon's clean
 # shutdown path (which also tears down its zygote children), short enough
@@ -159,3 +166,116 @@ def reap_leaked_omnigent_processes(
     survivor_pids = {proc.pid for proc in survivors}
     reaped = [cmd for pid, cmd in cmdline_by_pid.items() if pid not in survivor_pids]
     return reaped, [cmdline_by_pid[pid] for pid in survivor_pids]
+
+
+def write_owner_marker(directory: Path | str, pid: int | None = None) -> None:
+    """Record the owning process (default: this one) in *directory*.
+
+    The marker lets a later run decide whether the directory is abandoned:
+    only a pid whose recorded create time no longer matches is provably a
+    dead run. Written atomically (temp file + ``os.replace``) so a sweeper
+    never reads a half-written marker.
+
+    :param directory: The data dir to mark.
+    :param pid: The owning process; defaults to ``os.getpid()``.
+    """
+    if pid is None:
+        pid = os.getpid()
+    owner = psutil.Process(pid)
+    payload = {"pid": pid, "create_time": owner.create_time()}
+    marker = Path(directory) / OWNER_MARKER_NAME
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(marker.parent), prefix=f".{OWNER_MARKER_NAME}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp_name, marker)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def _owner_is_dead(directory: Path) -> bool:
+    """Whether *directory*'s recorded owner is provably gone.
+
+    ``True`` only for a marker that exists, parses, and names a pid that is
+    absent (:class:`psutil.NoSuchProcess`), a zombie
+    (:data:`psutil.STATUS_ZOMBIE`), or reused (create time differs by more
+    than 1 s). Every inconclusive case — no marker, unreadable or malformed
+    JSON, missing keys, :class:`psutil.AccessDenied`, any other error —
+    returns ``False`` so the directory is kept: a concurrent run may sit
+    between ``mkdtemp`` and its marker write, and a dir with no marker must
+    never be swept.
+
+    :param directory: The candidate data dir.
+    :returns: ``True`` when the recorded owner is confirmed dead.
+    """
+    marker = directory / OWNER_MARKER_NAME
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        pid = int(payload["pid"])
+        recorded = float(payload["create_time"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    try:
+        proc = psutil.Process(pid)
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return True
+        return abs(proc.create_time() - recorded) > 1.0
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError):
+        return False
+
+
+def sweep_dead_owner_dirs(
+    root: Path | str,
+    prefix: str,
+    *,
+    timeout: float = _REAP_TIMEOUT_S,
+) -> tuple[list[Path], list[str], list[str]]:
+    """Sweep directories under *root* whose recorded owner is dead.
+
+    A pytest run killed by pytest-timeout's ``os._exit`` or SIGKILL skips
+    ``pytest_unconfigure``, so its data dir and spawned processes linger.
+    For each real (non-symlink) directory whose name starts with *prefix*
+    and whose owner marker proves the owner gone, reap processes attributed
+    to the dir and remove it.
+
+    Safety rule: the liveness of the recorded owner decides, never age. A
+    directory without a marker is kept — a concurrent run may be between
+    ``mkdtemp`` and its marker write — and a live owner (another session or
+    worktree) keeps its directory even if it is old.
+
+    :param root: Directory whose entries are candidates.
+    :param prefix: Only entries whose name starts with this are considered.
+    :param timeout: Seconds to wait between TERM and KILL per directory.
+    :returns: ``(swept, reaped, survivors)``: the removed directories, all
+        reaped command lines, and all command lines that survived SIGKILL.
+    """
+    root_path = Path(root)
+    try:
+        entries = sorted(root_path.iterdir())
+    except OSError:
+        return [], [], []
+    swept: list[Path] = []
+    reaped: list[str] = []
+    survivors: list[str] = []
+    for entry in entries:
+        try:
+            if not entry.name.startswith(prefix):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not _owner_is_dead(entry):
+                continue
+            entry_reaped, entry_survivors = reap_leaked_omnigent_processes(entry, timeout=timeout)
+            shutil.rmtree(entry, ignore_errors=True)
+            swept.append(entry)
+            reaped.extend(entry_reaped)
+            survivors.extend(entry_survivors)
+        except OSError:
+            continue
+    return swept, reaped, survivors

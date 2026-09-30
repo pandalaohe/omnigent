@@ -11,6 +11,8 @@ is covered without paying the server-boot cost.
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -414,6 +416,32 @@ async def test_operation_failure_is_recorded_per_op() -> None:
     result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=3, warmup=0)
     assert result.n_success == 2
     assert result.failures == {"HTTP 503": 1}
+
+
+@pytest.mark.asyncio
+async def test_bench_environment_stops_children_when_enter_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An enter failure after children spawned still stops them and cleans up."""
+    env = BenchEnvironment()
+
+    def _fake_start() -> None:
+        env._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        env._mock_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(env, "_start", _fake_start)
+    try:
+        with pytest.raises(RuntimeError):
+            async with env:
+                pass
+        assert env._mock_proc is not None
+        assert env._mock_proc.poll() is not None
+        assert not env._tmp.exists()
+    finally:
+        if env._mock_proc is not None and env._mock_proc.poll() is None:
+            env._mock_proc.kill()
+            env._mock_proc.wait(timeout=10)
 
 
 # ── end-to-end smoke (boots the server) ──────────────────────
