@@ -494,10 +494,14 @@ class ChildKeepWarmSweeper:
                 self._settled_seen.pop(child_id, None)
 
         # Rule 2: a sticky miss pause lifts once the child left and
-        # re-entered the active zone (its archive revision moved).
+        # re-entered the active zone (its archive revision moved). The
+        # watermark moves to the current turn so rule 3 only re-arms on a
+        # later real turn, never on the cold cache the pause was about.
         if state is not None and state.s == "p" and state.why == "miss":
             if state.v != conv.archive_revision:
                 state.s, state.why = "c", "rev"
+                if running_since is not None:
+                    state.t = running_since
 
         # Rule 3: a new real turn settled starts a fresh episode. Only the
         # not-yet-revised miss pause is sticky — a cold ``cap`` / ``mom``
@@ -551,12 +555,13 @@ class ChildKeepWarmSweeper:
             state.s, state.why = "p", "fail"
             notices.append(("fail", {}))
 
-        # Rule 7 and 7b need the tracked flag; 7b and rule 8 also need the
-        # direct parent's presence. Children the sweeper would not touch
-        # skip the parent read entirely.
+        # Rule 7 and 7b need the tracked flag; 7b, rule 8 and any notice
+        # also need the direct parent's presence. A notice may never reach
+        # an absent mother, so a child with collected notices is read too;
+        # children the sweeper would not touch skip the parent read.
         tracked = child_id in self._tracked or (state is not None and state.s == "w")
         parent_present = True
-        if base_eligible or tracked:
+        if base_eligible or tracked or notices:
             parent_present = await self._parent_present(
                 conv, now, claude_interval, codex_interval, parent_cache, agent_cache
             )
@@ -564,20 +569,29 @@ class ChildKeepWarmSweeper:
 
         # Rule 7: cap and expiry settle tracked children whether or not they
         # are eligible to be pinged. An expired window under an archived
-        # mother or a switched-off zone goes cold silently.
+        # mother or a switched-off zone goes cold silently; an absent parent
+        # turns cap / expiry into a silent ``mom`` cold.
         if state is not None and state.s == "w" and tracked:
             if state.c is not None and now - state.c >= max_s:
-                state.s, state.why = "c", "cap"
-                notices.append(("cap", {"hours": max(1, round(max_s / 3600))}))
+                state.s = "c"
+                state.why = "cap" if parent_present else "mom"
+                if parent_present:
+                    notices.append(("cap", {"hours": max(1, round(max_s / 3600))}))
             elif state.w is not None and now > state.w and not busy:
-                state.s, state.why = "c", "exp"
-                if not ancestor_archived and switch_on:
+                state.s = "c"
+                state.why = "exp" if parent_present else "mom"
+                if parent_present and not ancestor_archived and switch_on:
                     notices.append(("exp", {}))
 
         # Rule 7b: the mother is gone — stop paying to keep this child warm.
         # No notice: a notice would wake the absent mother.
         if state is not None and state.s == "w" and tracked and not busy and not parent_present:
             state.s, state.why = "c", "mom"
+
+        # No notice may reach an absent parent (it would wake her): drop
+        # every notice collected for this child this tick.
+        if notices and not parent_present:
+            notices = []
 
         # Rule 8: due — write the attempt into the label first, then post.
         ping = False

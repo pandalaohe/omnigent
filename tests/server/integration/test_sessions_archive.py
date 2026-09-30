@@ -1100,6 +1100,53 @@ async def test_archive_without_stop_when_idle_writes_no_deferral_label(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+async def test_failed_child_lookup_writes_the_deferral_label(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A failed child lookup must not be read as "no children".
+
+    The route cannot prove the session is childless when the DB read
+    raises, so the archive defers the teardown: a running tree must not be
+    cut just because the child check failed.
+    """
+    session = await create_test_session(client, name="archive-lookup-fail")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    async def _skip_wait(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    coordinator = app.state.archive_close_coordinator
+    app.state.archive_close_coordinator = None
+    try:
+        with (
+            patch.object(
+                SqlAlchemyConversationStore,
+                "list_child_conversation_ids_by_parent",
+                side_effect=RuntimeError("transient DB error"),
+            ),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+            patch.object(_sessions_orchestration, "_wait_for_archive_idle", _skip_wait),
+        ):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            assert resp.status_code == 200
+            await _drain_detached_stops()
+        row = conv_store.get_conversation(session_id)
+        assert row is not None
+        assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(row.archive_revision)
+        # The deferred teardown honoured the wait and then proceeded: the
+        # label is not just left inert.
+        assert stopped == [session_id]
+    finally:
+        app.state.archive_close_coordinator = coordinator
+
+
 async def test_web_archive_of_child_defers_teardown_without_the_flag(
     client: httpx.AsyncClient,
     db_uri: str,

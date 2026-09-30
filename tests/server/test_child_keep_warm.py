@@ -689,6 +689,57 @@ async def test_idle_parent_past_its_interval_goes_cold_mom_silently(
     assert child.id not in harness.sweeper._tracked
 
 
+async def test_cap_with_an_absent_parent_goes_cold_mom_without_notice(
+    harness: _Harness,
+) -> None:
+    """§2.14: rule 7's cap turns silent ``mom`` while the mother is away."""
+    parent = _parent(harness, live_status="idle")
+    harness.clock.now = harness.now + 2 * 3600
+    now = harness.clock.now
+    u = now - 55 * 60
+    child = _child(
+        harness,
+        parent.id,
+        labels={KEEP_WARM_LABEL: _warm_label(t=u, c=now - _MAX_S - 1, w=now + 3600)},
+        running_since=u,
+    )
+    harness.sweeper._tracked[child.id] = now + 3600
+
+    await _tick(harness)
+
+    assert harness.post.calls == []
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "c" and state.why == "mom"
+    assert harness.notices.lines == []
+    assert (child.id, None) in harness.published
+    assert child.id not in harness.sweeper._tracked
+
+
+async def test_expiry_with_an_absent_parent_goes_cold_mom_without_notice(
+    harness: _Harness,
+) -> None:
+    """§2.14: rule 7's expiry turns silent ``mom`` while the mother is away."""
+    parent = _parent(harness, live_status="idle")
+    harness.clock.now = harness.now + 2 * 3600
+    now = harness.clock.now
+    u = now - 2 * 3600
+    child = _child(
+        harness,
+        parent.id,
+        labels={KEEP_WARM_LABEL: _warm_label(t=u, w=now - 60)},
+        running_since=u,
+    )
+    harness.sweeper._tracked[child.id] = now - 60
+
+    await _tick(harness)
+
+    assert harness.post.calls == []
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "c" and state.why == "mom"
+    assert harness.notices.lines == []
+    assert (child.id, None) in harness.published
+
+
 async def test_new_real_turn_after_mom_starts_a_new_episode(harness: _Harness) -> None:
     """§2.14: a ``why = mom`` cold label re-arms at the child's next real turn."""
     parent = _parent(harness, live_status="idle")
@@ -774,6 +825,38 @@ async def test_three_non_compliant_replies_pause_warming(harness: _Harness) -> N
     assert len(harness.notices.lines) == 1
     assert "3 keep-warm turns failed" in harness.notices.lines[0][1]
     assert (child.id, None) in harness.published
+
+
+async def test_third_failure_with_an_absent_parent_pauses_without_notice(
+    harness: _Harness,
+) -> None:
+    """§2.14: the failure pause is silent once the mother has gone away."""
+    parent = _parent(harness)
+    u = harness.now - 55 * 60
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+
+    for attempt in range(3):
+        await _tick(harness)
+        pinging = _read_label(harness, child.id)
+        assert pinging is not None and pinging.q is True
+        _settle_ping(harness, child.id, pinging)
+        _append_assistant(harness, child.id, "I will not say the line")
+        harness.clock.now = pinging.p + 60
+        await _tick(harness)
+        if attempt == 2:
+            # The parent goes away while the third keep-warm turn is in flight.
+            harness.store.set_session_live_status(parent.id, "idle")
+        harness.clock.now = pinging.p + 120
+        await _tick(harness)
+        settled = _read_label(harness, child.id)
+        assert settled is not None
+        if settled.s == "w" and settled.u is not None:
+            harness.clock.now = settled.u + _CLAUDE_INTERVAL_S
+
+    assert len(harness.post.calls) == 3
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "p" and state.why == "fail"
+    assert harness.notices.lines == []
 
 
 async def test_policy_denied_ping_pauses_without_retry(harness: _Harness) -> None:
@@ -887,7 +970,12 @@ async def test_claude_stale_cache_reading_is_unknown(harness: _Harness) -> None:
 async def test_sticky_miss_pause_lifts_on_revision_and_rearms_on_real_turn(
     harness: _Harness,
 ) -> None:
-    """Scenario 16: revision bump lifts the pause; only a real turn re-arms."""
+    """Scenario 16: revision bump lifts the pause; only a later turn re-arms.
+
+    The lift moves the watermark to the child's current ``running_since``,
+    so the turn that was already there when the pause lifted is not read as
+    new work: re-arming would ping the cold cache the pause was about.
+    """
     parent = _parent(harness)
     r = harness.now - 3 * 3600
     child = _child(
@@ -895,6 +983,7 @@ async def test_sticky_miss_pause_lifts_on_revision_and_rearms_on_real_turn(
         parent.id,
         labels={KEEP_WARM_LABEL: _label(s="p", why="miss", t=r, c=r, u=r, w=r + 3600, v=0)},
     )
+    _set_running_since(harness, child.id, r + 1000)
     harness.store.update_conversation(child.id, archived=True)
     harness.store.update_conversation(child.id, archived=False)
 
@@ -902,13 +991,20 @@ async def test_sticky_miss_pause_lifts_on_revision_and_rearms_on_real_turn(
 
     lifted = _read_label(harness, child.id)
     assert lifted is not None and lifted.s == "c" and lifted.why == "rev"
+    assert lifted.t == r + 1000
     assert harness.post.calls == []
 
-    _set_running_since(harness, child.id, r + 1000)
+    # The watermark turn is not new work: the label stays cold.
+    await _tick(harness)
+    still = _read_label(harness, child.id)
+    assert still is not None and still.s == "c" and still.why == "rev"
+    assert harness.post.calls == []
+
+    _set_running_since(harness, child.id, r + 2000)
     await _tick(harness)
 
     warm = _read_label(harness, child.id)
-    assert warm is not None and warm.s == "w" and warm.t == r + 1000
+    assert warm is not None and warm.s == "w" and warm.t == r + 2000
 
 
 async def test_unarchive_does_not_rearm_a_stale_cache_clock(harness: _Harness) -> None:

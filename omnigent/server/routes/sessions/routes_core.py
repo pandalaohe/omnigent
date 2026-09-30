@@ -3255,10 +3255,11 @@ def register_core_routes(
                             [session_id],
                         )
                     ).get(session_id)
-                except Exception:  # a failed lookup counts as no children.
+                except Exception:  # A failed lookup must not cut a running tree.
+                    archive_stop_when_idle = True
                     _logger.warning(
                         "Could not list children of %s for the archive deferral; "
-                        "treating it as childless",
+                        "deferring the teardown conservatively",
                         session_id,
                         exc_info=True,
                     )
