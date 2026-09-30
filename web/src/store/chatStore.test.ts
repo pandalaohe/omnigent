@@ -6299,6 +6299,22 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
     });
+
+    it("invalidates both child lists outside the redirect guard", () => {
+      useChatStore.setState({ conversationId: "conv_current", redirectToConversationId: null });
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_other",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      // The DB move happened regardless of which stream this client watches, so
+      // both lists refetch even though only the on-screen conversation redirects.
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_other") });
+      expect(spy).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_new") });
+    });
   });
 
   describe("session.status", () => {
@@ -8767,6 +8783,23 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(event);
       // Same reference — no setState call fired.
       expect(useChatStore.getState()).toBe(before);
+    });
+
+    it("invalidates the moved child's snapshot so it re-reads its parent", () => {
+      // A succession re-announces an existing child under the successor with a
+      // fresh session.created; its cached snapshot still names the old parent.
+      useChatStore.setState({ awaitingSideChatFor: null });
+      const spy = vi.spyOn(client, "invalidateQueries");
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_new",
+        childSessionId: "conv_moved",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_new",
+      } as SessionCreatedEvent);
+
+      expect(spy).toHaveBeenCalledWith({ queryKey: ["session", "conv_moved"] });
     });
   });
 

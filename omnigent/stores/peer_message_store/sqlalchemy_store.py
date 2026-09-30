@@ -243,6 +243,38 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 return None
             return _record_to_entity(row)
 
+    def retarget_receiver(
+        self,
+        old_receiver_id: str,
+        new_receiver_id: str,
+        states: tuple[str, ...],
+    ) -> list[str]:
+        """Re-address one receiver's not-yet-delivered records to another."""
+
+        def write(session: Session) -> list[str]:
+            stmt = select(SqlSessionPeerMessage.id).where(
+                SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                SqlSessionPeerMessage.receiver_session_id == old_receiver_id,
+                SqlSessionPeerMessage.state.in_(sorted(states)),
+            )
+            ids = list(session.execute(stmt).scalars().all())
+            if not ids:
+                return []
+            session.execute(
+                update(SqlSessionPeerMessage)
+                .where(
+                    SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                    SqlSessionPeerMessage.id.in_(ids),
+                )
+                .values(
+                    receiver_session_id=new_receiver_id,
+                    updated_at=now_epoch(),
+                )
+            )
+            return ids
+
+        return run_write_transaction(self._session_immediate, "retarget_peer_messages", write)
+
     def find_sent(
         self,
         sender_session_id: str,

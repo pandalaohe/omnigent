@@ -958,6 +958,50 @@ class SqlCliReleaseIntent(ConversationBase):
     )
 
 
+class SqlSessionSuccession(ConversationBase):
+    """Durable receipt for one session succession (old mother → new mother).
+
+    The row is the recoverable membership record of the phased operation:
+    ``direct_ids``/``moved_ids`` are JSON lists of the child sessions moved,
+    and every later phase resumes from the stored ``phase``. JSON payloads
+    (``opening``, ``dropped``, ``questions``) are opaque to SQL.
+    """
+
+    __tablename__ = "session_successions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    old_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    new_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    phase: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="planned", server_default="planned"
+    )
+    direct_ids: Mapped[str] = mapped_column(Text, nullable=False)
+    moved_ids: Mapped[str] = mapped_column(Text, nullable=False)
+    opening: Mapped[str | None] = mapped_column(Text, nullable=True)
+    opening_item_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    dropped: Mapped[str | None] = mapped_column(Text, nullable=True)
+    questions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "old_id",
+            "new_id",
+            name="uq_session_successions_pair",
+        ),
+    )
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.

@@ -6773,6 +6773,28 @@
         "title": "SessionGitOptions",
         "type": "object"
       },
+      "SessionHandoverRequest": {
+        "description": "Request body for `POST /v1/sessions/{session_id}/handover`.\n\nRecords a handover note on a top-level native session and optionally\nrequests that the session rotate at its next turn end.",
+        "properties": {
+          "handover": {
+            "description": "The note the successor session opens with. Must be non-empty after stripping whitespace.",
+            "minLength": 1,
+            "title": "Handover",
+            "type": "string"
+          },
+          "rotate": {
+            "default": true,
+            "description": "When `True` (the default), the session is cleared at the end of its current turn and continues in a new session that receives the note and the session's live sub-agents. When `False`, only the note is recorded.",
+            "title": "Rotate",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "handover"
+        ],
+        "title": "SessionHandoverRequest",
+        "type": "object"
+      },
       "SessionHeartbeatEvent": {
         "description": "Idle-stream keepalive on `GET /v1/sessions/{id}/stream`.\n\nEmitted by the session-stream route on a fixed cadence whenever\nthe underlying publish queue has been quiet (no turn in flight,\nno resource events). Distinct from `HeartbeatEvent`\n(`response.heartbeat`), which is per-turn and is driven by\nthe runtime workflow while a response is producing output.\n\nWhy this exists: the session stream stays open across many turns\nand through idle periods (waiting for the user to type). Without\na periodic emit, intermediate proxies, OS-level sockets, and the\nclient's SSE read-timeout can leave a half-open stream\nundetected for minutes after a network event (laptop sleep,\nWi-Fi handoff). The heartbeat puts a regular byte on the wire\nso the client's read-timeout and the server's\n`request.is_disconnected()` check both fire promptly.\n\nConsumers MAY ignore the payload entirely (the bytes crossing\nthe wire are sufficient). The optional `server_time` mirrors\n`HeartbeatEvent` for symmetry and debugging.",
         "properties": {
@@ -8845,6 +8867,22 @@
           "status"
         ],
         "title": "SessionStatusEvent",
+        "type": "object"
+      },
+      "SessionSuccessionRequest": {
+        "description": "Request body for `POST /v1/sessions/{session_id}/succession`.\n\nStarts (or resumes) handing the caller session's live children to the\ntarget session.",
+        "properties": {
+          "target_session_id": {
+            "description": "The successor session that takes the caller's live children, e.g. `\"conv_abc123\"`. Must be a top-level session the caller can edit.",
+            "minLength": 1,
+            "title": "Target Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_session_id"
+        ],
+        "title": "SessionSuccessionRequest",
         "type": "object"
       },
       "SessionSupersededEvent": {
@@ -16225,6 +16263,57 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/handover": {
+      "post": {
+        "description": "Record a handover note and optionally request a turn-end rotation.\n\nThe note is a persisted assistant message whose id is stored in\n`omnigent.handover_item`, so the succession engine can open the\nsuccessor with it. With `rotate`, `omnigent.rotate_requested`\ncarries the archive revision and the runner types `/clear` into\nthe session's terminal when the current turn ends.\n\nOnly a top-level claude-native / codex-native session may call\nthis: other harnesses have no rotation this fork can complete.",
+        "operationId": "record_session_handover_v1_sessions__session_id__handover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionHandoverRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Session Handover",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/items": {
       "get": {
         "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A `PaginatedList` of conversation items.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -18973,6 +19062,57 @@
           }
         },
         "summary": "Stream Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/succession": {
+      "post": {
+        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop` \u2014 ordinary rotations\nmust keep today's behaviour. Undo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe move transaction clears the forward pair and writes the inverse.",
+        "operationId": "start_session_succession_v1_sessions__session_id__succession_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionSuccessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Session Succession",
         "tags": [
           "sessions"
         ]

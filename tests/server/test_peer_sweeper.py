@@ -127,6 +127,19 @@ class _FakePeerStore(PeerMessageStore):
         candidates.sort(key=lambda r: r.created_at, reverse=True)
         return candidates[0] if candidates else None
 
+    def retarget_receiver(
+        self,
+        old_receiver_id: str,
+        new_receiver_id: str,
+        states: tuple[str, ...],
+    ) -> list[str]:
+        moved: list[str] = []
+        for row in self._rows.values():
+            if row.receiver_session_id == old_receiver_id and row.state in states:
+                row.receiver_session_id = new_receiver_id
+                moved.append(row.id)
+        return moved
+
     def find_sent(
         self,
         sender_session_id: str,

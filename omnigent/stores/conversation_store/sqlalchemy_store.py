@@ -49,6 +49,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
+    SqlSessionSuccession,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
@@ -110,6 +111,8 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SUCCEEDED_BY_LABEL_KEY,
+    SUCCEEDS_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ArchiveCloseClaimResult,
     ArchivedConversationFacets,
@@ -125,6 +128,8 @@ from omnigent.stores.conversation_store import (
     NativeSubagentReconcileFingerprint,
     NativeSubagentReconcileWriteResult,
     SessionConnectivity,
+    SessionSuccession,
+    SuccessionRefusedError,
     pinned_label_key,
 )
 from omnigent.stores.conversation_store.overrides import (
@@ -302,6 +307,25 @@ def _to_conversation(
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
         project_id=meta.project_id if meta else None,
+    )
+
+
+def _to_session_succession(row: SqlSessionSuccession) -> SessionSuccession:
+    """Convert a succession receipt row with its JSON payloads decoded."""
+    return SessionSuccession(
+        id=row.id,
+        old_id=row.old_id,
+        new_id=row.new_id,
+        phase=row.phase,
+        direct_ids=json.loads(row.direct_ids),
+        moved_ids=json.loads(row.moved_ids),
+        opening=json.loads(row.opening) if row.opening is not None else None,
+        opening_item_id=row.opening_item_id,
+        dropped=json.loads(row.dropped) if row.dropped is not None else None,
+        questions=json.loads(row.questions) if row.questions is not None else None,
+        error=row.error,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
@@ -4714,6 +4738,253 @@ class SqlAlchemyConversationStore(ConversationStore):
         else:
             meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
+
+    def reassign_live_children(
+        self,
+        old_id: str,
+        new_id: str,
+        receipt_id: str,
+        *,
+        reverse_of: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Move old's still-unarchived direct children and their subtrees under new.
+
+        Everything — locks, re-reads, reparenting, root rewrite, labels and
+        the receipt — commits in one AP transaction, so a crash leaves either
+        the whole move or none of it. A child archived concurrently before its
+        lock is simply left behind; when that leaves nothing to move, nothing
+        at all is written.
+
+        :param old_id: Top-level session whose children move.
+        :param new_id: Top-level successor session.
+        :param receipt_id: Pre-generated id for the receipt row.
+        :param reverse_of: When ``True`` this move reverses an existing link
+            (``new_id.succeeded_by == old_id``); the forward pair is removed
+            in the same transaction, and only once the move is known to
+            proceed, so a refusal leaves it intact.
+        :returns: ``(direct_ids, moved_ids)``.
+        :raises SuccessionRefusedError: With ``code`` ``same_session``,
+            ``not_found``, ``not_top_level``, ``target_archived`` or
+            ``title_clash``.
+        """
+        now = now_epoch()
+        workspace_id = current_workspace_id()
+
+        def move(ap_sess: Session) -> tuple[list[str], list[str]]:
+            if old_id == new_id:
+                raise SuccessionRefusedError("same_session", "a session cannot succeed itself")
+            self._lock_conversation(ap_sess, new_id)
+            self._lock_conversation(ap_sess, old_id)
+            new_row = ap_sess.get(SqlConversation, (workspace_id, new_id))
+            if new_row is None:
+                raise SuccessionRefusedError(
+                    "not_found", f"successor conversation {new_id!r} does not exist"
+                )
+            old_row = ap_sess.get(SqlConversation, (workspace_id, old_id))
+            if old_row is None:
+                raise SuccessionRefusedError(
+                    "not_found", f"conversation {old_id!r} does not exist"
+                )
+            if (
+                new_row.parent_conversation_id is not None
+                or old_row.parent_conversation_id is not None
+            ):
+                raise SuccessionRefusedError(
+                    "not_top_level",
+                    "succession requires top-level sessions on both sides",
+                )
+            # Stricter than the child-insert walk (which admits a plain archived
+            # parent): children moved under an archived session inherit its fence.
+            if new_row.archived:
+                raise SuccessionRefusedError(
+                    "target_archived", f"successor conversation {new_id!r} is archived"
+                )
+
+            candidates = list(
+                ap_sess.scalars(
+                    select(SqlConversation).where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.parent_conversation_id == old_id,
+                    )
+                )
+            )
+            kept: list[SqlConversation] = []
+            for candidate in candidates:
+                # The lock serializes against an archive transition; the
+                # re-read then sees whatever that transition committed.
+                self._lock_conversation(ap_sess, candidate.id)
+                ap_sess.refresh(candidate)
+                if not candidate.archived:
+                    kept.append(candidate)
+            if not kept:
+                return ([], [])
+
+            # Application-level uniqueness has no DB constraint: refuse
+            # before writing rather than leaving two same-titled siblings.
+            existing_titles = set(
+                ap_sess.scalars(
+                    select(SqlConversation.title).where(
+                        SqlConversation.workspace_id == workspace_id,
+                        SqlConversation.parent_conversation_id == new_id,
+                    )
+                )
+            )
+            for child in kept:
+                if child.title and child.title in existing_titles:
+                    raise SuccessionRefusedError(
+                        "title_clash",
+                        f"successor conversation {new_id!r} already has a child "
+                        f"titled {child.title!r}",
+                    )
+
+            kept_ids = [child.id for child in kept]
+            moved_ids: list[str] = []
+            seen: set[str] = set()
+            frontier = kept_ids
+            while frontier:
+                level = [session_id for session_id in frontier if session_id not in seen]
+                if not level:
+                    break
+                seen.update(level)
+                moved_ids.extend(level)
+                frontier = list(
+                    ap_sess.scalars(
+                        select(SqlConversation.id).where(
+                            SqlConversation.workspace_id == workspace_id,
+                            SqlConversation.parent_conversation_id.in_(level),
+                        )
+                    )
+                )
+
+            ap_sess.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == workspace_id,
+                    SqlConversation.id.in_(kept_ids),
+                )
+                .values(parent_conversation_id=new_id)
+            )
+            ap_sess.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == workspace_id,
+                    SqlConversation.id.in_(moved_ids),
+                )
+                .values(root_conversation_id=new_id)
+            )
+            if reverse_of:
+                # Undo: drop the forward pair only now, when the inverse move
+                # has passed every refusal; a refused move must keep it.
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == new_id,
+                        SqlConversationLabel.key == SUCCEEDED_BY_LABEL_KEY,
+                        SqlConversationLabel.value == old_id,
+                    )
+                )
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == workspace_id,
+                        SqlConversationLabel.conversation_id == old_id,
+                        SqlConversationLabel.key == SUCCEEDS_LABEL_KEY,
+                        SqlConversationLabel.value == new_id,
+                    )
+                )
+            _upsert_labels(ap_sess, old_id, {SUCCEEDED_BY_LABEL_KEY: new_id}, now)
+            _upsert_labels(ap_sess, new_id, {SUCCEEDS_LABEL_KEY: old_id}, now)
+            ap_sess.add(
+                SqlSessionSuccession(
+                    id=receipt_id,
+                    old_id=old_id,
+                    new_id=new_id,
+                    phase="moved",
+                    direct_ids=json.dumps(kept_ids),
+                    moved_ids=json.dumps(moved_ids),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            return (kept_ids, moved_ids)
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "reassign_live_children",
+            move,
+        )
+
+    def get_succession(self, old_id: str, new_id: str) -> SessionSuccession | None:
+        """Return the receipt for one ``(old_id, new_id)`` pair, or ``None``."""
+        with self._conv_session("select_succession_by_pair") as session:
+            row = session.scalar(
+                select(SqlSessionSuccession).where(
+                    SqlSessionSuccession.workspace_id == current_workspace_id(),
+                    SqlSessionSuccession.old_id == old_id,
+                    SqlSessionSuccession.new_id == new_id,
+                )
+            )
+            return _to_session_succession(row) if row is not None else None
+
+    def get_succession_by_id(self, receipt_id: str) -> SessionSuccession | None:
+        """Return the succession receipt by id, or ``None``."""
+        with self._conv_session("select_succession_by_id") as session:
+            row = session.get(SqlSessionSuccession, (current_workspace_id(), receipt_id))
+            return _to_session_succession(row) if row is not None else None
+
+    def list_unfinished_successions(self, limit: int = 100) -> list[SessionSuccession]:
+        """Return receipts whose phase is not ``done``, oldest first."""
+        with self._conv_session("list_unfinished_successions") as session:
+            rows = session.scalars(
+                select(SqlSessionSuccession)
+                .where(
+                    SqlSessionSuccession.workspace_id == current_workspace_id(),
+                    SqlSessionSuccession.phase != "done",
+                )
+                .order_by(SqlSessionSuccession.created_at, SqlSessionSuccession.id)
+                .limit(limit)
+            )
+            return [_to_session_succession(row) for row in rows]
+
+    def update_succession(
+        self,
+        receipt_id: str,
+        *,
+        expected_phase: str,
+        **fields: Any,
+    ) -> bool:
+        """Advance a receipt with a phase compare-and-set.
+
+        Serializes concurrent resumers: the update lands only while the row
+        still sits in ``expected_phase``. JSON columns (``opening``,
+        ``dropped``, ``questions``) accept Python dicts/lists and are
+        serialized here; ``updated_at`` is always refreshed.
+        """
+        values: dict[str, Any] = dict(fields)
+        for key in ("opening", "dropped", "questions"):
+            if key in values and values[key] is not None:
+                values[key] = json.dumps(values[key])
+        values["updated_at"] = now_epoch()
+
+        def write(session: Session) -> bool:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlSessionSuccession)
+                    .where(
+                        SqlSessionSuccession.workspace_id == current_workspace_id(),
+                        SqlSessionSuccession.id == receipt_id,
+                        SqlSessionSuccession.phase == expected_phase,
+                    )
+                    .values(**values)
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "update_succession",
+            write,
+        )
 
     def clear_model_override_if_matches(
         self,

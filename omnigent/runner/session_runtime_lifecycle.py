@@ -184,6 +184,14 @@ class SessionRuntimeLifecycle:
         """Return the latest revision observed for one archive-operation scope."""
         return self._state(session_id).archive_states.get(scope_id, (-1, False))[0]
 
+    def archive_scope_ids(self, session_id: str) -> tuple[str, ...]:
+        """Return the archive-operation scopes currently cached for one session."""
+        return tuple(self._state(session_id).archive_states)
+
+    def forget_archive_scope(self, session_id: str, scope_id: str) -> None:
+        """Drop a cached archive scope that no longer covers the session."""
+        self._state(session_id).archive_states.pop(scope_id, None)
+
     def archive_fence_matches(
         self,
         session_id: str,

@@ -65,6 +65,7 @@ from omnigent.native._native_post_delivery import (
     RepostResult,
     append_dead_letter,
     post_may_have_been_delivered,
+    post_session_succession,
     replay_dead_letters,
 )
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
@@ -2778,6 +2779,11 @@ async def _maybe_rotate_session_on_thread_started(
         old_session_id,
         new_session_id,
         new_thread_id,
+    )
+    await post_session_succession(
+        ap_client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
     )
     return True
 

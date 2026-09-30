@@ -307,6 +307,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     PINNED_LABEL_KEY,
+    SUCCESSION_OPERATION_LABEL_KEYS,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     drop_server_secret_labels,
@@ -10675,6 +10676,35 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {ARTIFACT_LINK_KEY_LABEL!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Succession operation labels are written by the move transaction or the
+    # handover tool only. A client write would forge lineage routing
+    # (``succeeded_by`` redirects everything addressed to the old id) or a
+    # rotation request, so every one of them is refused outside a create
+    # (where :func:`_strip_succession_operation_labels` drops copied ones).
+    for key in SUCCESSION_OPERATION_LABEL_KEYS:
+        if key in labels:
+            raise OmnigentError(
+                f"label {key!r} is server-managed and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+
+def _strip_succession_operation_labels(labels: dict[str, str] | None) -> None:
+    """
+    Drop copied succession operation labels from a session-create body.
+
+    A rotation client copies the old session's labels wholesale, which would
+    replay one rotation's per-operation facts (``succeeded_by``, ``succeeds``,
+    ``handover_item``, ``rotate_requested``) as the new session's own. They
+    are stripped before persistence and before
+    :func:`_reject_server_reserved_label_seed` would refuse the copy.
+
+    :param labels: The client-supplied initial labels, mutated in place.
+    """
+    if not labels:
+        return
+    for key in SUCCESSION_OPERATION_LABEL_KEYS:
+        labels.pop(key, None)
 
 
 def _member_model_id(row: Mapping[str, Any]) -> str | None:
@@ -12868,6 +12898,7 @@ __all__ = [
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",
+    "_strip_succession_operation_labels",
     "_structured_ask_user_question",
     "_targeted_elicitation_event",
     "_title_content_from_item",

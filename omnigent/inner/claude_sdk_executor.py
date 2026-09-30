@@ -956,7 +956,12 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
 
     examples = [
         name
-        for name in ("sys_session_rename", "sys_session_send", "sys_session_create")
+        for name in (
+            "sys_session_rename",
+            "sys_session_handover",
+            "sys_session_send",
+            "sys_session_create",
+        )
         if name in tool_names
     ]
     if examples:

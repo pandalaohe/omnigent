@@ -7196,6 +7196,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           queryKey: childSessionsQueryKey(event.conversationId),
         });
       }
+      // A succession re-announces moved children, so their cached parent snapshot is stale.
+      if (event.childSessionId) {
+        queryClient?.invalidateQueries({
+          queryKey: ["session", event.childSessionId],
+        });
+      }
       return;
     case "session_superseded":
       // The conversation we're viewing was rotated away (e.g. Claude
@@ -7213,6 +7219,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         if (s.conversationId !== event.conversationId) return {};
         if (event.targetConversationId === s.conversationId) return {};
         return { redirectToConversationId: event.targetConversationId };
+      });
+      // A succession moves live children between parents: refresh both lists.
+      queryClient?.invalidateQueries({
+        queryKey: childSessionsQueryKey(event.conversationId),
+      });
+      queryClient?.invalidateQueries({
+        queryKey: childSessionsQueryKey(event.targetConversationId),
       });
       // The rotation happened mid-input: the `/clear` (or whatever the user just
       // sent) never gets a `session.input.consumed` on THIS conversation — the

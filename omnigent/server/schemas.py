@@ -2789,6 +2789,40 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
+class SessionSuccessionRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/succession``.
+
+    Starts (or resumes) handing the caller session's live children to the
+    target session.
+
+    :param target_session_id: The successor session that takes the caller's
+        live children, e.g. ``"conv_abc123"``. Must be a top-level session
+        the caller can edit.
+    """
+
+    target_session_id: str = Field(min_length=1)
+
+
+class SessionHandoverRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/handover``.
+
+    Records a handover note on a top-level native session and optionally
+    requests that the session rotate at its next turn end.
+
+    :param handover: The note the successor session opens with. Must be
+        non-empty after stripping whitespace.
+    :param rotate: When ``True`` (the default), the session is cleared at
+        the end of its current turn and continues in a new session that
+        receives the note and the session's live sub-agents. When
+        ``False``, only the note is recorded.
+    """
+
+    handover: str = Field(min_length=1)
+    rotate: bool = True
+
+
 class SessionForkRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.

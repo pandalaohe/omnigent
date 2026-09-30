@@ -2754,6 +2754,8 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
             "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer"
         ):
             return httpx.Response(200, json={"id": "terminal_codex_main"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/succession":
+            return httpx.Response(200, json={"status": "noop"})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_new/events":
             assert isinstance(body, dict)
             posted_events.append(("conv_new", body))
@@ -2867,6 +2869,12 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     assert (
         "POST",
         "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer",
+        {"target_session_id": "conv_new"},
+    ) in requests
+    # The rotation hands the old session's live children to the replacement.
+    assert (
+        "POST",
+        "/v1/sessions/conv_old/succession",
         {"target_session_id": "conv_new"},
     ) in requests
     assert [
@@ -12136,6 +12144,73 @@ def test_forwarder_child_thread_started_does_not_rotate_parent_session(
         "it rotated. _thread_started_is_subagent guard is missing or broken."
     )
     # No Omnigent calls should have been made during rotation detection.
+    assert ap_posts == []
+
+
+def test_forwarder_ephemeral_thread_started_does_not_rotate_parent_session(
+    tmp_path: Path,
+) -> None:
+    """
+    An ephemeral ``thread/started`` event does not rotate the parent session.
+
+    Codex emits a second, non-persistable housekeeping thread mid-turn
+    (``ephemeral=true``). Rotating onto it would strand the real turn's output
+    and, with succession, could move live children under a throwaway session.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path=str(tmp_path / "sock"),
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+
+    ephemeral_thread_started_event: dict[str, Any] = {
+        "method": "thread/started",
+        "params": {
+            "thread": {
+                "id": "thread_housekeeping",
+                "ephemeral": True,
+                "path": None,
+            }
+        },
+    }
+    ap_posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def run() -> bool:
+        """
+        Drive the ephemeral thread-started event through the rotation check.
+
+        :returns: Whether a session rotation occurred.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler(ap_posts)),
+        ) as ap_client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id="conv_parent",
+                thread_id="thread_parent",
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    ap_client, "conv_parent"
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                    ap_client, "conv_parent"
+                ),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            return await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=ap_client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "sock"),
+                event=ephemeral_thread_started_event,
+            )
+
+    rotated = asyncio.run(run())
+    assert rotated is False
+    # No rotation means no replacement and no succession POST.
     assert ap_posts == []
 
 

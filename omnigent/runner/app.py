@@ -1861,6 +1861,14 @@ class _SubagentDeliveryAck:
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
+# Old session id → its successor, seen by this runner. A work entry registered
+# from a parent snapshot read before the server moved the children is rewritten
+# through this map, closing the read-before-move race.
+_succeeded_parents: dict[str, str] = {}
+# Successor session id → inbox items held until the server posts the opening
+# message and calls ``/succession/release``. Completions for a held successor
+# land here instead of its live inbox and never wake it.
+_held_successions: dict[str, list[_JsonObject]] = {}
 # Drained children's last delivered result keys. A later terminal edge whose
 # result key matches is a duplicate; a different key is the child's next turn.
 _drained_delivered_subagent_results: dict[str, str | None] = {}
@@ -1928,6 +1936,26 @@ _session_member_entries: dict[str, dict[str, dict[str, Any]]] = {}
 # the obligations its own turn opened from an unrelated turn's.
 _member_turn_stamps: dict[str, int] = {}
 _member_turn_counter = itertools.count(1)
+
+# Sessions whose ``sys_session_handover`` asked for a rotation. Armed when the
+# tool dispatches; consumed by the native idle edge, which types /clear into
+# the session's terminal. No retry: a failure leaves the label for a manual
+# /clear.
+_pending_rotations: set[str] = set()
+
+
+def record_pending_rotation(session_id: str) -> None:
+    """Arm a turn-end rotation for *session_id*."""
+    _pending_rotations.add(session_id)
+
+
+def pop_pending_rotation(session_id: str) -> bool:
+    """Consume and report whether *session_id* has an armed rotation."""
+    if session_id not in _pending_rotations:
+        return False
+    _pending_rotations.discard(session_id)
+    return True
+
 
 # The one runtime follow-up's text, composed and recognized in one place: the
 # runner must never parse its own ``[System: …]`` posts for mentions, and the
@@ -2113,6 +2141,23 @@ def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
     return lock
 
 
+# A succession chain is at most a few rotations deep; the bound only stops a
+# cyclic map from looping forever.
+_SUCCESSOR_MAX_HOPS = 8
+
+
+def _resolve_succeeded_parent(parent_session_id: str) -> str:
+    """Follow the succession chain from a stale parent to its live successor."""
+    seen = {parent_session_id}
+    for _ in range(_SUCCESSOR_MAX_HOPS):
+        successor = _succeeded_parents.get(parent_session_id)
+        if successor is None or successor in seen:
+            break
+        parent_session_id = successor
+        seen.add(successor)
+    return parent_session_id
+
+
 def register_subagent_work(
     *,
     parent_session_id: str,
@@ -2161,6 +2206,7 @@ def register_subagent_work(
         child already belonged to the flow.
     :returns: The registered work entry.
     """
+    parent_session_id = _resolve_succeeded_parent(parent_session_id)
     prior = _subagent_work_by_child.get(child_session_id)
     if prior is not None:
         children = _subagent_work_by_parent.get(prior.parent_session_id)
@@ -2207,6 +2253,51 @@ def register_subagent_work(
 
         note_child_dispatch(parent_session_id, child_session_id)
     return entry
+
+
+def _rekey_subagent_work_for_succession(
+    old_parent_id: str,
+    new_parent_id: str,
+) -> None:
+    """
+    Move this runner's delivery state for a rotated session onto its successor.
+
+    Only work entries currently parented by *old_parent_id* re-key. A
+    grandchild the server also moved belongs to its own moved parent and keeps
+    it, so its result reaches that parent rather than the successor; a late
+    registration against the stale parent is rewritten at registration through
+    ``_succeeded_parents``.
+
+    :param old_parent_id: The retired parent session, e.g. ``"conv_old123"``.
+    :param new_parent_id: Its successor, e.g. ``"conv_new456"``.
+    """
+    for child_id in list(_subagent_work_by_parent.get(old_parent_id, set())):
+        entry = _subagent_work_by_child.get(child_id)
+        if entry is None or entry.parent_session_id != old_parent_id:
+            continue
+        siblings = _subagent_work_by_parent.get(old_parent_id)
+        if siblings is not None:
+            siblings.discard(child_id)
+            if not siblings:
+                _subagent_work_by_parent.pop(old_parent_id, None)
+        entry.parent_session_id = new_parent_id
+        _subagent_work_by_parent.setdefault(new_parent_id, set()).add(child_id)
+    # A drained child left the work index, but its retained result key and
+    # fan-out metadata are still owned by the old parent; follow the successor
+    # so a later per-parent teardown cannot drop the new mother's state.
+    for child_id, parent_id in list(_subagent_retained_state_parents.items()):
+        if parent_id == old_parent_id:
+            _subagent_retained_state_parents[child_id] = new_parent_id
+    for child_id, meta in list(_child_session_parents.items()):
+        if meta.parent_id != old_parent_id:
+            continue
+        register_child_session(
+            child_id,
+            parent_session_id=new_parent_id,
+            title=meta.title,
+            tool=meta.tool,
+            session_name=meta.session_name,
+        )
 
 
 def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -2896,6 +2987,35 @@ def _deliver_subagent_completion(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_QUIET,
         )
+    output = entry.output
+    if output is None:
+        output = "[System: sub-agent completed with no output]"
+    payload: _JsonObject = {
+        "type": "sub_agent",
+        "work_id": entry.work_id,
+        "task_id": entry.child_session_id,
+        "handle_id": entry.child_session_id,
+        "conversation_id": entry.child_session_id,
+        "tool_name": entry.agent,
+        "agent": entry.agent,
+        "title": entry.title,
+        "status": entry.status,
+        "output": output,
+        "placement_label": entry.placement_label,
+    }
+    held = _held_successions.get(entry.parent_session_id)
+    if held is not None:
+        # A successor still waiting for its opening message must not be woken
+        # by a child result; the held buffer drains on release.
+        held.append(payload)
+        entry.delivered = True
+        entry.delivered_result_key = result_key
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_DELIVERED,
+        )
     inbox = _session_inboxes_ref.get(entry.parent_session_id)
     if inbox is None:
         _logger.warning(
@@ -2909,24 +3029,7 @@ def _deliver_subagent_completion(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
         )
-    output = entry.output
-    if output is None:
-        output = "[System: sub-agent completed with no output]"
-    inbox.put_nowait(
-        {
-            "type": "sub_agent",
-            "work_id": entry.work_id,
-            "task_id": entry.child_session_id,
-            "handle_id": entry.child_session_id,
-            "conversation_id": entry.child_session_id,
-            "tool_name": entry.agent,
-            "agent": entry.agent,
-            "title": entry.title,
-            "status": entry.status,
-            "output": output,
-            "placement_label": entry.placement_label,
-        }
-    )
+    inbox.put_nowait(payload)
     entry.delivered = True
     entry.delivered_result_key = result_key
     return _SubagentDeliveryAck(
@@ -4029,10 +4132,11 @@ def create_runner_app(
 
     app.state.cli_runtime_lifecycle = _cli_runtime_lifecycle
 
-    def _apply_archive_states(session_id: str, raw_states: object) -> None:
-        """Apply well-formed Server archive scopes and ignore malformed hints."""
+    def _apply_archive_states(session_id: str, raw_states: object) -> set[str]:
+        """Apply well-formed Server archive scopes; return the accepted scope ids."""
+        applied: set[str] = set()
         if not isinstance(raw_states, list):
-            return
+            return applied
         for raw_state in raw_states:
             if not isinstance(raw_state, dict):
                 continue
@@ -4054,6 +4158,8 @@ def create_runner_app(
                 revision=revision,
                 archived=archived,
             )
+            applied.add(scope_id)
+        return applied
 
     # Conversations whose claude-sdk `/compact` published an up-front
     # `response.compaction.in_progress`. Used to (a) swallow the executor's own
@@ -6258,6 +6364,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _pending_rotations.discard(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -6341,6 +6448,10 @@ def create_runner_app(
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
+        _held_successions.pop(session_id, None)
+        for _old_id, _successor_id in list(_succeeded_parents.items()):
+            if session_id in (_old_id, _successor_id):
+                del _succeeded_parents[_old_id]
         _subagent_recovery_done.discard(session_id)
         _subagent_recovery_locks.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
@@ -8214,7 +8325,14 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
-    async def _handle_claude_native_compact(conv_id: str) -> Response:
+    async def _handle_claude_native_slash_command(
+        conv_id: str,
+        command: str,
+        *,
+        error_code: str,
+        context: str,
+    ) -> Response:
+        """Type one slash command into a live claude-native pane."""
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
@@ -8230,27 +8348,42 @@ def create_runner_app(
             await asyncio.to_thread(
                 inject_slash_command,
                 bridge_dir,
-                command="/compact",
+                command=command,
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "claude_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native compact"),
+                    "error": error_code,
+                    "detail": _client_safe_error_detail(exc, context=context),
                 },
             )
         return Response(status_code=200)
 
-    async def _handle_codex_native_compact(conv_id: str) -> Response:
+    async def _handle_claude_native_compact(conv_id: str) -> Response:
+        return await _handle_claude_native_slash_command(
+            conv_id,
+            "/compact",
+            error_code="claude_native_compact_failed",
+            context="claude-native compact",
+        )
+
+    async def _handle_codex_native_slash_command(
+        conv_id: str,
+        command: str,
+        *,
+        error_code: str,
+        context: str,
+    ) -> Response:
+        """Type one slash command into a live codex pane."""
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
+                    "error": error_code,
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
@@ -8259,16 +8392,119 @@ def create_runner_app(
         target = instance.tmux_target
 
         try:
-            await asyncio.to_thread(_inject_codex_compact, socket_path, target)
+            await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, command)
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                    "error": error_code,
+                    "detail": _client_safe_error_detail(exc, context=context),
                 },
             )
         return Response(status_code=200)
+
+    async def _handle_codex_native_compact(conv_id: str) -> Response:
+        return await _handle_codex_native_slash_command(
+            conv_id,
+            "/compact",
+            error_code="codex_native_compact_failed",
+            context="codex-native compact",
+        )
+
+    async def _run_pending_rotation(conv_id: str) -> None:
+        """Type ``/clear`` for a session whose handover asked for rotation.
+
+        The server is the source of truth: a session archived (or rotated)
+        since the request must not be cleared again, and the label is the
+        request's durable record. Any failure is logged and never retried —
+        the label stays and the user can ``/clear`` by hand.
+        """
+        from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                params=_SESSION_METADATA_PARAMS,
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 - a failed read just skips the rotation.
+            _logger.warning(
+                "Pending rotation could not read session %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return
+        if resp.status_code != 200:
+            _logger.warning(
+                "Pending rotation read of session %s returned %d",
+                conv_id,
+                resp.status_code,
+                extra={"session_id": conv_id},
+            )
+            return
+        try:
+            snapshot = resp.json()
+        except ValueError:
+            return
+        if not isinstance(snapshot, dict) or snapshot.get("archived") is True:
+            return
+        labels = snapshot.get("labels")
+        if not isinstance(labels, dict) or not labels.get(ROTATE_REQUESTED_LABEL_KEY):
+            return
+        harness = snapshot.get("harness")
+        if not isinstance(harness, str) or not harness:
+            harness = _session_harness_name(conv_id)
+        try:
+            if harness == "claude-native":
+                response = await _handle_claude_native_slash_command(
+                    conv_id,
+                    "/clear",
+                    error_code="claude_native_clear_failed",
+                    context="claude-native clear",
+                )
+            elif harness == "codex-native":
+                response = await _handle_codex_native_slash_command(
+                    conv_id,
+                    "/clear",
+                    error_code="codex_native_clear_failed",
+                    context="codex-native clear",
+                )
+            else:
+                _logger.warning(
+                    "Pending rotation: unsupported harness %r for session %s",
+                    harness,
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                return
+        except Exception:  # noqa: BLE001 - no retry; the label remains for a manual clear.
+            _logger.warning(
+                "Pending rotation /clear failed for session %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return
+        if response.status_code >= 400:
+            _logger.warning(
+                "Pending rotation /clear was refused for session %s (status %d)",
+                conv_id,
+                response.status_code,
+                extra={"session_id": conv_id},
+            )
+
+    def _schedule_pending_rotation(session_id: str) -> None:
+        """Consume an armed rotation at the session's native idle edge."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if not pop_pending_rotation(session_id):
+            return
+        task = loop.create_task(_run_pending_rotation(session_id))
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
 
     async def _handle_opencode_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
@@ -8460,14 +8696,14 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
-    def _inject_codex_compact(socket_path: str, target: str) -> None:
-        # Typing "/compact" opens Codex's slash-command popup, which draws
+    def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        # Typing a slash command opens Codex's slash-command popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
@@ -12178,6 +12414,7 @@ def create_runner_app(
                     # A native lead's turn end is the forwarder's idle edge, the
                     # counterpart of _on_proxy_stream_end for non-native leads.
                     _handle_member_turn_end(conversation_id)
+                    _schedule_pending_rotation(conversation_id)
             if isinstance(data, dict) and data.get("cross_host") is True:
                 # A cross-host child's terminal edge is delivered through the
                 # PARENT's runner; this runner gets it as a mirror only, for
@@ -12577,6 +12814,128 @@ def create_runner_app(
                 },
             )
         return _forward_harness_response(resp)
+
+    @app.post("/v1/sessions/{session_id}/succession")
+    async def post_session_succession(session_id: str, request: Request) -> JSONResponse:
+        """Re-key this runner's delivery state for a rotated session onto its successor."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            body = None
+        target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
+        moved_ids = body.get("moved_ids") if isinstance(body, dict) else None
+        archive_states = body.get("archive_states") if isinstance(body, dict) else None
+        if archive_states is None:
+            archive_states = {}
+        if (
+            not isinstance(target_session_id, str)
+            or not target_session_id
+            or target_session_id == session_id
+            or not isinstance(moved_ids, list)
+            or not all(isinstance(moved_id, str) and moved_id for moved_id in moved_ids)
+            or not isinstance(archive_states, dict)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_input", "detail": "invalid succession request body"},
+            )
+        # A runner that holds none of the retired session's state is a moved
+        # child's host runner: it has nothing to drain or hold, so the
+        # successor's inbox is not required there.
+        if target_session_id not in _session_inboxes and (
+            session_id in _session_inboxes or _subagent_work_by_parent.get(session_id)
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={"error": "target_not_ready"},
+            )
+        # Only the first call opens the hold: a repeat after release must not
+        # re-hold a successor that no later release would drain.
+        first_call = _succeeded_parents.get(session_id) != target_session_id
+        _succeeded_parents[session_id] = target_session_id
+        _rekey_subagent_work_for_succession(session_id, target_session_id)
+        if first_call and target_session_id in _session_inboxes:
+            # Hold the successor's delivery until the server posts the opening
+            # message: the retired session's queued items move here first, and
+            # later completions are appended by ``_deliver_subagent_completion``.
+            held = _held_successions.setdefault(target_session_id, [])
+            old_inbox = _session_inboxes.pop(session_id, None)
+            if old_inbox is not None:
+                while not old_inbox.empty():
+                    held.append(old_inbox.get_nowait())
+        for moved_id in dict.fromkeys(moved_ids):
+            sent_scopes = _apply_archive_states(moved_id, archive_states.get(moved_id))
+            for scope_id in _cli_runtime_lifecycle.archive_scope_ids(moved_id):
+                if scope_id != moved_id and scope_id not in sent_scopes:
+                    _cli_runtime_lifecycle.forget_archive_scope(moved_id, scope_id)
+        from omnigent.runner.flows import cancel_flow, list_flows
+
+        dropped: list[_JsonObject] = []
+        try:
+            flows_payload = json.loads(list_flows(session_id))
+        except ValueError:
+            flows_payload = {}
+        flows = flows_payload.get("flows") if isinstance(flows_payload, dict) else None
+        flow_list: list[_JsonObject] = (
+            [flow for flow in flows if isinstance(flow, dict)] if isinstance(flows, list) else []
+        )
+        flow_ids = {flow["flow_id"] for flow in flow_list if isinstance(flow.get("flow_id"), str)}
+        for timer_id, timer_task in list(_session_timers.get(session_id, {}).items()):
+            if timer_id in flow_ids:
+                continue
+            if cancel_timer(session_id, timer_id):
+                dropped.append({"kind": "timer", "id": timer_id, "label": timer_task.get_name()})
+        for flow in flow_list:
+            flow_id = flow.get("flow_id")
+            if not isinstance(flow_id, str):
+                continue
+            await cancel_flow(session_id, flow_id)
+            label = flow.get("note")
+            if not isinstance(label, str) or not label:
+                steps = flow.get("steps")
+                label = (
+                    steps[0]
+                    if isinstance(steps, list) and steps and isinstance(steps[0], str)
+                    else ""
+                )
+            dropped.append({"kind": "flow", "id": flow_id, "label": label})
+        for handle_id, (async_task, cancel_event) in list(
+            _session_async_tasks.get(session_id, {}).items()
+        ):
+            cancel_event.set()
+            if not async_task.done():
+                async_task.cancel()
+            dropped.append({"kind": "async", "id": handle_id, "label": async_task.get_name()})
+        return JSONResponse(
+            status_code=200,
+            content={"status": "rekeyed", "dropped": dropped},
+        )
+
+    @app.post("/v1/sessions/{session_id}/succession/release")
+    async def post_session_succession_release(session_id: str) -> JSONResponse:
+        """Drain a held successor's buffer into its live inbox and wake it once."""
+        held = _held_successions.pop(session_id, None)
+        if held is None:
+            return JSONResponse(
+                status_code=200,
+                content={"status": "released", "delivered": 0},
+            )
+        inbox = _session_inboxes.setdefault(session_id, asyncio.Queue())
+        for item in held:
+            inbox.put_nowait(item)
+        _deliver_retained_subagent_results(session_id)
+        if held:
+            entries = [
+                entry for entry in list_subagent_work(session_id) if entry.completed_at is not None
+            ]
+            if entries:
+                _wake_for_delivered_result(
+                    max(entries, key=lambda entry: entry.completed_at or 0.0)
+                )
+        return JSONResponse(
+            status_code=200,
+            content={"status": "released", "delivered": len(held)},
+        )
 
     async def _resolve_conversation_id(response_id: str) -> str | None:
         return _resp_to_conv.get(response_id)

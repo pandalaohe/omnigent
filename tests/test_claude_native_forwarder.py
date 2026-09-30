@@ -903,6 +903,166 @@ async def test_post_clear_supersession_swallows_post_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_session_succession_posts_old_and_new_ids() -> None:
+    """
+    Succession is one POST to the old session naming the replacement target.
+
+    The server acts on the old id, so the loop must not substitute the
+    already-rotated-to session for it. The 60 s per-request timeout is the
+    helper's own: the forwarder's shared client timeout is far too short for
+    a phased move.
+    """
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+    timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the succession POST and return a done receipt."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"status": "done"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder.post_session_succession(
+            client,
+            old_session_id="conv_old",
+            new_session_id="conv_new",
+        )
+
+    assert calls == [
+        ("POST", "/v1/sessions/conv_old/succession", {"target_session_id": "conv_new"})
+    ]
+    assert timeouts[0]["read"] == 60.0
+
+
+@pytest.mark.asyncio
+async def test_post_session_succession_skips_when_old_equals_new() -> None:
+    """
+    Succession is a no-op when old and new ids collapse to one.
+
+    Posting to the live session would create a bogus self-succession receipt.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail loudly — no POST should happen."""
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder.post_session_succession(
+            client,
+            old_session_id="conv_same",
+            new_session_id="conv_same",
+        )
+
+
+@pytest.mark.asyncio
+async def test_post_session_succession_retries_5xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 5xx is transient: the helper retries and succeeds on a later attempt.
+
+    The server keeps one receipt per (old, new) pair, so re-POSTing after a
+    server-side failure cannot double-move the children.
+    """
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail the first two attempts, then accept."""
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(503, json={"error": {"message": "unavailable"}})
+        return httpx.Response(200, json={"status": "done"})
+
+    monkeypatch.setattr(
+        "omnigent.native._native_post_delivery._SUCCESSION_RETRY_DELAYS_S",
+        (0.0, 0.0),
+    )
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder.post_session_succession(
+            client,
+            old_session_id="conv_old",
+            new_session_id="conv_new",
+        )
+
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_post_session_succession_does_not_retry_4xx(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A 4xx refusal (e.g. a 409 title clash) is permanent: exactly one attempt.
+
+    Retrying a refusal cannot change its outcome, and the rotation must not
+    stall waiting on one. The refusal is still logged.
+    """
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Refuse the succession."""
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(409, json={"error": {"message": "child title clash"}})
+
+    transport = httpx.MockTransport(handler)
+    with caplog.at_level(logging.WARNING):
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            await forwarder.post_session_succession(
+                client,
+                old_session_id="conv_old",
+                new_session_id="conv_new",
+            )
+
+    assert attempts == 1
+    assert any(
+        "session succession" in record.getMessage() and "409" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_session_succession_swallows_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A transport error on every attempt is logged and swallowed, not raised.
+
+    The rotation has already happened by the time this runs, so an
+    unreachable server must never break the poll loop.
+    """
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail the connection on every attempt."""
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("refused", request=request)
+
+    monkeypatch.setattr(
+        "omnigent.native._native_post_delivery._SUCCESSION_RETRY_DELAYS_S",
+        (0.0, 0.0),
+    )
+    transport = httpx.MockTransport(handler)
+    with caplog.at_level(logging.WARNING):
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+            await forwarder.post_session_succession(
+                client,
+                old_session_id="conv_old",
+                new_session_id="conv_new",
+            )
+
+    assert attempts == 3
+    assert any("session succession" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_clear_hook_consumes_hook_rotated_session_without_duplicate_fork(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -968,6 +1128,209 @@ async def test_clear_hook_consumes_hook_rotated_session_without_duplicate_fork(
     assert rotated_again is None
     assert read_active_session_id(bridge_dir) == "conv_new"
     assert (bridge_dir / "hook_forwarder.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_forwarder_starts_succession_before_clear_supersession(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The /clear poll branch starts succession with the pre-rotation id first.
+
+    A hook-rotated clear has already rewritten the bridge's active session id
+    by the time the forwarder sees it, so the old id must come from the loop's
+    ``session_id``, not the bridge. The move must also be posted before the
+    supersession notice redirects old-session viewers to the replacement.
+    """
+    bridge_dir = prepare_bridge_dir(
+        "conv_old",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    write_active_session_id(bridge_dir, "conv_new")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "clear",
+            "omnigent_clear_rotated_to": "conv_new",
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        recorded = [await _get_recorded_request(server) for _ in range(4)]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert (recorded[0]["path"], recorded[0]["body"]) == (
+        "/v1/sessions/conv_old/succession",
+        {"target_session_id": "conv_new"},
+    )
+    # The three supersession events follow, and all address the old session.
+    assert [request["path"] for request in recorded[1:]] == ["/v1/sessions/conv_old/events"] * 3
+
+
+@pytest.mark.asyncio
+async def test_forwarder_survives_succession_transport_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A succession POST that fails on every attempt does not break the loop.
+
+    The rotation is already complete when the helper runs, so the
+    supersession notice must still go out after the helper gives up.
+    """
+    bridge_dir = prepare_bridge_dir(
+        "conv_old",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    write_active_session_id(bridge_dir, "conv_new")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "clear",
+            "omnigent_clear_rotated_to": "conv_new",
+        },
+    )
+    succession_attempts = 0
+    events_finished = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Refuse the succession; accept the supersession events."""
+        nonlocal succession_attempts
+        if request.url.path == "/v1/sessions/conv_old/succession":
+            succession_attempts += 1
+            raise httpx.ConnectError("refused", request=request)
+        if (
+            request.url.path == "/v1/sessions/conv_old/events"
+            and json.loads(request.content)["type"] == "external_session_superseded"
+        ):
+            events_finished.set()
+        return httpx.Response(202, json={})
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(
+        "omnigent.native._native_post_delivery._SUCCESSION_RETRY_DELAYS_S",
+        (0.0, 0.0),
+    )
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(events_finished.wait(), timeout=5.0)
+        assert not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert succession_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_forwarder_fork_rotation_posts_no_succession(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A /fork rotation starts no succession: the forked-from session stays live.
+
+    Only /clear hands children to a replacement; a fork keeps the old session
+    running as the parent of the new branch.
+    """
+    bridge_dir = prepare_bridge_dir(
+        "conv_old",
+        bridge_id="bridge_shared",
+        workspace=tmp_path,
+    )
+    fork_rotations = 0
+
+    async def fake_rotate_on_clear(**_kwargs: Any) -> None:
+        return None
+
+    async def fake_rotate_on_fork(**_kwargs: Any) -> str | None:
+        nonlocal fork_rotations
+        fork_rotations += 1
+        return "conv_fork" if fork_rotations == 1 else None
+
+    fork_branch_finished = asyncio.Event()
+
+    async def fake_mirror_external_session_id(**_kwargs: Any) -> bool:
+        fork_branch_finished.set()
+        return True
+
+    monkeypatch.setattr(forwarder, "_maybe_rotate_session_on_clear", fake_rotate_on_clear)
+    monkeypatch.setattr(forwarder, "_maybe_rotate_session_on_fork", fake_rotate_on_fork)
+    monkeypatch.setattr(
+        forwarder, "_maybe_mirror_external_session_id", fake_mirror_external_session_id
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_old",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # The next poll after the fork branch proves the branch ran; any
+        # succession POST would have been recorded before this point.
+        await asyncio.wait_for(fork_branch_finished.wait(), timeout=5.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    drained: list[dict[str, Any]] = []
+    while True:
+        try:
+            drained.append(server.requests.get_nowait())
+        except queue.Empty:
+            break
+    assert not [request for request in drained if request["path"].endswith("/succession")]
 
 
 @pytest.mark.asyncio

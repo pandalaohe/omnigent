@@ -244,6 +244,29 @@ async def test_reply_to_passthrough() -> None:
 
 
 @pytest.mark.asyncio
+async def test_redirected_send_rewrites_the_target() -> None:
+    """A route ``redirected_to`` becomes the tool result's own target."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_snapshot(parent="conv_other"))
+        return httpx.Response(200, json=_send_response(redirected_to="conv_successor"))
+
+    async with _client(handler) as client:
+        out = json.loads(
+            await _send_to_existing_session(
+                _TARGET,
+                "hi",
+                server_client=client,
+                conversation_id=_CALLER,
+                peer_messaging_enabled=True,
+            )
+        )
+    assert out["conversation_id"] == "conv_successor"
+    assert out["redirected_to"] == "conv_successor"
+
+
+@pytest.mark.asyncio
 async def test_feature_disabled_maps_to_peer_messaging_disabled() -> None:
     """``refused(feature_disabled)`` becomes the ``peer_messaging_disabled`` error."""
 

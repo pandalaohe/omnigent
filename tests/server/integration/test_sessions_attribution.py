@@ -33,6 +33,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store import SUCCEEDED_BY_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -583,3 +584,207 @@ async def test_external_conversation_item_direct_terminal_attributes_request_act
     # If this is None, _persist_external_conversation_item stopped reading
     # created_by from the request and direct terminal typing has no author label.
     assert persisted.created_by == "alice@example.com"
+
+
+# ── Succession: runner wakes to a succeeded session reach the successor ─────
+
+
+def _seed_succession_pair(db_uri: str) -> tuple[str, str]:
+    """Two EDIT-granted sessions with ``old`` carrying ``succeeded_by=new``."""
+    old_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    new_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    SqlAlchemyConversationStore(db_uri).set_labels(old_id, {SUCCEEDED_BY_LABEL_KEY: new_id})
+    return old_id, new_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_to", ["successor", "old"])
+async def test_post_event_forwards_a_runner_wake_to_the_successor(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    bound_to: str,
+) -> None:
+    """A runner wake posted to ``old`` lands on ``new``.
+
+    The rotation clears the old binding before succession writes the label,
+    so the token normally proves the runner against the successor; the
+    ``old`` case pins the pre-clear race where the old binding still stands.
+    """
+    from omnigent.runner.app import _format_subagent_wake_notice
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    old_id, new_id = _seed_succession_pair(db_uri)
+    runner_headers = _bind_runner(db_uri, new_id if bound_to == "successor" else old_id)
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=1
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{old_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": notice}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["queued"] is True
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    new_items = await asyncio.to_thread(conv_store.list_items, new_id)
+    assert [item.data.content[0]["text"] for item in new_items.data] == [notice]
+    old_items = await asyncio.to_thread(conv_store.list_items, old_id)
+    assert old_items.data == []
+
+
+@pytest.mark.asyncio
+async def test_post_event_wake_before_successor_release_is_not_dispatched(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake redirected while the receipt is pre-release waits for the runner."""
+    from omnigent.runner.app import _format_subagent_wake_notice
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    old_id, new_id = _seed_succession_pair(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.create_conversation(parent_conversation_id=old_id, title="A")
+    conv_store.reassign_live_children(old_id, new_id, "rcpt-wake")
+    assert (
+        conv_store.update_succession("rcpt-wake", expected_phase="moved", phase="rekeyed") is True
+    )
+    runner_headers = _bind_runner(db_uri, new_id)
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=1
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{old_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": notice}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+
+    old_items = await asyncio.to_thread(conv_store.list_items, old_id)
+    assert old_items.data == []
+    new_items = await asyncio.to_thread(conv_store.list_items, new_id)
+    assert new_items.data == []
+
+
+@pytest.mark.asyncio
+async def test_post_event_wake_held_when_a_later_chain_link_is_pre_release(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake crossing ``old -> mid -> new`` holds on a pre-release link.
+
+    Only the ``mid -> new`` receipt is pre-release; the ``old -> mid``
+    receipt is done, so the pair lookup against the final successor finds
+    no receipt and the wake must not reach ``new``.
+    """
+    from omnigent.runner.app import _format_subagent_wake_notice
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    old_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    mid_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    new_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.create_conversation(parent_conversation_id=old_id, title="A")
+    conv_store.reassign_live_children(old_id, mid_id, "rcpt-ab")
+    assert conv_store.update_succession("rcpt-ab", expected_phase="moved", phase="done") is True
+    conv_store.reassign_live_children(mid_id, new_id, "rcpt-bc")
+    assert conv_store.update_succession("rcpt-bc", expected_phase="moved", phase="rekeyed") is True
+    runner_headers = _bind_runner(db_uri, new_id)
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=1
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{old_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": notice}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+
+    for session_id in (old_id, mid_id, new_id):
+        items = await asyncio.to_thread(conv_store.list_items, session_id)
+        assert items.data == []
+
+
+@pytest.mark.asyncio
+async def test_post_event_plain_message_to_a_succeeded_session_is_unchanged(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user message to a succeeded session stays there, not on the successor."""
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    old_id, new_id = _seed_succession_pair(db_uri)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{old_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    old_items = await asyncio.to_thread(conv_store.list_items, old_id)
+    assert [item.data.content[0]["text"] for item in old_items.data] == ["hello"]
+    new_items = await asyncio.to_thread(conv_store.list_items, new_id)
+    assert new_items.data == []

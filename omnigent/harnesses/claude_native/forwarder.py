@@ -62,6 +62,7 @@ from omnigent.native._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
+    post_session_succession,
 )
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.process_logging import harness_stderr_capture_enabled
@@ -1432,6 +1433,14 @@ async def forward_claude_transcript_to_session(
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
                         subagent_task = None
+                        # Start the move of the old session's live children
+                        # BEFORE the supersession notice redirects viewers; only
+                        # /clear starts one (a /fork keeps the old session alive).
+                        await post_session_succession(
+                            client,
+                            old_session_id=session_id,
+                            new_session_id=rotation,
+                        )
                         # Tell the superseded (old) conversation it was cleared:
                         # persist a notice linking to the rotated-to session and
                         # emit a live redirect event. Use the loop's ``session_id``

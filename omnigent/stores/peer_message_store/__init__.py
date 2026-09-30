@@ -156,6 +156,28 @@ class PeerMessageStore(ABC):
         ...
 
     @abstractmethod
+    def retarget_receiver(
+        self,
+        old_receiver_id: str,
+        new_receiver_id: str,
+        states: tuple[str, ...],
+    ) -> list[str]:
+        """
+        Re-address one receiver's not-yet-delivered records to another.
+
+        Used by session succession: messages still queued or held for a
+        retired session follow its successor instead of being lost with the
+        old id. Only records in ``states`` move — one already delivered (or
+        being delivered inline) keeps the receiver it reached.
+
+        :param old_receiver_id: Retired receiver session.
+        :param new_receiver_id: Successor that now receives the records.
+        :param states: Record states eligible to move.
+        :returns: Ids of the records moved, in no particular order.
+        """
+        ...
+
+    @abstractmethod
     def find_sent(
         self,
         sender_session_id: str,
