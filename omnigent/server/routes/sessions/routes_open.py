@@ -66,6 +66,22 @@ from omnigent.util.session_lifecycle import is_session_closed, title_without_clo
 _logger = logging.getLogger(__name__)
 
 
+def _normalized_path(value: str) -> str:
+    """Resolve lexical ``.``/``..`` segments in an absolute path.
+
+    Relative paths are returned unchanged; Windows absolute paths use
+    ``ntpath`` so drive letters and separators normpath the host's way.
+
+    :param value: A workspace or root path.
+    :returns: The path with redundant segments removed.
+    """
+    if _is_windows_absolute_path(value):
+        return ntpath.normpath(value)
+    if value.startswith("/"):
+        return posixpath.normpath(value)
+    return value
+
+
 class SessionOpenRequest(BaseModel):
     """Body of ``POST /sessions/{sender_id}/open``."""
 
@@ -97,11 +113,7 @@ class SessionOpenRequest(BaseModel):
         """:returns: the workspace with lexical ``.``/``..`` segments resolved."""
         if value is None:
             return None
-        if _is_windows_absolute_path(value):
-            return ntpath.normpath(value)
-        if value.startswith("/"):
-            return posixpath.normpath(value)
-        return value
+        return _normalized_path(value)
 
 
 def _problem(
@@ -380,7 +392,7 @@ def register_open_routes(
                 )
             if not (
                 body.workspace.startswith("/") or _is_windows_absolute_path(body.workspace)
-            ) or not _is_subpath_of(body.workspace, root.workspace):
+            ) or not _is_subpath_of(body.workspace, _normalized_path(root.workspace)):
                 return _problem(
                     state,
                     "workspace_outside_project",

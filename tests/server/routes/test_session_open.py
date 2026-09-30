@@ -848,6 +848,33 @@ async def test_workspace_dotdot_segments_normalised(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", ["/opt/work", "/opt/work/sub"])
+async def test_trailing_slash_root_contains_itself_and_subdirs(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, workspace: str
+) -> None:
+    """A root with a trailing slash still accepts the root and its subdirectories."""
+    env = open_env
+    env["projects"].create(
+        uuid.uuid4().hex,
+        "Trailing",
+        ALICE,
+        {"host_id": HOST_ID, "workspace": "/opt/work/"},
+    )
+    captured = _patch_create(env, monkeypatch)
+    _patch_worktrees(monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            project="Trailing",
+            workspace=workspace,
+        )
+    assert data["state"] == "opened"
+    assert captured["body"].workspace == workspace
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("companion", [{"branch": "task/fix"}, {"from_ref": "main"}])
 async def test_workspace_with_a_branch_refused(
     open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, companion: dict[str, Any]
