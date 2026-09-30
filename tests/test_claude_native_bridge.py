@@ -9463,6 +9463,39 @@ def test_compute_transcript_cumulative_cost_dedupes_by_request_id(
     assert cost == pytest.approx(110.0)
 
 
+def test_compute_transcript_cumulative_cost_keeps_last_priced_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A later same-``requestId`` record with no pricing doesn't erase the cost.
+
+    Dedup keeps the last *priceable* record per ``requestId``, so an
+    unpriceable record after a priced one must not turn the total into
+    ``None``.
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    pricing = ModelPricing(input_per_token=1.0, output_per_token=2.0)
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: pricing if model == "priced" else None,
+    )
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path,
+        [
+            _assistant_entry(model="priced", input_tokens=1, output_tokens=1, request_id="req_A"),
+            _assistant_entry(
+                model="unpriced", input_tokens=1, output_tokens=1, request_id="req_A"
+            ),
+        ],
+    )
+    cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
+    # The last priceable record is the "priced" one: 1*1 + 1*2 = 3.0.
+    assert cost == pytest.approx(3.0)
+
+
 def test_compute_transcript_cumulative_cost_sums_priced_messages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
