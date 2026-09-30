@@ -979,6 +979,11 @@ class ChildSessionSummary(BaseModel):
     :param sub_agent_name: For bundled agents, the sub-agent member name
         within the parent's spec tree, e.g. ``"researcher"``. ``None``
         for children bound directly to a whole agent row.
+    :param warm_state: Whether the child's provider prompt cache is being
+        kept warm (``"warm"`` / ``"cold"``), read from its
+        ``omnigent.keep_warm`` label without a settings read. ``None`` when
+        the child has no label, is archived, or runs an unsupported
+        harness.
     """
 
     id: str
@@ -1012,6 +1017,7 @@ class ChildSessionSummary(BaseModel):
     harness: str | None = None
     archived_at: int | None = None
     sub_agent_name: str | None = None
+    warm_state: Literal["warm", "cold"] | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -2601,9 +2607,12 @@ class UpdateSessionRequest(BaseModel):
         legacy ``omni_project`` label, which is set via ``labels``.
     :param stop_when_idle: Only meaningful alongside ``archived: true``.
         When ``True`` the archive teardown, after the undo window, also waits
-        (bounded) until the session tree leaves the running state. Set by an
-        agent archiving its own session or an ancestor, whose turn would
-        otherwise be cut. Default ``False`` keeps the web archive's timing.
+        (bounded) until the session tree leaves the running state. The server
+        also applies it on its own to any archive whose target has a parent or
+        at least one child, so a whole tree finishes its admitted turns; the
+        tool still sends it for the caller or an ancestor, whose turn would
+        otherwise be cut. Default ``False`` keeps the timing of a parentless,
+        childless archive.
     """
 
     runner_id: str | None = None

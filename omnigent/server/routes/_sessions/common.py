@@ -307,6 +307,13 @@ _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY: str = "omnigent.last_auto_compact_toke
 
 _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY: str = "omnigent.last_provider_usage_limits"
 
+# Last-call cache split reported by the claude-native forwarder, consumed by
+# the keep-warm sweeper: ``"<read>,<creation>,<observed_at>"``.
+_LAST_CACHE_LABEL_KEY: str = "omnigent.last_cache"
+
+# Keep-warm episode state for a sub-agent child (see child_keep_warm.py).
+_KEEP_WARM_LABEL_KEY: str = "omnigent.keep_warm"
+
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
@@ -1169,9 +1176,11 @@ __all__ = [
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
     "_INTERRUPT_TYPE",
+    "_KEEP_WARM_LABEL_KEY",
     "_KIMI_NATIVE_HARNESS",
     "_KIRO_NATIVE_WRAPPER_LABEL_VALUE",
     "_LABEL_VALUE_MAX_LEN",
+    "_LAST_CACHE_LABEL_KEY",
     "_LAST_CONTEXT_TOKENS_LABEL_KEY",
     "_LAST_CONTEXT_WINDOW_LABEL_KEY",
     "_LAST_TASK_ERROR_CAUSE_LABEL_KEY",

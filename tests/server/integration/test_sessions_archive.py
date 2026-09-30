@@ -32,7 +32,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
-from tests.server.helpers import create_test_session
+from tests.server.helpers import CapturingRunnerClient, create_test_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -265,6 +265,10 @@ async def test_archive_idle_parent_stops_running_child(
     idle while its sub-agent child keeps running would get a no-op stop,
     leaving the child orphaned once the parent (and its DB row, via the
     cascading subtree delete/archive) is gone.
+
+    The child row now also forces the archive's idle deferral; the child
+    keeps running here, so the teardown proceeds at the leak guard and
+    must still stop the child, not the (idle) parent.
     """
     session = await create_test_session(client, name="archive-idle-parent-child")
     session_id = session["id"]
@@ -280,11 +284,21 @@ async def test_archive_idle_parent_stops_running_child(
     mock_stop = AsyncMock(return_value=True)
     _sessions_common._session_status_cache[child.id] = "running"
     try:
-        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+        with (
+            # The child stays running, so release the deferral at the leak
+            # guard; the stop itself is what this test pins.
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 0.2),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": True},
             )
+            row = conv_store.get_conversation(session_id)
+            assert row is not None
+            # The child row forces the deferral even without the flag.
+            assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(row.archive_revision)
             await _drain_detached_stops()
         assert resp.status_code == 200
         assert resp.json()["archived"] is True
@@ -1062,7 +1076,7 @@ async def test_archive_without_stop_when_idle_writes_no_deferral_label(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """The web archive path keeps its timing and writes no deferral label."""
+    """A parentless, childless web archive keeps its timing, with no label."""
     session = await create_test_session(client, name="archive-no-idle-label")
     session_id = session["id"]
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -1084,6 +1098,360 @@ async def test_archive_without_stop_when_idle_writes_no_deferral_label(
         assert stopped == [session_id]
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_failed_child_lookup_writes_the_deferral_label(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A failed child lookup must not be read as "no children".
+
+    The route cannot prove the session is childless when the DB read
+    raises, so the archive defers the teardown: a running tree must not be
+    cut just because the child check failed.
+    """
+    session = await create_test_session(client, name="archive-lookup-fail")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    async def _skip_wait(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    coordinator = app.state.archive_close_coordinator
+    app.state.archive_close_coordinator = None
+    try:
+        with (
+            patch.object(
+                SqlAlchemyConversationStore,
+                "list_child_conversation_ids_by_parent",
+                side_effect=RuntimeError("transient DB error"),
+            ),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+            patch.object(_sessions_orchestration, "_wait_for_archive_idle", _skip_wait),
+        ):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            assert resp.status_code == 200
+            await _drain_detached_stops()
+        row = conv_store.get_conversation(session_id)
+        assert row is not None
+        assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(row.archive_revision)
+        # The deferred teardown honoured the wait and then proceeded: the
+        # label is not just left inert.
+        assert stopped == [session_id]
+    finally:
+        app.state.archive_close_coordinator = coordinator
+
+
+async def test_web_archive_of_child_defers_teardown_without_the_flag(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child archived from the web still finishes its admitted turn.
+
+    D5: its parent forces the deferral even though the client sent no
+    ``stop_when_idle``, so the label names the revision and the teardown
+    waits for the tree to read idle.
+    """
+    parent = await create_test_session(client, name="archive-defer-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=parent["id"],
+        agent_id=parent["agent_id"],
+    )
+
+    stopped: list[str] = []
+    wait_started = asyncio.Event()
+    real_wait = _sessions_orchestration._wait_for_archive_idle
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    async def _recording_wait(
+        wait_session_id: str,
+        revision: int,
+        conversation_store: object,
+    ) -> None:
+        wait_started.set()
+        await real_wait(wait_session_id, revision, conversation_store)
+
+    _sessions_common._session_status_cache[child.id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.05),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+            patch.object(_sessions_facade, "_wait_for_archive_idle", _recording_wait),
+            patch.object(_sessions_orchestration, "_wait_for_archive_idle", _recording_wait),
+        ):
+            resp = await client.patch(f"/v1/sessions/{child.id}", json={"archived": True})
+            assert resp.status_code == 200
+            row = conv_store.get_conversation(child.id)
+            assert row is not None
+            assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(row.archive_revision)
+            await asyncio.wait_for(wait_started.wait(), timeout=5.0)
+            # The running child keeps the teardown parked.
+            await asyncio.sleep(0.2)
+            assert stopped == []
+
+            _sessions_common._session_status_cache[child.id] = "idle"
+            for _ in range(100):
+                if stopped:
+                    break
+                await asyncio.sleep(0.05)
+            assert stopped == [child.id]
+    finally:
+        _sessions_common._session_status_cache.pop(child.id, None)
+        await _drain_detached_stops()
+
+
+async def test_web_archive_of_parent_with_child_defers_teardown(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A parentless session with sub-sessions also defers for its tree.
+
+    D4: archiving the mother from the web must finish the admitted turns
+    of her whole tree before the runner is torn down.
+    """
+    session = await create_test_session(client, name="archive-defer-mother")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=session_id,
+        agent_id=session["agent_id"],
+    )
+
+    stopped: list[str] = []
+    wait_started = asyncio.Event()
+    real_wait = _sessions_orchestration._wait_for_archive_idle
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    async def _recording_wait(
+        wait_session_id: str,
+        revision: int,
+        conversation_store: object,
+    ) -> None:
+        wait_started.set()
+        await real_wait(wait_session_id, revision, conversation_store)
+
+    _sessions_common._session_status_cache[child.id] = "running"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.05),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+            patch.object(_sessions_facade, "_wait_for_archive_idle", _recording_wait),
+            patch.object(_sessions_orchestration, "_wait_for_archive_idle", _recording_wait),
+        ):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            assert resp.status_code == 200
+            row = conv_store.get_conversation(session_id)
+            assert row is not None
+            assert row.labels.get(ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY) == str(row.archive_revision)
+            await asyncio.wait_for(wait_started.wait(), timeout=5.0)
+            # The running child keeps the teardown parked.
+            await asyncio.sleep(0.2)
+            assert stopped == []
+
+            _sessions_common._session_status_cache[child.id] = "idle"
+            for _ in range(100):
+                if stopped:
+                    break
+                await asyncio.sleep(0.05)
+            assert stopped == [session_id]
+    finally:
+        _sessions_common._session_status_cache.pop(child.id, None)
+        await _drain_detached_stops()
+
+
+async def test_close_off_host_fences_a_deferred_archive_without_a_label(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``close_on_archive=false`` keeps no label but still fences new starts.
+
+    The store writes the deferral label only when the host closes CLIs on
+    archive, so this host has no teardown to wait for; the fence posted at
+    the archive moment still stops a queued drain from starting a turn.
+    """
+    session = await create_test_session(client, name="archive-close-off-fence")
+    session_id = session["id"]
+    host_id = "7a2b3c4d5e6f1234567890abcdef0123"
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.upsert_on_connect(host_id, "archive-fence-host", "local")
+    host_store.replace_cli_retention_policy(
+        host_id,
+        CliRetentionPolicy(
+            idle_threshold_minutes=60,
+            max_idle_clis=10,
+            close_on_archive=False,
+        ),
+        expected_revision=0,
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(session_id, host_id, workspace="/tmp/archive-close-off")
+    conv_store.set_runner_id(session_id, "b1b2c3d4e5f61234567890abcdef0123")
+    conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=session_id,
+        agent_id=session["agent_id"],
+    )
+    captured = CapturingRunnerClient()
+
+    async def _runner_client(*_args: object, **_kwargs: object) -> CapturingRunnerClient:
+        return captured
+
+    with patch.object(_sessions_facade, "_get_runner_client", _runner_client):
+        resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+        await _drain_detached_stops()
+    assert resp.status_code == 200
+    row = conv_store.get_conversation(session_id)
+    assert row is not None
+    assert ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY not in row.labels
+    assert [(p["url"], p["json"]) for p in captured.posted] == [
+        (
+            f"/v1/sessions/{session_id}/cli-retention/archive-state",
+            {
+                "archive_scope_id": session_id,
+                "archive_revision": row.archive_revision,
+                "archived": True,
+            },
+        )
+    ]
+
+
+async def test_archive_fence_sets_the_revision_and_unarchive_clears_it(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The deferred archive fences the child's runner; unarchive clears it.
+
+    D5 defers the runner release too, and a turn end drains buffered
+    messages into a new turn — the fence posted at the archive moment stops
+    those starts. The unarchive's newer revision supersedes it.
+    """
+    parent = await create_test_session(client, name="archive-fence-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=parent["id"],
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_runner_id(child.id, "b1b2c3d4e5f61234567890abcdef0123")
+    captured = CapturingRunnerClient()
+
+    async def _runner_client(*_args: object, **_kwargs: object) -> CapturingRunnerClient:
+        return captured
+
+    _sessions_common._session_status_cache[child.id] = "idle"
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.05),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_get_runner_client", _runner_client),
+        ):
+            archived = await client.patch(
+                f"/v1/sessions/{child.id}",
+                json={"archived": True},
+            )
+            assert archived.status_code == 200
+            await _drain_detached_stops()
+        row = conv_store.get_conversation(child.id)
+        assert row is not None
+        assert row.archive_revision == 1
+        assert (
+            f"/v1/sessions/{child.id}/cli-retention/archive-state",
+            {
+                "archive_scope_id": child.id,
+                "archive_revision": 1,
+                "archived": True,
+            },
+        ) in [(p["url"], p["json"]) for p in captured.posted]
+
+        captured.posted.clear()
+        with patch.object(_sessions_facade, "_get_runner_client", _runner_client):
+            unarchived = await client.patch(
+                f"/v1/sessions/{child.id}",
+                json={"archived": False},
+            )
+            assert unarchived.status_code == 200
+            await _drain_detached_stops()
+        assert (
+            f"/v1/sessions/{child.id}/cli-retention/archive-state",
+            {
+                "archive_scope_id": child.id,
+                "archive_revision": 2,
+                "archived": False,
+            },
+        ) in [(p["url"], p["json"]) for p in captured.posted]
+    finally:
+        _sessions_common._session_status_cache.pop(child.id, None)
+        await _drain_detached_stops()
+
+
+async def test_idle_wait_reads_persisted_live_status_without_a_cache_entry(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A member missing from the status cache is read from its persisted row.
+
+    Audit r3 #1: a server restart or another replica has no status-cache
+    entry for the member; it must not read that as idle while the row says
+    running. Once the row settles to idle the teardown proceeds.
+    """
+    session = await create_test_session(client, name="archive-idle-persisted")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    stopped: list[str] = []
+
+    async def _recording_stop(sid: str, *_args: object, **_kwargs: object) -> None:
+        stopped.append(sid)
+
+    _sessions_common._session_status_cache.pop(session_id, None)
+    conv_store.set_session_live_status(session_id, "running")
+    try:
+        with (
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.2),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+            patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+            patch.object(_sessions_facade, "_best_effort_stop", _recording_stop),
+        ):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            # The persisted running status keeps the teardown parked past
+            # the settle window even though the cache has no entry.
+            await asyncio.sleep(0.4)
+            assert stopped == []
+
+            conv_store.set_session_live_status(session_id, "idle")
+            for _ in range(100):
+                if stopped:
+                    break
+                await asyncio.sleep(0.05)
+            assert stopped == [session_id]
+    finally:
+        await _drain_detached_stops()
 
 
 async def test_client_cannot_seed_the_archive_deferral_label(
@@ -1122,12 +1490,18 @@ async def test_unarchive_after_archive_accepts_new_user_work(
         },
     }
 
-    archived = await client.patch(
-        f"/v1/sessions/{session_id}",
-        json={"archived": True, "stop_when_idle": True},
-    )
-    assert archived.status_code == 200
-    await _drain_detached_stops()
+    # The flag defers the teardown, so keep the idle settle short.
+    with (
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.05),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+    ):
+        archived = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"archived": True, "stop_when_idle": True},
+        )
+        assert archived.status_code == 200
+        await _drain_detached_stops()
 
     rejected = await client.post(f"/v1/sessions/{session_id}/events", json=message)
     assert rejected.status_code == 409
@@ -1173,9 +1547,15 @@ async def test_child_sessions_include_archived(
         agent_id=session["agent_id"],
     )
 
-    archived = await client.patch(f"/v1/sessions/{child.id}", json={"archived": True})
-    assert archived.status_code == 200
-    await _drain_detached_stops()
+    # The child's parent forces the idle deferral, so keep the settle short.
+    with (
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.05),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.02),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_MAX_WAIT_S", 20.0),
+    ):
+        archived = await client.patch(f"/v1/sessions/{child.id}", json={"archived": True})
+        assert archived.status_code == 200
+        await _drain_detached_stops()
 
     default = await client.get(f"/v1/sessions/{parent_id}/child_sessions")
     assert default.status_code == 200

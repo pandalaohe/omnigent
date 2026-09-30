@@ -16,6 +16,7 @@ from omnigent.runner.tool_dispatch import (
     build_native_relay_tool_schemas,
 )
 from omnigent.spec.types import AgentSpec
+from omnigent.tools.builtins.session_archive import SysSessionArchiveTool
 from omnigent.tools.manager import ToolManager
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
@@ -102,8 +103,8 @@ async def test_archive_other_session_patches_archived_without_idle_deferral() ->
     """Archiving another own session PATCHes the flag without a deferral.
 
     The target is not the caller or an ancestor, so the caller's turn is
-    not at risk: no ``stop_when_idle``, and the result names the undo
-    window as the stop condition.
+    not at risk: no ``stop_when_idle``. The server still defers a target
+    with a parent or sub-sessions, so the result names both timings.
     """
     patch_bodies: list[dict[str, Any]] = []
 
@@ -125,6 +126,8 @@ async def test_archive_other_session_patches_archived_without_idle_deferral() ->
     assert out["archived"] is True
     assert out["session_id"] == "conv_other"
     assert "undo window" in out["runner_stop"]
+    assert "parent or sub-sessions" in out["runner_stop"]
+    assert "current turn has ended" in out["runner_stop"]
     assert out["undo"]
 
 
@@ -171,6 +174,16 @@ async def test_archive_self_patches_stop_when_idle_without_snapshot() -> None:
     assert out["archived"] is True
     assert "already_archived" not in out
     assert "current turn" in out["runner_stop"]
+
+
+def test_archive_description_states_the_deferred_turn_timing() -> None:
+    """The LLM-facing description names the D5 / D4 deferred turn timing."""
+    description = SysSessionArchiveTool.description()
+    assert "a session with a parent or sub-sessions first finishes its current turn" in (
+        description
+    )
+    assert "at most 1 hour" in description
+    assert "running turn is interrupted" in description
 
 
 @pytest.mark.asyncio

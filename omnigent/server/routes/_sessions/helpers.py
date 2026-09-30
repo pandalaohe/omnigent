@@ -11662,6 +11662,26 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         routing_decision_id=routing_decision_id,
+        warm_state=_warm_state_from_label(conv, harness=harness, busy=busy),
+    )
+
+
+def _warm_state_from_label(
+    conv: Conversation,
+    *,
+    harness: str | None,
+    busy: bool,
+) -> Literal["warm", "cold"] | None:
+    """Derive the keep-warm pill state for a child summary (no settings read)."""
+    from omnigent.db.utils import now_epoch
+    from omnigent.server.child_keep_warm import KEEP_WARM_LABEL, warm_state_from_label
+
+    return warm_state_from_label(
+        conv.labels.get(KEEP_WARM_LABEL),
+        archived=bool(conv.archived),
+        harness=harness,
+        busy=busy,
+        now=now_epoch(),
     )
 
 

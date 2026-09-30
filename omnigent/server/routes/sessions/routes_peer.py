@@ -1614,7 +1614,9 @@ def register_peer_routes(
         return _record_to_dict(updated)
 
     sweeper: Any | None = None
+    child_keep_warm: Any | None = None
     if flags.enabled(Feature.SESSION_PEER_MESSAGING) and peer_message_store is not None:
+        from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
         from omnigent.server.peer_sweeper import PeerSweeper
 
         sweeper = PeerSweeper(
@@ -1625,8 +1627,16 @@ def register_peer_routes(
             deliver=_deliver,
             post_event_impl=post_event_impl,
         )
+        child_keep_warm = ChildKeepWarmSweeper(
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            liveness_lookup=liveness_lookup,
+            post_event_impl=post_event_impl,
+            notify_line=sweeper.notify_line,
+        )
     if app_state is not None:
         app_state.peer_sweeper = sweeper
+        app_state.child_keep_warm = child_keep_warm
     return PeerRoutes(peer_send, _true_state)
 
 

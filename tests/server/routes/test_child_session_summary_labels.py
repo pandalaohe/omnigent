@@ -10,11 +10,15 @@ strip. The same must hold for the server-secret artifact-link key.
 
 from __future__ import annotations
 
+import json
+import time
+
 from omnigent.entities import Conversation
 from omnigent.server.routes._sessions.common import _SUBAGENT_TERMINAL_STATUS_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
     _child_session_summary_from_conversation,
 )
+from omnigent.server.schemas import ChildSessionSummary
 from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, pinned_label_key
 
 
@@ -73,6 +77,49 @@ def test_child_summary_explicit_idle_is_not_overridden_by_durable_running() -> N
 
     assert summary.busy is False
     assert summary.current_task_status == "completed"
+
+
+def test_child_summary_derives_warm_state_from_the_keep_warm_label() -> None:
+    """The rail pill state comes from the label with no settings read."""
+    now = int(time.time())
+    keep_warm = "omnigent.keep_warm"
+
+    def _summary(labels: dict[str, str], *, harness: str | None) -> ChildSessionSummary:
+        return _child_session_summary_from_conversation(
+            _child(labels), "conv_parent", None, harness=harness
+        )
+
+    warm = json.dumps({"s": "w", "t": now - 100, "w": now + 3600})
+    past = json.dumps({"s": "w", "t": now - 7200, "w": now - 60})
+    paused = json.dumps({"s": "p", "why": "fail", "t": now - 7200})
+
+    assert _summary({keep_warm: warm}, harness="claude-native").warm_state == "warm"
+    assert _summary({keep_warm: past}, harness="codex-native").warm_state == "cold"
+    assert _summary({keep_warm: paused}, harness="claude-native").warm_state == "cold"
+    # Busy overrides a passed window: the next turn touches the prompt anyway.
+    busy = _child({keep_warm: past}, live_status="running")
+    summary = _child_session_summary_from_conversation(
+        busy, "conv_parent", None, harness="claude-native"
+    )
+    assert summary.warm_state == "warm"
+    # No label, unsupported harness, and archived children read None.
+    assert _summary({}, harness="claude-native").warm_state is None
+    assert _summary({keep_warm: warm}, harness="opencode-native").warm_state is None
+    assert _summary({keep_warm: warm}, harness=None).warm_state is None
+    archived = Conversation(
+        id="conv_child",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_parent",
+        title="tool:child-task",
+        agent_id="ag_test",
+        labels={keep_warm: warm},
+        archived=True,
+    )
+    archived_summary = _child_session_summary_from_conversation(
+        archived, "conv_parent", None, harness="claude-native"
+    )
+    assert archived_summary.warm_state is None
 
 
 def test_child_summary_durable_terminal_precedes_live_status_on_cache_miss() -> None:

@@ -192,6 +192,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _FENCE_EXEMPT_EVENT_TYPES,
     _GOAL_STATE_LABEL_KEY,
     _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
+    _LAST_CACHE_LABEL_KEY,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
     _LAST_CONTEXT_WINDOW_LABEL_KEY,
     _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY,
@@ -1374,10 +1375,12 @@ async def _wait_for_archive_idle(
     root and returns as soon as a successful read shows the row is no longer
     archived, its revision differs from ``revision``, or its deferral label
     no longer names ``revision`` — an unarchive or re-archive voids the wait
-    and the new revision is evaluated afresh. A failed read (root or
-    descendants) is never evidence of idleness: that poll counts as busy and
-    the settle clock restarts. Bounded by ``_ARCHIVE_IDLE_MAX_WAIT_S`` from
-    the ``archived_at`` of this revision.
+    and the new revision is evaluated afresh. A member with no status-cache
+    entry (server restart, another replica) is read from its persisted
+    ``live_status``; a failed read (root or descendants) is never evidence
+    of idleness: that poll counts as busy and the settle clock restarts.
+    Bounded by ``_ARCHIVE_IDLE_MAX_WAIT_S`` from the ``archived_at`` of this
+    revision.
 
     :param session_id: Root session/conversation identifier.
     :param revision: The archive revision whose teardown is deferred.
@@ -1437,7 +1440,34 @@ async def _wait_for_archive_idle(
             return
         busy = tree is None or not root_ok
         if not busy:
-            busy = any(_session_status_cache.get(sid) in ("running", "waiting") for sid in tree)
+            assert tree is not None
+            for member_id in tree:
+                if member_id in _session_status_cache:
+                    member_busy = _session_status_cache.get(member_id) in ("running", "waiting")
+                else:
+                    # No status-cache entry on this replica: the member row's
+                    # persisted live_status is the fallback. A failed read is
+                    # not evidence of idleness, so it counts as busy.
+                    try:
+                        member = await asyncio.to_thread(
+                            conversation_store.get_conversation, member_id
+                        )
+                    except Exception:  # noqa: BLE001
+                        _logger.debug(
+                            "Archive idle member re-read failed for %s; poll counts as busy",
+                            member_id,
+                            exc_info=True,
+                            extra={"session_id": member_id},
+                        )
+                        member_busy = True
+                    else:
+                        member_busy = member is not None and member.live_status in (
+                            "running",
+                            "waiting",
+                        )
+                if member_busy:
+                    busy = True
+                    break
         if busy:
             idle_since = None
         elif idle_since is None:
@@ -1878,13 +1908,15 @@ def _cancel_pending_archive_stop(session_id: str) -> None:
         task.cancel()
 
 
-async def _unfence_unarchived_tree(
+async def _fence_archive_tree(
     session_id: str,
     revision: int,
     conversation_store: ConversationStore,
     runner_router: Any,
+    *,
+    archived: bool,
 ) -> None:
-    """Tell every currently reachable target that a newer unarchive won."""
+    """Tell every currently reachable target one revision's archive state."""
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
     except Exception:  # noqa: BLE001 - a later user event carries the same revision.
@@ -1906,13 +1938,14 @@ async def _unfence_unarchived_tree(
                 json={
                     "archive_scope_id": session_id,
                     "archive_revision": revision,
-                    "archived": False,
+                    "archived": archived,
                 },
                 timeout=10.0,
             )
-        except Exception:  # noqa: BLE001 - first later event repeats the versioned clear.
+        except Exception:  # noqa: BLE001 - first later event repeats the versioned state.
             _logger.debug(
-                "Could not clear archive runtime fence for %s",
+                "Could not %s archive runtime fence for %s",
+                "apply" if archived else "clear",
                 target_id,
                 exc_info=True,
                 extra={"session_id": target_id},
@@ -1927,13 +1960,35 @@ def _spawn_archive_unfence(
 ) -> None:
     """Clear Runner archive fences without delaying the unarchive response."""
     task = asyncio.create_task(
-        _unfence_unarchived_tree(
+        _fence_archive_tree(
             session_id,
             revision,
             conversation_store,
             runner_router,
+            archived=False,
         ),
         name=f"archive-cli-unfence:{session_id}",
+    )
+    _detached_stop_tasks.add(task)
+    task.add_done_callback(_detached_stop_tasks.discard)
+
+
+def _spawn_archive_fence(
+    session_id: str,
+    revision: int,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+) -> None:
+    """Set Runner archive fences without delaying the archive response."""
+    task = asyncio.create_task(
+        _fence_archive_tree(
+            session_id,
+            revision,
+            conversation_store,
+            runner_router,
+            archived=True,
+        ),
+        name=f"archive-cli-fence:{session_id}",
     )
     _detached_stop_tasks.add(task)
     task.add_done_callback(_detached_stop_tasks.discard)
@@ -2903,6 +2958,13 @@ def _persist_native_cumulative_usage(
     return _priced_cost_for_display(current)
 
 
+def _optional_label_int(value: object) -> int | None:
+    """Return *value* as a non-negative int, or ``None`` when malformed."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 async def _persist_external_session_usage(
     session_id: str,
     body: SessionEventInput,
@@ -2973,6 +3035,12 @@ async def _persist_external_session_usage(
             f"external_session_usage data.provider_usage_limits is invalid: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    # Optional last-call cache split from the claude-native forwarder, read
+    # by the keep-warm sweeper's cache-miss probe. Malformed values are
+    # ignored, never fatal: an older forwarder omits the keys entirely.
+    last_cache_read = _optional_label_int(body.data.get("last_cache_read_input_tokens"))
+    last_cache_creation = _optional_label_int(body.data.get("last_cache_creation_input_tokens"))
+    last_cache_observed_at = _optional_label_int(body.data.get("last_usage_observed_at"))
     _CUMULATIVE_USAGE_KEYS = (
         "cumulative_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
@@ -3036,6 +3104,14 @@ async def _persist_external_session_usage(
         label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
     if has_auto_compact_token_limit and raw_auto_compact_token_limit is not None:
         label_updates[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(raw_auto_compact_token_limit)
+    if (
+        last_cache_read is not None
+        and last_cache_creation is not None
+        and last_cache_observed_at is not None
+    ):
+        label_updates[_LAST_CACHE_LABEL_KEY] = (
+            f"{last_cache_read},{last_cache_creation},{last_cache_observed_at}"
+        )
     if label_updates:
         await asyncio.to_thread(
             conversation_store.set_labels,
@@ -12898,6 +12974,7 @@ __all__ = [
     "_run_managed_wake",
     "_runner_reject_detail",
     "_schedule_deferred_elicitation_clear",
+    "_spawn_archive_fence",
     "_spawn_archive_stop",
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",

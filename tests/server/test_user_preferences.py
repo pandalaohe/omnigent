@@ -34,6 +34,7 @@ from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
+    clamp_keep_warm,
     read_approval_timeout,
     read_collab_settings,
     validate_preferences_envelope,
@@ -667,13 +668,14 @@ def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
     assert empty == default
     assert empty.open_rate_count == 10
     assert empty.open_rate_window_s == 60
+    assert empty.keep_warm_enabled is False
 
     store.patch_namespace("alice@example.com", "agent_badges", {"enabled": False})
     assert read_collab_settings(store, "alice@example.com") == default
 
 
-def test_read_collab_settings_reads_all_eleven_fields(db_uri: str) -> None:
-    """All eleven camelCase fields load; unknown keys are ignored."""
+def test_read_collab_settings_reads_all_fifteen_fields(db_uri: str) -> None:
+    """All fifteen camelCase fields load; unknown keys are ignored."""
     store = SqlAlchemyUserPreferencesStore(db_uri)
     store.patch_namespace(
         "all@example.com",
@@ -690,6 +692,10 @@ def test_read_collab_settings_reads_all_eleven_fields(db_uri: str) -> None:
             "duplicateWindowSeconds": 300,
             "undeliveredTtlSeconds": 7200,
             "flowTimerEnabled": False,
+            "childKeepWarmEnabled": True,
+            "childKeepWarmClaudeIntervalSeconds": 3000,
+            "childKeepWarmCodexIntervalSeconds": 1200,
+            "childKeepWarmMaxSeconds": 14400,
             "unexpectedKey": {"nested": True},
         },
     )
@@ -705,6 +711,10 @@ def test_read_collab_settings_reads_all_eleven_fields(db_uri: str) -> None:
         duplicate_window_s=300,
         undelivered_ttl_s=7200,
         flow_timer_enabled=False,
+        keep_warm_enabled=True,
+        keep_warm_claude_interval_s=3000,
+        keep_warm_codex_interval_s=1200,
+        keep_warm_max_s=14400,
     )
 
 
@@ -718,6 +728,11 @@ def test_read_collab_settings_reads_all_eleven_fields(db_uri: str) -> None:
         ("openRateCount", -1, "open_rate_count"),
         ("openRateCount", "5", "open_rate_count"),
         ("openRateCount", 5.5, "open_rate_count"),
+        ("childKeepWarmEnabled", "yes", "keep_warm_enabled"),
+        ("childKeepWarmEnabled", 1, "keep_warm_enabled"),
+        ("childKeepWarmClaudeIntervalSeconds", 0, "keep_warm_claude_interval_s"),
+        ("childKeepWarmCodexIntervalSeconds", True, "keep_warm_codex_interval_s"),
+        ("childKeepWarmMaxSeconds", "28800", "keep_warm_max_s"),
     ],
 )
 def test_read_collab_settings_falls_back_per_field(
@@ -733,6 +748,43 @@ def test_read_collab_settings_falls_back_per_field(
     settings = read_collab_settings(store, "field@example.com")
     assert settings.relay_depth_max == 12
     assert getattr(settings, attribute) == getattr(CollabSettings(), attribute)
+
+
+def test_clamp_keep_warm_returns_defaults_inside_the_bounds() -> None:
+    """The defaults are already inside every bound and pass through unchanged."""
+    assert clamp_keep_warm(CollabSettings()) == (3300, 1500, 28800)
+
+
+def test_clamp_keep_warm_clamps_stored_values_to_the_bounds(db_uri: str) -> None:
+    """A hand-written out-of-range window is clamped on read, not rejected."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "clamp@example.com",
+        "session_collab",
+        {
+            "childKeepWarmClaudeIntervalSeconds": 99999,
+            "childKeepWarmCodexIntervalSeconds": 1,
+            "childKeepWarmMaxSeconds": 999999,
+        },
+    )
+    settings = read_collab_settings(store, "clamp@example.com")
+    assert settings.keep_warm_claude_interval_s == 99999
+    assert clamp_keep_warm(settings) == (3540, 300, 172800)
+
+    store.patch_namespace(
+        "low@example.com",
+        "session_collab",
+        {
+            "childKeepWarmClaudeIntervalSeconds": 1,
+            "childKeepWarmCodexIntervalSeconds": 99999,
+            "childKeepWarmMaxSeconds": 1,
+        },
+    )
+    assert clamp_keep_warm(read_collab_settings(store, "low@example.com")) == (
+        300,
+        1740,
+        3600,
+    )
 
 
 def test_read_collab_settings_tolerates_bad_rows_and_shapes() -> None:

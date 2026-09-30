@@ -896,6 +896,11 @@ class _ForwardDedupeState:
     """
 
     usage: dict[str, float] | None = None
+    # Last usage payload ATTEMPTED (posted or awaiting retry), carrying the
+    # ``last_usage_observed_at`` stamped when its counters changed. Kept so a
+    # failed post retries with the same observation time instead of minting a
+    # fresh one every poll.
+    pending_usage: dict[str, float] | None = None
     context_window: int | None = None
     provider_usage_limits: dict[str, object] | None = None
     recorded_token_usage: dict[str, int] | None = None
@@ -6430,7 +6435,7 @@ async def _post_forward_side_channel_updates(
         )
         posted_usage: dict[str, float] | None = usage_from_status
         if posted_usage is None and result.latest_usage is not None:
-            posted_usage = dict(result.latest_usage)
+            posted_usage = _usage_with_last_cache_split(result.latest_usage)
         # Cost (``cumulative_cost_usd``) is POSTed separately by
         # ``_forward_session_cost``, which reconciles the statusLine total with the
         # forwarder's real-time sub-agent transcript estimate via max(). Strip it
@@ -6440,7 +6445,28 @@ async def _post_forward_side_channel_updates(
             posted_usage = {
                 key: value for key, value in posted_usage.items() if key != "cumulative_cost_usd"
             }
-        usage_changed = posted_usage is not None and posted_usage != dedupe.usage
+        # The last-call cache fields must not defeat the existing dedupe:
+        # compare without ``last_usage_observed_at`` so a steady usage does
+        # not re-post every poll. A changed usage gets a fresh observation
+        # stamp; a retry of the same (failed) payload keeps its original
+        # stamp, so the keep-warm sweeper can tie one reading to one turn.
+        usage_changed = posted_usage is not None and _usage_without_observed_at(
+            posted_usage
+        ) != _usage_without_observed_at(dedupe.usage)
+        if usage_changed:
+            attempted = dedupe.pending_usage
+            same_as_attempt = attempted is not None and _usage_without_observed_at(
+                attempted
+            ) == _usage_without_observed_at(posted_usage)
+            observed_at = attempted.get("last_usage_observed_at") if same_as_attempt else None
+            if observed_at is None:
+                observed_at = int(time.time())
+            posted_usage["last_usage_observed_at"] = observed_at
+            dedupe.pending_usage = dict(posted_usage)
+        elif posted_usage is not None and dedupe.usage is not None:
+            observed_at = dedupe.usage.get("last_usage_observed_at")
+            if observed_at is not None:
+                posted_usage["last_usage_observed_at"] = observed_at
         window_changed = (
             resolved_context_window is not None
             and resolved_context_window != dedupe.context_window
@@ -8725,21 +8751,59 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
     return await asyncio.to_thread(_mutate)
 
 
+def _usage_with_last_cache_split(usage: Mapping[str, int]) -> dict[str, float]:
+    """
+    Carry the transcript fallback's cache split as the last-call fields.
+
+    :func:`omnigent.harnesses.claude_native.bridge._usage_from_transcript_entry`
+    reports ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` only
+    when nonzero; the keep-warm sweeper reads both keys on every post, so
+    absent values become 0 and the raw keys are replaced by their ``last_*``
+    spelling.
+
+    :param usage: ``TranscriptReadResult.latest_usage``.
+    :returns: The usage dict with ``last_cache_*`` fields present.
+    """
+    cache_read = usage.get("cache_read_input_tokens")
+    cache_creation = usage.get("cache_creation_input_tokens")
+    result: dict[str, float] = {
+        key: value
+        for key, value in usage.items()
+        if key not in ("cache_read_input_tokens", "cache_creation_input_tokens")
+    }
+    result["last_cache_read_input_tokens"] = cache_read if isinstance(cache_read, int) else 0
+    result["last_cache_creation_input_tokens"] = (
+        cache_creation if isinstance(cache_creation, int) else 0
+    )
+    return result
+
+
+def _usage_without_observed_at(
+    usage: Mapping[str, float] | None,
+) -> dict[str, float] | None:
+    """Drop ``last_usage_observed_at`` so dedupe compares the counters only."""
+    if usage is None:
+        return None
+    return {key: value for key, value in usage.items() if key != "last_usage_observed_at"}
+
+
 def _usage_from_status_state(state: dict[str, object]) -> dict[str, float] | None:
     """
     Convert statusLine ``current_usage`` (+ cost) into the Omnigent usage shape.
 
     Sums input + cache_creation + cache_read for ``context_tokens``
     (matches claude-hud's ``getTotalTokens``: only input-side tokens
-    occupy the next prompt's budget). When the statusLine also captured
-    Claude Code's cumulative ``total_cost_usd``, it's surfaced as
+    occupy the next prompt's budget). The split itself rides along as
+    ``last_cache_read_input_tokens`` / ``last_cache_creation_input_tokens``
+    for the keep-warm sweeper's cache-miss probe. When the statusLine also
+    captured Claude Code's cumulative ``total_cost_usd``, it's surfaced as
     ``cumulative_cost_usd`` so the server can persist native session cost
     (SET semantics). Returns ``None`` when the state has no usable
     ``current_usage`` so the caller falls back to the JSONL-derived value.
 
     :param state: Parsed ``context.json`` payload.
-    :returns: Usage dict (token counts plus optional
-        ``cumulative_cost_usd``), or ``None``.
+    :returns: Usage dict (token counts, the last-call cache split, plus
+        optional ``cumulative_cost_usd``), or ``None``.
     """
     usage = state.get("current_usage")
     if not isinstance(usage, dict):
@@ -8760,6 +8824,11 @@ def _usage_from_status_state(state: dict[str, object]) -> dict[str, float] | Non
         "context_tokens": input_tokens + cc_i + cr_i,
         "input_tokens": input_tokens,
         "output_tokens": out_i,
+        # Last-call cache split for the keep-warm sweeper's cache-miss probe
+        # (the server stores these on ``omnigent.last_cache``). Always
+        # present, 0 when the statusLine reported none.
+        "last_cache_read_input_tokens": cr_i,
+        "last_cache_creation_input_tokens": cc_i,
     }
     total_cost = state.get("total_cost_usd")
     if (
