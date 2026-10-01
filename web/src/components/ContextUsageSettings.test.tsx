@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readUsageContextPreferences, usageContextSourceKey } from "@/lib/usageContextPreferences";
@@ -123,6 +123,29 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-b");
     expect(screen.getByText(/2 sources saved/)).toBeInTheDocument();
     expect(screen.getByText(/does not learn after a Compact/)).toBeInTheDocument();
+  });
+
+  it("clears the current source inputs when its saved row is deleted", async () => {
+    render(<ContextUsageSettings />);
+
+    const contextInput = screen.getByLabelText("Context window override in tokens");
+    const bufferInput = screen.getByLabelText("Automatic Compact buffer in tokens");
+    fireEvent.change(contextInput, { target: { value: "330000" } });
+    fireEvent.blur(contextInput);
+    fireEvent.change(bufferInput, { target: { value: "33000" } });
+    fireEvent.blur(bufferInput);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-a"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Office MacBook polly model-a" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete saved source?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(contextInput).toHaveValue(null));
+    expect(bufferInput).toHaveValue(null);
+    expect(screen.queryByTestId("saved-context-sources")).not.toBeInTheDocument();
   });
 
   it("shows the reported Compact buffer as the input placeholder", () => {
