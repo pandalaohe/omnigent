@@ -46,10 +46,10 @@ describe("usage/context preferences", () => {
     ).toEqual({ contextWindow: 258_400, autoCompactTokenLimit: 240_000 });
   });
 
-  it("uses a manual context total and Compact threshold when supplied", () => {
+  it("uses a manual context total and Compact buffer when supplied", () => {
     writeUsageContextOverride(
       {
-        version: 4,
+        version: 5,
         showProviderUsageLimits: false,
         overrides: {},
         lastProviderUsageLimits: {},
@@ -57,23 +57,23 @@ describe("usage/context preferences", () => {
       source,
       {
         contextWindowTokens: 330_000,
-        autoCompactThresholdPercent: 93,
+        autoCompactBufferTokens: 33_000,
       },
     );
     const preferences = readUsageContextPreferences();
     expect(preferences.showProviderUsageLimits).toBe(false);
     expect(resolveUsageContextLimits(preferences, source, 258_400, 240_000)).toEqual({
       contextWindow: 330_000,
-      autoCompactTokenLimit: 306_900,
+      autoCompactTokenLimit: 297_000,
     });
   });
 
   it("does not leak a manual override into a different Host or model", () => {
     writeUsageContextPreferences({
-      version: 4,
+      version: 5,
       showProviderUsageLimits: false,
       overrides: {
-        [source]: { contextWindowTokens: 330_000, autoCompactThresholdPercent: 93 },
+        [source]: { contextWindowTokens: 330_000, autoCompactBufferTokens: 33_000 },
       },
       lastProviderUsageLimits: {},
     });
@@ -96,11 +96,56 @@ describe("usage/context preferences", () => {
       JSON.stringify({
         version: 2,
         overrides: {
-          [source]: { contextWindowTokens: -1, autoCompactThresholdPercent: 101 },
+          [source]: { contextWindowTokens: -1, autoCompactBufferTokens: -5 },
         },
       }),
     );
     expect(readUsageContextPreferences()).toEqual(DEFAULT_USAGE_CONTEXT_PREFERENCES);
+  });
+
+  it("migrates a legacy Compact percentage into a token buffer", () => {
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({
+        version: 4,
+        overrides: {
+          [source]: { contextWindowTokens: 390_000, autoCompactThresholdPercent: 92.5 },
+        },
+      }),
+    );
+    expect(readUsageContextPreferences().overrides[source]).toEqual({
+      contextWindowTokens: 390_000,
+      autoCompactBufferTokens: 29_250,
+    });
+  });
+
+  it("drops a legacy Compact percentage without a context total", () => {
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({
+        version: 4,
+        overrides: {
+          [source]: { contextWindowTokens: null, autoCompactThresholdPercent: 90 },
+        },
+      }),
+    );
+    expect(readUsageContextPreferences().overrides).toEqual({});
+  });
+
+  it("falls back to the reported Compact limit when the buffer meets the context total", () => {
+    writeUsageContextPreferences({
+      version: 5,
+      showProviderUsageLimits: true,
+      overrides: {
+        [source]: { contextWindowTokens: 30_000, autoCompactBufferTokens: 33_000 },
+      },
+      lastProviderUsageLimits: {},
+    });
+    const preferences = readUsageContextPreferences();
+    expect(resolveUsageContextLimits(preferences, source, 258_400, 240_000)).toEqual({
+      contextWindow: 30_000,
+      autoCompactTokenLimit: 240_000,
+    });
   });
 
   it("retains provider usage only for the exact Host, agent, harness, and model", () => {

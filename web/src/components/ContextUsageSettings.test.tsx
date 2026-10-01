@@ -72,13 +72,13 @@ describe("ContextUsageSettings", () => {
     );
 
     const contextInput = screen.getByLabelText("Context window override in tokens");
-    const thresholdInput = screen.getByLabelText("Automatic Compact threshold percent");
+    const bufferInput = screen.getByLabelText("Automatic Compact buffer in tokens");
     expect(contextInput).toHaveAttribute("placeholder", "330000");
 
     fireEvent.change(contextInput, { target: { value: "330000" } });
     fireEvent.blur(contextInput);
-    fireEvent.change(thresholdInput, { target: { value: "93" } });
-    fireEvent.blur(thresholdInput);
+    fireEvent.change(bufferInput, { target: { value: "33000" } });
+    fireEvent.blur(bufferInput);
 
     const firstKey = usageContextSourceKey({
       hostId: "host-friendly",
@@ -89,18 +89,18 @@ describe("ContextUsageSettings", () => {
     await waitFor(() =>
       expect(readUsageContextPreferences().overrides[firstKey]).toEqual({
         contextWindowTokens: 330_000,
-        autoCompactThresholdPercent: 93,
+        autoCompactBufferTokens: 33_000,
       }),
     );
-    expect(screen.getByText(/Compact 306.9k/)).toBeInTheDocument();
+    expect(screen.getByText(/Compact 297k/)).toBeInTheDocument();
 
     mocks.model = "model-b";
     rerender(<ContextUsageSettings />);
     await waitFor(() => expect(contextInput).toHaveValue(null));
-    expect(thresholdInput).toHaveValue(null);
+    expect(bufferInput).toHaveValue(null);
 
-    fireEvent.change(thresholdInput, { target: { value: "80" } });
-    fireEvent.blur(thresholdInput);
+    fireEvent.change(bufferInput, { target: { value: "40000" } });
+    fireEvent.blur(bufferInput);
     const secondKey = usageContextSourceKey({
       hostId: "host-friendly",
       agentName: "polly",
@@ -111,11 +111,11 @@ describe("ContextUsageSettings", () => {
       const saved = readUsageContextPreferences().overrides;
       expect(saved[firstKey]).toEqual({
         contextWindowTokens: 330_000,
-        autoCompactThresholdPercent: 93,
+        autoCompactBufferTokens: 33_000,
       });
       expect(saved[secondKey]).toEqual({
         contextWindowTokens: null,
-        autoCompactThresholdPercent: 80,
+        autoCompactBufferTokens: 40_000,
       });
     });
     expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("Saved sources");
@@ -123,6 +123,18 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-b");
     expect(screen.getByText(/2 sources saved/)).toBeInTheDocument();
     expect(screen.getByText(/does not learn after a Compact/)).toBeInTheDocument();
+  });
+
+  it("shows the reported Compact buffer as the input placeholder", () => {
+    mocks.contextWindow = 330_000;
+    mocks.autoCompactTokenLimit = 297_000;
+
+    render(<ContextUsageSettings />);
+
+    expect(screen.getByLabelText("Automatic Compact buffer in tokens")).toHaveAttribute(
+      "placeholder",
+      "33000",
+    );
   });
 
   it("does not present an expired cached usage snapshot as current", () => {

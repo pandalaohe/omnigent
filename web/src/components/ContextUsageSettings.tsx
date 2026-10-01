@@ -51,8 +51,8 @@ export function ContextUsageSettings() {
   const [contextWindowDraft, setContextWindowDraft] = useState(
     activeOverride.contextWindowTokens?.toString() ?? "",
   );
-  const [thresholdDraft, setThresholdDraft] = useState(
-    activeOverride.autoCompactThresholdPercent?.toString() ?? "",
+  const [bufferDraft, setBufferDraft] = useState(
+    activeOverride.autoCompactBufferTokens?.toString() ?? "",
   );
   const reportedContextWindow = useChatStore((state) => state.contextWindow);
   const reportedCompactLimit = useChatStore((state) => state.autoCompactTokenLimit);
@@ -64,8 +64,8 @@ export function ContextUsageSettings() {
 
   useEffect(() => {
     setContextWindowDraft(activeOverride.contextWindowTokens?.toString() ?? "");
-    setThresholdDraft(activeOverride.autoCompactThresholdPercent?.toString() ?? "");
-  }, [activeOverride.contextWindowTokens, activeOverride.autoCompactThresholdPercent, sourceKey]);
+    setBufferDraft(activeOverride.autoCompactBufferTokens?.toString() ?? "");
+  }, [activeOverride.contextWindowTokens, activeOverride.autoCompactBufferTokens, sourceKey]);
 
   const writeOverride = (patch: Partial<typeof activeOverride>) =>
     writeUsageContextOverride(preferences, sourceKey, { ...activeOverride, ...patch });
@@ -73,20 +73,25 @@ export function ContextUsageSettings() {
     const next = optionalNumber(contextWindowDraft);
     writeOverride({ contextWindowTokens: next === null ? null : Math.round(next) });
   };
-  const commitThreshold = () => {
-    const next = optionalNumber(thresholdDraft);
-    writeOverride({
-      autoCompactThresholdPercent:
-        next !== null && next >= 1 && next <= 100 ? Math.round(next * 10) / 10 : null,
-    });
+  const commitBuffer = () => {
+    const next = optionalNumber(bufferDraft);
+    writeOverride({ autoCompactBufferTokens: next === null ? null : Math.round(next) });
   };
 
   const effectiveContextWindow = optionalNumber(contextWindowDraft) ?? reportedContextWindow;
-  const effectiveThreshold = optionalNumber(thresholdDraft);
+  const effectiveBuffer = optionalNumber(bufferDraft);
   const calculatedCompactPoint =
-    effectiveContextWindow != null && effectiveThreshold != null && effectiveThreshold <= 100
-      ? Math.round((effectiveContextWindow * effectiveThreshold) / 100)
+    effectiveContextWindow != null &&
+    effectiveBuffer != null &&
+    effectiveContextWindow > effectiveBuffer
+      ? Math.round(effectiveContextWindow - effectiveBuffer)
       : reportedCompactLimit;
+  const reportedBufferPlaceholder =
+    reportedContextWindow != null &&
+    reportedCompactLimit != null &&
+    reportedContextWindow > reportedCompactLimit
+      ? (reportedContextWindow - reportedCompactLimit).toString()
+      : "Auto";
   const hostName = session?.hostId
     ? (hosts.find((host) => host.host_id === session.hostId)?.name ?? "Unknown computer")
     : "Server";
@@ -155,18 +160,17 @@ export function ContextUsageSettings() {
             />
           </label>
           <label className="grid gap-1.5 text-sm">
-            Compact at (%)
+            Compact buffer (tokens)
             <Input
               type="number"
               min={1}
-              max={100}
-              step={0.1}
-              value={thresholdDraft}
-              placeholder="Auto"
-              onChange={(event) => setThresholdDraft(event.target.value)}
-              onBlur={commitThreshold}
+              step={1000}
+              value={bufferDraft}
+              placeholder={reportedBufferPlaceholder}
+              onChange={(event) => setBufferDraft(event.target.value)}
+              onBlur={commitBuffer}
               onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
-              aria-label="Automatic Compact threshold percent"
+              aria-label="Automatic Compact buffer in tokens"
             />
           </label>
         </div>
@@ -185,8 +189,9 @@ export function ContextUsageSettings() {
             : ""}
         </p>
         <p className="text-xs text-muted-foreground">
-          Auto follows values reported by the active session. It does not learn after a Compact or
-          change when the agent compacts; manual values only correct this indicator.
+          Compact point = context total minus the buffer. Auto follows values reported by the active
+          session. It does not learn after a Compact or change when the agent compacts; manual
+          values only correct this indicator.
         </p>
         {savedSources.length > 0 ? (
           <div
@@ -223,10 +228,8 @@ export function ContextUsageSettings() {
                       {source.model || "Auto model"}
                     </span>
                     <span className="tabular-nums text-muted-foreground sm:text-right">
-                      Context {override.contextWindowTokens?.toLocaleString() ?? "Auto"} · Compact{" "}
-                      {override.autoCompactThresholdPercent != null
-                        ? `${override.autoCompactThresholdPercent}%`
-                        : "Auto"}
+                      Context {override.contextWindowTokens?.toLocaleString() ?? "Auto"} · Compact
+                      buffer {override.autoCompactBufferTokens?.toLocaleString() ?? "Auto"}
                     </span>
                   </div>
                 );
