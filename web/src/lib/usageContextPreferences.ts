@@ -10,11 +10,12 @@ const MAX_PROVIDER_USAGE_SOURCES = 24;
 
 export interface UsageContextOverride {
   contextWindowTokens: number | null;
-  autoCompactThresholdPercent: number | null;
+  /** Tokens reserved before the context total; compact point = total - buffer. */
+  autoCompactBufferTokens: number | null;
 }
 
 export interface UsageContextPreferences {
-  version: 4;
+  version: 5;
   /** Show provider-reported usage windows beside the context ring. */
   showProviderUsageLimits: boolean;
   /** Display overrides scoped to the exact Host, agent, harness, and model. */
@@ -31,7 +32,7 @@ export interface UsageContextSource {
 }
 
 export const DEFAULT_USAGE_CONTEXT_PREFERENCES: UsageContextPreferences = {
-  version: 4,
+  version: 5,
   showProviderUsageLimits: true,
   overrides: {},
   lastProviderUsageLimits: {},
@@ -40,12 +41,6 @@ export const DEFAULT_USAGE_CONTEXT_PREFERENCES: UsageContextPreferences = {
 function positiveInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.round(value)
-    : null;
-}
-
-function compactPercent(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 100
-    ? Math.round(value * 10) / 10
     : null;
 }
 
@@ -63,15 +58,26 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     for (const [key, candidate] of Object.entries(raw.overrides).slice(0, 100)) {
       if (key.length === 0 || key.length > 512 || !candidate || typeof candidate !== "object")
         continue;
-      const source = candidate as Partial<UsageContextOverride>;
-      const normalized = {
-        contextWindowTokens: positiveInteger(source.contextWindowTokens),
-        autoCompactThresholdPercent: compactPercent(source.autoCompactThresholdPercent),
+      const source = candidate as Partial<UsageContextOverride> & {
+        autoCompactThresholdPercent?: unknown;
       };
-      if (
-        normalized.contextWindowTokens !== null ||
-        normalized.autoCompactThresholdPercent !== null
-      ) {
+      const contextWindowTokens = positiveInteger(source.contextWindowTokens);
+      const storedBufferTokens = positiveInteger(source.autoCompactBufferTokens);
+      const legacyPercent = source.autoCompactThresholdPercent;
+      const migratedBuffer =
+        storedBufferTokens === null &&
+        contextWindowTokens !== null &&
+        typeof legacyPercent === "number" &&
+        Number.isFinite(legacyPercent) &&
+        legacyPercent >= 1 &&
+        legacyPercent < 100
+          ? Math.round((contextWindowTokens * (100 - legacyPercent)) / 100)
+          : null;
+      const autoCompactBufferTokens =
+        storedBufferTokens ??
+        (migratedBuffer !== null && migratedBuffer > 0 ? migratedBuffer : null);
+      const normalized = { contextWindowTokens, autoCompactBufferTokens };
+      if (normalized.contextWindowTokens !== null || normalized.autoCompactBufferTokens !== null) {
         overrides[key] = normalized;
       }
     }
@@ -89,7 +95,7 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     for (const [key, snapshot] of entries) lastProviderUsageLimits[key] = snapshot;
   }
   return {
-    version: 4,
+    version: 5,
     showProviderUsageLimits:
       raw.showProviderUsageLimits !== undefined
         ? raw.showProviderUsageLimits !== false
@@ -138,7 +144,7 @@ export function usageContextOverrideFor(
   return (
     preferences.overrides[sourceKey] ?? {
       contextWindowTokens: null,
-      autoCompactThresholdPercent: null,
+      autoCompactBufferTokens: null,
     }
   );
 }
@@ -201,18 +207,18 @@ export function writeUsageContextOverride(
 ): void {
   const normalizedOverride = {
     contextWindowTokens: positiveInteger(override.contextWindowTokens),
-    autoCompactThresholdPercent: compactPercent(override.autoCompactThresholdPercent),
+    autoCompactBufferTokens: positiveInteger(override.autoCompactBufferTokens),
   };
   const overrides = { ...preferences.overrides };
   if (
     normalizedOverride.contextWindowTokens === null &&
-    normalizedOverride.autoCompactThresholdPercent === null
+    normalizedOverride.autoCompactBufferTokens === null
   ) {
     Reflect.deleteProperty(overrides, sourceKey);
   } else {
     overrides[sourceKey] = normalizedOverride;
   }
-  writeUsageContextPreferences({ ...preferences, version: 4, overrides });
+  writeUsageContextPreferences({ ...preferences, version: 5, overrides });
 }
 
 /** Return the last valid reading for one exact Host/agent/harness/model source. */
@@ -259,7 +265,7 @@ export function writeLastProviderUsageLimits(
     .slice(0, MAX_PROVIDER_USAGE_SOURCES);
   const next = {
     ...preferences,
-    version: 4,
+    version: 5,
     lastProviderUsageLimits: Object.fromEntries(entries),
   } satisfies UsageContextPreferences;
   if (displayIsUnchanged) {
@@ -279,9 +285,10 @@ export function resolveUsageContextLimits(
 ): { contextWindow: number | null; autoCompactTokenLimit: number | null } {
   const override = usageContextOverrideFor(preferences, sourceKey);
   const contextWindow = override.contextWindowTokens ?? reportedContextWindow;
+  const buffer = override.autoCompactBufferTokens;
   const manualCompactLimit =
-    contextWindow != null && contextWindow > 0 && override.autoCompactThresholdPercent != null
-      ? Math.round((contextWindow * override.autoCompactThresholdPercent) / 100)
+    contextWindow != null && buffer != null && contextWindow > buffer
+      ? contextWindow - buffer
       : null;
   return {
     contextWindow,
