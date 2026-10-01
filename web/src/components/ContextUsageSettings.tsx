@@ -5,6 +5,7 @@ import { useSession } from "@/hooks/useSession";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { Input } from "@/components/ui/input";
+import { SavedContextSources } from "@/components/SavedContextSources";
 import { Switch } from "@/components/ui/switch";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { formatTokenCountShort } from "@/lib/formatCost";
@@ -15,7 +16,6 @@ import {
 } from "@/lib/providerUsageLimits";
 import {
   usageContextOverrideFor,
-  usageContextSourceFromKey,
   usageContextSourceKey,
   writeUsageContextOverride,
   writeUsageContextPreferences,
@@ -106,10 +106,6 @@ export function ContextUsageSettings() {
     harness,
   });
   const savedOverrideCount = Object.keys(preferences.overrides).length;
-  const savedSources = Object.entries(preferences.overrides).flatMap(([key, override]) => {
-    const source = usageContextSourceFromKey(key);
-    return source ? [{ key, source, override }] : [];
-  });
   const currentProviderLimits = formatProviderUsageLimits(providerLimits) ? providerLimits : null;
   const providerStatusDetail = currentProviderLimits
     ? `${currentProviderLimits.provider} usage limits for this session.`
@@ -193,50 +189,12 @@ export function ContextUsageSettings() {
           session. It does not learn after a Compact or change when the agent compacts; manual
           values only correct this indicator.
         </p>
-        {savedSources.length > 0 ? (
-          <div
-            className="grid gap-2 border-t border-border pt-4"
-            data-testid="saved-context-sources"
-          >
-            <div>
-              <h4 className="text-sm font-medium text-foreground">Saved sources</h4>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Each computer, agent, harness, and model combination keeps its own values.
-              </p>
-            </div>
-            <div className="divide-y divide-border overflow-hidden rounded-lg border border-border">
-              {savedSources.map(({ key, source, override }) => {
-                const savedHostName = source.hostId
-                  ? (hosts.find((host) => host.host_id === source.hostId)?.name ?? source.hostId)
-                  : "Server";
-                const savedHarnessName = source.harness
-                  ? (BRAIN_HARNESS_LABELS[source.harness] ?? source.harness)
-                  : "Unknown";
-                const isCurrent = key === sourceKey;
-                return (
-                  <div key={key} className="grid gap-2 px-3 py-2.5 text-xs sm:grid-cols-2">
-                    <div className="flex min-w-0 items-center gap-2 sm:col-span-2">
-                      <span className="truncate font-medium text-foreground">{savedHostName}</span>
-                      {isCurrent ? (
-                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
-                          Current
-                        </span>
-                      ) : null}
-                    </div>
-                    <span className="truncate text-muted-foreground">
-                      {source.agentName || "Unknown agent"} · {savedHarnessName} ·{" "}
-                      {source.model || "Auto model"}
-                    </span>
-                    <span className="tabular-nums text-muted-foreground sm:text-right">
-                      Context {override.contextWindowTokens?.toLocaleString() ?? "Auto"} · Compact
-                      buffer {override.autoCompactBufferTokens?.toLocaleString() ?? "Auto"}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        ) : null}
+        <SavedContextSources
+          preferences={preferences}
+          currentSourceKey={sourceKey}
+          hosts={hosts}
+          currentOverride={activeOverride}
+        />
       </div>
 
       <div className="flex items-start justify-between gap-6 border-t border-border pt-5">

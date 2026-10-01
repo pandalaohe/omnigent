@@ -14,6 +14,12 @@ export interface UsageContextOverride {
   autoCompactBufferTokens: number | null;
 }
 
+/** Only present fields are applied; `null` clears the field to Auto. */
+export interface UsageContextOverridePatch {
+  contextWindowTokens?: number | null;
+  autoCompactBufferTokens?: number | null;
+}
+
 export interface UsageContextPreferences {
   version: 5;
   /** Show provider-reported usage windows beside the context ring. */
@@ -218,6 +224,59 @@ export function writeUsageContextOverride(
   } else {
     overrides[sourceKey] = normalizedOverride;
   }
+  writeUsageContextPreferences({ ...preferences, version: 5, overrides });
+}
+
+/**
+ * Apply one patch to many sources with a single sync write. Absent patch
+ * fields keep each row's existing value, so batched edits never copy one row's
+ * settings onto another.
+ */
+export function patchUsageContextOverrides(
+  preferences: UsageContextPreferences,
+  sourceKeys: string[],
+  patch: UsageContextOverridePatch,
+): void {
+  if (sourceKeys.length === 0) return;
+  const overrides = { ...preferences.overrides };
+  for (const sourceKey of sourceKeys) {
+    const existing = overrides[sourceKey] ?? {
+      contextWindowTokens: null,
+      autoCompactBufferTokens: null,
+    };
+    const next: UsageContextOverride = {
+      contextWindowTokens:
+        patch.contextWindowTokens !== undefined
+          ? positiveInteger(patch.contextWindowTokens)
+          : positiveInteger(existing.contextWindowTokens),
+      autoCompactBufferTokens:
+        patch.autoCompactBufferTokens !== undefined
+          ? positiveInteger(patch.autoCompactBufferTokens)
+          : positiveInteger(existing.autoCompactBufferTokens),
+    };
+    if (next.contextWindowTokens === null && next.autoCompactBufferTokens === null) {
+      Reflect.deleteProperty(overrides, sourceKey);
+    } else {
+      overrides[sourceKey] = next;
+    }
+  }
+  writeUsageContextPreferences({ ...preferences, version: 5, overrides });
+}
+
+/** Remove many sources with a single sync write. */
+export function deleteUsageContextOverrides(
+  preferences: UsageContextPreferences,
+  sourceKeys: string[],
+): void {
+  const overrides = { ...preferences.overrides };
+  let removed = false;
+  for (const sourceKey of sourceKeys) {
+    if (Object.hasOwn(overrides, sourceKey)) {
+      Reflect.deleteProperty(overrides, sourceKey);
+      removed = true;
+    }
+  }
+  if (!removed) return;
   writeUsageContextPreferences({ ...preferences, version: 5, overrides });
 }
 

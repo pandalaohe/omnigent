@@ -6,6 +6,8 @@ vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
+  deleteUsageContextOverrides,
+  patchUsageContextOverrides,
   readUsageContextPreferences,
   providerUsageLimitsForSource,
   resolveUsageContextLimits,
@@ -14,6 +16,7 @@ import {
   writeUsageContextOverride,
   writeUsageContextPreferences,
   writeLastProviderUsageLimits,
+  type UsageContextPreferences,
 } from "./usageContextPreferences";
 
 beforeEach(() => {
@@ -222,5 +225,106 @@ describe("usage/context preferences", () => {
     expect(providerUsageLimitsForSource(readUsageContextPreferences(), source)?.capturedAt).toBe(
       first.capturedAt + 60_000,
     );
+  });
+
+  it("patches a batch in one write, keeping each row's absent field", () => {
+    const second = usageContextSourceKey({
+      hostId: "host-a",
+      agentName: "claude",
+      harness: "claude-native",
+      model: "opus",
+    });
+    const preferences: UsageContextPreferences = {
+      version: 5,
+      showProviderUsageLimits: true,
+      overrides: {
+        [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
+        [second]: { contextWindowTokens: null, autoCompactBufferTokens: 20_000 },
+      },
+      lastProviderUsageLimits: {},
+    };
+
+    patchUsageContextOverrides(preferences, [source, second], {
+      autoCompactBufferTokens: 33_000,
+    });
+
+    const saved = readUsageContextPreferences().overrides;
+    expect(saved[source]).toEqual({
+      contextWindowTokens: 100_000,
+      autoCompactBufferTokens: 33_000,
+    });
+    expect(saved[second]).toEqual({ contextWindowTokens: null, autoCompactBufferTokens: 33_000 });
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a patched field to Auto and drops a row left all-Auto", () => {
+    const preferences: UsageContextPreferences = {
+      version: 5,
+      showProviderUsageLimits: true,
+      overrides: {
+        [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
+      },
+      lastProviderUsageLimits: {},
+    };
+
+    patchUsageContextOverrides(preferences, [source], { contextWindowTokens: null });
+    expect(readUsageContextPreferences().overrides[source]).toEqual({
+      contextWindowTokens: null,
+      autoCompactBufferTokens: 10_000,
+    });
+
+    patchUsageContextOverrides(readUsageContextPreferences(), [source], {
+      autoCompactBufferTokens: null,
+    });
+    expect(readUsageContextPreferences().overrides[source]).toBeUndefined();
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not write a patch without source keys", () => {
+    patchUsageContextOverrides(DEFAULT_USAGE_CONTEXT_PREFERENCES, [], { contextWindowTokens: 1 });
+
+    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
+    expect(localStorage.getItem("omnigent:usage-context-preferences")).toBeNull();
+  });
+
+  it("deletes only the given sources in one write", () => {
+    const second = usageContextSourceKey({
+      hostId: "host-a",
+      agentName: "claude",
+      harness: "claude-native",
+      model: "opus",
+    });
+    const keep = usageContextSourceKey({
+      hostId: "host-b",
+      agentName: "codex",
+      harness: "codex",
+      model: "gpt-5.6",
+    });
+    const preferences: UsageContextPreferences = {
+      version: 5,
+      showProviderUsageLimits: true,
+      overrides: {
+        [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
+        [second]: { contextWindowTokens: null, autoCompactBufferTokens: 20_000 },
+        [keep]: { contextWindowTokens: 50_000, autoCompactBufferTokens: null },
+      },
+      lastProviderUsageLimits: {},
+    };
+
+    deleteUsageContextOverrides(preferences, [source, second]);
+
+    const saved = readUsageContextPreferences().overrides;
+    expect(saved[source]).toBeUndefined();
+    expect(saved[second]).toBeUndefined();
+    expect(saved[keep]).toEqual({ contextWindowTokens: 50_000, autoCompactBufferTokens: null });
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not write a delete without a matching source", () => {
+    deleteUsageContextOverrides(DEFAULT_USAGE_CONTEXT_PREFERENCES, ["missing"]);
+    deleteUsageContextOverrides(DEFAULT_USAGE_CONTEXT_PREFERENCES, []);
+
+    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
+    expect(localStorage.getItem("omnigent:usage-context-preferences")).toBeNull();
   });
 });
