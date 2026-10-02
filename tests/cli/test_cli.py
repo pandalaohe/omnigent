@@ -1142,6 +1142,17 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
     assert cli.commands["update"] is cli.commands["upgrade"]
 
 
+def test_up_is_short_spelling_of_host_update_custom() -> None:
+    """``up`` is the same command object as ``host update custom``."""
+    assert cli.commands["up"] is cli.commands["host"].commands["update"].commands["custom"]
+
+    result = CliRunner().invoke(cli, ["up", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--rollback" in result.output
+    assert "Update this managed Host from our fork-only custom channel." in result.output
+
+
 def test_help_hides_extras_gated_harness_when_sdk_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -393,6 +393,7 @@ def test_update_suppresses_update_check_like_upgrade() -> None:
 
     assert _should_skip_update_check(["update"]) is True
     assert _should_skip_update_check(["upgrade"]) is True
+    assert _should_skip_update_check(["up"]) is True
 
 
 def test_upgrade_noop_install_reports_failure_not_success(

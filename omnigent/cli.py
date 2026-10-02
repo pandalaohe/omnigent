@@ -2146,6 +2146,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "stop",
         "system",
         "uninstall",
+        "up",
         "update",
         "upgrade",
         "usage",
@@ -2159,9 +2160,9 @@ def _should_skip_update_check(argv: list[str]) -> bool:
 
     Skipped for help / version requests, internal TUI subcommands
     (``pane-split`` / ``pane-picker``, invoked by the terminal UI rather
-    than the user), and ``upgrade`` (and its ``update`` alias) itself
-    (pointing the user at ``omni upgrade`` while they are running it is
-    noise).
+    than the user), and the updater commands ``upgrade`` (and its
+    ``update`` alias) and ``up`` itself (pointing the user at an update
+    command while they are running one is noise).
 
     :param argv: CLI arguments without the program name, e.g.
         ``["run", "agent.yaml"]``.
@@ -2174,6 +2175,7 @@ def _should_skip_update_check(argv: list[str]) -> bool:
         "-h",
         "--version",
         "version",
+        "up",
         "update",
         "upgrade",
         "pane-split",
@@ -9996,6 +9998,11 @@ def host_update_custom(
     )
     with guard:
         _host_update_custom_impl(check_only, dry_run, force, rollback)
+
+
+# ``update`` stays upstream's alias of ``upgrade`` (installs the upstream
+# PyPI release), so the fork's short spelling is ``up``.
+cli.add_command(host_update_custom, name="up")
 
 
 def _host_update_custom_impl(
