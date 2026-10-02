@@ -10216,7 +10216,7 @@ def create_runner_app(
         _background_tasks.add(_retry_task)
 
     async def _post_untracked_subagent_terminal(
-        child_session_id: str, *, status: str, output: str | None
+        child_session_id: str, *, status: str, output: str | None, require_parent: bool = False
     ) -> None:
         """Report a terminal edge for a sub-agent whose work is not tracked here.
 
@@ -10224,15 +10224,24 @@ def create_runner_app(
         delivery has no parent inbox to reach; posting the edge to the server
         routes it through the parent-runner forward. The same report recovers a
         local child whose work entry a restart wiped, one polling interval
-        sooner than the reconciliation backstop. Single-shot: the report carries
-        no dispatch id, so a late retry could complete the child's next entry.
+        sooner than the reconciliation backstop. A child is known either by a
+        recorded ``sub_agent_name`` or by a parent on its snapshot; under
+        ``require_parent`` the snapshot must confirm that parent, so a top-level
+        session never reports. Single-shot: the report carries no dispatch id,
+        so a late retry could complete the child's next entry.
 
         :param child_session_id: The sub-agent child session id.
         :param status: Server-vocabulary status, e.g. ``"completed"``.
         :param output: The child's terminal output text, or ``None``.
+        :param require_parent: When ``True``, report only if the session
+            snapshot names a parent; a top-level session is skipped.
         """
         from omnigent.native._native_post_delivery import post_external_session_status
 
+        if require_parent:
+            snapshot = await _session_snapshot(child_session_id)
+            if not snapshot.parent_session_id:
+                return
         try:
             await post_external_session_status(
                 server_client,
@@ -10249,9 +10258,14 @@ def create_runner_app(
             )
 
     def _post_untracked_subagent_terminal_soon(
-        child_session_id: str, *, status: str, output: str | None
+        child_session_id: str, *, status: str, output: str | None, require_parent: bool = False
     ) -> None:
-        """Schedule :func:`_post_untracked_subagent_terminal` on the loop."""
+        """Schedule :func:`_post_untracked_subagent_terminal` on the loop.
+
+        :param require_parent: Forwarded to the scheduled report; when
+            ``True`` the report is skipped unless the session snapshot names
+            a parent.
+        """
         reported = _SUBAGENT_REPORTED_TERMINAL_STATUS.get(status)
         if reported is None:
             return
@@ -10260,7 +10274,9 @@ def create_runner_app(
         except RuntimeError:
             return
         task = loop.create_task(
-            _post_untracked_subagent_terminal(child_session_id, status=reported, output=output)
+            _post_untracked_subagent_terminal(
+                child_session_id, status=reported, output=output, require_parent=require_parent
+            )
         )
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
@@ -10271,6 +10287,7 @@ def create_runner_app(
         status: str,
         output: str | None,
         result_key: str | None = None,
+        reported_by_server: bool = False,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id, status=status, output=output, result_key=result_key
@@ -10289,6 +10306,20 @@ def create_runner_app(
             # hand the terminal edge back to the server, whose sub-agent path
             # forwards it to the parent runner that owns the inbox.
             _post_untracked_subagent_terminal_soon(child_session_id, status=status, output=output)
+        elif (
+            not ack.delivered
+            and ack.entry is None
+            and child_session_id not in _session_sub_agent_names
+            and not reported_by_server
+            and not _is_native_harness(child_session_id)
+        ):
+            # A ``sys_session_create`` child is known only by its snapshot's
+            # parent: that gate keeps a top-level session quiet, a native
+            # child reports through its forwarder, and a server-routed edge
+            # must not loop back.
+            _post_untracked_subagent_terminal_soon(
+                child_session_id, status=status, output=output, require_parent=True
+            )
         return ack
 
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
@@ -12451,6 +12482,7 @@ def create_runner_app(
                     status="completed",
                     output=output if output is not None else "",
                     result_key=result_key,
+                    reported_by_server=True,
                 )
             elif status == "failed":
                 delivery_ack = _mark_subagent_terminal_and_wake(
@@ -12458,6 +12490,7 @@ def create_runner_app(
                     status="failed",
                     output=output or "Error: native sub-agent turn failed",
                     result_key=result_key,
+                    reported_by_server=True,
                 )
             elif status in ("stopped", "killed"):
                 delivery_ack = _mark_subagent_terminal_and_wake(
@@ -12466,6 +12499,7 @@ def create_runner_app(
                     output=output
                     or f"Sub-agent {status} before producing a reliable final result.",
                     result_key=result_key,
+                    reported_by_server=True,
                 )
             if delivery_ack is not None:
                 if (

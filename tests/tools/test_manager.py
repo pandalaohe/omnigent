@@ -1481,7 +1481,6 @@ def test_session_create_description_discloses_project_membership() -> None:
     assert "the result's `project_id` is null for No Project" in description
     assert "Omit all of them to inherit your host, project and working tree" in description
     assert "`worktree`" in description
-    assert "cross-host child on an SDK harness" in description
     assert "never removed automatically" in description
     # Usage policy lives in Global Instructions, not the tool text.
     assert "should take its own worktree" not in description

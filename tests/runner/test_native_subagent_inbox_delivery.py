@@ -1327,6 +1327,196 @@ async def test_untracked_sub_agent_terminal_reports_to_the_server(
         assert len(server_client.posts) == before
 
 
+@pytest.mark.asyncio
+async def test_unnamed_child_terminal_reports_to_the_server(
+    _clean_subagent_registry: None,
+) -> None:
+    """A parentful child without a ``sub_agent_name`` reports its terminal upstream.
+
+    ``sys_session_create`` records a parent for such a child but no
+    ``sub_agent_name``, so the init envelope alone cannot tell this runner the
+    child is a sub-agent. Its cross-host terminal edge still has to reach the
+    server so the parent's runner can deliver the result.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name=None, parent_session_id=PARENT_SESSION_ID),
+        _parent_snapshot(parent_session_id=None),
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": CHILD_SESSION_ID,
+                "agent_id": "ag_reviewer",
+            },
+        )
+        assert init.status_code == 201, init.text
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
+        )
+        reports: list[dict[str, Any]] = []
+        for _ in range(200):
+            reports = [
+                kwargs.get("json")
+                for url, kwargs in server_client.posts
+                if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events")
+            ]
+            if reports:
+                break
+            await asyncio.sleep(0.01)
+
+    assert reports, (
+        "a sys_session_create child's terminal edge never reached the server; the "
+        "parent runner can never deliver the result"
+    )
+    event = reports[-1]
+    assert event["type"] == "external_session_status"
+    assert event["data"]["status"] == "completed"
+    assert event["data"]["output"] == "review complete: LGTM"
+    assert runner_app._session_inboxes_ref.get(PARENT_SESSION_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_unnamed_native_child_stop_is_not_reported(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native child's stop edge must not be reported back to the server.
+
+    ``NativeInterruptRunner`` marks the child ``cancelled`` on every native
+    interrupt / stop, including after the child already completed. Native
+    children already reach the parent through their forwarder, so the
+    untracked-report path would escalate the delivered ``completed`` entry
+    into a second ``stopped`` delivery on the parent's runner.
+    """
+    from unittest.mock import AsyncMock
+
+    launch = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", launch)
+    monkeypatch.setattr(runner_app, "_resolve_native_spawn_env", AsyncMock(return_value={}))
+
+    def _no_relay(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("no relay in this test")
+
+    # A claude-native init pre-starts the comment relay; keep it off disk.
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.start_tool_relay", _no_relay)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name=None, parent_session_id=PARENT_SESSION_ID),
+        _parent_snapshot(parent_session_id=None),
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": CHILD_SESSION_ID,
+                "agent_id": "ag_reviewer",
+            },
+        )
+        assert init.status_code == 201, init.text
+        # Premise guard: the child resolved native, so the harness exclusion
+        # is the thing keeping the report from firing.
+        assert launch.await_args is not None
+        assert launch.await_args.args[0] == "claude-native"
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="cancelled", output="[System: sub-agent stopped]"
+        )
+        reports: list[dict[str, Any]] = []
+        for _ in range(200):
+            reports = [
+                kwargs.get("json")
+                for url, kwargs in server_client.posts
+                if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events")
+            ]
+            if reports:
+                break
+            await asyncio.sleep(0.01)
+
+    assert not reports, (
+        "a native child's stop must not be reported to the server; its forwarder "
+        "already reports the terminal edge"
+    )
+
+
+@pytest.mark.asyncio
+async def test_top_level_session_terminal_is_not_reported(
+    _clean_subagent_registry: None,
+) -> None:
+    """A top-level session has no parent and never reports a sub-agent edge."""
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    server_client = _SnapshotServerClient(
+        _child_snapshot(sub_agent_name=None, parent_session_id=None),
+        _parent_snapshot(parent_session_id=None),
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        init = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": CHILD_SESSION_ID,
+                "agent_id": "ag_reviewer",
+            },
+        )
+        assert init.status_code == 201, init.text
+        app.state.mark_subagent_terminal_and_wake(
+            CHILD_SESSION_ID, status="completed", output="done"
+        )
+        reports: list[dict[str, Any]] = []
+        for _ in range(200):
+            reports = [
+                kwargs.get("json")
+                for url, kwargs in server_client.posts
+                if url.rstrip("/").endswith(f"/v1/sessions/{CHILD_SESSION_ID}/events")
+            ]
+            if reports:
+                break
+            await asyncio.sleep(0.01)
+
+    assert not reports, "a top-level session must not report a sub-agent terminal edge"
+
+
 class _FlakyChildReportServerClient(_SnapshotServerClient):
     """A server client whose child-event POST fails the first *failures* times."""
 
