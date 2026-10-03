@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
@@ -7270,6 +7271,95 @@ async def test_post_external_session_interrupted_publishes_session_interrupted(
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200, snap.text
     assert snap.json()["items"] == []
+
+
+async def test_post_external_keep_warm_receipt_creates_no_item(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_keep_warm_receipt`` settles the sweeper's attempt, nothing else.
+
+    The runner's answer to a keep-warm ping is transient: it is routed to the
+    keep-warm sweeper verbatim, persists no transcript item, and publishes
+    nothing to the session stream.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """
+        Capture session-stream events emitted by the route.
+
+        :param session_id: Session id passed to ``session_stream``.
+        :param event: Event payload published to the stream.
+        :returns: None.
+        """
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    settled: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture_settle(session_id: str, data: dict[str, Any]) -> bool:
+        """
+        Capture receipts routed to the keep-warm sweeper.
+
+        :param session_id: Session the receipt was posted to.
+        :param data: The receipt payload.
+        :returns: Always ``True`` (matched).
+        """
+        settled.append((session_id, data))
+        return True
+
+    monkeypatch.setattr(app.state.child_keep_warm, "settle_receipt", capture_settle)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_keep_warm_receipt",
+            "data": {
+                "attempt_id": "abc123",
+                "outcome": "ok",
+                "cost_usd": 0.01,
+                "estimated": True,
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert settled == [
+        (
+            session["id"],
+            {"attempt_id": "abc123", "outcome": "ok", "cost_usd": 0.01, "estimated": True},
+        )
+    ]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json()["items"] == []
+    assert published == []
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_keep_warm_receipt", "data": {"outcome": "ok"}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "data.attempt_id" in resp.text
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_keep_warm_receipt",
+            "data": {"attempt_id": "abc123", "outcome": "bogus"},
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "data.outcome" in resp.text
 
 
 async def test_post_interrupt_without_data_field_is_accepted(

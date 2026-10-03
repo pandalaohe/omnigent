@@ -1,33 +1,33 @@
-"""Keep-warm sweeper — one quiet turn per provider cache window.
+"""Keep-warm sweeper — one control ping per provider cache window.
 
-Idle children in the active zone lose their provider prompt cache when
-the cache window (Claude 55 min, Codex 25 min) elapses, so the next real
-turn pays a full prompt rewrite. This background loop keeps an eligible
-child warm by posting one short ``[quiet]`` turn at last-cache-touch +
-interval, for at most the configured cap after the child's last real
-turn. It runs server-side (independent of any browser or mother
-connection) and gates every ping on the owner's collaboration settings.
+Idle sessions in the active zone lose their provider prompt cache when the
+cache window (Claude 1 h, Codex ~25 min) elapses, so the next real turn pays
+a full prompt rewrite. This background loop keeps an eligible session warm by
+forwarding one ``keep_warm_ping`` control to its runner at last-cache-touch +
+interval, for at most the configured cap after the session's last real turn.
+It covers main sessions and sub-agent children on harnesses with a keep-warm
+channel (``_SUPPORTED_HARNESSES``), runs server-side (independent of any
+browser connection), and gates every ping on the owner's per-agent keep-warm
+settings, the runner's liveness, the host's ``keep_warm_v1`` capability, and
+a server pre-filter that skips sessions with a pending synchronous card.
 
-State lives in one compact-JSON conversation label (``omnigent.keep_warm``)
-so it survives restarts and rides the existing label machinery — no new
-table, no migration. A ping's reply is silence by contract: the child's
-last assistant line must be ``[quiet]``; anything else counts as a
-failure, so a non-complying child costs at most three mother wakes before
-warming pauses. Two consecutive readings that miss the prompt cache pause
-warming too (a harness whose cache is shorter than the assumed window).
-
-Warming follows the child's direct parent: a child is kept warm only while
-its parent has recent life — a running turn that is not the parent's own
-keep-warm ping, or a real turn inside the parent's own interval. An absent
-or unreadable parent turns the child cold (``why = mom``) with no notice,
-because the notice itself would wake the absent mother.
+Pings never travel as conversation messages: the control is forwarded to the
+runner and the runner reports the outcome back as an
+``external_keep_warm_receipt`` event, settled by :meth:`settle_receipt`. State
+lives in two compact-JSON conversation labels — ``omnigent.keep_warm``
+(episode state, bounded) and ``omnigent.keep_warm_stats`` (pings, cost, last
+return) — so it survives restarts and rides the existing label machinery.
+Three consecutive failures pause warming until the next real turn; two
+consecutive measured cache misses pause it stickily (a harness whose cache is
+shorter than the assumed window), lifting only after the session leaves and
+re-enters the active zone.
 
 The loop is shaped like :class:`~omnigent.server.peer_sweeper.PeerSweeper`:
 ``start``/``shutdown`` own one task, ``_run`` loops ``_tick`` plus
-``asyncio.sleep`` swallowing errors, and tests drive ``_tick`` directly
-with an injected clock. Notices to the mother reuse the peer sweeper's
-``notify_line`` so they park, batch and drop for archived mothers exactly
-like every other server notice.
+``asyncio.sleep`` swallowing errors, and tests drive ``_tick`` directly with
+an injected clock. Notices to the mother reuse the peer sweeper's
+``notify_line`` when wired, so they park, batch and drop for archived mothers
+exactly like every other server notice.
 """
 
 from __future__ import annotations
@@ -35,21 +35,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Literal
-
-from starlette.requests import Request
+from typing import Any, Literal, NamedTuple
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
-from omnigent.entities.conversation import ConversationItem, MessageData
-from omnigent.native.native_coding_agents import NativeCodingAgent, public_agent_name
+from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.runtime.pending_elicitations import snapshot_for
 from omnigent.server.routes._sessions.common import (
     _KEEP_WARM_LABEL_KEY,
+    _KEEP_WARM_STATS_LABEL_KEY,
     _LAST_CACHE_LABEL_KEY,
-    _session_status_cache,
 )
 from omnigent.server.routes._sessions.helpers import (
     Placement,
@@ -57,17 +56,21 @@ from omnigent.server.routes._sessions.helpers import (
     _child_summary_identity,
     _effective_placement,
     _inherited_placement,
-    _native_coding_agent_for_session,
     _publish_child_status_to_parent,
+    _resolve_harness,
     _session_status_from_cache,
 )
-from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.server.user_preferences_store import (
-    CollabSettings,
-    clamp_keep_warm,
-    read_collab_settings,
+    KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S,
+    KEEP_WARM_CODEX_DEFAULT_INTERVAL_S,
+    KEEP_WARM_DEFAULT_MAX_S,
+    KEEP_WARM_MAX_BOUNDS_S,
+    KeepWarmSettings,
+    keep_warm_for_agent,
+    migrate_legacy_keep_warm,
+    read_keep_warm_settings,
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -76,34 +79,31 @@ from omnigent.util.session_lifecycle import is_session_closed, title_without_clo
 _logger = logging.getLogger(__name__)
 
 KEEP_WARM_LABEL = _KEEP_WARM_LABEL_KEY
+KEEP_WARM_STATS_LABEL = _KEEP_WARM_STATS_LABEL_KEY
 LAST_CACHE_LABEL = _LAST_CACHE_LABEL_KEY
 
-#: The one line a keep-warm turn asks the child to answer with.
-PING = (
-    "[System: keep-warm check from Omnigent. No action is needed; reply with only "
-    "this line: [quiet]]"
-)
-
-_QUIET_LINE = "[quiet]"
 _SLACK_S = 300
 _TICK_INTERVAL_S = 60.0
-_PING_TIMEOUT_S = 120.0
-_PING_TURN_MAX_S = 180
-_RUNNING_SINCE_LEAD_S = 5
-_SETTLE_USAGE_GRACE_S = 60
+_ATTEMPT_TIMEOUT_S = 180
 _FAILURE_PAUSE_THRESHOLD = 3
 _MISS_PAUSE_THRESHOLD = 2
 _PAGE_LIMIT = 200
 _MAX_PAGES = 100
 _MAX_PARENT_HOPS = 32
-_CANDIDATE_WINDOW_S = 59 * 60 + _SLACK_S
-#: Only Claude and Codex children have a provider cache worth keeping.
-_SUPPORTED_HARNESSES: dict[str, str] = {
+#: Claude's provider cache TTL: a session reads warm on the clock alone.
+_CLAUDE_TTL_S = 3600
+#: Codex reports no cache TTL; an observation older than this proves nothing.
+_CODEX_DEFAULT_STALENESS_S = 1800
+#: Only Claude and Codex sessions have a provider cache worth keeping. This
+#: map is the single place a later keep-warm channel registers.
+_SUPPORTED_HARNESSES: dict[str, Literal["claude", "codex"]] = {
     "claude-native": "claude",
     "codex-native": "codex",
 }
-#: Reasons a cold / paused label may carry: ``mom`` = the parent went away.
+#: Reasons a cold / paused label may carry. ``pol`` and ``mom`` are legacy
+#: (SCC19) codes — never written any more, still parsed from old labels.
 _WHY_CODES = frozenset({"cap", "exp", "fail", "pol", "miss", "rev", "mom"})
+_RECEIPT_OUTCOMES = frozenset({"ok", "skipped", "failed"})
 #: Mirrored native sub-agent rows describe another harness's internal
 #: sub-agent, not an Omnigent session with its own cache.
 _MIRRORED_WRAPPER_LABELS = frozenset(
@@ -112,6 +112,29 @@ _MIRRORED_WRAPPER_LABELS = frozenset(
 _WRAPPER_LABEL_KEY = "omnigent.wrapper"
 #: Placement stand-in for a child whose parent pointer is missing.
 _EMPTY_PLACEMENT = Placement(None, None, None)
+#: A turn whose usage reading never lands stops retrying this long after the
+#: episode opened.
+_LATE_USAGE_GRACE_S = 300
+#: Receipt stop reasons store as one of these bounded ASCII codes (``other``
+#: otherwise) so a long or non-ASCII reason cannot break the 256-char label.
+_STOP_REASON_CODES = frozenset(
+    {
+        "card",
+        "unknown",
+        "busy",
+        "preempted",
+        "composer_draft",
+        "composer_changed",
+        "user_active",
+        "no_live_client",
+        "btw_unavailable",
+        "aborted",
+        "tool_attempt",
+        "timeout",
+        "harness_error",
+        "unsupported",
+    }
+)
 
 
 def _as_int(value: object) -> int | None:
@@ -121,32 +144,48 @@ def _as_int(value: object) -> int | None:
     return value
 
 
+def _as_number(value: object) -> float | None:
+    """Return *value* as a float when it is numeric (never a bool)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 @dataclass
 class _WarmState:
     """
-    One child's parsed ``omnigent.keep_warm`` label.
+    One session's parsed ``omnigent.keep_warm`` label.
 
     Short keys keep the serialized label well under the 256-character
     label bound: ``s`` state (``w`` warm / ``c`` cold / ``p`` paused),
     ``why`` reason, ``t`` last-seen ``running_since``, ``c`` episode start,
-    ``u`` last cache touch, ``p`` ping attempt time, ``q`` pending flag,
-    ``f`` failures, ``m`` misses, ``b`` usage baseline, ``v``
-    ``archive_revision`` at a miss pause, ``w`` warm-until.
+    ``u`` last cache touch, ``p`` ping attempt time, ``a`` pending attempt
+    id, ``f`` failures, ``m`` misses, ``b`` usage baseline, ``v``
+    ``archive_revision`` at a miss pause, ``w`` warm-until, ``o`` latest
+    cache observation ``[epoch, 1=hit|0=miss]``, ``r`` late-usage retry
+    pending, ``k`` stop reason.
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
-        ``fail``, ``pol``, ``miss``, ``rev``, ``mom``.
+        ``fail``, ``miss``, ``rev`` (``pol`` / ``mom`` parse from SCC19
+        labels but are never written).
     :param t: ``running_since`` of the last turn seen.
     :param c: Epoch seconds the last real turn was seen settled.
-    :param u: Epoch seconds the last turn (real or ping) was seen settled.
+    :param u: Epoch seconds the last turn (real or ok ping) was seen settled.
     :param p: Epoch seconds of the current ping attempt.
-    :param q: ``True`` while that attempt is pending.
+    :param a: Pending attempt id the receipt must match, else ``None``.
     :param f: Consecutive failures.
     :param m: Consecutive observed cache misses.
-    :param b: Usage baseline at ping time — the Claude reading's
+    :param b: Usage baseline marker — the last consumed Claude reading's
         ``observed_at``, or Codex's cumulative ``[input, cached]``.
     :param v: ``archive_revision`` at a miss pause.
     :param w: Epoch seconds the current interval window ends.
+    :param o: Latest cache observation ``[epoch, hit]`` — the Codex
+        warm_state evidence.
+    :param r: Whether the episode-opening turn still owes a cache reading
+        (the harness reported no usage in time); later ticks retry it.
+    :param k: Why warming currently does not ping — the first failing
+        eligibility gate or a receipt's reason code, else ``None``.
     """
 
     s: str
@@ -155,12 +194,15 @@ class _WarmState:
     c: int | None = None
     u: int | None = None
     p: int | None = None
-    q: bool = False
+    a: str | None = None
     f: int = 0
     m: int = 0
     b: int | list[int] | None = None
     v: int | None = None
     w: int | None = None
+    o: list[int] | None = None
+    r: bool = False
+    k: str | None = None
 
     def to_label(self) -> str:
         """Serialize to the compact JSON label value."""
@@ -175,8 +217,8 @@ class _WarmState:
             data["u"] = self.u
         if self.p is not None:
             data["p"] = self.p
-        if self.q:
-            data["q"] = 1
+        if self.a is not None:
+            data["a"] = self.a
         if self.f:
             data["f"] = self.f
         if self.m:
@@ -187,6 +229,12 @@ class _WarmState:
             data["v"] = self.v
         if self.w is not None:
             data["w"] = self.w
+        if self.o is not None:
+            data["o"] = self.o
+        if self.r:
+            data["r"] = 1
+        if self.k is not None:
+            data["k"] = self.k
         return json.dumps(data, separators=(",", ":"))
 
     @classmethod
@@ -216,6 +264,15 @@ class _WarmState:
             or (isinstance(baseline, list) and not all(_as_int(v) is not None for v in baseline))
         ):
             baseline = None
+        observation = data.get("o")
+        if (
+            not isinstance(observation, list)
+            or len(observation) != 2
+            or any(_as_int(v) is None for v in observation)
+        ):
+            observation = None
+        attempt_id = data.get("a")
+        stop_reason = data.get("k")
         return cls(
             s=state,
             why=why if isinstance(why, str) and why in _WHY_CODES else None,
@@ -223,13 +280,139 @@ class _WarmState:
             c=_as_int(data.get("c")),
             u=_as_int(data.get("u")),
             p=_as_int(data.get("p")),
-            q=bool(data.get("q")),
+            a=attempt_id if isinstance(attempt_id, str) else None,
             f=_as_int(data.get("f")) or 0,
             m=_as_int(data.get("m")) or 0,
             b=baseline,
             v=_as_int(data.get("v")),
             w=_as_int(data.get("w")),
+            o=observation,
+            r=bool(data.get("r")),
+            k=stop_reason if isinstance(stop_reason, str) else None,
         )
+
+
+@dataclass
+class _WarmStats:
+    """
+    One session's parsed ``omnigent.keep_warm_stats`` label.
+
+    Counters live apart from the episode label so the 256-character bound
+    holds. Costs are integer micro-USD. ``e`` flags that some summed ping was
+    an estimate (a channel that reports no usage).
+
+    :param ep_p: Pings in the current episode (since the last real turn).
+    :param ep_c: Episode cost in micro-USD.
+    :param ep_e: Whether any episode ping was an estimate.
+    :param ep_s: Episode start epoch seconds.
+    :param tot_p: Lifetime pings.
+    :param tot_c: Lifetime cost in micro-USD.
+    :param tot_e: Whether any lifetime ping was an estimate.
+    :param lr_at: Epoch seconds of the last return-after-absence real turn.
+    :param lr_r: Its cache result — ``hit`` / ``miss`` / ``unknown``.
+    """
+
+    ep_p: int = 0
+    ep_c: int = 0
+    ep_e: bool = False
+    ep_s: int | None = None
+    tot_p: int = 0
+    tot_c: int = 0
+    tot_e: bool = False
+    lr_at: int | None = None
+    lr_r: str | None = None
+
+    def to_label(self) -> str:
+        """Serialize to the compact JSON label value."""
+        data: dict[str, object] = {}
+        episode: dict[str, object] = {}
+        if self.ep_p:
+            episode["p"] = self.ep_p
+        if self.ep_c:
+            episode["c"] = self.ep_c
+        if self.ep_e:
+            episode["e"] = 1
+        if self.ep_s is not None:
+            episode["s"] = self.ep_s
+        if episode:
+            data["ep"] = episode
+        total: dict[str, object] = {}
+        if self.tot_p:
+            total["p"] = self.tot_p
+        if self.tot_c:
+            total["c"] = self.tot_c
+        if self.tot_e:
+            total["e"] = 1
+        if total:
+            data["tot"] = total
+        if self.lr_at is not None:
+            data["lr"] = [self.lr_at, self.lr_r or "unknown"]
+        return json.dumps(data, separators=(",", ":"))
+
+    @classmethod
+    def parse(cls, raw: str | None) -> _WarmStats:
+        """Parse a stored label, returning zeros for anything unusable."""
+        if not raw:
+            return cls()
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return cls()
+        if not isinstance(data, dict):
+            return cls()
+        episode = data.get("ep")
+        episode = episode if isinstance(episode, dict) else {}
+        total = data.get("tot")
+        total = total if isinstance(total, dict) else {}
+        last_return = data.get("lr")
+        lr_at: int | None = None
+        lr_r: str | None = None
+        if (
+            isinstance(last_return, list)
+            and len(last_return) == 2
+            and _as_int(last_return[0]) is not None
+        ):
+            lr_at = _as_int(last_return[0])
+            lr_r = last_return[1] if last_return[1] in ("hit", "miss", "unknown") else None
+        return cls(
+            ep_p=_as_int(episode.get("p")) or 0,
+            ep_c=_as_int(episode.get("c")) or 0,
+            ep_e=bool(episode.get("e")),
+            ep_s=_as_int(episode.get("s")),
+            tot_p=_as_int(total.get("p")) or 0,
+            tot_c=_as_int(total.get("c")) or 0,
+            tot_e=bool(total.get("e")),
+            lr_at=lr_at,
+            lr_r=lr_r,
+        )
+
+
+class _TickResult(NamedTuple):
+    """One locked tick pass's deferred effects, applied after the lock.
+
+    :param conv: The session row the pass read.
+    :param notices: Stop notices to send the mother.
+    :param touch: Whether to forward the episode-start touch.
+    :param ping: ``(attempt_id, family, harness)`` when a ping goes out.
+    """
+
+    conv: Conversation
+    notices: list[tuple[str, dict[str, int]]]
+    touch: bool
+    ping: tuple[str, str | None, str | None] | None
+
+
+class _ReceiptResult(NamedTuple):
+    """One locked receipt settle's outcome, applied after the lock.
+
+    :param matched: Whether the receipt matched the pending attempt.
+    :param conv: The session row, when the receipt matched.
+    :param notices: Stop notices to send the mother.
+    """
+
+    matched: bool
+    conv: Conversation | None
+    notices: list[tuple[str, dict[str, int]]]
 
 
 def warm_state_from_label(
@@ -239,37 +422,113 @@ def warm_state_from_label(
     harness: str | None,
     busy: bool,
     now: int,
+    family: Literal["claude", "codex"] | None = None,
+    codex_staleness_s: int = _CODEX_DEFAULT_STALENESS_S,
 ) -> Literal["warm", "cold"] | None:
     """
-    Derive the rail pill state from a child's keep-warm label.
+    Derive the rail pill state from a session's keep-warm label.
 
-    No settings read: an archived child, an unsupported harness, or an idle
-    child with no label reads ``None``. A busy child is ``warm`` whatever the
-    label says (its running turn touches the provider cache); an idle child
-    reads the label — a warm state inside its window is ``warm``, anything
-    else ``cold``.
+    No settings read: an archived session, an unsupported harness, or an idle
+    session with no label reads ``None``. A busy session is ``warm`` whatever
+    the label says (its running turn touches the provider cache). Otherwise
+    the rule is per family: Claude is a clock estimate (``warm`` while the
+    episode is warm and the last touch is inside the 1 h cache window); Codex
+    is observation-based (``warm`` only while the latest usage observation —
+    ping receipt or real turn — is a hit younger than the staleness bound,
+    the agent's interval + 300 s).
 
     :param raw: The ``omnigent.keep_warm`` label value, or ``None``.
-    :param archived: Whether the child row itself is archived.
-    :param harness: The child's canonical harness, e.g. ``"claude-native"``.
-    :param busy: Whether the child's status is ``running`` / ``waiting``.
+    :param archived: Whether the session row itself is archived.
+    :param harness: The session's canonical harness, e.g. ``"claude-native"``.
+    :param busy: Whether the session's status is ``running`` / ``waiting``.
     :param now: Current epoch seconds.
+    :param family: Model family; derived from *harness* when omitted.
+    :param codex_staleness_s: Codex observation staleness bound in seconds.
     :returns: ``"warm"``, ``"cold"``, or ``None``.
     """
     if archived or harness not in _SUPPORTED_HARNESSES:
         return None
+    if family is None:
+        family = _SUPPORTED_HARNESSES[harness]
     if busy:
         return "warm"
     state = _WarmState.parse(raw)
     if state is None:
         return None
-    if state.s == "w" and state.w is not None and now <= state.w:
+    if family == "codex":
+        observation = state.o
+        if (
+            observation is not None
+            and observation[1] == 1
+            and now - observation[0] < codex_staleness_s
+        ):
+            return "warm"
+        return "cold"
+    if state.s == "w" and state.u is not None and now - state.u < _CLAUDE_TTL_S:
         return "warm"
     return "cold"
 
 
+def _receipt_measurement(
+    family: str | None, data: dict[str, Any]
+) -> Literal["hit", "miss"] | None:
+    """
+    Classify one ok receipt's normalized cache fields; ``None`` is unknown.
+
+    Claude miss = ``cache_write > cache_read``; Codex miss =
+    ``cache_read / input_total < 0.5``. A missing field never reads as a
+    miss — the measurement is simply unknown.
+    """
+    read = _as_int(data.get("cache_read"))
+    if family == "claude":
+        write = _as_int(data.get("cache_write"))
+        if read is None or write is None:
+            return None
+        return "miss" if write > read else "hit"
+    if family == "codex":
+        total = _as_int(data.get("input_total"))
+        if read is None or total is None or total <= 0:
+            return None
+        return "miss" if read / total < 0.5 else "hit"
+    return None
+
+
+def _micro_usd(value: object) -> int:
+    """Convert a receipt's ``cost_usd`` to integer micro-USD (0 when absent)."""
+    number = _as_number(value)
+    if number is None or number <= 0:
+        return 0
+    return round(number * 1_000_000)
+
+
+def _has_sync_pending(session_id: str) -> bool:
+    """
+    Server pre-filter: whether the session has a pending synchronous card.
+
+    Any own pending elicitation whose ``params`` carry no ``async_kind``
+    blocks a ping; mirrored items (``target_session_id``) are not the
+    session's own card. The authoritative check is the runner's gate at ping
+    time — an unreadable index here fails closed, never toward pinging.
+    """
+    try:
+        events = snapshot_for(session_id)
+    except Exception:
+        _logger.exception("Keep-warm pending-elicitation pre-filter failed")
+        return True
+    for event in events:
+        params = event.get("params")
+        if not isinstance(params, dict):
+            return True
+        if params.get("target_session_id"):
+            continue
+        if params.get("async_kind"):
+            continue
+        return True
+    return False
+
+
 class ChildKeepWarmSweeper:
-    """Post one quiet turn per cache window for eligible active-zone children."""
+    """Forward one keep-warm control per cache window for eligible sessions."""
 
     def __init__(
         self,
@@ -277,39 +536,52 @@ class ChildKeepWarmSweeper:
         conversation_store: ConversationStore,
         permission_store: PermissionStore | None,
         liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
-        post_event_impl: Callable[..., Awaitable[Any]],
-        notify_line: Callable[[str, str], Awaitable[None]],
+        forward_control: Callable[[str, dict[str, Any]], Awaitable[bool]],
+        host_ok: Callable[[Conversation], bool],
+        notify_line: Callable[[str, str], Awaitable[None]] | None = None,
         interval: float = _TICK_INTERVAL_S,
         clock: Callable[[], int] = now_epoch,
     ) -> None:
         """
-        :param conversation_store: Store for child rows and label writes.
+        :param conversation_store: Store for session rows and label writes.
         :param permission_store: Permission store for owner resolution
             (``None`` in single-user local mode).
         :param liveness_lookup: Bulk session-liveness lookup — the ping idle
             gate reads ``runner_online`` from it, never ``_true_state``.
-        :param post_event_impl: The raw events-post callable the ping uses.
+        :param forward_control: Forward one control body to the session's
+            runner; ``True`` when the runner accepted it (2xx).
+        :param host_ok: Whether the session's host is live and advertises the
+            ``keep_warm_v1`` capability (hostless local sessions count as
+            supported).
         :param notify_line: ``PeerSweeper.notify_line`` — the mother's parked
-            notice queue.
+            notice queue, or ``None`` when peer messaging is off (notices are
+            then dropped; the label state still settles).
         :param interval: Seconds between ticks.
         :param clock: Epoch-seconds clock, overridable for tests.
         """
         self._conversation_store = conversation_store
         self._permission_store = permission_store
         self._liveness_lookup = liveness_lookup
-        self._post_event_impl = post_event_impl
+        self._forward_control = forward_control
+        self._host_ok = host_ok
         self._notify_line = notify_line
         self._interval = interval
         self._clock = clock
-        # child_id -> warm_until for every label that says state = warm.
+        # session_id -> warm_until for every label that says state = warm.
         self._tracked: dict[str, int] = {}
-        # child_id -> post outcome recorded by the ping task, applied on the
-        # next tick so a slow post never stalls the loop.
+        # session_id -> forward failure recorded by the ping task, applied on
+        # the next tick so a slow forward never stalls the loop.
         self._outcomes: dict[str, str] = {}
-        # child_id -> tick time the ping's turn was first seen settled, so
-        # the cache check waits for the usage post to land.
-        self._settled_seen: dict[str, int] = {}
         self._ping_tasks: set[asyncio.Task[None]] = set()
+        # One lock serializes each session's label read-modify-write between
+        # a tick and a receipt. The server runs one sweeper replica, so an
+        # in-process lock is the whole exclusion story.
+        self._session_lock = asyncio.Lock()
+        # Owners whose legacy migration already ran in this process.
+        self._migrated_owners: set[str] = set()
+        # Candidate scan window: the largest configured cap seen (at least
+        # the default) plus slack; grows as settings are read.
+        self._scan_window_s = KEEP_WARM_DEFAULT_MAX_S + _SLACK_S
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -322,7 +594,7 @@ class ChildKeepWarmSweeper:
         self._task = asyncio.create_task(self._run(), name="child-keep-warm")
 
     async def shutdown(self) -> None:
-        """Stop the loop and any in-flight ping posts."""
+        """Stop the loop and any in-flight ping forwards."""
         task = self._task
         self._task = None
         if task is not None:
@@ -347,31 +619,31 @@ class ChildKeepWarmSweeper:
     async def _seed_tracked(self) -> None:
         """Seed the tracked map from non-archived rows carrying a warm label."""
         try:
-            children = await asyncio.to_thread(self._scan_labeled_children)
+            sessions = await asyncio.to_thread(self._scan_labeled_sessions)
         except Exception:
             _logger.exception("Child keep-warm failed to seed its tracked set")
             return
-        for conv in children:
+        for conv in sessions:
             state = _WarmState.parse(conv.labels.get(KEEP_WARM_LABEL))
             if state is not None and state.s == "w":
                 self._tracked[conv.id] = state.w or 0
 
-    def _scan_labeled_children(self) -> list[Conversation]:
-        """Page every non-archived sub-agent row for the startup seed."""
-        children: list[Conversation] = []
+    def _scan_labeled_sessions(self) -> list[Conversation]:
+        """Page every non-archived session row for the startup seed."""
+        sessions: list[Conversation] = []
         after: str | None = None
         for _ in range(_MAX_PAGES):
             page = self._conversation_store.list_conversations(
                 limit=_PAGE_LIMIT,
                 after=after,
-                kind="sub_agent",
+                kind=None,
                 include_archived=False,
             )
-            children.extend(page.data)
+            sessions.extend(page.data)
             if not page.has_more or page.last_id is None:
                 break
             after = page.last_id
-        return children
+        return sessions
 
     async def _tick(self) -> None:
         """One sweep over ping candidates plus tracked episodes; never raises."""
@@ -382,26 +654,25 @@ class ChildKeepWarmSweeper:
             candidate_ids = await asyncio.to_thread(self._list_ping_candidates, now)
         except Exception:
             _logger.exception("Child keep-warm failed to list ping candidates")
-        settings_cache: dict[str, CollabSettings] = {}
-        agent_cache: dict[str, NativeCodingAgent | None] = {}
-        parent_cache: dict[str, bool] = {}
-        for child_id in sorted(candidate_ids | set(self._tracked)):
+        settings_cache: dict[str, KeepWarmSettings] = {}
+        harness_cache: dict[str, str | None] = {}
+        for session_id in sorted(candidate_ids | set(self._tracked)):
             try:
-                await self._process_child(child_id, now, settings_cache, agent_cache, parent_cache)
+                await self._process_session(session_id, now, settings_cache, harness_cache)
             except Exception:
-                _logger.exception("Child keep-warm failed to process child %s", child_id)
+                _logger.exception("Child keep-warm failed to process session %s", session_id)
 
     def _list_ping_candidates(self, now: int) -> set[str]:
-        """Return children updated inside the candidate window (paged)."""
+        """Return sessions updated inside the candidate window (paged)."""
         ids: set[str] = set()
         after: str | None = None
         for _ in range(_MAX_PAGES):
             page = self._conversation_store.list_conversations(
                 limit=_PAGE_LIMIT,
                 after=after,
-                kind="sub_agent",
+                kind=None,
                 include_archived=False,
-                updated_after=now - _CANDIDATE_WINDOW_S,
+                updated_after=now - self._scan_window_s,
                 sort_by="updated_at",
             )
             ids.update(conv.id for conv in page.data)
@@ -410,20 +681,130 @@ class ChildKeepWarmSweeper:
             after = page.last_id
         return ids
 
-    async def _process_child(
+    async def _settings_for(
+        self, owner: str, now: int, cache: dict[str, KeepWarmSettings]
+    ) -> KeepWarmSettings:
+        """
+        Read one owner's keep-warm settings, cached per tick.
+
+        The one-time legacy migration runs before the first read of an owner
+        in this process, with the claude-native / codex-native agents that
+        exist now; afterwards only the ``keep_warm`` namespace is read.
+        """
+        cached = cache.get(owner)
+        if cached is not None:
+            return cached
+        preferences_store = getattr(
+            getattr(self._app, "state", None), "user_preferences_store", None
+        )
+        if preferences_store is not None and owner not in self._migrated_owners:
+            try:
+                agents = await asyncio.to_thread(self._native_agents_for_migration)
+            except Exception:
+                # Enumeration failed: skip the migration (and leave the owner
+                # unmarked) so a later tick retries with a real agent list —
+                # migrating against an empty snapshot would write an empty
+                # keep_warm namespace and lose legacy warming for good.
+                _logger.exception("Child keep-warm agent enumeration failed; migration deferred")
+            else:
+                await asyncio.to_thread(
+                    migrate_legacy_keep_warm, preferences_store, owner, agents, now
+                )
+                self._migrated_owners.add(owner)
+        settings = await asyncio.to_thread(read_keep_warm_settings, preferences_store, owner)
+        max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
+        for row in settings.agents.values():
+            clamped = min(max(row.max_s, max_low), max_high)
+            self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
+        cache[owner] = settings
+        return settings
+
+    def _native_agents_for_migration(self) -> list[tuple[str, str]]:
+        """
+        List the existing claude-native / codex-native agents as
+        ``(agent_id, family)`` pairs for the legacy migration.
+
+        Raises on enumeration failure: the caller defers the migration so an
+        empty list is never mistaken for "no native agents exist". Blocking:
+        callers run it in a thread.
+        """
+        agents: list[tuple[str, str]] = []
+        app_state = getattr(self._app, "state", None)
+        agent_store = getattr(app_state, "agent_store", None)
+        if agent_store is None:
+            return agents
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.runtime import get_agent_cache
+
+        agent_cache = get_agent_cache()
+        after: str | None = None
+        for _ in range(_MAX_PAGES):
+            page = agent_store.list(limit=_PAGE_LIMIT, after=after)
+            for agent in page.data:
+                harness = self._agent_harness(agent, agent_cache, canonicalize_harness)
+                family = _SUPPORTED_HARNESSES.get(harness or "")
+                if family is not None:
+                    agents.append((agent.id, family))
+            if not page.has_more or page.last_id is None:
+                break
+            after = page.last_id
+        return agents
+
+    @staticmethod
+    def _agent_harness(agent: Any, agent_cache: Any, canonicalize: Any) -> str | None:
+        """Resolve one agent's canonical harness from its bundle spec."""
+        if agent.bundle_location is None:
+            return None
+        try:
+            loaded = agent_cache.load(
+                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            )
+            harness = loaded.spec.executor.config.get("harness") or loaded.spec.executor.type
+        except Exception:  # noqa: BLE001 — an unloadable bundle migrates nothing
+            return None
+        return canonicalize(harness) or harness
+
+    async def _harness_for(self, conv: Conversation, cache: dict[str, str | None]) -> str | None:
+        """Resolve the session's harness (honours ``harness_override``)."""
+        if conv.id not in cache:
+            cache[conv.id] = await asyncio.to_thread(_resolve_harness, conv)
+        return cache[conv.id]
+
+    async def _process_session(
         self,
-        child_id: str,
+        session_id: str,
         now: int,
-        settings_cache: dict[str, CollabSettings],
-        agent_cache: dict[str, NativeCodingAgent | None],
-        parent_cache: dict[str, bool],
+        settings_cache: dict[str, KeepWarmSettings],
+        harness_cache: dict[str, str | None],
     ) -> None:
-        """Read one child fresh and apply the state-machine rules in order."""
-        store = self._conversation_store
-        conv = await asyncio.to_thread(store.get_conversation, child_id)
-        if conv is None:
-            self._drop_tracking(child_id)
+        """Run one session's pass under its lock, then apply deferred effects."""
+        async with self._session_lock:
+            result = await self._process_session_locked(
+                session_id, now, settings_cache, harness_cache
+            )
+        if result is None:
             return
+        if result.notices:
+            await self._send_notices(result.conv, result.notices)
+        if result.touch:
+            await self._forward_touch(session_id)
+        if result.ping is not None:
+            attempt_id, family, harness = result.ping
+            self._spawn_ping(session_id, attempt_id, family, harness)
+
+    async def _process_session_locked(
+        self,
+        session_id: str,
+        now: int,
+        settings_cache: dict[str, KeepWarmSettings],
+        harness_cache: dict[str, str | None],
+    ) -> _TickResult | None:
+        """Read one session fresh and apply the state-machine rules in order."""
+        store = self._conversation_store
+        conv = await asyncio.to_thread(store.get_conversation, session_id)
+        if conv is None:
+            self._drop_tracking(session_id)
+            return None
 
         raw_label = conv.labels.get(KEEP_WARM_LABEL)
         state = _WarmState.parse(raw_label)
@@ -431,87 +812,127 @@ class ChildKeepWarmSweeper:
         status = _session_status_from_cache(conv.id, conv.live_status)
         busy = status == "running"
 
-        # Rule 1: the child itself archived — drop it; the pill reads None
+        # Rule 1: the session itself archived — drop it; the pill reads None
         # and the label goes inert. An archived mother keeps the child
         # tracked so rule 7 can settle it cold silently.
         if conv.archived:
-            self._drop_tracking(child_id)
-            return
+            self._drop_tracking(session_id)
+            return None
 
-        agent = await self._native_agent_for(conv, agent_cache)
         mirrored = conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
-        inspectable = agent is not None and not mirrored
-        harness = agent.harness if agent is not None else None
+        harness = await self._harness_for(conv, harness_cache)
         family = _SUPPORTED_HARNESSES.get(harness or "")
+        inspectable = family is not None and not mirrored
         if not inspectable and state is None:
-            self._drop_tracking(child_id)
-            return
+            self._drop_tracking(session_id)
+            return None
+
+        is_child = conv.parent_conversation_id is not None
+        owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
+        settings = await self._settings_for(owner, now, settings_cache)
+        resolved = keep_warm_for_agent(settings, conv.agent_id, family) if family else None
+        # Absent agent = off; the session's class picks the row's switch.
+        switch_on = resolved is not None and (resolved.child if is_child else resolved.main)
+        if resolved is not None:
+            interval = resolved.interval_s
+            max_s = resolved.max_s
+        else:
+            interval = (
+                KEEP_WARM_CODEX_DEFAULT_INTERVAL_S
+                if family == "codex"
+                else KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S
+            )
+            max_s = KEEP_WARM_DEFAULT_MAX_S
+        staleness_s = interval + _SLACK_S if resolved is not None else _CODEX_DEFAULT_STALENESS_S
 
         warm_before = warm_state_from_label(
-            raw_label, archived=False, harness=harness, busy=busy, now=now
+            raw_label,
+            archived=False,
+            harness=harness,
+            busy=busy,
+            now=now,
+            family=family,
+            codex_staleness_s=staleness_s,
         )
         # A label that said warm may already DERIVE cold once its window
         # passed (the rail still shows the last publish), so leaving a warm
         # label is itself a pill transition worth publishing.
         state_warm_before = state is not None and state.s == "w"
 
-        owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
-        settings = settings_cache.get(owner)
-        if settings is None:
-            preferences_store = getattr(
-                getattr(self._app, "state", None), "user_preferences_store", None
-            )
-            settings = await asyncio.to_thread(read_collab_settings, preferences_store, owner)
-            settings_cache[owner] = settings
-        claude_interval, codex_interval, max_s = clamp_keep_warm(settings)
-        switch_on = bool(settings.enabled and settings.keep_warm_enabled)
-        interval = codex_interval if family == "codex" else claude_interval
-        ancestor_archived = await asyncio.to_thread(self._ancestor_archived, conv)
-        runner_online = self._runner_online(child_id)
+        ancestor_archived = is_child and await asyncio.to_thread(self._ancestor_archived, conv)
+        runner_online = self._runner_online(session_id)
+        host_ok = self._host_okay(conv)
+        sync_pending = _has_sync_pending(session_id)
         base_eligible = (
             inspectable
+            and switch_on
             and running_since is not None
             and not is_session_closed(conv.labels, conv.title)
             and not ancestor_archived
-            and switch_on
             and runner_online is True
+            and host_ok
             and status == "idle"
+            and not sync_pending
         )
+        # The stop reason names the first gate, in the order the checks run,
+        # that blocks a ping right now; ``None`` means none blocks.
+        gate: str | None = None
+        if not switch_on:
+            gate = "switch"
+        elif runner_online is not True:
+            gate = "runner"
+        elif not host_ok:
+            gate = "host"
+        elif sync_pending:
+            gate = "card"
 
         notices: list[tuple[str, dict[str, int]]] = []
+        stats = _WarmStats.parse(conv.labels.get(KEEP_WARM_STATS_LABEL))
+        stats_dirty = False
+        touch = False
         # A failed attempt is retried on a LATER tick, never in the same pass
         # that recorded its failure.
         retry_deferred = False
 
-        # A ping task's outcome applies on the tick after it was recorded.
-        outcome = self._outcomes.pop(child_id, None)
-        if state is not None and state.q and outcome is not None:
-            if outcome == "denied":
-                state.s, state.why, state.q = "p", "pol", False
-                self._settled_seen.pop(child_id, None)
-                notices.append(("pol", {}))
-            elif outcome == "error":
-                state.f += 1
-                state.q = False
-                retry_deferred = True
-                self._settled_seen.pop(child_id, None)
+        # A ping task's forward failure applies on the tick after it was
+        # recorded: one failure, attempt cleared.
+        outcome = self._outcomes.pop(session_id, None)
+        if state is not None and state.a is not None and outcome is not None:
+            state.f += 1
+            state.a = None
+            state.p = None
+            retry_deferred = True
 
-        # Rule 2: a sticky miss pause lifts once the child left and
+        # A pending attempt the runner never receipts times out as a failure.
+        if (
+            state is not None
+            and state.a is not None
+            and state.p is not None
+            and now - state.p > _ATTEMPT_TIMEOUT_S
+        ):
+            state.f += 1
+            state.a = None
+            state.p = None
+            retry_deferred = True
+
+        # Rule 2: a sticky miss pause lifts once the session left and
         # re-entered the active zone (its archive revision moved). The
         # watermark moves to the current turn so rule 3 only re-arms on a
-        # later real turn, never on the cold cache the pause was about.
+        # later real turn, never on the cold cache the pause was about, and
+        # the miss count starts fresh — the pause was about the old zone.
         if state is not None and state.s == "p" and state.why == "miss":
             if state.v != conv.archive_revision:
                 state.s, state.why = "c", "rev"
+                state.m = 0
                 if running_since is not None:
                     state.t = running_since
 
         # Rule 3: a new real turn settled starts a fresh episode. Only the
-        # not-yet-revised miss pause is sticky — a cold ``cap`` / ``mom``
-        # label re-arms here.
+        # not-yet-revised miss pause is sticky — a cold ``cap`` label re-arms
+        # here. The turn's cache reading (when measurable) classifies the
+        # return after an absence and feeds the Codex warm_state observation.
         if inspectable and running_since is not None and status == "idle":
-            ours = _turn_is_ours(state, running_since)
-            new_episode = state is None or (running_since != state.t and not ours)
+            new_episode = state is None or running_since != state.t
             if new_episode:
                 sticky_miss = (
                     state is not None
@@ -520,34 +941,74 @@ class ChildKeepWarmSweeper:
                     and state.v == conv.archive_revision
                 )
                 if not sticky_miss:
+                    prev_u = state.u if state is not None else None
+                    prev_b = state.b if state is not None else None
+                    prev_m = state.m if state is not None else 0
                     settle = conv.updated_at if conv.updated_at >= running_since else now
+                    reading = self._turn_cache_reading(conv, prev_b, running_since, family)
+                    misses = prev_m
+                    if reading is not None:
+                        misses = prev_m + 1 if reading[0] == "miss" else 0
                     state = _WarmState(
                         s="w",
                         t=running_since,
                         c=settle,
                         u=settle,
+                        m=misses,
+                        b=self._usage_baseline(conv, family),
                         w=settle + interval + _SLACK_S,
+                        r=reading is None,
                     )
-                    self._settled_seen.pop(child_id, None)
-
-        # Rule 4: a pending attempt never posts again; it settles once the
-        # ping's own turn is over and its usage post has had 60 s to land,
-        # or fails after 180 s with no turn of ours having started.
-        if state is not None and state.q and state.p is not None:
-            ours = _turn_is_ours(state, running_since)
-            if ours and status in ("idle", "failed") and running_since is not None:
-                first_seen = self._settled_seen.setdefault(child_id, now)
-                if now - first_seen >= _SETTLE_USAGE_GRACE_S:
-                    self._settled_seen.pop(child_id, None)
-                    notices.extend(
-                        await self._settle_ping(conv, state, running_since, now, interval, family)
+                    if family == "codex" and reading is not None:
+                        state.o = [settle, 0 if reading[0] == "miss" else 1]
+                    if (
+                        reading is not None
+                        and reading[0] == "miss"
+                        and misses >= _MISS_PAUSE_THRESHOLD
+                    ):
+                        state.s, state.why = "p", "miss"
+                        state.v = conv.archive_revision
+                        notices.append(("miss", {"read": reading[1], "creation": reading[2]}))
+                    stats = _WarmStats(
+                        ep_s=settle,
+                        tot_p=stats.tot_p,
+                        tot_c=stats.tot_c,
+                        tot_e=stats.tot_e,
+                        lr_at=stats.lr_at,
+                        lr_r=stats.lr_r,
                     )
-            elif not ours and now - state.p > _PING_TURN_MAX_S:
-                state.f += 1
-                state.q = False
-                state.b = None
-                retry_deferred = True
-                self._settled_seen.pop(child_id, None)
+                    stats_dirty = True
+                    ttl = _CLAUDE_TTL_S if family == "claude" else staleness_s
+                    if prev_u is not None and running_since > prev_u + ttl:
+                        stats.lr_at = settle
+                        stats.lr_r = reading[0] if reading is not None else "unknown"
+                    # The reaper-yield touch protects an episode that will be
+                    # pinged; with the switch off there is nothing to protect.
+                    touch = switch_on and runner_online is True and host_ok
+            elif state is not None and state.r and state.s == "w":
+                # The episode opened with an unmeasurable reading; retry the
+                # same turn's classification against the stored baseline
+                # (running_since still matches state.t here) until the grace
+                # elapses.
+                if state.c is not None and now - state.c > _LATE_USAGE_GRACE_S:
+                    state.r = False
+                else:
+                    late = self._turn_cache_reading(conv, state.b, running_since, family)
+                    if late is not None:
+                        state.r = False
+                        # The consumed reading is the new baseline: the next
+                        # episode measures only its own turn.
+                        state.b = self._usage_baseline(conv, family)
+                        state.m = state.m + 1 if late[0] == "miss" else 0
+                        if family == "codex":
+                            state.o = [now, 0 if late[0] == "miss" else 1]
+                        if stats.lr_at == state.c and stats.lr_r == "unknown":
+                            stats.lr_r = late[0]
+                            stats_dirty = True
+                        if late[0] == "miss" and state.m >= _MISS_PAUSE_THRESHOLD:
+                            state.s, state.why = "p", "miss"
+                            state.v = conv.archive_revision
+                            notices.append(("miss", {"read": late[1], "creation": late[2]}))
 
         # Rule 6: repeated failures pause warming until the next real turn.
         if (
@@ -558,147 +1019,255 @@ class ChildKeepWarmSweeper:
             state.s, state.why = "p", "fail"
             notices.append(("fail", {}))
 
-        # Rule 7 and 7b need the tracked flag; 7b, rule 8 and any notice
-        # also need the direct parent's presence. A notice may never reach
-        # an absent mother, so a child with collected notices is read too;
-        # children the sweeper would not touch skip the parent read.
-        tracked = child_id in self._tracked or (state is not None and state.s == "w")
-        parent_present = True
-        if base_eligible or tracked or notices:
-            parent_present = await self._parent_present(
-                conv, now, claude_interval, codex_interval, parent_cache, agent_cache
-            )
-        eligible = base_eligible and parent_present
-
-        # Rule 7: cap and expiry settle tracked children whether or not they
+        # Rule 7: cap and expiry settle tracked sessions whether or not they
         # are eligible to be pinged. An expired window under an archived
-        # mother or a switched-off zone goes cold silently; an absent parent
-        # turns cap / expiry into a silent ``mom`` cold.
+        # mother or a switched-off agent goes cold silently.
+        tracked = session_id in self._tracked or (state is not None and state.s == "w")
         if state is not None and state.s == "w" and tracked:
             if state.c is not None and now - state.c >= max_s:
                 state.s = "c"
-                state.why = "cap" if parent_present else "mom"
-                if parent_present:
-                    notices.append(("cap", {"hours": max(1, round(max_s / 3600))}))
+                state.why = "cap"
+                notices.append(("cap", {"hours": max(1, round(max_s / 3600))}))
             elif state.w is not None and now > state.w and not busy:
                 state.s = "c"
-                state.why = "exp" if parent_present else "mom"
-                if parent_present and not ancestor_archived and switch_on:
-                    notices.append(("exp", {}))
+                state.why = "exp"
 
-        # Rule 7b: the mother is gone — stop paying to keep this child warm.
-        # No notice: a notice would wake the absent mother.
-        if state is not None and state.s == "w" and tracked and not busy and not parent_present:
-            state.s, state.why = "c", "mom"
+        # Stop-reason visibility: an idle inspectable episode records the
+        # first gate blocking its ping, and clears it once the gates pass or
+        # the episode leaves warm. Written only on change so a quiet session
+        # churns no label.
+        desired_k = gate if state is not None and state.s == "w" else None
+        if inspectable and not busy and state is not None and state.k != desired_k:
+            state.k = desired_k
 
-        # No notice may reach an absent parent (it would wake her): drop
-        # every notice collected for this child this tick.
-        if notices and not parent_present:
-            notices = []
-
-        # Rule 8: due — write the attempt into the label first, then post.
-        ping = False
+        # Rule 8: due — write the attempt into the label first, then forward.
+        ping_due = False
         if (
-            eligible
+            base_eligible
             and state is not None
             and state.s == "w"
-            and not state.q
+            and state.a is None
             and not retry_deferred
         ):
-            if state.u is not None and now >= state.u + interval:
+            if (
+                state.u is not None
+                and now >= state.u + interval
+                and (state.c is None or now - state.c < max_s)
+            ):
                 state.p = now
-                state.q = True
-                state.b = self._usage_baseline(conv, family)
-                ping = True
+                state.a = secrets.token_hex(4)
+                ping_due = True
 
+        updates: dict[str, str] = {}
         new_label = state.to_label() if state is not None else None
         if new_label is not None and new_label != raw_label:
-            await asyncio.to_thread(store.set_labels, child_id, {KEEP_WARM_LABEL: new_label})
-            warm_after = warm_state_from_label(
-                new_label, archived=False, harness=harness, busy=busy, now=now
-            )
-            state_warm_after = state is not None and state.s == "w"
-            if warm_after != warm_before or (state_warm_before and not state_warm_after):
-                _publish_child_status_to_parent(child_id, None)
+            updates[KEEP_WARM_LABEL] = new_label
+        if stats_dirty:
+            new_stats = stats.to_label()
+            if new_stats != conv.labels.get(KEEP_WARM_STATS_LABEL):
+                updates[KEEP_WARM_STATS_LABEL] = new_stats
+        if updates:
+            await asyncio.to_thread(store.set_labels, session_id, updates)
+            if KEEP_WARM_LABEL in updates:
+                warm_after = warm_state_from_label(
+                    new_label,
+                    archived=False,
+                    harness=harness,
+                    busy=busy,
+                    now=now,
+                    family=family,
+                    codex_staleness_s=staleness_s,
+                )
+                state_warm_after = state is not None and state.s == "w"
+                if warm_after != warm_before or (state_warm_before and not state_warm_after):
+                    _publish_child_status_to_parent(session_id, None)
         if state is not None and state.s == "w":
-            self._tracked[child_id] = state.w or 0
+            self._tracked[session_id] = state.w or 0
         else:
-            self._tracked.pop(child_id, None)
+            self._tracked.pop(session_id, None)
 
-        if notices:
-            await self._send_notices(conv, notices)
-        if ping:
-            self._spawn_ping(child_id, owner)
+        ping: tuple[str, str | None, str | None] | None = None
+        if ping_due and state is not None and state.a is not None:
+            ping = (state.a, family, harness)
+        return _TickResult(conv=conv, notices=notices, touch=touch, ping=ping)
 
-    async def _settle_ping(
-        self,
-        conv: Conversation,
-        state: _WarmState,
-        running_since: int,
-        now: int,
-        interval: int,
-        family: str | None,
-    ) -> list[tuple[str, dict[str, int]]]:
-        """Rule 5: evaluate one settled keep-warm turn, mutating *state*."""
+    async def settle_receipt(self, session_id: str, data: dict[str, Any]) -> bool:
+        """
+        Settle one pending ping attempt from the runner's receipt.
+
+        Unknown or already-settled attempt ids are ignored (``False``).
+        ``ok`` advances the last cache touch, counts the ping and its cost,
+        clears any recorded stop reason, and applies the measured miss rule
+        on the normalized usage fields; ``skipped`` clears the attempt with
+        no other change (the cache may expire); ``failed`` counts a failure
+        (three pause warming). A ``skipped`` / ``failed`` receipt's
+        ``reason`` is recorded as the stop reason.
+
+        :param session_id: Session the receipt belongs to.
+        :param data: The ``external_keep_warm_receipt`` payload.
+        :returns: ``True`` when the receipt matched the pending attempt.
+        """
+        async with self._session_lock:
+            result = await self._settle_receipt_locked(session_id, data)
+        if result.conv is not None and result.notices:
+            await self._send_notices(result.conv, result.notices)
+        return result.matched
+
+    async def _settle_receipt_locked(
+        self, session_id: str, data: dict[str, Any]
+    ) -> _ReceiptResult:
+        """Settle one pending attempt under the session lock."""
+        attempt_id = data.get("attempt_id")
+        outcome = data.get("outcome")
+        store = self._conversation_store
+        conv = await asyncio.to_thread(store.get_conversation, session_id)
+        if conv is None or conv.archived:
+            return _ReceiptResult(False, None, [])
+        raw_label = conv.labels.get(KEEP_WARM_LABEL)
+        state = _WarmState.parse(raw_label)
+        if (
+            state is None
+            or state.a is None
+            or not isinstance(attempt_id, str)
+            or attempt_id != state.a
+            or outcome not in _RECEIPT_OUTCOMES
+        ):
+            return _ReceiptResult(False, None, [])
+
+        now = self._clock()
+        status = _session_status_from_cache(conv.id, conv.live_status)
+        busy = status == "running"
+        harness = await asyncio.to_thread(_resolve_harness, conv)
+        family = _SUPPORTED_HARNESSES.get(harness or "")
+        is_child = conv.parent_conversation_id is not None
+        owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
+        settings = await self._settings_for(owner, now, {})
+        resolved = keep_warm_for_agent(settings, conv.agent_id, family) if family else None
+        if resolved is not None:
+            interval = resolved.interval_s
+            staleness_s = resolved.interval_s + _SLACK_S
+        else:
+            interval = (
+                KEEP_WARM_CODEX_DEFAULT_INTERVAL_S
+                if family == "codex"
+                else KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S
+            )
+            staleness_s = _CODEX_DEFAULT_STALENESS_S
+
+        warm_before = warm_state_from_label(
+            raw_label,
+            archived=False,
+            harness=harness,
+            busy=busy,
+            now=now,
+            family=family,
+            codex_staleness_s=staleness_s,
+        )
+        state_warm_before = state.s == "w"
+
         notices: list[tuple[str, dict[str, int]]] = []
-        state.t = running_since
-        settle = conv.updated_at if conv.updated_at >= running_since else now
-        state.u = settle
-        state.w = settle + interval + _SLACK_S
-        state.q = False
-        state.p = None
-        complied = await asyncio.to_thread(self._ping_reply_complied, conv.id)
-        turn_failed = _session_status_from_cache(conv.id, conv.live_status) == "failed"
-        if turn_failed or not complied:
-            state.f += 1
-        else:
+        stats = _WarmStats.parse(conv.labels.get(KEEP_WARM_STATS_LABEL))
+        stats_dirty = False
+        if outcome == "ok":
+            state.u = now
             state.f = 0
-            reading = self._cache_reading(conv, state, running_since, family)
-            if reading is not None:
-                kind, read_tokens, creation_tokens = reading
-                if kind == "miss":
-                    state.m += 1
-                    if state.m >= _MISS_PAUSE_THRESHOLD:
-                        state.s, state.why = "p", "miss"
-                        state.v = conv.archive_revision
-                        notices.append(
-                            ("miss", {"read": read_tokens, "creation": creation_tokens})
-                        )
-                else:
-                    state.m = 0
-        state.b = None
-        return notices
+            state.w = now + interval + _SLACK_S
+            state.k = None
+            if stats.ep_s is None:
+                stats.ep_s = state.c
+            stats.ep_p += 1
+            stats.tot_p += 1
+            cost = _micro_usd(data.get("cost_usd"))
+            stats.ep_c += cost
+            stats.tot_c += cost
+            if data.get("estimated") is True:
+                stats.ep_e = True
+                stats.tot_e = True
+            stats_dirty = True
+            measurement = _receipt_measurement(family, data)
+            if measurement == "miss":
+                state.m += 1
+                if family == "codex":
+                    state.o = [now, 0]
+                if state.m >= _MISS_PAUSE_THRESHOLD:
+                    state.s, state.why = "p", "miss"
+                    state.v = conv.archive_revision
+                    notices.append(("miss", _receipt_miss_detail(family, data)))
+            elif measurement == "hit":
+                state.m = 0
+                if family == "codex":
+                    state.o = [now, 1]
+        else:
+            if outcome == "failed":
+                state.f += 1
+            reason = data.get("reason")
+            if isinstance(reason, str) and reason:
+                state.k = reason if reason in _STOP_REASON_CODES else "other"
+        state.a = None
+        state.p = None
+        if state.f >= _FAILURE_PAUSE_THRESHOLD and not (state.s == "p" and state.why == "fail"):
+            state.s, state.why = "p", "fail"
+            notices.append(("fail", {}))
 
-    def _cache_reading(
+        updates: dict[str, str] = {}
+        new_label = state.to_label()
+        if new_label != raw_label:
+            updates[KEEP_WARM_LABEL] = new_label
+        if stats_dirty:
+            new_stats = stats.to_label()
+            if new_stats != conv.labels.get(KEEP_WARM_STATS_LABEL):
+                updates[KEEP_WARM_STATS_LABEL] = new_stats
+        if updates:
+            await asyncio.to_thread(store.set_labels, session_id, updates)
+        warm_after = warm_state_from_label(
+            new_label,
+            archived=False,
+            harness=harness,
+            busy=busy,
+            now=now,
+            family=family,
+            codex_staleness_s=staleness_s,
+        )
+        if warm_after != warm_before or (state_warm_before and state.s != "w"):
+            _publish_child_status_to_parent(session_id, None)
+        if state.s == "w":
+            self._tracked[session_id] = state.w or 0
+        else:
+            self._tracked.pop(session_id, None)
+        return _ReceiptResult(True, conv, notices if is_child else [])
+
+    def _turn_cache_reading(
         self,
         conv: Conversation,
-        state: _WarmState,
-        ping_running_since: int,
+        baseline: int | list[int] | None,
+        turn_running_since: int,
         family: str | None,
     ) -> tuple[str, int, int] | None:
-        """Classify the settled ping's cache use; ``None`` is unknown."""
+        """Classify one settled real turn's cache use; ``None`` is unknown."""
         if family == "claude":
             parsed = _parse_last_cache(conv.labels.get(LAST_CACHE_LABEL))
             if parsed is None:
                 return None
             read, creation, observed_at = parsed
-            baseline = state.b if isinstance(state.b, int) and not isinstance(state.b, bool) else 0
-            if observed_at <= ping_running_since or observed_at <= baseline:
+            floor = baseline if isinstance(baseline, int) and not isinstance(baseline, bool) else 0
+            if observed_at <= turn_running_since or observed_at <= floor:
                 return None
             return ("miss" if creation > read else "hit"), read, creation
         if family == "codex":
-            baseline = state.b
-            if not (
-                isinstance(baseline, list)
-                and len(baseline) == 2
-                and all(_as_int(value) is not None for value in baseline)
-            ):
-                return None
+            floor = (
+                baseline
+                if (
+                    isinstance(baseline, list)
+                    and len(baseline) == 2
+                    and all(_as_int(value) is not None for value in baseline)
+                )
+                else [0, 0]
+            )
             usage = conv.session_usage or {}
             current_input = _as_int(usage.get("input_tokens")) or 0
             current_cached = _as_int(usage.get("cache_read_input_tokens")) or 0
-            delta_input = max(0, current_input - int(baseline[0]))
-            delta_cached = max(0, current_cached - int(baseline[1]))
+            delta_input = max(0, current_input - int(floor[0]))
+            delta_cached = max(0, current_cached - int(floor[1]))
             total = delta_input + delta_cached
             if total <= 0:
                 return None
@@ -708,7 +1277,7 @@ class ChildKeepWarmSweeper:
         return None
 
     def _usage_baseline(self, conv: Conversation, family: str | None) -> int | list[int]:
-        """Capture the ping-time baseline the next cache reading compares to."""
+        """Capture the marker the next real turn's cache reading compares to."""
         if family == "codex":
             usage = conv.session_usage or {}
             return [
@@ -717,28 +1286,6 @@ class ChildKeepWarmSweeper:
             ]
         parsed = _parse_last_cache(conv.labels.get(LAST_CACHE_LABEL))
         return parsed[2] if parsed is not None else 0
-
-    def _ping_reply_complied(self, child_id: str) -> bool:
-        """Whether the ping's turn ended with the ``[quiet]`` line."""
-        items_by_child = self._conversation_store.list_latest_message_items_for_conversations(
-            [child_id], 10
-        )
-        text = _last_assistant_text(items_by_child.get(child_id, []))
-        if text is None:
-            return False
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        return bool(lines) and lines[-1] == _QUIET_LINE
-
-    async def _native_agent_for(
-        self, conv: Conversation, cache: dict[str, NativeCodingAgent | None]
-    ) -> NativeCodingAgent | None:
-        """Resolve the child's native coding agent, cached for this tick."""
-        if conv.id not in cache:
-            agent = await asyncio.to_thread(_native_coding_agent_for_session, conv)
-            cache[conv.id] = (
-                agent if agent is not None and agent.harness in _SUPPORTED_HARNESSES else None
-            )
-        return cache[conv.id]
 
     def _ancestor_archived(self, conv: Conversation) -> bool:
         """Walk the parent chain for any archived ancestor (mother included)."""
@@ -757,120 +1304,72 @@ class ChildKeepWarmSweeper:
             current = parent
         return False
 
-    async def _parent_present(
-        self,
-        conv: Conversation,
-        now: int,
-        claude_interval: int,
-        codex_interval: int,
-        parent_cache: dict[str, bool],
-        agent_cache: dict[str, NativeCodingAgent | None],
-    ) -> bool:
-        """
-        Whether the child's direct parent shows recent life (design §2.14).
-
-        A missing / unreadable parent row and an unknown parent status fail
-        toward not spending. A running parent is present unless its turn is
-        its own keep-warm ping; otherwise the parent is present while its
-        last real turn is inside the parent's own harness interval.
-        """
-        parent_id = conv.parent_conversation_id
-        if parent_id is None:
-            return False
-        if parent_id in parent_cache:
-            return parent_cache[parent_id]
-        present = False
-        try:
-            parent = await asyncio.to_thread(self._conversation_store.get_conversation, parent_id)
-        except Exception:  # noqa: BLE001 — an unreadable parent fails toward cold
-            parent = None
-        if parent is not None and (
-            _session_status_cache.get(parent.id) is not None or parent.live_status is not None
-        ):
-            status = _session_status_from_cache(parent.id, parent.live_status)
-            state = _WarmState.parse(parent.labels.get(KEEP_WARM_LABEL))
-            ours = state is not None and state.q and _turn_is_ours(state, _running_since(parent))
-            if status == "running" and not ours:
-                present = True
-            else:
-                last_real = (
-                    state.c if state is not None and state.c is not None else parent.updated_at
-                )
-                agent = await self._native_agent_for(parent, agent_cache)
-                family = _SUPPORTED_HARNESSES.get(agent.harness) if agent is not None else None
-                interval = codex_interval if family == "codex" else claude_interval
-                present = now - last_real <= interval
-        parent_cache[parent_id] = present
-        return present
-
-    def _runner_online(self, child_id: str) -> bool | None:
+    def _runner_online(self, session_id: str) -> bool | None:
         """Strict runner reachability; ``None`` when no lookup is wired."""
         if self._liveness_lookup is None:
             return None
         try:
-            liveness = self._liveness_lookup([child_id]).get(child_id)
+            liveness = self._liveness_lookup([session_id]).get(session_id)
         except Exception:
             _logger.exception("Child keep-warm liveness lookup failed")
             return None
         return liveness.runner_online if liveness is not None else None
 
-    def _drop_tracking(self, child_id: str) -> None:
-        self._tracked.pop(child_id, None)
-        self._outcomes.pop(child_id, None)
-        self._settled_seen.pop(child_id, None)
+    def _host_okay(self, conv: Conversation) -> bool:
+        """The host gate fails closed: an unreadable host blocks the ping."""
+        try:
+            return bool(self._host_ok(conv))
+        except Exception:
+            _logger.exception("Child keep-warm host check failed for %s", conv.id)
+            return False
 
-    def _spawn_ping(self, child_id: str, owner: str) -> None:
-        """Run the ping post in its own task so a slow post never stalls a tick."""
+    def _drop_tracking(self, session_id: str) -> None:
+        self._tracked.pop(session_id, None)
+        self._outcomes.pop(session_id, None)
+
+    def _spawn_ping(
+        self, session_id: str, attempt_id: str, family: str | None, harness: str | None
+    ) -> None:
+        """Forward the ping in its own task so a slow runner never stalls a tick."""
+        body = {
+            "type": "keep_warm_ping",
+            "attempt_id": attempt_id,
+            "family": family,
+            "harness": harness,
+        }
         task = asyncio.create_task(
-            self._post_ping(child_id, owner), name=f"child-keep-warm-ping-{child_id}"
+            self._forward_ping(session_id, body), name=f"child-keep-warm-ping-{session_id}"
         )
         self._ping_tasks.add(task)
         task.add_done_callback(self._ping_tasks.discard)
 
-    async def _post_ping(self, child_id: str, owner: str) -> None:
-        """Post one keep-warm turn and record its outcome for the next tick."""
-        outcome = "error"
+    async def _forward_ping(self, session_id: str, body: dict[str, Any]) -> None:
+        """Forward one keep-warm ping; record a transport failure for the next tick."""
         try:
-            request = self._synthetic_request(child_id, self._app)
-            result = await asyncio.wait_for(
-                self._post_event_impl(
-                    request,
-                    child_id,
-                    SessionEventInput(
-                        type="message",
-                        data={
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": PING}],
-                        },
-                    ),
-                    acting_user_id=owner,
-                ),
-                timeout=_PING_TIMEOUT_S,
-            )
-        except TimeoutError:
-            # An ASK policy can stall the post; treat the timeout like a
-            # denial so it pauses instead of retrying an unattended turn.
-            outcome = "denied"
+            accepted = await self._forward_control(session_id, body)
         except asyncio.CancelledError:
             raise
         except Exception:
-            _logger.exception("Child keep-warm ping failed for %s", child_id)
-        else:
-            if isinstance(result, dict) and result.get("denied") is True:
-                outcome = "denied"
-            elif isinstance(result, dict) and result.get("queued") is False:
-                outcome = "error"
-            else:
-                outcome = "forwarded"
-        if outcome != "forwarded":
-            self._outcomes[child_id] = outcome
+            _logger.exception("Child keep-warm ping failed for %s", session_id)
+            accepted = False
+        if not accepted:
+            self._outcomes[session_id] = "error"
+
+    async def _forward_touch(self, session_id: str) -> None:
+        """Best-effort episode-start touch: re-arms the runner's idle clocks."""
+        try:
+            await self._forward_control(session_id, {"type": "keep_warm_touch"})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("Child keep-warm touch failed for %s", session_id)
 
     async def _send_notices(
         self, conv: Conversation, notices: list[tuple[str, dict[str, int]]]
     ) -> None:
         """Send one ``[System: ...]`` line per stop event to the mother."""
         parent_id = conv.parent_conversation_id
-        if parent_id is None:
+        if parent_id is None or self._notify_line is None:
             return
         for kind, detail in notices:
             try:
@@ -903,29 +1402,14 @@ class ChildKeepWarmSweeper:
                 "It restarts after the child's next real turn."
             )
             prefix = "keep-warm stopped"
-        elif kind == "exp":
-            body = (
-                "its runner was offline past the keep-warm window; "
-                "it restarts after the child's next real turn."
-            )
-            prefix = "keep-warm paused"
         elif kind == "fail":
-            body = (
-                "3 keep-warm turns failed or did not answer [quiet]; "
-                "it restarts after the child's next real turn."
-            )
-            prefix = "keep-warm paused"
-        elif kind == "pol":
-            body = (
-                "a policy did not allow the unattended keep-warm turn; "
-                "it restarts after the child's next real turn."
-            )
+            body = "3 keep-warm pings failed; it restarts after the child's next real turn."
             prefix = "keep-warm paused"
         else:
             read = detail.get("read", 0)
             creation = detail.get("creation", 0)
             body = (
-                "two keep-warm turns did not read the prompt cache "
+                "two keep-warm probes did not read the prompt cache "
                 f"(last: read {read}, written {creation} tokens) — its harness "
                 "likely keeps a shorter cache. Warming stays off for this child "
                 "until it is moved to past and back."
@@ -933,23 +1417,15 @@ class ChildKeepWarmSweeper:
             prefix = "keep-warm paused"
         return f'[System: {prefix} for child "{title}" ({where}): {body}]'
 
-    @staticmethod
-    def _synthetic_request(session_id: str, app: Any) -> Request:
-        """Build the one synthetic ``Request`` the events path needs."""
-        return Request(
-            {
-                "type": "http",
-                "method": "POST",
-                "path": f"/v1/sessions/{session_id}/events",
-                "headers": [],
-                "query_string": b"",
-                "app": app,
-                "scheme": "http",
-                "root_path": "",
-                "client": None,
-                "server": None,
-            }
-        )
+
+def _receipt_miss_detail(family: str | None, data: dict[str, Any]) -> dict[str, int]:
+    """Notice detail for a measured receipt miss: read vs written tokens."""
+    read = _as_int(data.get("cache_read")) or 0
+    if family == "codex":
+        # Codex reports no cache write; the uncached share is the rewrite.
+        total = _as_int(data.get("input_total")) or 0
+        return {"read": read, "creation": max(0, total - read)}
+    return {"read": read, "creation": _as_int(data.get("cache_write")) or 0}
 
 
 def _parse_last_cache(raw: str | None) -> tuple[int, int, int] | None:
@@ -973,18 +1449,6 @@ def _parse_last_cache(raw: str | None) -> tuple[int, int, int] | None:
     return read, creation, observed_at
 
 
-def _turn_is_ours(state: _WarmState | None, running_since: int | None) -> bool:
-    """
-    Whether *running_since* belongs to the ping attempt in *state*.
-
-    A turn is the ping's own when it started within a small lead of the
-    attempt and no later than the turn budget.
-    """
-    if state is None or state.p is None or running_since is None:
-        return False
-    return state.p - _RUNNING_SINCE_LEAD_S <= running_since <= state.p + _PING_TURN_MAX_S
-
-
 def _running_since(conv: Conversation) -> int | None:
     """Return the persisted ``omnigent.running_since`` stamp, if any."""
     raw = conv.labels.get(RUNNING_SINCE_LABEL_KEY)
@@ -993,32 +1457,10 @@ def _running_since(conv: Conversation) -> int | None:
     return None
 
 
-def _last_assistant_text(items: list[ConversationItem]) -> str | None:
-    """
-    Return the newest assistant message's text, or ``None``.
-
-    Newest-first items; hidden meta messages and non-assistant items are
-    skipped, and an assistant item with no text blocks does not mask an
-    earlier text reply.
-    """
-    for item in items:
-        data = item.data
-        if not isinstance(data, MessageData) or data.is_meta or data.role != "assistant":
-            continue
-        parts: list[str] = []
-        for block in data.content:
-            if block.get("type") in ("output_text", "text") and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
-    return None
-
-
 __all__ = [
     "KEEP_WARM_LABEL",
+    "KEEP_WARM_STATS_LABEL",
     "LAST_CACHE_LABEL",
-    "PING",
     "ChildKeepWarmSweeper",
     "warm_state_from_label",
 ]

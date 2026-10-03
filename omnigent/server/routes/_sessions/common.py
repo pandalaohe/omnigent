@@ -105,6 +105,11 @@ _EXTERNAL_BTW_SIDECHAT_TYPE: str = "external_btw_sidechat"
 # pane so the terminal's own ``/btw`` overlay closes in lockstep.
 _EXTERNAL_BTW_DISMISS_TYPE: str = "external_btw_dismiss"
 
+# Keep-warm ping receipt: the runner answers a ``keep_warm_ping`` control with
+# the attempt's outcome and normalized cache-usage fields. Transient — settles
+# the sweeper's label, never persists a conversation item.
+_EXTERNAL_KEEP_WARM_RECEIPT_TYPE: str = "external_keep_warm_receipt"
+
 
 _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 
@@ -311,8 +316,12 @@ _LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY: str = "omnigent.last_provider_usage_limit
 # the keep-warm sweeper: ``"<read>,<creation>,<observed_at>"``.
 _LAST_CACHE_LABEL_KEY: str = "omnigent.last_cache"
 
-# Keep-warm episode state for a sub-agent child (see child_keep_warm.py).
+# Keep-warm episode state for a session (see child_keep_warm.py).
 _KEEP_WARM_LABEL_KEY: str = "omnigent.keep_warm"
+
+# Keep-warm counters (episode / total pings and cost, last return). Split from
+# the episode label so the 256-character label bound holds (child_keep_warm.py).
+_KEEP_WARM_STATS_LABEL_KEY: str = "omnigent.keep_warm_stats"
 
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
@@ -601,6 +610,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
     _EXTERNAL_BTW_SIDECHAT_TYPE,
     _EXTERNAL_BTW_DISMISS_TYPE,
+    _EXTERNAL_KEEP_WARM_RECEIPT_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
@@ -1149,6 +1159,7 @@ __all__ = [
     "_EXTERNAL_ELICITATION_RESOLVED_TYPE",
     "_EXTERNAL_GOAL_STATE_TYPE",
     "_EXTERNAL_GOAL_STATE_VALUES",
+    "_EXTERNAL_KEEP_WARM_RECEIPT_TYPE",
     "_EXTERNAL_MCP_STARTUP_STATUS_VALUES",
     "_EXTERNAL_MCP_STARTUP_TYPE",
     "_EXTERNAL_MODEL_CHANGE_TYPE",
@@ -1181,6 +1192,7 @@ __all__ = [
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
     "_INTERRUPT_TYPE",
     "_KEEP_WARM_LABEL_KEY",
+    "_KEEP_WARM_STATS_LABEL_KEY",
     "_KIMI_NATIVE_HARNESS",
     "_KIRO_NATIVE_WRAPPER_LABEL_VALUE",
     "_LABEL_VALUE_MAX_LEN",

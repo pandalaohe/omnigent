@@ -94,8 +94,8 @@ def test_child_summary_derives_warm_state_from_the_keep_warm_label() -> None:
             _child(labels, live_status=live_status), "conv_parent", None, harness=harness
         )
 
-    warm = json.dumps({"s": "w", "t": now - 100, "w": now + 3600})
-    past = json.dumps({"s": "w", "t": now - 7200, "w": now - 60})
+    warm = json.dumps({"s": "w", "t": now - 100, "u": now - 100, "w": now + 3600})
+    past = json.dumps({"s": "w", "t": now - 7200, "u": now - 7200, "w": now - 60})
     paused = json.dumps({"s": "p", "why": "fail", "t": now - 7200})
 
     assert _summary({keep_warm: warm}, harness="claude-native").warm_state == "warm"

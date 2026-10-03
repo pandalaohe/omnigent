@@ -211,7 +211,11 @@ async def test_child_sessions_expose_warm_state_from_the_keep_warm_label(
     )
     conv_store.set_labels(
         warm.id,
-        {"omnigent.keep_warm": json.dumps({"s": "w", "t": now - 100, "w": now + 3600})},
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "t": now - 100, "u": now - 100, "w": now + 3600}
+            )
+        },
     )
     conv_store.set_labels(
         cold.id,
