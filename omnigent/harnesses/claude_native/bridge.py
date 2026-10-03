@@ -7877,14 +7877,15 @@ def _composer_region_text(pane: str) -> str | None:
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
         return None
-    region = [line.rstrip(" ") for line in lines[rules[-2] + 1 : rules[-1]]]
+    # Claude Code renders the glyph's separator as a no-break space (U+00A0).
+    region = [line.rstrip(" \xa0") for line in lines[rules[-2] + 1 : rules[-1]]]
     if not region:
         return ""
     first = region[0]
     if not first.startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     head = first[len(_CLAUDE_PROMPT_GLYPH) :]
-    if head.startswith(" "):
+    if head[:1] in (" ", "\xa0"):
         head = head[1:]
     elif head:
         # Text fused to the glyph is not the composer's render; the

@@ -13759,3 +13759,15 @@ def test_claude_turn_running_reads_the_status_file(
     assert (
         claude_native_bridge._claude_turn_running(bridge_dir, "/tmp/x.sock", "claude:0.0") is None
     )
+
+
+def test_keep_warm_composer_reads_claude_no_break_space_separator() -> None:
+    """Claude Code renders ``❯`` + U+00A0; an idle box must read empty, a paste exact."""
+    rule = "─" * 30
+    idle = f"{rule}\n❯\xa0\n{rule}\n"
+    pasted = f"{rule}\n❯\xa0{claude_native_bridge.KEEP_WARM_BTW_TEXT}\n{rule}\n"
+    assert claude_native_bridge._composer_region_text(idle) == ""
+    assert (
+        claude_native_bridge._composer_region_text(pasted)
+        == claude_native_bridge.KEEP_WARM_BTW_TEXT
+    )
