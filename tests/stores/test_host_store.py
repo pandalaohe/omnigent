@@ -555,6 +555,44 @@ def test_set_offline(host_store: HostStore) -> None:
     assert fetched.status == "offline"
 
 
+def test_set_online_restores_a_racing_offline(host_store: HostStore) -> None:
+    """
+    Verify set_online undoes a set_offline that landed after the upsert.
+
+    The tunnel route calls it once a reconnect is registered, so a stale
+    disconnect write cannot leave a connected host offline.
+    """
+    host_store.upsert_on_connect("7b463227e479b3a677307588a5d9e44f", "laptop", "carol@example.com")
+    host_store.set_offline("7b463227e479b3a677307588a5d9e44f")
+
+    host_store.set_online("7b463227e479b3a677307588a5d9e44f")
+
+    assert host_store.is_online("7b463227e479b3a677307588a5d9e44f")
+    host_store.set_online("aababcc3941edb738172734a9ab7bb8c")  # unknown host: no-op
+
+
+def test_set_online_leaves_managed_host_lifecycle_alone(db_uri: str) -> None:
+    """
+    Verify set_online does not undo a managed host's lifecycle offline write.
+    """
+    store = HostStore(db_uri)
+    store.register_managed_host(
+        host_id="d55a61010459cea88ed2af0fe916139c",
+        name="managed-m5",
+        user_id="alice@example.com",
+        token="raw-launch-token-5",
+        provider="modal",
+        sandbox_id="sb-m5",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    store.set_online("d55a61010459cea88ed2af0fe916139c")
+
+    fetched = store.get_host("d55a61010459cea88ed2af0fe916139c")
+    assert fetched is not None
+    assert fetched.status == "offline"
+
+
 def test_set_offline_noop_for_unknown_host(
     host_store: HostStore,
 ) -> None:

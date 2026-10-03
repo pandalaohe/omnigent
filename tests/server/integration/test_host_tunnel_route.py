@@ -260,6 +260,64 @@ async def test_host_tunnel_ping_loop_persists_heartbeat(
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+async def test_reconnect_survives_superseded_offline_landing_after_upsert(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify a reconnect stays online when the old tunnel's offline write races it.
+
+    On a network-blip reconnect the old tunnel's cleanup can commit
+    ``offline`` after the new tunnel's upsert; nothing refreshes ``status``
+    afterwards, so the connected host would stay offline indefinitely.
+    """
+    app, registry, store = host_app
+    upsert = store.upsert_on_connect
+
+    def upsert_then_late_offline(*args: object, **kwargs: object) -> object:
+        host = upsert(*args, **kwargs)
+        store.set_offline(_HOST_ID)
+        return host
+
+    monkeypatch.setattr(store, "upsert_on_connect", upsert_then_late_offline)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    # Registration precedes the repair write, so wait for it to land.
+    async def _poll_online() -> None:
+        while not store.is_online(_HOST_ID):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll_online(), timeout=budget(2.0))
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_superseded_offline_after_reconnect_registered_is_undone(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """
+    Verify the old tunnel's cleanup re-asserts online when a reconnect is live,
+    while a real disconnect with no live tunnel still ends offline.
+    """
+    from omnigent.server.routes.host_tunnel import _mark_offline
+
+    app, registry, store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    # The superseded handler finishes after the reconnect registered.
+    await _mark_offline(store, registry, _HOST_ID)
+    assert store.is_online(_HOST_ID)
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+    async def _poll_offline() -> None:
+        while store.is_online(_HOST_ID):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll_offline(), timeout=budget(2.0))
+
+
 async def test_host_tunnel_accepts_and_registers(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
