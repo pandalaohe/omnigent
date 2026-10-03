@@ -88,6 +88,7 @@ UserPreferenceNamespace = Literal[
     "calling_last",
     "session_collab",
     "host_colors",
+    "keep_warm",
 ]
 
 
