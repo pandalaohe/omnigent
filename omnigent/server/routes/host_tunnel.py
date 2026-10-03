@@ -327,6 +327,8 @@ def create_host_tunnel_router(
                 # sandbox, not a user machine reconnecting on a managed host id.
                 registered_with_managed_token=managed_token is not None,
             )
+            # A superseded tunnel's cleanup may have written offline after our upsert.
+            await asyncio.to_thread(host_store.set_online, host_id)
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
@@ -408,7 +410,7 @@ def create_host_tunnel_router(
                 # If the host already reconnected, this handler's connection
                 # was replaced; only the current one may mark it offline.
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await _mark_offline(host_store, host_registry, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -431,7 +433,7 @@ def create_host_tunnel_router(
             # or flip that owner's host offline (cross-user DoS).
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await _mark_offline(host_store, host_registry, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -457,11 +459,23 @@ def create_host_tunnel_router(
                 await ws.close(code=4005, reason="host connection failed")
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await _mark_offline(host_store, host_registry, host_id)
             elif host_persisted:
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                await _mark_offline(host_store, host_registry, host_id)
 
     return router
+
+
+async def _mark_offline(host_store: HostStore, host_registry: HostRegistry, host_id: str) -> None:
+    """Persist a disconnect, unless a reconnect registered while it was in flight.
+
+    :param host_store: Persistent host store.
+    :param host_registry: Live host registry of this replica.
+    :param host_id: Host whose tunnel ended, e.g. ``"host_abc123"``.
+    """
+    await asyncio.to_thread(host_store.set_offline, host_id)
+    if host_registry.get(host_id) is not None:
+        await asyncio.to_thread(host_store.set_online, host_id)
 
 
 async def _send_connection_error(

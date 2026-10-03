@@ -791,6 +791,35 @@ class HostStore:
 
         run_write_transaction(self._session_immediate, "set_host_offline", write)
 
+    def set_online(self, host_id: str) -> None:
+        """
+        Mark a connected host online again after a racing ``set_offline``.
+
+        A superseded tunnel's disconnect cleanup can commit ``offline``
+        after the reconnecting tunnel's upsert; the tunnel route calls
+        this once the new connection is registered. No-op if the host
+        does not exist or is a managed sandbox host, whose status also
+        follows lifecycle transitions (rearm, detach) this must not undo.
+
+        :param host_id: Host identifier, e.g.
+            ``"host_a1b2c3d4..."``.
+        """
+        updated_at = now_epoch()
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
+                    SqlHost.sandbox_provider.is_(None),
+                )
+                .values(status=encode_host_status("online"), updated_at=updated_at)
+            )
+
+        run_write_transaction(self._session_immediate, "set_host_online", write)
+
     def update_harness_readiness(
         self,
         host_id: str,
