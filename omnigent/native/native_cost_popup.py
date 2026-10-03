@@ -164,9 +164,9 @@ def _tmux_window_activity_at(socket_path: str, tmux_target: str) -> float | None
         return None
 
 
-def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | None:
+def _tmux_last_client_input(socket_path: str, tmux_target: str) -> tuple[bool, float | None]:
     """
-    Epoch seconds of the last human input on a regular tmux client of *tmux_target*.
+    Probe the last human input on a regular tmux client of *tmux_target*.
 
     tmux advances a regular (terminal) client's ``client_activity`` when it
     attaches and on every keypress — never for idle time, pane output, or a
@@ -175,13 +175,77 @@ def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | No
     advance it after attaching, even while forwarding keystrokes, so they are
     skipped; the bridge stamps its own interactions on the terminal instance.
 
+    Unlike :func:`_tmux_last_client_input_at`, an unreadable query is told
+    apart from a successful one, so a caller gating on inactivity never
+    mistakes "tmux can't say" for "nobody is typing".
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux target whose session's clients to inspect, e.g.
+        ``"main"``.
+    :returns: ``(readable, last_input_at)`` — ``(False, None)`` when the tmux
+        server/target is gone or any row is malformed or carries an
+        unrecognised field (only a well-formed answer establishes
+        inactivity); otherwise ``(True, ...)`` with the epoch of the newest
+        attach-or-keypress across regular attached clients, ``None`` when
+        none is attached.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "list-clients",
+                "-t",
+                tmux_target,
+                "-F",
+                "#{client_control_mode} #{client_activity}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_LIST_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return (False, None)
+    if proc.returncode != 0:
+        return (False, None)
+    newest: float | None = None
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            return (False, None)
+        if fields[0] == "1":
+            continue
+        if fields[0] != "0":
+            return (False, None)
+        try:
+            activity_at = float(fields[1])
+        except ValueError:
+            return (False, None)
+        newest = activity_at if newest is None else max(newest, activity_at)
+    return (True, newest)
+
+
+def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | None:
+    """
+    Epoch seconds of the last human input on a regular tmux client of *tmux_target*.
+
+    Legacy lenient twin of :func:`_tmux_last_client_input`: rows it cannot
+    classify are skipped, and "no regular client attached" and "query
+    unreadable" both read as ``None``. Callers that gate on inactivity must
+    use the readable form instead.
+
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux target whose session's clients to inspect, e.g.
         ``"main"``.
     :returns: Epoch seconds of the newest attach-or-keypress across regular
         attached clients, or ``None`` when none is attached, the tmux
-        server/target is gone, or the output is unparseable.
+        server/target is gone, or a regular row's value is unparseable.
     """
     import subprocess
 

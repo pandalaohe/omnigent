@@ -17258,6 +17258,37 @@ async def test_relay_btw_overlay_no_overlay_is_noop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_btw_overlay_keep_warm_marker_is_never_posted() -> None:
+    """
+    Keep-warm's own ``/btw`` exchange is skipped and marked posted.
+
+    The ping's overlay carries the ``[omnigent keep-warm]`` marker so the
+    web never shows it; marking it posted keeps the persistent overlay
+    from being re-examined (and the two-read stability wait unspent).
+    """
+    overlay = BtwOverlay(
+        question="/btw [omnigent keep-warm] reply with only: ok",
+        answer="ok",
+        truncated=False,
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        for _ in range(3):
+            await forwarder._relay_btw_overlay(
+                client,
+                session_id="conv1",
+                overlay=overlay,
+                dedupe=dedupe,
+            )
+
+    assert calls == []
+    assert dedupe.btw_pending_key is None
+    assert len(dedupe.posted_btw_keys) == 1
+
+
+@pytest.mark.asyncio
 async def test_forward_pane_signals_captures_once_and_relays_both(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

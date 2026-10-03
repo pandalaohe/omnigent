@@ -7797,6 +7797,150 @@ def create_runner_app(
             return Response(status_code=204)
         return Response(status_code=200)
 
+    def _note_keep_warm_activity(conversation_id: str) -> None:
+        """Re-arm both runner idle clocks for a keep-warm control (every control, any outcome)."""
+        pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if pane_reaper is not None:
+            pane_reaper.note_activity(conversation_id)
+        if process_manager is not None:
+            process_manager.note_activity(conversation_id)
+
+    def _keep_warm_receipt(attempt_id: str, *, outcome: str, reason: str | None) -> dict[str, Any]:
+        """Build one normalized keep-warm receipt with no usage fields."""
+        return {
+            "attempt_id": attempt_id,
+            "outcome": outcome,
+            "reason": reason,
+            "input_total": None,
+            "cache_read": None,
+            "cache_write": None,
+            "cost_usd": None,
+            "estimated": False,
+        }
+
+    from omnigent.native.native_cost_popup import _tmux_last_client_input
+
+    # A human driving the session's pane this recently skips the ping —
+    # the native pane reaper's own evidence window.
+    _KEEP_WARM_USER_ACTIVE_WINDOW_S = 60.0
+
+    async def _keep_warm_pane_user_active(conversation_id: str) -> bool | None:
+        """
+        Human-at-the-pane evidence for one keep-warm ping.
+
+        The same disjunction the native pane reaper's busy check uses:
+        a regular tmux client took input within the window, or the web
+        attach bridge stamped an interaction on the pane's terminal
+        instance. ``None`` when the conversation's pane tracker or the
+        tmux client-activity query can't be read — the caller treats
+        that as "can't establish unattended", never as "no activity".
+        """
+        registry = resource_registry.terminal_registry if resource_registry is not None else None
+        if registry is None or not hasattr(registry, "native_panes"):
+            return None
+        pane = next(
+            (
+                (name, socket_path)
+                for conv_id, name, socket_path in registry.native_panes()
+                if conv_id == conversation_id
+            ),
+            None,
+        )
+        if pane is None:
+            return None
+        name, socket_path = pane
+        readable, input_at = await asyncio.to_thread(
+            _tmux_last_client_input, str(socket_path), "main"
+        )
+        if not readable:
+            return None
+        if input_at is not None and time.time() - input_at < _KEEP_WARM_USER_ACTIVE_WINDOW_S:
+            return True
+        instance = registry.get(conversation_id, name, "main")
+        if instance is None:
+            return None
+        return instance.client_interaction_within(_KEEP_WARM_USER_ACTIVE_WINDOW_S)
+
+    async def _run_keep_warm_ping(
+        conversation_id: str,
+        *,
+        attempt_id: str,
+        family: Any,
+        card: bool,
+    ) -> None:
+        """
+        Forward one keep-warm ping to the live harness and report the receipt.
+
+        The runner only gates, forwards and reports; the harness runs
+        the channel. Gates, in order: a pending synchronous prompt
+        (``card``), then human-at-the-pane evidence (``user_active``;
+        an unreadable tracker is ``unknown``, never "no activity"). A
+        ping never spawns a harness subprocess — ``get_client(...,
+        "any")`` only reuses a live one. The receipt goes to the
+        server as an ``external_keep_warm_receipt`` event (no
+        conversation item), best-effort: the server's own attempt
+        timeout settles a receipt that never arrives.
+        """
+        receipt: dict[str, Any]
+        if card:
+            receipt = _keep_warm_receipt(attempt_id, outcome="skipped", reason="card")
+        elif process_manager is None:
+            receipt = _keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
+        else:
+            user_active = await _keep_warm_pane_user_active(conversation_id)
+            if user_active is None:
+                receipt = _keep_warm_receipt(attempt_id, outcome="skipped", reason="unknown")
+            elif user_active:
+                receipt = _keep_warm_receipt(attempt_id, outcome="skipped", reason="user_active")
+            else:
+                try:
+                    harness_client = await process_manager.get_client(conversation_id, "any")
+                except NoLiveHarnessError:
+                    receipt = _keep_warm_receipt(
+                        attempt_id, outcome="skipped", reason="no_live_client"
+                    )
+                except RuntimeError:
+                    receipt = _keep_warm_receipt(
+                        attempt_id, outcome="failed", reason="harness_error"
+                    )
+                else:
+                    try:
+                        resp = await harness_client.post(
+                            f"/v1/sessions/{conversation_id}/events",
+                            json={"type": "keep_warm", "attempt_id": attempt_id, "family": family},
+                            timeout=60.0,
+                        )
+                        payload: Any = resp.json() if resp.status_code == 200 else None
+                    except httpx.TimeoutException:
+                        receipt = _keep_warm_receipt(
+                            attempt_id, outcome="failed", reason="timeout"
+                        )
+                    except Exception:  # noqa: BLE001 — any transport/parse failure is one failed ping
+                        receipt = _keep_warm_receipt(
+                            attempt_id, outcome="failed", reason="harness_error"
+                        )
+                    else:
+                        if isinstance(payload, dict):
+                            # The runner owns the attempt id; the server settles by it.
+                            payload["attempt_id"] = attempt_id
+                            receipt = payload
+                        else:
+                            receipt = _keep_warm_receipt(
+                                attempt_id, outcome="failed", reason="harness_error"
+                            )
+        try:
+            await server_client.post(
+                f"/v1/sessions/{conversation_id}/events",
+                json={"type": "external_keep_warm_receipt", "data": receipt},
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 — the server's attempt timeout settles a lost receipt
+            _logger.warning(
+                "keep-warm: receipt delivery to the server failed",
+                exc_info=True,
+                extra={"session_id": conversation_id},
+            )
+
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
@@ -12813,6 +12957,40 @@ def create_runner_app(
                 except Exception:  # noqa: BLE001 — best-effort; deny path continues
                     pass
             body = {**_data, "type": "approval"}
+
+        if body_type == "keep_warm_touch":
+            _note_keep_warm_activity(conversation_id)
+            return Response(status_code=204)
+
+        if body_type == "keep_warm_ping":
+            _note_keep_warm_activity(conversation_id)
+            attempt_id = body.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'attempt_id' must be a non-empty string",
+                    },
+                )
+            # The runner is the authority on synchronous prompts: its own
+            # trackers decide "card" at ping time, so a server restart that
+            # emptied the in-memory index never turns "unknown" into "no card".
+            card = pending_approvals.has_pending(conversation_id) or (
+                conversation_id in _claude_prompt_waiters
+            )
+            task = asyncio.create_task(
+                _run_keep_warm_ping(
+                    conversation_id,
+                    attempt_id=attempt_id,
+                    family=body.get("family"),
+                    card=card,
+                ),
+                name=f"keep-warm-{conversation_id}",
+            )
+            task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(task)
+            return Response(status_code=202)
 
         try:
             harness_client = await process_manager.get_client(conversation_id, "any")

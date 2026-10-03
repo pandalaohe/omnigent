@@ -367,15 +367,66 @@ class PolicyVerdictEvent(BaseModel):
     data: dict[str, Any] | None = None
 
 
+class KeepWarmEvent(BaseModel):
+    """
+    Downward ``keep_warm`` event — ping the session so the provider
+    prompt cache stays warm.
+
+    Carries no conversation payload and creates no item: the harness
+    answers with a receipt dict (``outcome`` / ``reason`` / usage
+    fields) the runner relays to the server. The scaffold skips the
+    ping while any in-flight turn waits on a human (elicitation or
+    policy verdict) so a pending card is never disturbed; harnesses
+    without a keep-warm channel answer ``skipped`` / ``unsupported``.
+
+    :param type: Event discriminator; always ``"keep_warm"``.
+    :param attempt_id: Server-allocated ping attempt id, echoed on
+        the receipt so the server can settle it.
+    :param family: Model family the ping prices for, e.g.
+        ``"claude"`` or ``"codex"``.
+    """
+
+    type: Literal["keep_warm"]
+    attempt_id: str
+    family: str
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
 # unknown values raise 422 (fail-loud per
 # ``designs/DESIGN_PRINCIPLES.md``).
 InboundEventRequest = Annotated[
-    MessageEvent | InterruptEvent | ToolResultEvent | ApprovalEvent | PolicyVerdictEvent,
+    MessageEvent
+    | InterruptEvent
+    | ToolResultEvent
+    | ApprovalEvent
+    | PolicyVerdictEvent
+    | KeepWarmEvent,
     Field(discriminator="type"),
 ]
+
+
+def _keep_warm_receipt(attempt_id: str, *, outcome: str, reason: str | None) -> dict[str, Any]:
+    """
+    Build one normalized keep-warm receipt with no usage fields.
+
+    :param attempt_id: Ping attempt id to echo.
+    :param outcome: ``"ok"`` / ``"skipped"`` / ``"failed"``.
+    :param reason: Machine reason, e.g. ``"card"``; ``None`` on ``"ok"``.
+    :returns: The receipt dict the runner posts to the server as
+        ``external_keep_warm_receipt`` data.
+    """
+    return {
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+        "reason": reason,
+        "input_total": None,
+        "cache_read": None,
+        "cache_write": None,
+        "cost_usd": None,
+        "estimated": False,
+    }
 
 
 class TurnContext:
@@ -1155,6 +1206,9 @@ class HarnessApp:
         - :class:`ApprovalEvent` → :meth:`_resolve_elicitation`
           after adapting to :class:`ElicitationResult` (404 on
           unknown elicitation_id — single-shot correlation).
+        - :class:`KeepWarmEvent` → :meth:`_handle_keep_warm_event`
+          (200 with the receipt; ``skipped`` / ``card`` while a
+          human wait is pending, without touching the hook).
 
         Unknown ``type`` values fail at request validation with
         422 (Pydantic discriminator), per ``designs/DESIGN_PRINCIPLES.md``
@@ -1192,6 +1246,8 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, KeepWarmEvent):
+            return await self._handle_keep_warm_event(body)
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.
@@ -1268,6 +1324,38 @@ class HarnessApp:
             if ctx._complete_policy_evaluation(body.evaluation_id, verdict):
                 break
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async def _handle_keep_warm_event(self, body: KeepWarmEvent) -> JSONResponse:
+        """
+        Answer a :class:`KeepWarmEvent` with the receipt dict as JSON 200.
+
+        A turn parked on a human wait (an unanswered elicitation or
+        policy evaluation) means a synchronous card is open; the ping
+        is then skipped (``card``) without calling :meth:`_keep_warm`
+        so the prompt is never disturbed.
+
+        :param body: The decoded :class:`KeepWarmEvent`.
+        :returns: 200 with the normalized receipt body.
+        """
+        if any(ctx._pending_human_waits > 0 for ctx in self._in_flight.values()):
+            return JSONResponse(
+                content=_keep_warm_receipt(body.attempt_id, outcome="skipped", reason="card")
+            )
+        receipt = await self._keep_warm(attempt_id=body.attempt_id, family=body.family)
+        return JSONResponse(content=receipt)
+
+    async def _keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
+        """
+        Hook answering one keep-warm ping; the default skips ``unsupported``.
+
+        Harnesses with a keep-warm channel override this (via
+        ``ExecutorAdapter`` onto the inner executor).
+
+        :param attempt_id: Ping attempt id to echo on the receipt.
+        :param family: Model family, e.g. ``"claude"``.
+        :returns: The normalized receipt dict.
+        """
+        return _keep_warm_receipt(attempt_id, outcome="skipped", reason="unsupported")
 
     async def _start_or_inject_turn(
         self, request: CreateResponseRequest, *, session_id: str | None = None

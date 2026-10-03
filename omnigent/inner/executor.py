@@ -673,6 +673,19 @@ class Executor:
         """Send a new user message to a live session without interrupting it, if supported."""
         return False
 
+    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # noqa: ARG002 — default unsupported; subclasses with a keep-warm channel override
+        """Ping the live session so the provider prompt cache stays warm; returns the receipt."""
+        return {
+            "attempt_id": attempt_id,
+            "outcome": "skipped",
+            "reason": "unsupported",
+            "input_total": None,
+            "cache_read": None,
+            "cache_write": None,
+            "cost_usd": None,
+            "estimated": False,
+        }
+
     def supports_live_message_queue(self) -> bool:
         """Whether ``enqueue_session_message()`` is expected to work during a running turn."""
         return False

@@ -13097,3 +13097,665 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+# ── keep-warm /btw ping ──────────────────────────────────────────────
+
+_KEEP_WARM_TEXT = "/btw [omnigent keep-warm] reply with only: ok"
+
+_KEEP_WARM_OVERLAY_PANE = _btw_pane(
+    "",
+    f"    {_KEEP_WARM_TEXT}",
+    "",
+    "      ok",
+    "",
+    "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+)
+
+
+@pytest.fixture
+def btw_guard_trackers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize the prompt / turn / client-activity trackers around one guard."""
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: False)
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: False)
+    monkeypatch.setattr(claude_native_bridge, "_tmux_last_client_input", lambda *_: (True, None))
+
+
+def test_keep_warm_btw_pending_prompt_skips_card(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard 1: a pending Claude question/permission prompt skips ``card``, pane untouched."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: True)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "card")
+    assert sends == []
+
+
+def test_keep_warm_btw_missing_tmux_info_skips_unknown(tmp_path: Path) -> None:
+    """Guard 2: no advertised tmux metadata skips ``unknown``, pane untouched."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "unknown")
+
+
+def test_keep_warm_btw_running_turn_skips_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 3: Claude's status file reporting a generating turn skips ``busy``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "busy")
+    assert sends == []
+
+
+def test_keep_warm_btw_unreadable_turn_tracker_skips_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 3: an unreadable status file is never evidence of idle — ``unknown``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: None)
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "unknown")
+    assert sends == []
+
+
+def test_keep_warm_btw_occupied_pane_skips_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 4: a dialog over the input box skips ``busy``, pane untouched."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_MCP_APPROVAL_DIALOG_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "busy")
+    assert sends == []
+
+
+def test_keep_warm_btw_composer_draft_skips_composer_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 5: a draft in the composer skips ``composer_draft``, pane untouched."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_composer_pane("half-typed question")])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_draft")
+    assert sends == []
+
+
+def test_keep_warm_btw_recent_client_input_skips_user_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 6: a regular client's keypress within 60s skips ``user_active``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    # The virtual clock reads time.time() == 0.0, so a stamp of 0.0 is "just now".
+    monkeypatch.setattr(claude_native_bridge, "_tmux_last_client_input", lambda *_: (True, 0.0))
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "user_active")
+    assert sends == []
+
+
+def test_keep_warm_btw_unreadable_client_activity_skips_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 6: a failed tmux client query is never evidence of unattended — ``unknown``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_tmux_last_client_input", lambda *_: (False, None))
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "unknown")
+    assert sends == []
+
+
+def test_keep_warm_btw_happy_path_pastes_enters_and_dismisses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """
+    Happy path: bracketed paste (NO Ctrl-A/Ctrl-K pre-clear), exact-draft
+    check, Enter, the marked overlay answers, Escape dismisses → ``ok``.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,  # pane-idle + composer-empty guards
+            _composer_pane(_KEEP_WARM_TEXT),  # paste committed, exactly
+            _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
+            _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1] == [
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        "omnigent-paste",
+        "-t",
+        "claude:0.0",
+    ]
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+    # The real-message pre-clear must NOT run: the composer was verified empty.
+    assert ["send-keys", "-t", "claude:0.0", "C-a"] not in sends
+    assert ["send-keys", "-t", "claude:0.0", "C-k"] not in sends
+
+
+def test_keep_warm_btw_composer_mismatch_sends_no_cleanup_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """
+    Scenario 10: the composer changed between paste and Enter — NO
+    cleanup keys are sent (a Backspace can't tell our characters from
+    the person's), so human typing survives; no Enter either.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane("someone typed over the paste"),
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_changed")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert len(sends) == 2
+
+
+def test_keep_warm_btw_dialog_after_paste_receives_no_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A dialog opening during the commit window is never typed into."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _MCP_APPROVAL_DIALOG_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_changed")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert len(sends) == 2
+
+
+def test_keep_warm_btw_multiline_composer_draft_skips_composer_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 5: a blank first composer row with human text below still skips."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = (
+        "──────────────────────────────\n"
+        "❯ \n"
+        "  HUMAN DRAFT\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(monkeypatch, [pane])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_draft")
+    assert sends == []
+
+
+def test_keep_warm_btw_blank_composer_rows_read_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Guard 5: a blank glyph row with only blank rows below is an empty composer, not a draft."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    tall_blank = (
+        "──────────────────────────────\n❯ \n\n──────────────────────────────\n  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            tall_blank,  # composer empty (the row below the glyph is blank)
+            _composer_pane(_KEEP_WARM_TEXT),  # paste committed, exactly
+            _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
+            _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+
+
+def test_keep_warm_btw_blank_row_below_the_paste_still_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Our text with only blank rows below it is exactly ours — Enter and Escape go out."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    tall_paste = (
+        "──────────────────────────────\n"
+        f"❯ {_KEEP_WARM_TEXT}\n"
+        "\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            tall_paste,  # paste committed; the row below it is blank box height
+            _KEEP_WARM_OVERLAY_PANE,
+            _KEEP_WARM_OVERLAY_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+
+
+def test_keep_warm_btw_human_text_below_the_paste_blocks_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Our text on the first composer row with human text below is not exactly ours — no Enter."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = (
+        "──────────────────────────────\n"
+        f"❯ {_KEEP_WARM_TEXT}\n"
+        "  HUMAN DRAFT\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE, pane])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_changed")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert len(sends) == 2
+
+
+def test_keep_warm_btw_text_on_a_continuation_row_blocks_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A blank glyph row with our text on a continuation row is not exactly ours — no Enter."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = (
+        "──────────────────────────────\n"
+        "❯ \n"
+        f"  {_KEEP_WARM_TEXT}\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE, pane])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_changed")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert len(sends) == 2
+
+
+def test_keep_warm_btw_blank_line_then_text_below_the_paste_blocks_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Our text followed by a human blank line and text is not exactly ours — no Enter."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = (
+        "──────────────────────────────\n"
+        f"❯ {_KEEP_WARM_TEXT}\n"
+        "\n"
+        "  HUMAN DRAFT\n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE, pane])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_changed")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert len(sends) == 2
+
+
+def test_keep_warm_btw_trailing_padding_spaces_still_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Terminal padding spaces after the paste still compare exactly — Enter and Escape go out."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    padded = (
+        "──────────────────────────────\n"
+        f"❯ {_KEEP_WARM_TEXT}   \n"
+        "──────────────────────────────\n"
+        "  ? for shortcuts\n"
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            padded,
+            _KEEP_WARM_OVERLAY_PANE,
+            _KEEP_WARM_OVERLAY_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+
+
+def test_keep_warm_btw_prompt_after_paste_blocks_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A prompt appearing after the paste re-runs the card guard — no Enter."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _API_KEY_DIALOG_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "card")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert len(sends) == 2
+
+
+def test_keep_warm_btw_unmarked_overlay_is_not_dismissed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A settled overlay whose question lacks the marker is never Escaped."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    other_overlay = _btw_pane(
+        "",
+        "    /btw is this backward compatible?",
+        "",
+        "      Yes, the public API is unchanged.",
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            other_overlay,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "btw_unavailable")
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_prompt_during_overlay_poll_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A prompt appearing during the 30 s overlay poll aborts it — no Escape."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _API_KEY_DIALOG_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_failed_dismissal_is_not_ok(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """The overlay is gone at the dismissal's own capture — no Escape, not ``ok``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,  # the poll sees our settled overlay
+            _IDLE_PANE,  # the dismissal's capture: overlay already gone
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_running_turn_at_dismissal_blocks_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A turn reported by the dismissal's fresh status check spends no Escape."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    # Guard, paste-commit poll, overlay poll all read idle; the
+    # dismissal's own check then reports a generating turn.
+    running = iter([False, False, False, True])
+    monkeypatch.setattr(
+        claude_native_bridge, "_claude_turn_running", lambda *_: next(running, True)
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,  # the poll sees our settled overlay
+            _KEEP_WARM_OVERLAY_PANE,  # the dismissal's capture: still ours
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_unreadable_status_during_overlay_poll_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """An unreadable turn status mid-poll aborts like a known running turn — no Escape."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    # Guard and paste-commit poll read idle; the overlay poll's status read goes unreadable.
+    running = iter([False, False, None])
+    monkeypatch.setattr(
+        claude_native_bridge, "_claude_turn_running", lambda *_: next(running, None)
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_no_overlay_fails_btw_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """The question went in but no settled overlay appeared in 30s → ``btw_unavailable``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _IDLE_PANE,  # the overlay poll never sees an overlay
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "btw_unavailable")
+    assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
+    assert sends[1][:1] == ["paste-buffer"]
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    # No Escape: only a verifiably-present overlay may be dismissed.
+    assert len(sends) == 3
+
+
+def test_tmux_pane_pid_parses_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pane pid comes from ``list-panes -F '#{pane_pid}'``; failures are ``None``."""
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        assert "list-panes" in cmd
+        return SimpleNamespace(returncode=0, stdout="4242\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    assert claude_native_bridge._tmux_pane_pid("/tmp/x.sock", "claude:0.0") == 4242
+
+    def _failing_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="can't find pane")
+
+    monkeypatch.setattr("subprocess.run", _failing_run)
+    assert claude_native_bridge._tmux_pane_pid("/tmp/x.sock", "claude:0.0") is None
+
+
+def test_claude_turn_running_reads_the_status_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pane pid names the status file; its mapped status answers the guard."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setattr(claude_native_bridge, "_tmux_pane_pid", lambda *_: 4242)
+    resolved: dict[str, Any] = {}
+
+    def _fake_resolve(*, pane_pid: int | None, expected_session_id: str | None) -> Path:
+        resolved["pane_pid"] = pane_pid
+        resolved["expected_session_id"] = expected_session_id
+        return Path("/claude/sessions/4242.json")
+
+    monkeypatch.setattr(claude_native_bridge, "resolve_status_file", _fake_resolve)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_session_status",
+        lambda _: SimpleNamespace(runner_status="running"),
+    )
+
+    assert claude_native_bridge._claude_turn_running(bridge_dir, "/tmp/x.sock", "claude:0.0")
+    assert resolved["pane_pid"] == 4242
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_session_status",
+        lambda _: SimpleNamespace(runner_status="idle"),
+    )
+    assert not claude_native_bridge._claude_turn_running(bridge_dir, "/tmp/x.sock", "claude:0.0")
+    monkeypatch.setattr(claude_native_bridge, "resolve_status_file", lambda **_: None)
+    assert (
+        claude_native_bridge._claude_turn_running(bridge_dir, "/tmp/x.sock", "claude:0.0") is None
+    )
+    monkeypatch.setattr(claude_native_bridge, "_tmux_pane_pid", lambda *_: None)
+    assert (
+        claude_native_bridge._claude_turn_running(bridge_dir, "/tmp/x.sock", "claude:0.0") is None
+    )

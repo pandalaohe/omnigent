@@ -65,6 +65,13 @@ from filelock import Timeout as FileLockTimeout
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+from omnigent.harnesses.claude_native.status_file import (
+    RUNNING as _CLAUDE_STATUS_RUNNING,
+)
+from omnigent.harnesses.claude_native.status_file import (
+    read_session_status,
+    resolve_status_file,
+)
 from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
@@ -81,6 +88,7 @@ from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
 from omnigent.native import native_bridge_common
+from omnigent.native.native_cost_popup import _tmux_last_client_input
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -4840,6 +4848,18 @@ _BTW_FOOTER_CLOSE_HINT = "Esc to close"
 _BTW_FOOTER_COMPLETE_HINTS = ("c to copy", "f to fork")
 _BTW_ANSWERING_HINT = "Answering"
 _BTW_QUESTION_PREFIX = "/btw"
+# Keep-warm's fixed /btw question. The marker identifies the settled
+# overlay to the ping that asked it, and tells the forwarder the
+# exchange must never be published to the web view.
+KEEP_WARM_BTW_MARKER = "[omnigent keep-warm]"
+KEEP_WARM_BTW_TEXT = f"/btw {KEEP_WARM_BTW_MARKER} reply with only: ok"
+# A regular tmux client taking input (attach or keypress) this recently
+# means a person may be at the pane; the ping skips instead of typing.
+_KEEP_WARM_CLIENT_INPUT_WINDOW_S = 60.0
+# Budget for the /btw answer's overlay to settle; past it the channel is
+# treated as unavailable for this attempt.
+_KEEP_WARM_OVERLAY_TIMEOUT_S = 30.0
+_KEEP_WARM_OVERLAY_POLL_INTERVAL_S = 0.5
 # Read-only capture cannot tell a complete tall answer from one the pane
 # clipped (both end in a blank + footer), so an overlay whose border→footer
 # span reaches this many rows is flagged possibly-truncated. This
@@ -5483,6 +5503,72 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
             False, exited=True, exit_status=fields[1] if len(fields) > 1 else None
         )
     return _ClaudePaneState(None)
+
+
+def _tmux_pane_pid(socket_path: str, tmux_target: str) -> int | None:
+    """
+    Return the pane's process pid, or ``None`` when tmux can't say.
+
+    Same ``list-panes`` shape as :func:`_claude_pane_state`: a rejected
+    query fails outright, where ``display-message`` exits 0 on an empty
+    line that a pid parse would misread.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: The ``#{pane_pid}`` value, or ``None``.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _claude_turn_running(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Read Claude's own running/idle status file for the pane.
+
+    The ``sessions/<pid>.json`` file — not the pane, whose composer
+    stays mounted mid-turn for queued input — says whether a turn is
+    generating; typing ``/btw`` into a generating turn would queue it
+    as a real user message. Resolution mirrors the runner's status
+    watcher: the pane pid names the file, and the bridge-captured
+    Claude session uuid cross-checks it.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :returns: The file's answer, or ``None`` when the pid or the file
+        can't be resolved — an unreadable tracker, never evidence of
+        idle.
+    """
+    pane_pid = _tmux_pane_pid(socket_path, tmux_target)
+    if pane_pid is None:
+        return None
+    path = resolve_status_file(
+        pane_pid=pane_pid,
+        expected_session_id=read_claude_session_id(bridge_dir),
+    )
+    if path is None:
+        return None
+    status = read_session_status(path)
+    if status is None:
+        return None
+    return status.runner_status == _CLAUDE_STATUS_RUNNING
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -7742,6 +7828,259 @@ def dismiss_btw_overlay(bridge_dir: Path) -> bool:
         return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
     return True
+
+
+@dataclass(frozen=True)
+class KeepWarmBtwResult:
+    """
+    Outcome of one guarded keep-warm ``/btw`` attempt.
+
+    :param outcome: ``"ok"`` when the marked overlay answered and was
+        dismissed, ``"skipped"`` when a guard refused before any
+        effect, ``"failed"`` when the question went in but no settled
+        overlay appeared or the attempt had to abort.
+    :param reason: Machine reason for non-ok outcomes: ``"card"``,
+        ``"unknown"``, ``"busy"``, ``"composer_draft"``,
+        ``"user_active"``, ``"composer_changed"``, ``"aborted"``, or
+        ``"btw_unavailable"``.
+    """
+
+    outcome: str
+    reason: str | None = None
+
+
+def _composer_region_text(pane: str) -> str | None:
+    """
+    Return the complete draft inside Claude's live input box, or ``None``.
+
+    The region is every row between the composer frame's opening and
+    closing rules, taken as rendered — blank rows kept, leading space
+    kept, only trailing terminal-padding spaces trimmed — and compared
+    row by row against the single-line paste: ``""`` when every row is
+    blank; the glyph row's content when every other row is blank;
+    anything else — a draft on a continuation row, a wrapped capture,
+    extra leading spaces — keeps the rows joined by ``"\\n"``, which can
+    never pass as the paste. The first interior row must carry the
+    ``❯`` glyph; its content is what follows it (and its one
+    separating space).
+
+    ``None`` fails the read closed: the box is not framed on both
+    sides (an overlay replaces it, or a tall draft pushes the closing
+    rule off a sliver pane and clips the rest), or the framed region
+    is not a chat composer.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The full composer text, or ``None`` when the render
+        can't be read exactly.
+    """
+    lines = pane.splitlines()
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2:
+        return None
+    region = [line.rstrip(" ") for line in lines[rules[-2] + 1 : rules[-1]]]
+    if not region:
+        return ""
+    first = region[0]
+    if not first.startswith(_CLAUDE_PROMPT_GLYPH):
+        return None
+    head = first[len(_CLAUDE_PROMPT_GLYPH) :]
+    if head.startswith(" "):
+        head = head[1:]
+    elif head:
+        # Text fused to the glyph is not the composer's render; the
+        # glyph row itself is returned so it can never equal the paste.
+        return first
+    rest = region[1:]
+    if all(not row for row in rest):
+        # Blank rows below the glyph row are the box's empty height, not content.
+        return head
+    return "\n".join([head, *rest])
+
+
+def _paste_keep_warm_btw(bridge_dir: Path, socket_path: str, tmux_target: str) -> None:
+    """
+    Bracketed-paste :data:`KEEP_WARM_BTW_TEXT` into the verified-empty composer.
+
+    Same buffer mechanics as :func:`_paste_and_submit` (a tmux buffer,
+    never argv) but WITHOUT the Ctrl-A/Ctrl-K pre-clear: keep-warm only
+    pastes into a composer it just verified empty, and the pre-clear
+    would silently delete a draft that raced in between.
+
+    :param bridge_dir: Bridge directory path (hosts the paste temp file).
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
+    with tempfile.NamedTemporaryFile(
+        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+    ) as paste_file:
+        paste_file.write(_paste_payload_bytes(KEEP_WARM_BTW_TEXT))
+        paste_path = paste_file.name
+    try:
+        _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+            "-d",  # drop the buffer after pasting (no stale copies server-side)
+            "-b",
+            "omnigent-paste",
+            "-t",
+            tmux_target,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(paste_path)
+
+
+def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool:
+    """
+    Escape keep-warm's own settled overlay; ``False`` spends no key.
+
+    One fresh capture decides: a settled ``/btw`` overlay whose
+    question carries :data:`KEEP_WARM_BTW_MARKER` (ours — not a side
+    chat of the person's), no pending user prompt, and Claude's
+    status file explicitly idle — a turn that just started, or a
+    tracker that can't be read, spends no key. Anything else is
+    left exactly as it is. Keep-warm's dismiss; the web-initiated
+    :func:`dismiss_btw_overlay` keeps its broader any-``/btw`` contract.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :returns: ``True`` when an Escape was sent.
+    """
+    pane = _capture_pane(socket_path, tmux_target)
+    overlay = _btw_overlay_from_pane(pane)
+    if overlay is None or overlay.question is None or KEEP_WARM_BTW_MARKER not in overlay.question:
+        return False
+    if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
+        return False
+    if _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False:
+        return False
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    return True
+
+
+def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
+    """
+    Drive one guarded keep-warm ``/btw`` exchange on the live pane.
+
+    Types :data:`KEEP_WARM_BTW_TEXT` — a side question, so the ping
+    reads the cached prefix with no tool access and no transcript
+    item — only when the pane is verifiably unattended and idle. A
+    guard failure skips the tick (the cache may then expire) rather
+    than risk the person's input. Guards, in order:
+
+    1. a pending Claude question / permission prompt → ``card``;
+    2. tmux metadata missing → ``unknown``;
+    3. Claude's status file says a turn is generating → ``busy``, and
+       an unreadable file → ``unknown`` (never evidence of idle);
+    4. no mounted, uncovered chat input → ``busy``;
+    5. the composer region unreadable → ``unknown``, or a draft on any
+       of its rows (:func:`_composer_region_text`) → ``composer_draft``;
+    6. a regular tmux client took input within
+       :data:`_KEEP_WARM_CLIENT_INPUT_WINDOW_S` → ``user_active``, and
+       an unreadable client-activity query → ``unknown`` (never
+       evidence of unattended).
+
+    Before Enter one fresh capture must again show no pending prompt,
+    no running turn, and the composer holding exactly the paste; on
+    any mismatch NO further key is sent (``composer_changed``) — the
+    paste may stay in the composer for the person to see, which is
+    preferred to backspacing characters that may be theirs. The
+    overlay poll aborts with no key when a prompt or a turn appears or
+    the turn tracker goes unreadable, and Escape is spent only on our
+    own marked overlay with no prompt pending and an explicitly idle
+    status on that capture. Accepted residual: a state change in the
+    milliseconds between a capture and the next key, and runner-side
+    web actions that write the pane, can never be excluded.
+
+    The caller holds the executor's injection lock, so a real message
+    arriving meanwhile waits the few seconds this takes instead of
+    interleaving keystrokes; cancellation sets a flag every tmux call
+    checks before sending.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The attempt's outcome; guard refusals return, never raise.
+    :raises RuntimeError: If a ``tmux`` invocation fails mid-sequence.
+    """
+    if has_pending_user_prompt(bridge_dir):
+        return KeepWarmBtwResult("skipped", "card")
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return KeepWarmBtwResult("skipped", "unknown")
+    running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
+    if running is None:
+        return KeepWarmBtwResult("skipped", "unknown")
+    if running:
+        return KeepWarmBtwResult("skipped", "busy")
+    pane = _capture_pane(socket_path, tmux_target)
+    if not claude_pane_text_ready(pane):
+        return KeepWarmBtwResult("skipped", "busy")
+    draft = _composer_region_text(pane)
+    if draft is None:
+        return KeepWarmBtwResult("skipped", "unknown")
+    if draft:
+        return KeepWarmBtwResult("skipped", "composer_draft")
+    readable, last_input_at = _tmux_last_client_input(socket_path, tmux_target)
+    if not readable:
+        return KeepWarmBtwResult("skipped", "unknown")
+    if (
+        last_input_at is not None
+        and time.time() - last_input_at < _KEEP_WARM_CLIENT_INPUT_WINDOW_S
+    ):
+        return KeepWarmBtwResult("skipped", "user_active")
+    _paste_keep_warm_btw(bridge_dir, socket_path, tmux_target)
+    # Enter goes out only while one fresh capture shows no pending
+    # prompt, no running turn, and the composer holding exactly the
+    # paste — an Enter into anything else would submit a raced-in
+    # draft or confirm a dialog that just popped. A ``None``/empty
+    # read is the paste still landing, so the poll waits out the
+    # commit budget; every other read ends the attempt with no key.
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
+            return KeepWarmBtwResult("skipped", "card")
+        running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
+        if running is None:
+            return KeepWarmBtwResult("skipped", "unknown")
+        if running:
+            return KeepWarmBtwResult("skipped", "busy")
+        draft = _composer_region_text(pane)
+        if draft == KEEP_WARM_BTW_TEXT:
+            break
+        if draft not in (None, ""):
+            return KeepWarmBtwResult("skipped", "composer_changed")
+        if time.monotonic() >= deadline:
+            return KeepWarmBtwResult("skipped", "composer_changed")
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    deadline = time.monotonic() + _KEEP_WARM_OVERLAY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
+            return KeepWarmBtwResult("failed", "aborted")
+        # An unreadable status aborts exactly like a known running turn.
+        if _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False:
+            return KeepWarmBtwResult("failed", "aborted")
+        overlay = _btw_overlay_from_pane(pane)
+        if (
+            overlay is not None
+            and overlay.question is not None
+            and KEEP_WARM_BTW_MARKER in overlay.question
+        ):
+            if _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target):
+                return KeepWarmBtwResult("ok")
+            return KeepWarmBtwResult("failed", "aborted")
+        time.sleep(_KEEP_WARM_OVERLAY_POLL_INTERVAL_S)
+    # The question is in and may still be answering; leave the overlay
+    # for the next injected message to dismiss. A later slice adds the
+    # quiet-turn fallback after repeated btw_unavailable failures.
+    return KeepWarmBtwResult("failed", "btw_unavailable")
 
 
 def read_claude_status_model(bridge_dir: Path) -> str | None:

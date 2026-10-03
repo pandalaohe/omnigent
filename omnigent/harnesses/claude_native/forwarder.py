@@ -24,6 +24,7 @@ import httpx
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    KEEP_WARM_BTW_MARKER,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
     ClaudeHookRecord,
@@ -7591,6 +7592,13 @@ async def _relay_btw_overlay(
         return
     key = hashlib.sha256(f"{overlay.question or ''}\x00{overlay.answer}".encode()).hexdigest()
     if key in dedupe.posted_btw_keys:
+        return
+    if KEEP_WARM_BTW_MARKER in (overlay.question or ""):
+        # Keep-warm's own ping: never relayed to the web view, but
+        # marked posted so the persistent overlay isn't re-examined
+        # (and the two-read stability wait never spent on it).
+        dedupe.posted_btw_keys[key] = None
+        dedupe.btw_pending_key = None
         return
     # Require the same exchange on two consecutive reads before relaying so a
     # torn capture (footer read, answer still painting) can't post a partial.
