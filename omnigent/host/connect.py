@@ -460,6 +460,11 @@ try:
     _LIFECYCLE_POLL_INTERVAL_S = float(os.environ.get("OMNIGENT_HOST_LIFECYCLE_POLL_S", "60"))
 except ValueError:
     _LIFECYCLE_POLL_INTERVAL_S = 60.0
+# How often a connected host asks the server whether it lists this host online,
+# and how many consecutive "offline" answers force a reconnect. A server can
+# record offline for a tunnel it still serves; reconnecting re-registers it.
+_SERVER_STATUS_CHECK_INTERVAL_S = 60.0
+_SERVER_OFFLINE_CHECKS_TO_RECONNECT = 2
 # Keep first startup tolerant of a cold server, but do not spend the library's
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
@@ -3928,6 +3933,52 @@ class HostProcess:
             self._abort_live_tunnel()
             return
 
+    def _server_lists_host_offline(self) -> bool:
+        """Ask the server whether it currently lists this host offline.
+
+        :returns: ``True`` only on a definite ``offline`` answer; errors and
+            any other response count as not offline.
+        """
+        try:
+            resp = httpx.get(
+                f"{self._server_url}/v1/hosts/{self._identity.host_id}",
+                headers=self._build_connect_headers(),
+                timeout=10.0,
+            )
+            return resp.status_code == 200 and resp.json().get("status") == "offline"
+        except Exception:  # noqa: BLE001
+            _logger.debug("host status self-check failed", exc_info=True)
+            return False
+
+    async def _server_status_monitor_loop(self) -> None:
+        """Reconnect when the server keeps listing this connected host offline.
+
+        Covers a server that recorded the host offline while still serving its
+        tunnel; nothing on the tunnel itself reveals that state.
+
+        :returns: None. Runs until cancelled.
+        """
+        offline_checks = 0
+        checked_ws: object | None = None
+        while True:
+            await asyncio.sleep(_SERVER_STATUS_CHECK_INTERVAL_S)
+            ws = self._ws
+            if ws is None or ws is not checked_ws:
+                offline_checks = 0
+                checked_ws = ws
+            if ws is None:
+                continue
+            if not await asyncio.to_thread(self._server_lists_host_offline):
+                offline_checks = 0
+                continue
+            offline_checks += 1
+            if offline_checks >= _SERVER_OFFLINE_CHECKS_TO_RECONNECT and self._ws is ws:
+                _logger.warning(
+                    "Server lists this host offline while its tunnel is up; reconnecting"
+                )
+                offline_checks = 0
+                self._abort_live_tunnel()
+
     def _abort_live_tunnel(self) -> None:
         """Abort the live tunnel transport, if any, to break the serve loop.
 
@@ -3997,6 +4048,15 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        # Managed sandbox hosts are set offline by the server's own lifecycle.
+        if not os.environ.get(HOST_TOKEN_ENV_VAR):
+            status_task = asyncio.create_task(
+                self._server_status_monitor_loop(), name="host-server-status-check"
+            )
+            self._watcher_tasks.add(status_task)
+            status_task.add_done_callback(self._watcher_tasks.discard)
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure

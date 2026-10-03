@@ -7512,6 +7512,107 @@ async def test_on_resume_from_suspend_aborts_live_tunnel() -> None:
     assert host._woke_from_suspend is True
 
 
+class _AbortRecorder:
+    """asyncio-transport stub that records an ``abort()``."""
+
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        """Record the forced close.
+
+        :returns: None.
+        """
+        self.aborted = True
+
+
+async def _run_status_monitor(
+    monkeypatch: pytest.MonkeyPatch, answers: list[bool]
+) -> tuple[_AbortRecorder, int]:
+    """Drive the status monitor over scripted offline answers.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param answers: Successive results of the offline self-check.
+    :returns: The transport stub and how many checks ran.
+    """
+    import omnigent.host.connect as connect_mod
+
+    monkeypatch.setattr(connect_mod, "_SERVER_STATUS_CHECK_INTERVAL_S", 0.0)
+    host = _make_host_process()
+    transport = _AbortRecorder()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+    remaining = list(answers)
+    calls = 0
+
+    def _check() -> bool:
+        nonlocal calls
+        calls += 1
+        if not remaining:
+            raise asyncio.CancelledError
+        return remaining.pop(0)
+
+    monkeypatch.setattr(host, "_server_lists_host_offline", _check)
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(host._server_status_monitor_loop(), timeout=2.0)
+    return transport, calls
+
+
+async def test_status_monitor_reconnects_after_consecutive_offline_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two consecutive "offline" answers abort the live tunnel to re-register.
+
+    :returns: None.
+    """
+    transport, _calls = await _run_status_monitor(monkeypatch, [True, True])
+
+    assert transport.aborted is True
+
+
+async def test_status_monitor_ignores_a_single_offline_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline answer followed by online resets the count; no reconnect.
+
+    :returns: None.
+    """
+    transport, calls = await _run_status_monitor(monkeypatch, [True, False, True])
+
+    assert calls == 4
+    assert transport.aborted is False
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (SimpleNamespace(status_code=200, json=lambda: {"status": "offline"}), True),
+        (SimpleNamespace(status_code=200, json=lambda: {"status": "online"}), False),
+        (SimpleNamespace(status_code=401, json=dict), False),
+        (OSError("unreachable"), False),
+    ],
+)
+def test_server_lists_host_offline_only_on_definite_answer(
+    monkeypatch: pytest.MonkeyPatch, response: object, expected: bool
+) -> None:
+    """Only a 200 with ``status == "offline"`` counts; errors never force a reconnect.
+
+    :returns: None.
+    """
+    import omnigent.host.connect as connect_mod
+
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+
+    def _get(*_args: object, **_kwargs: object) -> object:
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(connect_mod.httpx, "get", _get)
+
+    assert host._server_lists_host_offline() is expected
+
+
 async def test_on_resume_from_suspend_noop_without_live_tunnel() -> None:
     """With no live tunnel the resume hook does nothing and sets no flag.
 
