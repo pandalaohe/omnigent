@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +44,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -158,6 +159,10 @@ async def register_worktree_host(
         ref) and ``create_error`` (the failure message). Returns a
         ``_HostCapture`` whose ``.create`` / ``.remove`` lists accumulate
         the create- and remove-worktree frames the host received.
+        ``place_under_entry=True`` makes the fake host honor the frame's
+        ``entry`` the way a real host does, returning a path under
+        ``<entry>/.worktrees/<repo>/<branch>`` instead of the legacy
+        sibling location.
     """
     conns: list[HostConnection] = []
 
@@ -166,6 +171,7 @@ async def register_worktree_host(
         create_status: str = "ok",
         create_error: str | None = None,
         stat_fails_for: Callable[[str], bool] | None = None,
+        place_under_entry: bool = False,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
@@ -212,10 +218,17 @@ async def register_worktree_host(
                     if fut is not None and not fut.done():
                         if create_status == "ok":
                             dirname = frame.branch_name.replace("/", "-")
+                            if place_under_entry and frame.entry is not None:
+                                worktree_path = (
+                                    f"{frame.entry}/.worktrees/"
+                                    f"{Path(frame.repo_path).name}/{dirname}"
+                                )
+                            else:
+                                worktree_path = f"{frame.repo_path}-worktrees/{dirname}"
                             fut.set_result(
                                 {
                                     "status": "ok",
-                                    "worktree_path": f"{frame.repo_path}-worktrees/{dirname}",
+                                    "worktree_path": worktree_path,
                                     "branch": frame.branch_name,
                                     "error": None,
                                 }
@@ -621,3 +634,266 @@ async def test_create_rolls_back_worktree_on_canonicalize_failure(
     assert cap.remove[0].worktree_path == created_path
     assert cap.remove[0].branch == "feature/orphan"
     assert cap.remove[0].delete_branch is True
+
+
+async def _create_project_parent_session(
+    client: httpx.AsyncClient,
+    agent_id: str,
+) -> str:
+    """Create a plain (no-git) parent session filed in ``_PROJECT_ID``.
+
+    :param client: The test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: The new session's id, for use as ``parent_session_id``.
+    """
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent_id,
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def test_child_inherits_parent_project_entry_for_worktree_placement(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child create that names no project places its worktree under the
+    parent project's entry.
+
+    The child sends ``parent_session_id`` + ``git`` but no ``project_id``;
+    its worktree must still land at ``<entry>/.worktrees/<repo>/<branch>``
+    (the parent project's entry on the host), not the sibling fallback.
+    Placement only: the child's own launch directory stays its worktree, so
+    the response workspace and worktree are both the created path.
+    """
+    cap = register_worktree_host(place_under_entry=True)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-child-entry-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    # The host received the inherited entry; with no primary binding the
+    # entry itself is the source repo.
+    assert len(cap.create) == 1, cap.create
+    frame = cap.create[0]
+    assert frame.entry == _ENTRY
+    assert frame.repo_path == _ENTRY
+
+    # The child launches in its own worktree, not at the entry.
+    body = resp.json()
+    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
+    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+
+
+async def test_child_with_explicit_null_project_inherits_no_entry(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An explicit ``"project_id": null`` opts the child out of inheriting
+    the parent project's entry.
+
+    Field presence, not value, controls defaulting: the null stays explicit,
+    so the create resolves no parent project and the host frame carries no
+    entry (legacy sibling placement), exactly as before the inheritance fix.
+    """
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-child-null-project-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "project_id": None,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry is None
+
+
+async def test_explicit_project_create_keeps_entry_placement(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A create that names its project is unchanged by the inheritance fix.
+
+    The entry still reaches the host (the fake host places under it here),
+    and the launch-at-entry placement still applies: the session's workspace
+    is the entry and the created worktree is recorded separately.
+    """
+    cap = register_worktree_host(place_under_entry=True)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-explicit-entry-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry == _ENTRY
+
+    body = resp.json()
+    assert body["workspace"] == _ENTRY
+    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+
+
+async def test_child_of_project_without_entry_uses_sibling_placement(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A parent project with no entry row on the host inherits nothing.
+
+    The child's host frame carries no entry, so the worktree lands at the
+    legacy sibling location, exactly as before the inheritance fix.
+    """
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "No-entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs()
+    agent = await create_test_agent(client, name="wt-child-no-entry-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry is None
+
+
+async def test_child_inherited_checkout_outside_boundary_fails_400(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An inherited source checkout that fails validation refuses the create.
+
+    The parent project's primary binding names the repository a worktree
+    sources from; the caller's own workspace (the entry) never stood in for
+    it, so the swapped source is validated against the agent's boundary
+    first. A failure raises 400 invalid_input before any
+    ``host.create_worktree`` frame — no worktree, no session row.
+    """
+    binding_repo = "/Users/alice/other-repo"
+    cap = register_worktree_host(stat_fails_for=lambda path: path == binding_repo)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries=[(_HOST_ID, _ENTRY)],
+        bindings=[(_HOST_ID, binding_repo)],
+    )
+    agent = await create_test_agent(client, name="wt-child-bad-checkout-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert cap.create == [], f"expected no create_worktree frame, got {cap.create}"
+
+
+async def test_named_sub_agent_child_sends_no_entry(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A named sub-agent child is out of the inheritance fix's scope.
+
+    Its create takes the resolver's named-sub-agent early return, so even
+    with a parent filed in a project the host frame carries no entry —
+    today's behaviour, unchanged.
+    """
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+
+    parent = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"project_id": _PROJECT_ID})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="wt-named-parent", sub_agents=[{"name": "worker"}]),
+                "application/gzip",
+            )
+        },
+    )
+    assert parent.status_code == 201, parent.text
+    parent_id = parent.json()["session_id"]
+    parent_agent = await client.get(f"/v1/sessions/{parent_id}/agent")
+    assert parent_agent.status_code == 200, parent_agent.text
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent_agent.json()["id"],
+            "parent_session_id": parent_id,
+            "sub_agent_name": "worker",
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry is None

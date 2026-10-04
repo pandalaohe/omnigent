@@ -63,12 +63,20 @@ class ProjectCreateResolution:
         (no entry, no host, or the sandbox host).
     :param checkout: The repository a worktree would source from on the
         resolved host, or ``None``.
+    :param worktree_entry: Where a worktree this create cuts is placed —
+        the request's project's entry on the resolved host, or for a child
+        that names no project, its parent project's.
+    :param worktree_checkout: Where a worktree this create cuts is sourced —
+        the request's project's checkout on the resolved host, or for a
+        child that names no project, its parent project's.
     """
 
     body: Any
     project_id: str | None = None
     entry: str | None = None
     checkout: str | None = None
+    worktree_entry: str | None = None
+    worktree_checkout: str | None = None
 
 
 async def resolve_create_calling(
@@ -401,8 +409,30 @@ async def resolve_project_session_create(
         entry = next((row.workspace for row in entries if row.host_id == resolved_host_id), None)
         checkout = checkout_on_host(bindings, entries, resolved_host_id)
 
+    # Worktree placement and sourcing follow the request's project; a child
+    # that named no project inherits its parent project's instead, so its
+    # worktree still lands under the project's entry.
+    worktree_entry, worktree_checkout = entry, checkout
+    if (
+        project is None
+        and parent_project is not None
+        and resolved_host_id is not None
+        and resolved_host_id != "__sandbox__"
+    ):
+        p_bindings = await load_bindings(binding_store, parent_project.id)
+        p_entries = await load_entries(binding_store, parent_project.id)
+        worktree_entry = next(
+            (row.workspace for row in p_entries if row.host_id == resolved_host_id), None
+        )
+        worktree_checkout = checkout_on_host(p_bindings, p_entries, resolved_host_id)
+
     return ProjectCreateResolution(
-        body=resolved, project_id=project_id, entry=entry, checkout=checkout
+        body=resolved,
+        project_id=project_id,
+        entry=entry,
+        checkout=checkout,
+        worktree_entry=worktree_entry,
+        worktree_checkout=worktree_checkout,
     )
 
 
