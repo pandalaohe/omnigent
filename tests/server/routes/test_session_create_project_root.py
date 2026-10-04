@@ -969,8 +969,9 @@ async def test_git_create_sources_checkout_and_launches_in_the_worktree(
     assert body["workspace"] == created
     assert body["worktree"] == created
     assert body["git_branch"] == "feature/x"
-    # Only the picked directory meets the boundary; its worktree inherits the pass.
-    assert placement.validated == ["/entry"]
+    # The picked directory and the checkout meet the boundary; the worktree
+    # inherits the checkout's pass.
+    assert placement.validated == ["/entry", "/entry/fork/omnigent"]
 
 
 async def test_checkout_still_sources_with_collaboration_off(
@@ -1072,7 +1073,42 @@ async def test_created_worktree_outside_the_agent_boundary_still_launches(
     )
     assert response.status_code == 201, response.text
     assert response.json()["workspace"] == "/elsewhere/feature/x"
-    assert placement.validated == ["/entry"]
+    assert placement.validated == ["/entry", "/entry/fork/omnigent"]
+
+
+@pytest.mark.parametrize(
+    ("checkout", "allowed"),
+    [("/entry/fork/omnigent", True), ("/other/omnigent", False)],
+)
+async def test_project_checkout_meets_the_agent_boundary_before_the_cut(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    placement: _PlacementSeams,
+    checkout: str,
+    allowed: bool,
+) -> None:
+    """A create naming its project validates the checkout it swaps to.
+
+    The entry passes the agent's boundary; a checkout outside it is refused
+    before the host is asked to cut a worktree.
+    """
+    project_id = await _project(client, "place-checkout-scope", {"agent_id": AGENT_ID})
+    app.state.project_host_binding_store = Bindings(
+        [_binding(project_id, _HOST, checkout)],
+        [_entry(project_id, _HOST, "/entry")],
+    )
+    placement.allowed = "/entry"
+    response = await _post_create(
+        client, project_id, host_id=_HOST, git={"branch_name": "feature/x"}
+    )
+    assert placement.validated == ["/entry", checkout]
+    if allowed:
+        assert response.status_code == 201, response.text
+        assert placement.sources == [checkout]
+    else:
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "invalid_input"
+        assert placement.sources == []
 
 
 async def test_explicit_nested_workspace_without_git_launches_there(

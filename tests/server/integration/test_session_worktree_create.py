@@ -1017,6 +1017,43 @@ async def test_child_inherited_checkout_outside_boundary_fails_400(
     assert cap.create == [], f"expected no create_worktree frame, got {cap.create}"
 
 
+async def test_explicit_project_checkout_outside_boundary_fails_400(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A create naming its project validates the checkout it swaps to.
+
+    This is the body ``sys_session_open`` sends for ``branch``: the caller's
+    workspace is the entry, and the worktree would be cut from the
+    project's primary binding. A checkout that fails validation refuses the
+    create with 400 before any ``host.create_worktree`` frame.
+    """
+    binding_repo = "/Users/alice/other-repo"
+    cap = register_worktree_host(stat_fails_for=lambda path: path == binding_repo)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries=[(_HOST_ID, _ENTRY)],
+        bindings=[(_HOST_ID, binding_repo)],
+    )
+    agent = await create_test_agent(client, name="wt-explicit-bad-checkout-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert cap.create == [], f"expected no create_worktree frame, got {cap.create}"
+
+
 async def test_named_sub_agent_child_sends_no_entry(
     app: FastAPI,
     register_worktree_host: RegisterHost,

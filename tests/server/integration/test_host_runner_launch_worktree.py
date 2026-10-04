@@ -794,6 +794,60 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     assert conv.git_branch == "feature/x"
 
 
+@pytest.mark.parametrize(
+    ("checkout", "allowed"),
+    [(_CHECKOUT, True), ("/Users/alice/other/omnigent", False)],
+)
+async def test_launch_runner_checkout_meets_the_agent_boundary_before_the_cut(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    checkout: str,
+    allowed: bool,
+) -> None:
+    """A branch created with the entry picked validates the checkout it swaps to.
+
+    The entry passes the agent's boundary; a checkout outside it is refused
+    with 400 before any ``host.create_worktree`` frame.
+    """
+    from omnigent.server.routes import _workspace_validation
+
+    seen: list[str] = []
+
+    async def _validate(*, workspace: str, **kwargs: object) -> str:
+        seen.append(workspace)
+        if workspace != _ENTRY and not workspace.startswith(f"{_ENTRY}/"):
+            raise _workspace_validation.WorkspaceValidationError(
+                f"workspace '{workspace}' is outside the agent's required path"
+            )
+        return workspace
+
+    monkeypatch.setattr(_workspace_validation, "validate_workspace", _validate)
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries=[(_HOST_ID, _ENTRY)], bindings=[(_HOST_ID, checkout)]
+    )
+    session_id = await _project_session(client, db_uri)
+
+    response = await _launch(
+        client, session_id, workspace=_ENTRY, git={"branch_name": "feature/x"}
+    )
+
+    if allowed:
+        assert response.status_code == 200, response.text
+        assert [frame.repo_path for frame in cap.create] == [checkout]
+        # The created worktree is canonicalised through the same validator.
+        assert seen == [_ENTRY, checkout, f"{checkout}-worktrees/feature-x"]
+    else:
+        assert seen == [_ENTRY, checkout]
+        assert response.status_code == 400, response.text
+        assert "outside the agent's required path" in response.json()["detail"]
+        assert cap.create == []
+        assert cap.launch == []
+
+
 async def test_launch_runner_sends_the_entry_even_outside_it(
     app: FastAPI,
     register_host: RegisterHost,

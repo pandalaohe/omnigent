@@ -1463,6 +1463,28 @@ def create_hosts_router(
                         and same_canonical_path(workspace, entry)
                     ):
                         source_repo = checkout
+                        if (
+                            agent_store is not None
+                            and agent_cache is not None
+                            and not same_canonical_path(source_repo, workspace)
+                        ):
+                            # The checkout never passed the picked directory's
+                            # boundary check; run it before the host cuts from it.
+                            from omnigent.server.routes._workspace_validation import (
+                                WorkspaceValidationError,
+                                validate_workspace,
+                            )
+
+                            try:
+                                source_repo = await validate_workspace(
+                                    host_registry=host_registry,
+                                    host_id=host_id,
+                                    workspace=source_repo,
+                                    spec_cwd=spec_cwd,
+                                    host_name_for_errors=target.host.name,
+                                )
+                            except WorkspaceValidationError as exc:
+                                raise HTTPException(status_code=400, detail=exc.message) from exc
                     try:
                         worktree = await create_worktree_on_host(
                             host_registry=host_registry,

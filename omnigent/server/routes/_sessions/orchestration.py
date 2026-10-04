@@ -11715,13 +11715,10 @@ async def _create_session_from_existing_agent(
                 and same_canonical_path(canonical_workspace, project_resolution.worktree_entry)
             ):
                 source_repo = project_resolution.worktree_checkout
-                if project_resolution.entry is None and not same_canonical_path(
-                    source_repo, canonical_workspace
-                ):
-                    # A child that named no project inherited this checkout
-                    # from its parent project, so it never passed the caller's
-                    # workspace validation; check it against the agent's
-                    # boundary before the host cuts from it.
+                if not same_canonical_path(source_repo, canonical_workspace):
+                    # The checkout never passed the caller's workspace
+                    # validation; check it against the agent's boundary
+                    # before the host cuts from it.
                     assert body.host_id is not None
                     source_repo = await _validate_session_workspace(
                         user_id=user_id,
