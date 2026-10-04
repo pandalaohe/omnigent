@@ -88,7 +88,7 @@ describe("KeyboardShortcutEditor", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Open command palette" }),
     );
-    fireEvent.keyDown(window, { key: "n", code: "KeyN", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "n", code: "KeyN", ctrlKey: true, altKey: true });
 
     expect(screen.getByText(/already used by Start a new session/i)).toBeTruthy();
     expect(resolveShortcutBindings("commandPalette", "windows")).toEqual([

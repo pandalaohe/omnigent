@@ -18,7 +18,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -52,24 +52,24 @@ def _clean_succession_state() -> Iterator[None]:
             parent: set(children)
             for parent, children in runner_app._subagent_work_by_parent.items()
         },
-        dict(runner_app._subagent_retained_state_parents),
-        dict(runner_app._subagent_work_origins),
-        dict(runner_app._drained_delivered_subagent_results),
+        dict(subagent_work._subagent_retained_state_parents),
+        dict(subagent_work._subagent_work_origins),
+        dict(subagent_work._drained_delivered_subagent_results),
         dict(runner_app._child_session_parents),
         dict(runner_app._session_inboxes_ref),
-        dict(runner_app._succeeded_parents),
-        {new_id: list(items) for new_id, items in runner_app._held_successions.items()},
+        dict(subagent_work._succeeded_parents),
+        {new_id: list(items) for new_id, items in subagent_work._held_successions.items()},
         {session: dict(timers) for session, timers in runner_app._session_timers.items()},
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
-    runner_app._subagent_retained_state_parents.clear()
-    runner_app._subagent_work_origins.clear()
-    runner_app._drained_delivered_subagent_results.clear()
+    subagent_work._subagent_retained_state_parents.clear()
+    subagent_work._subagent_work_origins.clear()
+    subagent_work._drained_delivered_subagent_results.clear()
     runner_app._child_session_parents.clear()
     runner_app._session_inboxes_ref.clear()
-    runner_app._succeeded_parents.clear()
-    runner_app._held_successions.clear()
+    subagent_work._succeeded_parents.clear()
+    subagent_work._held_successions.clear()
     runner_app._session_timers.clear()
     try:
         yield
@@ -78,20 +78,20 @@ def _clean_succession_state() -> Iterator[None]:
         runner_app._subagent_work_by_child.update(saved[0])
         runner_app._subagent_work_by_parent.clear()
         runner_app._subagent_work_by_parent.update(saved[1])
-        runner_app._subagent_retained_state_parents.clear()
-        runner_app._subagent_retained_state_parents.update(saved[2])
-        runner_app._subagent_work_origins.clear()
-        runner_app._subagent_work_origins.update(saved[3])
-        runner_app._drained_delivered_subagent_results.clear()
-        runner_app._drained_delivered_subagent_results.update(saved[4])
+        subagent_work._subagent_retained_state_parents.clear()
+        subagent_work._subagent_retained_state_parents.update(saved[2])
+        subagent_work._subagent_work_origins.clear()
+        subagent_work._subagent_work_origins.update(saved[3])
+        subagent_work._drained_delivered_subagent_results.clear()
+        subagent_work._drained_delivered_subagent_results.update(saved[4])
         runner_app._child_session_parents.clear()
         runner_app._child_session_parents.update(saved[5])
         runner_app._session_inboxes_ref.clear()
         runner_app._session_inboxes_ref.update(saved[6])
-        runner_app._succeeded_parents.clear()
-        runner_app._succeeded_parents.update(saved[7])
-        runner_app._held_successions.clear()
-        runner_app._held_successions.update(saved[8])
+        subagent_work._succeeded_parents.clear()
+        subagent_work._succeeded_parents.update(saved[7])
+        subagent_work._held_successions.clear()
+        subagent_work._held_successions.update(saved[8])
         runner_app._session_timers.clear()
         runner_app._session_timers.update(saved[9])
 
@@ -132,7 +132,7 @@ async def test_succession_409_when_target_not_ready_changes_nothing(
 ) -> None:
     """The successor's runner must hold its inbox before any state moves."""
     runner_app._session_inboxes_ref[OLD_SESSION_ID] = asyncio.Queue()
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="reviewer",
@@ -148,9 +148,9 @@ async def test_succession_409_when_target_not_ready_changes_nothing(
         CHILD_SESSION_ID
     ]
     assert runner_app.list_subagent_work(NEW_SESSION_ID) == []
-    assert runner_app._succeeded_parents == {}
+    assert subagent_work._succeeded_parents == {}
     assert OLD_SESSION_ID in runner_app._session_inboxes_ref
-    assert NEW_SESSION_ID not in runner_app._held_successions
+    assert NEW_SESSION_ID not in subagent_work._held_successions
 
 
 @pytest.mark.asyncio
@@ -160,27 +160,27 @@ async def test_succession_rekeys_children_onto_new_parent(
     """Work entries for the moved children follow the successor."""
     runner_app._session_inboxes_ref[OLD_SESSION_ID] = asyncio.Queue()
     runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="reviewer",
         title="review",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=OTHER_CHILD_ID,
         agent="writer",
         title="draft",
     )
     drained_id = "conv_child_drained"
-    drained = runner_app.register_subagent_work(
+    drained = subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=drained_id,
         agent="drainer",
         title="drained",
     )
     drained.delivered = True
-    runner_app.unregister_subagent_work(drained_id, remember_drained_delivery=True)
+    subagent_work.unregister_subagent_work(drained_id, remember_drained_delivery=True)
     app, _server_client = _build_runner()
     async with _runner_client(app) as client:
         resp = await _post_succession(
@@ -196,7 +196,7 @@ async def test_succession_rekeys_children_onto_new_parent(
     assert runner_app.list_subagent_work(OLD_SESSION_ID) == []
     assert runner_app.get_subagent_work(CHILD_SESSION_ID) is not None
     assert runner_app.get_subagent_work(CHILD_SESSION_ID).parent_session_id == NEW_SESSION_ID
-    assert runner_app._subagent_retained_state_parents[drained_id] == NEW_SESSION_ID
+    assert subagent_work._subagent_retained_state_parents[drained_id] == NEW_SESSION_ID
 
 
 @pytest.mark.asyncio
@@ -208,13 +208,13 @@ async def test_moved_grandchild_work_stays_parented_by_its_own_parent(
     runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
     child_id = "conv_child_A"
     grandchild_id = "conv_grandchild_A1"
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=child_id,
         agent="reviewer",
         title="A",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=child_id,
         child_session_id=grandchild_id,
         agent="reviewer",
@@ -245,7 +245,7 @@ async def test_late_registration_after_succession_lands_under_new_parent(
         resp = await _post_succession(client, moved_ids=[])
     assert resp.status_code == 200
 
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="reviewer",
@@ -267,7 +267,7 @@ async def test_held_completion_is_delivered_once_by_release(
     runner_app._session_inboxes_ref[OLD_SESSION_ID] = asyncio.Queue()
     new_inbox = asyncio.Queue()
     runner_app._session_inboxes_ref[NEW_SESSION_ID] = new_inbox
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="reviewer",
@@ -289,7 +289,7 @@ async def test_held_completion_is_delivered_once_by_release(
 
         await asyncio.sleep(0.05)
         assert new_inbox.empty(), "a held completion reached the live inbox"
-        assert len(runner_app._held_successions[NEW_SESSION_ID]) == 1
+        assert len(subagent_work._held_successions[NEW_SESSION_ID]) == 1
         assert server_client.posts == [], "a held completion woke the successor"
 
         release = await client.post(f"/v1/sessions/{NEW_SESSION_ID}/succession/release")
@@ -329,7 +329,7 @@ async def test_old_inbox_items_move_to_held_then_release_in_order(
         resp = await _post_succession(client, moved_ids=[])
         assert resp.status_code == 200
         assert OLD_SESSION_ID not in runner_app._session_inboxes_ref
-        assert [item["seq"] for item in runner_app._held_successions[NEW_SESSION_ID]] == [1, 2]
+        assert [item["seq"] for item in subagent_work._held_successions[NEW_SESSION_ID]] == [1, 2]
         assert new_inbox.empty()
 
         release = await client.post(f"/v1/sessions/{NEW_SESSION_ID}/succession/release")
@@ -339,7 +339,7 @@ async def test_old_inbox_items_move_to_held_then_release_in_order(
         while not new_inbox.empty():
             drained.append(new_inbox.get_nowait())
         assert [item["seq"] for item in drained] == [1, 2]
-        assert NEW_SESSION_ID not in runner_app._held_successions
+        assert NEW_SESSION_ID not in subagent_work._held_successions
 
 
 @pytest.mark.asyncio
@@ -400,7 +400,7 @@ async def test_succession_repeat_is_idempotent(_clean_succession_state: None) ->
     """A repeated succession call re-applies nothing and drops nothing."""
     runner_app._session_inboxes_ref[OLD_SESSION_ID] = asyncio.Queue()
     runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=OLD_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="reviewer",
@@ -435,4 +435,4 @@ async def test_succession_repeat_after_release_does_not_hold_again(
         repeat = await _post_succession(client, moved_ids=[CHILD_SESSION_ID])
 
     assert repeat.status_code == 200
-    assert NEW_SESSION_ID not in runner_app._held_successions
+    assert NEW_SESSION_ID not in subagent_work._held_successions

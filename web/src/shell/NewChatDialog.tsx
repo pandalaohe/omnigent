@@ -143,6 +143,7 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -278,6 +279,7 @@ import {
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
+import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -2688,6 +2690,10 @@ export function NewChatLandingScreen() {
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // The runner picked during desktop onboarding, preselected once it's online.
+  const onboardingHost = useOnboardingRunnerHost(hosts);
+  // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
+  const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
@@ -3105,6 +3111,15 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     if (!prefillSettled) return;
     if (configProjectId !== null && projectHostRoots?.default_host_reason !== "none") return;
+    if (!onboardingHostSettled.current) {
+      if (onboardingHost.pending) return;
+      onboardingHostSettled.current = true;
+      if (onboardingHost.hostId && !sandboxSelected && selectedHostId === null) {
+        writeLastHostChoice(onboardingHost.hostId);
+        setSelectedHostId(onboardingHost.hostId);
+        return;
+      }
+    }
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
@@ -3156,6 +3171,8 @@ export function NewChatLandingScreen() {
     configProjectId,
     projectHostRoots,
     defaultSandboxProvider,
+    onboardingHost.pending,
+    onboardingHost.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -5131,7 +5148,7 @@ export function NewChatLandingScreen() {
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
-  const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(skillsHarness);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
@@ -5139,15 +5156,15 @@ export function NewChatLandingScreen() {
       ),
     [availableSkills, skillPrefix],
   );
-  // Selecting a skill fills "/name " and leaves the caret ready for the
-  // argument — skills never auto-execute from the menu.
+  // Insert the selected skill at the caret while preserving surrounding text.
   function applySlashSelection(cmd: string) {
-    setMessage(cmd + " ");
-    textareaRef.current?.focus();
+    setMessage(slashCompletion.complete(cmd).text);
   }
   const slashCompletion = useSlashCompletion({
     text: message,
     commands: skillCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobileViewport,
@@ -7046,7 +7063,12 @@ export function NewChatLandingScreen() {
               input={{
                 ref: textareaRef,
                 value: message,
+                onSelect: (e) => {
+                  slashCompletion.onSelectionChange(e.currentTarget);
+                  setTailCaret(e.currentTarget.selectionStart);
+                },
                 onChange: (e) => {
+                  slashCompletion.onSelectionChange(e.target);
                   setMessage(e.target.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
@@ -7070,7 +7092,6 @@ export function NewChatLandingScreen() {
                   // dictation inserts there instead of at the end of the draft.
                   dictation.noteFocus();
                 },
-                onSelect: (e) => setTailCaret(e.currentTarget.selectionStart),
                 onScroll: (e) => {
                   // Keep the overlay's scroll position locked to the textarea's.
                   if (backdropRef.current)
@@ -7174,7 +7195,8 @@ export function NewChatLandingScreen() {
                         query={slashCompletion.query}
                         activeIndex={slashCompletion.index}
                         onSelect={applySlashSelection}
-                        commands={skillCommands}
+                        commands={slashCompletion.commands}
+                        builtinNames={slashCompletion.builtinNames}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
@@ -7404,7 +7426,7 @@ export function NewChatLandingScreen() {
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}
                         <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          Local
+                          My machines
                         </div>
                         {allHosts.length === 0 && !showConnectThisMachine && (
                           <div className="px-2 py-1.5 text-sm text-muted-foreground">

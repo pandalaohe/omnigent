@@ -96,8 +96,18 @@ describe("keyboardShortcutPreferences", () => {
   });
 
   it("matches default primary shortcuts only on the selected platform", () => {
-    const commandN = new KeyboardEvent("keydown", { code: "KeyN", key: "n", metaKey: true });
-    const controlN = new KeyboardEvent("keydown", { code: "KeyN", key: "n", ctrlKey: true });
+    const commandN = new KeyboardEvent("keydown", {
+      code: "KeyN",
+      key: "n",
+      metaKey: true,
+      altKey: true,
+    });
+    const controlN = new KeyboardEvent("keydown", {
+      code: "KeyN",
+      key: "n",
+      ctrlKey: true,
+      altKey: true,
+    });
 
     expect(eventMatchesShortcutAction(commandN, "newSession", "macos")).toBe(true);
     expect(eventMatchesShortcutAction(controlN, "newSession", "macos")).toBe(false);

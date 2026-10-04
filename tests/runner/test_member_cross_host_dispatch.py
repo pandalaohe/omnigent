@@ -74,12 +74,13 @@ async def _dispatch(
         host / worktree lookups and captures the final work entry.
     """
     from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
     from omnigent.runner.tool_dispatch import execute_tool
 
     create_bodies: list[dict[str, Any]] = []
     calls: dict[str, Any] = {"host": 0, "worktree": 0, "work_status": None}
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -163,7 +164,7 @@ async def _dispatch(
             if keep_work:
                 calls["work_entry"] = work
             else:
-                runner_app.unregister_subagent_work(_CHILD_ID)
+                subagent_work.unregister_subagent_work(_CHILD_ID)
             runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
     return output, create_bodies, calls
 
@@ -314,6 +315,7 @@ async def test_continuation_to_an_existing_remote_child_is_marked_started(
     continuation marks the work started from the child's live session there.
     """
     from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
 
     try:
         output, bodies, calls = await _dispatch(
@@ -331,12 +333,12 @@ async def test_continuation_to_an_existing_remote_child_is_marked_started(
         assert entry.remote is True
         assert entry.host_id == _MEMBER_HOST
         assert (
-            runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
+            subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
             == []
         )
         assert runner_app.get_subagent_work(_CHILD_ID) is not None
     finally:
-        runner_app.unregister_subagent_work(_CHILD_ID)
+        subagent_work.unregister_subagent_work(_CHILD_ID)
         runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
 
 
@@ -376,6 +378,7 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
 ) -> None:
     """A by-session-id send to a remote child gets the same start proof."""
     from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
     from omnigent.runner.tool_dispatch import execute_tool
 
     child_id = "conv_child_remote_by_id"
@@ -413,7 +416,7 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
         return httpx.Response(404, json={"error": str(request.url)})
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
 
     try:
         async with httpx.AsyncClient(
@@ -436,11 +439,11 @@ async def test_by_id_continuation_of_a_remote_child_is_marked_started(
         assert entry.remote is True
         assert entry.host_id == _MEMBER_HOST
         assert (
-            runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
+            subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
             == []
         )
     finally:
-        runner_app.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work(child_id)
         runner_app._session_inboxes_ref.pop("conv_member_cross_host", None)
 
 
@@ -494,9 +497,9 @@ def _register_remote_work(
     host_id: str | None = _MEMBER_HOST,
 ) -> Any:
     """Register one started work entry directly in the runner registry."""
-    from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
 
-    entry = runner_app.register_subagent_work(
+    entry = subagent_work.register_subagent_work(
         parent_session_id="conv_member_cross_host",
         child_session_id=child_id,
         agent="worker",
@@ -504,7 +507,7 @@ def _register_remote_work(
         remote=remote,
         host_id=host_id,
     )
-    runner_app.mark_subagent_work_started(child_id)
+    subagent_work.mark_subagent_work_started(child_id)
     return entry
 
 
@@ -734,13 +737,14 @@ async def test_remote_member_liveness_leaves_a_replacement_dispatch_untouched(
 ) -> None:
     """A new dispatch for the same child during the read keeps its own outcome."""
     from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
 
     entry = _register_remote_work()
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     runner_app._session_inboxes_ref["conv_member_cross_host"] = inbox
 
     async def _replace() -> None:
-        runner_app.register_subagent_work(
+        subagent_work.register_subagent_work(
             parent_session_id="conv_member_cross_host",
             child_session_id=_CHILD_ID,
             agent="worker",
@@ -827,7 +831,7 @@ async def test_remote_member_check_interval_zero_disables_the_sweep(
 @pytest.mark.asyncio
 async def test_launch_reaper_runs_the_remote_member_check() -> None:
     """The sweep loop invokes the remote-member check each round."""
-    from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
 
     checked = asyncio.Event()
     calls: list[str] = []
@@ -837,7 +841,7 @@ async def test_launch_reaper_runs_the_remote_member_check() -> None:
         checked.set()
 
     sweep = asyncio.create_task(
-        runner_app.run_subagent_launch_reaper(interval_s=0.001, check_remote_members=_check)
+        subagent_work.run_subagent_launch_reaper(interval_s=0.001, check_remote_members=_check)
     )
     try:
         await asyncio.wait_for(checked.wait(), timeout=5)

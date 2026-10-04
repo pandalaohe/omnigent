@@ -285,11 +285,12 @@ async def test_steering_the_agents_running_child_joins_the_flow_before_the_post(
     server: _FakeServer, inbox: None
 ) -> None:
     from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
 
     child = "conv_child"
     server.sessions[child] = {"id": child, "parent_session_id": _SESSION, "labels": {}}
     # The agent's own send started the child's turn; the flow then steers that turn.
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=_SESSION, child_session_id=child, agent="a", title="t"
     )
     assert runner_app.mark_subagent_work_started(child) is not None

@@ -120,6 +120,14 @@ describe("settingsNavGroups", () => {
     expect(ids(true)).toContain("updates");
   });
 
+  it("places Desktop immediately after General", () => {
+    expect(settingsNavGroups(false, true).map((group) => group.title)).toEqual([
+      "General",
+      "Desktop",
+      "Archived",
+    ]);
+  });
+
   it("includes the Admin group (Members / Policies / Global instructions / System status / Sharing) for any admin, in accounts OR OIDC mode", () => {
     const ids = (accountsEnabled: boolean, isAdmin: boolean) =>
       settingsNavGroups(accountsEnabled, false, isAdmin)

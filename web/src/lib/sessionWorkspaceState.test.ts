@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   readInheritLastRightRailTab,
   readLastExplicitRightRailTab,
+  readLastExplicitRightRailTabOrNull,
   readSessionWorkspaceState,
   writeInheritLastRightRailTab,
   writeLastExplicitRightRailTab,
@@ -22,6 +23,20 @@ describe("sessionWorkspaceState", () => {
     expect(readLastExplicitRightRailTab()).toBe("files");
     writeLastExplicitRightRailTab("archive");
     expect(readLastExplicitRightRailTab()).toBe("archive");
+  });
+
+  it("ignores dynamic browser / side-chat tabs stored by older builds", () => {
+    // Pre-merge fork builds persisted the permanent Browser tab (and side-chat
+    // switches) through the same key, but neither is the user's own pick, so a
+    // stored soft tab must read as "never picked" — otherwise a new session
+    // opens on a tab the current nav no longer offers.
+    writeLastExplicitRightRailTab("browser");
+    expect(readLastExplicitRightRailTabOrNull()).toBeNull();
+    expect(readLastExplicitRightRailTab()).toBe("files");
+
+    writeLastExplicitRightRailTab("sidechat");
+    expect(readLastExplicitRightRailTabOrNull()).toBeNull();
+    expect(readLastExplicitRightRailTab()).toBe("files");
   });
 
   it("defaults new sessions to inheriting the last explicit tab and persists opt-out", () => {

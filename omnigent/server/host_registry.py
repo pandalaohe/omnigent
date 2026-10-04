@@ -42,6 +42,7 @@ from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     CAP_KEEP_WARM,
     HostHelloFrame,
+    HostMcpServersResultFrame,
     HostSkillsResultFrame,
 )
 
@@ -85,6 +86,26 @@ def _canonical_host_id(host_id: str) -> str:
         return uuid_to_bytes(host_id).hex()
     except InvalidUuidError:
         return host_id
+
+
+def _fail_pending_imports(conn: HostConnection) -> None:
+    """Fail the connection's in-flight import streams immediately.
+
+    A dead tunnel can never deliver another session frame; without this
+    signal the import request only learns of the drop by waiting out its
+    per-frame timeout (60s of "Importing…" in the UI).
+    """
+    while conn.pending_import_local:
+        _request_id, queue = conn.pending_import_local.popitem()
+        queue.put_nowait(
+            (
+                "done",
+                {
+                    "status": "failed",
+                    "error": f"host '{conn.host_id}' disconnected mid-import",
+                },
+            )
+        )
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -291,6 +312,7 @@ class HostConnection:
         host sends ``host.post_bind_hook_result``. Values carry
         ``status``, ``exit_code``, ``output`` and ``error``.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
+    :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
     """
 
     workspace_id: int
@@ -357,6 +379,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
+        default_factory=dict,
+    )
+    pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
         default_factory=dict,
     )
     # Import streams one session per frame, so the tunnel pushes each onto a
@@ -455,6 +480,7 @@ class HostRegistry:
                     host_id,
                 )
                 old.outbound_queue.put_nowait(None)
+                _fail_pending_imports(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -496,6 +522,7 @@ class HostRegistry:
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
+        _fail_pending_imports(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

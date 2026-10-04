@@ -58,6 +58,8 @@ interface FileViewerContextType {
    * against {@link workspaceRoot}. Null when unknown.
    */
   workspaceHome: string | null;
+  /** Host running the session, so desktop-only file actions can check it is this machine. */
+  sessionHostId?: string | null;
 }
 
 export const FileViewerContext = createContext<FileViewerContextType | null>(null);

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1554,7 +1555,7 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
-        inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
+        inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
@@ -1693,12 +1694,20 @@ class TerminalInstance:
 
         return {"status": "sent"}
 
-    async def read(self, scrollback: int = 0) -> TerminalResult:
-        """Capture the terminal screen."""
+    async def read(self, scrollback: int = 0, *, join_wrapped: bool = False) -> TerminalResult:
+        """Capture the terminal screen.
+
+        :param scrollback: Scrollback lines to include above the visible pane.
+        :param join_wrapped: Join lines the pane wrapped at its width back into
+            one line (``capture-pane -J``), so a long token such as a sign-in
+            address printed into an 80-column pane reads back whole.
+        """
         if not self.running:
             return {"error": "Terminal is not running"}
 
         args = ["capture-pane", "-t", self.tmux_target, "-p"]
+        if join_wrapped:
+            args.append("-J")
         if scrollback > 0:
             args.extend(["-S", f"-{scrollback}"])
 
@@ -2698,16 +2707,6 @@ class TerminalInstance:
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
         return proc.stdout.decode()
-
-
-def _shell_quote(s: str) -> str:
-    """Quote a string for shell use."""
-    if not s:
-        return "''"
-    # Simple quoting for common cases.
-    if re.match(r"^[a-zA-Z0-9_./:@=-]+$", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 @dataclass(frozen=True)

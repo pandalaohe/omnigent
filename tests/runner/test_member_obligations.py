@@ -21,7 +21,7 @@ import pytest
 
 from omnigent.member_snapshot import encode_member_entry, member_label_key, parse_role_mentions
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
@@ -723,7 +723,7 @@ async def _run_named_dispatch(
 
     monkeypatch.setattr(harness_install, "missing_harness_cli", lambda _harness: None)
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_joint_lead")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
 
     agent_spec = SimpleNamespace(
         sub_agents=[
@@ -780,7 +780,7 @@ async def _run_named_dispatch(
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app.unregister_subagent_work(child_id)
+            subagent_work.unregister_subagent_work(child_id)
             runner_app._session_inboxes_ref.pop(PARENT, None)
     return output, create_bodies
 
@@ -975,7 +975,7 @@ def _fast_wake_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _no_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(runner_app, "_wake_retry_sleep", _no_sleep)
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", _no_sleep)
 
 
 @pytest.mark.asyncio
@@ -1072,7 +1072,7 @@ async def test_child_failure_posts_the_notice_and_closes(
         runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
         runner_app.mark_member_obligation_met(PARENT, WORKER_ROLE, WORKER_CHILD)
         runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
-        runner_app.register_subagent_work(
+        subagent_work.register_subagent_work(
             parent_session_id=PARENT,
             child_session_id=WORKER_CHILD,
             agent=WORKER_ROLE,
@@ -1107,7 +1107,7 @@ async def test_child_completion_closes_without_a_notice(
         runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
         runner_app.mark_member_obligation_met(PARENT, WORKER_ROLE, WORKER_CHILD)
         runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
-        runner_app.register_subagent_work(
+        subagent_work.register_subagent_work(
             parent_session_id=PARENT,
             child_session_id=WORKER_CHILD,
             agent=WORKER_ROLE,
@@ -1147,7 +1147,7 @@ async def test_completed_child_upgrade_to_failed_still_notices(
         runner_app.record_member_obligation(PARENT, WORKER_ROLE, request_turn=1)
         runner_app.mark_member_obligation_met(PARENT, WORKER_ROLE, WORKER_CHILD)
         runner_app._session_inboxes_ref[PARENT] = asyncio.Queue()
-        runner_app.register_subagent_work(
+        subagent_work.register_subagent_work(
             parent_session_id=PARENT,
             child_session_id=WORKER_CHILD,
             agent=WORKER_ROLE,

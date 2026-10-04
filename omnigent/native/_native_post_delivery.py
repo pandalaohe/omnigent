@@ -183,6 +183,7 @@ async def post_external_session_status(
     response_id: str | None = None,
     replayed: bool = False,
     failure_detail: str | None = None,
+    turn_completed: bool | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -219,6 +220,11 @@ async def post_external_session_status(
         edge, e.g. ``"API Error: 500 Internal server error"``. Unlike
         ``output`` it keeps the harness-neutral failure code, and servers
         that predate it ignore it. Ignored when falsy.
+    :param turn_completed: Whether this ``"idle"`` edge reports a turn the
+        harness knows finished (e.g. Claude's ``Stop`` hook, which never fires
+        on an interrupt). ``True`` lets the runner deliver a sub-agent
+        ``completed`` as fact; ``None`` (the default) marks a quiescence-derived
+        edge that cannot distinguish "finished" from "stopped early".
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -234,6 +240,8 @@ async def post_external_session_status(
         data["response_id"] = response_id
     if replayed:
         data["replayed"] = True
+    if turn_completed is not None:
+        data["turn_completed"] = turn_completed
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

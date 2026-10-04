@@ -46,7 +46,7 @@ async def test_turn_recovers_native_pane_without_reacquiring_lifecycle_lock(
         registry._by_conversation[sid] = {(terminal, "main"): pane}
 
     created = AsyncMock(return_value=JSONResponse({"id": f"terminal_{terminal}_main"}))
-    monkeypatch.setattr("omnigent.runner.app._ensure_native_terminal", created)
+    monkeypatch.setattr("omnigent.runner.resource_routes._ensure_native_terminal", created)
     spec = AgentSpec(
         spec_version=1, name="test", executor=ExecutorSpec(config={"harness": harness})
     )
@@ -98,14 +98,16 @@ async def test_terminal_recovery_failure_settles_the_turn(
     stream: bool, failure: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sid = "c1b2c3d4e5f61234567890abcdef0123"
-    monkeypatch.setattr("omnigent.runner.app._NATIVE_TERMINAL_RECOVERY_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_routes._NATIVE_TERMINAL_RECOVERY_TIMEOUT_S", 0.01
+    )
 
     async def create_terminal(*args, **kwargs):
         if failure == "timeout":
             await asyncio.Event().wait()
         return JSONResponse({"error": "launch failed"}, status_code=503)
 
-    monkeypatch.setattr("omnigent.runner.app._ensure_native_terminal", create_terminal)
+    monkeypatch.setattr("omnigent.runner.resource_routes._ensure_native_terminal", create_terminal)
     spec = AgentSpec(
         spec_version=1, name="test", executor=ExecutorSpec(config={"harness": "goose-native"})
     )
@@ -154,7 +156,7 @@ async def test_codex_startup_can_be_cancelled_before_native_turn_exists(
         await release.wait()
         return JSONResponse({"id": "terminal_codex_main"})
 
-    monkeypatch.setattr("omnigent.runner.app._ensure_native_terminal", create_terminal)
+    monkeypatch.setattr("omnigent.runner.resource_routes._ensure_native_terminal", create_terminal)
     spec = AgentSpec(
         spec_version=1, name="test", executor=ExecutorSpec(config={"harness": "codex-native"})
     )

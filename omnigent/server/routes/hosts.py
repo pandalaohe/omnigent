@@ -1386,6 +1386,9 @@ def create_hosts_router(
             _entry_within_boundary if entry is not None else None
         )
         placed_worktree: str | None = None
+        # Canonical root of a just-created worktree, recorded as the session
+        # worktree; ``None`` unless this request created one below.
+        worktree_root: str | None = None
 
         git_branch: str | None = None
         worktree = None
@@ -1427,7 +1430,25 @@ def create_hosts_router(
                 ),
             )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
-            await _rollback_worktree()
+            try:
+                if worktree is not None or (body.git is not None and body.git.existing_worktree):
+                    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+                    previous_root = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    if previous_root is None:
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            body.session_id,
+                            {WORKTREE_ROOT_LABEL_KEY: previous_root},
+                        )
+            finally:
+                await _rollback_worktree()
 
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
@@ -1487,8 +1508,21 @@ def create_hosts_router(
                     try:
                         workspace = await _canonical_worktree_path(
                             host_id=host_id,
-                            worktree_path=worktree.worktree_path,
+                            worktree_path=worktree.workspace or worktree.worktree_path,
                             request=request,
+                        )
+                        # The recorded worktree is the canonical ROOT: the
+                        # launch may relocate into a subdirectory of the new
+                        # worktree, while delete cleanup, sharer checks and
+                        # git readers key on the root.
+                        worktree_root = (
+                            await _canonical_worktree_path(
+                                host_id=host_id,
+                                worktree_path=worktree.worktree_path,
+                                request=request,
+                            )
+                            if worktree.workspace is not None
+                            else workspace
                         )
                     except BaseException:
                         await _rollback_worktree()
@@ -1503,6 +1537,7 @@ def create_hosts_router(
                     target=workspace,
                     git_used=body.git is not None,
                     entry_boundary=entry_boundary,
+                    worktree_root=worktree_root,
                 )
                 # Placement of a given target always yields a directory.
                 workspace = placed_workspace or workspace
@@ -1532,8 +1567,41 @@ def create_hosts_router(
                     status_code=400,
                     detail="session already has a runner bound",
                 )
-            persist_task = asyncio.create_task(
-                asyncio.to_thread(
+
+            async def persist_binding() -> None:
+                """Record cleanup identity before making the new binding visible."""
+                if worktree is not None:
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        worktree_root_fingerprint,
+                    )
+
+                    # Fingerprint the canonical root the session records, not
+                    # the raw host path: delete cleanup recovers the root from
+                    # recorded ancestors and misses when the two differ.
+                    root = worktree_root or worktree.worktree_path
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        body.session_id,
+                        {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)},
+                    )
+                elif body.git is not None and body.git.existing_worktree:
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        recorded_worktree_root,
+                    )
+
+                    fingerprint = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    if (
+                        fingerprint is not None
+                        and recorded_worktree_root(workspace, fingerprint) is None
+                    ):
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        )
+                await asyncio.to_thread(
                     conversation_store.set_host_id,
                     body.session_id,
                     host_id,
@@ -1541,7 +1609,8 @@ def create_hosts_router(
                     git_branch,
                     placed_worktree,
                 )
-            )
+
+            persist_task = asyncio.create_task(persist_binding())
             try:
                 await asyncio.shield(persist_task)
             except BaseException as exc:

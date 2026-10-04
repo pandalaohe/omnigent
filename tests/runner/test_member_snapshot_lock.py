@@ -103,11 +103,12 @@ async def _dispatch(
     :returns: ``(tool_output, create_bodies)``.
     """
     from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
     from omnigent.runner.tool_dispatch import execute_tool
 
     create_bodies: list[dict[str, Any]] = []
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -157,7 +158,7 @@ async def _dispatch(
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app.unregister_subagent_work("conv_child_member")
+            subagent_work.unregister_subagent_work("conv_child_member")
             runner_app._session_inboxes_ref.pop(conv_id, None)
     return output, create_bodies
 

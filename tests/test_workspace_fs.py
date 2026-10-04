@@ -88,6 +88,20 @@ def test_read_text_file_returns_utf8_content(tmp_path: Path) -> None:
     assert result["content"] == "# Title\nbody\n"
 
 
+def test_read_text_file_has_no_agent_line_cap(tmp_path: Path) -> None:
+    """Host fallback serves the full file even when it exceeds 2,000 lines."""
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
+    (tmp_path / "large.py").write_text(content, encoding="utf-8")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("large.py")
+
+    assert result["truncated"] is False
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == content
+    assert result["bytes"] == len(content.encode("utf-8"))
+
+
 def test_read_binary_file_returns_base64(tmp_path: Path) -> None:
     """Reading a non-UTF-8 file returns base64-encoded content.
 
@@ -103,17 +117,14 @@ def test_read_binary_file_returns_base64(tmp_path: Path) -> None:
 
 
 def test_read_raw_returns_text_past_default_line_cap(tmp_path: Path) -> None:
-    """``raw=True`` returns a whole text file, not the default 2000-line cap.
+    """``raw=True`` still returns a whole text file past 2000 lines.
 
-    A bundle response must carry the file as written; the line cap would
+    A bundle response must carry the file as written; a line cap would
     silently cut an HTML page off mid-document.
     """
     lines = [f"line {i}\n" for i in range(2501)]
     (tmp_path / "long.txt").write_text("".join(lines))
     reader = WorkspaceReader(tmp_path)
-
-    capped = reader.list_or_read("long.txt")
-    assert capped["truncated"] is True
 
     whole = reader.list_or_read("long.txt", raw=True)
     assert whole["truncated"] is False

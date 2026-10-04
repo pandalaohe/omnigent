@@ -55,7 +55,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     label: "Start a new session",
     group: "general",
     scope: "global",
-    defaultBindings: [chord("KeyN", ["primary"])],
+    defaultBindings: [chord("KeyN", ["primary", "alt"])],
   },
   commandPalette: {
     id: "commandPalette",

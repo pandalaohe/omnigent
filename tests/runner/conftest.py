@@ -20,6 +20,7 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
+from omnigent.terminals import TerminalRegistry
 from tests.conftest import _TEST_OMNIGENT_DATA_DIR
 from tests.runner.helpers import NullServerClient
 
@@ -128,48 +129,48 @@ def _clean_subagent_registry() -> Iterator[None]:
     """Snapshot and restore the process-wide sub-agent / inbox maps.
 
     The sub-agent work registry and inbox queues live in module-level dicts on
-    ``omnigent.runner.app`` that otherwise leak across tests. Clear them before
-    the test and restore the originals after.
+    ``omnigent.runner.subagent_work`` that otherwise leak across tests. Clear
+    them before the test and restore the originals after.
     """
-    from omnigent.runner import app as runner_app
+    from omnigent.runner import subagent_work
 
     saved = (
-        dict(runner_app._subagent_work_by_child),
-        {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
-        dict(runner_app._session_inboxes_ref),
-        dict(runner_app._drained_delivered_subagent_results),
-        set(runner_app._subagent_recovery_done),
-        dict(runner_app._subagent_recovery_locks),
-        dict(runner_app._subagent_work_origins),
-        dict(runner_app._subagent_retained_state_parents),
+        dict(subagent_work._subagent_work_by_child),
+        {k: set(v) for k, v in subagent_work._subagent_work_by_parent.items()},
+        dict(subagent_work._session_inboxes_ref),
+        dict(subagent_work._drained_delivered_subagent_results),
+        set(subagent_work._subagent_recovery_done),
+        dict(subagent_work._subagent_recovery_locks),
+        dict(subagent_work._subagent_work_origins),
+        dict(subagent_work._subagent_retained_state_parents),
     )
-    runner_app._subagent_work_by_child.clear()
-    runner_app._subagent_work_by_parent.clear()
-    runner_app._session_inboxes_ref.clear()
-    runner_app._drained_delivered_subagent_results.clear()
-    runner_app._subagent_recovery_done.clear()
-    runner_app._subagent_recovery_locks.clear()
-    runner_app._subagent_work_origins.clear()
-    runner_app._subagent_retained_state_parents.clear()
+    subagent_work._subagent_work_by_child.clear()
+    subagent_work._subagent_work_by_parent.clear()
+    subagent_work._session_inboxes_ref.clear()
+    subagent_work._drained_delivered_subagent_results.clear()
+    subagent_work._subagent_recovery_done.clear()
+    subagent_work._subagent_recovery_locks.clear()
+    subagent_work._subagent_work_origins.clear()
+    subagent_work._subagent_retained_state_parents.clear()
     try:
         yield
     finally:
-        runner_app._subagent_work_by_child.clear()
-        runner_app._subagent_work_by_child.update(saved[0])
-        runner_app._subagent_work_by_parent.clear()
-        runner_app._subagent_work_by_parent.update(saved[1])
-        runner_app._session_inboxes_ref.clear()
-        runner_app._session_inboxes_ref.update(saved[2])
-        runner_app._drained_delivered_subagent_results.clear()
-        runner_app._drained_delivered_subagent_results.update(saved[3])
-        runner_app._subagent_recovery_done.clear()
-        runner_app._subagent_recovery_done.update(saved[4])
-        runner_app._subagent_recovery_locks.clear()
-        runner_app._subagent_recovery_locks.update(saved[5])
-        runner_app._subagent_work_origins.clear()
-        runner_app._subagent_work_origins.update(saved[6])
-        runner_app._subagent_retained_state_parents.clear()
-        runner_app._subagent_retained_state_parents.update(saved[7])
+        subagent_work._subagent_work_by_child.clear()
+        subagent_work._subagent_work_by_child.update(saved[0])
+        subagent_work._subagent_work_by_parent.clear()
+        subagent_work._subagent_work_by_parent.update(saved[1])
+        subagent_work._session_inboxes_ref.clear()
+        subagent_work._session_inboxes_ref.update(saved[2])
+        subagent_work._drained_delivered_subagent_results.clear()
+        subagent_work._drained_delivered_subagent_results.update(saved[3])
+        subagent_work._subagent_recovery_done.clear()
+        subagent_work._subagent_recovery_done.update(saved[4])
+        subagent_work._subagent_recovery_locks.clear()
+        subagent_work._subagent_recovery_locks.update(saved[5])
+        subagent_work._subagent_work_origins.clear()
+        subagent_work._subagent_work_origins.update(saved[6])
+        subagent_work._subagent_retained_state_parents.clear()
+        subagent_work._subagent_retained_state_parents.update(saved[7])
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:
@@ -482,6 +483,20 @@ async def _spec_resolver_returning(spec: AgentSpec) -> Any:
         return spec
 
     return _resolve
+
+
+async def _build_app_for_spec(
+    spec: AgentSpec, *, terminal_registry: TerminalRegistry | None = None
+) -> tuple[FastAPI, _FakeProcessManager]:
+    """Build the real runner app with an idle harness and one fixed agent spec."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    return app, pm
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -937,7 +952,7 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _record(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
+    monkeypatch.setattr("omnigent.runner.subagent_work._wake_retry_sleep", _record)
     return recorded
 
 

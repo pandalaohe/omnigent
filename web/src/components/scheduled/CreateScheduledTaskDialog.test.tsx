@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 // Tests for the manual create dialog: submit stays disabled until the required
 // fields are filled, the workspace-without-host pairing rule surfaces inline,
 // and a valid submit calls the create mutation with the RRULE built from the
@@ -101,14 +102,12 @@ vi.mock("@/shell/NewChatDialog", () => ({
         type="button"
         data-testid="pick-harness-claude"
         onClick={() =>
-          onSelectAgent({
-            id: "ag_claude_native",
-            name: "claude-native-ui",
-            display_name: "Claude Code",
-            description: null,
-            harness: "claude-native",
-            skills: [],
-          })
+          onSelectAgent(
+            testAgent("ag_claude_native", "claude-native-ui", {
+              display_name: "Claude Code",
+              harness: "claude-native",
+            }),
+          )
         }
       >
         pick claude harness
@@ -117,14 +116,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
         type="button"
         data-testid="pick-agent-polly"
         onClick={() =>
-          onSelectAgent({
-            id: "ag_1",
-            name: "polly",
-            display_name: "Polly",
-            description: null,
-            harness: "claude-sdk",
-            skills: [],
-          })
+          onSelectAgent(
+            testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+          )
         }
       >
         pick polly
@@ -180,30 +174,12 @@ vi.mock("@/lib/nativeCodingAgents", async (orig) => {
 });
 
 const AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_1",
-    name: "polly",
-    display_name: "Polly",
-    description: null,
-    harness: "claude-sdk",
-    skills: [],
-  },
-  {
-    id: "ag_claude_native",
-    name: "claude-native-ui",
+  testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+  testAgent("ag_claude_native", "claude-native-ui", {
     display_name: "Claude Code",
-    description: null,
     harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "ag_codex",
-    name: "codex-agent",
-    display_name: "Codex agent",
-    description: null,
-    harness: "codex",
-    skills: [],
-  },
+  }),
+  testAgent("ag_codex", "codex-agent", { display_name: "Codex agent", harness: "codex" }),
 ];
 
 // A saved multi-member Agent. The roster is deliberately not lead-first so the
@@ -361,24 +337,16 @@ describe("agent picker readiness (needs-setup badges)", () => {
     vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
       data: [
         ...AGENTS,
-        {
-          id: "ag_jcode",
-          name: "jcode",
+        testAgent("ag_jcode", "jcode", {
           display_name: "Jcode",
-          description: null,
           harness: "jcode",
-          skills: [],
           acpHarness: true,
-        },
-        {
-          id: "ag_grok",
-          name: "grok",
+        }),
+        testAgent("ag_grok", "grok", {
           display_name: "Grok Build",
-          description: null,
           harness: "grok",
-          skills: [],
           acpHarness: true,
-        },
+        }),
       ],
     } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
 

@@ -10,13 +10,14 @@ import {
   isShortcutRecordingActive,
 } from "@/lib/keyboardShortcutPreferences";
 
-/** True for Cmd+N on Apple platforms or Ctrl+N elsewhere, without extra modifiers. */
+/** True for Cmd+Alt+N on Apple platforms or Ctrl+Alt+N elsewhere. */
 export function isNewSessionHotkey(e: globalThis.KeyboardEvent, isMac = isMacPlatform()): boolean {
   if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("newSession")) return false;
   if (!hasCustomShortcutBindings("newSession")) {
-    if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return false;
-    return e.key === "n" || e.key === "N";
+    if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return false;
+    // Match the physical key because Alt can remap the typed character.
+    return e.code === "KeyN";
   }
   return eventMatchesShortcutAction(e, "newSession");
 }

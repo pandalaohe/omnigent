@@ -16,7 +16,7 @@ import io
 import json
 import tarfile
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -247,6 +247,23 @@ def _arm_member_host(hosts: HostStore) -> None:
     hosts.upsert_on_connect(_MEMBER_HOST, "member-worker-laptop", _USER)
 
 
+def _member_snapshot_reads(monkeypatch: pytest.MonkeyPatch, replacement: object) -> None:
+    """Route the member-snapshot phase through *replacement* host store.
+
+    Upstream #8675's create-time readiness check reads the app's registered
+    host first; these tests pin the snapshot's own host-store behaviour after
+    it, so only the snapshot call is given the replacement.
+    """
+    from omnigent.server.routes.sessions import routes_core
+
+    real = routes_core._member_snapshot_labels
+
+    async def _snapshot(spec: object, *, host_store: object, **kwargs: object) -> object:
+        return await real(spec, host_store=replacement, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(routes_core, "_member_snapshot_labels", _snapshot)
+
+
 def _stub_member_catalogs(
     monkeypatch: pytest.MonkeyPatch,
     table: dict[tuple[str, str], list[dict[str, object]]],
@@ -458,10 +475,11 @@ async def test_host_store_failure_still_writes_labels_without_availability(
     """A raising host store degrades to missing facts, never a failed create."""
     _arm_host(member_server.hosts)
 
-    def _broken_get_host(_host_id: str) -> None:
-        raise RuntimeError("host store down")
+    class _BrokenHostStore:
+        def get_host(self, _host_id: str) -> None:
+            raise RuntimeError("host store down")
 
-    monkeypatch.setattr(member_server.hosts, "get_host", _broken_get_host)
+    _member_snapshot_reads(monkeypatch, _BrokenHostStore())
 
     entries = await _member_labels_after_create(member_server, joint_bundle())
 
@@ -580,9 +598,18 @@ async def test_offline_host_marks_every_member_host_offline(
 
 @pytest.mark.asyncio
 async def test_unknown_host_marks_members_host_offline(
-    member_server: _MemberServer,
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A host row that was never registered counts as not live."""
+    """A host row the snapshot cannot read counts as not live."""
+    # Readiness resolves the registered host first; the snapshot sees none.
+    _arm_host(member_server.hosts)
+
+    class _UnknownHostStore:
+        def get_host(self, _host_id: str) -> None:
+            return None
+
+    _member_snapshot_reads(monkeypatch, _UnknownHostStore())
+
     entries = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries["researcher"]["unavailable"] == "host_offline"
@@ -590,14 +617,24 @@ async def test_unknown_host_marks_members_host_offline(
 
 @pytest.mark.asyncio
 async def test_unconfigured_harness_maps_false_to_reason_code(
-    member_server: _MemberServer,
+    member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``False`` readiness becomes ``harness_not_configured``; a reported string
     reason is stored as-is."""
-    _arm_host(
-        member_server.hosts,
-        configured_harnesses={"codex": False, "claude-sdk": "binary-missing"},
+    # Readiness must pass on the registered host; the snapshot then reads the
+    # reported-harness map below.
+    _arm_host(member_server.hosts)
+    host = member_server.hosts.get_host(_HOST_ID)
+    assert host is not None
+    snapshot_host = replace(
+        host, configured_harnesses={"codex": False, "claude-sdk": "binary-missing"}
     )
+
+    class _ConfiguredHarnessStore:
+        def get_host(self, _host_id: str) -> object:
+            return snapshot_host
+
+    _member_snapshot_reads(monkeypatch, _ConfiguredHarnessStore())
 
     entries = await _member_labels_after_create(member_server, joint_bundle())
 
@@ -636,8 +673,11 @@ async def test_explicit_model_missing_from_catalog_is_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_member_label_key_over_cap_is_a_400(client: httpx.AsyncClient) -> None:
+async def test_member_label_key_over_cap_is_a_400(
+    member_server: _MemberServer, client: httpx.AsyncClient
+) -> None:
     """A role whose label key exceeds 128 chars is rejected, never truncated."""
+    _arm_host(member_server.hosts)
     role = "r" * 113
     response = await _create(client, joint_bundle(worker_name=role), expect=400)
 
@@ -646,8 +686,11 @@ async def test_member_label_key_over_cap_is_a_400(client: httpx.AsyncClient) -> 
 
 
 @pytest.mark.asyncio
-async def test_member_label_value_over_cap_is_a_400(client: httpx.AsyncClient) -> None:
+async def test_member_label_value_over_cap_is_a_400(
+    member_server: _MemberServer, client: httpx.AsyncClient
+) -> None:
     """A member value over the 256-char label cap is a 400 naming the role."""
+    _arm_host(member_server.hosts)
     response = await _create(client, joint_bundle(worker_model="m" * 240), expect=400)
 
     body = response.json()

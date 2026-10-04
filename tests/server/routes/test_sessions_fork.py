@@ -1305,6 +1305,45 @@ async def test_fork_switch_drops_claude_permission_mode_label() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fork_switch_drops_member_snapshot_labels() -> None:
+    """An agent switch drops every ``omnigent.member.*`` snapshot label.
+
+    The frozen member roster belongs to the source agent (g2-D2); carrying it
+    onto a fork bound to another agent would lock members the target's spec
+    never declared.
+    """
+    conv = _make_conversation(
+        labels={
+            "omnigent.member.researcher": "{}",
+            "omnigent.member.custom-reviewer": "{}",
+            "omnigent.ui": "terminal",
+        }
+    )
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
+    )
+    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    )
+
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    dropped = conv_store.fork_calls[0]["dropped_label_keys"]
+    assert {
+        "omnigent.member.researcher",
+        "omnigent.member.custom-reviewer",
+    } <= set(dropped)
+    assert "omnigent.ui" not in dropped
+
+
+@pytest.mark.asyncio
 async def test_fork_same_agent_keeps_permission_mode_label() -> None:
     """A same-agent fork with no explicit launch args drops NO mode labels.
 

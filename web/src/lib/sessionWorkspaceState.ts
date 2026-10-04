@@ -18,6 +18,11 @@ const RAIL_TABS: readonly RightRailTab[] = [
   "sidechat",
 ];
 
+// Dynamic soft-tab modes, never the user's own nav pick, so a value stored by
+// an older build that wrote them reads as "never picked" (mirrors AppShell's
+// write-side guard).
+const SOFT_RAIL_TABS: readonly RightRailTab[] = ["browser", "sidechat"];
+
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
@@ -66,7 +71,8 @@ function isRailTab(value: unknown): value is RightRailTab {
 export function readLastExplicitRightRailTabOrNull(): RightRailTab | null {
   if (typeof window === "undefined") return null;
   const value = window.localStorage.getItem(LAST_EXPLICIT_TAB_KEY);
-  return isRailTab(value) ? value : null;
+  if (!isRailTab(value) || SOFT_RAIL_TABS.includes(value)) return null;
+  return value;
 }
 
 export function readLastExplicitRightRailTab(): RightRailTab {

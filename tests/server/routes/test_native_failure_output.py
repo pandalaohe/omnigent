@@ -1,4 +1,4 @@
-"""A failed native turn must not reuse a previous turn's assistant reply."""
+"""Failed or cancelled native turns must not reuse a previous assistant reply."""
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.stores.conversation_store import ConversationStore
 
-# Fork mod: a terminal edge always carries an output. Where upstream leaves the
-# key absent, this fork substitutes a status-shaped placeholder — so "did not
-# report an old success" is asserted as "reported the placeholder", not as
-# "reported nothing".
+# Fork mod: a failed/stopped/killed terminal edge always carries an output.
+# Where upstream leaves the key absent, this fork substitutes a status-shaped
+# placeholder — so "did not report an old success" is asserted as "reported the
+# placeholder", except for a cancelled idle, which has no idle fallback and
+# reports nothing.
 _FAILED_FALLBACK = TERMINAL_STATUS_FALLBACK_OUTPUTS["failed"]
 
 
@@ -45,9 +46,14 @@ async def _enrich(data: dict, items: list[ConversationItem]) -> dict:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [{"status": "failed"}, {"status": "idle", "turn_outcome": "cancelled"}]
+)
 @pytest.mark.parametrize("response_id", [None, "resp_new"])
-async def test_failed_turn_does_not_report_an_old_success(response_id: str | None) -> None:
-    data = {"status": "failed"}
+async def test_failed_turn_does_not_report_an_old_success(
+    response_id: str | None, status: dict
+) -> None:
+    data = dict(status)
     if response_id is not None:
         data["response_id"] = response_id
     result = await _enrich(
@@ -57,16 +63,27 @@ async def test_failed_turn_does_not_report_an_old_success(response_id: str | Non
             _message("assistant", "The previous task succeeded.", "resp_old"),
         ],
     )
-    assert result["output"] == _FAILED_FALLBACK
+    if status.get("turn_outcome") == "cancelled":
+        # Cancelled-idle carries no fallback: the turn stopped before output.
+        assert "output" not in result
+    else:
+        assert result["output"] == _FAILED_FALLBACK
 
 
 @pytest.mark.asyncio
-async def test_response_id_prevents_reusing_an_old_reply_without_a_user_item() -> None:
+@pytest.mark.parametrize(
+    "status", [{"status": "failed"}, {"status": "idle", "turn_outcome": "cancelled"}]
+)
+async def test_response_id_prevents_reusing_an_old_reply_without_a_user_item(status: dict) -> None:
     result = await _enrich(
-        {"status": "failed", "response_id": "resp_new"},
+        {**status, "response_id": "resp_new"},
         [_message("assistant", "Previous reply", "resp_old")],
     )
-    assert result["output"] == _FAILED_FALLBACK
+    if status.get("turn_outcome") == "cancelled":
+        # Cancelled-idle carries no fallback: the turn stopped before output.
+        assert "output" not in result
+    else:
+        assert result["output"] == _FAILED_FALLBACK
 
 
 @pytest.mark.asyncio
@@ -82,9 +99,12 @@ async def test_failed_turn_selects_its_own_detail_after_a_later_reply() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_failure_keeps_current_reply_and_ignores_meta_messages() -> None:
+@pytest.mark.parametrize(
+    "status", [{"status": "failed"}, {"status": "idle", "turn_outcome": "cancelled"}]
+)
+async def test_legacy_failure_keeps_current_reply_and_ignores_meta_messages(status: dict) -> None:
     result = await _enrich(
-        {"status": "failed"},
+        status,
         [
             _message("user", "Internal notice", "resp_meta", is_meta=True),
             _message("assistant", "Provider rejected this turn", "resp_current"),

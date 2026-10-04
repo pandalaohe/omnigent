@@ -618,6 +618,11 @@ def calling_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         location = f"{agent_id}/bundle"
         artifacts.put(location, _harness_bundle(harness))
         agents.create(agent_id, f"calling-{harness}", location)
+    hosts = HostStore(db_uri)
+    # Upstream #8675's create-time readiness check resolves the host first, so
+    # the hosts these tests create sessions on must be registered.
+    hosts.upsert_on_connect(HDS, "hds", ALICE)
+    hosts.upsert_on_connect(TMB, "tmb", ALICE)
     app = create_app(
         agent_store=agents,
         file_store=SqlAlchemyFileStore(db_uri),
@@ -626,7 +631,7 @@ def calling_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
         permission_store=SqlAlchemyPermissionStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri),
-        host_store=HostStore(db_uri),
+        host_store=hosts,
         host_model_catalog_cache_store=HostModelCatalogCacheStore(db_uri),
         user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
@@ -969,7 +974,8 @@ async def test_child_without_default_names_the_project_setting(
     )
     assert child.status_code == 400, child.text
     message = child.json()["error"]["message"]
-    assert f"has no default agent on host '{HDS}'" in message
+    # The fixture registers the host, so the error names its friendly host name.
+    assert "has no default agent on host 'hds'" in message
     assert "Pass agent_id" in message
 
 

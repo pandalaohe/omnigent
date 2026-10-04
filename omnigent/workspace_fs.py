@@ -44,7 +44,6 @@ from omnigent.artifact_paths import resolved_within
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
-from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
 from omnigent.runner import github_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -145,8 +144,8 @@ class WorkspaceReader:
         :param after: Forward-pagination cursor entry id.
         :param before: Backward-pagination cursor entry id.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
-        :param raw: Return a file whole, without the line cap; the byte cap
-            and ``truncated`` flag stay as they are. Ignored for a listing.
+        :param raw: Accepted from older callers; files are always returned
+            whole up to the byte cap, so it changes nothing.
         :param within: Bundle root (relative to the workspace, ``""`` for the
             workspace root) the file must resolve strictly inside, passing
             the bundle name rules; anything else is a 404. A directory
@@ -154,6 +153,7 @@ class WorkspaceReader:
         :returns: A directory-listing dict or a file-content dict.
         :raises WorkspaceReaderError: On invalid path or missing file.
         """
+        del raw
         resolved = self._resolve(path)
         if resolved.is_dir():
             if within is not None:
@@ -165,7 +165,7 @@ class WorkspaceReader:
             root = self._resolve(within)
             if not resolved_within(resolved, root):
                 raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
-        payload = self._read_file(path, resolved, limit=None if raw else _DEFAULT_READ_LIMIT)
+        payload = self._read_file(path, resolved)
         if within is not None:
             payload["within_enforced"] = True
         return payload
@@ -244,19 +244,16 @@ class WorkspaceReader:
         self,
         rel: str,
         resolved: Path,
-        *,
-        limit: int | None = _DEFAULT_READ_LIMIT,
     ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
-        Text files are UTF-8 decoded and line-capped at ``limit``; binary
-        files are base64-encoded.  Both are byte-capped at
-        :data:`_MAX_READ_BYTES`.  Shape matches the runner's file-content
+        Text files are UTF-8 decoded; binary files are base64-encoded.
+        Both are byte-capped at :data:`_MAX_READ_BYTES`.
+        Shape matches the runner's file-content
         response, including the mimetype guess.
 
-        Reads at most ``_MAX_READ_BYTES`` from disk (like the runner's
-        bounded read) rather than slurping the whole file, so opening a
-        multi-GB file in the viewer can't OOM the host process.
+        Reads at most ``_MAX_READ_BYTES + 1`` from disk, bounding memory
+        use before decoding oversized files.
         """
         try:
             with resolved.open("rb") as fh:
@@ -266,14 +263,12 @@ class WorkspaceReader:
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
 
-        return self._file_content_payload(rel, capped, limit=limit)
+        return self._file_content_payload(rel, capped)
 
     def _file_content_payload(
         self,
         rel: str,
         raw: bytes,
-        *,
-        limit: int | None,
     ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
         content_type_guess, _ = mimetypes.guess_type(rel)
@@ -305,11 +300,6 @@ class WorkspaceReader:
             "content_type": content_type_guess,
         }
         if text is not None:
-            if limit is not None:
-                lines = text.splitlines(keepends=True)
-                if len(lines) > limit:
-                    text = "".join(lines[:limit])
-                    truncated = True
             data = text.encode("utf-8")
             payload["bytes"] = len(data)
             payload["truncated"] = truncated

@@ -201,15 +201,15 @@ async def test_continue_repeat_returns_same_session(
     )
 
 
-async def test_continue_clones_session_scoped_agent_and_switch_keeps_archived_row(
+async def test_continue_clones_session_scoped_agent_and_keeps_archived_row(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A session-scoped agent is cloned; a later switch leaves the source row.
+    """A session-scoped agent is cloned without changing the source row.
 
     Binding the archived session's raw agent id would make the new
-    session share that row, and switching its agent would delete it —
-    breaking the archived session. The clone must be its own row with
+    session share that row and risk breaking the archived session.
+    The clone must be its own row with
     the same bundle. The clone path takes no run-config overrides, so the
     source's harness / cost-control / routing overrides must still land.
     """
@@ -232,9 +232,6 @@ async def test_continue_clones_session_scoped_agent_and_switch_keeps_archived_ro
         is not None
     )
 
-    switch_seed = await create_test_agent(client, name="continue-switch-seed")
-    switch_target = _real_template(switch_seed, db_uri, "continue-switch-target")
-
     await _archive(client, source_session_id)
     resp = await _continue(client, source_session_id)
     assert resp.status_code == 201, resp.text
@@ -255,16 +252,8 @@ async def test_continue_clones_session_scoped_agent_and_switch_keeps_archived_ro
     assert clone_row.session_id == continued["id"]
     assert clone_row.bundle_location == source_agent_row.bundle_location
 
-    switch = await client.post(
-        f"/v1/sessions/{continued['id']}/switch-agent",
-        json={"agent_id": switch_target},
-    )
-    assert switch.status_code == 200, switch.text
-
     survivor = agent_store.get(source["id"])
-    assert survivor is not None, (
-        "Switching the continuation's agent deleted the archived session's agent row"
-    )
+    assert survivor is not None, "Continuing the session changed the archived session's agent row"
     assert survivor.session_id == source_session_id
 
 

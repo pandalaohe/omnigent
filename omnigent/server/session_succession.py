@@ -34,12 +34,12 @@ from omnigent.server.routes._sessions.helpers import (
     _message_text,
     _publish_child_status_to_parent,
     _publish_external_conversation_item,
-    _publish_session_created,
     _publish_session_superseded,
     _signal_harness_elicitation_resolved_by_id,
 )
 from omnigent.server.routes._sessions.orchestration import _post_system_message
 from omnigent.server.runner_session_init import runner_archive_states_for_conversation
+from omnigent.server.schemas import SessionCreatedEvent
 from omnigent.stores.conversation_store import (
     HANDOVER_ITEM_LABEL_KEY,
     ConversationStore,
@@ -582,7 +582,19 @@ async def _phase_publish_done(
         child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
         if child is None:
             continue
-        _publish_session_created(receipt.new_id, child.id, child.agent_id)
+        # Only the session.created SSE per moved child (the scc24 contract);
+        # the child was relocated, not created, so no delegated transcript
+        # item or creation debug row.
+        session_stream.publish(
+            receipt.new_id,
+            SessionCreatedEvent(
+                type="session.created",
+                conversation_id=receipt.new_id,
+                child_session_id=child.id,
+                agent_id=child.agent_id,
+                parent_session_id=receipt.new_id,
+            ).model_dump(),
+        )
         _publish_child_status_to_parent(child.id, None)
     return await _advance(receipt, "done", conversation_store=conversation_store)
 

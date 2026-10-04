@@ -26,6 +26,7 @@ from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
@@ -166,6 +167,8 @@ async def register_worktree_host(
         create_status: str = "ok",
         create_error: str | None = None,
         stat_fails_for: Callable[[str], bool] | None = None,
+        workspace: str | None = None,
+        canonical_path: Callable[[str], str] | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
@@ -202,7 +205,11 @@ async def register_worktree_host(
                                     "status": "ok",
                                     "exists": True,
                                     "type": "directory",
-                                    "canonical_path": frame.path,
+                                    "canonical_path": (
+                                        canonical_path(frame.path)
+                                        if canonical_path is not None
+                                        else frame.path
+                                    ),
                                     "error": None,
                                 }
                             )
@@ -215,7 +222,8 @@ async def register_worktree_host(
                             fut.set_result(
                                 {
                                     "status": "ok",
-                                    "worktree_path": f"{frame.repo_path}-worktrees/{dirname}",
+                                    "worktree_path": f"{_SOURCE_REPO}-worktrees/{dirname}",
+                                    "workspace": workspace,
                                     "branch": frame.branch_name,
                                     "error": None,
                                 }
@@ -229,6 +237,22 @@ async def register_worktree_host(
                                     "error": create_error,
                                 }
                             )
+                elif isinstance(frame, HostListWorktreesFrame):
+                    branch = cap.create[-1].branch_name if cap.create else None
+                    fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": "ok",
+                                "worktrees": [
+                                    {
+                                        "path": frame.repo_path,
+                                        "branch": branch,
+                                        "is_main": False,
+                                    }
+                                ],
+                            }
+                        )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
@@ -621,3 +645,97 @@ async def test_create_rolls_back_worktree_on_canonicalize_failure(
     assert cap.remove[0].worktree_path == created_path
     assert cap.remove[0].branch == "feature/orphan"
     assert cap.remove[0].delete_branch is True
+
+
+async def test_create_preserves_selected_subdirectory(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """Persist the relocated subdirectory returned by the host as the session workspace."""
+    workspace = f"{_SOURCE_REPO}-worktrees/worktree-1234abcd/packages/app"
+    cap = register_worktree_host(workspace=workspace)
+    agent = await create_test_agent(client, name="subdirectory-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": f"{_SOURCE_REPO}/packages/app",
+            "git": {"branch_name": "worktree-1234abcd"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert cap.create[0].repo_path == f"{_SOURCE_REPO}/packages/app"
+    assert response.json()["workspace"] == workspace
+    detail = await client.get(f"/v1/sessions/{response.json()['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["workspace"] == workspace
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    assert detail.json()["labels"][WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(
+        f"{_SOURCE_REPO}-worktrees/worktree-1234abcd"
+    )
+
+
+async def test_create_records_canonical_root_so_delete_finds_worktree(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A raw host path that canonicalises elsewhere still cleans up on delete.
+
+    The recorded worktree root is the canonical path while the host returned
+    the raw one, so the cleanup label must fingerprint the canonical root:
+    fingerprinting the raw path makes ``recorded_worktree_root`` miss it and
+    delete silently leaks the worktree.
+    """
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    raw = f"{_SOURCE_REPO}-worktrees/feature-canonical"
+
+    def _canonicalize(path: str) -> str:
+        return f"/opt/work/canonical{path}" if path == raw else path
+
+    cap = register_worktree_host(canonical_path=_canonicalize)
+    agent = await create_test_agent(client, name="canonical-root-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/canonical"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    canonical = _canonicalize(raw)
+    assert response.json()["workspace"] == canonical
+
+    detail = await client.get(f"/v1/sessions/{session_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["labels"][WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(canonical)
+
+    deleted = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
+    assert deleted.status_code == 200, deleted.text
+    assert len(cap.remove) == 1, "delete cleanup must find the canonical worktree root"
+    assert cap.remove[0].worktree_path == canonical
+
+
+async def test_create_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient,
+) -> None:
+    """Clients cannot redirect the server-owned cleanup identity."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    agent = await create_test_agent(client, name="forged-root-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}},
+    )
+    assert response.status_code == 400, response.text

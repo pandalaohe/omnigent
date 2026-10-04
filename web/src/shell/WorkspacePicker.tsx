@@ -1,7 +1,7 @@
 import {
   FolderDotIcon,
   FolderPlusIcon,
-  ArrowLeftIcon,
+  CornerLeftUpIcon,
   EyeIcon,
   EyeOffIcon,
   CheckIcon,
@@ -9,6 +9,7 @@ import {
   AlertTriangleIcon,
   HardDriveIcon,
   PinIcon,
+  RefreshCwIcon,
   SearchIcon,
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -373,12 +374,12 @@ export function HostWorkspacePicker(props: HostWorkspacePickerProps) {
  *
  * The reference-style chrome separates path navigation from listing search:
  * a header provides up / Computer / breadcrumbs / typed path / optional Host
- * pin / hidden / close controls, while a dedicated search row filters the
- * current directory. Clicking a folder navigates into it; files stay visible
- * but disabled because workspaces must be directories. Commit-style callers
- * get the persistent Cancel / Confirm footer. The picker always uses the
- * canonical full-frame geometry; live ``onNavigate`` remains available only
- * for primitive tests.
+ * pin / hidden / refresh / close controls, while a dedicated search row
+ * filters the current directory. Clicking a folder navigates into it; files
+ * stay visible but disabled because workspaces must be directories.
+ * Commit-style callers get the persistent Cancel / Confirm footer. The picker
+ * always uses the canonical full-frame geometry; live ``onNavigate`` remains
+ * available only for primitive tests.
  *
  * @param hostId Host whose filesystem to browse.
  * @param onSelect Fired with the current directory on "Confirm".
@@ -456,9 +457,14 @@ export function WorkspacePicker({
 
   const directoryQuery = useHostFilesystem(hostId, showRoots ? null : path);
   const rootsQuery = useHostFilesystemRoots(hostId, supportsFilesystemRoots && showRoots);
-  const { data, isLoading, isFetching, error, isPlaceholderData } = showRoots
-    ? rootsQuery
-    : directoryQuery;
+  const {
+    data,
+    isLoading,
+    isFetching,
+    error,
+    isPlaceholderData,
+    refetch: refetchListing,
+  } = showRoots ? rootsQuery : directoryQuery;
   const navigationPending = Boolean(isLoading || isFetching || isPlaceholderData);
 
   // Resolve the host's home dir independently of where the picker is
@@ -512,6 +518,7 @@ export function WorkspacePicker({
     isFetching: worktreesFetching,
     isPlaceholderData: worktreesPlaceholder,
     error: worktreesError,
+    refetch: refetchWorktrees,
   } = useHostWorktrees(hostId, worktreeQueryPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
   const verifiedGitWorktrees = useVerifiedGitWorktrees({
@@ -659,6 +666,17 @@ export function WorkspacePicker({
     onSelect?.(selectedWorktreePath ?? currentAbsolute);
   }
 
+  // Nothing re-polls the host while the picker stays open, so a folder or
+  // worktree created outside Omnigent (e.g. `git worktree add` in a terminal)
+  // would not appear until the user navigated away and back.
+  function refreshListing() {
+    if (hostId === null) return;
+    void refetchListing();
+    // A disabled worktree query has no repo path; refetching it would
+    // request the host's worktrees for "".
+    if (worktreeQueryPath !== null) void refetchWorktrees();
+  }
+
   // Directory the "New folder" action creates in. A resolved absolute
   // path is used as-is. At the home view the absolute path is derived
   // from the first listing entry, so an *empty* home yields no entry and
@@ -723,7 +741,7 @@ export function WorkspacePicker({
       >
         <PickerIconButton
           label="Up one level"
-          icon={<ArrowLeftIcon className={showGitDialog ? "size-4" : "size-5"} />}
+          icon={<CornerLeftUpIcon className={showGitDialog ? "size-4" : "size-5"} />}
           onClick={() => {
             if (parent !== null) navigateTo(parent);
             else if (supportsFilesystemRoots) navigateToRoots();
@@ -751,11 +769,11 @@ export function WorkspacePicker({
             testId="workspace-picker-workspace"
           />
         )}
-        <div className="min-w-0 flex-1 px-1" data-testid="workspace-picker-breadcrumbs">
+        <div className="min-w-0 flex-1" data-testid="workspace-picker-breadcrumbs">
           {!pathEditing && (
             <div
               className={cn(
-                "flex min-w-0 items-center gap-1 overflow-hidden text-base font-medium",
+                "flex min-w-0 items-center gap-px overflow-hidden text-base font-medium",
                 showGitDialog && "font-normal leading-[1.6]",
               )}
             >
@@ -764,9 +782,9 @@ export function WorkspacePicker({
                 return (
                   <div
                     key={item.path || "home"}
-                    className={cn("flex min-w-0 items-center gap-1", !isLast && "shrink-0")}
+                    className={cn("flex min-w-0 items-center gap-px", !isLast && "shrink-0")}
                   >
-                    {index > 0 && (
+                    {index > 0 && breadcrumbItems[index - 1].path !== "/" && (
                       <span className="shrink-0 text-muted-foreground" aria-hidden>
                         /
                       </span>
@@ -834,41 +852,50 @@ export function WorkspacePicker({
             data-testid="workspace-picker-path-input"
           />
         </div>
-        {defaultPath && (
+        <div className="flex items-center gap-px">
+          {defaultPath && (
+            <PickerIconButton
+              label={`Open pinned folder: ${defaultPath}`}
+              icon={<PinIcon className="size-4" />}
+              onClick={() => navigateTo(defaultPath)}
+              testId="workspace-picker-open-pinned"
+            />
+          )}
           <PickerIconButton
-            label={`Open pinned folder: ${defaultPath}`}
-            icon={<PinIcon className="size-4" />}
-            onClick={() => navigateTo(defaultPath)}
-            testId="workspace-picker-open-pinned"
+            label="New folder"
+            icon={<FolderPlusIcon className="size-4" />}
+            onClick={openNewFolder}
+            disabled={!canCreateFolder}
+            testId="workspace-picker-new-folder"
           />
-        )}
-        <PickerIconButton
-          label="New folder"
-          icon={<FolderPlusIcon className="size-4" />}
-          onClick={openNewFolder}
-          disabled={!canCreateFolder}
-          testId="workspace-picker-new-folder"
-        />
-        <PickerIconButton
-          label={showHidden ? "Hide hidden files" : "Show hidden files"}
-          icon={
-            showHidden ? (
-              <EyeIcon className={showGitDialog ? "size-4" : "size-5"} />
-            ) : (
-              <EyeOffIcon className={showGitDialog ? "size-4" : "size-5"} />
-            )
-          }
-          onClick={() => setShowHidden((v) => !v)}
-          testId="workspace-picker-show-hidden"
-        />
-        {onClose && (
           <PickerIconButton
-            label="Close"
-            icon={<XIcon className={showGitDialog ? "size-4" : "size-5"} />}
-            onClick={onClose}
-            testId="workspace-picker-close"
+            label={showHidden ? "Hide hidden files" : "Show hidden files"}
+            icon={
+              showHidden ? (
+                <EyeIcon className={showGitDialog ? "size-4" : "size-5"} />
+              ) : (
+                <EyeOffIcon className={showGitDialog ? "size-4" : "size-5"} />
+              )
+            }
+            onClick={() => setShowHidden((v) => !v)}
+            testId="workspace-picker-show-hidden"
           />
-        )}
+          <PickerIconButton
+            label="Refresh"
+            icon={<RefreshCwIcon className={showGitDialog ? "size-4" : "size-5"} />}
+            onClick={refreshListing}
+            disabled={hostId === null || navigationPending || worktreesFetching}
+            testId="workspace-picker-refresh"
+          />
+          {onClose && (
+            <PickerIconButton
+              label="Close"
+              icon={<XIcon className={showGitDialog ? "size-4" : "size-5"} />}
+              onClick={onClose}
+              testId="workspace-picker-close"
+            />
+          )}
+        </div>
       </div>
       <div
         className={cn(
@@ -1169,9 +1196,7 @@ export function WorkspacePicker({
             <Button
               type="button"
               variant="outline"
-              size="sm"
               onClick={onClose}
-              className="rounded-lg px-3 font-normal"
               data-testid="workspace-picker-cancel"
             >
               Cancel
@@ -1180,7 +1205,6 @@ export function WorkspacePicker({
           {onSelect && (
             <Button
               type="button"
-              size="sm"
               disabled={
                 currentAbsolute === "" ||
                 currentAbsolute === null ||
@@ -1189,7 +1213,6 @@ export function WorkspacePicker({
               }
               onClick={handleSelect}
               title={`Confirm folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
-              className="shrink-0 rounded-lg px-3 font-normal"
               data-testid="workspace-picker-select"
             >
               Confirm

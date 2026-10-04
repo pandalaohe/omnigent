@@ -56,6 +56,7 @@ from omnigent.server.user_preferences_store import ApprovalTimeout
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
@@ -88,19 +89,6 @@ def _reset_approval_grants() -> None:
     approval_grants.clear()
     yield
     approval_grants.clear()
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a minimal session and return its id.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
 
 
 async def _drain_until_elicitation(
@@ -4308,7 +4296,7 @@ async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (".venv/bin/python -m pytest tests/harnesses/codex_native/session/ -q"),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [
@@ -4376,7 +4364,7 @@ async def test_codex_command_approval_hook_rejects_malformed_execpolicy_amendmen
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (".venv/bin/python -m pytest tests/harnesses/codex_native/session/ -q"),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [

@@ -329,6 +329,9 @@ class MessageData(BaseModel):
     :param stream_message_id: Native live-preview stream finalized by
         this assistant message. Persisted so reconnect snapshots can
         suppress delayed preview chunks after the authoritative item.
+    :param user_authored: Confirmed or conservatively preserved user input;
+        prevents legacy content cleanup from hiding literal agent markup.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     role: Literal["user", "assistant"]
@@ -336,6 +339,8 @@ class MessageData(BaseModel):
     content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
+    user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
 
@@ -430,6 +435,7 @@ class FunctionCallOutputData(BaseModel):
         work that is still running.
     :param is_error: Whether the native harness marked the tool result as an
         error. Missing on conversation items written by older versions.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     call_id: str
@@ -437,6 +443,7 @@ class FunctionCallOutputData(BaseModel):
     tool_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
     is_async: bool | None = Field(default=None, exclude_if=lambda value: value is None)
     is_error: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorData(BaseModel):
@@ -457,12 +464,21 @@ class ErrorData(BaseModel):
         notice (e.g. codex started a fresh thread) rather than a failure;
         ``None`` / ``"error"`` is the destructive default and is omitted from
         the wire so existing error items are unchanged.
+    :param title: Optional short headline naming the failure, e.g. ``"Codex can't
+        start until you sign in to Databricks"``. Kept so the card reads the
+        same after a reload as it did live.
+    :param cause: Optional one or two sentences explaining why it failed.
+    :param remediation: Optional concrete next step, e.g. the sign-in link
+        and code; the card offers it as an action.
     """
 
     source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
     level: Literal["error", "info"] | None = None
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
     @field_validator("code", "message")
     @classmethod
