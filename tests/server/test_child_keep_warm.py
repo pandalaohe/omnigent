@@ -1486,7 +1486,12 @@ async def test_unarchive_does_not_rearm_a_stale_cache_clock(harness: _Harness) -
 async def test_first_real_turn_after_an_absence_records_the_return(
     harness: _Harness,
 ) -> None:
-    """A return past the family TTL is classified from ``omnigent.last_cache``."""
+    """A return past the family TTL is classified from ``omnigent.last_cache``.
+
+    The measured miss is recorded as the return but NOT counted toward the
+    miss pause: the turn began after the previous episode's window with no
+    ok ping behind it, so keep-warm was not holding the cache for it.
+    """
     t0 = harness.now - 2 * 3600
     r = harness.now - 60
     main = _main(
@@ -1501,17 +1506,22 @@ async def test_first_real_turn_after_an_absence_records_the_return(
     stats = _read_stats(harness, main.id)
     assert stats.lr_at == main.updated_at and stats.lr_r == "miss"
     state = _read_label(harness, main.id)
-    assert state is not None and state.s == "w" and state.m == 1
+    assert state is not None and state.s == "w" and state.m == 0
     # The consumed reading is the new baseline: a second tick reclassifies nothing.
     await _tick(harness)
     state = _read_label(harness, main.id)
-    assert state is not None and state.m == 1
+    assert state is not None and state.m == 0
 
 
 async def test_turn_with_no_reading_retries_the_classification_late(
     harness: _Harness,
 ) -> None:
-    """An unmeasurable opening reading flags r; a later tick settles it."""
+    """An unmeasurable opening reading flags r; a later tick settles it.
+
+    This turn began after the previous episode's window with no ok ping
+    behind it, so the episode opened ineligible (``e`` stays unset): the
+    late miss settles the return record but is not counted toward the pause.
+    """
     t0 = harness.now - 2 * 3600
     r = harness.now - 60
     main = _main(
@@ -1525,7 +1535,7 @@ async def test_turn_with_no_reading_retries_the_classification_late(
     await _tick(harness)
 
     state = _read_label(harness, main.id)
-    assert state is not None and state.s == "w" and state.r is True
+    assert state is not None and state.s == "w" and state.r is True and state.e is False
     stats = _read_stats(harness, main.id)
     assert stats.lr_at == main.updated_at and stats.lr_r == "unknown"
 
@@ -1537,7 +1547,7 @@ async def test_turn_with_no_reading_retries_the_classification_late(
 
     settled = _read_label(harness, main.id)
     assert settled is not None and settled.s == "w" and settled.r is False
-    assert settled.m == 1
+    assert settled.e is False and settled.m == 0
     stats = _read_stats(harness, main.id)
     assert stats.lr_at == main.updated_at and stats.lr_r == "miss"
 
@@ -1620,16 +1630,20 @@ async def test_codex_episode_records_observation_and_return(harness: _Harness) -
 
 
 async def test_codex_real_turn_miss_counts_toward_the_pause(harness: _Harness) -> None:
-    """A measured real-turn miss survives the episode reset; two pause."""
+    """A real-turn miss inside a ping-kept warm window counts; two pause."""
     parent = _parent(harness)
-    t0 = harness.now - 2 * 3600
+    t0 = harness.now - 1200
     r = harness.now - 120
     child = _child(
         harness,
         parent.id,
         harness_override="codex-native",
         agent_id=_CODEX_AGENT,
-        labels={KEEP_WARM_LABEL: _warm_label(t=t0, interval=_CODEX_INTERVAL_S, w=t0 + 1800)},
+        labels={
+            # Warm, the window still open at the turn, one ok ping behind it.
+            KEEP_WARM_LABEL: _warm_label(t=t0, interval=_CODEX_INTERVAL_S),
+            KEEP_WARM_STATS_LABEL: child_keep_warm._WarmStats(ep_p=1).to_label(),
+        },
         running_since=r,
     )
     harness.store.set_session_usage(
@@ -1640,6 +1654,11 @@ async def test_codex_real_turn_miss_counts_toward_the_pause(harness: _Harness) -
     assert first is not None and first.s == "w" and first.m == 1
     assert first.o == [child.updated_at, 0]
 
+    # The episode reset the episode counters; the next turn's miss counts
+    # only with an ok ping behind this episode too (set directly here).
+    harness.store.set_labels(
+        child.id, {KEEP_WARM_STATS_LABEL: child_keep_warm._WarmStats(ep_p=1).to_label()}
+    )
     r2 = r + 500
     _set_running_since(harness, child.id, r2)
     harness.store.set_session_usage(
@@ -1653,26 +1672,141 @@ async def test_codex_real_turn_miss_counts_toward_the_pause(harness: _Harness) -
     assert len(harness.notices.lines) == 1
 
 
+async def test_fresh_sessions_first_real_turn_miss_does_not_count(
+    harness: _Harness,
+) -> None:
+    """A fresh session's first real turn measures a miss that is not keep-warm's."""
+    main = _main(harness, running_since=harness.now - 60)
+    _set_last_cache(harness, main.id, read=10, creation=90, observed_at=harness.now - 30)
+
+    await _tick(harness)
+
+    state = _read_label(harness, main.id)
+    assert state is not None and state.s == "w" and state.m == 0
+    assert harness.notices.lines == []
+
+
+async def test_real_turn_miss_after_the_window_does_not_count(harness: _Harness) -> None:
+    """Warm prior episode with pings, but the turn began after ``w`` — no blame."""
+    t0 = harness.now - 2 * 3600
+    r = harness.now - 60
+    main = _main(
+        harness,
+        labels={
+            KEEP_WARM_LABEL: _warm_label(t=t0, w=t0 + 3600),  # the window closed before r
+            KEEP_WARM_STATS_LABEL: child_keep_warm._WarmStats(ep_p=1).to_label(),
+        },
+        running_since=r,
+    )
+    _set_last_cache(harness, main.id, read=10, creation=90, observed_at=r + 30)
+
+    await _tick(harness)
+
+    state = _read_label(harness, main.id)
+    assert state is not None and state.s == "w" and state.m == 0
+
+
+async def test_real_turn_miss_without_a_prior_ok_ping_does_not_count(
+    harness: _Harness,
+) -> None:
+    """Inside the window but keep-warm never pinged — the opening miss is not counted."""
+    t0 = harness.now - 1200
+    r = harness.now - 60
+    main = _main(
+        harness,
+        labels={KEEP_WARM_LABEL: _warm_label(t=t0)},  # the window covers r; ep_p == 0
+        running_since=r,
+    )
+    _set_last_cache(harness, main.id, read=10, creation=90, observed_at=r + 30)
+
+    await _tick(harness)
+
+    state = _read_label(harness, main.id)
+    assert state is not None and state.s == "w" and state.m == 0
+
+
+async def test_late_reading_miss_counts_when_the_episode_was_eligible(
+    harness: _Harness,
+) -> None:
+    """A late-landing miss counts when the episode opened inside a ping-kept window."""
+    t0 = harness.now - 1200
+    r = harness.now - 60
+    main = _main(
+        harness,
+        labels={
+            KEEP_WARM_LABEL: _warm_label(t=t0),
+            KEEP_WARM_STATS_LABEL: child_keep_warm._WarmStats(ep_p=1).to_label(),
+        },
+        running_since=r,
+    )
+
+    # No ``omnigent.last_cache`` yet: the episode opens unmeasurable but eligible.
+    await _tick(harness)
+
+    state = _read_label(harness, main.id)
+    assert state is not None and state.s == "w" and state.r is True and state.e is True
+
+    # The turn's reading lands late; because the episode was eligible, the
+    # miss counts toward the pause.
+    _set_last_cache(harness, main.id, read=10, creation=90, observed_at=r + 30)
+    harness.clock.now += 60
+    await _tick(harness)
+
+    settled = _read_label(harness, main.id)
+    assert settled is not None and settled.s == "w" and settled.r is False
+    assert settled.e is False and settled.m == 1
+
+
+async def test_late_reading_miss_does_not_count_when_the_episode_was_ineligible(
+    harness: _Harness,
+) -> None:
+    """A late-landing miss never counts when the episode opened with no ok ping."""
+    t0 = harness.now - 1200
+    r = harness.now - 60
+    main = _main(
+        harness,
+        labels={KEEP_WARM_LABEL: _warm_label(t=t0)},  # inside the window, no pings yet
+        running_since=r,
+    )
+
+    await _tick(harness)
+
+    state = _read_label(harness, main.id)
+    assert state is not None and state.s == "w" and state.r is True and state.e is False
+
+    _set_last_cache(harness, main.id, read=10, creation=90, observed_at=r + 30)
+    harness.clock.now += 60
+    await _tick(harness)
+
+    settled = _read_label(harness, main.id)
+    assert settled is not None and settled.s == "w" and settled.r is False
+    assert settled.e is False and settled.m == 0
+
+
 async def test_late_codex_reading_advances_the_usage_baseline(harness: _Harness) -> None:
     """A late-consumed reading becomes the baseline the next episode measures.
 
     Without the advance, the next turn's cumulative usage compares against
     the pre-reading baseline and its own warm delta reads as a second miss.
     """
-    t0 = harness.now - 2 * 3600
+    t0 = harness.now - 1200
     r = harness.now - 60
     main = _main(
         harness,
         harness_override="codex-native",
         agent_id=_CODEX_AGENT,
-        labels={KEEP_WARM_LABEL: _warm_label(t=t0, interval=_CODEX_INTERVAL_S, w=t0 + 1800)},
+        labels={
+            # Warm, the window still open at the turn, one ok ping behind it.
+            KEEP_WARM_LABEL: _warm_label(t=t0, interval=_CODEX_INTERVAL_S),
+            KEEP_WARM_STATS_LABEL: child_keep_warm._WarmStats(ep_p=1).to_label(),
+        },
         running_since=r,
     )
 
     # No usage yet: the episode opens with the classification pending.
     await _tick(harness)
     state = _read_label(harness, main.id)
-    assert state is not None and state.r is True
+    assert state is not None and state.r is True and state.e is True
 
     # The turn's usage lands late: a [900, 100] delta reads as a miss.
     harness.store.set_session_usage(main.id, {"input_tokens": 900, "cache_read_input_tokens": 100})
@@ -1680,7 +1814,7 @@ async def test_late_codex_reading_advances_the_usage_baseline(harness: _Harness)
     await _tick(harness)
 
     settled = _read_label(harness, main.id)
-    assert settled is not None and settled.r is False and settled.m == 1
+    assert settled is not None and settled.r is False and settled.e is False and settled.m == 1
     assert settled.b == [900, 100]
 
     # The next turn adds [10, 90]: against the advanced baseline, a hit.
@@ -1882,6 +2016,7 @@ async def test_label_round_trips_through_the_store_at_its_largest(
         w=2**31 - 1,
         o=[2**31 - 1, 1],
         r=True,
+        e=True,
         k="x" * 24,
     )
     value = state.to_label()

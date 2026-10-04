@@ -163,7 +163,8 @@ class _WarmState:
     id, ``f`` failures, ``m`` misses, ``b`` usage baseline, ``v``
     ``archive_revision`` at a miss pause, ``w`` warm-until, ``o`` latest
     cache observation ``[epoch, 1=hit|0=miss]``, ``r`` late-usage retry
-    pending, ``k`` stop reason.
+    pending, ``e`` pending late reading may count as a miss, ``k`` stop
+    reason.
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
@@ -184,6 +185,9 @@ class _WarmState:
         warm_state evidence.
     :param r: Whether the episode-opening turn still owes a cache reading
         (the harness reported no usage in time); later ticks retry it.
+    :param e: Whether the pending late reading may count as a miss —
+        the episode-opening eligibility, stored because it cannot be
+        re-derived once the episode's own state replaces the previous one.
     :param k: Why warming currently does not ping — the first failing
         eligibility gate or a receipt's reason code, else ``None``.
     """
@@ -202,6 +206,7 @@ class _WarmState:
     w: int | None = None
     o: list[int] | None = None
     r: bool = False
+    e: bool = False
     k: str | None = None
 
     def to_label(self) -> str:
@@ -233,6 +238,8 @@ class _WarmState:
             data["o"] = self.o
         if self.r:
             data["r"] = 1
+        if self.e:
+            data["e"] = 1
         if self.k is not None:
             data["k"] = self.k
         return json.dumps(data, separators=(",", ":"))
@@ -288,6 +295,7 @@ class _WarmState:
             w=_as_int(data.get("w")),
             o=observation,
             r=bool(data.get("r")),
+            e=bool(data.get("e")),
             k=stop_reason if isinstance(stop_reason, str) else None,
         )
 
@@ -944,11 +952,24 @@ class ChildKeepWarmSweeper:
                     prev_u = state.u if state is not None else None
                     prev_b = state.b if state is not None else None
                     prev_m = state.m if state is not None else 0
+                    # A real-turn miss is evidence against keep-warm only when
+                    # warming held the cache for this turn: a warm prior episode
+                    # whose window covers the turn's start, with an ok ping in it.
+                    miss_counts = (
+                        state is not None
+                        and state.s == "w"
+                        and state.w is not None
+                        and running_since <= state.w
+                        and stats.ep_p >= 1
+                    )
                     settle = conv.updated_at if conv.updated_at >= running_since else now
                     reading = self._turn_cache_reading(conv, prev_b, running_since, family)
                     misses = prev_m
                     if reading is not None:
-                        misses = prev_m + 1 if reading[0] == "miss" else 0
+                        if reading[0] == "miss":
+                            misses = prev_m + 1 if miss_counts else prev_m
+                        else:
+                            misses = 0
                     state = _WarmState(
                         s="w",
                         t=running_since,
@@ -958,12 +979,14 @@ class ChildKeepWarmSweeper:
                         b=self._usage_baseline(conv, family),
                         w=settle + interval + _SLACK_S,
                         r=reading is None,
+                        e=reading is None and miss_counts,
                     )
                     if family == "codex" and reading is not None:
                         state.o = [settle, 0 if reading[0] == "miss" else 1]
                     if (
                         reading is not None
                         and reading[0] == "miss"
+                        and miss_counts
                         and misses >= _MISS_PAUSE_THRESHOLD
                     ):
                         state.s, state.why = "p", "miss"
@@ -992,20 +1015,29 @@ class ChildKeepWarmSweeper:
                 # elapses.
                 if state.c is not None and now - state.c > _LATE_USAGE_GRACE_S:
                     state.r = False
+                    state.e = False
                 else:
                     late = self._turn_cache_reading(conv, state.b, running_since, family)
                     if late is not None:
                         state.r = False
+                        # The miss blame eligibility was fixed when the episode
+                        # opened; a late hit resets the count either way.
+                        late_counts = state.e
+                        state.e = False
                         # The consumed reading is the new baseline: the next
                         # episode measures only its own turn.
                         state.b = self._usage_baseline(conv, family)
-                        state.m = state.m + 1 if late[0] == "miss" else 0
+                        if late[0] == "miss":
+                            if late_counts:
+                                state.m += 1
+                        else:
+                            state.m = 0
                         if family == "codex":
                             state.o = [now, 0 if late[0] == "miss" else 1]
                         if stats.lr_at == state.c and stats.lr_r == "unknown":
                             stats.lr_r = late[0]
                             stats_dirty = True
-                        if late[0] == "miss" and state.m >= _MISS_PAUSE_THRESHOLD:
+                        if late[0] == "miss" and late_counts and state.m >= _MISS_PAUSE_THRESHOLD:
                             state.s, state.why = "p", "miss"
                             state.v = conv.archive_revision
                             notices.append(("miss", {"read": late[1], "creation": late[2]}))

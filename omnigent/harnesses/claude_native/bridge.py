@@ -66,9 +66,13 @@ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.status_file import (
+    IDLE as _CLAUDE_STATUS_IDLE,
+)
+from omnigent.harnesses.claude_native.status_file import (
     RUNNING as _CLAUDE_STATUS_RUNNING,
 )
 from omnigent.harnesses.claude_native.status_file import (
+    SessionStatus,
     read_session_status,
     resolve_status_file,
 )
@@ -5538,23 +5542,24 @@ def _tmux_pane_pid(socket_path: str, tmux_target: str) -> int | None:
         return None
 
 
-def _claude_turn_running(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool | None:
+def _claude_session_status(
+    bridge_dir: Path, socket_path: str, tmux_target: str
+) -> SessionStatus | None:
     """
-    Read Claude's own running/idle status file for the pane.
+    Read Claude's own session status file for the pane.
 
     The ``sessions/<pid>.json`` file — not the pane, whose composer
-    stays mounted mid-turn for queued input — says whether a turn is
-    generating; typing ``/btw`` into a generating turn would queue it
-    as a real user message. Resolution mirrors the runner's status
-    watcher: the pane pid names the file, and the bridge-captured
-    Claude session uuid cross-checks it.
+    stays mounted mid-turn for queued input — says what Claude is
+    doing. Resolution mirrors the runner's status watcher: the pane
+    pid names the file, and the bridge-captured Claude session uuid
+    cross-checks it.
 
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string.
-    :returns: The file's answer, or ``None`` when the pid or the file
-        can't be resolved — an unreadable tracker, never evidence of
-        idle.
+    :returns: The file's mapped status, or ``None`` when the pid or
+        the file can't be resolved — an unreadable tracker, never
+        evidence of idle.
     """
     pane_pid = _tmux_pane_pid(socket_path, tmux_target)
     if pane_pid is None:
@@ -5565,7 +5570,28 @@ def _claude_turn_running(bridge_dir: Path, socket_path: str, tmux_target: str) -
     )
     if path is None:
         return None
-    status = read_session_status(path)
+    return read_session_status(path)
+
+
+def _claude_turn_running(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Read Claude's own running/idle status file for the pane.
+
+    The ``sessions/<pid>.json`` file — not the pane, whose composer
+    stays mounted mid-turn for queued input — says whether a turn is
+    generating; typing ``/btw`` into a generating turn would queue it
+    as a real user message. A thin mapped-boolean view of
+    :func:`_claude_session_status` for the pre-paste guards, where an
+    open dialog of anyone's must read as busy.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :returns: The file's answer, or ``None`` when the pid or the file
+        can't be resolved — an unreadable tracker, never evidence of
+        idle.
+    """
+    status = _claude_session_status(bridge_dir, socket_path, tmux_target)
     if status is None:
         return None
     return status.runner_status == _CLAUDE_STATUS_RUNNING
@@ -7934,16 +7960,49 @@ def _paste_keep_warm_btw(bridge_dir: Path, socket_path: str, tmux_target: str) -
             os.unlink(paste_path)
 
 
+def _claude_free_behind_keep_warm_overlay(
+    bridge_dir: Path, socket_path: str, tmux_target: str
+) -> bool:
+    """
+    Whether keep-warm's Escape can interrupt nothing behind its overlay.
+
+    Claude Code reports its own open ``/btw`` overlay as ``waiting``
+    with reason ``"dialog open"`` — a status :func:`_claude_turn_running`
+    reads as a generating turn. Behind keep-warm's verifiably-present
+    marked overlay that reading is expected rather than busy, so an
+    explicitly idle status OR that exact waiting reason frees the
+    Escape. An unreadable status, ``busy``, or ``waiting`` with any
+    other reason (a permission prompt, an input request) does not.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :returns: ``True`` when no real turn can be generating behind the
+        overlay.
+    """
+    status = _claude_session_status(bridge_dir, socket_path, tmux_target)
+    if status is None:
+        return False
+    if status.runner_status == _CLAUDE_STATUS_IDLE:
+        return True
+    return status.raw_status == "waiting" and status.blocked_on == "dialog open"
+
+
 def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool:
     """
     Escape keep-warm's own settled overlay; ``False`` spends no key.
 
     One fresh capture decides: a settled ``/btw`` overlay whose
     question carries :data:`KEEP_WARM_BTW_MARKER` (ours — not a side
-    chat of the person's), no pending user prompt, and Claude's
-    status file explicitly idle — a turn that just started, or a
-    tracker that can't be read, spends no key. Anything else is
-    left exactly as it is. Keep-warm's dismiss; the web-initiated
+    chat of the person's), no pending user prompt, and Claude free
+    behind the overlay (:func:`_claude_free_behind_keep_warm_overlay`).
+    Claude reports its own ``/btw`` overlay as ``waiting`` /
+    ``"dialog open"``, which this accepts only behind our marked
+    overlay on the same capture; accepted residual: a real turn that
+    starts behind our overlay and is reported as ``"dialog open"``
+    (the overlay consumes the Escape). Anything else — a generating
+    turn, an unreadable tracker, another wait reason — is left exactly
+    as it is. Keep-warm's dismiss; the web-initiated
     :func:`dismiss_btw_overlay` keeps its broader any-``/btw`` contract.
 
     :param bridge_dir: Bridge directory path.
@@ -7957,7 +8016,7 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
         return False
     if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
         return False
-    if _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False:
+    if not _claude_free_behind_keep_warm_overlay(bridge_dir, socket_path, tmux_target):
         return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
     return True
@@ -7990,12 +8049,18 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     any mismatch NO further key is sent (``composer_changed``) — the
     paste may stay in the composer for the person to see, which is
     preferred to backspacing characters that may be theirs. The
-    overlay poll aborts with no key when a prompt or a turn appears or
-    the turn tracker goes unreadable, and Escape is spent only on our
-    own marked overlay with no prompt pending and an explicitly idle
-    status on that capture. Accepted residual: a state change in the
-    milliseconds between a capture and the next key, and runner-side
-    web actions that write the pane, can never be excluded.
+    overlay poll aborts with no key only when a prompt appears; a
+    running or unreadable status read is NOT an abort there, because
+    Claude reports its own open ``/btw`` overlay as ``waiting`` /
+    ``"dialog open"`` — before the overlay settles that read is not
+    evidence of a real turn, and the poll sends no key. Escape is
+    spent only on our own marked overlay on a fresh capture, whose
+    dismissal accepts idle or that dialog-open status behind the
+    overlay. Accepted residual: a real turn that starts behind our
+    overlay and is reported as ``"dialog open"`` (the overlay consumes
+    the Escape), a state change in the milliseconds between a capture
+    and the next key, and runner-side web actions that write the pane,
+    can never be excluded.
 
     The caller holds the executor's injection lock, so a real message
     arriving meanwhile waits the few seconds this takes instead of
@@ -8065,9 +8130,8 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
         pane = _capture_pane(socket_path, tmux_target)
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
             return KeepWarmBtwResult("failed", "aborted")
-        # An unreadable status aborts exactly like a known running turn.
-        if _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False:
-            return KeepWarmBtwResult("failed", "aborted")
+        # No status read here: our own open /btw overlay reports
+        # waiting/"dialog open"; the dismissal's gate protects the Escape.
         overlay = _btw_overlay_from_pane(pane)
         if (
             overlay is not None

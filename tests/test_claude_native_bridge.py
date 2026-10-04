@@ -66,6 +66,7 @@ from omnigent.harnesses.claude_native.bridge import (
     stop_hook_seen_since,
     write_tmux_target,
 )
+from omnigent.harnesses.claude_native.status_file import IDLE, RUNNING, SessionStatus
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
@@ -13112,12 +13113,29 @@ _KEEP_WARM_OVERLAY_PANE = _btw_pane(
     "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
 )
 
+_IDLE_SESSION_STATUS = SessionStatus(runner_status=IDLE, raw_status="idle", status_updated_at=None)
+_BUSY_SESSION_STATUS = SessionStatus(
+    runner_status=RUNNING, raw_status="busy", status_updated_at=None
+)
+# Claude Code reports its own open /btw overlay as waiting/"dialog open".
+_DIALOG_OPEN_SESSION_STATUS = SessionStatus(
+    runner_status=RUNNING, raw_status="waiting", status_updated_at=None, blocked_on="dialog open"
+)
+_PERMISSION_WAIT_SESSION_STATUS = SessionStatus(
+    runner_status=RUNNING,
+    raw_status="waiting",
+    status_updated_at=None,
+    blocked_on="permission prompt",
+)
+
 
 @pytest.fixture
 def btw_guard_trackers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize the prompt / turn / client-activity trackers around one guard."""
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _: False)
-    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: False)
+    monkeypatch.setattr(
+        claude_native_bridge, "_claude_session_status", lambda *_: _IDLE_SESSION_STATUS
+    )
     monkeypatch.setattr(claude_native_bridge, "_tmux_last_client_input", lambda *_: (True, None))
 
 
@@ -13623,13 +13641,15 @@ def test_keep_warm_btw_running_turn_at_dismissal_blocks_escape(
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """A turn reported by the dismissal's fresh status check spends no Escape."""
+    """A ``busy`` status at the dismissal's fresh status check spends no Escape."""
     bridge_dir = _picker_bridge_dir(tmp_path)
-    # Guard, paste-commit poll, overlay poll all read idle; the
-    # dismissal's own check then reports a generating turn.
-    running = iter([False, False, False, True])
+    # Guard and paste-commit poll read idle; the dismissal's own status
+    # check then reports a generating turn.
+    statuses = iter([_IDLE_SESSION_STATUS, _IDLE_SESSION_STATUS, _BUSY_SESSION_STATUS])
     monkeypatch.setattr(
-        claude_native_bridge, "_claude_turn_running", lambda *_: next(running, True)
+        claude_native_bridge,
+        "_claude_session_status",
+        lambda *_: next(statuses, _BUSY_SESSION_STATUS),
     )
     sends = _fake_tmux(
         monkeypatch,
@@ -13648,23 +13668,25 @@ def test_keep_warm_btw_running_turn_at_dismissal_blocks_escape(
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
 
-def test_keep_warm_btw_unreadable_status_during_overlay_poll_aborts(
+def test_keep_warm_btw_unreadable_status_at_dismissal_blocks_escape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """An unreadable turn status mid-poll aborts like a known running turn — no Escape."""
+    """An unreadable status at the dismissal is never evidence of free — no Escape."""
     bridge_dir = _picker_bridge_dir(tmp_path)
-    # Guard and paste-commit poll read idle; the overlay poll's status read goes unreadable.
-    running = iter([False, False, None])
+    # Guard and paste-commit poll read idle; the dismissal's own status read
+    # then resolves nothing.
+    statuses = iter([_IDLE_SESSION_STATUS, _IDLE_SESSION_STATUS, None])
     monkeypatch.setattr(
-        claude_native_bridge, "_claude_turn_running", lambda *_: next(running, None)
+        claude_native_bridge, "_claude_session_status", lambda *_: next(statuses, None)
     )
     sends = _fake_tmux(
         monkeypatch,
         [
             _IDLE_PANE,
             _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,
             _KEEP_WARM_OVERLAY_PANE,
         ],
     )
@@ -13674,6 +13696,145 @@ def test_keep_warm_btw_unreadable_status_during_overlay_poll_aborts(
     assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_permission_wait_at_dismissal_blocks_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """``waiting`` with any reason but ``"dialog open"`` at the dismissal spends no Escape."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    statuses = iter([_IDLE_SESSION_STATUS, _IDLE_SESSION_STATUS, _PERMISSION_WAIT_SESSION_STATUS])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_session_status",
+        lambda *_: next(statuses, _PERMISSION_WAIT_SESSION_STATUS),
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,
+            _KEEP_WARM_OVERLAY_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_dialog_open_status_behind_the_overlay_dismisses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Claude reports its own /btw overlay as waiting/"dialog open" — ours still dismisses."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    # Guard and paste-commit poll read idle; once our overlay is up, the
+    # status reads Claude's own dialog.
+    statuses = iter([_IDLE_SESSION_STATUS, _IDLE_SESSION_STATUS, _DIALOG_OPEN_SESSION_STATUS])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_session_status",
+        lambda *_: next(statuses, _DIALOG_OPEN_SESSION_STATUS),
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
+            _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+
+
+@pytest.mark.parametrize("poll_status", [_BUSY_SESSION_STATUS, None], ids=["busy", "unreadable"])
+def test_keep_warm_btw_overlay_poll_never_aborts_on_a_status_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+    poll_status: SessionStatus | None,
+) -> None:
+    """A busy or unreadable read before the overlay settles aborts nothing.
+
+    The poll sends no key, so the status there is not evidence of a real
+    turn (our own overlay reads waiting/"dialog open"); the poll keeps
+    polling, and the settled marked overlay still dismisses behind it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    frames = [
+        _IDLE_PANE,  # pane-idle + composer-empty guards
+        _composer_pane(_KEEP_WARM_TEXT),  # paste committed, exactly
+        _IDLE_PANE,  # the overlay is still answering
+        _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
+        _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+    ]
+    current = {"pane": "", "captures": 0}
+    sends: list[list[str]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        sends.append(list(args))
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        current["captures"] += 1
+        current["pane"] = frames.pop(0) if len(frames) > 1 else frames[0]
+        return current["pane"]
+
+    def _fake_status(*_args: object) -> SessionStatus | None:
+        pane = current["pane"]
+        if current["captures"] == 0:
+            return _IDLE_SESSION_STATUS  # the pre-paste guard, before any capture
+        if "Esc to close" in pane:
+            # Our settled overlay holds the terminal: Claude's own dialog.
+            return _DIALOG_OPEN_SESSION_STATUS
+        if _KEEP_WARM_TEXT in pane:
+            return _IDLE_SESSION_STATUS  # the paste-commit poll
+        return poll_status  # a read while the overlay has not settled
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "_claude_session_status", _fake_status)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+
+
+def test_keep_warm_btw_dialog_open_status_before_the_paste_skips_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """waiting/"dialog open" before any paste is someone else's dialog — busy, no keys."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(
+        claude_native_bridge, "_claude_session_status", lambda *_: _DIALOG_OPEN_SESSION_STATUS
+    )
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "busy")
+    assert sends == []
 
 
 def test_keep_warm_btw_no_overlay_fails_btw_unavailable(
