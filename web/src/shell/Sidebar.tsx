@@ -2776,7 +2776,7 @@ function ConversationList({
                         // and select entry points hide while selection owns
                         // the header.
                         !selectionMode ? (
-                          <>
+                          <div className="flex items-center gap-0.5">
                             {unreadConversations.length > 0 && (
                               <Tooltip>
                                 <TooltipTrigger asChild>
@@ -2801,6 +2801,31 @@ function ConversationList({
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <Button
+                                  asChild
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="New session"
+                                  data-testid="sessions-new-session"
+                                  className="text-muted-foreground"
+                                >
+                                  <Link
+                                    to="/"
+                                    componentId="sidebar.sessions_new_chat"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      onActiveTabChange("mine");
+                                      onRowClick(event);
+                                    }}
+                                  >
+                                    <MessageCirclePlusIcon className="size-3.5" />
+                                  </Link>
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">New session</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
                                   type="button"
                                   variant="ghost"
                                   size="icon-xs"
@@ -2817,7 +2842,7 @@ function ConversationList({
                               </TooltipTrigger>
                               <TooltipContent side="bottom">Select sessions</TooltipContent>
                             </Tooltip>
-                          </>
+                          </div>
                         ) : undefined
                       }
                       persistentHeaderAction={
