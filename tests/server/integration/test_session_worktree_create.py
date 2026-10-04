@@ -836,6 +836,43 @@ async def test_child_inherits_parent_project_entry_for_worktree_placement(
     assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
 
 
+async def test_child_naming_its_project_launches_in_its_worktree(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child that names its project launches in the worktree it cut.
+
+    This is ``sys_session_create`` with ``worktree`` and ``project_id``: the
+    project's entry fills the child's workspace and places the worktree, and
+    the child runs in that worktree, not at the entry.
+    """
+    cap = register_worktree_host(place_under_entry=True)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-child-named-project-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry == _ENTRY
+    body = resp.json()
+    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
+    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+
+
 async def test_child_with_explicit_null_project_inherits_no_entry(
     app: FastAPI,
     register_worktree_host: RegisterHost,
@@ -872,17 +909,17 @@ async def test_child_with_explicit_null_project_inherits_no_entry(
     assert cap.create[0].entry is None
 
 
-async def test_explicit_project_create_keeps_entry_placement(
+async def test_explicit_project_create_launches_in_its_worktree(
     app: FastAPI,
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A create that names its project is unchanged by the inheritance fix.
+    """A create that names its project launches in the worktree it cut.
 
-    The entry still reaches the host (the fake host places under it here),
-    and the launch-at-entry placement still applies: the session's workspace
-    is the entry and the created worktree is recorded separately.
+    This is the body ``sys_session_open`` sends for ``branch``: the entry
+    reaches the host (the fake host places under it here) and the session's
+    workspace is the created worktree, not the entry.
     """
     cap = register_worktree_host(place_under_entry=True)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
@@ -905,8 +942,44 @@ async def test_explicit_project_create_keeps_entry_placement(
     assert cap.create[0].entry == _ENTRY
 
     body = resp.json()
-    assert body["workspace"] == _ENTRY
+    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
     assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+
+
+async def test_explicit_project_bind_launches_in_the_existing_worktree(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Binding an existing worktree inside the entry launches in it.
+
+    This is the body ``sys_session_open`` sends for ``workspace`` naming a
+    listed worktree: nothing is created and the session runs there.
+    """
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-explicit-bind-agent")
+    existing = f"{_ENTRY}/.worktrees/project/task"
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": existing,
+            "git": {"branch_name": "task/fix", "existing_worktree": True},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert cap.create == []
+    body = resp.json()
+    assert body["workspace"] == existing
+    assert body["worktree"] == existing
+    assert body["git_branch"] == "task/fix"
 
 
 async def test_child_of_project_without_entry_uses_sibling_placement(
@@ -971,6 +1044,43 @@ async def test_child_inherited_checkout_outside_boundary_fails_400(
         json={
             "agent_id": agent["id"],
             "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert cap.create == [], f"expected no create_worktree frame, got {cap.create}"
+
+
+async def test_explicit_project_checkout_outside_boundary_fails_400(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A create naming its project validates the checkout it swaps to.
+
+    This is the body ``sys_session_open`` sends for ``branch``: the caller's
+    workspace is the entry, and the worktree would be cut from the
+    project's primary binding. A checkout that fails validation refuses the
+    create with 400 before any ``host.create_worktree`` frame.
+    """
+    binding_repo = "/Users/alice/other-repo"
+    cap = register_worktree_host(stat_fails_for=lambda path: path == binding_repo)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries=[(_HOST_ID, _ENTRY)],
+        bindings=[(_HOST_ID, binding_repo)],
+    )
+    agent = await create_test_agent(client, name="wt-explicit-bad-checkout-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
             "host_id": _HOST_ID,
             "workspace": _ENTRY,
             "git": {"branch_name": "feature/x"},

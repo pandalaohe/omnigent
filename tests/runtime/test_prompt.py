@@ -502,6 +502,27 @@ def test_worktree_instruction_gate_and_text() -> None:
     assert '"/entry/.worktrees/repo/topic"' in text
 
 
+@pytest.mark.parametrize(
+    ("workspace", "worktree"),
+    [
+        # An older session launched at the project entry.
+        ("/entry", "/entry/.worktrees/repo/topic"),
+        # A launch in a subdirectory of its worktree.
+        ("/entry/.worktrees/repo/topic/web", "/entry/.worktrees/repo/topic"),
+        # A child that took its parent's worktree from another directory.
+        ("/entry/.worktrees/repo/child", "/entry/.worktrees/repo/topic"),
+    ],
+)
+def test_worktree_instruction_wording_holds_for_every_row_that_gets_it(
+    workspace: str, worktree: str
+) -> None:
+    """The line states only the two paths, never what the launch directory is."""
+    assert worktree_instruction(workspace, worktree) == (
+        f'Your launch directory is "{workspace}". Your git working tree is '
+        f'"{worktree}": make code changes, run git and tests there.'
+    )
+
+
 def test_worktree_instruction_strips_trailing_separators_when_comparing() -> None:
     """A trailing separator is not a difference, on either side."""
     assert worktree_instruction("/entry/", "/entry/.worktrees/repo/topic") == (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,9 +16,9 @@ from omnigent.server.project_placement import (
     load_bindings,
     load_eligible_host_ids,
     load_entries,
-    place_session,
     root_on_host,
 )
+from omnigent.server.routes._sessions.helpers import _place_project_session
 
 
 def _project(*, host_id: str | None = "h1", workspace: str = "/config") -> Project:
@@ -159,50 +160,45 @@ def test_checkout_prefers_binding_then_entry() -> None:
     assert checkout_on_host([], [], "h1") is None
 
 
-# ── R-PLACE step 4–5 ────────────────────────────────────────────────────
+# ── Launch directory and recorded worktree ──────────────────────────────
 
 
-def test_place_session_inside_entry_launches_at_entry() -> None:
-    assert place_session(
-        "/entry", "/entry/worktrees/x", git_used=True, entry_within_agent_boundary=True
-    ) == ("/entry", "/entry/worktrees/x")
-
-
-def test_place_session_equal_and_prefix_trap_stay_at_target() -> None:
-    assert place_session("/x/a", "/x/a", git_used=True, entry_within_agent_boundary=True) == (
-        "/x/a",
-        "/x/a",
+@pytest.mark.parametrize(
+    ("target", "git_used", "worktree_root", "expected"),
+    [
+        # A created worktree inside the entry: the session launches in it.
+        ("/entry/.worktrees/repo/x", True, None, ("/entry/.worktrees/repo/x",) * 2),
+        # A bound worktree outside any entry.
+        ("/outside/x", True, None, ("/outside/x", "/outside/x")),
+        # A launch relocated into a subdirectory records the worktree root.
+        (
+            "/entry/.worktrees/repo/x/web",
+            True,
+            "/entry/.worktrees/repo/x",
+            ("/entry/.worktrees/repo/x/web", "/entry/.worktrees/repo/x"),
+        ),
+        # No git: the entry itself, or a directory inside it, records nothing.
+        ("/entry", False, None, ("/entry", None)),
+        ("/entry/sub", False, None, ("/entry/sub", None)),
+        (None, False, None, (None, None)),
+    ],
+)
+def test_place_project_session_launches_at_the_target(
+    target: str | None,
+    git_used: bool,
+    worktree_root: str | None,
+    expected: tuple[str | None, str | None],
+) -> None:
+    assert (
+        _place_project_session(target=target, git_used=git_used, worktree_root=worktree_root)
+        == expected
     )
-    assert place_session("/x/a", "/x/a/", git_used=False, entry_within_agent_boundary=True) == (
-        "/x/a/",
-        None,
-    )
-    assert place_session("/x/a", "/x/ab/w", git_used=True, entry_within_agent_boundary=True) == (
-        "/x/ab/w",
-        "/x/ab/w",
-    )
 
 
-def test_place_session_windows_case_and_separators() -> None:
-    target = "d:\\p\\omnigent\\fork\\omnigent-worktrees\\x"
-    assert place_session(
-        "D:\\P\\omnigent", target, git_used=True, entry_within_agent_boundary=True
-    ) == ("D:\\P\\omnigent", target)
-    # Same directory, different case and trailing separator: not "inside".
-    assert place_session("D:\\P", "d:\\p\\", git_used=True, entry_within_agent_boundary=True) == (
-        "d:\\p\\",
-        "d:\\p\\",
-    )
-
-
-def test_place_session_boundary_and_non_git_outcomes() -> None:
-    assert place_session(
-        "/entry", "/entry/worktrees/x", git_used=True, entry_within_agent_boundary=False
-    ) == ("/entry/worktrees/x", "/entry/worktrees/x")
-    assert place_session(
-        "/entry", "/outside/x", git_used=False, entry_within_agent_boundary=True
-    ) == ("/outside/x", None)
-    assert place_session(None, "/outside/x", git_used=True, entry_within_agent_boundary=True) == (
-        "/outside/x",
-        "/outside/x",
-    )
+def test_place_project_session_child_takes_the_parent_worktree() -> None:
+    parent = SimpleNamespace(worktree="/entry/.worktrees/repo/x")
+    assert _place_project_session(
+        target="/entry",
+        git_used=False,
+        parent=parent,  # type: ignore[arg-type]
+    ) == ("/entry", "/entry/.worktrees/repo/x")

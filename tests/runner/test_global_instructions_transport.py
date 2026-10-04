@@ -268,4 +268,4 @@ async def test_without_a_worktree_the_recorded_value_is_the_global_text(
 
     assert recorded == ["GLOBAL-MARKER"]
     assert composed.endswith("GLOBAL-MARKER")
-    assert "You started in the project directory" not in composed
+    assert "Your git working tree is" not in composed

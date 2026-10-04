@@ -132,7 +132,6 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     RepoWorkspace,
 )
-from omnigent.server.project_placement import place_session
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
@@ -6211,40 +6210,25 @@ async def _validate_session_workspace(
     )
 
 
-async def _place_project_session(
+def _place_project_session(
     *,
-    host_id: str | None,
-    project_id: str | None,
-    entry: str | None,
     target: str | None,
     git_used: bool,
-    entry_boundary: Callable[[], Awaitable[object]] | None,
     parent: Conversation | None = None,
     worktree_root: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Decide a new session's launch directory and recorded worktree.
 
-    The child-inheritance rule plus the placement rule: ``parent`` is the
-    parent row when the request names a parent and omits an explicit
-    workspace: the child keeps its launch directory and takes the parent's
-    worktree. Otherwise, when the project has an entry on the target host
-    and the target sits strictly inside it, the session launches at the
-    entry and records the target as its worktree — a session editing
-    through its launch directory's grants may not reach a worktree outside
-    it — but only when the entry passes the same boundary validation the
-    target passed. Every other case launches at the target, recording it
-    as the worktree only when a git worktree was created or bound.
+    ``parent`` is the parent row when the request names a parent and omits
+    an explicit workspace: the child keeps its launch directory and takes
+    the parent's worktree. Every other session launches at the target —
+    a created or bound git worktree, or the directory it picked — and
+    records a worktree only when a git worktree was created or bound.
 
-    :param host_id: Host the session binds to, or ``None``.
-    :param project_id: Project the session is filed under, or ``None``.
-    :param entry: The project's entry on ``host_id``, or ``None``.
-    :param target: The validated directory the session would launch in.
+    :param target: The validated directory the session launches in.
     :param git_used: Whether a git worktree was created or bound for this
         session.
-    :param entry_boundary: Validates ``entry`` the way ``target`` was
-        validated (that site's own boundary check); ``None`` when there is
-        no entry. A failed check is a boundary failure, never propagated.
     :param parent: Parent row when the child-inheritance rule applies,
         else ``None``.
     :param worktree_root: Canonical root of a just-created git worktree, or
@@ -6255,23 +6239,7 @@ async def _place_project_session(
     """
     if parent is not None:
         return target, parent.worktree
-    if target is None or host_id is None or project_id is None:
-        return target, (worktree_root or target) if git_used else None
-    entry_within_agent_boundary = True
-    if entry is not None and entry_boundary is not None:
-        try:
-            await entry_boundary()
-        except OmnigentError:
-            entry_within_agent_boundary = False
-    workspace, worktree = place_session(
-        entry,
-        target,
-        git_used=git_used,
-        entry_within_agent_boundary=entry_within_agent_boundary,
-    )
-    if worktree is not None and worktree_root is not None:
-        worktree = worktree_root
-    return workspace, worktree
+    return target, (worktree_root or target) if git_used else None
 
 
 @dataclass
