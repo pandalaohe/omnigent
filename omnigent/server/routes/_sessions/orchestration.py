@@ -11781,9 +11781,7 @@ async def _create_session_from_existing_agent(
 
     # The launch directory and recorded worktree. A child created without
     # an explicit workspace keeps its directory and takes the parent's
-    # worktree; everything else is placed at the project entry when the
-    # target sits strictly inside it and passes the agent's boundary, and
-    # at the target otherwise.
+    # worktree; everything else launches at the target.
     inherit_parent: Conversation | None = None
     if (
         body.parent_session_id is not None
@@ -11792,30 +11790,10 @@ async def _create_session_from_existing_agent(
         and parent_conv is not None
     ):
         inherit_parent = parent_conv
-    entry_boundary: Callable[[], Awaitable[object]] | None = None
-    if project_resolution.entry is not None:
-        _entry_path = project_resolution.entry
 
-        async def _check_entry_boundary() -> object:
-            assert body.host_id is not None
-            return await _validate_session_workspace(
-                user_id=user_id,
-                host_id=body.host_id,
-                workspace=_entry_path,
-                agent=agent,
-                agent_cache=agent_cache,
-                request=request,
-            )
-
-        entry_boundary = _check_entry_boundary
-
-    workspace, worktree = await _place_project_session(
-        host_id=body.host_id,
-        project_id=project_resolution.project_id,
-        entry=project_resolution.entry,
+    workspace, worktree = _place_project_session(
         target=canonical_workspace,
         git_used=body.git is not None,
-        entry_boundary=entry_boundary,
         parent=inherit_parent,
         worktree_root=canonical_worktree_root,
     )

@@ -705,17 +705,17 @@ async def test_launch_runner_rollback_preserves_existing_branch(
 # ── R-PLACE at launch_runner ─────────────────────────────────────────────
 
 
-async def test_launch_runner_reuse_binds_at_entry_and_records_worktree(
+async def test_launch_runner_reuse_binds_the_picked_directory(
     app: FastAPI,
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """Scenario 20: a no-git Fork reuse of a nested worktree launches at the entry.
+    """Scenario 20: a no-git Fork reuse of a nested directory launches there.
 
-    The user picked the existing worktree ``T`` (the Fork dialog pre-fills
-    the source's effective worktree), so nothing is created; the session
-    nevertheless launches at the project entry and records ``T``.
+    The user picked ``T`` inside the entry (the Fork dialog pre-fills the
+    source's effective worktree) and sent no git options, so nothing is
+    created or recorded: the session launches in ``T``.
     """
     cap = register_host()
     app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
@@ -726,12 +726,40 @@ async def test_launch_runner_reuse_binds_at_entry_and_records_worktree(
     assert response.status_code == 200, response.text
     assert cap.create == [], "a Fork reuse must not create a worktree"
     assert len(cap.launch) == 1
-    assert cap.launch[0].workspace == _ENTRY
+    assert cap.launch[0].workspace == f"{_ENTRY}/nested"
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
-    assert conv.workspace == _ENTRY
-    assert conv.worktree == f"{_ENTRY}/nested"
+    assert conv.workspace == f"{_ENTRY}/nested"
+    assert conv.worktree is None
     assert conv.host_id == _HOST_ID
+
+
+async def test_launch_runner_binds_an_existing_worktree_inside_the_entry(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Binding an existing worktree inside the entry launches in it."""
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    session_id = await _project_session(client, db_uri)
+    existing = f"{_ENTRY}/.worktrees/omnigent/task"
+
+    response = await _launch(
+        client,
+        session_id,
+        workspace=existing,
+        git={"branch_name": "task/fix", "existing_worktree": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert cap.create == []
+    assert cap.launch[0].workspace == existing
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == existing
+    assert conv.worktree == existing
 
 
 async def test_launch_runner_git_create_at_entry_sources_the_checkout(
@@ -740,7 +768,7 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A branch created with the entry picked sources the checkout, then places at the entry."""
+    """A branch created with the entry picked sources the checkout and launches in it."""
     cap = register_host()
     app.state.project_host_binding_store = _ProjectDirs(
         entries=[(_HOST_ID, _ENTRY)], bindings=[(_HOST_ID, _CHECKOUT)]
@@ -758,10 +786,10 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     # worktree under ``<entry>/.worktrees/``.
     assert cap.create[0].entry == _ENTRY
     created = f"{_CHECKOUT}-worktrees/feature-x"
-    assert cap.launch[0].workspace == _ENTRY
+    assert cap.launch[0].workspace == created
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
-    assert conv.workspace == _ENTRY
+    assert conv.workspace == created
     assert conv.worktree == created
     assert conv.git_branch == "feature/x"
 

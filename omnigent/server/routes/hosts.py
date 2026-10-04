@@ -21,7 +21,6 @@ import contextlib
 import logging
 import secrets
 import weakref
-from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -1328,9 +1327,8 @@ def create_hosts_router(
                 body.session_id,
             )
 
-        # A session filed in a project binds at that project's entry on this
-        # host and records the picked worktree. Without a project, an entry,
-        # or a binding store the placement below is a no-op.
+        # A worktree created for a session filed in a project is placed under
+        # that project's entry on this host and sourced from its checkout.
         entry: str | None = None
         checkout: str | None = None
         binding_store = getattr(request.app.state, "project_host_binding_store", None)
@@ -1362,29 +1360,6 @@ def create_hosts_router(
             _place_project_session,
         )
 
-        # The entry-boundary check applied before launching at the entry:
-        # the same validation the picked directory already passed.
-        async def _entry_within_boundary() -> object:
-            from omnigent.server.routes._workspace_validation import (
-                WorkspaceValidationError,
-                validate_workspace,
-            )
-
-            assert entry is not None
-            try:
-                return await validate_workspace(
-                    host_registry=host_registry,
-                    host_id=host_id,
-                    workspace=entry,
-                    spec_cwd=spec_cwd,
-                    host_name_for_errors=target.host.name,
-                )
-            except WorkspaceValidationError as exc:
-                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
-
-        entry_boundary: Callable[[], Awaitable[object]] | None = (
-            _entry_within_boundary if entry is not None else None
-        )
         placed_worktree: str | None = None
         # Canonical root of a just-created worktree, recorded as the session
         # worktree; ``None`` unless this request created one below.
@@ -1532,21 +1507,11 @@ def create_hosts_router(
                         raise
                     git_branch = worktree.branch
 
-            try:
-                placed_workspace, placed_worktree = await _place_project_session(
-                    host_id=host_id,
-                    project_id=target.conv.project_id,
-                    entry=entry,
-                    target=workspace,
-                    git_used=body.git is not None,
-                    entry_boundary=entry_boundary,
-                    worktree_root=worktree_root,
-                )
-                # Placement of a given target always yields a directory.
-                workspace = placed_workspace or workspace
-            except BaseException:
-                await _rollback_worktree()
-                raise
+            _, placed_worktree = _place_project_session(
+                target=workspace,
+                git_used=body.git is not None,
+                worktree_root=worktree_root,
+            )
 
             try:
                 await host_registry.admit_launch(

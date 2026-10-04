@@ -10,10 +10,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry
-from omnigent.server.routes._workspace_validation import (
-    _is_subpath_of,
-    _is_windows_absolute_path,
-)
+from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store import ProjectStore
@@ -177,8 +174,8 @@ def host_roots(
 def same_canonical_path(first: str, second: str) -> bool:
     """Return whether two host-canonical paths name the same directory.
 
-    ``_is_subpath_of`` treats equal paths as contained; placement needs them
-    distinguished ("strictly inside"). Windows paths compare case-insensitively
+    ``_is_subpath_of`` treats equal paths as contained; callers that need them
+    distinguished use this. Windows paths compare case-insensitively
     with separators normalised, so ``D:\\P`` and ``d:\\p\\`` are the same
     directory.
 
@@ -189,40 +186,6 @@ def same_canonical_path(first: str, second: str) -> bool:
     if _is_windows_absolute_path(first) or _is_windows_absolute_path(second):
         return ntpath.normcase(ntpath.normpath(first)) == ntpath.normcase(ntpath.normpath(second))
     return first.rstrip("/") == second.rstrip("/")
-
-
-def place_session(
-    entry: str | None,
-    target: str,
-    *,
-    git_used: bool,
-    entry_within_agent_boundary: bool,
-) -> tuple[str, str | None]:
-    """Decide a session's launch directory and recorded worktree.
-
-    When the project has an entry on the target host, the target is strictly
-    inside it, and the entry passes the same agent-boundary check the target
-    passed, the session launches at the entry and records the target as its
-    worktree — the entry's grants may not reach the target otherwise. Every
-    other case launches at the target, recording it as the worktree only when
-    git worktree creation or binding ran.
-
-    :param entry: The project's entry on the target host, or ``None``.
-    :param target: The validated directory the session would launch in.
-    :param git_used: Whether a git worktree was created or bound for this
-        session.
-    :param entry_within_agent_boundary: Whether the entry passes the agent's
-        workspace validation.
-    :returns: ``(workspace, worktree)`` to persist.
-    """
-    if (
-        entry is not None
-        and entry_within_agent_boundary
-        and not same_canonical_path(target, entry)
-        and _is_subpath_of(target, entry)
-    ):
-        return entry, target
-    return target, target if git_used else None
 
 
 def default_host(

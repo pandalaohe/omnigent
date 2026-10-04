@@ -401,7 +401,8 @@ async def resolve_project_session_create(
         )
 
     # The entry and checkout on the resolved host, whether the workspace came
-    # from the project or the caller sent it explicitly; placement needs both.
+    # from the project or the caller sent it explicitly; worktree placement and
+    # sourcing need both.
     entry: str | None = None
     checkout: str | None = None
     resolved_host_id = getattr(resolved, "host_id", None)

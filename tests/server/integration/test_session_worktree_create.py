@@ -872,17 +872,17 @@ async def test_child_with_explicit_null_project_inherits_no_entry(
     assert cap.create[0].entry is None
 
 
-async def test_explicit_project_create_keeps_entry_placement(
+async def test_explicit_project_create_launches_in_its_worktree(
     app: FastAPI,
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A create that names its project is unchanged by the inheritance fix.
+    """A create that names its project launches in the worktree it cut.
 
-    The entry still reaches the host (the fake host places under it here),
-    and the launch-at-entry placement still applies: the session's workspace
-    is the entry and the created worktree is recorded separately.
+    This is the body ``sys_session_open`` sends for ``branch``: the entry
+    reaches the host (the fake host places under it here) and the session's
+    workspace is the created worktree, not the entry.
     """
     cap = register_worktree_host(place_under_entry=True)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
@@ -905,8 +905,44 @@ async def test_explicit_project_create_keeps_entry_placement(
     assert cap.create[0].entry == _ENTRY
 
     body = resp.json()
-    assert body["workspace"] == _ENTRY
+    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
     assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+
+
+async def test_explicit_project_bind_launches_in_the_existing_worktree(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Binding an existing worktree inside the entry launches in it.
+
+    This is the body ``sys_session_open`` sends for ``workspace`` naming a
+    listed worktree: nothing is created and the session runs there.
+    """
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-explicit-bind-agent")
+    existing = f"{_ENTRY}/.worktrees/project/task"
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": existing,
+            "git": {"branch_name": "task/fix", "existing_worktree": True},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert cap.create == []
+    body = resp.json()
+    assert body["workspace"] == existing
+    assert body["worktree"] == existing
+    assert body["git_branch"] == "task/fix"
 
 
 async def test_child_of_project_without_entry_uses_sibling_placement(

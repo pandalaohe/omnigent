@@ -1159,9 +1159,7 @@ def register_core_routes(
 
         # Shared with the JSON create: a child created without an explicit
         # workspace keeps its directory and takes the parent's worktree;
-        # everything else launches at the project entry when the target sits
-        # strictly inside it and the entry passes the same spec boundary the
-        # target passed.
+        # everything else launches at the target.
         inherit_parent: Conversation | None = None
         if (
             parsed_metadata.parent_session_id is not None
@@ -1169,39 +1167,11 @@ def register_core_routes(
             and parent_conv is not None
         ):
             inherit_parent = parent_conv
-        entry_boundary: Callable[[], Awaitable[object]] | None = None
-        if project_resolution.entry is not None:
-            _entry_path = project_resolution.entry
-            _entry_host_id = parsed_metadata.host_id
-
-            async def _check_entry_boundary() -> object:
-                from omnigent.server.routes._session_create_validation import (
-                    validate_uploaded_bundle_host_workspace,
-                )
-
-                assert _entry_host_id is not None
-                return await validate_uploaded_bundle_host_workspace(
-                    user_id=user_id,
-                    host_id=_entry_host_id,
-                    workspace=_entry_path,
-                    spec_cwd=spec_cwd,
-                    host_store=getattr(request.app.state, "host_store", None),
-                    host_registry=getattr(request.app.state, "host_registry", None),
-                )
-
-            entry_boundary = _check_entry_boundary
-
-        placed_workspace, placed_worktree = await _place_project_session(
-            host_id=parsed_metadata.host_id,
-            project_id=project_resolution.project_id,
-            entry=project_resolution.entry,
+        _, placed_worktree = _place_project_session(
             target=parsed_metadata.workspace,
             git_used=False,
-            entry_boundary=entry_boundary,
             parent=inherit_parent,
         )
-        if placed_workspace != parsed_metadata.workspace:
-            parsed_metadata = parsed_metadata.model_copy(update={"workspace": placed_workspace})
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
