@@ -836,6 +836,43 @@ async def test_child_inherits_parent_project_entry_for_worktree_placement(
     assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
 
 
+async def test_child_naming_its_project_launches_in_its_worktree(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child that names its project launches in the worktree it cut.
+
+    This is ``sys_session_create`` with ``worktree`` and ``project_id``: the
+    project's entry fills the child's workspace and places the worktree, and
+    the child runs in that worktree, not at the entry.
+    """
+    cap = register_worktree_host(place_under_entry=True)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-child-named-project-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry == _ENTRY
+    body = resp.json()
+    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
+    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+
+
 async def test_child_with_explicit_null_project_inherits_no_entry(
     app: FastAPI,
     register_worktree_host: RegisterHost,
