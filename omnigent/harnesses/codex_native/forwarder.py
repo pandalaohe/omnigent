@@ -3678,7 +3678,7 @@ async def _handle_hook_completed(
     entries = run.get("entries")
     if not isinstance(entries, list):
         return
-    response_id = _response_id(_params_with_turn_id(params, run_id))
+    response_id = _hook_response_id(run_id)
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
@@ -9249,6 +9249,22 @@ def _response_id(params: _JsonObject) -> str:
     if isinstance(turn_id, str) and turn_id:
         return f"codex_{turn_id}"
     return "codex_native"
+
+
+def _hook_response_id(run_id: str) -> str:
+    """
+    Build a stable, bounded Omnigent response id for one Codex hook run.
+
+    Codex hook run ids embed the hooks file path, so the id carries a
+    digest of the run id rather than the run id itself; response ids are
+    stored in 64 characters.
+
+    :param run_id: Codex hook run id, e.g.
+        ``"session-start:3:/home/user/.codex/hooks.json"``.
+    :returns: Response id, e.g. ``"codex_hook_<32 hex chars>"``.
+    """
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
+    return f"codex_hook_{digest}"
 
 
 def _source_id(params: _JsonObject, item: _JsonObject) -> str:
