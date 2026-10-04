@@ -56,23 +56,31 @@ _PROJECT_ID = "aa11bb22cc33dd44ee55ff6600112233"
 
 
 class _ProjectDirs:
-    """In-memory project entries and bindings for the create route."""
+    """In-memory project entries and bindings for the create route.
+
+    ``entries_by_project`` scopes entries to one project; without it,
+    ``entries`` applies to every project (single-project tests).
+    """
 
     def __init__(
         self,
         *,
         entries: list[tuple[str, str]] = (),
         bindings: list[tuple[str, str]] = (),
+        entries_by_project: dict[str, list[tuple[str, str]]] | None = None,
     ) -> None:
         self._entries = list(entries)
         self._bindings = list(bindings)
+        self._entries_by_project = entries_by_project
 
     def list_entries(self, project_id: str) -> list[ProjectHostEntry]:
         """Return the project's per-host entries."""
-        return [
-            ProjectHostEntry(project_id, host_id, workspace, 1)
-            for host_id, workspace in self._entries
-        ]
+        rows = (
+            self._entries
+            if self._entries_by_project is None
+            else self._entries_by_project.get(project_id, [])
+        )
+        return [ProjectHostEntry(project_id, host_id, workspace, 1) for host_id, workspace in rows]
 
     def list_by_project(self, project_id: str) -> list[ProjectHostBinding]:
         """Return the project's primary bindings."""
@@ -757,20 +765,25 @@ async def test_create_rejects_forged_worktree_identity(
 async def _create_project_parent_session(
     client: httpx.AsyncClient,
     agent_id: str,
+    *,
+    project_id: str = _PROJECT_ID,
+    workspace: str = _ENTRY,
 ) -> str:
-    """Create a plain (no-git) parent session filed in ``_PROJECT_ID``.
+    """Create a plain (no-git) parent session filed in the given project.
 
     :param client: The test HTTP client.
     :param agent_id: Agent to bind.
+    :param project_id: Project to file the parent under.
+    :param workspace: The parent's (and its project's) directory.
     :returns: The new session's id, for use as ``parent_session_id``.
     """
     resp = await client.post(
         "/v1/sessions",
         json={
             "agent_id": agent_id,
-            "project_id": _PROJECT_ID,
+            "project_id": project_id,
             "host_id": _HOST_ID,
-            "workspace": _ENTRY,
+            "workspace": workspace,
         },
     )
     assert resp.status_code == 201, resp.text
@@ -1015,3 +1028,72 @@ async def test_named_sub_agent_child_sends_no_entry(
 
     assert len(cap.create) == 1, cap.create
     assert cap.create[0].entry is None
+
+
+_PROJECT_B = "90817263544536271809f8e7d6c5b4a3"
+_ROOT_A = "/opt/work/project-a"
+_ROOT_B = "/opt/work/project-b"
+_REPO_B = "/opt/work/project-b/repo"
+
+
+def _calling_config(workspace: str, model: str, effort: str) -> dict[str, object]:
+    """A project root on the test host whose per-host row names model / effort."""
+    return {
+        "host_id": _HOST_ID,
+        "workspace": workspace,
+        "calling_defaults": {
+            _HOST_ID: {"harnesses": {"claude-sdk": {"model": model, "effort": effort}}}
+        },
+    }
+
+
+async def test_child_worktree_from_another_projects_repo_lands_under_that_project(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child worktree cut from project B's repo lands under B's entry and takes B's defaults."""
+    cap = register_worktree_host(place_under_entry=True)
+    projects = SqlAlchemyProjectStore(db_uri)
+    projects.create(
+        _PROJECT_ID, "project-a", None, config=_calling_config(_ROOT_A, "model-a", "high")
+    )
+    projects.create(
+        _PROJECT_B, "project-b", None, config=_calling_config(_ROOT_B, "model-b", "low")
+    )
+    app.state.host_store = HostStore(db_uri)
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries_by_project={_PROJECT_B: [(_HOST_ID, _ROOT_B)]}
+    )
+    agent = await create_test_agent(client, name="wt-cross-project-agent")
+    parent_id = await _create_project_parent_session(
+        client, agent["id"], project_id=_PROJECT_ID, workspace=_ROOT_A
+    )
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _REPO_B,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    # The child named no project, but its workspace lives in B's root: the
+    # owner lookup files it under B and the frame carries B's entry, so the
+    # host cuts the worktree under B — not the parent project A's entry.
+    assert len(cap.create) == 1, cap.create
+    frame = cap.create[0]
+    assert frame.entry == _ROOT_B
+    assert frame.repo_path == _REPO_B
+
+    body = resp.json()
+    assert body["project_id"] == _PROJECT_B
+    assert body["model_override"] == "model-b"
+    assert body["reasoning_effort"] == "low"
+    assert body["workspace"] == f"{_ROOT_B}/.worktrees/repo/feature-x"
+    assert body["worktree"] == f"{_ROOT_B}/.worktrees/repo/feature-x"
