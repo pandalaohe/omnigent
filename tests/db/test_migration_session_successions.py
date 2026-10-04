@@ -25,9 +25,13 @@ def _run(uri: str, engine: sa.Engine, action: str, revision: str) -> None:
         getattr(command, action)(config, revision)
 
 
-def test_single_alembic_head_is_session_successions() -> None:
+def test_single_alembic_head_includes_session_successions() -> None:
+    """One head, and the session-successions revision is on the way to it."""
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
-    assert script.get_heads() == [_MIGRATION]
+    heads = script.get_heads()
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
+    lineage = {rev.revision for rev in script.iterate_revisions(heads[0], "base")}
+    assert _MIGRATION in lineage, "session-successions migration is not an ancestor of head"
     assert script.get_revision(_MIGRATION).down_revision == _PREVIOUS
 
 

@@ -140,12 +140,16 @@ map an area, remove it here in the same change.
 - Host import review: `tests/e2e_ui/onboarding/`
 - Visual snapshots: `tests/e2e_ui/visual/`
 - Onboarding: `tests/e2e_ui/onboarding/`
+- Composer attachment tokens: `tests/e2e_ui/composer/`
+- Projects (host entries and calling defaults): `tests/e2e_ui/projects/`
 
 **CLI commands:**
 
 - Setup and diagnostics: `omnigent setup`, `omnigent config`, `omnigent doctor`,
   `omnigent diagnose`, `omnigent debug`, `omnigent usage`
-- Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`
+- Server status: `omnigent system`
+- Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`,
+  `omnigent up`
 - Running agents and servers: `omnigent run`, `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,
   `omnigent import`
