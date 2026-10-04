@@ -123,14 +123,13 @@ def child_session_framework_instructions(*, has_parent: bool) -> list[str]:
     return [CHILD_QUIET_INSTRUCTION] if has_parent else []
 
 
-# A session can launch at a project directory while its git working tree sits
-# elsewhere (a linked worktree inside the project entry). Naming both keeps the
-# model editing and running git in the worktree instead of the shared project
-# directory.
+# A session's launch directory can differ from its git working tree: a launch
+# in a subdirectory of the tree, a child that took its parent's tree, or an
+# older session launched at the project entry. Naming both keeps the model
+# editing and running git in the tree.
 WORKTREE_INSTRUCTION = (
-    "You started in the project directory {workspace}. Your working tree is "
-    "{worktree}: make code changes, run git and tests there; the project "
-    "directory holds shared project files."
+    "Your launch directory is {workspace}. Your git working tree is "
+    "{worktree}: make code changes, run git and tests there."
 )
 
 # Steers models toward the embedded browser they are handed: the browser_*
@@ -331,8 +330,8 @@ def worktree_instruction(workspace: str | None, worktree: str | None) -> str | N
     both paths, so neither may be blank. Both paths are JSON-quoted into the
     line, so punctuation or newlines in a directory name cannot break out of it.
 
-    :param workspace: The session's launch directory (its project entry), or
-        ``None`` when it has none.
+    :param workspace: The session's launch directory, or ``None`` when it has
+        none.
     :param worktree: The session's recorded git working tree, or ``None``.
     :returns: The composed instruction, or ``None`` when no line applies.
     """
