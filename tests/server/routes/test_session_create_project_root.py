@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import session_open_rate
 from omnigent.server.app import create_app
@@ -34,6 +35,7 @@ from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
 ALICE = "alice@example.com"
+BOB = "bob@example.com"
 AGENT_ID = builtin_agent_id("generic-builtin")
 
 
@@ -830,6 +832,8 @@ class _PlacementSeams:
         self.canonical_prefix: str | None = None
         # The agent's boundary root; a workspace outside it fails validation.
         self.allowed: str | None = None
+        # Host-canonical path per raw workspace for the ownership lookup.
+        self.canonical_workspaces: dict[str, str] = {}
 
     async def validate(self, *, workspace: str | None, **kwargs: object) -> str:
         """Stand-in for ``_validate_session_workspace`` (the agent boundary)."""
@@ -861,8 +865,48 @@ class _PlacementSeams:
         return worktree_path
 
 
+class _WorkspaceHost:
+    """Fake host registry answering ``host.stat`` and runner launches."""
+
+    def __init__(self, canonical_workspaces: dict[str, str]) -> None:
+        self.canonical_workspaces = canonical_workspaces
+        self.conn = SimpleNamespace(host_id=_HOST, pending_stats={}, pending_launches={})
+        self.stats: list[str] = []
+
+    def get(self, host_id: str) -> object | None:
+        """The fake connection for the test host, ``None`` for other hosts."""
+        return self.conn if host_id == _HOST else None
+
+    async def admit_launch(self, conn: object, session_id: str) -> None:
+        """Accept the runner launch admission for the fake host."""
+
+    def send_text(self, conn: object, frame: str) -> None:
+        """Resolve a pending stat or launch frame with a canned success."""
+        decoded = decode_host_frame(frame)
+        if isinstance(decoded, HostStatFrame):
+            self.stats.append(decoded.path)
+            future = self.conn.pending_stats.pop(decoded.request_id, None)
+            if future is not None and not future.done():
+                future.set_result(
+                    {
+                        "status": "ok",
+                        "exists": True,
+                        "type": "directory",
+                        "canonical_path": self.canonical_workspaces.get(
+                            decoded.path, decoded.path
+                        ),
+                        "error": None,
+                    }
+                )
+            return
+        assert isinstance(decoded, HostLaunchRunnerFrame)
+        future = self.conn.pending_launches.pop(decoded.request_id, None)
+        if future is not None and not future.done():
+            future.set_result({"status": "ok"})
+
+
 @pytest.fixture()
-def placement(monkeypatch: pytest.MonkeyPatch) -> _PlacementSeams:
+def placement(app: FastAPI, monkeypatch: pytest.MonkeyPatch, db_uri: str) -> _PlacementSeams:
     """Install the fake host seams the JSON create calls."""
     from omnigent.server.routes._sessions import orchestration
 
@@ -870,6 +914,11 @@ def placement(monkeypatch: pytest.MonkeyPatch) -> _PlacementSeams:
     monkeypatch.setattr(orchestration, "_validate_session_workspace", seams.validate)
     monkeypatch.setattr(orchestration, "_create_session_worktree", seams.create_worktree)
     monkeypatch.setattr(orchestration, "_canonical_worktree_path", seams.canonicalise)
+    app.state.host_registry = _WorkspaceHost(seams.canonical_workspaces)
+    # The child workspace lookup authorizes its target host first.
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(_HOST, "desktop", ALICE)
+    app.state.host_store = host_store
     return seams
 
 
@@ -1080,6 +1129,207 @@ async def test_child_with_git_options_records_its_own_created_worktree(
     assert child.json()["worktree"] != parent_worktree
     assert child.json()["worktree"] == "/entry-worktrees/feature/child"
     assert child.json()["git_branch"] == "feature/child"
+
+
+def _calling_config(workspace: str, model: str, effort: str) -> dict[str, object]:
+    """A project root on the test host whose per-host row names model / effort."""
+    return {
+        "agent_id": AGENT_ID,
+        "host_id": _HOST,
+        "workspace": workspace,
+        "calling_defaults": {
+            _HOST: {"harnesses": {"claude-sdk": {"model": model, "effort": effort}}}
+        },
+    }
+
+
+async def _child(client: httpx.AsyncClient, parent_id: str, **payload: object) -> httpx.Response:
+    """POST an agent-initiated child create of the builtin agent."""
+    return await client.post(
+        "/v1/sessions",
+        json={"agent_id": AGENT_ID, "parent_session_id": parent_id, **payload},
+        headers=_headers(),
+    )
+
+
+async def test_child_workspace_adopts_owning_project_and_calling_defaults(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """A child workspace inside another project's root takes that project / its defaults."""
+    project_a = await _project(
+        client, "child-root-a", _calling_config("/repo-a", "model-a", "high")
+    )
+    project_b = await _project(
+        client, "child-root-b", _calling_config("/repo-b", "model-b", "low")
+    )
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(client, parent.json()["id"], host_id=_HOST, workspace="/repo-b/nested")
+    assert child.status_code == 201, child.text
+    body = child.json()
+    assert body["project_id"] == project_b
+    assert body["model_override"] == "model-b"
+    assert body["reasoning_effort"] == "low"
+
+
+async def test_child_explicit_project_beats_the_workspace_owner(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """An explicit project_id on the child wins over the workspace's owner."""
+    project_a = await _project(
+        client, "child-pin-a", _calling_config("/repo-a", "model-a", "high")
+    )
+    await _project(client, "child-pin-b", _calling_config("/repo-b", "model-b", "low"))
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(
+        client,
+        parent.json()["id"],
+        project_id=project_a,
+        host_id=_HOST,
+        workspace="/repo-b/nested",
+    )
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_a
+    assert child.json()["model_override"] == "model-a"
+    assert child.json()["reasoning_effort"] == "high"
+
+
+async def test_child_workspace_in_no_project_keeps_the_parents_project(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """A workspace no project owns leaves the child in the parent's project."""
+    project_a = await _project(
+        client, "child-unowned-a", _calling_config("/repo-a", "model-a", "high")
+    )
+    await _project(client, "child-unowned-b", _calling_config("/repo-b", "model-b", "low"))
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(client, parent.json()["id"], host_id=_HOST, workspace="/unowned/nested")
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_a
+    assert child.json()["model_override"] == "model-a"
+
+
+async def test_child_without_workspace_keeps_the_parents_project(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """A child that names no workspace keeps the parent's project and defaults."""
+    project_a = await _project(
+        client, "child-nows-a", _calling_config("/repo-a", "model-a", "high")
+    )
+    await _project(client, "child-nows-b", _calling_config("/repo-b", "model-b", "low"))
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(client, parent.json()["id"])
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_a
+    assert child.json()["model_override"] == "model-a"
+
+
+async def test_child_workspace_takes_the_deepest_owning_root(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """When roots nest, the deepest project root owning the workspace wins."""
+    project_outer = await _project(
+        client, "child-deep-outer", _calling_config("/repo", "model-outer", "high")
+    )
+    project_inner = await _project(
+        client, "child-deep-inner", _calling_config("/repo/sub", "model-inner", "low")
+    )
+    parent = await _post_create(client, project_outer, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(client, parent.json()["id"], host_id=_HOST, workspace="/repo/sub/nested")
+    assert child.status_code == 201, child.text
+    body = child.json()
+    assert body["project_id"] == project_inner
+    assert body["model_override"] == "model-inner"
+
+
+async def test_child_workspace_tie_keeps_the_parents_project(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """Two projects sharing one root leave the child in the parent's project."""
+    project_a = await _project(client, "child-tie-a", _calling_config("/repo", "model-a", "high"))
+    await _project(client, "child-tie-b", _calling_config("/repo", "model-b", "low"))
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(client, parent.json()["id"], host_id=_HOST, workspace="/repo/nested")
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_a
+    assert child.json()["model_override"] == "model-a"
+
+
+async def test_child_workspace_is_canonicalised_before_the_owner_lookup(
+    client: httpx.AsyncClient, placement: _PlacementSeams
+) -> None:
+    """A raw child workspace takes its host-canonical owner, not the raw one."""
+    project_a = await _project(
+        client, "child-canon-a", _calling_config("/repo-a", "model-a", "high")
+    )
+    project_b = await _project(
+        client, "child-canon-b", _calling_config("/repo-b", "model-b", "low")
+    )
+    placement.canonical_workspaces["/repo-a/../repo-b/nested"] = "/repo-b/nested"
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+    child = await _child(
+        client, parent.json()["id"], host_id=_HOST, workspace="/repo-a/../repo-b/nested"
+    )
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_b
+    assert child.json()["model_override"] == "model-b"
+
+
+async def test_child_workspace_lookup_failure_keeps_the_parents_project(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    placement: _PlacementSeams,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ownership lookup still files the child under the parent's project."""
+    project_a = await _project(
+        client, "child-fail-a", _calling_config("/repo-a", "model-a", "high")
+    )
+    await _project(client, "child-fail-b", _calling_config("/repo-b", "model-b", "low"))
+    parent = await _post_create(client, project_a, host_id=_HOST)
+    assert parent.status_code == 201, parent.text
+
+    def unavailable(*, user_id: str | None) -> list[object]:
+        raise RuntimeError("project store unavailable")
+
+    monkeypatch.setattr(app.state.project_store, "list", unavailable)
+    child = await _child(client, parent.json()["id"], host_id=_HOST, workspace="/repo-b/nested")
+    assert child.status_code == 201, child.text
+    assert child.json()["project_id"] == project_a
+    assert child.json()["model_override"] == "model-a"
+
+
+async def test_child_foreign_host_is_refused_before_any_stat(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A child naming another user's host is rejected without probing it.
+
+    The workspace-owner lookup runs before the normal host validation, so it
+    must authorize its target host the same way. Alice's child names Bob's
+    host: the create is rejected exactly as it is on a tree without the
+    lookup, and Bob's host never sees a ``host.stat``.
+    """
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(_HOST, "bob-desktop", BOB)
+    app.state.host_store = host_store
+    registry = _WorkspaceHost({})
+    app.state.host_registry = registry
+
+    parent = await client.post("/v1/sessions", json={"agent_id": AGENT_ID}, headers=_headers())
+    assert parent.status_code == 201, parent.text
+
+    child = await _child(client, parent.json()["id"], host_id=_HOST, workspace="/repo-a/nested")
+    assert child.status_code == 403, child.text
+    assert child.json()["detail"] == "not your host"
+    assert registry.stats == []
 
 
 async def test_multipart_create_places_a_nested_workspace_at_the_entry(

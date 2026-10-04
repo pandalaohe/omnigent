@@ -489,16 +489,24 @@ def register_open_routes(
                 git = SessionGitOptions(branch_name=body.branch, base_branch=body.from_ref)
             elif body.from_ref is not None:
                 git = SessionGitOptions(branch_name=f"open-{sid[:8]}", base_branch=body.from_ref)
-            create_body = ProjectSessionCreateRequest(
-                project_id=project.id,
-                host_id=host_id,
-                workspace=workspace,
-                agent_id=agent.id,
-                git=git,
-                title=body.title,
-                model_override=body.model,
-                reasoning_effort=body.reasoning_effort,
-            )
+            create_fields: dict[str, Any] = {
+                "project_id": project.id,
+                "host_id": host_id,
+                "workspace": workspace,
+                "agent_id": agent.id,
+                "title": body.title,
+            }
+            # Omitted fields fall through to create defaults: a plain open
+            # leaves git for the project hint, an explicit workspace pins it.
+            if body.workspace is not None or git is not None:
+                create_fields["git"] = git
+            # A null / empty model or effort is omitted, matching the runner's
+            # sys_session_create body, so the calling-defaults chain fills it.
+            if isinstance(body.model, str) and body.model:
+                create_fields["model_override"] = body.model
+            if isinstance(body.reasoning_effort, str) and body.reasoning_effort:
+                create_fields["reasoning_effort"] = body.reasoning_effort
+            create_body = ProjectSessionCreateRequest(**create_fields)
             _, conv = await _create_session_from_existing_agent(
                 conversation_store,
                 agent_store,
