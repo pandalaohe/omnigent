@@ -30,6 +30,15 @@ _TASK_ID_RE = re.compile(r"<(task-id|tool-use-id)>\s*([^<]+?)\s*</\1>")
 _COMPLETION_EVENT_TYPE = "session.subagent.completion-observed"
 _COMPLETION_RESOURCE_TYPE = "subagent_completion"
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# Native async tool-result statuses that close a background child, mapped onto
+# the terminal status vocabulary the parent notice renders.
+_ASYNC_TOOL_TERMINAL_STATUSES = {
+    "completed": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "killed": "cancelled",
+    "stopped": "cancelled",
+}
 
 
 def native_subagent_terminal_status(
@@ -247,6 +256,14 @@ def _claude_completion_ids(
     ):
         if item.data.subagent_return_id:
             task_ids[item.data.subagent_return_id] = "completed"
+    if isinstance(item.data, FunctionCallOutputData) and item.data.is_async is True:
+        # A converted Claude task-notification carries its terminal status only
+        # in the async tool-result metadata; read it so failed/killed children
+        # still get the parent "returned" link and completed ones get the call
+        # marker too.
+        status = _ASYNC_TOOL_TERMINAL_STATUSES.get(item.data.tool_status or "")
+        if status is not None:
+            call_ids[item.data.call_id] = status
     if isinstance(item.data, MessageData) and item.data.is_meta:
         for block in item.data.content:
             text = block.get("text")

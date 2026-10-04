@@ -1514,7 +1514,9 @@ def create_hosts_router(
                         # The recorded worktree is the canonical ROOT: the
                         # launch may relocate into a subdirectory of the new
                         # worktree, while delete cleanup, sharer checks and
-                        # git readers key on the root.
+                        # git readers key on the root. The host reports a
+                        # workspace even for an unrelocated worktree; only a
+                        # relocated one needs a second canonicalisation.
                         worktree_root = (
                             await _canonical_worktree_path(
                                 host_id=host_id,
@@ -1522,6 +1524,7 @@ def create_hosts_router(
                                 request=request,
                             )
                             if worktree.workspace is not None
+                            and not same_canonical_path(worktree.workspace, worktree.worktree_path)
                             else workspace
                         )
                     except BaseException:

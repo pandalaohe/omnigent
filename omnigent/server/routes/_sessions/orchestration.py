@@ -4303,9 +4303,9 @@ async def _persist_external_conversation_items(
     Matches :func:`_persist_external_conversation_item` per body for items
     that neither drain a pending input nor seed a title. As on the per-entry
     path, a malformed body raises only after the bodies before it are applied,
-    the append runs under the session's external-item lock, a transcript
-    identity conflict answers 409, and a re-posted item is flagged instead of
-    re-broadcast.
+    the append runs under the session's native-mirror lock
+    (:func:`_native_mirror_lock`), a transcript identity conflict answers 409,
+    and a re-posted item is flagged instead of re-broadcast.
 
     :returns: ``(item_id, replayed)`` per applied body, in body order.
     """
@@ -4547,8 +4547,8 @@ async def _enrich_terminal_status_with_subagent_output(
     to the store, not runner memory, so the text is read here and forwarded
     with the terminal edge.
 
-    Failed or explicitly cancelled turns are filled only when the forwarder
-    attached no output of its own. A harness-reported ``failure_detail`` wins
+    Forwarder-attached output always wins, for every status; the store fills in
+    only when the edge carries none. A harness-reported ``failure_detail`` wins
     over the store for failures; fallback text must belong to the current
     response or follow the latest user message when no response id is present.
     A turn stopped before any output must not borrow an earlier turn's reply.
@@ -11695,6 +11695,8 @@ async def _create_session_from_existing_agent(
                 # The recorded worktree is the canonical ROOT: the launch may
                 # relocate into a subdirectory of the new worktree, while
                 # delete cleanup, sharer checks and git readers key on the root.
+                # The host reports a workspace even for an unrelocated worktree;
+                # only a relocated one needs a second canonicalisation.
                 canonical_worktree_root = (
                     await _canonical_worktree_path(
                         host_id=body.host_id,
@@ -11702,6 +11704,7 @@ async def _create_session_from_existing_agent(
                         request=request,
                     )
                     if created_worktree.workspace is not None
+                    and not same_canonical_path(created_worktree.workspace, created_worktree_path)
                     else canonical_workspace
                 )
             except Exception:

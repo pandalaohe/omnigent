@@ -1,5 +1,7 @@
 """Lifecycle notices remain named, ordered, and idempotent across native delivery races."""
 
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
@@ -7,6 +9,7 @@ import pytest
 from sqlalchemy import event
 
 from omnigent.entities import MessageData, NewConversationItem
+from omnigent.harnesses.claude_native.bridge import read_transcript_items_from_offset
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _persist_external_conversation_items,
@@ -219,3 +222,84 @@ async def test_claude_completion_survives_retries_and_late_child_discovery(
         "title": "Inspect authentication",
         **({"status": expected} if expected else {}),
     }
+
+
+@pytest.mark.parametrize(
+    "notification_status,expected,markers",
+    [
+        ("completed", "completed", {("task", "completed"), ("call", "completed")}),
+        ("failed", "failed", {("call", "failed")}),
+        ("killed", "cancelled", {("call", "cancelled")}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bridge_async_notification_records_returned_link(
+    db_uri: str,
+    tmp_path: Path,
+    notification_status: str,
+    expected: str,
+    markers: set[tuple[str, str]],
+) -> None:
+    """A converted Claude task-notification keeps the failed/killed returned link."""
+    notification = (
+        "<task-notification>\n"
+        "<task-id>agent-1</task-id>\n"
+        "<tool-use-id>tool-1</tool-use-id>\n"
+        f"<status>{notification_status}</status>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"task-notification-{notification_status}",
+                "message": {"role": "user", "content": notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    [bridge_item] = result.items
+    assert bridge_item.item_type == "function_call_output"
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=parent.id, title="Explore:agent-1")
+    store.set_labels(
+        child.id,
+        {
+            "omnigent.claude_native.subagent_id": "agent-1",
+            "omnigent.claude_native.tool_use_id": "tool-1",
+        },
+    )
+    await record_subagent_activity(child.id, "delegated", store)
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "source_id": bridge_item.source_id,
+            "response_id": bridge_item.response_id,
+            "item_type": bridge_item.item_type,
+            "item_data": bridge_item.data,
+            "subagent_return_id": bridge_item.subagent_return_id,
+        },
+    )
+    await _persist_external_conversation_items(parent.id, [body], store)
+
+    completion_markers = {
+        (row.data.resource["kind"], row.data.resource["status"])
+        for row in store.list_items(parent.id, type="resource_event").data
+        if row.data.event_type == "session.subagent.completion-observed"
+    }
+    assert completion_markers == markers
+    returned = [
+        row
+        for row in store.list_items(parent.id, type="resource_event").data
+        if row.data.event_type == "session.subagent.returned"
+    ]
+    assert len(returned) == 1
+    assert returned[0].data.resource_id == child.id
+    assert returned[0].data.resource["status"] == expected
