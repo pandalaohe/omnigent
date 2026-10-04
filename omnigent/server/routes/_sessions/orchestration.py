@@ -11654,18 +11654,34 @@ async def _create_session_from_existing_agent(
             # checkout, not the entry itself.
             source_repo = canonical_workspace
             if (
-                project_resolution.entry is not None
-                and project_resolution.checkout is not None
+                project_resolution.worktree_entry is not None
+                and project_resolution.worktree_checkout is not None
                 and canonical_workspace is not None
-                and same_canonical_path(canonical_workspace, project_resolution.entry)
+                and same_canonical_path(canonical_workspace, project_resolution.worktree_entry)
             ):
-                source_repo = project_resolution.checkout
+                source_repo = project_resolution.worktree_checkout
+                if project_resolution.entry is None and not same_canonical_path(
+                    source_repo, canonical_workspace
+                ):
+                    # A child that named no project inherited this checkout
+                    # from its parent project, so it never passed the caller's
+                    # workspace validation; check it against the agent's
+                    # boundary before the host cuts from it.
+                    assert body.host_id is not None
+                    source_repo = await _validate_session_workspace(
+                        user_id=user_id,
+                        host_id=body.host_id,
+                        workspace=source_repo,
+                        agent=agent,
+                        agent_cache=agent_cache,
+                        request=request,
+                    )
             created_worktree = await _create_session_worktree(
                 host_id=body.host_id,
                 source_repo=source_repo,
                 git=body.git,
                 request=request,
-                entry=project_resolution.entry,
+                entry=project_resolution.worktree_entry,
             )
             # The host's path is canonicalised before any comparison or
             # persistence; rollback keeps the raw path it returned.
