@@ -3678,7 +3678,9 @@ async def _handle_hook_completed(
     entries = run.get("entries")
     if not isinstance(entries, list):
         return
-    response_id = _response_id(_params_with_turn_id(params, run_id))
+    # Hook run ids embed the hooks file path; response ids are stored in 64 chars.
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
+    response_id = f"codex_hook_{digest}"
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue

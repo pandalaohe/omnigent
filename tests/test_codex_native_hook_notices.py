@@ -6,8 +6,16 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from omnigent.db.db_models import SqlConversationItem
 from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES, ErrorData
 from omnigent.harnesses.codex_native import forwarder as fwd
+
+# Real Codex hook run ids are "<event>:<index>:<hooks file path>".
+_PATH_RUN_ID = (
+    "session-start:3:/home/user/.omnigent/codex-native/"
+    "0123456789abcdef0123456789abcdef/codex-home/hooks.json"
+)
+_RESPONSE_ID_MAX_CHARS = SqlConversationItem.__table__.c.response_id.type.length
 
 
 async def _forward(tmp_path, entries, *, thread="parent", run_id="hook-1", replay=False):
@@ -88,6 +96,23 @@ async def test_hook_notice_replay_and_child_routing(tmp_path: Path) -> None:
         != original[0].kwargs["json"]["data"]["source_id"]
     )
     assert await _forward(tmp_path, entries, thread="stale") == []
+
+
+@pytest.mark.asyncio
+async def test_hook_notice_response_id_fits_storage_for_path_run_ids(tmp_path: Path) -> None:
+    """A run id carrying the hooks file path still yields a storable, stable id."""
+    entries = [{"kind": "warning", "text": "Attention"}]
+    original = await _forward(tmp_path, entries, run_id=_PATH_RUN_ID)
+    replay = await _forward(tmp_path, entries, run_id=_PATH_RUN_ID, replay=True)
+    other_run = await _forward(
+        tmp_path, entries, run_id=_PATH_RUN_ID.replace("session-start:3:", "session-start:4:")
+    )
+    response_id = original[0].kwargs["json"]["data"]["response_id"]
+    assert len(_PATH_RUN_ID) > _RESPONSE_ID_MAX_CHARS
+    assert len(response_id) <= _RESPONSE_ID_MAX_CHARS
+    assert "hooks.json" not in response_id
+    assert replay[0].kwargs["json"]["data"]["response_id"] == response_id
+    assert other_run[0].kwargs["json"]["data"]["response_id"] != response_id
 
 
 @pytest.mark.asyncio
