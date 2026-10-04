@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ntpath
+import posixpath
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
@@ -15,6 +16,7 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
+from omnigent.stores.project_store import ProjectStore
 
 
 @dataclass(frozen=True)
@@ -301,3 +303,55 @@ async def load_eligible_host_ids(
         and getattr(host, "deleted_at", None) is None
         and (user_id is None or host.user_id == user_id)
     )
+
+
+def _root_depth(path: str) -> int:
+    """Count a host absolute path's components for deepest-root ordering."""
+    if _is_windows_absolute_path(path):
+        drive, tail = ntpath.splitdrive(ntpath.normpath(path))
+        depth = len([part for part in tail.split("\\") if part])
+        return depth + (1 if drive else 0)
+    return len([part for part in posixpath.normpath(path).split("/") if part])
+
+
+async def project_owning_workspace(
+    *,
+    project_store: ProjectStore,
+    binding_store: ProjectHostBindingStore | None,
+    user_id: str | None,
+    host_id: str | None,
+    workspace: str | None,
+) -> Project | None:
+    """The caller's project whose root on *host_id* contains *workspace*.
+
+    Candidates are the caller's own projects carrying a root on the host; the
+    deepest root wins, and no match / a shared-root tie returns ``None`` so
+    the caller keeps its fallback project. Containment follows
+    :func:`_is_subpath_of` (an equal path counts); roots that both contain a
+    path lie on one prefix chain, so a same-depth pair names one directory and
+    the tie rule sees it as ambiguous.
+
+    :param project_store: Owner-scoped project store.
+    :param binding_store: Per-project host directories, or ``None``.
+    :param user_id: Owner whose projects are candidates.
+    :param host_id: Host whose roots the workspace must live on, or ``None``.
+    :param workspace: Absolute directory on that host, or ``None``.
+    :returns: The owning project, or ``None``.
+    """
+    if host_id is None or not workspace:
+        return None
+    projects = await asyncio.to_thread(project_store.list, user_id=user_id)
+    best: Project | None = None
+    best_depth = -1
+    for project in projects:
+        bindings = await load_bindings(binding_store, project.id)
+        entries = await load_entries(binding_store, project.id)
+        root = root_on_host(project, bindings, host_id, entries=entries)
+        if root is None or not _is_subpath_of(workspace, root.workspace):
+            continue
+        depth = _root_depth(root.workspace)
+        if depth > best_depth:
+            best, best_depth = project, depth
+        elif depth == best_depth:
+            best = None
+    return best

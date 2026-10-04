@@ -157,7 +157,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
-from omnigent.server.project_placement import same_canonical_path
+from omnigent.server.project_placement import project_owning_workspace, same_canonical_path
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -167,6 +167,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._session_create_validation import (
     CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
+    _authorize_host_for_workspace,
     validate_session_agent,
     validate_session_model_metadata,
 )
@@ -373,6 +374,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_runner_client,
     effective_host_id,
 )
+from omnigent.server.routes._workspace_validation import validate_workspace
 from omnigent.server.runner_session_init import (
     RunnerSessionInitializer,
     runner_archive_states_for_conversation,
@@ -11169,9 +11171,9 @@ async def _create_session_from_existing_agent(
     )
 
     request_fields_set = body.model_fields_set
-    # The parent's project and host feed a child's calling defaults, so the
-    # owner-checked lookup runs before the resolver. The parent conversation
-    # is reused below for runner affinity.
+    # The owner-checked project / host lookup feeds a child's calling defaults,
+    # so it runs before the resolver; a child naming a workspace takes the
+    # project owning that directory instead. The parent row is reused below.
     parent_conv: Conversation | None = None
     parent_project: Project | None = None
     parent_host_id: str | None = None
@@ -11187,6 +11189,59 @@ async def _create_session_from_existing_agent(
                 parent_project = await asyncio.to_thread(
                     project_store.get, parent_conv.project_id, user_id=user_id
                 )
+            if (
+                "project_id" not in request_fields_set
+                and "workspace" in request_fields_set
+                and project_store is not None
+            ):
+                host_registry = getattr(request.app.state, "host_registry", None)
+                host_store = getattr(request.app.state, "host_store", None)
+                owning_host_id = body.host_id or parent_host_id
+                if (
+                    host_registry is not None
+                    and host_store is not None
+                    and owning_host_id is not None
+                    and body.workspace
+                ):
+                    # Ownership before the stat round-trip: a non-owner falls
+                    # through silently to the parent's project and the normal
+                    # validation below still rejects an explicit foreign host.
+                    try:
+                        await _authorize_host_for_workspace(
+                            user_id=user_id,
+                            host_id=owning_host_id,
+                            host_store=host_store,
+                            host_registry=host_registry,
+                        )
+                    except Exception:  # noqa: BLE001 - optional lookup never fails a create
+                        pass
+                    else:
+                        try:
+                            canonical_owning_workspace = await validate_workspace(
+                                host_registry=host_registry,
+                                host_id=owning_host_id,
+                                workspace=body.workspace,
+                                spec_cwd=None,
+                                host_name_for_errors=None,
+                            )
+                            owning = await project_owning_workspace(
+                                project_store=project_store,
+                                binding_store=getattr(
+                                    request.app.state, "project_host_binding_store", None
+                                ),
+                                user_id=user_id,
+                                host_id=owning_host_id,
+                                workspace=canonical_owning_workspace,
+                            )
+                            if owning is not None:
+                                parent_project = owning
+                        except Exception:  # noqa: BLE001 - optional lookup never fails a create
+                            _logger.warning(
+                                "Project lookup for child workspace %r failed; keeping the "
+                                "parent's project",
+                                body.workspace,
+                                exc_info=True,
+                            )
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -11561,8 +11616,8 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
-    # The parent lookup ran before the resolver; a parent project only counts
-    # for inheritance when this caller still owns it.
+    # The project lookup ran before the resolver; it only counts for
+    # inheritance when this caller still owns it.
     child_project_id: str | None = parent_project.id if parent_project is not None else None
     if body.parent_session_id is not None and parent_conv is not None:
         inherited_runner_id = parent_conv.runner_id

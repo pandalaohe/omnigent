@@ -23,11 +23,18 @@ from fastapi.responses import JSONResponse
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Agent, ProjectHostBinding
 from omnigent.errors import OmnigentError
+from omnigent.native.native_coding_agents import (
+    CLAUDE_NATIVE_AGENT_NAME,
+    native_coding_agent_for_agent_name,
+)
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server import session_open_rate
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes._host_worktree import WorktreeProxyError
+from omnigent.server.routes._session_create_validation import (
+    resolve_project_session_create,
+)
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes.sessions import routes_open
 from omnigent.server.routes.sessions.routes_open import register_open_routes
@@ -686,6 +693,107 @@ async def test_open_creates_top_level_owned_session(
     assert any(g.user_id == ALICE and g.level >= LEVEL_OWNER for g in grants)
     assert captured["kwargs"]["calling_path_label"] == "sys_session_open"
     assert captured["kwargs"]["user_id"] == ALICE
+
+
+@pytest.mark.asyncio
+async def test_plain_open_leaves_model_effort_and_git_for_defaults(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain open omits model / effort / git so project defaults can fill them."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"])
+    assert data["state"] == "opened"
+    body = captured["body"]
+    assert "model_override" not in body.model_fields_set
+    assert "reasoning_effort" not in body.model_fields_set
+    assert "git" not in body.model_fields_set
+
+
+@pytest.mark.asyncio
+async def test_open_model_and_effort_stay_explicit(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open that names model / effort keeps them explicit on the create body."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            model="databricks-claude-sonnet-4-6",
+            reasoning_effort="high",
+        )
+    assert data["state"] == "opened"
+    body = captured["body"]
+    assert body.model_fields_set >= {"model_override", "reasoning_effort"}
+    assert body.model_override == "databricks-claude-sonnet-4-6"
+    assert body.reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_open_null_model_and_effort_are_omitted_like_the_runner(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit JSON null falls through to defaults, matching sys_session_create."""
+    env = open_env
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            model=None,
+            reasoning_effort=None,
+        )
+    assert data["state"] == "opened"
+    body = captured["body"]
+    assert "model_override" not in body.model_fields_set
+    assert "reasoning_effort" not in body.model_fields_set
+
+
+@pytest.mark.asyncio
+async def test_plain_open_body_lets_project_calling_defaults_fill(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The captured plain-open body resolves model / effort from the project row."""
+    env = open_env
+    native_agent_id = generate_agent_id()
+    env["agents"].create(native_agent_id, CLAUDE_NATIVE_AGENT_NAME, "test:///bundle")
+    native_agent = native_coding_agent_for_agent_name(CLAUDE_NATIVE_AGENT_NAME)
+    assert native_agent is not None
+    config = dict(env["project"].config)
+    config["calling_defaults"] = {
+        HOST_ID: {
+            "harnesses": {native_agent.harness: {"model": "project-model", "effort": "high"}}
+        }
+    }
+    env["projects"].update(env["project"].id, user_id=ALICE, config=config)
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client, env["sender"].id, env["sender_token"], agent=CLAUDE_NATIVE_AGENT_NAME
+        )
+    assert data["state"] == "opened"
+    state = SimpleNamespace(
+        host_store=None,
+        agent_store=env["agents"],
+        agent_cache=None,
+        user_preferences_store=None,
+        host_model_catalog_cache_store=None,
+    )
+    resolved = await resolve_project_session_create(
+        body=captured["body"],
+        user_id=ALICE,
+        project_store=env["projects"],
+        binding_store=env["bindings_store"],
+        request=SimpleNamespace(app=SimpleNamespace(state=state)),
+        apply_calling_defaults=True,
+    )
+    assert resolved.body.model_override == "project-model"
+    assert resolved.body.reasoning_effort == "high"
 
 
 @pytest.mark.asyncio
