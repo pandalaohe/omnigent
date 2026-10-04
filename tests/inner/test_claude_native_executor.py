@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import threading
 from pathlib import Path
@@ -24,6 +25,7 @@ from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.llms.context_window import ModelPricing
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -1931,3 +1933,211 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_maps_a_guard_skip_onto_the_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A guard refusal comes back as the skip receipt, with the inject lock held throughout."""
+    bridge_dir = tmp_path / "bridge"
+    observed: dict[str, Any] = {}
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        observed["bridge_dir"] = bridge_dir_arg
+        observed["lock_held"] = executor._inject_lock.locked()
+        return claude_bridge.KeepWarmBtwResult("skipped", "composer_draft")
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert observed == {"bridge_dir": bridge_dir, "lock_held": True}
+    assert not executor._inject_lock.locked()
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "skipped",
+        "reason": "composer_draft",
+        "input_total": None,
+        "cache_read": None,
+        "cache_write": None,
+        "cost_usd": None,
+        "estimated": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_receipt_estimates_cost_from_the_statusline_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``ok`` prices the session's current context tokens (input + cache
+    creation + cache read from ``context.json``) as cache reads on the
+    statusLine's model, flagged ``estimated``.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "context.json").write_text(
+        json.dumps(
+            {
+                "context_window_size": 1000000,
+                "model": "claude-sonnet-4-6",
+                "current_usage": {
+                    "input_tokens": 1000,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 34000,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "run_keep_warm_btw",
+        lambda _: claude_bridge.KeepWarmBtwResult("ok", None),
+    )
+    priced: dict[str, Any] = {}
+
+    def fake_pricing(model: str) -> ModelPricing:
+        priced["model"] = model
+        return ModelPricing(
+            input_per_token=3e-6,
+            output_per_token=15e-6,
+            cache_read_per_token=3e-7,
+            cache_write_per_token=3.75e-6,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", fake_pricing)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert priced["model"] == "claude-sonnet-4-6"
+    assert receipt["attempt_id"] == "att-1"
+    assert receipt["outcome"] == "ok"
+    assert receipt["reason"] is None
+    assert receipt["input_total"] is None
+    assert receipt["cache_read"] == 37000
+    assert receipt["cache_write"] is None
+    assert receipt["cost_usd"] == pytest.approx(0.0111)
+    assert receipt["estimated"] is True
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_receipt_leaves_cost_none_when_unpriceable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No snapshot at all → tokens unknown; an unpriceable model → no dollar figure."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setattr(
+        claude_native_executor,
+        "run_keep_warm_btw",
+        lambda _: claude_bridge.KeepWarmBtwResult("ok", None),
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": None,
+        "cache_read": None,
+        "cache_write": None,
+        "cost_usd": None,
+        "estimated": True,
+    }
+
+    (bridge_dir / "context.json").write_text(
+        json.dumps(
+            {
+                "context_window_size": 1000000,
+                "model": "some-unpriced-model",
+                "current_usage": {"input_tokens": 37000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", lambda _: None)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert receipt["cache_read"] == 37000
+    assert receipt["cost_usd"] is None
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_bridge_failure_reports_harness_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A tmux failure mid-sequence is one failed ping, and the lock is released."""
+
+    def fail_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        del bridge_dir_arg
+        raise RuntimeError("tmux command failed (rc=1): no server")
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fail_run)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert not executor._inject_lock.locked()
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "failed",
+        "reason": "harness_error",
+        "input_total": None,
+        "cache_read": None,
+        "cache_write": None,
+        "cost_usd": None,
+        "estimated": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_cancellation_drains_the_worker_before_releasing_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Cancel mid-sequence: the inject lock stays held until the bridge
+    worker has finished, and the cancel flag refuses the worker's next key.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    observed: dict[str, Any] = {}
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        del bridge_dir_arg
+        started.set()
+        assert release.wait(timeout=5.0), "test must release the worker"
+        # The bridge runs this check before every key it sends.
+        try:
+            claude_bridge._check_injection_cancelled()
+        except claude_bridge.ClaudeInjectionCancelled:
+            observed["key_blocked"] = True
+        return claude_bridge.KeepWarmBtwResult("ok", None)
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    task = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="claude"))
+    assert await asyncio.to_thread(started.wait, 5.0), "the worker must start"
+
+    task.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done(), "the ping must wait for the worker, not abandon it"
+    assert executor._inject_lock.locked()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert observed["key_blocked"] is True
+    assert not executor._inject_lock.locked()

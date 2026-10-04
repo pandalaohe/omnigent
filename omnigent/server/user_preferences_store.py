@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
@@ -54,6 +55,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "calling_last",
         "session_collab",
         "host_colors",
+        "keep_warm",
     }
 )
 
@@ -262,6 +264,18 @@ def _parse_collab_value(kind: _CollabFieldKind, raw: Any) -> Any | None:
             return None
 
 
+def _parse_collab_settings(value: Any) -> CollabSettings:
+    """Resolve one stored ``session_collab`` namespace value, defaulting per field."""
+    if not isinstance(value, dict):
+        return CollabSettings()
+    resolved: dict[str, Any] = {}
+    for json_key, field_name, kind in _COLLAB_SETTING_FIELDS:
+        parsed = _parse_collab_value(kind, value.get(json_key))
+        if parsed is not None:
+            resolved[field_name] = parsed
+    return CollabSettings(**resolved)
+
+
 def read_collab_settings(
     store: SqlAlchemyUserPreferencesStore | None,
     owner: str | None,
@@ -298,15 +312,289 @@ def read_collab_settings(
     settings = envelope.get("settings")
     if not isinstance(settings, dict):
         return CollabSettings()
-    value = settings.get(SESSION_COLLAB_NAMESPACE)
+    return _parse_collab_settings(settings.get(SESSION_COLLAB_NAMESPACE))
+
+
+KEEP_WARM_NAMESPACE = "keep_warm"
+KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S = 3300
+KEEP_WARM_CODEX_DEFAULT_INTERVAL_S = 1500
+KEEP_WARM_DEFAULT_MAX_S = 14400
+KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_S = 14400
+
+
+@dataclass(frozen=True)
+class AgentKeepWarm:
+    """
+    Stored keep-warm row for one agent.
+
+    :param main: Whether this agent's main sessions are kept warm.
+    :param child: Whether this agent's active children are kept warm.
+    :param interval_s: Stored ping interval in seconds, or ``None`` when the
+        row takes the family default.
+    :param max_s: Longest keep-warm run per session, in seconds.
+    """
+
+    main: bool
+    child: bool
+    interval_s: int | None
+    max_s: int
+
+
+@dataclass(frozen=True)
+class KeepWarmSettings:
+    """
+    Resolved ``keep_warm`` namespace for one session owner.
+
+    :param agents: Per-agent rows keyed by agent id; an absent agent is off.
+    :param host_offline_archive_s: Seconds a host stays offline before its
+        children auto-archive; ``0`` disables auto-archive.
+    :param migrated_from_legacy_at: Unix time of the one-time legacy
+        migration, or ``None`` when it never ran.
+    :param present: Whether the ``keep_warm`` namespace exists in the stored
+        envelope; the legacy migration runs only when it does not.
+    """
+
+    agents: dict[str, AgentKeepWarm]
+    host_offline_archive_s: int
+    migrated_from_legacy_at: int | None
+    present: bool
+
+
+@dataclass(frozen=True)
+class ResolvedAgentKeepWarm:
+    """
+    One agent's keep-warm row resolved for a family: defaults applied, clamped.
+
+    :param main: Whether this agent's main sessions are kept warm.
+    :param child: Whether this agent's active children are kept warm.
+    :param interval_s: Effective ping interval in seconds, clamped to the
+        family bounds.
+    :param max_s: Effective run cap in seconds, clamped to the shared bounds.
+    """
+
+    main: bool
+    child: bool
+    interval_s: int
+    max_s: int
+
+
+def _default_keep_warm_settings(*, present: bool = False) -> KeepWarmSettings:
+    return KeepWarmSettings(
+        agents={},
+        host_offline_archive_s=KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_S,
+        migrated_from_legacy_at=None,
+        present=present,
+    )
+
+
+def read_keep_warm_settings(
+    store: SqlAlchemyUserPreferencesStore | None,
+    owner: str | None,
+) -> KeepWarmSettings:
+    """
+    Read one owner's keep-warm settings, defaulting on any gap.
+
+    The keep-warm path must never fail on a malformed preference row: a
+    missing store / owner / namespace, a non-object namespace value, an
+    invalid field, a row that fails store validation, or a database error all
+    resolve to the fail-safe defaults. Per agent row, ``main`` / ``child``
+    accept only a JSON boolean (anything else reads ``False``),
+    ``intervalSeconds`` accepts only a positive int (anything else reads
+    ``None`` = the family default) and ``maxSeconds`` a positive int (else the
+    default); a row that is not an object is skipped.
+    ``hostOfflineArchiveSeconds`` accepts a non-negative int and clamps to the
+    shared keep-warm bounds (``0`` stays ``0`` = disabled). A namespace that
+    exists but holds garbage still reports ``present=True``, so the legacy
+    migration stays a no-op for it. Unknown keys are ignored.
+
+    :param store: Preferences store, or ``None`` when the server has no
+        synced preferences.
+    :param owner: Session owner whose settings apply, or ``None`` when the
+        session has no resolvable owner.
+    :returns: The owner's :class:`KeepWarmSettings`, or the defaults.
+    """
+    if store is None or owner is None:
+        return _default_keep_warm_settings()
+    try:
+        envelope = store.get(owner)
+    except UserPreferencesValidationError:
+        return _default_keep_warm_settings()
+    except SQLAlchemyError:
+        logger.warning("Failed to read keep-warm preferences for %s", owner, exc_info=True)
+        return _default_keep_warm_settings()
+    if not isinstance(envelope, dict):
+        return _default_keep_warm_settings()
+    settings = envelope.get("settings")
+    if not isinstance(settings, dict):
+        return _default_keep_warm_settings()
+    if KEEP_WARM_NAMESPACE not in settings:
+        return _default_keep_warm_settings()
+    value = settings[KEEP_WARM_NAMESPACE]
     if not isinstance(value, dict):
-        return CollabSettings()
-    resolved: dict[str, Any] = {}
-    for json_key, field_name, kind in _COLLAB_SETTING_FIELDS:
-        parsed = _parse_collab_value(kind, value.get(json_key))
-        if parsed is not None:
-            resolved[field_name] = parsed
-    return CollabSettings(**resolved)
+        return _default_keep_warm_settings(present=True)
+    agents: dict[str, AgentKeepWarm] = {}
+    raw_agents = value.get("agents")
+    if isinstance(raw_agents, dict):
+        for agent_id, row in raw_agents.items():
+            if not isinstance(row, dict):
+                continue
+            raw_main = row.get("main")
+            raw_child = row.get("child")
+            interval_s = _parse_collab_value("positive_int", row.get("intervalSeconds"))
+            max_s = _parse_collab_value("positive_int", row.get("maxSeconds"))
+            agents[agent_id] = AgentKeepWarm(
+                main=raw_main if isinstance(raw_main, bool) else False,
+                child=raw_child if isinstance(raw_child, bool) else False,
+                interval_s=interval_s,
+                max_s=max_s if max_s is not None else KEEP_WARM_DEFAULT_MAX_S,
+            )
+    raw_host = value.get("hostOfflineArchiveSeconds")
+    if isinstance(raw_host, int) and not isinstance(raw_host, bool) and raw_host >= 0:
+        host_offline_archive_s = clamp_host_offline_archive_s(raw_host)
+    else:
+        host_offline_archive_s = KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_S
+    raw_migrated = value.get("migratedFromLegacyAt")
+    migrated_from_legacy_at = (
+        raw_migrated
+        if isinstance(raw_migrated, int) and not isinstance(raw_migrated, bool)
+        else None
+    )
+    return KeepWarmSettings(
+        agents=agents,
+        host_offline_archive_s=host_offline_archive_s,
+        migrated_from_legacy_at=migrated_from_legacy_at,
+        present=True,
+    )
+
+
+def keep_warm_for_agent(
+    settings: KeepWarmSettings,
+    agent_id: str | None,
+    family: Literal["claude", "codex"],
+) -> ResolvedAgentKeepWarm | None:
+    """
+    Resolve one agent's keep-warm row, or ``None`` when the agent is off.
+
+    A ``None`` agent id and an agent absent from the settings both resolve to
+    ``None`` (absent = off). A stored interval of ``None`` takes the family
+    default; the interval clamps to the family bounds and the cap to the
+    shared keep-warm bounds.
+
+    :param settings: The owner's resolved keep-warm settings.
+    :param agent_id: Agent whose row applies, or ``None``.
+    :param family: Model family, selecting the default and interval bounds.
+    :returns: The resolved row, or ``None`` when keep-warm is off.
+    """
+    if agent_id is None:
+        return None
+    row = settings.agents.get(agent_id)
+    if row is None:
+        return None
+    if family == "claude":
+        default_interval = KEEP_WARM_CLAUDE_DEFAULT_INTERVAL_S
+        bounds = KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_S
+    else:
+        default_interval = KEEP_WARM_CODEX_DEFAULT_INTERVAL_S
+        bounds = KEEP_WARM_CODEX_INTERVAL_BOUNDS_S
+    interval = row.interval_s if row.interval_s is not None else default_interval
+    low, high = bounds
+    interval_s = min(max(interval, low), high)
+    max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
+    max_s = min(max(row.max_s, max_low), max_high)
+    return ResolvedAgentKeepWarm(
+        main=row.main, child=row.child, interval_s=interval_s, max_s=max_s
+    )
+
+
+def clamp_host_offline_archive_s(value: int) -> int:
+    """
+    Clamp the host-offline auto-archive delay to the keep-warm bounds.
+
+    ``0`` disables auto-archive and stays ``0``.
+
+    :param value: Stored delay in seconds.
+    :returns: The clamped delay in seconds.
+    """
+    if value == 0:
+        return 0
+    low, high = KEEP_WARM_MAX_BOUNDS_S
+    return min(max(value, low), high)
+
+
+def migrate_legacy_keep_warm(
+    store: SqlAlchemyUserPreferencesStore | None,
+    owner: str | None,
+    native_agents: Iterable[tuple[str, str]],
+    now: int,
+) -> bool:
+    """
+    Run the one-time migration of the legacy child keep-warm switch.
+
+    Runs only when the owner's ``keep_warm`` namespace is absent and the
+    legacy switch was effectively on — the legacy sweeper required both
+    ``session_collab.enabled`` and ``session_collab.childKeepWarmEnabled``.
+    It then writes one ``{main: false, child: true}`` row per currently
+    existing native agent with the legacy interval of that agent's family,
+    plus the default host-offline delay and the migration timestamp. An agent
+    created afterwards stays absent, hence off. The legacy keys are never
+    changed or deleted. One ``store.get`` decides both the namespace's
+    presence and the legacy flags: a store error logs a warning and returns
+    ``False`` without writing, so a failed read cannot pass for an absent
+    namespace and clobber an explicit setting on a later retry; this never
+    raises.
+
+    :param store: Preferences store, or ``None`` when the server has no
+        synced preferences.
+    :param owner: Owner to migrate, or ``None``.
+    :param native_agents: ``(agent_id, family)`` pairs of the claude-native /
+        codex-native agents existing now.
+    :param now: Unix time recorded as ``migratedFromLegacyAt``.
+    :returns: ``True`` when the namespace was written.
+    """
+    if store is None or owner is None:
+        return False
+    try:
+        envelope = store.get(owner)
+        if not isinstance(envelope, dict):
+            return False
+        settings = envelope.get("settings")
+        if not isinstance(settings, dict):
+            return False
+        if KEEP_WARM_NAMESPACE in settings:
+            return False
+        collab = _parse_collab_settings(settings.get(SESSION_COLLAB_NAMESPACE))
+        if not (collab.enabled and collab.keep_warm_enabled):
+            return False
+        agents: dict[str, Any] = {}
+        for agent_id, family in native_agents:
+            interval = (
+                collab.keep_warm_claude_interval_s
+                if family == "claude"
+                else collab.keep_warm_codex_interval_s
+            )
+            agents[agent_id] = {
+                "main": False,
+                "child": True,
+                "intervalSeconds": interval,
+                "maxSeconds": KEEP_WARM_DEFAULT_MAX_S,
+            }
+        store.patch_namespace(
+            owner,
+            KEEP_WARM_NAMESPACE,
+            {
+                "agents": agents,
+                "hostOfflineArchiveSeconds": KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_S,
+                "migratedFromLegacyAt": now,
+            },
+        )
+    except (
+        SQLAlchemyError,
+        UserPreferencesValidationError,
+        UserPreferencesUserNotFoundError,
+    ):
+        logger.warning("Failed to migrate legacy keep-warm settings for %s", owner, exc_info=True)
+        return False
+    return True
 
 
 def _validate_json(value: Any, *, depth: int = 0) -> None:

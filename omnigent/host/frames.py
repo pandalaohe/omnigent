@@ -56,11 +56,17 @@ CAP_FS_READ_RAW = "fs_read_raw"
 # ``host.resource_sampling`` leases; the server gates fast-mode on this.
 CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
 
+# The runner answers keep-warm controls (``keep_warm_ping`` / ``keep_warm_touch``)
+# and posts ``external_keep_warm_receipt`` events; the server pings only runners
+# that advertise it (older runners would forward an unknown type to the harness).
+CAP_KEEP_WARM = "keep_warm_v1"
+
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_FS_READ_RAW,
+    CAP_KEEP_WARM,
     CAP_RESOURCE_SNAPSHOT,
 ]
 

@@ -10521,7 +10521,8 @@
                 "calling_defaults",
                 "calling_last",
                 "session_collab",
-                "host_colors"
+                "host_colors",
+                "keep_warm"
               ]
             },
             "title": "Settings",
@@ -12772,6 +12773,7 @@
                         "calling_last",
                         "context_indicator",
                         "host_colors",
+                        "keep_warm",
                         "keyboard_shortcuts",
                         "mobile_assistant",
                         "session_collab",
@@ -12854,7 +12856,8 @@
                 "calling_defaults",
                 "calling_last",
                 "session_collab",
-                "host_colors"
+                "host_colors",
+                "keep_warm"
               ],
               "title": "Namespace",
               "type": "string"

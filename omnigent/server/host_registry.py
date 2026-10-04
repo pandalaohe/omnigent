@@ -38,7 +38,12 @@ from omnigent.db.account_authority import (
     current_account_user,
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame, HostSkillsResultFrame
+from omnigent.host.frames import (
+    CAP_CODEX_SIDE_CHAT,
+    CAP_KEEP_WARM,
+    HostHelloFrame,
+    HostSkillsResultFrame,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -581,6 +586,25 @@ class HostRegistry:
         if conn is None:
             return True
         return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
+
+    def host_supports_keep_warm(self, host_id: str, workspace_id: int | None = None) -> bool:
+        """Whether the connected host's build answers keep-warm controls.
+
+        Reads the ``keep_warm_v1`` capability the host advertised in its hello
+        frame. Fails CLOSED: an offline/unknown host reads unsupported — a
+        keep-warm control sent to a host we cannot see would be forwarded to
+        the harness by an old runner's generic fall-through.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``True`` only for a connected host advertising
+            ``keep_warm_v1``.
+        """
+        conn = self.get(host_id, workspace_id)
+        if conn is None:
+            return False
+        return CAP_KEEP_WARM in conn.hello.capabilities
 
     def record_gateway_inference(
         self,

@@ -600,7 +600,9 @@ def test_tmux_last_client_input_at_none_on_unparseable_output(
     Garbage from tmux is treated as "no evidence", not a crash.
 
     An old tmux echoes unknown format variables back verbatim; the reaper must
-    fall back to its other signals rather than read that as a keypress.
+    fall back to its other signals rather than read that as a keypress. The
+    readable form flags the same output as unreadable, so a caller gating on
+    inactivity never mistakes it for "nobody is typing".
     """
     import subprocess
 
@@ -610,4 +612,5 @@ def test_tmux_last_client_input_at_none_on_unparseable_output(
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert native_cost_popup._tmux_last_client_input("/tmp/x.sock", "main") == (False, None)
     assert native_cost_popup._tmux_last_client_input_at("/tmp/x.sock", "main") is None

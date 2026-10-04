@@ -10,6 +10,7 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -18,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     ClaudeTerminalExited,
+    KeepWarmBtwResult,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -25,10 +27,12 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     read_active_session_id,
+    read_claude_context_state,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    run_keep_warm_btw,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -46,6 +50,7 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     framework_notices,
 )
+from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
@@ -125,6 +130,65 @@ class ClaudeNativeExecutor(Executor):
         except RuntimeError:
             return False
         return True
+
+    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
+        """
+        Ping the pane with a guarded ``/btw`` side question (keep-warm).
+
+        The whole guard-and-paste sequence runs under ``_inject_lock``,
+        so a real message arriving meanwhile simply waits the few
+        seconds the exchange takes — keystrokes never interleave.
+        Cancellation sets a stop flag the bridge checks before every
+        key it sends, and the lock is released only after the worker
+        thread finished. ``/btw`` answers have no tool access, so the
+        ping can never do real work. Claude Code reports no usage for
+        side questions, so the receipt estimates cost: the session's
+        current context tokens (the statusLine snapshot) priced as
+        cache reads.
+
+        :param attempt_id: Server-allocated ping attempt id, echoed on
+            the receipt.
+        :param family: Model family from the server; unused — the
+            claude-native channel only ever serves ``"claude"``.
+        :returns: The normalized receipt dict.
+        """
+        del family
+        async with self._inject_lock:
+            try:
+                result = await self._keep_warm_btw()
+            except Exception:
+                _logger.exception(
+                    "claude-native: keep-warm ping failed",
+                    extra={"session_id": self._request_session_id},
+                )
+                return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+        if result.outcome != "ok":
+            return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
+        cache_read = _current_context_tokens(self._bridge_dir)
+        return _keep_warm_receipt(
+            attempt_id,
+            outcome="ok",
+            reason=None,
+            cache_read=cache_read,
+            cost_usd=_keep_warm_cost_usd(self._bridge_dir, cache_read),
+            estimated=True,
+        )
+
+    async def _keep_warm_btw(self) -> KeepWarmBtwResult:
+        """Run the bridge sequence in a worker drained before return (no ``_inject`` pane reap)."""
+        cancelled = threading.Event()
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(asyncio.to_thread(run_keep_warm_btw, self._bridge_dir))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            raise
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
@@ -434,6 +498,89 @@ def _bridge_dir_from_env() -> Path:
     if not raw:
         raise RuntimeError(f"{BRIDGE_DIR_ENV_VAR} is required for claude-native harness")
     return Path(raw)
+
+
+def _keep_warm_receipt(
+    attempt_id: str,
+    *,
+    outcome: str,
+    reason: str | None,
+    cache_read: int | None = None,
+    cost_usd: float | None = None,
+    estimated: bool = False,
+) -> dict[str, Any]:
+    """
+    Build one normalized keep-warm receipt.
+
+    :param attempt_id: Ping attempt id to echo.
+    :param outcome: ``"ok"`` / ``"skipped"`` / ``"failed"``.
+    :param reason: Machine reason; ``None`` on ``"ok"``.
+    :param cache_read: Context tokens the ping read, when known.
+    :param cost_usd: Estimated cost, when priceable.
+    :param estimated: Whether the usage figures are estimates.
+    :returns: The receipt dict the runner relays to the server.
+    """
+    return {
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+        "reason": reason,
+        "input_total": None,
+        "cache_read": cache_read,
+        "cache_write": None,
+        "cost_usd": cost_usd,
+        "estimated": estimated,
+    }
+
+
+def _current_context_tokens(bridge_dir: Path) -> int | None:
+    """
+    Total tokens currently occupying the session's context.
+
+    Sums input + cache-creation + cache-read of the statusLine
+    snapshot's ``current_usage`` — the same input-side total the
+    forwarder's ``context_tokens`` carries. ``None`` when no usable
+    snapshot exists.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The context token count, or ``None``.
+    """
+    state = read_claude_context_state(bridge_dir)
+    if state is None:
+        return None
+    usage = state.get("current_usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens")
+    if not isinstance(input_tokens, int):
+        return None
+    cache_write = usage.get("cache_creation_input_tokens")
+    cache_read = usage.get("cache_read_input_tokens")
+    return (
+        input_tokens
+        + (cache_write if isinstance(cache_write, int) else 0)
+        + (cache_read if isinstance(cache_read, int) else 0)
+    )
+
+
+def _keep_warm_cost_usd(bridge_dir: Path, cache_read: int | None) -> float | None:
+    """
+    Price *cache_read* context tokens as cache reads on the session's live model.
+
+    :param bridge_dir: Bridge directory path.
+    :param cache_read: Context tokens the ping read, or ``None``.
+    :returns: The estimated USD cost, or ``None`` when the tokens are
+        unknown, the statusLine never captured a model, or the catalog
+        can't price it.
+    """
+    if cache_read is None:
+        return None
+    model = read_claude_status_model(bridge_dir)
+    if model is None:
+        return None
+    pricing = fetch_model_pricing(model)
+    if pricing is None:
+        return None
+    return compute_llm_cost({"cache_read_input_tokens": cache_read}, pricing)
 
 
 def _request_session_id_from_env() -> str | None:

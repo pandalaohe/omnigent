@@ -29,14 +29,21 @@ from omnigent.server.auth import (
 )
 from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
 from omnigent.server.user_preferences_store import (
+    AgentKeepWarm,
     ApprovalTimeout,
     CollabSettings,
+    KeepWarmSettings,
+    ResolvedAgentKeepWarm,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
+    clamp_host_offline_archive_s,
     clamp_keep_warm,
+    keep_warm_for_agent,
+    migrate_legacy_keep_warm,
     read_approval_timeout,
     read_collab_settings,
+    read_keep_warm_settings,
     validate_preferences_envelope,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -837,6 +844,307 @@ def test_store_accepts_session_collab_patch_and_reads_it_back(db_uri: str) -> No
     )
 
 
+def test_read_keep_warm_settings_defaults_on_missing_store_owner_or_namespace(
+    db_uri: str,
+) -> None:
+    """Every gap resolves to the fail-safe keep-warm defaults with present=False."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    default = KeepWarmSettings(
+        agents={}, host_offline_archive_s=14400, migrated_from_legacy_at=None, present=False
+    )
+    assert read_keep_warm_settings(None, "alice@example.com") == default
+    assert read_keep_warm_settings(store, None) == default
+    assert read_keep_warm_settings(store, "alice@example.com") == default
+
+    store.patch_namespace("alice@example.com", "session_collab", {"childKeepWarmEnabled": True})
+    assert read_keep_warm_settings(store, "alice@example.com") == default
+
+
+def test_read_keep_warm_settings_parses_rows_and_defaults_invalid_fields(db_uri: str) -> None:
+    """Per-row fields validate independently; a non-object row is skipped."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "kw@example.com",
+        "keep_warm",
+        {
+            "agents": {
+                "agent-a": {
+                    "main": True,
+                    "child": False,
+                    "intervalSeconds": 900,
+                    "maxSeconds": 7200,
+                },
+                "agent-b": {"main": "yes", "child": 1, "intervalSeconds": 0, "maxSeconds": -3},
+                "agent-c": {"child": True},
+                "agent-d": "not-a-row",
+            },
+            "hostOfflineArchiveSeconds": 0,
+            "migratedFromLegacyAt": 123,
+            "unexpectedKey": {"ignored": True},
+        },
+    )
+    settings = read_keep_warm_settings(store, "kw@example.com")
+    assert settings.present is True
+    assert settings.host_offline_archive_s == 0
+    assert settings.migrated_from_legacy_at == 123
+    assert settings.agents == {
+        "agent-a": AgentKeepWarm(main=True, child=False, interval_s=900, max_s=7200),
+        "agent-b": AgentKeepWarm(main=False, child=False, interval_s=None, max_s=14400),
+        "agent-c": AgentKeepWarm(main=False, child=True, interval_s=None, max_s=14400),
+    }
+
+    # The host-offline delay clamps to the shared keep-warm bounds on read.
+    store.patch_namespace("clamped@example.com", "keep_warm", {"hostOfflineArchiveSeconds": 100})
+    assert read_keep_warm_settings(store, "clamped@example.com").host_offline_archive_s == 3600
+
+
+def test_read_keep_warm_settings_tolerates_bad_rows_and_shapes() -> None:
+    """A corrupt row or malformed namespace value never fails a caller."""
+    default = KeepWarmSettings(
+        agents={}, host_offline_archive_s=14400, migrated_from_legacy_at=None, present=False
+    )
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise UserPreferencesValidationError("stored preferences are invalid JSON")
+
+    class _SQLStore:
+        def get(self, user_id: str) -> None:
+            raise SQLAlchemyError("database unavailable")
+
+    class _ShapeStore:
+        def __init__(self, value: object) -> None:
+            self._value = value
+
+        def get(self, user_id: str) -> object:
+            return self._value
+
+    assert read_keep_warm_settings(_RaisingStore(), "alice@example.com") == default
+    assert read_keep_warm_settings(_SQLStore(), "alice@example.com") == default
+    assert read_keep_warm_settings(_ShapeStore([]), "alice@example.com") == default
+
+    # A non-object namespace value reads as defaults, but the namespace exists.
+    garbage = read_keep_warm_settings(
+        _ShapeStore({"settings": {"keep_warm": "compact"}}), "alice@example.com"
+    )
+    assert garbage == KeepWarmSettings(
+        agents={}, host_offline_archive_s=14400, migrated_from_legacy_at=None, present=True
+    )
+
+    # An invalid host-offline value takes the default while the rows survive.
+    partial = read_keep_warm_settings(
+        _ShapeStore(
+            {
+                "settings": {
+                    "keep_warm": {
+                        "agents": {"agent-a": {"main": True, "child": True}},
+                        "hostOfflineArchiveSeconds": True,
+                    }
+                }
+            }
+        ),
+        "alice@example.com",
+    )
+    assert partial.host_offline_archive_s == 14400
+    assert partial.agents == {
+        "agent-a": AgentKeepWarm(main=True, child=True, interval_s=None, max_s=14400)
+    }
+
+
+def test_keep_warm_for_agent_resolves_family_defaults_and_clamps(db_uri: str) -> None:
+    """Absent agents are off; stored values clamp to the family bounds."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "resolve@example.com",
+        "keep_warm",
+        {
+            "agents": {
+                "defaulted": {"main": True, "child": True},
+                "tight-claude": {
+                    "main": True,
+                    "child": False,
+                    "intervalSeconds": 10,
+                    "maxSeconds": 999999,
+                },
+                "wide-codex": {
+                    "main": False,
+                    "child": True,
+                    "intervalSeconds": 5000,
+                    "maxSeconds": 100,
+                },
+            }
+        },
+    )
+    settings = read_keep_warm_settings(store, "resolve@example.com")
+    assert keep_warm_for_agent(settings, None, "claude") is None
+    assert keep_warm_for_agent(settings, "absent", "claude") is None
+    assert keep_warm_for_agent(settings, "defaulted", "claude") == ResolvedAgentKeepWarm(
+        main=True, child=True, interval_s=3300, max_s=14400
+    )
+    assert keep_warm_for_agent(settings, "defaulted", "codex") == ResolvedAgentKeepWarm(
+        main=True, child=True, interval_s=1500, max_s=14400
+    )
+    assert keep_warm_for_agent(settings, "tight-claude", "claude") == ResolvedAgentKeepWarm(
+        main=True, child=False, interval_s=300, max_s=172800
+    )
+    assert keep_warm_for_agent(settings, "wide-codex", "codex") == ResolvedAgentKeepWarm(
+        main=False, child=True, interval_s=1740, max_s=3600
+    )
+
+
+def test_clamp_host_offline_archive_s_keeps_zero_and_clamps() -> None:
+    """0 disables auto-archive and stays 0; other values take the shared bounds."""
+    assert clamp_host_offline_archive_s(0) == 0
+    assert clamp_host_offline_archive_s(100) == 3600
+    assert clamp_host_offline_archive_s(14400) == 14400
+    assert clamp_host_offline_archive_s(999999) == 172800
+
+
+def test_migrate_legacy_keep_warm_writes_rows_for_the_given_agents(db_uri: str) -> None:
+    """The migration writes one row per given agent and stamps the write."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "mig@example.com",
+        "session_collab",
+        {
+            "childKeepWarmEnabled": True,
+            "childKeepWarmClaudeIntervalSeconds": 3000,
+            "childKeepWarmCodexIntervalSeconds": 1200,
+        },
+    )
+    wrote = migrate_legacy_keep_warm(
+        store,
+        "mig@example.com",
+        [("agent-claude", "claude"), ("agent-codex", "codex")],
+        now=111,
+    )
+    assert wrote is True
+    envelope = store.get("mig@example.com")
+    assert envelope is not None
+    assert envelope["settings"]["keep_warm"] == {
+        "agents": {
+            "agent-claude": {
+                "main": False,
+                "child": True,
+                "intervalSeconds": 3000,
+                "maxSeconds": 14400,
+            },
+            "agent-codex": {
+                "main": False,
+                "child": True,
+                "intervalSeconds": 1200,
+                "maxSeconds": 14400,
+            },
+        },
+        "hostOfflineArchiveSeconds": 14400,
+        "migratedFromLegacyAt": 111,
+    }
+    # The legacy keys are never changed or deleted.
+    collab = read_collab_settings(store, "mig@example.com")
+    assert collab.keep_warm_enabled is True
+    assert (collab.keep_warm_claude_interval_s, collab.keep_warm_codex_interval_s) == (3000, 1200)
+    # A second run is a no-op: the namespace now exists.
+    assert (
+        migrate_legacy_keep_warm(store, "mig@example.com", [("other", "claude")], now=222) is False
+    )
+    envelope = store.get("mig@example.com")
+    assert envelope is not None
+    assert envelope["settings"]["keep_warm"]["migratedFromLegacyAt"] == 111
+
+
+def test_migrate_legacy_keep_warm_noops_when_namespace_exists_or_legacy_off(
+    db_uri: str,
+) -> None:
+    """No namespace and no legacy switch means nothing is ever written."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    assert migrate_legacy_keep_warm(None, "none@example.com", [("a", "claude")], now=1) is False
+    assert migrate_legacy_keep_warm(store, None, [("a", "claude")], now=1) is False
+
+    # Legacy switch off (the default): nothing written.
+    assert migrate_legacy_keep_warm(store, "off@example.com", [("a", "claude")], now=1) is False
+    assert read_keep_warm_settings(store, "off@example.com").present is False
+
+    # Legacy switch on but collaboration disabled: the legacy sweeper required
+    # both flags, so nothing is written.
+    store.patch_namespace(
+        "disabled@example.com",
+        "session_collab",
+        {"enabled": False, "childKeepWarmEnabled": True},
+    )
+    assert (
+        migrate_legacy_keep_warm(store, "disabled@example.com", [("a", "claude")], now=1) is False
+    )
+    assert read_keep_warm_settings(store, "disabled@example.com").present is False
+
+    # Namespace already present: no-op even with the legacy switch on.
+    store.patch_namespace("on@example.com", "session_collab", {"childKeepWarmEnabled": True})
+    existing = {
+        "agents": {"a": {"main": True, "child": False, "intervalSeconds": 600, "maxSeconds": 7200}}
+    }
+    store.patch_namespace("on@example.com", "keep_warm", existing)
+    assert migrate_legacy_keep_warm(store, "on@example.com", [("b", "codex")], now=2) is False
+    envelope = store.get("on@example.com")
+    assert envelope is not None
+    assert envelope["settings"]["keep_warm"] == existing
+
+
+def test_migrate_legacy_keep_warm_leaves_later_agents_off(db_uri: str) -> None:
+    """Scenario 27: an agent created after the migration is absent = off."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace("late@example.com", "session_collab", {"childKeepWarmEnabled": True})
+    assert migrate_legacy_keep_warm(store, "late@example.com", [("agent-old", "claude")], now=7)
+    settings = read_keep_warm_settings(store, "late@example.com")
+    assert keep_warm_for_agent(settings, "agent-new", "claude") is None
+    assert keep_warm_for_agent(settings, "agent-old", "claude") == ResolvedAgentKeepWarm(
+        main=False, child=True, interval_s=3300, max_s=14400
+    )
+
+
+def test_migrate_legacy_keep_warm_returns_false_on_store_error() -> None:
+    """A store failure logs and returns False instead of raising."""
+
+    class _FailingStore:
+        def get(self, user_id: str) -> object:
+            return {
+                "version": 1,
+                "settings": {"session_collab": {"childKeepWarmEnabled": True}},
+            }
+
+        def patch_namespace(self, *args: object, **kwargs: object) -> None:
+            raise SQLAlchemyError("database unavailable")
+
+    assert (
+        migrate_legacy_keep_warm(_FailingStore(), "err@example.com", [("a", "claude")], now=1)
+        is False
+    )
+
+
+def test_migrate_legacy_keep_warm_returns_false_when_the_read_fails() -> None:
+    """A transient read failure is not an absent namespace: nothing is written."""
+
+    class _FlakyStore:
+        def __init__(self) -> None:
+            self.get_calls = 0
+            self.patch_calls: list[object] = []
+
+        def get(self, user_id: str) -> object:
+            self.get_calls += 1
+            if self.get_calls == 1:
+                raise SQLAlchemyError("database unavailable")
+            return {
+                "version": 1,
+                "settings": {"session_collab": {"childKeepWarmEnabled": True}},
+            }
+
+        def patch_namespace(self, *args: object, **kwargs: object) -> None:
+            self.patch_calls.append(args)
+
+    store = _FlakyStore()
+    assert migrate_legacy_keep_warm(store, "err@example.com", [("a", "claude")], now=1) is False
+    assert store.get_calls == 1
+    assert store.patch_calls == []
+
+
 class _OwnerGrantStore:
     """Minimal permission store returning fixed grants for owner resolution."""
 
@@ -967,3 +1275,43 @@ async def test_preferences_api_accepts_the_host_colors_namespace(
         )
         assert patched.status_code == 200, patched.text
         assert patched.json()["settings"]["host_colors"] == {**first_host, **second_host}
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_accepts_the_keep_warm_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The keep_warm namespace is allowlisted by the API and reads back resolved."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "keepwarm@example.com"}
+        patched = await client.patch(
+            "/v1/me/preferences/keep_warm",
+            headers=headers,
+            json={
+                "value": {
+                    "agents": {
+                        "agent-a": {
+                            "main": True,
+                            "child": False,
+                            "intervalSeconds": 10,
+                            "maxSeconds": 7200,
+                        }
+                    },
+                    "hostOfflineArchiveSeconds": 0,
+                }
+            },
+        )
+        assert patched.status_code == 200, patched.text
+
+    settings = read_keep_warm_settings(
+        SqlAlchemyUserPreferencesStore(db_uri), "keepwarm@example.com"
+    )
+    assert settings.host_offline_archive_s == 0
+    assert keep_warm_for_agent(settings, "agent-a", "claude") == ResolvedAgentKeepWarm(
+        main=True, child=False, interval_s=300, max_s=7200
+    )
+    assert keep_warm_for_agent(settings, "agent-b", "codex") is None

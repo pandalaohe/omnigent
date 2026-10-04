@@ -115,6 +115,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_GOAL_STATE_TYPE,
+    _EXTERNAL_KEEP_WARM_RECEIPT_TYPE,
     _EXTERNAL_MCP_STARTUP_STATUS_VALUES,
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
@@ -1135,6 +1136,7 @@ def register_events_routes(
         peer_message_store=peer_message_store,
         runner_router=runner_router,
         agent_store=agent_store,
+        host_registry=host_registry,
         app_state=app_state,
     )
     from omnigent.server.routes.sessions.routes_open import register_open_routes
@@ -1333,6 +1335,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
             _EXTERNAL_BTW_SIDECHAT_TYPE,
             _EXTERNAL_BTW_DISMISS_TYPE,
+            _EXTERNAL_KEEP_WARM_RECEIPT_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE,
@@ -2148,6 +2151,26 @@ def register_events_routes(
                 runner_router,
                 {"type": "btw_dismiss"},
             )
+            return {"queued": False}
+        if body.type == _EXTERNAL_KEEP_WARM_RECEIPT_TYPE:
+            # The runner's answer to a keep-warm ping: settles the pending
+            # attempt in the sweeper's label. Transient and best-effort — no
+            # conversation item, no transcript publish; an absent sweeper
+            # (focused router) just drops the receipt.
+            attempt_id = body.data.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                raise OmnigentError(
+                    "external_keep_warm_receipt requires a non-empty string data.attempt_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.data.get("outcome") not in ("ok", "skipped", "failed"):
+                raise OmnigentError(
+                    "external_keep_warm_receipt data.outcome must be one of ok/skipped/failed",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            keep_warm = getattr(request.app.state, "child_keep_warm", None)
+            if keep_warm is not None:
+                await keep_warm.settle_receipt(session_id, body.data)
             return {"queued": False}
         if body.type == _EXTERNAL_ELICITATION_RESOLVED_TYPE:
             elicitation_id = body.data.get("elicitation_id")

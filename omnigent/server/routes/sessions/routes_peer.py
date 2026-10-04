@@ -54,8 +54,12 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.helpers import (
+    Placement,
     SessionLiveness,
+    _effective_placement,
+    _forward_session_change_to_runner,
     _get_runner_client,
+    _inherited_placement,
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -746,6 +750,7 @@ def register_peer_routes(
     peer_message_store: PeerMessageStore | None = None,
     runner_router: RunnerRouter | None = None,
     agent_store: AgentStore | None = None,
+    host_registry: Any | None = None,
     app_state: Any | None = None,
 ) -> PeerRoutes:
     """Register the peer-messaging routes on the sessions router.
@@ -763,12 +768,15 @@ def register_peer_routes(
     :param peer_message_store: Durable record store.
     :param runner_router: Router resolving the receiver's runner client.
     :param agent_store: Store for the sender's public agent name.
+    :param host_registry: Live host registry — the keep-warm sweeper's host
+        capability gate.
     :param app_state: The owning FastAPI app's ``.state``, or ``None``.
         When the flag is on and a store is configured, the constructed
         :class:`~omnigent.server.peer_sweeper.PeerSweeper` is stashed on
         ``app_state.peer_sweeper`` for the lifespan to start/stop; ``None``
         input skips the stash (routers built for focused tests without a
         host app), and a disabled/unconfigured setup stashes ``None``.
+        The keep-warm sweeper is constructed and stashed unconditionally.
     """
     flags = feature_flags if feature_flags is not None else resolve_feature_flags()
 
@@ -1753,9 +1761,7 @@ def register_peer_routes(
         return _record_to_dict(updated)
 
     sweeper: Any | None = None
-    child_keep_warm: Any | None = None
     if flags.enabled(Feature.SESSION_PEER_MESSAGING) and peer_message_store is not None:
-        from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
         from omnigent.server.peer_sweeper import PeerSweeper
 
         sweeper = PeerSweeper(
@@ -1766,13 +1772,54 @@ def register_peer_routes(
             deliver=_deliver,
             post_event_impl=post_event_impl,
         )
-        child_keep_warm = ChildKeepWarmSweeper(
-            conversation_store=conversation_store,
-            permission_store=permission_store,
-            liveness_lookup=liveness_lookup,
-            post_event_impl=post_event_impl,
-            notify_line=sweeper.notify_line,
+
+    from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
+
+    async def _forward_keep_warm_control(session_id: str, event: dict[str, Any]) -> bool:
+        result = await _forward_session_change_to_runner(
+            session_id, runner_router, event, timeout_s=5.0
         )
+        return result is not None and 200 <= result.status_code < 300
+
+    def _keep_warm_host_ok(conv: Conversation) -> bool:
+        # Only the EFFECTIVE host counts: children inherit their placement
+        # from ancestors, so a child with no host_id of its own can still be
+        # hosted. A session no row placed runs on the local in-process
+        # runner and counts as supported; a hosted session needs a live host
+        # advertising keep_warm_v1. Placement resolution fails closed.
+        try:
+            inherited = (
+                _inherited_placement(conversation_store, conv.parent_conversation_id)
+                if conv.parent_conversation_id is not None
+                else Placement(None, None, None)
+            )
+            host_id = _effective_placement(conv, inherited).host_id
+        except Exception:
+            _logger.warning("Keep-warm host placement resolution failed", exc_info=True)
+            return False
+        if not host_id:
+            return True
+        host_store = getattr(app_state, "host_store", None) if app_state is not None else None
+        if host_store is None or host_registry is None:
+            return False
+        try:
+            online = host_store.is_online(host_id)
+        except Exception:
+            _logger.warning("Keep-warm host liveness read failed", exc_info=True)
+            return False
+        return bool(online) and host_registry.host_supports_keep_warm(host_id)
+
+    # The keep-warm sweeper runs whether or not peer messaging is on; without
+    # the peer sweeper its notices to the mother are simply dropped (the
+    # label state still settles).
+    child_keep_warm = ChildKeepWarmSweeper(
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        liveness_lookup=liveness_lookup,
+        forward_control=_forward_keep_warm_control,
+        host_ok=_keep_warm_host_ok,
+        notify_line=sweeper.notify_line if sweeper is not None else None,
+    )
     if app_state is not None:
         app_state.peer_sweeper = sweeper
         app_state.child_keep_warm = child_keep_warm

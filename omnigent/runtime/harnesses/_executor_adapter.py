@@ -410,6 +410,10 @@ class ExecutorAdapter(HarnessApp):
             await self._executor.interrupt_session(self._session_key)
         return response
 
+    async def _keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
+        """Answer a keep-warm ping through the inner executor's channel."""
+        return await self._ensure_executor().keep_warm(attempt_id=attempt_id, family=family)
+
     async def _prepare_turn_retry(self) -> bool:
         """Wait for confirmed teardown without cancelling the background reap."""
         cleanup = self._abandoned_executor_cleanup
