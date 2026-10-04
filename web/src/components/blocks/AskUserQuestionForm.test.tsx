@@ -55,7 +55,8 @@ describe("AskUserQuestionForm — async card", () => {
     if (payload === null) throw new Error("expected a payload");
     renderForm(payload.questions, payload.context);
 
-    expect(screen.getByTestId("ask-user-question-context")).toBeDefined();
+    // A rule under the context separates the recap from the question.
+    expect(screen.getByTestId("ask-user-question-context")).toHaveClass("border-b");
     const link = screen.getByRole("button", { name: "r" });
     expect(link.tagName).toBe("A");
     expect(link).toHaveAttribute("data-streamdown", "link");
