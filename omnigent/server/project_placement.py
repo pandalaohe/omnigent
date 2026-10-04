@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry
-from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
+from omnigent.server.routes._workspace_validation import (
+    _is_subpath_of,
+    _is_windows_absolute_path,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 from omnigent.stores.project_store import ProjectStore
