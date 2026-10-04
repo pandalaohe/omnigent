@@ -254,7 +254,10 @@ export function AskUserQuestionForm({
       </div>
 
       {context && (
-        <div className="text-ui text-foreground" data-testid="ask-user-question-context">
+        <div
+          className="border-b border-border pb-3 mb-1 text-ui text-foreground"
+          data-testid="ask-user-question-context"
+        >
           <FilePathAwareMessageResponse>{context}</FilePathAwareMessageResponse>
         </div>
       )}
