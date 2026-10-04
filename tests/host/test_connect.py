@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import yaml
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
@@ -895,6 +896,116 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "Runner launch failed" in output
     assert "session_missing_workspace" in output
     assert "/nonexistent/path/that/does/not/exist" in output
+
+
+def _pre_launch_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: Path
+) -> tuple[HostProcess, list[str], Path, HostLaunchRunnerFrame]:
+    """Build a host whose spawn records the pre-launch stub's output, then stops.
+
+    :returns: The host, the per-spawn records, the record file and a launch frame.
+    """
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir(exist_ok=True)
+    record = tmp_path / "record.txt"
+    host = HostProcess(
+        identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        server_url="http://localhost:8000",
+        config_path=config,
+    )
+    seen_at_spawn: list[str] = []
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        seen_at_spawn.append(record.read_text() if record.exists() else "")
+        raise OSError(errno.EIO, "stop after the pre-launch command")
+
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    frame = HostLaunchRunnerFrame(
+        request_id="req_pre_launch",
+        binding_token="token_pre_launch",
+        workspace=str(workspace),
+    )
+    return host, seen_at_spawn, record, frame
+
+
+def _write_pre_launch_stub(tmp_path: Path, record: Path, tail: str) -> Path:
+    """Write a stub that records its cwd, then runs ``tail``."""
+    stub = tmp_path / "pre-launch.sh"
+    stub.write_text(f'#!/bin/sh\nprintf "cwd=%s\\n" "$PWD" >> "{record}"\n{tail}\n')
+    stub.chmod(0o755)
+    return stub
+
+
+@pytest.mark.parametrize(
+    ("case", "ran", "logged"),
+    [
+        ("ok", True, "Pre-launch command ran"),
+        ("fails", True, "Pre-launch command exited 1"),
+        ("times_out", True, "Pre-launch command timed out"),
+        ("relative", False, "must start with an absolute path"),
+        ("batch", False, "must not be a .bat/.cmd file"),
+        ("crashes", False, "Pre-launch command crashed"),
+    ],
+)
+async def test_handle_launch_runs_the_pre_launch_command_before_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    ran: bool,
+    logged: str,
+) -> None:
+    """The host's pre-launch command runs once in the workspace, then the spawn.
+
+    No outcome of the command blocks the launch: the spawn is always reached.
+    """
+    from omnigent.host import connect, pre_launch_command
+
+    record = tmp_path / "record.txt"
+    tails = {"fails": "exit 1", "times_out": "sleep 5"}
+    stub = _write_pre_launch_stub(tmp_path, record, tails.get(case, "exit 0"))
+    command = {
+        "relative": ["./pre-launch.sh"],
+        "batch": [str(tmp_path / "pre-launch.bat")],
+    }.get(case, [str(stub)])
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"host": {"pre_launch_command": command}}))
+    if case == "times_out":
+        monkeypatch.setattr(pre_launch_command, "PRE_LAUNCH_TIMEOUT_S", 1.0)
+    if case == "crashes":
+
+        def _crash(*_args: object) -> None:
+            raise RuntimeError("pre-launch bug")
+
+        monkeypatch.setattr(connect, "run_pre_launch_command", _crash)
+    host, seen_at_spawn, _, frame = _pre_launch_host(tmp_path, monkeypatch, config)
+    workspace = frame.workspace
+
+    caplog.set_level(logging.INFO, logger="omnigent.host")
+    result = await host._handle_launch(frame)
+
+    assert seen_at_spawn == [f"cwd={workspace}\n" if ran else ""]
+    assert result.status == "failed"
+    assert "stop after the pre-launch command" in (result.error or "")
+    assert logged in caplog.text
+
+
+async def test_handle_launch_rereads_the_pre_launch_command_per_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A key added to the host config applies to the next launch, no restart."""
+    record = tmp_path / "record.txt"
+    stub = _write_pre_launch_stub(tmp_path, record, "exit 0")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"host": {"name": "test-laptop"}}))
+    host, seen_at_spawn, _, frame = _pre_launch_host(tmp_path, monkeypatch, config)
+
+    await host._handle_launch(frame)
+    config.write_text(yaml.safe_dump({"host": {"pre_launch_command": [str(stub)]}}))
+    await host._handle_launch(frame)
+
+    assert seen_at_spawn == ["", f"cwd={frame.workspace}\n"]
 
 
 async def test_handle_launch_attributes_spawn_failure_to_host(

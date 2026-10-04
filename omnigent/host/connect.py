@@ -134,6 +134,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor, RunnerLogRunawayTracker
 from omnigent.host.post_bind_hook import PostBindHookRunner
+from omnigent.host.pre_launch_command import run_pre_launch_command
 from omnigent.host.resource_sampler import ResourceSampler
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
@@ -1138,10 +1139,11 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
-        # The hook reads the command from the config file this process was
+        # Configured commands are read from the config file this process was
         # started with; a host launched with an explicit --config must not
         # fall back to the default file.
-        self._post_bind_hook_runner = PostBindHookRunner(config_path or CONFIG_PATH)
+        self._config_path = config_path or CONFIG_PATH
+        self._post_bind_hook_runner = PostBindHookRunner(self._config_path)
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
         # files). Each entry remembers the repository root it was built for.
@@ -1915,6 +1917,15 @@ class HostProcess:
                 workspace_missing_message(workspace),
                 error_code=WORKSPACE_MISSING_ERROR_CODE,
             )
+
+        # The host's own pre-launch command prepares the workspace; it never
+        # blocks the launch.
+        try:
+            await self._run_host_subprocess_in_thread(
+                functools.partial(run_pre_launch_command, self._config_path, workspace)
+            )
+        except Exception:
+            _logger.exception("Pre-launch command crashed for %s", workspace)
 
         runner_id = token_bound_runner_id(frame.binding_token)
         initial_auth_token = await asyncio.to_thread(
