@@ -5782,3 +5782,390 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
     assert fake_sdk.created_clients == []
     assert executor._clients["sess-1"].client is live_client
     assert live_client.prompts == ["second question"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: keep-warm ping channel
+# ---------------------------------------------------------------------------
+
+
+class _PingResultMessage:
+    """Minimal ``ResultMessage`` stand-in carrying usage and cost."""
+
+    def __init__(self, *, usage=None, total_cost_usd=None):
+        self.usage = usage
+        self.total_cost_usd = total_cost_usd
+        self.is_error = False
+        self.result = "ok"
+
+
+def _ping_sdk():
+    """Fake SDK module exposing only what the ping drain narrows on."""
+
+    class _FakeSDK:
+        ResultMessage = _PingResultMessage
+
+    return _FakeSDK
+
+
+async def _stream_messages(*messages):
+    """Async generator yielding the scripted messages, then ending."""
+    for message in messages:
+        yield message
+
+
+class _PingClient:
+    """Live client double scripting one drain per ``receive_response`` call."""
+
+    def __init__(self, *streams):
+        self._streams = list(streams)
+        self.queries = []
+        self.streams = 0
+        self.interrupts = 0
+        self.disconnects = 0
+        self._transport = _make_transport_with_process(None)
+
+    async def query(self, prompt, session_id="default"):
+        self.queries.append((prompt, session_id))
+
+    def receive_response(self):
+        self.streams += 1
+        return self._streams.pop(0)
+
+    async def interrupt(self):
+        self.interrupts += 1
+
+    async def disconnect(self):
+        self.disconnects += 1
+
+    async def set_model(self, model):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_pings_the_live_client_and_reports_usage() -> None:
+    """One ping: one query with the session key, drain discarded, usage normalized."""
+    from omnigent.inner.claude_sdk_executor import (
+        _KEEP_WARM_PING_PROMPT,
+        ClaudeSDKExecutor,
+        _ClaudeClientState,
+    )
+
+    result_msg = _PingResultMessage(
+        usage={
+            "input_tokens": 120,
+            "cache_read_input_tokens": 9_000,
+            "cache_creation_input_tokens": 400,
+        },
+        total_cost_usd=0.125,
+    )
+    client = _PingClient(_stream_messages(result_msg))
+    executor = ClaudeSDKExecutor()
+    executor._clients["s1"] = _ClaudeClientState(client=client, model=None)
+    executor._pending_framework_context["s1"] = "keep me"
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+        receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert client.queries == [(_KEEP_WARM_PING_PROMPT, "s1")]
+    assert client.streams == 1
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": 120 + 9_000 + 400,
+        "cache_read": 9_000,
+        "cache_write": 400,
+        "cost_usd": 0.125,
+        "estimated": False,
+    }
+    # The ping never touches transcript / framework state or the client cache.
+    assert executor._pending_framework_context == {"s1": "keep me"}
+    assert executor._crashed_sessions == {}
+    assert executor._clients["s1"].client is client
+    slot = executor._query_slot("s1")
+    assert not slot.lock.locked()
+    assert not slot.maintenance and not slot.tool_attempted
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_without_usage_reports_none_fields() -> None:
+    """A ResultMessage with no usage still yields an ``ok`` receipt with None fields."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    client = _PingClient(_stream_messages(_PingResultMessage(usage=None, total_cost_usd=None)))
+    executor = ClaudeSDKExecutor()
+    executor._clients["s1"] = _ClaudeClientState(client=client, model=None)
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+        receipt = await executor.keep_warm(attempt_id="att-2", family="claude")
+
+    assert receipt["outcome"] == "ok"
+    assert receipt["input_total"] is None
+    assert receipt["cache_read"] is None
+    assert receipt["cache_write"] is None
+    assert receipt["cost_usd"] is None
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_without_live_client_skips_and_creates_nothing() -> None:
+    """No cached client → ``no_live_client``; the ping never resolves the SDK."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    with patch(
+        "omnigent.inner.claude_sdk_executor._ensure_sdk",
+        side_effect=AssertionError("a ping must never create a client"),
+    ):
+        receipt = await executor.keep_warm(attempt_id="att-3", family="claude")
+
+    assert receipt["outcome"] == "skipped"
+    assert receipt["reason"] == "no_live_client"
+    assert executor._clients == {}
+    assert executor._query_slots == {}
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_skips_busy_while_a_turn_holds_the_slot() -> None:
+    """A real turn holding the session's query slot → ``skipped`` / ``busy``."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    client = _PingClient(_stream_messages(_PingResultMessage()))
+    executor = ClaudeSDKExecutor()
+    executor._clients["s1"] = _ClaudeClientState(client=client, model=None)
+    slot = executor._query_slot("s1")
+    await slot.lock.acquire()
+    try:
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+            receipt = await executor.keep_warm(attempt_id="att-4", family="claude")
+    finally:
+        slot.lock.release()
+
+    assert receipt["outcome"] == "skipped"
+    assert receipt["reason"] == "busy"
+    assert client.queries == []
+
+
+@pytest.mark.parametrize("mode", ["bypassPermissions", "default"])
+@pytest.mark.asyncio
+async def test_keep_warm_gate_vetoes_tools_during_maintenance(mode: str) -> None:
+    """The maintenance veto denies with interrupt before policy and elicitation."""
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    executor = ClaudeSDKExecutor(permission_mode=mode)
+    policy = AsyncMock(return_value=PolicyVerdictPayload(action="POLICY_ACTION_ALLOW"))
+    elicit = AsyncMock(return_value=True)
+    executor._policy_evaluator = policy
+    executor._elicitation_handler = elicit
+    slot = executor._query_slot("s1")
+    slot.maintenance = True
+    perm_ctx = SimpleNamespace(tool_use_id="tu_1", agent_id=None, suggestions=[])
+
+    denial = await executor._can_use_tool_gate(
+        "Bash", {"command": "ls"}, perm_ctx, permission_mode=mode, session_key="s1"
+    )
+
+    assert isinstance(denial, PermissionResultDeny)
+    assert denial.message == "keep-warm maintenance turn: tools are disabled"
+    assert denial.interrupt is True
+    policy.assert_not_awaited()
+    elicit.assert_not_awaited()
+    assert slot.tool_attempted is True
+
+    # Once the ping ends the gate behaves exactly as before.
+    slot.maintenance = False
+    allowed = await executor._can_use_tool_gate(
+        "Bash", {"command": "ls"}, perm_ctx, permission_mode=mode, session_key="s1"
+    )
+    assert isinstance(allowed, PermissionResultAllow)
+    policy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_tool_attempt_reports_tool_attempt() -> None:
+    """A tool call during the ping is denied and the receipt says ``tool_attempt``."""
+    from claude_agent_sdk import PermissionResultDeny
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    denied: list[object] = []
+
+    async def _attempt_tool_stream():
+        denied.append(
+            await executor._can_use_tool_gate(
+                "Bash",
+                {"command": "ls"},
+                SimpleNamespace(tool_use_id="tu_1", agent_id=None, suggestions=[]),
+                permission_mode="bypassPermissions",
+                session_key="s1",
+            )
+        )
+        yield _PingResultMessage(usage={"input_tokens": 5}, total_cost_usd=0.0)
+
+    client = _PingClient(_attempt_tool_stream())
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+    executor._clients["s1"] = _ClaudeClientState(
+        client=client, model=None, permission_mode="bypassPermissions"
+    )
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+        receipt = await executor.keep_warm(attempt_id="att-5", family="claude")
+
+    assert isinstance(denied[0], PermissionResultDeny)
+    assert denied[0].interrupt is True
+    assert receipt["outcome"] == "failed"
+    assert receipt["reason"] == "tool_attempt"
+    slot = executor._query_slot("s1")
+    assert not slot.lock.locked()
+    assert not slot.maintenance and not slot.tool_attempted
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_timeout_interrupts_and_releases_the_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ping past its budget is interrupted and reported ``failed`` / ``timeout``."""
+
+    async def _blocking_stream():
+        try:
+            await asyncio.Event().wait()
+            yield  # pragma: no cover -- the stream never yields
+        finally:
+            pass
+
+    client = _PingClient(_blocking_stream())
+    from omnigent.inner import claude_sdk_executor as cse
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    monkeypatch.setattr(cse, "_KEEP_WARM_PING_BUDGET_S", 0.05)
+    monkeypatch.setattr(cse, "_KEEP_WARM_DRAIN_S", 0.2)
+
+    executor = ClaudeSDKExecutor()
+    executor._clients["s1"] = _ClaudeClientState(client=client, model=None)
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+        receipt = await executor.keep_warm(attempt_id="att-6", family="claude")
+
+    assert receipt["outcome"] == "failed"
+    assert receipt["reason"] == "timeout"
+    assert client.interrupts == 1
+    slot = executor._query_slot("s1")
+    assert not slot.lock.locked()
+    assert not slot.maintenance and not slot.tool_attempted
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ping_is_preempted_by_a_real_turn() -> None:
+    """A real turn arriving mid-ping interrupts it and queries only after the drain."""
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner import claude_sdk_executor as cse
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    class _Sentinel:
+        pass
+
+    def _result(text, input_tokens):
+        return SDKResultMessage(
+            subtype="result",
+            session_id="s1",
+            result=text,
+            total_cost_usd=0.0,
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            usage={"input_tokens": input_tokens},
+        )
+
+    class _TurnClient:
+        def __init__(self, options):
+            self.options = options
+            self._query = None
+            self._transport = _make_transport_with_process(None)
+            self.events: list[tuple[str, str | None]] = []
+            self.ping_queried = asyncio.Event()
+            self.ping_interrupted = asyncio.Event()
+            self.interrupts = 0
+            self._inflight = 0
+            self.max_inflight = 0
+            self._call = 0
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt, session_id="default"):
+            self.events.append(("query", prompt if isinstance(prompt, str) else None))
+            self._inflight += 1
+            self.max_inflight = max(self.max_inflight, self._inflight)
+            if prompt == cse._KEEP_WARM_PING_PROMPT:
+                self.ping_queried.set()
+
+        async def receive_response(self):
+            call = self._call
+            self._call += 1
+            try:
+                if call == 0:
+                    await self.ping_interrupted.wait()
+                    self.events.append(("ping_result", None))
+                    yield _result("ok", 2)
+                else:
+                    self.events.append(("real_result", None))
+                    yield _result("done", 3)
+            finally:
+                self._inflight -= 1
+
+        async def interrupt(self):
+            self.interrupts += 1
+            self.events.append(("interrupt", None))
+            self.ping_interrupted.set()
+
+        async def disconnect(self):
+            return None
+
+        async def set_model(self, model):
+            return None
+
+    class _FakeSDK(_sdk_types()):
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        ClaudeSDKClient = _TurnClient
+
+    executor = ClaudeSDKExecutor()
+    client = _TurnClient(options=None)
+    executor._clients["s1"] = _ClaudeClientState(client=client, model=None, permission_mode="auto")
+    messages = [{"role": "user", "content": "hi", "session_id": "s1"}]
+
+    async def _collect() -> list[object]:
+        return [event async for event in executor.run_turn(messages, [], "")]
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        ping_task = asyncio.create_task(executor.keep_warm(attempt_id="att-7", family="claude"))
+        await client.ping_queried.wait()
+        turn_task = asyncio.create_task(_collect())
+        receipt = await ping_task
+        events = await turn_task
+
+    assert receipt["outcome"] == "skipped"
+    assert receipt["reason"] == "preempted"
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    assert client.interrupts == 1
+    # The real query only runs after the interrupted ping's drain finished,
+    # and the two never had a query in flight at once.
+    kinds = [kind for kind, _ in client.events]
+    assert kinds.index("interrupt") > kinds.index("query")
+    assert kinds.index("query", kinds.index("interrupt")) > kinds.index("ping_result")
+    assert client.max_inflight == 1
+    assert executor._query_slot("s1").lock.locked() is False

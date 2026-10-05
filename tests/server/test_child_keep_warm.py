@@ -48,6 +48,7 @@ _MIRRORED_CODEX_WRAPPER = "codex-native-ui-subagent"
 _HOST_ID = "0123456789abcdef0123456789abcdef"
 _CLAUDE_AGENT = "c0ffee" * 5 + "c0"
 _CODEX_AGENT = "badcad" * 5 + "ba"
+_CLAUDE_SDK_AGENT = "decafe" * 5 + "de"
 
 
 # ── Fakes ────────────────────────────────────────────────
@@ -453,6 +454,27 @@ async def test_due_main_session_is_pinged_and_the_label_carries_the_attempt(
     # The ping never travels as a conversation message.
     items = harness.store.list_latest_message_items_for_conversations([main.id], 10)
     assert not any(items.values())
+
+
+async def test_claude_sdk_main_session_is_pinged(harness: _Harness) -> None:
+    """A top-level claude-sdk session gets a claude-family ping on the SDK harness."""
+    u = harness.now - 55 * 60
+    main = _main(
+        harness,
+        harness_override="claude-sdk",
+        labels={KEEP_WARM_LABEL: _warm_label(t=u)},
+        running_since=u,
+    )
+
+    await _tick(harness)
+
+    pings = harness.forward.pings()
+    assert len(pings) == 1
+    assert pings[0]["session_id"] == main.id
+    body = pings[0]["body"]
+    assert body["type"] == "keep_warm_ping"
+    assert body["harness"] == "claude-sdk"
+    assert body["family"] == "claude"
 
 
 async def test_child_is_pinged_without_the_mother_present(harness: _Harness) -> None:
@@ -1899,14 +1921,25 @@ async def test_migration_defers_when_agent_enumeration_fails(
 async def test_migration_ignores_sdk_agents(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The legacy migration covers the native agents only, never the SDK Codex agent."""
+    """The legacy migration covers the native agents only, never the SDK agents."""
     monkeypatch.setattr(
         "omnigent.runtime.get_agent_cache",
-        lambda: _HarnessByAgentCache({_CLAUDE_AGENT: "claude-native", _CODEX_AGENT: "codex"}),
+        lambda: _HarnessByAgentCache(
+            {
+                _CLAUDE_AGENT: "claude-native",
+                _CODEX_AGENT: "codex",
+                _CLAUDE_SDK_AGENT: "claude-sdk",
+            }
+        ),
     )
     native = SimpleNamespace(id=_CLAUDE_AGENT, bundle_location="/fake/claude.zip", session_id=None)
-    sdk = SimpleNamespace(id=_CODEX_AGENT, bundle_location="/fake/codex.zip", session_id=None)
-    harness.sweeper._app.state.agent_store = _AgentListStore([native, sdk])
+    sdk_codex = SimpleNamespace(
+        id=_CODEX_AGENT, bundle_location="/fake/codex.zip", session_id=None
+    )
+    sdk_claude = SimpleNamespace(
+        id=_CLAUDE_SDK_AGENT, bundle_location="/fake/claude-sdk.zip", session_id=None
+    )
+    harness.sweeper._app.state.agent_store = _AgentListStore([native, sdk_codex, sdk_claude])
     harness.prefs.keep_warm = None
     harness.prefs.collab = {"enabled": True, "childKeepWarmEnabled": True}
     _main(harness, running_since=harness.now - 120)
@@ -1918,6 +1951,7 @@ async def test_migration_ignores_sdk_agents(
     assert namespace == "keep_warm"
     assert _CLAUDE_AGENT in value["agents"]
     assert _CODEX_AGENT not in value["agents"]
+    assert _CLAUDE_SDK_AGENT not in value["agents"]
 
 
 # ── warm_state rule ──────────────────────────────────────

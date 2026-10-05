@@ -98,6 +98,7 @@ _CODEX_DEFAULT_STALENESS_S = 1800
 #: map is the single place a later keep-warm channel registers.
 _SUPPORTED_HARNESSES: dict[str, Literal["claude", "codex"]] = {
     "claude-native": "claude",
+    "claude-sdk": "claude",
     "codex-native": "codex",
     "codex": "codex",
 }

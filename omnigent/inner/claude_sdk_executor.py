@@ -38,7 +38,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
@@ -360,6 +360,17 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
 _STREAM_IDLE_WARN_SECONDS = 600.0
+
+# ── Keep-warm ping ────────────────────────────────────────
+# Hard budget for one keep-warm ping; the turn normally completes in seconds.
+_KEEP_WARM_PING_BUDGET_S = 60.0
+# After an interrupt (preemption or budget lapse) the drain waits this long
+# for the ResultMessage before releasing the query slot.
+_KEEP_WARM_DRAIN_S = 5.0
+# A real turn waits this long for a preempted ping to yield its slot before
+# it closes the live client and starts a fresh one.
+_KEEP_WARM_PREEMPT_WAIT_S = 15.0
+_KEEP_WARM_PING_PROMPT = "[System: keep-warm. Reply with only: ok]"
 
 # ── Multimodal content block conversion ──────────────────────
 
@@ -837,6 +848,85 @@ class _ClaudeClientState:
     permission_mode: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
+
+
+@dataclass
+class _QuerySlot:
+    """Per-session query slot shared by ``run_turn`` and the keep-warm ping.
+
+    A real turn and a ping never have a query in flight on the same client
+    at once: ``lock`` serializes them, ``preempt`` tells an in-flight ping
+    that a real turn is waiting, ``maintenance`` marks the ping's turn (and
+    disables tools), and ``tool_attempted`` records a model tool call so the
+    ping's receipt can report ``tool_attempt``.
+
+    :param lock: Held from just before ``query`` until the drain ends.
+    :param preempt: Set by a waiting ``run_turn``; watched by the ping.
+    :param maintenance: ``True`` while a keep-warm ping owns the slot.
+    :param tool_attempted: ``True`` once the ping turn tried to call a tool.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    preempt: asyncio.Event = field(default_factory=asyncio.Event)
+    maintenance: bool = False
+    tool_attempted: bool = False
+
+
+class _KeepWarmPingOutcome(NamedTuple):
+    """
+    One drained keep-warm ping, receipt-ready.
+
+    :param result: The turn's ``ResultMessage``, when one arrived.
+    :param timed_out: ``True`` when the ping budget lapsed.
+    :param preempted: ``True`` when a real turn claimed the slot mid-ping.
+    :param tool_attempted: ``True`` when the ping turn tried to call a tool.
+    """
+
+    result: object | None = None
+    timed_out: bool = False
+    preempted: bool = False
+    tool_attempted: bool = False
+
+
+def _usage_token(value: object) -> int | None:
+    """Return *value* when it is a genuine token count (never a bool), else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _keep_warm_receipt(
+    attempt_id: str,
+    *,
+    outcome: str,
+    reason: str | None,
+    input_total: int | None = None,
+    cache_read: int | None = None,
+    cache_write: int | None = None,
+    cost_usd: float | None = None,
+) -> dict[str, Any]:
+    """
+    Build one normalized keep-warm receipt.
+
+    :param attempt_id: Ping attempt id to echo.
+    :param outcome: ``"ok"`` / ``"skipped"`` / ``"failed"``.
+    :param reason: Machine reason; ``None`` on ``"ok"``.
+    :param input_total: Prompt tokens (input + cache read + cache write).
+    :param cache_read: ``cache_read_input_tokens`` from the ping turn.
+    :param cache_write: ``cache_creation_input_tokens`` from the ping turn.
+    :param cost_usd: The turn's reported total cost, when present.
+    :returns: The receipt dict the runner relays to the server.
+    """
+    return {
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+        "reason": reason,
+        "input_total": input_total,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "cost_usd": cost_usd,
+        "estimated": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -1720,6 +1810,8 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        # Per-session query slots serializing real turns and keep-warm pings.
+        self._query_slots: dict[str, _QuerySlot] = {}
         self._pending_framework_context: dict[str, str] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
@@ -1966,7 +2058,22 @@ class ClaudeSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
+        self._query_slots.pop(session_key, None)
         await self._close_live_client(session_key)
+
+    def _query_slot(self, session_key: str) -> _QuerySlot:
+        """Return the session's query slot, creating it on first use."""
+        slot = self._query_slots.get(session_key)
+        if slot is None:
+            slot = _QuerySlot()
+            self._query_slots[session_key] = slot
+        return slot
+
+    def _reset_query_slot(self, session_key: str) -> _QuerySlot:
+        """Replace a wedged session slot so a turn can proceed on a fresh one."""
+        slot = _QuerySlot()
+        self._query_slots[session_key] = slot
+        return slot
 
     async def _close_live_client(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
@@ -2076,6 +2183,206 @@ class ClaudeSDKExecutor(Executor):
                 exc,
             )
             return False
+
+    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
+        """
+        Ping the live Claude SDK session so its provider prompt cache stays warm.
+
+        The ping reuses the session's existing ``ClaudeSDKClient`` only — it
+        never creates or reconnects one. A missing or terminated client skips
+        ``no_live_client``; a real turn holding the session's query slot skips
+        ``busy``. While the ping owns the slot the session's maintenance flag
+        denies every tool call, so the fixed one-line turn can never do real
+        work; a real turn arriving mid-ping preempts it, and the ping yields
+        ``skipped`` / ``preempted``. The response is drained to its
+        ``ResultMessage`` without emitting executor events or touching
+        transcript state.
+
+        :param attempt_id: Server-allocated ping attempt id, echoed on the
+            receipt.
+        :param family: Model family from the server; unused — the claude-sdk
+            channel only ever serves ``"claude"``.
+        :returns: The normalized receipt dict.
+        """
+        del family
+        live = await self._live_client_state()
+        if live is None:
+            return _keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
+        session_key, state = live
+        slot = self._query_slot(session_key)
+        if slot.lock.locked():
+            return _keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
+        await slot.lock.acquire()
+        slot.maintenance = True
+        slot.tool_attempted = False
+        slot.preempt.clear()
+        try:
+            outcome = await self._drive_keep_warm_ping(state.client, slot, session_key)
+        except Exception:
+            logger.exception("claude-sdk: keep-warm ping failed for session %s", session_key)
+            return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+        finally:
+            slot.maintenance = False
+            slot.tool_attempted = False
+            slot.preempt.clear()
+            slot.lock.release()
+        if outcome.preempted:
+            return _keep_warm_receipt(attempt_id, outcome="skipped", reason="preempted")
+        if outcome.tool_attempted:
+            return _keep_warm_receipt(attempt_id, outcome="failed", reason="tool_attempt")
+        if outcome.timed_out:
+            return _keep_warm_receipt(attempt_id, outcome="failed", reason="timeout")
+        if outcome.result is None:
+            return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+        return self._keep_warm_ok_receipt(attempt_id, outcome.result)
+
+    @staticmethod
+    def _keep_warm_ok_receipt(attempt_id: str, result: object) -> dict[str, Any]:
+        """
+        Normalize a completed ping's ``ResultMessage`` into an ``ok`` receipt.
+
+        :param attempt_id: Ping attempt id to echo.
+        :param result: The ping turn's ``ResultMessage``.
+        :returns: The receipt dict; usage fields are ``None`` when the
+            message carried no usage.
+        """
+        usage = getattr(result, "usage", None)
+        input_total = cache_read = cache_write = None
+        if isinstance(usage, dict) and usage:
+            cache_read = _usage_token(usage.get("cache_read_input_tokens"))
+            cache_write = _usage_token(usage.get("cache_creation_input_tokens"))
+            input_tokens = _usage_token(usage.get("input_tokens"))
+            input_total = (input_tokens or 0) + (cache_read or 0) + (cache_write or 0)
+        raw_cost = getattr(result, "total_cost_usd", None)
+        cost_usd = (
+            float(raw_cost)
+            if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool)
+            else None
+        )
+        return _keep_warm_receipt(
+            attempt_id,
+            outcome="ok",
+            reason=None,
+            input_total=input_total,
+            cache_read=cache_read,
+            cache_write=cache_write,
+            cost_usd=cost_usd,
+        )
+
+    async def _live_client_state(self) -> tuple[str, _ClaudeClientState] | None:
+        """
+        Return this subprocess's live client; never creates or reconnects one.
+
+        Terminated CLI children are evicted first with the same check
+        :meth:`run_turn` uses between turns, so a reaped corpse counts as no
+        live client.
+
+        :returns: ``(session_key, state)`` for a usable client, else ``None``.
+        """
+        for session_key in list(self._clients):
+            await self._evict_terminated_client(session_key)
+        for session_key, state in self._clients.items():
+            return session_key, state
+        return None
+
+    async def _drive_keep_warm_ping(
+        self, client: _ClaudeClient, slot: _QuerySlot, session_key: str
+    ) -> _KeepWarmPingOutcome:
+        """
+        Send the fixed ping prompt and drain its response to the ResultMessage.
+
+        Messages are consumed and discarded, so nothing reaches the executor
+        event stream and no transcript state is touched. The budget bounds the
+        whole exchange; a preemption (``slot.preempt``) or a lapsed budget
+        interrupts the turn and gives the ``ResultMessage`` a few more seconds
+        to arrive.
+
+        :param client: The session's live SDK client.
+        :param slot: The session's query slot, whose maintenance flag the
+            caller set before calling.
+        :param session_key: Session key the ping is sent under.
+        :returns: The drained outcome, receipt-ready.
+        """
+        sdk = cast(_ClaudeSDK, _ensure_sdk())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _KEEP_WARM_PING_BUDGET_S
+        try:
+            await asyncio.wait_for(
+                client.query(_KEEP_WARM_PING_PROMPT, session_id=session_key),
+                timeout=min(_QUERY_START_TIMEOUT_SECONDS, _KEEP_WARM_PING_BUDGET_S),
+            )
+        except asyncio.TimeoutError:
+            await self._interrupt_keep_warm_client(client)
+            return _KeepWarmPingOutcome(timed_out=True)
+
+        stream = client.receive_response()
+        result: object | None = None
+        timed_out = False
+        preempted = False
+        interrupted = False
+        next_task: asyncio.Task[Any] | None = None  # type: ignore[explicit-any]  # anext() result is an opaque SDK message
+        preempt_task: asyncio.Task[bool] | None = None
+        try:
+            next_task = asyncio.ensure_future(anext(stream))
+            preempt_task = asyncio.ensure_future(slot.preempt.wait())
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    if interrupted:
+                        if not preempted:
+                            timed_out = True
+                        break
+                    timed_out = True
+                    await self._interrupt_keep_warm_client(client)
+                    interrupted = True
+                    deadline = loop.time() + _KEEP_WARM_DRAIN_S
+                    continue
+                done, _ = await asyncio.wait(
+                    {next_task, preempt_task},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if preempt_task in done and not preempted:
+                    preempted = True
+                    await self._interrupt_keep_warm_client(client)
+                    interrupted = True
+                    deadline = min(deadline, loop.time() + _KEEP_WARM_DRAIN_S)
+                if next_task not in done:
+                    continue
+                try:
+                    message = next_task.result()
+                except StopAsyncIteration:
+                    break
+                if isinstance(message, sdk.ResultMessage):
+                    result = message
+                    break
+                next_task = asyncio.ensure_future(anext(stream))
+        finally:
+            for task in (next_task, preempt_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(BaseException):
+                        await task
+            # ``receive_response`` returns an async generator, which always
+            # has ``aclose``; guard for duck-typed test doubles.
+            aclose = getattr(stream, _ACLOSE_ATTR, None)
+            if aclose is not None:
+                with suppress(Exception):
+                    await aclose()
+        return _KeepWarmPingOutcome(
+            result=result,
+            timed_out=timed_out,
+            preempted=preempted,
+            tool_attempted=slot.tool_attempted,
+        )
+
+    @staticmethod
+    async def _interrupt_keep_warm_client(client: _ClaudeClient) -> None:
+        """Best-effort interrupt of a keep-warm ping; never raises."""
+        try:
+            await asyncio.wait_for(client.interrupt(), timeout=0.5)
+        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+            logger.warning("Claude SDK keep-warm interrupt failed: %s", exc)
 
     async def enqueue_session_message(
         self,
@@ -2456,20 +2763,25 @@ class ClaudeSDKExecutor(Executor):
         perm_ctx: object,
         *,
         permission_mode: str | None = None,
+        session_key: str | None = None,
     ) -> object:
         """
         Unified ``options.can_use_tool`` callback for the claude-sdk path.
 
-        Composes two independent gates, in order:
+        Composes three independent gates, in order:
 
-        1. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
+        1. **Keep-warm maintenance veto**: while a keep-warm ping owns the
+           session's query slot, every tool call is denied with
+           ``interrupt=True`` under every permission mode — the fixed
+           maintenance turn must never do real work.
+        2. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
            wired): a hard DENY short-circuits to
            :class:`~claude_agent_sdk.PermissionResultDeny`. This runs in
            EVERY permission mode — including ``bypassPermissions`` — so
            connector-native MCP tools can't slip past policy. ALLOW /
            no-match falls through with no human interaction, preserving
            ``bypassPermissions`` ergonomics for un-gated tools.
-        2. **Human-consent elicitation** (only when the permission mode is
+        3. **Human-consent elicitation** (only when the permission mode is
            NOT ``bypassPermissions`` and an elicitation handler is wired):
            the pre-existing per-tool approval prompt. Under
            ``bypassPermissions`` this step is skipped entirely, so the
@@ -2481,10 +2793,23 @@ class ClaudeSDKExecutor(Executor):
         :param perm_ctx: :class:`claude_agent_sdk.ToolPermissionContext`.
         :param permission_mode: This client's mode, or the executor default
             for a direct call.
+        :param session_key: Session this callback was installed for;
+            ``None`` for a direct call, which skips the maintenance veto.
         :returns: A :class:`~claude_agent_sdk.PermissionResult`.
         """
-        from claude_agent_sdk import PermissionResultAllow
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
+        slot = self._query_slots.get(session_key) if session_key is not None else None
+        if slot is not None and slot.maintenance:
+            slot.tool_attempted = True
+            logger.info(
+                "keep-warm maintenance turn attempted tool %s; denying and interrupting",
+                tool_name,
+            )
+            return PermissionResultDeny(
+                message="keep-warm maintenance turn: tools are disabled",
+                interrupt=True,
+            )
         policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
         if policy_result is not None:
             # Hard DENY from policy — block before execution.
@@ -2758,7 +3083,9 @@ class ClaudeSDKExecutor(Executor):
             or self._elicitation_handler is not None
         ):
             options.can_use_tool = partial(
-                self._can_use_tool_gate, permission_mode=permission_mode
+                self._can_use_tool_gate,
+                permission_mode=permission_mode,
+                session_key=session_key,
             )
 
         self._install_subagent_router_hook(sdk, options, model)
@@ -2954,13 +3281,38 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
-        self._pending_framework_context[session_key] = "\n\n".join(
-            notice
-            for message in notice_messages
-            if message.get("role") == "user"
-            for notice in framework_notices(message.get("content"))
-        )
+        # Claim the session's query slot before setting per-turn context: a
+        # keep-warm ping owning the slot yields to this turn, and no ping may
+        # interleave a query on the same client while this turn streams.
+        slot = self._query_slot(session_key)
+        if slot.maintenance:
+            slot.preempt.set()
+            try:
+                await asyncio.wait_for(slot.lock.acquire(), timeout=_KEEP_WARM_PREEMPT_WAIT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Claude SDK keep-warm ping did not yield for session %s; "
+                    "closing the live client so the turn starts fresh",
+                    session_key,
+                )
+                await self._close_live_client(session_key)
+                client = await self._get_or_create_client(
+                    sdk,
+                    session_key=session_key,
+                    options=options,
+                    model=model,
+                )
+                slot = self._reset_query_slot(session_key)
+                await slot.lock.acquire()
+        else:
+            await slot.lock.acquire()
         try:
+            self._pending_framework_context[session_key] = "\n\n".join(
+                notice
+                for message in notice_messages
+                if message.get("role") == "user"
+                for notice in framework_notices(message.get("content"))
+            )
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
                 if isinstance(prompt, list):
@@ -3373,6 +3725,7 @@ class ClaudeSDKExecutor(Executor):
             return
         finally:
             self._pending_framework_context.pop(session_key, None)
+            slot.lock.release()
         # A turn can end without ``ResultMessage`` usage — the CLI can close
         # the stream early, fail terminally (auth failure, rejected retries),
         # or be cut short before its final usage is reported. In all of those
