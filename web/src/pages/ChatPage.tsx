@@ -239,6 +239,10 @@ import {
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useComments } from "@/hooks/useComments";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import {
+  pendingCardsToAcknowledge,
+  useAcknowledgePendingElicitations,
+} from "@/hooks/useSessionPollingHotkeys";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -484,6 +488,18 @@ export function ChatPage() {
     sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
+  // Opening a session acknowledges the cards it shows, so Poll stops pulling
+  // back to it. The store's conversation id gates the transcript against a
+  // route switch; the loaded row's count covers an unloaded row.
+  const pendingCardCount = useChatStore((s) =>
+    pendingCardsToAcknowledge(
+      s.blocks,
+      sessionConvId,
+      conversations?.find((c) => c.id === sessionConvId)?.pending_elicitations_count,
+      s.conversationId,
+    ),
+  );
+  useAcknowledgePendingElicitations(sessionConvId, pendingCardCount);
 
   // Sync the store's active conversation to the URL. Single source of
   // truth: URL is what's "current"; store mirrors it. The effect is

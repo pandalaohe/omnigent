@@ -114,9 +114,9 @@ export function SessionNavigationSettings() {
           <span className="text-sm font-medium text-foreground">Background and Goal sessions</span>
           <p
             className="mt-1 text-sm text-muted-foreground"
-            title="Sessions showing B or G remain available, but Poll visits other sessions first."
+            title="Needs-response sessions always come first; otherwise B and G sessions keep their place in the polling order."
           >
-            Keep sessions showing B or G in the second polling pass.
+            Unread B or G sessions wait their turn instead of jumping the queue.
           </p>
         </div>
         <Switch
