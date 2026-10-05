@@ -2867,10 +2867,15 @@ class _CodexAppServerSession:
         if self._signer is not None:
             root_stat = codex_home_root.lstat()
             unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            # Windows dirs never read back POSIX-private modes or a sticky bit.
             if (
                 not stat.S_ISDIR(root_stat.st_mode)
                 or codex_home_root.is_symlink()
-                or (unsafe_writable and not root_stat.st_mode & stat.S_ISVTX)
+                or (
+                    hasattr(os, "getuid")
+                    and unsafe_writable
+                    and not root_stat.st_mode & stat.S_ISVTX
+                )
             ):
                 raise OSError("unsafe signer session temp root")
         # Stage outside the workspace, falling back to a private temp home
@@ -2884,7 +2889,9 @@ class _CodexAppServerSession:
         self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
         os.chmod(self._codex_home_dir, 0o700)
         home_stat = self._codex_home_dir.lstat()
-        if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
+        if not stat.S_ISDIR(home_stat.st_mode) or (
+            hasattr(os, "getuid") and stat.S_IMODE(home_stat.st_mode) != 0o700
+        ):
             raise OSError("unsafe signer CODEX_HOME")
         # The runner grants only this session's skills directory to its tools.
         # Keep its inode stable so cached sandbox mounts survive worker restarts.
