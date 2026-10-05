@@ -99,10 +99,15 @@ afterEach(() => {
 });
 
 function renderButton(agent: Agent | undefined) {
+  // The popover body now reads the session's sidebar row through react-query
+  // (the keep-warm block), so even a session-less button needs a client.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <TooltipProvider>
-      <AgentInfoButton agent={agent} />
-    </TooltipProvider>,
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <AgentInfoButton agent={agent} />
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -644,10 +649,13 @@ describe("AgentInfoButton per-model usage breakdown", () => {
 // (no popover trigger needed) with the policies data layer mocked.
 // ---------------------------------------------------------------------------
 
-function renderContent(sessionId: string, permissionLevel: number | null = LEVEL_OWNER) {
-  const qc = new QueryClient({
+function renderContent(
+  sessionId: string,
+  permissionLevel: number | null = LEVEL_OWNER,
+  qc: QueryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  }),
+) {
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
@@ -660,6 +668,40 @@ function renderContent(sessionId: string, permissionLevel: number | null = LEVEL
     </QueryClientProvider>,
   );
 }
+
+describe("AgentInfoContent keep-warm block", () => {
+  it("renders the state, reason, counters and last return for a keep-warm session", () => {
+    // The block reads the session's sidebar row (here seeded into the
+    // conversation cache) rather than a dedicated status endpoint.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["conversation-backfill", "conv_keep_warm"], {
+      id: "conv_keep_warm",
+      object: "conversation",
+      title: "Keep-warm session",
+      created_at: 1,
+      updated_at: 2,
+      labels: {},
+      permission_level: null,
+      warm_state: "warm",
+      keep_warm: {
+        state: "paused",
+        stop_reason: "failures",
+        episode: { pings: 4, cost_usd: 0.038, estimated: true, started_at: 100 },
+        total: { pings: 12, cost_usd: 0.42, estimated: false },
+        last_return: { at: 1_700_000_000, result: "hit" },
+        last_reason: "btw_unavailable",
+      },
+    });
+    renderContent("conv_keep_warm", LEVEL_OWNER, qc);
+
+    const block = screen.getByTestId("agent-info-keep-warm");
+    expect(block).toHaveTextContent("paused");
+    expect(block).toHaveTextContent("failures (btw_unavailable)");
+    expect(block).toHaveTextContent("4 pings ≈$0.04");
+    expect(block).toHaveTextContent("12 pings $0.42");
+    expect(block).toHaveTextContent("hit");
+  });
+});
 
 describe("SessionPoliciesSection", () => {
   beforeEach(() => {

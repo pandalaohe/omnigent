@@ -178,6 +178,7 @@ import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import {
   BackgroundActivityBadge,
+  ColdIdleDot,
   GoalActivityBadge,
   SessionStateBadge,
 } from "@/components/SessionStateBadge";
@@ -4473,6 +4474,11 @@ function ConversationRowImpl({
       : isStartingUp
         ? { kind: "starting" as const }
         : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
+  // Cold keep-warm: recolor the unseen dot / awaiting tag, and show a blue
+  // dot of its own when the idle row has no other session state to display.
+  const isCold = conversation.warm_state === "cold";
+  const keepWarm = conversation.keep_warm ?? null;
+  const hasColdIdleDot = isCold && sessionState === null;
   const backgroundActivityCount = Math.max(0, conversation.background_activity_count ?? 0);
   const hasBackgroundActivity = backgroundActivityCount > 0;
   const hasGoalMarker = goalState === "active" || goalState === "paused";
@@ -4481,11 +4487,15 @@ function ConversationRowImpl({
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive && !hasBackgroundActivity && !hasGoalMarker;
   const hasSessionIndicator =
-    sessionState !== null || hasBackgroundActivity || hasGoalMarker || showDraftIndicator;
+    sessionState !== null ||
+    hasColdIdleDot ||
+    hasBackgroundActivity ||
+    hasGoalMarker ||
+    showDraftIndicator;
   const showSharedIndicator = !isOwner;
   const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
   const compactMarkerCount =
-    (sessionState !== null && sessionState.kind !== "awaiting" ? 1 : 0) +
+    ((sessionState !== null && sessionState.kind !== "awaiting") || hasColdIdleDot ? 1 : 0) +
     (hasBackgroundActivity ? 1 : 0) +
     (hasGoalMarker ? 1 : 0);
 
@@ -4898,9 +4908,9 @@ function ConversationRowImpl({
             "right-1 max-md:right-10",
             unfiledWorkspace && "top-4",
             // The wide "awaiting" pill keeps its natural width; every other
-            // marker (running/starting/unseen dot, or the draft pencil) sits in
-            // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) &&
+            // marker (running/starting/unseen/cold dot, or the draft pencil)
+            // sits in the fixed centered box so it lines up under the kebab.
+            (isDotMarker(sessionState) || hasColdIdleDot) &&
               (compactMarkerCount >= 3
                 ? "w-16 justify-center gap-1"
                 : compactMarkerCount === 2
@@ -4912,7 +4922,9 @@ function ConversationRowImpl({
           )}
         >
           {sessionState !== null ? (
-            <SessionStateBadge state={sessionState} />
+            <SessionStateBadge state={sessionState} cold={isCold} keepWarm={keepWarm} />
+          ) : hasColdIdleDot ? (
+            <ColdIdleDot keepWarm={keepWarm} />
           ) : showDraftIndicator ? (
             <span
               role="img"
@@ -5302,6 +5314,8 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "goal_state",
   "foreground_status",
   "background_activity_count",
+  "warm_state",
+  "keep_warm",
   "agent_id",
   "agent_template_id",
 ];
@@ -5309,6 +5323,12 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
   if (a === b) return true;
   for (const key of RENDERED_CONVERSATION_FIELDS) {
+    if (key === "keep_warm") {
+      // Structured value: each frame/merge yields a fresh object, so compare
+      // by content or every snapshot would re-render every cold row.
+      if (JSON.stringify(a.keep_warm ?? null) !== JSON.stringify(b.keep_warm ?? null)) return false;
+      continue;
+    }
     if (a[key] !== b[key]) return false;
   }
   // `labels` is an object; compare by value (rename/project moves ride here).

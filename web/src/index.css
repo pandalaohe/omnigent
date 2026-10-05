@@ -63,6 +63,8 @@
   --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
+  /* Cold keep-warm cache — clear status blue, distinct from brand pink. */
+  --color-keep-cold: var(--keep-cold);
   /* Pink tag surface (translucent) — generates `bg-tag-pink`. */
   --color-tag-pink: var(--tag-pink);
   /* Named status hues — success/warning/info are repointed to the

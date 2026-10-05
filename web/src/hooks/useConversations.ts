@@ -181,6 +181,44 @@ export class BulkConversationMutationError extends Error {
   }
 }
 
+/** Whether keep-warm currently holds this session's prompt cache. */
+export type WarmState = "warm" | "cold";
+
+/** Mirrors the server's `KeepWarmEpisode`. */
+export interface KeepWarmEpisode {
+  pings: number;
+  cost_usd: number;
+  estimated: boolean;
+  started_at: number | null;
+}
+
+/** Mirrors the server's `KeepWarmTotal`. */
+export interface KeepWarmTotal {
+  pings: number;
+  cost_usd: number;
+  estimated: boolean;
+}
+
+/** Mirrors the server's `KeepWarmLastReturn`. */
+export interface KeepWarmLastReturn {
+  at: number;
+  result: "hit" | "miss" | "unknown";
+}
+
+/** Why warming stopped or paused, mirroring the server's vocabulary. */
+export type KeepWarmStopReason =
+  "cap" | "misses" | "failures" | "card" | "host" | "switch_off" | "runner_version";
+
+/** Mirrors the server's `KeepWarmStatus`. */
+export interface KeepWarmStatus {
+  state: "on" | "off" | "paused" | "stopped";
+  stop_reason: KeepWarmStopReason | null;
+  episode: KeepWarmEpisode;
+  total: KeepWarmTotal;
+  last_return: KeepWarmLastReturn | null;
+  last_reason: string | null;
+}
+
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
   id: string;
@@ -225,6 +263,17 @@ export interface Conversation {
   background_activity_count?: number;
   /** Provider-neutral Goal marker reported by Codex or Claude. */
   goal_state?: "active" | "paused" | null;
+  /**
+   * Whether keep-warm currently holds this session's prompt cache.
+   * `null`/absent when the harness has no keep-warm or the session is
+   * archived; `"cold"` drives the sidebar's blue indicators.
+   */
+  warm_state?: WarmState | null;
+  /**
+   * Keep-warm episode / lifetime counters and the last measured return.
+   * `null`/absent when the session has no keep-warm label or is archived.
+   */
+  keep_warm?: KeepWarmStatus | null;
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
    * `GET /v1/sessions` and the `WS /v1/sessions/updates` stream include
@@ -564,7 +613,30 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     host_online: wire.host_online ?? undefined,
     git_branch: wire.git_branch ?? null,
     archived: wire.archived ?? false,
+    warm_state: wire.warm_state ?? null,
+    keep_warm: wire.keep_warm ?? null,
   };
+}
+
+/**
+ * Read one session's sidebar-shaped row for surfaces that hold only its id
+ * (the Agent info panel). Prefers the freshest row already cached by the
+ * sidebar lists / pinned section, and backfills through
+ * {@link fetchConversationById} for a session no cached list holds. Shares
+ * the `["conversation-backfill", id]` cache the pin overlays patch.
+ */
+export function useConversationRow(id: string | null | undefined): Conversation | null {
+  const queryClient = useQueryClient();
+  const rowId = id ?? null;
+  const query = useQuery<Conversation | null>({
+    queryKey: ["conversation-backfill", rowId],
+    enabled: rowId !== null,
+    staleTime: 30_000,
+    retry: false,
+    queryFn: () => fetchConversationById(rowId as string),
+    initialData: () => (rowId === null ? undefined : findCachedConversationRow(queryClient, rowId)),
+  });
+  return query.data ?? null;
 }
 
 export async function fetchConversationsPage({

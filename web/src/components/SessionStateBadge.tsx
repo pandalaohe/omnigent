@@ -5,13 +5,26 @@
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { KeepWarmStatus } from "@/hooks/useConversations";
 import type { SessionState } from "@/hooks/useSessionState";
+import { keepWarmTooltipLine } from "@/lib/keepWarmStatus";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
 import { CircleAlertIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
+  /**
+   * Render the cold keep-warm treatment (blue dot / blue framed tag) for the
+   * unseen and awaiting states. Other states are unaffected.
+   */
+  cold?: boolean;
+  /** Keep-warm status backing the appended cold tooltip line. */
+  keepWarm?: KeepWarmStatus | null;
+}
+
+export interface ColdIdleDotProps {
+  keepWarm?: KeepWarmStatus | null;
 }
 
 export interface BackgroundActivityBadgeProps {
@@ -27,9 +40,11 @@ interface Visual {
   ariaLabel: string;
   tooltip: string;
   render: () => ReactElement;
+  /** Whether the cold keep-warm styling applies to this state. */
+  cold: boolean;
 }
 
-function describe(state: SessionState): Visual {
+function describe(state: SessionState, cold: boolean): Visual {
   switch (state.kind) {
     case "awaiting": {
       const tooltip =
@@ -38,8 +53,15 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: tooltip,
         tooltip,
+        cold,
         render: () => (
-          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">
+          <Badge
+            className={cn(
+              cold
+                ? "border-keep-cold bg-keep-cold/15 text-keep-cold"
+                : "border-transparent bg-brand-accent/15 text-brand-accent",
+            )}
+          >
             Needs response
           </Badge>
         ),
@@ -50,6 +72,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session running",
         tooltip: "Session running",
+        cold: false,
         render: () => <RunningDot className="size-3" />,
       };
     case "starting":
@@ -58,6 +81,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session starting up",
         tooltip: "Session starting up",
+        cold: false,
         render: () => <RunningDot className="size-3" />,
       };
     case "error":
@@ -65,6 +89,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Latest message is an error",
         tooltip: "Latest message is an error",
+        cold: false,
         render: () => (
           <CircleAlertIcon aria-hidden className="size-3.5 shrink-0 text-destructive" />
         ),
@@ -74,6 +99,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Host disconnected",
         tooltip: "Host disconnected",
+        cold: false,
         render: () => (
           <span
             aria-hidden
@@ -82,13 +108,14 @@ function describe(state: SessionState): Visual {
         ),
       };
     case "unseen":
-      // Solid brand-pink dot — distinguished from the running indicator,
-      // which is a grey spinner.
+      // Solid dot — brand pink normally, keep-cold blue when the cache is
+      // cold. Distinguished from the running indicator (a grey spinner).
       return {
         kind: state.kind,
         ariaLabel: "New messages",
         tooltip: "New messages",
-        render: () => <Dot tone="bg-brand-accent" />,
+        cold,
+        render: () => <Dot tone={cold ? "bg-keep-cold" : "bg-brand-accent"} />,
       };
   }
 }
@@ -97,14 +124,20 @@ function Dot({ tone }: { tone: string }) {
   return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
-export function SessionStateBadge({ state }: SessionStateBadgeProps) {
-  const visual = describe(state);
+export function SessionStateBadge({
+  state,
+  cold = false,
+  keepWarm = null,
+}: SessionStateBadgeProps) {
+  const visual = describe(state, cold);
+  const coldLine = visual.cold ? keepWarmTooltipLine(keepWarm) : null;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
           data-testid="session-state-badge"
           data-state={visual.kind}
+          data-cold={visual.cold ? "true" : undefined}
           role="img"
           aria-label={visual.ariaLabel}
           className="inline-flex h-5 shrink-0 items-center justify-center"
@@ -114,7 +147,36 @@ export function SessionStateBadge({ state }: SessionStateBadgeProps) {
       </TooltipTrigger>
       {/* Opens left: the badge sits at the right edge of the narrow
           sidebar, so a right-opening tooltip would overflow the panel. */}
-      <TooltipContent side="left">{visual.tooltip}</TooltipContent>
+      <TooltipContent side="left">
+        {visual.tooltip}
+        {coldLine !== null && <span className="block">{coldLine}</span>}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Idle-cold marker: the blue dot shown when a session's keep-warm cache is
+ * cold but it has no other state to surface. Occupies the same fixed slot
+ * as the unseen dot so compact-marker sizing lines up.
+ */
+export function ColdIdleDot({ keepWarm = null }: ColdIdleDotProps) {
+  const label = keepWarmTooltipLine(keepWarm);
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          data-testid="session-state-badge"
+          data-state="cold"
+          data-cold="true"
+          role="img"
+          aria-label={label}
+          className="inline-flex h-5 shrink-0 items-center justify-center"
+        >
+          <Dot tone="bg-keep-cold" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="left">{label}</TooltipContent>
     </Tooltip>
   );
 }

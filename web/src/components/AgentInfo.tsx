@@ -23,8 +23,14 @@ import {
   type McpServerSummary,
   type UpsertMcpServerInput,
 } from "@/hooks/useAgents";
+import { useConversationRow, type KeepWarmStatus } from "@/hooks/useConversations";
 import type { ModelUsage } from "@/lib/types";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
+import {
+  formatKeepWarmCounters,
+  keepWarmLastReturnLabel,
+  keepWarmStopReason,
+} from "@/lib/keepWarmStatus";
 import { showToast } from "@/components/ui/toast";
 import {
   usePolicies,
@@ -1218,6 +1224,47 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Keep-warm status (read-only)
+// ---------------------------------------------------------------------------
+
+function KeepWarmRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <span className="text-sm text-muted-foreground">{label}</span>
+      <span className="font-mono text-sm tabular-nums text-muted-foreground">{children}</span>
+    </div>
+  );
+}
+
+/**
+ * Keep-warm counters for the described session. The sidebar only flags a
+ * cold cache; warm sessions report their status here and nowhere else.
+ */
+function KeepWarmSection({ status }: { status: KeepWarmStatus }) {
+  const reason = keepWarmStopReason(status);
+  return (
+    <div className="flex flex-col gap-1.5 py-3" data-testid="agent-info-keep-warm">
+      <SectionLabel>Keep-warm</SectionLabel>
+      <KeepWarmRow label="State">{status.state}</KeepWarmRow>
+      {reason !== null && <KeepWarmRow label="Stop reason">{reason}</KeepWarmRow>}
+      <KeepWarmRow label="Episode">
+        {formatKeepWarmCounters(
+          status.episode.pings,
+          status.episode.cost_usd,
+          status.episode.estimated,
+        )}
+      </KeepWarmRow>
+      <KeepWarmRow label="Total">
+        {formatKeepWarmCounters(status.total.pings, status.total.cost_usd, status.total.estimated)}
+      </KeepWarmRow>
+      {status.last_return !== null && (
+        <KeepWarmRow label="Last return">{keepWarmLastReturnLabel(status.last_return)}</KeepWarmRow>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -1303,6 +1350,11 @@ export function AgentInfoContent({
   const viewerOwnsSession = owner != null && owner === viewerId;
   const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionId ?? null) : null);
   const isSessionShared = isSessionSharedWithOthers(owner ?? null, viewerId, ownerGrants);
+  // The sidebar row already carries the keep-warm status; this surface reads
+  // it from the same cache (backfilling the row if no list holds it) rather
+  // than asking the server for a second status object.
+  const conversation = useConversationRow(sessionId ?? null);
+  const keepWarm = conversation?.keep_warm ?? null;
 
   useEffect(() => {
     return () => {
@@ -1395,6 +1447,7 @@ export function AgentInfoContent({
             )}
           </div>
         )}
+      {keepWarm !== null && <KeepWarmSection status={keepWarm} />}
       <McpServersSection
         sessionId={sessionId}
         servers={servers}
