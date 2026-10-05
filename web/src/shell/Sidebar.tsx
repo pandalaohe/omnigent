@@ -2272,12 +2272,13 @@ function ConversationList({
     (name: string, conversations: Conversation[]) => {
       setFolderConversations((prev) => {
         const existing = prev.get(name);
-        // Skip the update when the id set is unchanged, so a background refetch
-        // that returns the same rows doesn't churn state (and re-render).
+        // Row objects, not ids: Poll reads pending cards and updated_at from
+        // this map, and a changed row arrives as a fresh object while
+        // react-query keeps unchanged rows referentially stable.
         if (
           existing &&
           existing.length === conversations.length &&
-          existing.every((c, i) => c.id === conversations[i]?.id)
+          existing.every((c, i) => c === conversations[i])
         ) {
           return prev;
         }
@@ -2368,70 +2369,61 @@ function ConversationList({
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
 
-  const pollingArchive = useArchiveConversation();
-  const conversationPages = conversationsQuery.data?.pages;
-  const hasNextConversationPage = conversationsQuery.hasNextPage;
-  const fetchNextConversationPage = conversationsQuery.fetchNextPage;
-  const getPollingConversations = useCallback(async () => {
-    let pages = conversationPages ?? [];
-    let hasMore = hasNextConversationPage;
-    while (hasMore) {
-      // Cursor pagination is sequential: each request needs the cursor returned by the prior page.
-      // SidebarListQuery erases fetchNextPage's return to `unknown` so the
-      // several sources behind it stay interchangeable; this loop is the one
-      // caller that reads it, so it names the two fields it consumes.
-      // eslint-disable-next-line no-await-in-loop
-      const result = (await fetchNextConversationPage()) as {
-        data?: { pages?: typeof pages };
-        hasNextPage?: boolean;
-      };
-      pages = result.data?.pages ?? pages;
-      hasMore = result.hasNextPage ?? false;
-    }
-    const allWithPinned = dedupeConversationsById([
-      ...pages.flatMap((page) => page.data),
-      ...pinnedConversations,
-    ]).filter((conversation) => conversation.archived !== true);
-    const pinned = orderByPinnedTimestamp(
-      allWithPinned.filter((conversation) => pinnedSet.has(conversation.id)),
-    );
-    const pinnedIds = new Set(pinned.map((conversation) => conversation.id));
-    const projectRows: Conversation[] = [];
-    const filedIds = new Set<string>();
-    for (const project of projects) {
-      const rows = sortByUpdatedAtDesc(
-        allWithPinned.filter(
-          (conversation) =>
-            isOwnedByViewer(conversation, viewerId) &&
-            !pinnedIds.has(conversation.id) &&
-            ((project.id !== null && conversation.project_id === project.id) ||
-              conversation.labels?.[PROJECT_LABEL_KEY] === project.name),
-        ),
-        activeOverride,
-      );
-      for (const row of rows) filedIds.add(row.id);
-      projectRows.push(...rows);
-    }
-    const rest = sortByUpdatedAtDesc(
-      allWithPinned.filter(
-        (conversation) => !pinnedIds.has(conversation.id) && !filedIds.has(conversation.id),
+  // Poll's candidate pool in sidebar order: what the rendered sections hold,
+  // with each project folder's own paginated rows in place of the global
+  // window's subset. A row the sidebar doesn't hold (another page, another
+  // filter) is not a target, and polling never fetches a page to find one.
+  const pollingPopulation = useMemo(() => {
+    const rows = dedupeConversationsById([
+      ...sections.pinned,
+      ...sections.projectGroups.flatMap(
+        (group) => folderConversations.get(group.name) ?? group.conversations,
       ),
-      activeOverride,
-    );
-    return [...pinned, ...projectRows, ...rest];
+      ...loadedSections.sessions,
+    ]);
+    return rows.filter((conversation) => conversation.archived !== true);
+  }, [sections.pinned, sections.projectGroups, folderConversations, loadedSections.sessions]);
+
+  // Rows the rendered sidebar hides: a collapsed Pinned/Chats section, the
+  // collapsed Projects group or an unexpanded project folder, and flat rows
+  // past the display page. Poll's plain cycle skips these; needs-response and
+  // unread jumps still reach them.
+  const hiddenPollingIds = useMemo(() => {
+    const visibleIds = new Set<string>();
+    if (!effectiveCollapsedSections.includes("Pinned")) {
+      for (const conversation of sections.pinned) visibleIds.add(conversation.id);
+    }
+    if (!effectiveCollapsedSections.includes("Projects")) {
+      for (const group of sections.projectGroups) {
+        if (!expandedProjects.includes(group.name)) continue;
+        for (const conversation of folderConversations.get(group.name) ?? group.conversations) {
+          visibleIds.add(conversation.id);
+        }
+      }
+    }
+    if (!effectiveCollapsedSections.includes("Chats")) {
+      for (const conversation of sections.sessions) visibleIds.add(conversation.id);
+    }
+    const hidden = new Set<string>();
+    for (const conversation of pollingPopulation) {
+      if (!visibleIds.has(conversation.id)) hidden.add(conversation.id);
+    }
+    return hidden;
   }, [
-    conversationPages,
-    hasNextConversationPage,
-    fetchNextConversationPage,
-    pinnedConversations,
-    pinnedSet,
-    projects,
-    viewerId,
-    activeOverride,
+    pollingPopulation,
+    sections.pinned,
+    sections.projectGroups,
+    sections.sessions,
+    folderConversations,
+    effectiveCollapsedSections,
+    expandedProjects,
   ]);
+
+  const pollingArchive = useArchiveConversation();
   useSessionPollingHotkeys({
     activeId,
-    getConversations: getPollingConversations,
+    getConversations: async () => pollingPopulation,
+    isCollapsed: (conversation) => hiddenPollingIds.has(conversation.id),
     onArchive: async (conversation) => {
       await pollingArchive.mutateAsync({ id: conversation.id, archived: true });
       showArchiveUndoToast(queryClient, [conversation], navigate);

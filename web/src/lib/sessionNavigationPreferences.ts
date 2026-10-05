@@ -10,7 +10,7 @@ export type NativeMobileHeaderMode = "server" | "conversation-title";
 export interface SessionNavigationPreferences {
   /** Null keeps the official behavior: every non-archived session participates. */
   pollingActiveWindowHours: number | null;
-  /** Keep sessions carrying the B marker behind non-background poll targets. */
+  /** On (the default): unread B/G sessions do not jump the poll's unread queue. */
   deprioritizeBackgroundSessions: boolean;
   /** Show the unofficial current-session Goal frame and sidebar G markers. */
   showGoalSessionMarkers: boolean;
