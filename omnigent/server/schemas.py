@@ -89,6 +89,7 @@ UserPreferenceNamespace = Literal[
     "session_collab",
     "host_colors",
     "keep_warm",
+    "worktree_location",
 ]
 
 

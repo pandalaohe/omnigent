@@ -136,6 +136,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
@@ -403,6 +404,7 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
+from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -11728,12 +11730,20 @@ async def _create_session_from_existing_agent(
                         agent_cache=agent_cache,
                         request=request,
                     )
+            # The owner's worktree location template rides the frame; an
+            # unset preference keeps the upstream sibling layout.
+            path_template = await asyncio.to_thread(
+                read_worktree_path_template,
+                getattr(request.app.state, "user_preferences_store", None),
+                user_id or RESERVED_USER_LOCAL,
+            )
             created_worktree = await _create_session_worktree(
                 host_id=body.host_id,
                 source_repo=source_repo,
                 git=body.git,
                 request=request,
                 entry=project_resolution.worktree_entry,
+                path_template=path_template,
             )
             # The host's path is canonicalised before any comparison or
             # persistence; rollback keeps the raw path it returned.

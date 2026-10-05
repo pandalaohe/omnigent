@@ -9959,6 +9959,7 @@ async def _create_session_worktree(
     git: SessionGitOptions,
     request: Request,
     entry: str | None = None,
+    path_template: str | None = None,
 ) -> CreatedWorktree:
     """
     Create a git worktree on the host for a new session branch.
@@ -9977,9 +9978,9 @@ async def _create_session_worktree(
         ``base_branch``).
     :param request: FastAPI request carrying the host registry.
     :param entry: The session project's entry directory on the host, or
-        ``None``. When set, the host creates the worktree under
-        ``<entry>/.worktrees/`` and records it as the session's working
-        tree.
+        ``None``. Only fills the template's ``{entry}`` token.
+    :param path_template: The owner's worktree location template, or
+        ``None`` for the upstream sibling layout.
     :returns: The worktree root for rollback, the relocated ``workspace``,
         and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
@@ -10016,6 +10017,7 @@ async def _create_session_worktree(
             base_branch=git.base_branch,
             existing_branch=git.existing_branch,
             entry=entry,
+            path_template=path_template,
         )
     except WorktreeHostUnavailableError as exc:
         # Host offline / unresponsive — infra, not user input.

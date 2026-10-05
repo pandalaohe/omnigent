@@ -11,7 +11,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
@@ -44,6 +44,7 @@ from omnigent.server.user_preferences_store import (
     read_approval_timeout,
     read_collab_settings,
     read_keep_warm_settings,
+    read_worktree_path_template,
     validate_preferences_envelope,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -1315,3 +1316,292 @@ async def test_preferences_api_accepts_the_keep_warm_namespace(
         main=True, child=False, interval_s=300, max_s=7200
     )
     assert keep_warm_for_agent(settings, "agent-b", "codex") is None
+
+
+_ENTRY_TEMPLATE = "{entry}/.worktrees/{repo}/{branch}"
+
+
+def test_store_accepts_and_clears_the_worktree_location_namespace(db_uri: str) -> None:
+    """A valid template stores and reads back; ``null`` value and patch both unset."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    patched = store.patch_namespace(
+        "alice@example.com", "worktree_location", {"pathTemplate": _ENTRY_TEMPLATE}
+    )
+    assert patched["settings"]["worktree_location"] == {"pathTemplate": _ENTRY_TEMPLATE}
+    assert read_worktree_path_template(store, "alice@example.com") == _ENTRY_TEMPLATE
+
+    # An explicit {"pathTemplate": null} keeps the namespace with no template.
+    patched = store.patch_namespace(
+        "alice@example.com", "worktree_location", {"pathTemplate": None}
+    )
+    assert patched["settings"]["worktree_location"] == {"pathTemplate": None}
+    assert read_worktree_path_template(store, "alice@example.com") is None
+
+    removed = store.patch_namespace("alice@example.com", "worktree_location", None)
+    assert "worktree_location" not in removed["settings"]
+    assert read_worktree_path_template(store, "alice@example.com") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ("a string", "worktree_location must be an object"),
+        ({"template": "x"}, "unsupported worktree_location key: template"),
+        ({"pathTemplate": 42}, "must be a string or null"),
+        ({"pathTemplate": ""}, "must not be empty"),
+        ({"pathTemplate": "wt/{branch}"}, "must contain {repo}"),
+        ({"pathTemplate": "{entry}/{repo}"}, "must contain {branch}"),
+        ({"pathTemplate": "{unknown}/{repo}/{branch}"}, "unknown token"),
+        ({"pathTemplate": "{entry}/wt/{repo}/{branch"}, "stray"),
+        ({"pathTemplate": "{entry}/../{repo}/{branch}"}, "must not contain '.' or '..'"),
+        ({"pathTemplate": "{entry}/~/x/{repo}/{branch}"}, "only as the whole first segment"),
+        ({"pathTemplate": "{entry}/" + "a" * 510 + "/{repo}/{branch}"}, "at most 512"),
+        ({"pathTemplate": "{entry}/wt\t/{repo}/{branch}"}, "control characters"),
+    ],
+)
+def test_store_rejects_invalid_worktree_location_values(
+    db_uri: str, value: object, match: str
+) -> None:
+    """Write validation runs the template grammar; a refusal writes no row."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    with pytest.raises(UserPreferencesValidationError, match=match):
+        store.patch_namespace("alice@example.com", "worktree_location", value)
+    # The refusal happened before the write transaction: no rows at all.
+    assert store.get("alice@example.com") is None
+
+
+def test_stored_worktree_location_under_an_older_rule_still_reads(db_uri: str) -> None:
+    """A stored value a newer rule would reject never breaks the envelope.
+
+    Write validation lives only on the incoming value, so a template stored
+    under an older rule survives ``_assemble_envelope``: sibling namespaces
+    keep reading and patching, and the reader returns the string unchanged
+    (the host re-validates it before rendering).
+    """
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.add(
+            SqlPreference(
+                workspace_id=0,
+                user_id="alice@example.com",
+                key="settings.version",
+                value="1",
+            )
+        )
+        session.add(
+            SqlPreference(
+                workspace_id=0,
+                user_id="alice@example.com",
+                key="settings.worktree_location",
+                value='{"pathTemplate":"wt/{branch}"}',
+            )
+        )
+        session.commit()
+
+    envelope = store.get("alice@example.com")
+    assert envelope is not None
+    assert envelope["settings"]["worktree_location"] == {"pathTemplate": "wt/{branch}"}
+    assert read_worktree_path_template(store, "alice@example.com") == "wt/{branch}"
+
+    merged = store.patch_namespace("alice@example.com", "usage_context", {"visible": True})
+    assert merged["settings"]["worktree_location"] == {"pathTemplate": "wt/{branch}"}
+    assert merged["settings"]["usage_context"] == {"visible": True}
+
+
+def test_read_worktree_path_template_defaults_on_missing_store_owner_or_namespace(
+    db_uri: str,
+) -> None:
+    """Every gap resolves to ``None`` — the upstream sibling layout."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    assert read_worktree_path_template(None, "alice@example.com") is None
+    assert read_worktree_path_template(store, None) is None
+    assert read_worktree_path_template(store, "alice@example.com") is None
+
+
+def test_read_worktree_path_template_tolerates_bad_rows_and_shapes() -> None:
+    """A corrupt row or malformed value never fails a worktree create."""
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise UserPreferencesValidationError("stored preferences are invalid JSON")
+
+    class _ValueErrorStore:
+        def get(self, user_id: str) -> None:
+            raise ValueError("oversized integer in stored preferences")
+
+    class _DatabaseErrorStore:
+        def get(self, user_id: str) -> None:
+            raise OperationalError("select", {}, Exception("down"))
+
+    class _ShapeStore:
+        def __init__(self, value: object) -> None:
+            self._value = value
+
+        def get(self, user_id: str) -> object:
+            return self._value
+
+    assert read_worktree_path_template(_RaisingStore(), "alice@example.com") is None
+    assert read_worktree_path_template(_ValueErrorStore(), "alice@example.com") is None
+    assert read_worktree_path_template(_DatabaseErrorStore(), "alice@example.com") is None
+    assert read_worktree_path_template(_ShapeStore([]), "alice@example.com") is None
+    assert (
+        read_worktree_path_template(
+            _ShapeStore({"settings": {"worktree_location": "compact"}}),
+            "alice@example.com",
+        )
+        is None
+    )
+    assert (
+        read_worktree_path_template(
+            _ShapeStore({"settings": {"worktree_location": {"pathTemplate": None}}}),
+            "alice@example.com",
+        )
+        is None
+    )
+    assert (
+        read_worktree_path_template(
+            _ShapeStore({"settings": {"worktree_location": {"pathTemplate": ""}}}),
+            "alice@example.com",
+        )
+        is None
+    )
+    assert (
+        read_worktree_path_template(
+            _ShapeStore({"settings": {"worktree_location": {"pathTemplate": 42}}}),
+            "alice@example.com",
+        )
+        is None
+    )
+    assert (
+        read_worktree_path_template(
+            _ShapeStore({"settings": {"worktree_location": {"pathTemplate": _ENTRY_TEMPLATE}}}),
+            "alice@example.com",
+        )
+        == _ENTRY_TEMPLATE
+    )
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_accepts_the_worktree_location_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The worktree_location namespace is allowlisted by the API and reads back."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "worktree@example.com"}
+        patched = await client.patch(
+            "/v1/me/preferences/worktree_location",
+            headers=headers,
+            json={"value": {"pathTemplate": _ENTRY_TEMPLATE}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["worktree_location"] == {"pathTemplate": _ENTRY_TEMPLATE}
+
+    assert (
+        read_worktree_path_template(SqlAlchemyUserPreferencesStore(db_uri), "worktree@example.com")
+        == _ENTRY_TEMPLATE
+    )
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_rejects_an_invalid_worktree_location_template(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """A 422 detail carries the template rule verbatim; nothing is stored."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "worktree@example.com"}
+        refused = await client.patch(
+            "/v1/me/preferences/worktree_location",
+            headers=headers,
+            json={"value": {"pathTemplate": "wt/{branch}"}},
+        )
+        assert refused.status_code == 422, refused.text
+        assert "must contain {repo}" in refused.json()["detail"]
+
+        refused = await client.patch(
+            "/v1/me/preferences/worktree_location",
+            headers=headers,
+            json={"value": {"other": "{entry}/{repo}/{branch}"}},
+        )
+        assert refused.status_code == 422, refused.text
+        assert "unsupported worktree_location key: other" in refused.json()["detail"]
+
+    assert (
+        read_worktree_path_template(SqlAlchemyUserPreferencesStore(db_uri), "worktree@example.com")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_clears_the_worktree_location_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """PATCH ``null`` removes the namespace; the reader defaults to ``None``."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "worktree@example.com"}
+        patched = await client.patch(
+            "/v1/me/preferences/worktree_location",
+            headers=headers,
+            json={"value": {"pathTemplate": _ENTRY_TEMPLATE}},
+        )
+        assert patched.status_code == 200, patched.text
+
+        cleared = await client.patch(
+            "/v1/me/preferences/worktree_location",
+            headers=headers,
+            json={"value": None},
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert "worktree_location" not in cleared.json()["settings"]
+
+    assert (
+        read_worktree_path_template(SqlAlchemyUserPreferencesStore(db_uri), "worktree@example.com")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_initialize_validates_worktree_location(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """PUT applies the same rule: an invalid template 422s and stores nothing."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "worktree@example.com"}
+        refused = await client.put(
+            "/v1/me/preferences",
+            headers=headers,
+            json={
+                "version": 1,
+                "settings": {"worktree_location": {"pathTemplate": "wt/{branch}"}},
+            },
+        )
+        assert refused.status_code == 422, refused.text
+        assert "must contain {repo}" in refused.json()["detail"]
+
+        accepted = await client.put(
+            "/v1/me/preferences",
+            headers=headers,
+            json={
+                "version": 1,
+                "settings": {"worktree_location": {"pathTemplate": _ENTRY_TEMPLATE}},
+            },
+        )
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["settings"]["worktree_location"] == {
+            "pathTemplate": _ENTRY_TEMPLATE
+        }

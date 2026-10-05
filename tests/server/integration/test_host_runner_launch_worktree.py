@@ -38,11 +38,13 @@ from omnigent.host.frames import (
     HostStatFrame,
     decode_host_frame,
 )
+from omnigent.host.git_worktree import _resolve_worktree_path
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes import hosts as hosts_routes
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -51,6 +53,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import create_test_agent
 
@@ -144,6 +147,32 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
+@pytest.fixture()
+def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """Auth-enabled twin of ``app``: same stores plus header auth.
+
+    Overrides the shared conftest ``auth_app`` (which wires no ``host_store``
+    and so cannot run ``launch_runner``) for this module. The shared
+    ``auth_client`` fixture then serves this app.
+    """
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
 class _FakeWebSocket:
     """Minimal WebSocket stand-in (the registry only enqueues)."""
 
@@ -194,8 +223,11 @@ async def register_host(
     :returns: Async iterator yielding a ``register`` factory. Kwargs:
         ``create_status`` (``"ok"``/``"failed"``), ``create_error``
         (host failure detail), ``launch_status``
-        (``"launched"``/``"failed"``). Returns the :class:`_HostCapture`
-        accumulating frames the host received.
+        (``"launched"``/``"failed"``), ``owner`` (the host's owner, so an
+        auth-enabled test can own it; defaults to
+        ``RESERVED_USER_LOCAL``), and ``app_override`` (register into that
+        app's registry instead of the fixture's). Returns the
+        :class:`_HostCapture` accumulating frames the host received.
     """
     conns: list[HostConnection] = []
     resolver_tasks: list[asyncio.Task[None]] = []
@@ -208,13 +240,16 @@ async def register_host(
         launch_status: str = "launched",
         stat_fails_for: Callable[[str], bool] | None = None,
         workspace: str | None = None,
+        owner: str = RESERVED_USER_LOCAL,
+        app_override: FastAPI | None = None,
     ) -> _HostCapture:
-        HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
-        conn = app.state.host_registry.register(
+        target_app = app_override if app_override is not None else app
+        HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", owner)
+        conn = target_app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
             hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
-            owner=RESERVED_USER_LOCAL,
+            owner=owner,
         )
         cap = _HostCapture()
 
@@ -227,16 +262,23 @@ async def register_host(
             if future.done():
                 return
             if create_status == "ok":
-                dirname = frame.branch_name.replace("/", "-")
                 repo_root = frame.repo_path
                 if repo_root != _SOURCE_REPO and repo_root.startswith(f"{_SOURCE_REPO}/"):
                     # A launch into a checkout subdirectory still nests the
                     # worktree beside the checkout root, like the real host.
                     repo_root = _SOURCE_REPO
+                worktree_path = str(
+                    _resolve_worktree_path(
+                        repo_root,
+                        frame.branch_name,
+                        path_template=frame.path_template,
+                        entry=frame.entry,
+                    )[0]
+                )
                 future.set_result(
                     {
                         "status": "ok",
-                        "worktree_path": f"{repo_root}-worktrees/{dirname}",
+                        "worktree_path": worktree_path,
                         "workspace": workspace,
                         "branch": frame.branch_name,
                         "error": None,
@@ -327,15 +369,18 @@ async def register_host(
         await asyncio.gather(*resolver_tasks, return_exceptions=True)
 
 
-async def _bare_session(client: httpx.AsyncClient, name: str) -> str:
+async def _bare_session(client: httpx.AsyncClient, name: str, *, user: str | None = None) -> str:
     """Create an unbound session (agent only, no host/workspace).
 
     :param client: The test HTTP client.
     :param name: Agent name to create.
+    :param user: Optional authenticated identity for both requests; its
+        ``X-Forwarded-Email`` header is sent when set.
     :returns: The new session id.
     """
-    agent = await create_test_agent(client, name=name)
-    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    agent = await create_test_agent(client, name=name, user=user)
+    headers = {"X-Forwarded-Email": user} if user is not None else None
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]}, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
 
@@ -346,6 +391,7 @@ async def _launch(
     *,
     workspace: str = _SOURCE_REPO,
     git: dict[str, object] | None = None,
+    user: str | None = None,
 ) -> httpx.Response:
     """POST the dedicated per-session bind+launch endpoint.
 
@@ -356,12 +402,31 @@ async def _launch(
     :param git: Optional ``git`` block. Create mode, e.g.
         ``{"branch_name": "feature/x"}``; bind mode, e.g.
         ``{"branch_name": "feature/x", "existing_worktree": True}``.
+    :param user: Optional authenticated identity; sent as
+        ``X-Forwarded-Email`` when set.
     :returns: The raw HTTP response.
     """
     body: dict[str, object] = {"session_id": session_id, "workspace": workspace}
     if git is not None:
         body["git"] = git
-    return await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=body)
+    headers = {"X-Forwarded-Email": user} if user is not None else None
+    return await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=body, headers=headers)
+
+
+_ENTRY_TEMPLATE = "{entry}/.worktrees/{repo}/{branch}"
+
+
+def _store_path_template(app: FastAPI, db_uri: str) -> None:
+    """Wire a preferences store carrying the ``{entry}`` worktree template.
+
+    Auth is off in these tests, so the launch request's owner resolves to
+    ``RESERVED_USER_LOCAL``.
+    """
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        RESERVED_USER_LOCAL, "worktree_location", {"pathTemplate": _ENTRY_TEMPLATE}
+    )
+    app.state.user_preferences_store = store
 
 
 async def test_launch_runner_with_git_creates_worktree_and_persists_branch(
@@ -395,6 +460,8 @@ async def test_launch_runner_with_git_creates_worktree_and_persists_branch(
     assert cap.create[0].base_branch == "main"
     # No project on this session: no entry, so the legacy location is used.
     assert cap.create[0].entry is None
+    # No stored template either: the upstream sibling layout.
+    assert cap.create[0].path_template is None
     # Success path: no rollback.
     assert cap.remove == [], "worktree was rolled back on a successful launch"
 
@@ -770,6 +837,7 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
 ) -> None:
     """A branch created with the entry picked sources the checkout and launches in it."""
     cap = register_host()
+    _store_path_template(app, db_uri)
     app.state.project_host_binding_store = _ProjectDirs(
         entries=[(_HOST_ID, _ENTRY)], bindings=[(_HOST_ID, _CHECKOUT)]
     )
@@ -782,15 +850,53 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     assert response.status_code == 200, response.text
     assert len(cap.create) == 1
     assert cap.create[0].repo_path == _CHECKOUT, "the worktree must come from the checkout"
-    # The project's entry travels with the frame so the host nests the
-    # worktree under ``<entry>/.worktrees/``.
+    # The project's entry and the owner's stored template both travel with
+    # the frame, and the fake host renders the path from them (entry + repo
+    # dir name + sanitized branch).
     assert cap.create[0].entry == _ENTRY
-    created = f"{_CHECKOUT}-worktrees/feature-x"
+    assert cap.create[0].path_template == _ENTRY_TEMPLATE
+    created = "/Users/alice/entry/.worktrees/omnigent/feature-x"
     assert cap.launch[0].workspace == created
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.workspace == created
     assert conv.worktree == created
+    assert conv.git_branch == "feature/x"
+
+
+async def test_launch_runner_git_create_at_entry_without_template_uses_sibling(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Same entry checkout, no stored template: the upstream sibling layout.
+
+    The frame still carries the project's entry, but with no
+    ``worktree_location`` preference the fake host's real resolver falls
+    back to ``<checkout>-worktrees/<branch>``.
+    """
+    cap = register_host()
+    app.state.project_host_binding_store = _ProjectDirs(
+        entries=[(_HOST_ID, _ENTRY)], bindings=[(_HOST_ID, _CHECKOUT)]
+    )
+    session_id = await _project_session(client, db_uri)
+
+    response = await _launch(
+        client, session_id, workspace=_ENTRY, git={"branch_name": "feature/x"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(cap.create) == 1
+    assert cap.create[0].repo_path == _CHECKOUT
+    assert cap.create[0].entry == _ENTRY
+    assert cap.create[0].path_template is None
+    sibling = "/Users/alice/entry/fork/omnigent-worktrees/feature-x"
+    assert cap.launch[0].workspace == sibling
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == sibling
+    assert conv.worktree == sibling
     assert conv.git_branch == "feature/x"
 
 
@@ -978,3 +1084,34 @@ async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
         assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == expected
     assert conv.workspace == (workspace if launch_status == "launched" else None)
     assert cap.create == []
+
+
+async def test_launch_runner_reads_the_authenticated_owners_template(
+    auth_app: FastAPI,
+    register_host: RegisterHost,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """With auth on, the launching user's own template is read, not ``"local"``'s.
+
+    Bob and the reserved local owner each hold a different template, so a
+    hard-coded owner would surface in the frame: it must carry alice's.
+    """
+    alice = "alice@example.com"
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(alice, "worktree_location", {"pathTemplate": _ENTRY_TEMPLATE})
+    store.patch_namespace(
+        "bob@example.com", "worktree_location", {"pathTemplate": "/data/wt/{repo}/{branch}"}
+    )
+    store.patch_namespace(
+        RESERVED_USER_LOCAL, "worktree_location", {"pathTemplate": "/tmp/local/{repo}/{branch}"}
+    )
+    auth_app.state.user_preferences_store = store
+    cap = register_host(app_override=auth_app, owner=alice)
+    session_id = await _bare_session(auth_client, "wt-auth-owner-agent", user=alice)
+
+    response = await _launch(auth_client, session_id, git={"branch_name": "feature/x"}, user=alice)
+
+    assert response.status_code == 200, response.text
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].path_template == _ENTRY_TEMPLATE

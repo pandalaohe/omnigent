@@ -155,6 +155,36 @@ async def test_create_worktree_success_returns_path_and_branch(
     assert sent.base_branch == "main"
     # No entry passed: the frame carries none (legacy location).
     assert sent.entry is None
+    # No template passed: the host keeps the upstream sibling layout.
+    assert sent.path_template is None
+
+
+async def test_create_worktree_forwards_path_template(host_setup: HostRegistry) -> None:
+    """The owner's worktree location template reaches the host frame."""
+    registry = host_setup
+    registry._create_reply_for_test.update(  # type: ignore[attr-defined]
+        {
+            "status": "ok",
+            "worktree_path": "/Users/alice/project/.worktrees/myrepo/feature-login",
+            "branch": "feature/login",
+            "error": None,
+        }
+    )
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    await create_worktree_on_host(
+        host_registry=registry,
+        host_conn=conn,
+        repo_path="/Users/alice/myrepo",
+        branch_name="feature/login",
+        base_branch=None,
+        entry="/Users/alice/project",
+        path_template="{entry}/.worktrees/{repo}/{branch}",
+    )
+    sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
+    assert isinstance(sent, HostCreateWorktreeFrame)
+    assert sent.entry == "/Users/alice/project"
+    assert sent.path_template == "{entry}/.worktrees/{repo}/{branch}"
 
 
 async def test_create_worktree_forwards_entry(host_setup: HostRegistry) -> None:

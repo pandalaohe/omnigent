@@ -32,10 +32,12 @@ from omnigent.host.frames import (
     HostStatFrame,
     decode_host_frame,
 )
+from omnigent.host.git_worktree import _resolve_worktree_path
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -168,10 +170,13 @@ async def register_worktree_host(
         ref) and ``create_error`` (the failure message). Returns a
         ``_HostCapture`` whose ``.create`` / ``.remove`` lists accumulate
         the create- and remove-worktree frames the host received.
-        ``place_under_entry=True`` makes the fake host honor the frame's
-        ``entry`` the way a real host does, returning a path under
-        ``<entry>/.worktrees/<repo>/<branch>`` instead of the legacy
-        sibling location.
+        ``place_like_host=True`` makes the fake host render its reply
+        through the real ``_resolve_worktree_path`` — the frame's
+        ``path_template`` (or the sibling layout when it is ``None``)
+        decides the returned path, exactly as a real host would.
+        ``owner`` sets the host's owner (for auth-enabled tests) and
+        ``app_override`` registers into that app's registry instead of the
+        fixture's.
     """
     conns: list[HostConnection] = []
 
@@ -182,14 +187,17 @@ async def register_worktree_host(
         stat_fails_for: Callable[[str], bool] | None = None,
         workspace: str | None = None,
         canonical_path: Callable[[str], str] | None = None,
-        place_under_entry: bool = False,
+        place_like_host: bool = False,
+        owner: str = RESERVED_USER_LOCAL,
+        app_override: FastAPI | None = None,
     ) -> _HostCapture:
-        HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
-        conn = app.state.host_registry.register(
+        target_app = app_override if app_override is not None else app
+        HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", owner)
+        conn = target_app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
             hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
-            owner=RESERVED_USER_LOCAL,
+            owner=owner,
         )
         cap = _HostCapture()
 
@@ -232,13 +240,17 @@ async def register_worktree_host(
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         if create_status == "ok":
-                            dirname = frame.branch_name.replace("/", "-")
-                            if place_under_entry and frame.entry is not None:
-                                worktree_path = (
-                                    f"{frame.entry}/.worktrees/"
-                                    f"{Path(frame.repo_path).name}/{dirname}"
+                            if place_like_host:
+                                worktree_path = str(
+                                    _resolve_worktree_path(
+                                        frame.repo_path,
+                                        frame.branch_name,
+                                        path_template=frame.path_template,
+                                        entry=frame.entry,
+                                    )[0]
                                 )
                             else:
+                                dirname = frame.branch_name.replace("/", "-")
                                 worktree_path = f"{_SOURCE_REPO}-worktrees/{dirname}"
                             fut.set_result(
                                 {
@@ -300,6 +312,8 @@ async def _create_git_session(
     client: httpx.AsyncClient,
     agent_id: str,
     git: dict[str, Any],
+    *,
+    user: str | None = None,
 ) -> httpx.Response:
     """POST a JSON session-create with a ``git`` block.
 
@@ -307,8 +321,11 @@ async def _create_git_session(
     :param agent_id: Agent to bind.
     :param git: The ``git`` block, e.g.
         ``{"branch_name": "feature/x", "base_branch": "main"}``.
+    :param user: Optional authenticated identity; sent as
+        ``X-Forwarded-Email`` when set.
     :returns: The raw create response.
     """
+    headers = {"X-Forwarded-Email": user} if user is not None else None
     return await client.post(
         "/v1/sessions",
         json={
@@ -317,7 +334,24 @@ async def _create_git_session(
             "workspace": _SOURCE_REPO,
             "git": git,
         },
+        headers=headers,
     )
+
+
+_ENTRY_TEMPLATE = "{entry}/.worktrees/{repo}/{branch}"
+
+
+def _store_path_template(app: FastAPI, db_uri: str) -> None:
+    """Wire a preferences store carrying the ``{entry}`` worktree template.
+
+    Auth is off in these tests, so the creating request's owner resolves
+    to ``RESERVED_USER_LOCAL``.
+    """
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        RESERVED_USER_LOCAL, "worktree_location", {"pathTemplate": _ENTRY_TEMPLATE}
+    )
+    app.state.user_preferences_store = store
 
 
 async def test_create_passes_branch_and_base_branch_to_host(
@@ -355,6 +389,34 @@ async def test_create_passes_branch_and_base_branch_to_host(
     body = resp.json()
     assert body["git_branch"] == "feature/login"
     assert body["workspace"] == f"{_SOURCE_REPO}-worktrees/feature-login"
+
+
+async def test_create_with_template_and_no_entry_uses_the_repo_as_entry(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """With the template stored but no project entry, ``{entry}`` is the source repo.
+
+    The create has no project, so the frame carries no entry; the host
+    renders ``{entry}`` from the main work tree, nesting the worktree at
+    ``<source repo>/.worktrees/<repo name>/<branch>``.
+    """
+    cap = register_worktree_host(place_like_host=True)
+    _store_path_template(app, db_uri)
+    agent = await create_test_agent(client, name="wt-template-no-entry-agent")
+
+    resp = await _create_git_session(client, agent["id"], {"branch_name": "feature/x"})
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].entry is None
+    assert cap.create[0].path_template == _ENTRY_TEMPLATE
+
+    body = resp.json()
+    assert body["workspace"] == "/Users/alice/myrepo/.worktrees/myrepo/feature-x"
+    assert body["worktree"] == "/Users/alice/myrepo/.worktrees/myrepo/feature-x"
 
 
 async def test_create_without_base_branch_sends_none(
@@ -800,12 +862,14 @@ async def test_child_inherits_parent_project_entry_for_worktree_placement(
     parent project's entry.
 
     The child sends ``parent_session_id`` + ``git`` but no ``project_id``;
-    its worktree must still land at ``<entry>/.worktrees/<repo>/<branch>``
-    (the parent project's entry on the host), not the sibling fallback.
-    Placement only: the child's own launch directory stays its worktree, so
-    the response workspace and worktree are both the created path.
+    with the ``{entry}`` template stored, its worktree must still land at
+    ``<entry>/.worktrees/<repo>/<branch>`` (the parent project's entry on
+    the host), not the sibling fallback. Placement only: the child's own
+    launch directory stays its worktree, so the response workspace and
+    worktree are both the created path.
     """
-    cap = register_worktree_host(place_under_entry=True)
+    cap = register_worktree_host(place_like_host=True)
+    _store_path_template(app, db_uri)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
     app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
     agent = await create_test_agent(client, name="wt-child-entry-agent")
@@ -836,6 +900,51 @@ async def test_child_inherits_parent_project_entry_for_worktree_placement(
     assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
 
 
+async def test_child_inherits_parent_project_entry_without_template_uses_sibling(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Without a stored template the inherited entry no longer places the worktree.
+
+    The child sends ``parent_session_id`` + ``git`` but no ``project_id``,
+    so its frame still carries the parent project's entry on the host —
+    but with no ``worktree_location`` preference the host falls back to
+    the upstream sibling layout, not ``<entry>/.worktrees/``.
+    """
+    cap = register_worktree_host(place_like_host=True)
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-child-entry-no-template-agent")
+    parent_id = await _create_project_parent_session(client, agent["id"])
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": {"branch_name": "feature/x"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    assert len(cap.create) == 1, cap.create
+    frame = cap.create[0]
+    assert frame.entry == _ENTRY
+    assert frame.path_template is None
+
+    # The entry is still sent, but the worktree lands beside the repo root
+    # (the entry here, since the project has no primary binding), not
+    # under the entry.
+    body = resp.json()
+    sibling = "/Users/alice/project-worktrees/feature-x"
+    assert body["workspace"] == sibling
+    assert body["worktree"] == sibling
+
+
 async def test_child_naming_its_project_launches_in_its_worktree(
     app: FastAPI,
     register_worktree_host: RegisterHost,
@@ -845,10 +954,12 @@ async def test_child_naming_its_project_launches_in_its_worktree(
     """A child that names its project launches in the worktree it cut.
 
     This is ``sys_session_create`` with ``worktree`` and ``project_id``: the
-    project's entry fills the child's workspace and places the worktree, and
-    the child runs in that worktree, not at the entry.
+    project's entry fills the child's workspace and, with the ``{entry}``
+    template stored, places the worktree, and the child runs in that
+    worktree, not at the entry.
     """
-    cap = register_worktree_host(place_under_entry=True)
+    cap = register_worktree_host(place_like_host=True)
+    _store_path_template(app, db_uri)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
     app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
     agent = await create_test_agent(client, name="wt-child-named-project-agent")
@@ -918,10 +1029,11 @@ async def test_explicit_project_create_launches_in_its_worktree(
     """A create that names its project launches in the worktree it cut.
 
     This is the body ``sys_session_open`` sends for ``branch``: the entry
-    reaches the host (the fake host places under it here) and the session's
-    workspace is the created worktree, not the entry.
+    and the stored ``{entry}`` template reach the host together, and the
+    session's workspace is the created worktree, not the entry.
     """
-    cap = register_worktree_host(place_under_entry=True)
+    cap = register_worktree_host(place_like_host=True)
+    _store_path_template(app, db_uri)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
     app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
     agent = await create_test_agent(client, name="wt-explicit-entry-agent")
@@ -940,6 +1052,7 @@ async def test_explicit_project_create_launches_in_its_worktree(
 
     assert len(cap.create) == 1, cap.create
     assert cap.create[0].entry == _ENTRY
+    assert cap.create[0].path_template == _ENTRY_TEMPLATE
 
     body = resp.json()
     assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
@@ -1164,7 +1277,8 @@ async def test_child_worktree_from_another_projects_repo_lands_under_that_projec
     db_uri: str,
 ) -> None:
     """A child worktree cut from project B's repo lands under B's entry and takes B's defaults."""
-    cap = register_worktree_host(place_under_entry=True)
+    cap = register_worktree_host(place_like_host=True)
+    _store_path_template(app, db_uri)
     projects = SqlAlchemyProjectStore(db_uri)
     projects.create(
         _PROJECT_ID, "project-a", None, config=_calling_config(_ROOT_A, "model-a", "high")
@@ -1207,3 +1321,36 @@ async def test_child_worktree_from_another_projects_repo_lands_under_that_projec
     assert body["reasoning_effort"] == "low"
     assert body["workspace"] == f"{_ROOT_B}/.worktrees/repo/feature-x"
     assert body["worktree"] == f"{_ROOT_B}/.worktrees/repo/feature-x"
+
+
+async def test_create_reads_the_authenticated_owners_template(
+    auth_app: FastAPI,
+    register_worktree_host: RegisterHost,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """With auth on, the creating user's own template is read, not ``"local"``'s.
+
+    Bob and the reserved local owner each hold a different template, so a
+    hard-coded owner would surface in the frame: it must carry alice's.
+    """
+    alice = "alice@example.com"
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(alice, "worktree_location", {"pathTemplate": _ENTRY_TEMPLATE})
+    store.patch_namespace(
+        "bob@example.com", "worktree_location", {"pathTemplate": "/data/wt/{repo}/{branch}"}
+    )
+    store.patch_namespace(
+        RESERVED_USER_LOCAL, "worktree_location", {"pathTemplate": "/tmp/local/{repo}/{branch}"}
+    )
+    auth_app.state.user_preferences_store = store
+    cap = register_worktree_host(app_override=auth_app, owner=alice)
+    agent = await create_test_agent(auth_client, name="wt-auth-owner-agent", user=alice)
+
+    resp = await _create_git_session(
+        auth_client, agent["id"], {"branch_name": "feature/x"}, user=alice
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].path_template == _ENTRY_TEMPLATE
