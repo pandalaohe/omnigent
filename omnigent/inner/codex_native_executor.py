@@ -451,8 +451,10 @@ class CodexNativeExecutor(Executor):
                 state.socket_path,
                 client_name="omnigent-codex-native",
             )
-            await client.connect()
             try:
+                # Inside the try: a failed initialize handshake can still have
+                # opened the client, which must be closed.
+                await client.connect()
                 result = await drive_keep_warm_ping(
                     request=client.request,
                     respond=client.respond,

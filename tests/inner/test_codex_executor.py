@@ -1255,6 +1255,63 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_reader_loop_diverts_legacy_conversation_id_fork_requests(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            proc = _FakeProcess()
+            proc.stdout = _QueuedStdoutPipe()
+            session._proc = proc
+            reader = asyncio.create_task(session._reader_loop())
+            try:
+                proc.stdout.feed(
+                    {
+                        "method": "thread/started",
+                        "params": {
+                            "thread": {
+                                "id": "thread_fork",
+                                "ephemeral": True,
+                                "threadSource": "omnigent-keep-warm",
+                                "forkedFromId": "thread-1",
+                            }
+                        },
+                    }
+                )
+                while "thread_fork" not in session._keep_warm_queues:
+                    await asyncio.sleep(0)
+                fork_queue = session._keep_warm_queues["thread_fork"]
+                proc.stdout.feed(
+                    {
+                        "id": 7,
+                        "method": "applyPatchApproval",
+                        "params": {"conversationId": "thread_fork", "callId": "call_1"},
+                    }
+                )
+                # The queue already held the fork's thread/started; wait until
+                # the legacy request lands somewhere (fork queue or session).
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while (
+                    fork_queue.qsize() < 2
+                    and session._events.empty()
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0)
+                # The legacy request reached only the fork queue: the session
+                # stream stayed empty and no activity was noted.
+                self.assertEqual(fork_queue.qsize(), 2)
+                self.assertTrue(session._events.empty())
+                self.assertFalse(session._native_progress_observed)
+            finally:
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
+
+        _run(_t())
+
     def test_keep_warm_ping_forks_turns_and_retires_the_fork(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -1358,6 +1415,101 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(session._keep_warm_fork_id_for(late), "thread_fork")
             self.assertIsNone(session._keep_warm_queues.get("thread_fork"))
             self.assertTrue(session._events.empty())
+
+        _run(_t())
+
+    def test_keep_warm_ping_retires_reader_registered_fork_when_fork_fails(self):
+        """A fork whose RPC failed after ``thread/started`` still gets retired."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._proc = _FakeProcess()
+            session._started = True
+            session.thread_id = "thread-1"
+            fork_started = {
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": "thread_fork",
+                        "ephemeral": True,
+                        "threadSource": "omnigent-keep-warm",
+                        "forkedFromId": "thread-1",
+                    }
+                },
+            }
+
+            async def _request(method: str, params: dict) -> dict:
+                # The fork's thread/started reaches the reader while the RPC is
+                # in flight; the RPC then fails before events_for ran.
+                session._keep_warm_fork_id_for(fork_started)
+                raise RuntimeError("fork rpc failed")
+
+            session._request = _request  # type: ignore[assignment]
+            session._send_response = AsyncMock()
+
+            with self.assertRaises(RuntimeError):
+                await session.keep_warm_ping()
+
+            # Retired: a straggler is dropped, never delivered to the session.
+            self.assertNotIn("thread_fork", session._keep_warm_queues)
+            late = {
+                "method": "thread/tokenUsage/updated",
+                "params": {"threadId": "thread_fork", "tokenUsage": {"last": {}}},
+            }
+            self.assertEqual(session._keep_warm_fork_id_for(late), "thread_fork")
+            self.assertIsNone(session._keep_warm_queues.get("thread_fork"))
+            self.assertTrue(session._events.empty())
+
+        _run(_t())
+
+    def test_keep_warm_ping_retires_reader_registered_fork_on_cancel(self):
+        """Cancellation retires a fork the reader registered before the RPC ended."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._proc = _FakeProcess()
+            session._started = True
+            session.thread_id = "thread-1"
+            fork_started = {
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": "thread_fork",
+                        "ephemeral": True,
+                        "threadSource": "omnigent-keep-warm",
+                        "forkedFromId": "thread-1",
+                    }
+                },
+            }
+            fork_requested = asyncio.Event()
+
+            async def _request(method: str, params: dict) -> dict:
+                # The reader registers the fork while the RPC is in flight.
+                session._keep_warm_fork_id_for(fork_started)
+                fork_requested.set()
+                await asyncio.Event().wait()
+                return {}
+
+            session._request = _request  # type: ignore[assignment]
+            session._send_response = AsyncMock()
+
+            ping = asyncio.create_task(session.keep_warm_ping())
+            await asyncio.wait_for(fork_requested.wait(), timeout=1)
+            ping.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await ping
+
+            self.assertNotIn("thread_fork", session._keep_warm_queues)
 
         _run(_t())
 

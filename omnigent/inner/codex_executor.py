@@ -4399,7 +4399,8 @@ class _CodexAppServerSession:
                     self._keep_warm_queues.setdefault(thread_id, asyncio.Queue())
                 return thread_id
             return None
-        thread_id = params.get("threadId")
+        # Legacy server requests identify the thread by ``conversationId``.
+        thread_id = params.get("threadId") or params.get("conversationId")
         if not isinstance(thread_id, str) or not thread_id:
             return None
         if thread_id in self._keep_warm_queues or thread_id in self._keep_warm_retired:
@@ -4420,6 +4421,11 @@ class _CodexAppServerSession:
         assert self.thread_id is not None  # the executor gates on a live thread
         queue: asyncio.Queue[CodexMessage] = asyncio.Queue()
         fork_id_holder: list[str] = []
+        # The reader may divert the fork's early ``thread/started`` into its
+        # own queue before the fork RPC answers — or before it fails, when
+        # ``events_for`` never runs. Snapshot the existing registrations so
+        # every exit also retires the ones the reader created during the ping.
+        registered_before = set(self._keep_warm_queues)
 
         def _events_for(fork_id: str) -> AsyncIterator[CodexMessage]:
             # The reader may already have seen the fork's thread/started and
@@ -4435,7 +4441,11 @@ class _CodexAppServerSession:
                 parent_thread_id=self.thread_id,
             )
         finally:
-            for fork_id in fork_id_holder:
+            retired_ids = set(fork_id_holder)
+            retired_ids.update(
+                fork_id for fork_id in self._keep_warm_queues if fork_id not in registered_before
+            )
+            for fork_id in retired_ids:
                 self._keep_warm_queues.pop(fork_id, None)
                 self._keep_warm_retired[fork_id] = None
                 while len(self._keep_warm_retired) > _KEEP_WARM_RETIRED_LIMIT:

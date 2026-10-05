@@ -349,7 +349,7 @@ async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(tmp_path
         {
             "url": f"/v1/sessions/{_CONV}/events",
             "json": {"type": "keep_warm", "attempt_id": "att-1", "family": "claude"},
-            "timeout": 60.0,
+            "timeout": 120.0,
         }
     ]
     assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]
@@ -450,7 +450,7 @@ async def test_keep_warm_ping_for_sdk_harness_forwards_without_a_pane_tracker() 
         {
             "url": f"/v1/sessions/{_CONV}/events",
             "json": {"type": "keep_warm", "attempt_id": "att-1", "family": "codex"},
-            "timeout": 60.0,
+            "timeout": 120.0,
         }
     ]
     assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]

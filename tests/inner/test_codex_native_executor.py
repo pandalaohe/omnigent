@@ -2658,3 +2658,41 @@ def test_keep_warm_ping_fork_rpc_failure_reports_harness_error(
 
     assert receipt["outcome"] == "failed" and receipt["reason"] == "harness_error"
     assert _FakeKeepWarmClient.created[0].closed is True
+
+
+def test_keep_warm_ping_closes_client_when_connect_fails_after_opening(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed initialize handshake still closes the already-opened client."""
+
+    class _FailingConnectClient(_FakeKeepWarmClient):
+        def __init__(
+            self,
+            socket_path: Path | None = None,
+            *,
+            ws_url: str | None = None,
+            client_name: str = "omnigent",
+        ) -> None:
+            super().__init__(socket_path, ws_url=ws_url, client_name=client_name)
+            self.opened = False
+
+        async def connect(self) -> None:
+            """Record the opened socket, then fail the initialize handshake."""
+            self.opened = True
+            raise RuntimeError("initialize handshake failed")
+
+    _FakeKeepWarmClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FailingConnectClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    receipt = asyncio.run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+    assert receipt["outcome"] == "failed" and receipt["reason"] == "harness_error"
+    client = _FailingConnectClient.created[0]
+    assert client.opened is True
+    assert client.closed is True

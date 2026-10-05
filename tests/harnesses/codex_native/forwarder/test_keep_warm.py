@@ -95,6 +95,60 @@ def _posted_types(posted: list[tuple[str, dict[str, Any]]]) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_legacy_conversation_id_fork_request_is_skipped(tmp_path: Path) -> None:
+    """A legacy approval request keyed only by ``conversationId`` stays invisible."""
+    client = _QueueEventsClient()
+    posted: list[tuple[str, dict[str, Any]]] = []
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record one Omnigent request and accept it."""
+        requests.append((request.method, request.url.path))
+        if request.content:
+            posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202, json={"queued": False})
+
+    task = asyncio.create_task(
+        fwd.supervise_forwarder(
+            base_url="http://127.0.0.1:9",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            app_server_url="ws://127.0.0.1:9",
+            thread_id=_PARENT_THREAD,
+            client=client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
+        )
+    )
+    try:
+        for event in (
+            _fork_event(),
+            {
+                "id": 77,
+                "method": "applyPatchApproval",
+                "params": {"conversationId": "thread_fork", "callId": "call_1"},
+            },
+            _parent_turn_started(),
+        ):
+            client.events.put_nowait(event)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            if "external_session_status" in _posted_types(posted):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    # The legacy fork request never parked an elicitation card: the parent's
+    # status is the only conversation traffic.
+    assert len(posted) == 1
+    assert posted[0][1]["type"] == "external_session_status"
+    assert client.responses == []
+
+
+@pytest.mark.asyncio
 async def test_keep_warm_fork_stream_is_invisible_and_a_parent_event_still_lands(
     tmp_path: Path,
 ) -> None:

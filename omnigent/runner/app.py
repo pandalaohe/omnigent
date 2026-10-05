@@ -4823,7 +4823,10 @@ def create_runner_app(
                         resp = await harness_client.post(
                             f"/v1/sessions/{conversation_id}/events",
                             json={"type": "keep_warm", "attempt_id": attempt_id, "family": family},
-                            timeout=60.0,
+                            # Must exceed every harness channel's own ping budget
+                            # (90 s): the channel's deadline, not this client cut,
+                            # decides a slow ping's outcome.
+                            timeout=120.0,
                         )
                         payload: Any = resp.json() if resp.status_code == 200 else None
                     except httpx.TimeoutException:

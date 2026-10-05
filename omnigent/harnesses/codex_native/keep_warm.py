@@ -25,7 +25,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeVar
 
 from omnigent.harnesses.codex_native.side_chat import (
     KeepWarmRequestFn,
@@ -40,18 +40,26 @@ _JsonObject = dict[str, Any]
 #: Hard budget for one fork ping; the turn normally completes in seconds.
 KEEP_WARM_PING_BUDGET_S = 90.0
 
+#: Bound on the best-effort ``turn/interrupt`` cleanup after a failed ping.
+_KEEP_WARM_INTERRUPT_TIMEOUT_S = 5.0
+
 #: Item types a legitimate ping turn may produce; anything else (command
 #: execution, file change, MCP tool, ...) means the model tried to work.
 _PASSIVE_ITEM_TYPES = frozenset({"userMessage", "agentMessage", "reasoning"})
 
-#: Server-request methods Codex answers with a decision verdict.
-_APPROVAL_REQUEST_METHODS = frozenset(
+#: v2 approval methods whose decline verdict is ``"decline"``.
+_V2_APPROVAL_REQUEST_METHODS = frozenset(
     {
         "item/commandExecution/requestApproval",
         "item/fileChange/requestApproval",
-        "item/permissions/requestApproval",
-        "applyPatchApproval",
+    }
+)
+
+#: Legacy approval methods whose deny verdict is ``"denied"``.
+_LEGACY_APPROVAL_REQUEST_METHODS = frozenset(
+    {
         "execCommandApproval",
+        "applyPatchApproval",
     }
 )
 
@@ -81,20 +89,29 @@ def refusal_payload(message: _JsonObject) -> _JsonObject:
     """
     Build the refusal answering a server request from the ping turn.
 
-    Approval methods take a decision verdict; the other shapes mirror the
-    decline answers the SDK executor and the native forwarder already
-    produce. The turn is interrupted right after, so the answer only needs
+    Each shape mirrors the decline verdict the server-side adapters in
+    ``omnigent/server/routes/_codex_elicitation.py`` produce for that
+    method. The turn is interrupted right after, so the answer only needs
     to unblock the app-server.
 
     :param message: The app-server's request envelope.
     :returns: The JSON-RPC result payload to answer with.
     """
     method = message.get("method")
-    if method in _APPROVAL_REQUEST_METHODS:
+    if method in _LEGACY_APPROVAL_REQUEST_METHODS:
+        # Mirrors _codex_command_approval_response / _codex_apply_patch_approval_response.
+        return {"decision": "denied"}
+    if method in _V2_APPROVAL_REQUEST_METHODS:
+        # Mirrors _codex_command_approval_response / _codex_file_change_approval_response.
         return {"decision": "decline"}
+    if method == "item/permissions/requestApproval":
+        # Mirrors _codex_permissions_approval_response.
+        return {"permissions": {}, "scope": "turn"}
     if method == "mcpServer/elicitation/request":
+        # Mirrors _codex_mcp_elicitation_response.
         return {"action": "decline", "content": None, "_meta": None}
     if method == "item/tool/requestUserInput":
+        # Mirrors _codex_request_user_input_response.
         return {"answers": {}}
     if method == "item/tool/call":
         # Dynamic-tool refusal, mirroring ``_dynamic_tool_result_payload``.
@@ -102,8 +119,8 @@ def refusal_payload(message: _JsonObject) -> _JsonObject:
             "success": False,
             "contentItems": [{"type": "inputText", "text": "keep-warm ping declined"}],
         }
-    # Anything unrecognized: the approval verdict is the only refusal shape
-    # both Codex clients already produce.
+    # Anything unrecognized: the v2 approval verdict is the only other
+    # refusal shape a Codex client already produces.
     return {"decision": "decline"}
 
 
@@ -125,32 +142,43 @@ async def drive_keep_warm_ping(
         the ping turn starts.
     :param parent_thread_id: Live Codex thread id to fork from.
     :param budget_s: Ping budget in seconds; ``None`` takes
-        :data:`KEEP_WARM_PING_BUDGET_S`.
+        :data:`KEEP_WARM_PING_BUDGET_S`. Bounds the WHOLE ping — the fork
+        RPC, the turn RPC and the event consumption; the teardown interrupt
+        has its own bound.
     :returns: The ping outcome and raw usage.
     :raises RuntimeError: When the fork or the event stream fails outright —
         the caller reports ``harness_error``.
     """
     budget = KEEP_WARM_PING_BUDGET_S if budget_s is None else budget_s
-    forked = await fork_keep_warm_thread(request, parent_thread_id)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    try:
+        forked = await _await_within_budget(
+            fork_keep_warm_thread(request, parent_thread_id), deadline, loop
+        )
+    except TimeoutError:
+        return KeepWarmPingResult("failed", "timeout")
     if forked is None:
         raise RuntimeError("Codex keep-warm fork returned no thread id")
     fork_id, model = forked
     events = events_for(fork_id)
-    turn_id = await submit_keep_warm_turn(request, fork_id)
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget
+    try:
+        turn_id = await _await_within_budget(
+            submit_keep_warm_turn(request, fork_id), deadline, loop
+        )
+    except TimeoutError:
+        return KeepWarmPingResult("failed", "timeout")
     last_usage: _JsonObject | None = None
     iterator = events.__aiter__()
+    turn_finished = False
     try:
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                await _interrupt_keep_warm_turn(request, fork_id, turn_id)
                 return KeepWarmPingResult("failed", "timeout")
             try:
                 message = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
             except TimeoutError:
-                await _interrupt_keep_warm_turn(request, fork_id, turn_id)
                 return KeepWarmPingResult("failed", "timeout")
             except StopAsyncIteration:
                 raise RuntimeError(
@@ -163,10 +191,9 @@ async def drive_keep_warm_ping(
             request_id = message.get("id")
             if request_id is not None and message.get("method") is not None:
                 # The turn asked for something (approval, input, a tool
-                # call): refuse so the app-server never hangs, then tear the
-                # turn down.
+                # call): refuse so the app-server never hangs; the cleanup
+                # below tears the turn down.
                 await respond(request_id, refusal_payload(message))
-                await _interrupt_keep_warm_turn(request, fork_id, turn_id)
                 return KeepWarmPingResult("failed", "tool_attempt")
             method = message.get("method")
             params = message.get("params")
@@ -191,17 +218,26 @@ async def drive_keep_warm_ping(
                 item = params.get("item")
                 item_type = item.get("type") if isinstance(item, dict) else None
                 if item_type not in _PASSIVE_ITEM_TYPES:
-                    await _interrupt_keep_warm_turn(request, fork_id, turn_id)
                     return KeepWarmPingResult("failed", "tool_attempt")
             elif method == "turn/completed":
+                turn_finished = True
                 return _ok_result(last_usage, model)
             elif method == "turn/failed":
+                turn_finished = True
                 return KeepWarmPingResult("failed", "harness_error", model=model)
     finally:
-        aclose = getattr(iterator, "aclose", None)
-        if aclose is not None:
-            with contextlib.suppress(Exception):
-                await aclose()
+        try:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+        finally:
+            if not turn_finished:
+                # Every exit that leaves the fork turn running — timeout,
+                # refusal, stream end, a failed respond, cancellation — tears
+                # it down. The cleanup is bounded and never masks the ping's
+                # own outcome.
+                await _interrupt_keep_warm_turn(request, fork_id, turn_id)
 
 
 def keep_warm_receipt(
@@ -261,14 +297,36 @@ def keep_warm_result_receipt(attempt_id: str, result: KeepWarmPingResult) -> dic
     )
 
 
+_T = TypeVar("_T")
+
+
+async def _await_within_budget(
+    awaitable: Awaitable[_T],
+    deadline: float,
+    loop: asyncio.AbstractEventLoop,
+) -> _T:
+    """Await *awaitable* under the ping deadline, cancelling it on expiry."""
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        raise TimeoutError
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
 async def _interrupt_keep_warm_turn(
     request: KeepWarmRequestFn, fork_thread_id: str, turn_id: str | None
 ) -> None:
-    """Best-effort ``turn/interrupt`` of the ping turn; never raises."""
+    """Best-effort bounded ``turn/interrupt`` of the ping turn; never raises."""
     if not turn_id:
         return
-    with contextlib.suppress(Exception):
-        await request("turn/interrupt", {"threadId": fork_thread_id, "turnId": turn_id})
+    try:
+        await asyncio.wait_for(
+            request("turn/interrupt", {"threadId": fork_thread_id, "turnId": turn_id}),
+            timeout=_KEEP_WARM_INTERRUPT_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — teardown is best-effort, never masks the outcome
+        _logger.debug("Codex keep-warm turn interrupt failed", exc_info=True)
 
 
 def _ok_result(last_usage: _JsonObject | None, model: str | None) -> KeepWarmPingResult:
@@ -296,7 +354,8 @@ def _fork_thread_id(message: _JsonObject) -> str | None:
     params = message.get("params")
     if not isinstance(params, dict):
         return None
-    thread_id = params.get("threadId")
+    # Legacy server requests identify the thread by ``conversationId``.
+    thread_id = params.get("threadId") or params.get("conversationId")
     if isinstance(thread_id, str) and thread_id:
         return thread_id
     thread = params.get("thread")

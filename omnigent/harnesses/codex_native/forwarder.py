@@ -3143,7 +3143,13 @@ def _skip_keep_warm_fork_event(event: CodexMessage, forwarder_state: _CodexForwa
     params = event.get("params")
     if not isinstance(params, dict):
         return False
-    return forwarder_state.is_keep_warm_fork_thread(_thread_id_from_params(params))
+    thread_id = _thread_id_from_params(params)
+    if thread_id is None:
+        # Legacy server requests identify the thread by ``conversationId``.
+        legacy_thread_id = params.get("conversationId")
+        if isinstance(legacy_thread_id, str) and legacy_thread_id:
+            thread_id = legacy_thread_id
+    return forwarder_state.is_keep_warm_fork_thread(thread_id)
 
 
 def _event_indicates_thread_active(event: CodexMessage) -> bool:
