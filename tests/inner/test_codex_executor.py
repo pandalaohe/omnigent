@@ -4054,6 +4054,412 @@ def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
     assert not (target / "config.toml").exists()
 
 
+def test_populate_codex_home_config_symlinks_agents_roles(tmp_path: Path) -> None:
+    """``agents/`` is symlinked so user-defined subagent roles are visible.
+
+    Codex discovers custom subagent roles by walking ``$CODEX_HOME/agents``;
+    without bridging it a private home sees none of the user's roles. The
+    directory (not each role file) is linked because codex opens role files
+    with ``O_NOFOLLOW`` on the final path component.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "explores"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "agents").is_symlink()
+    assert (target / "agents" / "explorer.toml").read_text() == 'description = "explores"'
+
+
+def test_populate_codex_home_config_minimal_mode_skips_agents(tmp_path: Path) -> None:
+    """Minimal (title-sidecar) mode does not bridge ``agents/`` — it spawns no subagents."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "explores"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, minimal_config=True)
+
+    assert not (target / "agents").exists()
+
+
+def test_populate_codex_home_config_copies_agents_when_symlink_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without symlink privilege, ``agents/`` falls back to a real copy.
+
+    Codex opens role files with ``O_NOFOLLOW`` on the final component, so the
+    fallback copy must dereference a symlinked role file into a regular file
+    rather than preserving the link.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "explores"')
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "shared.toml").write_text('description = "shared role"')
+    (source / "agents" / "linked.toml").symlink_to(elsewhere / "shared.toml")
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    def _no_symlink(self: Path, *_args: object, **_kwargs: object) -> None:
+        raise OSError("symlink privilege not held")
+
+    monkeypatch.setattr(Path, "symlink_to", _no_symlink)
+    _populate_codex_home_config(target, source)
+
+    agents = target / "agents"
+    assert agents.is_dir()
+    assert not agents.is_symlink()
+    assert (agents / "explorer.toml").read_text() == 'description = "explores"'
+    linked = agents / "linked.toml"
+    assert not linked.is_symlink()
+    assert linked.is_file()
+    assert linked.read_text() == 'description = "shared role"'
+
+
+def test_populate_codex_home_config_refreshes_copied_agents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied ``agents/`` is re-mirrored from the source on every populate.
+
+    The persistent codex-native home reuses its private home across launches,
+    so role files added, changed, or removed on the host between launches
+    must all propagate to the copy.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "v1"')
+    (source / "agents" / "retired.toml").write_text('description = "retired"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    def _no_symlink(self: Path, *_args: object, **_kwargs: object) -> None:
+        raise OSError("symlink privilege not held")
+
+    monkeypatch.setattr(Path, "symlink_to", _no_symlink)
+    _populate_codex_home_config(target, source)
+    assert (target / "agents" / "explorer.toml").read_text() == 'description = "v1"'
+
+    (source / "agents" / "explorer.toml").write_text('description = "v2"')
+    (source / "agents" / "reviewer.toml").write_text('description = "reviews"')
+    (source / "agents" / "retired.toml").unlink()
+    _populate_codex_home_config(target, source)
+
+    agents = target / "agents"
+    assert not agents.is_symlink()
+    assert (agents / "explorer.toml").read_text() == 'description = "v2"'
+    assert (agents / "reviewer.toml").read_text() == 'description = "reviews"'
+    assert not (agents / "retired.toml").exists()
+
+
+def test_populate_codex_home_config_resyncs_role_defaults(tmp_path: Path) -> None:
+    """An existing private ``config.toml`` gets lane-owned role defaults re-synced.
+
+    The persistent codex-native home reuses its copied ``config.toml`` across
+    launches; host-side edits to the subagent role defaults must still arrive,
+    while session-written keys (e.g. an in-TUI ``/model``) and other
+    ``[agents]`` content stay untouched.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "gpt-a"\n'
+        "\n"
+        "[agents]\n"
+        'default_subagent_model = "gpt-sub-a"\n'
+        'default_subagent_reasoning_effort = "high"\n'
+        "\n"
+        "[agents.explorer]\n"
+        'description = "explores"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    # Simulate an in-TUI /model write to the session's private copy.
+    config_path = target / "config.toml"
+    config_path.write_text(
+        config_path.read_text().replace('model = "gpt-a"', 'model = "gpt-session"', 1)
+    )
+    (source / "config.toml").write_text(
+        'model = "gpt-b"\n'
+        "\n"
+        "[agents]\n"
+        'default_subagent_model = "gpt-sub-b"\n'
+        'default_subagent_reasoning_effort = "low"\n'
+        "\n"
+        "[agents.explorer]\n"
+        'description = "explores"\n'
+    )
+
+    _populate_codex_home_config(target, source)
+
+    config = tomllib.loads(config_path.read_text())
+    # Lane-owned defaults track the host; session and role tables stay put.
+    assert config["model"] == "gpt-session"
+    assert config["agents"]["default_subagent_model"] == "gpt-sub-b"
+    assert config["agents"]["default_subagent_reasoning_effort"] == "low"
+    assert config["agents"]["explorer"] == {"description": "explores"}
+
+
+def test_populate_codex_home_config_removes_dropped_role_defaults(tmp_path: Path) -> None:
+    """Defaults the host removed disappear from the private copy on re-populate.
+
+    The two lane-owned keys mirror the host exactly — when the host's
+    ``[agents]`` no longer sets them, the private copy must not keep stale
+    values.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "gpt-a"\n'
+        "\n"
+        "[agents]\n"
+        'default_subagent_model = "gpt-sub-a"\n'
+        'default_subagent_reasoning_effort = "high"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+    (source / "config.toml").write_text('model = "gpt-a"\n\n[agents]\n')
+
+    _populate_codex_home_config(target, source)
+
+    config = tomllib.loads((target / "config.toml").read_text())
+    assert "default_subagent_model" not in config.get("agents", {})
+    assert "default_subagent_reasoning_effort" not in config.get("agents", {})
+    assert config["model"] == "gpt-a"
+
+
+def test_populate_codex_home_config_resyncs_dotted_key_role_defaults(tmp_path: Path) -> None:
+    """Dotted-key ``agents.*`` entries in the private config are refreshed too.
+
+    Codex accepts ``agents.default_subagent_model = "..."`` at top level; a
+    pre-existing private config in that form must sync to the host value and
+    remain valid TOML.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "gpt-a"\n\n[agents]\ndefault_subagent_model = "gpt-sub-a"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    (target / "config.toml").write_text(
+        'model = "gpt-session"\nagents.default_subagent_model = "old"\n'
+    )
+
+    _populate_codex_home_config(target, source)
+
+    config = tomllib.loads((target / "config.toml").read_text())
+    assert config["agents"]["default_subagent_model"] == "gpt-sub-a"
+    assert config["model"] == "gpt-session"
+
+
+def test_populate_codex_home_config_minimal_mode_skips_role_default_sync(
+    tmp_path: Path,
+) -> None:
+    """Minimal-mode re-populate never adds role defaults to an existing config.
+
+    The title worker's private config must not grow lane-owned defaults it
+    never had, even when the host sets them.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "gpt-a"\n\n[agents]\ndefault_subagent_model = "gpt-sub-a"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    (target / "config.toml").write_text('model = "gpt-session"\n')
+
+    _populate_codex_home_config(target, source, minimal_config=True)
+
+    config = tomllib.loads((target / "config.toml").read_text())
+    assert "agents" not in config
+    assert config["model"] == "gpt-session"
+
+
+def test_populate_codex_home_config_role_sync_write_failure_keeps_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed role-default write leaves the private config unchanged.
+
+    The re-sync is best effort: an unwritable private ``config.toml`` must
+    not abort session boot — the launch proceeds with the copy as it was.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "gpt-a"\n\n[agents]\ndefault_subagent_model = "gpt-sub-a"\n'
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    config_path = target / "config.toml"
+    original_text = config_path.read_text()
+    (source / "config.toml").write_text(
+        'model = "gpt-a"\n\n[agents]\ndefault_subagent_model = "gpt-sub-b"\n'
+    )
+
+    real_write_text = Path.write_text
+
+    def _deny_private_config_write(self: Path, *args: object, **kwargs: object) -> int:
+        if self == config_path:
+            raise PermissionError("private config is read-only")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _deny_private_config_write)
+    _populate_codex_home_config(target, source)
+
+    assert config_path.read_text() == original_text
+
+
+def test_populate_codex_home_config_failed_agents_refresh_keeps_old_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed re-mirror keeps the previously copied ``agents/`` intact.
+
+    The private home's copied roles are the session's only view of them, so
+    a refresh that fails midway must leave the old copy in place rather
+    than deleting it first.
+    """
+    import shutil
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "v1"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    def _no_symlink(self: Path, *_args: object, **_kwargs: object) -> None:
+        raise OSError("symlink privilege not held")
+
+    monkeypatch.setattr(Path, "symlink_to", _no_symlink)
+    _populate_codex_home_config(target, source)
+    assert (target / "agents" / "explorer.toml").read_text() == 'description = "v1"'
+
+    (source / "agents" / "explorer.toml").write_text('description = "v2"')
+
+    def _no_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copytree", _no_copy)
+    _populate_codex_home_config(target, source)
+
+    agents = target / "agents"
+    assert agents.is_dir()
+    assert (agents / "explorer.toml").read_text() == 'description = "v1"'
+    assert not (target / "agents.new").exists()
+
+
+def test_populate_codex_home_config_retires_copied_agents_when_source_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the host's ``agents/`` disappears, the stale fallback copy is retired.
+
+    On a no-symlink host, deleting the whole roles dir must not leave the
+    session's previously copied roles behind forever.
+    """
+    import shutil
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "explores"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    def _no_symlink(self: Path, *_args: object, **_kwargs: object) -> None:
+        raise OSError("symlink privilege not held")
+
+    monkeypatch.setattr(Path, "symlink_to", _no_symlink)
+    _populate_codex_home_config(target, source)
+    assert (target / "agents" / "explorer.toml").is_file()
+
+    shutil.rmtree(source / "agents")
+    _populate_codex_home_config(target, source)
+
+    assert not (target / "agents").exists()
+
+
+def test_populate_codex_home_config_keeps_agents_symlink_when_source_removed(
+    tmp_path: Path,
+) -> None:
+    """A symlinked ``agents/`` is never removed, even when its target vanishes.
+
+    The retire-stale-copy path owns real directories only; removing the
+    session's link (or deleting through it) is never correct.
+    """
+    import shutil
+
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "agents").mkdir()
+    (source / "agents" / "explorer.toml").write_text('description = "explores"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+    assert (target / "agents").is_symlink()
+
+    shutil.rmtree(source / "agents")
+    _populate_codex_home_config(target, source)
+
+    assert (target / "agents").is_symlink()
+
+
 @pytest.mark.parametrize(
     "user_agent,direct_tools",
     [

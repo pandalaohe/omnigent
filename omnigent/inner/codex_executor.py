@@ -208,7 +208,14 @@ _CODEX_HOME_SYMLINK_DIRS = (
     # same memories and rules as the real home without replicating them.
     Path("memories"),
     Path("rules"),
+    # User-defined subagent roles.
+    Path("agents"),
 )
+# Dirs copied instead when the symlink fails (Windows without symlink
+# privilege); refreshed on every populate.
+_CODEX_HOME_COPY_FALLBACK_DIRS = frozenset({Path("agents")})
+# Subagent role defaults owned by the host's lane settings.
+_CODEX_ROLE_DEFAULT_KEYS = ("default_subagent_model", "default_subagent_reasoning_effort")
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
@@ -1072,6 +1079,82 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _mirror_codex_home_dir_copy(source_subdir: Path, link_path: Path) -> None:
+    """Copy into a sibling staging dir, then swap it over the old copy.
+
+    A failed copy removes only the staging dir, leaving the previous copy
+    in place.
+
+    :param source_subdir: Directory in the real ``CODEX_HOME`` to mirror.
+    :param link_path: Existing real directory inside the private home.
+    """
+    staging = link_path.with_name(link_path.name + ".new")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        shutil.copytree(source_subdir, staging)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    shutil.rmtree(link_path)
+    staging.rename(link_path)
+
+
+def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
+    """Re-sync the lane-owned ``[agents]`` role defaults into an existing copy.
+
+    A persistent private home keeps its copied ``config.toml`` across
+    launches, so host edits to the subagent role defaults must be mirrored
+    explicitly. Only :data:`_CODEX_ROLE_DEFAULT_KEYS` are touched; every
+    other key in the private copy survives. Best effort — an unreadable or
+    unparsable file on either side aborts the sync without writing.
+
+    :param source_config: Host ``config.toml`` to read the defaults from.
+    :param dest_config: Existing private ``config.toml`` to update in place.
+    """
+    import tomlkit
+    import tomlkit.exceptions
+    import tomllib
+
+    try:
+        source_data = tomllib.loads(source_config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        logger.warning("could not read %s (%s); skipping role-default sync", source_config, exc)
+        return
+    source_agents = source_data.get("agents")
+    if not isinstance(source_agents, dict):
+        source_agents = {}
+    try:
+        document = tomlkit.parse(dest_config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
+        logger.warning("could not parse %s (%s); skipping role-default sync", dest_config, exc)
+        return
+    agents = document.get("agents")
+    if agents is not None and not isinstance(agents, MutableMapping):
+        # An ``agents = "..."`` scalar/array is not ours to rewrite.
+        logger.warning(
+            "codex config %s has a non-table 'agents' value; skipping role-default sync",
+            dest_config,
+        )
+        return
+    changed = False
+    for key in _CODEX_ROLE_DEFAULT_KEYS:
+        if key in source_agents:
+            if agents is None:
+                agents = tomlkit.table()
+                document["agents"] = agents
+            if agents.get(key) != source_agents[key]:
+                agents[key] = source_agents[key]
+                changed = True
+        elif agents is not None and key in agents:
+            del agents[key]
+            changed = True
+    if changed:
+        try:
+            dest_config.write_text(tomlkit.dumps(document), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("could not write %s (%s); skipping role-default sync", dest_config, exc)
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1102,7 +1185,10 @@ def _populate_codex_home_config(
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
       enforcement isolated between concurrent sessions. Hook-trust keys inside
       the copy are rewritten to reference the private home's paths so Codex
-      recognises previously-trusted hooks without an interactive prompt.
+      recognises previously-trusted hooks without an interactive prompt. An
+      existing private copy keeps its own keys across launches, except the
+      lane-owned ``[agents]`` subagent role defaults, which are re-synced
+      from the source.
     - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
       available at the same path within the private home that the rewritten
       trust keys reference.
@@ -1110,6 +1196,8 @@ def _populate_codex_home_config(
       are respected.
     - ``memories/`` and ``rules/`` are **symlinked** so file-based memories
       and user-defined rules are visible in each session.
+    - ``agents/`` is **symlinked** (copied when symlinks are unavailable) so
+      user-defined subagent roles are visible in each session.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -1188,15 +1276,69 @@ def _populate_codex_home_config(
     if not minimal_config:
         for reldir in _CODEX_HOME_SYMLINK_DIRS:
             source_subdir = source_dir / reldir
-            if not source_subdir.is_dir():
-                continue
             link_path = target_dir / reldir
-            if link_path.exists() or link_path.is_symlink():
+            copy_fallback = reldir in _CODEX_HOME_COPY_FALLBACK_DIRS
+            if not source_subdir.is_dir():
+                if (
+                    copy_fallback
+                    and not source_subdir.exists()
+                    and not source_subdir.is_symlink()
+                    and link_path.is_dir()
+                    and not link_path.is_symlink()
+                ):
+                    # The host removed the whole dir since it was copied;
+                    # retire the stale fallback copy.
+                    try:
+                        shutil.rmtree(link_path)
+                    except OSError as exc:
+                        logger.warning(
+                            "could not remove stale copied %r in %s (%s); keeping it",
+                            str(reldir),
+                            target_dir,
+                            exc,
+                        )
+                continue
+            if link_path.is_symlink():
+                continue
+            if link_path.exists():
+                if not copy_fallback or not link_path.is_dir():
+                    continue
+                # A previous populate copied this dir when the symlink failed;
+                # re-mirror so host-side edits and removals still propagate.
+                try:
+                    _mirror_codex_home_dir_copy(source_subdir, link_path)
+                except OSError as exc:
+                    logger.warning(
+                        "could not refresh copied %r in %s (%s); the next launch retries",
+                        str(reldir),
+                        target_dir,
+                        exc,
+                    )
                 continue
             link_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 link_path.symlink_to(source_subdir.resolve())
             except OSError as exc:
+                if copy_fallback:
+                    # Codex opens role files with O_NOFOLLOW on the final
+                    # component, so linked role files would be rejected; copy
+                    # so they arrive as regular files.
+                    logger.warning(
+                        "could not symlink %r into %s (%s); copying instead",
+                        str(reldir),
+                        target_dir,
+                        exc,
+                    )
+                    try:
+                        shutil.copytree(source_subdir, link_path)
+                    except OSError as copy_exc:
+                        logger.warning(
+                            "could not copy %r into %s (%s); skipping",
+                            str(reldir),
+                            target_dir,
+                            copy_exc,
+                        )
+                    continue
                 # Symlink unsupported (some Windows configs) or a race — skip
                 # the dedupe rather than abort session boot; codex re-populates
                 # its own private cache, costing disk but staying correct.
@@ -1218,6 +1360,15 @@ def _populate_codex_home_config(
             continue
         dest_path = target_dir / filename
         if dest_path.exists() or dest_path.is_symlink():
+            if (
+                filename == "config.toml"
+                and not minimal_config
+                and dest_path.is_file()
+                and not dest_path.is_symlink()
+            ):
+                # Persistent private homes reuse their copied config across
+                # launches; re-sync the lane-owned role defaults from the host.
+                _sync_codex_role_defaults(source_file, dest_path)
             continue
         if minimal_config and filename == "config.toml":
             import tomlkit
