@@ -2195,3 +2195,136 @@ async def test_keep_warm_cancellation_drains_the_worker_before_releasing_the_loc
         await task
     assert observed["key_blocked"] is True
     assert not executor._inject_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_takes_the_quiet_turn_after_two_btw_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Two ``btw_unavailable`` pings, then the third ping uses the quiet turn.
+
+    The quiet turn's receipt reports the channel reason and carries
+    ``turn: true`` so the server can tell the ping's own turn from a real
+    one.
+    """
+    bridge_dir = tmp_path / "bridge"
+    btw_results = iter(
+        [
+            claude_bridge.KeepWarmBtwResult("failed", "btw_unavailable"),
+            claude_bridge.KeepWarmBtwResult("failed", "btw_unavailable"),
+        ]
+    )
+    calls: list[str] = []
+    injected: list[str] = []
+
+    def fake_btw(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        del bridge_dir_arg
+        calls.append("btw")
+        return next(btw_results)
+
+    def fake_quiet(
+        bridge_dir_arg: Path,
+        attempt_id: str,
+        *,
+        inject: Any,
+    ) -> claude_bridge.KeepWarmQuietTurnResult:
+        del bridge_dir_arg
+        calls.append("quiet")
+        inject(claude_bridge.KEEP_WARM_QUIET_TURN_TEXT)
+        return claude_bridge.KeepWarmQuietTurnResult("ok", "quiet_turn")
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_btw)
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_quiet_turn", fake_quiet)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda _bridge_dir, *, content: injected.append(content),
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    first = await executor.keep_warm(attempt_id="att-1", family="claude")
+    second = await executor.keep_warm(attempt_id="att-2", family="claude")
+    third = await executor.keep_warm(attempt_id="att-3", family="claude")
+
+    assert calls == ["btw", "btw", "quiet"]
+    assert first["outcome"] == "failed" and first["reason"] == "btw_unavailable"
+    assert "turn" not in first
+    assert second["outcome"] == "failed" and second["reason"] == "btw_unavailable"
+    assert third["outcome"] == "ok" and third["reason"] == "quiet_turn"
+    assert third["turn"] is True
+    # The fallback delivers exactly the one fixed maintenance line.
+    assert injected == [claude_bridge.KEEP_WARM_QUIET_TURN_TEXT]
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_btw_resets_the_quiet_turn_fallback_counter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An ok ``/btw`` resets the failure streak, so the next ping tries ``/btw`` again."""
+    btw_results = iter(
+        [
+            claude_bridge.KeepWarmBtwResult("failed", "btw_unavailable"),
+            claude_bridge.KeepWarmBtwResult("ok", None),
+            claude_bridge.KeepWarmBtwResult("failed", "btw_unavailable"),
+            claude_bridge.KeepWarmBtwResult("ok", None),
+        ]
+    )
+    calls: list[str] = []
+
+    def fake_btw(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        del bridge_dir_arg
+        calls.append("btw")
+        return next(btw_results)
+
+    def fake_quiet(*args: Any, **kwargs: Any) -> claude_bridge.KeepWarmQuietTurnResult:
+        del args, kwargs
+        calls.append("quiet")
+        return claude_bridge.KeepWarmQuietTurnResult("ok", "quiet_turn")
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_btw)
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_quiet_turn", fake_quiet)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    for attempt in ("att-1", "att-2", "att-3", "att-4"):
+        await executor.keep_warm(attempt_id=attempt, family="claude")
+
+    assert calls == ["btw", "btw", "btw", "btw"]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_reason"),
+    [
+        (claude_bridge.KeepWarmQuietTurnResult("failed", "tool_attempt"), "tool_attempt"),
+        (claude_bridge.KeepWarmQuietTurnResult("failed", "timeout"), "timeout"),
+        (claude_bridge.KeepWarmQuietTurnResult("skipped", "composer_draft"), "composer_draft"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_keep_warm_quiet_turn_receipts_carry_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result: claude_bridge.KeepWarmQuietTurnResult,
+    expected_reason: str,
+) -> None:
+    """Every fallback receipt maps the bridge outcome and carries ``turn: true``."""
+    monkeypatch.setattr(
+        claude_native_executor,
+        "run_keep_warm_quiet_turn",
+        lambda *args, **kwargs: result,
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda _bridge_dir, *, content: None,
+    )
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor._btw_unavailable_failures = 2
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert receipt["attempt_id"] == "att-1"
+    assert receipt["outcome"] == result.outcome
+    assert receipt["reason"] == expected_reason
+    assert receipt["turn"] is True

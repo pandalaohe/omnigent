@@ -19,13 +19,16 @@ from omnigent.harnesses.claude_native.bridge import (
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
+    keep_warm_maintenance_deny_output,
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
     read_claude_status_model,
+    read_keep_warm_maintenance_marker,
     read_permission_hook_config,
     read_seen_claude_session_ids,
     record_hook_event,
+    record_keep_warm_tool_attempt,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -969,6 +972,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     ``additionalContext`` (Claude sees the warning but the tool result
     is already committed — PostToolUse hooks are observational).
 
+    While a quiet keep-warm maintenance turn is in flight (an unexpired
+    marker in the bridge dir), every ``PreToolUse`` is denied before any
+    policy evaluation, so the ping can never do real work; the denial is
+    also recorded on the marker for the ping's receipt.
+
     Failure handling is phase-aware (mirroring the runner-side default
     from PR #163). Once the session is known to be governed (an active
     session id and a configured ``ap_server_url``) and the round-trip to
@@ -1010,11 +1018,19 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    hook_event = payload.get("hook_event_name", "")
+    # A quiet keep-warm turn denies every tool before any policy
+    # evaluation, so the ping can never do real work.
+    if hook_event == "PreToolUse" and read_keep_warm_maintenance_marker(bridge_dir) is not None:
+        record_keep_warm_tool_attempt(bridge_dir)
+        output = keep_warm_maintenance_deny_output(hook_event)
+        if output is not None:
+            sys.stdout.write(json.dumps(output))
+        return 0
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
 
-    hook_event = payload.get("hook_event_name", "")
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
         # Unrecognized hook event — no policy to evaluate.

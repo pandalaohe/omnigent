@@ -1283,6 +1283,87 @@ async def test_pings_do_not_reset_the_cap(harness: _Harness) -> None:
     assert state is not None and state.s == "c" and state.why == "cap"
 
 
+async def test_fallback_ping_turn_receipt_does_not_reset_the_cap(harness: _Harness) -> None:
+    """
+    Scenario 6 with the quiet-turn fallback: every ok ping receipt carries
+    ``turn: true`` and its maintenance turn moved ``running_since``, yet the
+    pings at 55/110/165/220 min still stop at ``max_s`` from the last REAL turn.
+    """
+    parent = _parent(harness)
+    t0 = harness.now
+    child = _child(
+        harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=t0)}, running_since=t0
+    )
+
+    for minutes in (55, 110, 165, 220):
+        harness.clock.now = t0 + minutes * 60
+        await _tick(harness)
+        # The fallback's maintenance turn starts after the attempt was recorded.
+        _set_running_since(harness, child.id, harness.clock.now + 5)
+        await _settle(harness, child.id, turn=True)
+        state = _read_label(harness, child.id)
+        assert state is not None
+        # The ping's own turn is adopted as already seen; the episode and its
+        # cap clock stay on t0.
+        assert state.t == harness.clock.now + 5 and state.c == t0
+        stats = _read_stats(harness, child.id)
+        assert stats.ep_p == minutes // 55
+        assert stats.ep_s == t0
+
+    harness.clock.now = t0 + 241 * 60
+    await _tick(harness)
+
+    assert len(harness.forward.pings()) == 4
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "c" and state.why == "cap"
+
+
+async def test_tick_between_fallback_turn_and_receipt_waits_for_the_receipt(
+    harness: _Harness,
+) -> None:
+    """
+    Rule 3: while the fallback attempt is pending and ``running_since`` moved
+    after the attempt, a tick opens no episode; the receipt adopts the turn,
+    and a later real turn still opens one.
+    """
+    parent = _parent(harness)
+    t0 = harness.now
+    child = _child(
+        harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=t0)}, running_since=t0
+    )
+    harness.clock.now = t0 + 55 * 60
+    await _tick(harness)
+    state = _read_label(harness, child.id)
+    assert state is not None and state.a is not None
+
+    # The quiet turn starts after the attempt; a tick arrives before its receipt.
+    turn_running_since = harness.clock.now + 5
+    _set_running_since(harness, child.id, turn_running_since)
+    harness.clock.now += 60
+    await _tick(harness)
+
+    state = _read_label(harness, child.id)
+    assert state is not None
+    assert state.a is not None, "the pending attempt must survive the tick"
+    assert state.t == t0 and state.c == t0, "the ping turn must not open an episode"
+    assert len(harness.forward.pings()) == 1
+
+    await _settle(harness, child.id, turn=True)
+    state = _read_label(harness, child.id)
+    assert state is not None and state.t == turn_running_since
+
+    # A real turn after the fallback episode still opens a new one.
+    real_turn_running_since = harness.clock.now + 500
+    _set_running_since(harness, child.id, real_turn_running_since)
+    harness.clock.now += 60
+    await _tick(harness)
+
+    state = _read_label(harness, child.id)
+    assert state is not None
+    assert state.s == "w" and state.t == real_turn_running_since
+    assert len(harness.forward.touches()) == 1
+
+
 async def test_window_passed_while_runner_offline_goes_cold_silently(
     harness: _Harness,
 ) -> None:
