@@ -2416,6 +2416,18 @@ class SessionResponse(BaseModel):
         kept) of the newest assistant message. Filled only when the
         request asked with ``include_preview=true``; ``None`` otherwise
         or when no assistant message carries text.
+    :param warm_state: Whether the session's provider prompt cache is being
+        kept warm (``"warm"`` / ``"cold"``), read from its
+        ``omnigent.keep_warm`` label without a harness lookup. ``None`` when
+        the session has no keep-warm label, is archived, or carries a label
+        written before the family stamp existed.
+    :param keep_warm: Keep-warm episode status object (state, stop reason,
+        pings, cost, last return), or ``None`` when the session has no
+        keep-warm label or is archived.
+    :param archive_reason: Why the session was archived, read from the
+        ``omnigent.archive_reason`` label (e.g. ``"host_offline"`` when the
+        keep-warm sweeper retired a child under an offline host). ``None``
+        when the user archived it or the row is not archived.
     """
 
     id: str
@@ -2501,6 +2513,9 @@ class SessionResponse(BaseModel):
     running_since: int | None = None
     last_message_preview: str | None = None
     last_message_tail: str | None = None
+    warm_state: Literal["warm", "cold"] | None = None
+    keep_warm: KeepWarmStatus | None = None
+    archive_reason: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -2998,6 +3013,94 @@ class SessionSearchMatch(BaseModel):
     snippet: str
 
 
+class KeepWarmEpisode(BaseModel):
+    """
+    Keep-warm ping counters for the episode since the last real turn.
+
+    :param pings: Pings forwarded in the current episode.
+    :param cost_usd: Episode spend in USD (integer micro-USD in the label,
+        converted for the wire).
+    :param estimated: Whether any summed ping was an estimated cost (a
+        channel that reports no usage).
+    :param started_at: Episode start epoch seconds, or ``None`` when no
+        episode label has been written.
+    """
+
+    pings: int = Field(default=0, ge=0)
+    cost_usd: float = 0.0
+    estimated: bool = False
+    started_at: int | None = None
+
+
+class KeepWarmTotal(BaseModel):
+    """
+    Lifetime keep-warm ping counters for one session.
+
+    :param pings: Pings forwarded over the session's lifetime.
+    :param cost_usd: Lifetime spend in USD.
+    :param estimated: Whether any summed ping was an estimated cost.
+    """
+
+    pings: int = Field(default=0, ge=0)
+    cost_usd: float = 0.0
+    estimated: bool = False
+
+
+class KeepWarmLastReturn(BaseModel):
+    """
+    Cache result of the first real turn after an absence longer than the
+    family's prompt-cache TTL.
+
+    :param at: Epoch seconds the return turn settled.
+    :param result: ``"hit"`` / ``"miss"`` / ``"unknown"`` from the turn's
+        cache reading.
+    """
+
+    at: int
+    result: Literal["hit", "miss", "unknown"] = "unknown"
+
+
+class KeepWarmStatus(BaseModel):
+    """
+    Keep-warm status object for a session row.
+
+    Built from the ``omnigent.keep_warm`` / ``omnigent.keep_warm_stats``
+    labels with no settings read. ``None`` is used at the field level when a
+    session has no keep-warm label or is archived.
+
+    :param state: Episode state — ``"on"`` while warming is active,
+        ``"off"`` with no episode, ``"paused"`` after repeated failures or
+        measured cache misses, ``"stopped"`` when the cap / window ended.
+    :param stop_reason: Why warming stopped or paused, or ``None`` when the
+        stored code has no vocabulary entry.
+    :param episode: Pings / cost since the last real turn.
+    :param total: Pings / cost over the session's lifetime.
+    :param last_return: The measured first turn after an absence, or
+        ``None`` when none was recorded.
+    :param last_reason: The label's raw ``k`` code — the last ping's skip /
+        fail reason, e.g. ``"btw_unavailable"`` — so a ``failures`` pause
+        names its cause. ``None`` when no code is stored.
+    """
+
+    state: Literal["on", "off", "paused", "stopped"]
+    stop_reason: (
+        Literal[
+            "cap",
+            "misses",
+            "failures",
+            "card",
+            "host",
+            "switch_off",
+            "runner_version",
+        ]
+        | None
+    ) = None
+    episode: KeepWarmEpisode = Field(default_factory=KeepWarmEpisode)
+    total: KeepWarmTotal = Field(default_factory=KeepWarmTotal)
+    last_return: KeepWarmLastReturn | None = None
+    last_reason: str | None = None
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -3110,6 +3213,14 @@ class SessionListItem(BaseModel):
     :param last_message_preview: Single-line excerpt of the session's
         newest visible message. Present only when the list request
         passes ``include_preview=true``.
+    :param warm_state: Whether the session's provider prompt cache is being
+        kept warm (``"warm"`` / ``"cold"``), read from its
+        ``omnigent.keep_warm`` label without a harness lookup. ``None`` when
+        the session has no keep-warm label, is archived, or carries a label
+        written before the family stamp existed.
+    :param keep_warm: Keep-warm episode status object (state, stop reason,
+        pings, cost, last return), or ``None`` when the session has no
+        keep-warm label or is archived.
     """
 
     id: str
@@ -3156,6 +3267,8 @@ class SessionListItem(BaseModel):
     # (absent on the wire via ``exclude_none``). Lets an agent pick a
     # peer by recent work without opening each transcript.
     last_message_preview: str | None = None
+    warm_state: Literal["warm", "cold"] | None = None
+    keep_warm: KeepWarmStatus | None = None
 
 
 class SessionList(BaseModel):

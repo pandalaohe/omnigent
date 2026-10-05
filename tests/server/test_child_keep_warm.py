@@ -32,6 +32,8 @@ from omnigent.server.child_keep_warm import (
     KEEP_WARM_STATS_LABEL,
     LAST_CACHE_LABEL,
     ChildKeepWarmSweeper,
+    keep_warm_status_from_labels,
+    warm_state_for_labels,
     warm_state_from_label,
 )
 from omnigent.server.routes._sessions.helpers import SessionLiveness
@@ -2057,6 +2059,195 @@ async def test_codex_warm_state_follows_the_latest_observation() -> None:
         warm_state_from_label(hit, archived=False, harness="codex-native", busy=True, now=now)
         == "warm"
     )
+
+
+async def test_warm_state_label_round_trips_the_family() -> None:
+    """The family stamp survives a serialize / parse cycle; bad values drop."""
+    state = child_keep_warm._WarmState(s="w", y="claude", t=1)
+    serialized = state.to_label()
+    parsed = child_keep_warm._WarmState.parse(serialized)
+    assert parsed is not None
+    assert parsed.y == "claude"
+    assert '"y":"claude"' in serialized
+    # A label without the stamp, or with an unknown family, reads no family.
+    assert child_keep_warm._WarmState.parse(_label(s="w", t=1)).y is None
+    assert child_keep_warm._WarmState.parse(_label(s="w", y="other", t=1)).y is None
+
+
+async def test_warm_state_for_labels_uses_the_family_stamp() -> None:
+    """No harness lookup: the label's ``y`` picks the per-family rule."""
+    now = 1_000_000
+    claude_warm = _label(s="w", y="claude", t=1, u=now - 100, w=now + 100)
+    claude_stale = _label(s="w", y="claude", t=1, u=now - 3601, w=now + 100)
+    codex_hit = _label(s="w", y="codex", t=1, u=now - 1200, w=now, o=[now - 1200, 1])
+    codex_stale = _label(s="w", y="codex", t=1, u=now - 2400, w=now, o=[now - 2400, 1])
+    codex_miss = _label(s="w", y="codex", t=1, u=now - 1200, w=now, o=[now - 1200, 0])
+
+    def _state(labels: dict[str, str], *, archived: bool = False, busy: bool = False) -> Any:
+        return warm_state_for_labels(labels, archived=archived, busy=busy, now=now)
+
+    assert _state({KEEP_WARM_LABEL: claude_warm}) == "warm"
+    assert _state({KEEP_WARM_LABEL: claude_stale}) == "cold"
+    assert _state({KEEP_WARM_LABEL: codex_hit}) == "warm"
+    assert _state({KEEP_WARM_LABEL: codex_stale}) == "cold"
+    assert _state({KEEP_WARM_LABEL: codex_miss}) == "cold"
+    # Busy wins over the clock / observation: the next turn touches the cache.
+    assert _state({KEEP_WARM_LABEL: claude_stale}, busy=True) == "warm"
+    assert _state({}, busy=True) is None
+    # Archived, no labels, and a label predating the family stamp read None.
+    assert _state({KEEP_WARM_LABEL: claude_warm}, archived=True) is None
+    assert _state({}) is None
+    assert _state({KEEP_WARM_LABEL: _label(s="w", t=1, u=now - 100)}) is None
+    assert _state({"omnigent.keep_warm_stats": "{}"}) is None
+
+
+async def test_warm_state_for_labels_falls_back_to_the_harness_family() -> None:
+    """No label or a pre-stamp label reads per the resolved harness family."""
+    now = 1_000_000
+    # No label: cold when idle, warm while busy, None without a family.
+    assert (
+        warm_state_for_labels({}, archived=False, busy=False, now=now, family="claude") == "cold"
+    )
+    assert warm_state_for_labels({}, archived=False, busy=True, now=now, family="claude") == "warm"
+    assert warm_state_for_labels({}, archived=False, busy=False, now=now) is None
+    # A label predating the family stamp uses the resolved family's rule.
+    stale_codex = _label(s="w", t=1, u=now - 1200, o=[now - 2400, 1])
+    hit_codex = _label(s="w", t=1, u=now - 1200, o=[now - 1200, 1])
+    assert (
+        warm_state_for_labels(
+            {KEEP_WARM_LABEL: stale_codex}, archived=False, busy=False, now=now, family="codex"
+        )
+        == "cold"
+    )
+    assert (
+        warm_state_for_labels(
+            {KEEP_WARM_LABEL: hit_codex}, archived=False, busy=False, now=now, family="codex"
+        )
+        == "warm"
+    )
+    # Archived and mirrored rows read None whatever the family says.
+    assert warm_state_for_labels({}, archived=True, busy=False, now=now, family="claude") is None
+    assert (
+        warm_state_for_labels(
+            {_WRAPPER_LABEL_KEY: _MIRRORED_CLAUDE_WRAPPER},
+            archived=False,
+            busy=False,
+            now=now,
+            family="claude",
+        )
+        is None
+    )
+
+
+async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
+    """The family helpers map supported harnesses and the label's ``y`` stamp."""
+    assert child_keep_warm.keep_warm_family_for_harness("claude-native") == "claude"
+    assert child_keep_warm.keep_warm_family_for_harness("claude-sdk") == "claude"
+    assert child_keep_warm.keep_warm_family_for_harness("codex") == "codex"
+    assert child_keep_warm.keep_warm_family_for_harness("opencode-native") is None
+    assert child_keep_warm.keep_warm_family_for_harness(None) is None
+    assert (
+        child_keep_warm.keep_warm_family_from_labels({KEEP_WARM_LABEL: _label(s="w", y="codex")})
+        == "codex"
+    )
+    assert child_keep_warm.keep_warm_family_from_labels({KEEP_WARM_LABEL: _label(s="w")}) is None
+    assert child_keep_warm.keep_warm_family_from_labels({}) is None
+
+
+async def test_sweeper_stamps_the_family_on_label_writes(harness: _Harness) -> None:
+    """A fresh episode and a due ping both persist ``y`` for label readers."""
+    main = _main(harness, running_since=harness.now - 50)
+    await _tick(harness)
+    opened = _read_label(harness, main.id)
+    assert opened is not None and opened.y == "claude"
+
+    child = _child(
+        harness,
+        main.id,
+        labels={
+            KEEP_WARM_LABEL: _warm_label(
+                t=harness.now - 100, u=harness.now - _CLAUDE_INTERVAL_S - 1
+            )
+        },
+        running_since=harness.now - 100,
+    )
+    assert _read_label(harness, child.id).y is None
+    await _tick(harness)
+    due = _read_label(harness, child.id)
+    assert due is not None and due.y == "claude"
+    assert due.a is not None
+
+
+async def test_keep_warm_status_maps_state_reasons_and_costs() -> None:
+    """The status object reads on / paused / stopped / off from the label."""
+    now = 1_000_000
+    stats = child_keep_warm._WarmStats(
+        ep_p=3,
+        ep_c=40_000,
+        ep_e=True,
+        ep_s=now - 3600,
+        tot_p=9,
+        tot_c=120_000,
+        tot_e=True,
+        lr_at=now - 50,
+        lr_r="hit",
+    ).to_label()
+
+    def _status(raw: str | None, *, archived: bool = False) -> dict[str, Any] | None:
+        labels = {} if raw is None else {KEEP_WARM_LABEL: raw, KEEP_WARM_STATS_LABEL: stats}
+        return keep_warm_status_from_labels(labels, archived=archived, now=now)
+
+    on = _status(_label(s="w", y="claude", t=1, u=now - 100, w=now + 100))
+    assert on is not None
+    assert on["state"] == "on"
+    assert on["stop_reason"] is None
+    # Micro-USD converts to float USD; the last return passes through.
+    assert on["episode"] == {
+        "pings": 3,
+        "cost_usd": pytest.approx(0.04),
+        "estimated": True,
+        "started_at": now - 3600,
+    }
+    assert on["total"] == {"pings": 9, "cost_usd": pytest.approx(0.12), "estimated": True}
+    assert on["last_return"] == {"at": now - 50, "result": "hit"}
+    assert on["last_reason"] is None
+
+    paused = _status(_label(s="p", why="miss", y="claude", t=1))
+    assert paused is not None
+    assert paused["state"] == "paused"
+    assert paused["stop_reason"] == "misses"
+
+    stopped = _status(_label(s="c", why="cap", y="claude", t=1))
+    assert stopped is not None
+    assert stopped["state"] == "stopped"
+    assert stopped["stop_reason"] == "cap"
+
+    off = _status(_label(s="c", y="claude", t=1))
+    assert off is not None
+    assert off["state"] == "off"
+    assert off["stop_reason"] is None
+
+    # An unrecognized stored code never errors; it reads a null stop reason.
+    unknown = _status(_label(s="c", why="exp", y="claude", t=1))
+    assert unknown is not None
+    assert unknown["state"] == "stopped"
+    assert unknown["stop_reason"] is None
+
+    assert _status(None) is None
+    assert _status(_label(s="w", y="claude", t=1), archived=True) is None
+
+
+async def test_keep_warm_status_names_the_failure_cause() -> None:
+    """A failures pause carries the last ping's raw skip / fail code."""
+    status = keep_warm_status_from_labels(
+        {KEEP_WARM_LABEL: _label(s="p", why="fail", k="btw_unavailable", y="claude", t=1, f=3)},
+        archived=False,
+        now=1_000_000,
+    )
+    assert status is not None
+    assert status["state"] == "paused"
+    assert status["stop_reason"] == "failures"
+    assert status["last_reason"] == "btw_unavailable"
 
 
 # ── Label mechanics ──────────────────────────────────────

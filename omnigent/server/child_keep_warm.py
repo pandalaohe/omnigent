@@ -192,18 +192,20 @@ class _WarmState:
 
     Short keys keep the serialized label well under the 256-character
     label bound: ``s`` state (``w`` warm / ``c`` cold / ``p`` paused),
-    ``why`` reason, ``t`` last-seen ``running_since``, ``c`` episode start,
-    ``u`` last cache touch, ``p`` ping attempt time, ``a`` pending attempt
-    id, ``f`` failures, ``m`` misses, ``b`` usage baseline, ``v``
-    ``archive_revision`` at a miss pause, ``w`` warm-until, ``o`` latest
-    cache observation ``[epoch, 1=hit|0=miss]``, ``r`` late-usage retry
-    pending, ``e`` pending late reading may count as a miss, ``k`` stop
-    reason.
+    ``why`` reason, ``y`` model family, ``t`` last-seen ``running_since``,
+    ``c`` episode start, ``u`` last cache touch, ``p`` ping attempt time,
+    ``a`` pending attempt id, ``f`` failures, ``m`` misses, ``b`` usage
+    baseline, ``v`` ``archive_revision`` at a miss pause, ``w``
+    warm-until, ``o`` latest cache observation ``[epoch, 1=hit|0=miss]``,
+    ``r`` late-usage retry pending, ``e`` pending late reading may count
+    as a miss, ``k`` stop reason.
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
         ``fail``, ``miss``, ``rev`` (``pol`` / ``mom`` parse from SCC19
         labels but are never written).
+    :param y: Model family (``claude`` / ``codex``), written on every label
+        write so readers can derive the warm rule without a harness lookup.
     :param t: ``running_since`` of the last turn seen.
     :param c: Epoch seconds the last real turn was seen settled.
     :param u: Epoch seconds the last turn (real or ok ping) was seen settled.
@@ -228,6 +230,7 @@ class _WarmState:
 
     s: str
     why: str | None = None
+    y: Literal["claude", "codex"] | None = None
     t: int | None = None
     c: int | None = None
     u: int | None = None
@@ -248,6 +251,8 @@ class _WarmState:
         data: dict[str, object] = {"s": self.s}
         if self.why is not None:
             data["why"] = self.why
+        if self.y is not None:
+            data["y"] = self.y
         if self.t is not None:
             data["t"] = self.t
         if self.c is not None:
@@ -298,6 +303,10 @@ class _WarmState:
         if state not in ("w", "c", "p"):
             return None
         why = data.get("why")
+        family = data.get("y")
+        parsed_family: Literal["claude", "codex"] | None = (
+            family if family == "claude" or family == "codex" else None
+        )
         baseline = data.get("b")
         if (
             not isinstance(baseline, (int, list))
@@ -317,6 +326,7 @@ class _WarmState:
         return cls(
             s=state,
             why=why if isinstance(why, str) and why in _WHY_CODES else None,
+            y=parsed_family,
             t=_as_int(data.get("t")),
             c=_as_int(data.get("c")),
             u=_as_int(data.get("u")),
@@ -488,9 +498,11 @@ def warm_state_from_label(
     :param codex_staleness_s: Codex observation staleness bound in seconds.
     :returns: ``"warm"``, ``"cold"``, or ``None``.
     """
-    if archived or harness not in _SUPPORTED_HARNESSES:
+    if archived:
         return None
     if family is None:
+        if harness not in _SUPPORTED_HARNESSES:
+            return None
         family = _SUPPORTED_HARNESSES[harness]
     if busy:
         return "warm"
@@ -509,6 +521,162 @@ def warm_state_from_label(
     if state.s == "w" and state.u is not None and now - state.u < _CLAUDE_TTL_S:
         return "warm"
     return "cold"
+
+
+#: Label reason codes mapped onto the status object's ``stop_reason``
+#: vocabulary. ``runner`` is the sweeper's runner-liveness gate (the design's
+#: old-runner stop); codes with no vocabulary entry read as ``None``.
+_STOP_REASON_STATUS: dict[str, str] = {
+    "cap": "cap",
+    "miss": "misses",
+    "fail": "failures",
+    "card": "card",
+    "host": "host",
+    "switch": "switch_off",
+    "runner": "runner_version",
+}
+
+
+def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "codex"] | None:
+    """
+    Map a canonical harness onto the keep-warm family it belongs to.
+
+    :param harness: Canonical harness id, e.g. ``"claude-native"``; ``None``
+        for an unresolved session.
+    :returns: ``"claude"`` / ``"codex"`` for a harness with a keep-warm
+        channel, else ``None``.
+    """
+    return _SUPPORTED_HARNESSES.get(harness or "")
+
+
+def keep_warm_family_from_labels(
+    labels: Mapping[str, str] | None,
+) -> Literal["claude", "codex"] | None:
+    """
+    Return the family the sweeper stamped on a session's keep-warm label.
+
+    :param labels: Conversation labels, or ``None``.
+    :returns: The label's ``y`` family, or ``None`` when the label is
+        missing, malformed, or predates the stamp.
+    """
+    if not labels:
+        return None
+    state = _WarmState.parse(labels.get(KEEP_WARM_LABEL))
+    return state.y if state is not None else None
+
+
+def warm_state_for_labels(
+    labels: Mapping[str, str] | None,
+    *,
+    archived: bool,
+    busy: bool,
+    now: int,
+    family: Literal["claude", "codex"] | None = None,
+) -> Literal["warm", "cold"] | None:
+    """
+    Derive the rail pill state from raw labels plus a resolved harness family.
+
+    ``None`` only for an archived session, a mirrored native sub-agent row,
+    or a session whose harness has no known keep-warm family. The label's
+    ``y`` stamp wins when present; otherwise the caller's ``family`` —
+    resolved from the session's harness — supplies the per-family rule. A
+    session outside the sweeper's scan window carries no label at all and
+    reads ``warm`` while busy, ``cold`` otherwise.
+
+    :param labels: Conversation labels, or ``None``.
+    :param archived: Whether the session row itself is archived.
+    :param busy: Whether the session's status is ``running`` / ``waiting``.
+    :param now: Current epoch seconds.
+    :param family: Model family resolved from the session's harness, used
+        when the label carries no ``y`` stamp.
+    :returns: ``"warm"``, ``"cold"``, or ``None``.
+    """
+    if archived:
+        return None
+    if labels and labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS:
+        return None
+    stamped = keep_warm_family_from_labels(labels)
+    if stamped is not None:
+        family = stamped
+    raw = labels.get(KEEP_WARM_LABEL) if labels else None
+    if raw is None:
+        if family is None:
+            return None
+        return "warm" if busy else "cold"
+    if family is None:
+        return None
+    return warm_state_from_label(
+        raw,
+        archived=False,
+        harness=None,
+        busy=busy,
+        now=now,
+        family=family,
+    )
+
+
+def keep_warm_status_from_labels(
+    labels: Mapping[str, str] | None,
+    *,
+    archived: bool,
+    now: int,  # noqa: ARG001 — state comes from the label, not the clock
+) -> dict[str, Any] | None:
+    """
+    Build the ``keep_warm`` status object from a session's labels.
+
+    ``state`` mirrors the episode label: ``s == "w"`` reads ``on``,
+    ``s == "p"`` reads ``paused``, and ``s == "c"`` reads ``stopped`` when the
+    label records a reason (``why`` / ``k``), else ``off``. ``stop_reason`` is
+    the first recognized reason mapped onto the status vocabulary; an
+    unrecognized code reads ``None``, never an error. ``last_reason`` always
+    carries the label's raw ``k`` code (the last ping's skip / fail reason).
+    Costs convert integer micro-USD to float USD.
+
+    :param labels: Conversation labels, or ``None``.
+    :param archived: Whether the session row itself is archived.
+    :param now: Current epoch seconds.
+    :returns: The status object, or ``None`` when the session is archived or
+        carries no keep-warm label.
+    """
+    if archived or not labels:
+        return None
+    state = _WarmState.parse(labels.get(KEEP_WARM_LABEL))
+    if state is None:
+        return None
+    if state.s == "w":
+        status = "on"
+    elif state.s == "p":
+        status = "paused"
+    elif state.why is not None or state.k is not None:
+        status = "stopped"
+    else:
+        status = "off"
+    stop_reason: str | None = None
+    if status != "on":
+        stop_reason = _STOP_REASON_STATUS.get(state.why or "") or _STOP_REASON_STATUS.get(
+            state.k or ""
+        )
+    stats = _WarmStats.parse(labels.get(KEEP_WARM_STATS_LABEL))
+    last_return = (
+        {"at": stats.lr_at, "result": stats.lr_r or "unknown"} if stats.lr_at is not None else None
+    )
+    return {
+        "state": status,
+        "stop_reason": stop_reason,
+        "episode": {
+            "pings": stats.ep_p,
+            "cost_usd": stats.ep_c / 1_000_000,
+            "estimated": stats.ep_e,
+            "started_at": stats.ep_s,
+        },
+        "total": {
+            "pings": stats.tot_p,
+            "cost_usd": stats.tot_c / 1_000_000,
+            "estimated": stats.tot_e,
+        },
+        "last_return": last_return,
+        "last_reason": state.k,
+    }
 
 
 def keep_warm_episode_active(labels: Mapping[str, str] | None) -> bool:
@@ -1006,6 +1174,10 @@ class ChildKeepWarmSweeper:
         mirrored = conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
         harness = await self._harness_for(conv, harness_cache)
         family = _SUPPORTED_HARNESSES.get(harness or "")
+        # Stamp the family on every write so later readers derive the warm
+        # rule from the label alone.
+        if state is not None and family is not None:
+            state.y = family
         inspectable = family is not None and not mirrored
         if not inspectable and state is None:
             self._drop_tracking(session_id)
@@ -1148,6 +1320,7 @@ class ChildKeepWarmSweeper:
                             misses = 0
                     state = _WarmState(
                         s="w",
+                        y=family,
                         t=running_since,
                         c=settle,
                         u=settle,
@@ -1347,6 +1520,8 @@ class ChildKeepWarmSweeper:
         busy = status == "running"
         harness = await asyncio.to_thread(_resolve_harness, conv)
         family = _SUPPORTED_HARNESSES.get(harness or "")
+        if family is not None:
+            state.y = family
         is_child = conv.parent_conversation_id is not None
         owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
         settings = await self._settings_for(owner, now, {})
@@ -1674,5 +1849,9 @@ __all__ = [
     "LAST_CACHE_LABEL",
     "ChildKeepWarmSweeper",
     "keep_warm_episode_active",
+    "keep_warm_family_for_harness",
+    "keep_warm_family_from_labels",
+    "keep_warm_status_from_labels",
+    "warm_state_for_labels",
     "warm_state_from_label",
 ]

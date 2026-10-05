@@ -8,7 +8,7 @@ import json
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import (
@@ -84,6 +84,10 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
+from omnigent.server.child_keep_warm import (
+    keep_warm_family_for_harness,
+    keep_warm_family_from_labels,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -2044,6 +2048,7 @@ def register_core_routes(
             for child_id, child in child_rows.items()
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
+        keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, page.data)
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
@@ -2058,6 +2063,7 @@ def register_core_routes(
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
                 last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
+                keep_warm_families=keep_warm_families,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -2076,6 +2082,35 @@ def register_core_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    def _keep_warm_families_for(
+        convs: list[Conversation],
+    ) -> dict[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]:
+        """
+        Resolve keep-warm families for rows with no family-stamped label.
+
+        One harness resolution per distinct ``(agent_id, harness_override,
+        sub_agent_name)`` triple, mirroring the sweeper's ``_harness_for``.
+        Blocking (loads agent bundles), so callers run it via
+        :func:`asyncio.to_thread`.
+
+        :param convs: Session rows on the page whose labels may need the
+            harness fallback.
+        :returns: Lookup keyed by the resolution triple; a missing key means
+            the row's harness has no keep-warm family.
+        """
+        pending: dict[tuple[str | None, str | None, str | None], Conversation] = {}
+        for conv in convs:
+            if keep_warm_family_from_labels(conv.labels) is not None:
+                continue
+            key = (conv.agent_id, conv.harness_override, conv.sub_agent_name)
+            pending.setdefault(key, conv)
+        return {
+            key: keep_warm_family_for_harness(
+                _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+            )
+            for key, conv in pending.items()
+        }
 
     async def _comments_fingerprints_for(
         conv_ids: list[str],
@@ -2258,6 +2293,7 @@ def register_core_routes(
             for child_id, child in child_rows.items()
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
+        keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, convs)
         items = [
             _build_session_list_item(
                 conv,
@@ -2271,6 +2307,7 @@ def register_core_routes(
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
+                keep_warm_families=keep_warm_families,
             )
             for conv in convs
         ]

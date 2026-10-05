@@ -8493,6 +8493,67 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
+    # No keep-warm label on the snapshot → the projected fields are null.
+    assert info["warm_state"] is None
+    assert info["keep_warm"] is None
+    assert info["archive_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
+    """warm_state / keep_warm / archive_reason ride the snapshot projection."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_labelled":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_labelled",
+                    "agent_id": "ag_self",
+                    "status": "idle",
+                    "created_at": 1,
+                    "updated_at": 42,
+                    "runner_id": None,
+                    "pending_elicitations": [],
+                    "warm_state": "cold",
+                    "keep_warm": {
+                        "state": "stopped",
+                        "stop_reason": "cap",
+                        "episode": {
+                            "pings": 3,
+                            "cost_usd": 0.04,
+                            "estimated": True,
+                            "started_at": 10,
+                        },
+                        "total": {"pings": 9, "cost_usd": 0.12, "estimated": True},
+                        "last_return": {"at": 40, "result": "hit"},
+                        "last_reason": "timeout",
+                    },
+                    "archive_reason": "host_offline",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_labelled"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["warm_state"] == "cold"
+    assert info["keep_warm"]["state"] == "stopped"
+    assert info["keep_warm"]["stop_reason"] == "cap"
+    assert info["keep_warm"]["episode"]["cost_usd"] == 0.04
+    assert info["keep_warm"]["last_return"] == {"at": 40, "result": "hit"}
+    assert info["keep_warm"]["last_reason"] == "timeout"
+    assert info["archive_reason"] == "host_offline"
 
 
 @pytest.mark.asyncio

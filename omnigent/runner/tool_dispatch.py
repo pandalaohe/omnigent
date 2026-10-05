@@ -7276,8 +7276,9 @@ async def _session_get_info_via_rest(
     effort, effective model, parent linkage, workspace / git branch,
     persisted last-activity time, the outstanding approval prompts, and the
     snapshot's durations and runtime facts (session age, idle time, current
-    running period, cost, context usage, last error, archive state,
-    last-message excerpt). Durations are derived on the server's clock:
+    running period, cost, context usage, last error, archive state / reason,
+    keep-warm state, last-message excerpt). Durations are derived on the
+    server's clock:
     ``as_of`` is the response's HTTP ``Date`` header (fallback: the runner's
     clock), and ``age_seconds`` / ``idle_seconds`` / ``running_seconds`` are
     ``as_of`` minus the corresponding server-stamped timestamp, floored at 0.
@@ -7530,6 +7531,10 @@ async def _session_info_item(
         "last_message_tail": snap.get("last_message_tail"),
         "archived": snap.get("archived"),
         "archived_at": snap.get("archived_at"),
+        # Keep-warm state plus why an auto-archived row was retired.
+        "warm_state": snap.get("warm_state"),
+        "keep_warm": snap.get("keep_warm"),
+        "archive_reason": snap.get("archive_reason"),
         "total_cost_usd": snap.get("total_cost_usd"),
         "context_tokens": context_tokens,
         "context_window": context_window,

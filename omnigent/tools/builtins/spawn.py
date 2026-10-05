@@ -751,7 +751,7 @@ class SysSessionGetInfoTool(Tool):
     effective model, parent
     linkage, workspace / git branch, persisted last-activity time,
     outstanding approval prompts, cost, context usage, last error, archive
-    state, and a last-message excerpt.
+    state / reason, keep-warm state, and a last-message excerpt.
 
     Durations (``age_seconds``, ``idle_seconds``, ``running_seconds``) are
     computed on the server's clock, so a runner on another host can't skew

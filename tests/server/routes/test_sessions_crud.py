@@ -9,15 +9,20 @@ the stores.
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
 import signal
 import sys
+import tarfile
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import pytest_asyncio
+import yaml
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
@@ -26,6 +31,7 @@ from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -42,6 +48,25 @@ async def session_id(db_uri: str) -> str:
     agent_store.create(agent_id, name="test-agent", bundle_location="test:///bundle")
     conv = conv_store.create_conversation(agent_id=agent_id)
     return conv.id
+
+
+def _harness_bundle(harness: str) -> bytes:
+    """A minimal valid agent bundle whose executor declares *harness*."""
+    config = yaml.safe_dump(
+        {
+            "spec_version": 1,
+            "name": "keep-warm-harness-agent",
+            "executor": {"type": "omnigent", "config": {"harness": harness}},
+            "prompt": "hi",
+        }
+    )
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        data = config.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
 
 
 # ── GET /v1/sessions (list) ─────────────────────────────────────────
@@ -66,6 +91,76 @@ async def test_list_sessions_after_create(
     body = resp.json()
     ids = [s["id"] for s in body["data"]]
     assert session_id in ids
+
+
+async def test_list_sessions_carries_keep_warm_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A labelled row exposes warm_state / keep_warm; a bare row stays null."""
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="kw-agent", bundle_location="test:///bundle")
+    labelled = conv_store.create_conversation(agent_id=agent_id)
+    bare = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(
+        labelled.id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 100, "u": now - 100, "w": now + 3600}
+            ),
+            "omnigent.keep_warm_stats": json.dumps(
+                {"ep": {"p": 3, "c": 40000, "e": 1, "s": now - 600}}
+            ),
+        },
+    )
+
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+
+    assert rows[labelled.id]["warm_state"] == "warm"
+    keep_warm = rows[labelled.id]["keep_warm"]
+    assert keep_warm["state"] == "on"
+    assert keep_warm.get("stop_reason") is None
+    assert keep_warm["episode"]["pings"] == 3
+    assert keep_warm["episode"]["cost_usd"] == pytest.approx(0.04)
+    assert keep_warm["episode"]["estimated"] is True
+    assert keep_warm["episode"]["started_at"] == now - 600
+
+    assert rows[bare.id].get("warm_state") is None
+    assert rows[bare.id].get("keep_warm") is None
+
+
+async def test_list_sessions_keep_warm_state_uses_harness_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A session the sweeper never labelled reads cold on a supported harness
+    and no state on a harness with no keep-warm channel."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    supported_agent = generate_agent_id()
+    unsupported_agent = generate_agent_id()
+    for agent_id, harness in (
+        (supported_agent, "claude-native"),
+        (unsupported_agent, "opencode-native"),
+    ):
+        location = f"{agent_id}/bundle"
+        artifacts.put(location, _harness_bundle(harness))
+        agent_store.create(agent_id, name=f"kw-{harness}", bundle_location=location)
+    supported = conv_store.create_conversation(agent_id=supported_agent)
+    unsupported = conv_store.create_conversation(agent_id=unsupported_agent)
+
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    assert rows[supported.id]["warm_state"] == "cold"
+    assert rows[unsupported.id].get("warm_state") is None
 
 
 async def test_list_sessions_pagination(
