@@ -1024,7 +1024,7 @@ async def test_fire_refuses_a_default_model_the_catalog_does_not_offer() -> None
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "invalid_input"
     assert "is not offered by host" in store.runs[0]["error"]
-    assert "Change the setting or pass model" in store.runs[0]["error"]
+    assert "Change the setting, pass model, or run Sync models" in store.runs[0]["error"]
 
 
 @pytest.mark.asyncio

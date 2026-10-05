@@ -272,7 +272,8 @@ def test_check_offered_flags_a_default_model_missing_from_the_catalog() -> None:
             "message": (
                 "Default model 'gpt-6-sol' from project 'P' host settings is not offered "
                 "by host 'HDS' (codex, last sync 2023-11-14 22:13 UTC). "
-                "Change the setting or pass model."
+                "Change the setting, pass model, or run Sync models (Settings › "
+                "Calling defaults) if the host offers it now."
             ),
         }
     ]

@@ -385,7 +385,8 @@ def _offered_problem(
             f"Default {field} {value!r} from {_setting_phrase(setting, project_name)} is not "
             f"offered by host {host_id!r} ({harness}, last sync "
             f"{_format_sync_time(catalog.get('fetched_at'))}). "
-            f"Change the setting or pass {field}."
+            f"Change the setting, pass {field}, or run Sync models (Settings › Calling "
+            f"defaults) if the host offers it now."
         ),
     }
 
