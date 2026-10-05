@@ -117,6 +117,10 @@ from omnigent.server.routes._member_placement import resolve_member_worktree_on_
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._session_create_validation import CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
 from omnigent.server.routes._sessions.common import (
+    _ARCHIVE_EXEMPT_SINCE_LABEL_KEY,
+    _ARCHIVE_REASON_HOST_OFFLINE,
+    _ARCHIVE_REASON_LABEL_KEY,
+    _ARCHIVED_BY_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -186,6 +190,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
+    effective_host_id,
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -3402,6 +3407,32 @@ def register_core_routes(
                     conversation_store,
                     runner_router,
                 )
+                # Unarchiving a keep-warm host-offline archive opts out of that
+                # pass for the host's current offline spell: drop the provenance
+                # and pin the host's last-seen stamp (a reconnect bumps it,
+                # re-arming the pass).
+                if updated.labels.get(_ARCHIVE_REASON_LABEL_KEY) == _ARCHIVE_REASON_HOST_OFFLINE:
+                    await asyncio.to_thread(
+                        conversation_store.delete_label, session_id, _ARCHIVE_REASON_LABEL_KEY
+                    )
+                    await asyncio.to_thread(
+                        conversation_store.delete_label, session_id, _ARCHIVED_BY_LABEL_KEY
+                    )
+                    exempt_host_id = await asyncio.to_thread(
+                        effective_host_id, conversation_store, updated
+                    )
+                    host_store = getattr(request.app.state, "host_store", None)
+                    exempt_host = (
+                        await asyncio.to_thread(host_store.get_host, exempt_host_id)
+                        if exempt_host_id is not None and host_store is not None
+                        else None
+                    )
+                    if exempt_host is not None:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            session_id,
+                            {_ARCHIVE_EXEMPT_SINCE_LABEL_KEY: str(exempt_host.updated_at)},
+                        )
         # The runner applies native settings live and caches SDK settings for the
         # next turn. Silent startup metadata writes skip both recovery and
         # forwarding to avoid recursive launches.

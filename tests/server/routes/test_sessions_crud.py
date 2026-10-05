@@ -895,3 +895,74 @@ async def test_patch_rejects_forged_worktree_identity(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+
+
+# ── Unarchive exemption for keep-warm host-offline archives ─────────
+
+
+async def test_unarchive_after_host_offline_archive_pins_exemption(
+    app,
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Unarchiving a session the keep-warm sweep archived for an offline host
+    clears the provenance labels and pins the host's current last-seen stamp,
+    so the same offline spell does not immediately re-archive it."""
+    from omnigent.server.child_keep_warm import (
+        ARCHIVE_EXEMPT_SINCE_LABEL,
+        ARCHIVE_REASON_LABEL,
+        ARCHIVED_BY_LABEL,
+    )
+    from omnigent.stores.host_store import HostStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_id = "7a2b3c4d5e6f1234567890abcdef0123"
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.upsert_on_connect(host_id, "kw-exempt-host", "local")
+    conv_store.set_host_id(session_id, host_id, workspace="/tmp/kw-exempt")
+    conv_store.set_labels(
+        session_id,
+        {ARCHIVE_REASON_LABEL: "host_offline", ARCHIVED_BY_LABEL: "keep_warm"},
+    )
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+    assert resp.status_code == 200, resp.text
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.archived is False
+    assert ARCHIVE_REASON_LABEL not in conv.labels
+    assert ARCHIVED_BY_LABEL not in conv.labels
+    host = host_store.get_host(host_id)
+    assert host is not None
+    assert conv.labels.get(ARCHIVE_EXEMPT_SINCE_LABEL) == str(host.updated_at)
+
+
+async def test_unarchive_with_other_archive_reason_leaves_labels_alone(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """The exemption only fires for the keep-warm host-offline provenance; an
+    archive with any other reason keeps its labels and gains no exemption."""
+    from omnigent.server.child_keep_warm import (
+        ARCHIVE_EXEMPT_SINCE_LABEL,
+        ARCHIVE_REASON_LABEL,
+    )
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(session_id, {ARCHIVE_REASON_LABEL: "user"})
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+    assert resp.status_code == 200, resp.text
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(ARCHIVE_REASON_LABEL) == "user"
+    assert ARCHIVE_EXEMPT_SINCE_LABEL not in conv.labels

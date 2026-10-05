@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.server.child_keep_warm import keep_warm_episode_active
 
 _logger = logging.getLogger(__name__)
 
@@ -841,7 +842,12 @@ class CliRetentionCoordinator:
                 unknown_count += 1
                 continue
             supported_count += 1
-            if conversation.id in protected_by_descendant:
+            # A warm keep-warm episode yields the pool the same way a live
+            # descendant does: never counted against max_idle_clis, never
+            # released out from under the warming.
+            if conversation.id in protected_by_descendant or keep_warm_episode_active(
+                getattr(conversation, "labels", None)
+            ):
                 busy = True
                 eligible = False
                 idle_seconds = 0.0

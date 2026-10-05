@@ -25,6 +25,9 @@ from omnigent.runtime import pending_elicitations
 from omnigent.server import child_keep_warm
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.child_keep_warm import (
+    ARCHIVE_EXEMPT_SINCE_LABEL,
+    ARCHIVE_REASON_LABEL,
+    ARCHIVED_BY_LABEL,
     KEEP_WARM_LABEL,
     KEEP_WARM_STATS_LABEL,
     LAST_CACHE_LABEL,
@@ -34,6 +37,7 @@ from omnigent.server.child_keep_warm import (
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import Host
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 pytestmark = pytest.mark.asyncio
@@ -2244,3 +2248,187 @@ async def test_legacy_why_codes_round_trip() -> None:
     for why in ("mom", "pol"):
         state = child_keep_warm._WarmState(s="c", why=why, t=1, c=1, u=1, w=1)
         assert child_keep_warm._WarmState.parse(state.to_label()) == state
+
+
+# ── Host-offline archive pass ────────────────────────────
+
+
+class _HostStore:
+    """Host store fake with scripted rows."""
+
+    def __init__(self, hosts: dict[str, Host]) -> None:
+        self._hosts = hosts
+
+    def get_host(self, host_id: str) -> Host | None:
+        return self._hosts.get(host_id)
+
+
+def _wire_host(harness: _Harness, host_id: str, *, status: str, updated_at: int) -> Host:
+    """Attach a scripted host row to the sweeper's app state."""
+    host = Host(
+        host_id=host_id,
+        name="keep-warm-test-host",
+        user_id=RESERVED_USER_LOCAL,
+        status=status,
+        created_at=updated_at,
+        updated_at=updated_at,
+    )
+    harness.sweeper._app.state.host_store = _HostStore({host_id: host})
+    return host
+
+
+async def _tick_archive_pass(harness: _Harness) -> None:
+    """Drive enough ticks to run the host-offline archive pass exactly once."""
+    for _ in range(child_keep_warm._ARCHIVE_PASS_TICK_INTERVAL):
+        await _tick(harness)
+
+
+def _archived(harness: _Harness, session_id: str) -> bool:
+    conv = harness.store.get_conversation(session_id)
+    assert conv is not None
+    return bool(conv.archived)
+
+
+async def test_host_offline_past_threshold_archives_the_child(harness: _Harness) -> None:
+    """A child whose host is offline past the 4 h default is archived, stamped."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    assert conv.labels[ARCHIVE_REASON_LABEL] == "host_offline"
+    assert conv.labels[ARCHIVED_BY_LABEL] == "keep_warm"
+    assert (child.id, None) in harness.published
+    # The mother is a top-level row: never touched by the pass.
+    assert _archived(harness, parent.id) is False
+
+
+async def test_host_offline_under_threshold_leaves_the_child(harness: _Harness) -> None:
+    """One minute short of the 4 h default, nothing is archived."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 - 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+
+
+async def test_host_offline_archive_never_touches_top_level_sessions(
+    harness: _Harness,
+) -> None:
+    """The pass scans ``kind="sub_agent"`` only, even for a host-bound main."""
+    main = harness.store.create_conversation(
+        agent_id=_CLAUDE_AGENT,
+        host_id=_HOST_ID,
+        workspace="/tmp/kw-main",
+    )
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, main.id) is False
+
+
+async def test_host_offline_archive_setting_zero_disables(harness: _Harness) -> None:
+    """``hostOfflineArchiveSeconds: 0`` turns the pass off for that owner."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True}},
+        "hostOfflineArchiveSeconds": 0,
+    }
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+
+
+async def test_host_offline_archive_has_no_recency_window(harness: _Harness) -> None:
+    """A child untouched for days is still archived — the pass has no updated_after."""
+    from sqlalchemy import update as sql_update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlConversation
+
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+    # Backdate the row three days, well outside the ping candidate window.
+    with Session(harness.store._engine) as session:
+        session.execute(
+            sql_update(SqlConversation)
+            .where(SqlConversation.id == child.id)
+            .values(updated_at=harness.now - 3 * 86400)
+        )
+        session.commit()
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+
+
+async def test_unarchive_exemption_skips_the_same_offline_spell(harness: _Harness) -> None:
+    """A row pinned to the host's current last-seen stamp is not re-archived."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    host = _wire_host(
+        harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60)
+    )
+    harness.store.set_labels(child.id, {ARCHIVE_EXEMPT_SINCE_LABEL: str(host.updated_at)})
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+
+
+async def test_unarchive_exemption_expires_when_the_host_last_seen_moves(
+    harness: _Harness,
+) -> None:
+    """A stamp from a PREVIOUS offline spell no longer exempts the row."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    host = _wire_host(
+        harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60)
+    )
+    # The exemption names an older last-seen stamp: the host reconnected (and
+    # died again) since the user unarchived, so the pass applies once more.
+    harness.store.set_labels(child.id, {ARCHIVE_EXEMPT_SINCE_LABEL: str(host.updated_at - 7200)})
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+
+
+async def test_host_offline_archive_caps_a_pass_at_fifty(harness: _Harness) -> None:
+    """A dead host's fleet archives in bounded batches, not one burst."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    children = [
+        _child(harness, parent.id, live_status=None, title=f"researcher:task{i}")
+        for i in range(55)
+    ]
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    archived = [child.id for child in children if _archived(harness, child.id)]
+    assert len(archived) == child_keep_warm._ARCHIVE_PASS_MAX_ARCHIVES
+
+
+async def test_host_offline_archive_runs_only_every_tenth_tick(harness: _Harness) -> None:
+    """The pass cadence: ticks before the interval boundary archive nothing."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    for _ in range(child_keep_warm._ARCHIVE_PASS_TICK_INTERVAL - 1):
+        await _tick(harness)
+    assert _archived(harness, child.id) is False
+
+    await _tick(harness)
+    assert _archived(harness, child.id) is True

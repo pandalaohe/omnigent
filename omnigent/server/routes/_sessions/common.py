@@ -328,6 +328,19 @@ _KEEP_WARM_LABEL_KEY: str = "omnigent.keep_warm"
 # the episode label so the 256-character label bound holds (child_keep_warm.py).
 _KEEP_WARM_STATS_LABEL_KEY: str = "omnigent.keep_warm_stats"
 
+# Auto-archive provenance (child_keep_warm.py's host-offline pass). A user
+# unarchive of such a row pins ``omnigent.archive_exempt_since`` to the host's
+# last-seen stamp so the same offline spell does not re-archive it.
+_ARCHIVE_REASON_LABEL_KEY: str = "omnigent.archive_reason"
+
+_ARCHIVE_REASON_HOST_OFFLINE: str = "host_offline"
+
+_ARCHIVED_BY_LABEL_KEY: str = "omnigent.archived_by"
+
+_ARCHIVED_BY_KEEP_WARM: str = "keep_warm"
+
+_ARCHIVE_EXEMPT_SINCE_LABEL_KEY: str = "omnigent.archive_exempt_since"
+
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
@@ -1111,6 +1124,11 @@ __all__ = [
     "_APPROVAL_TIMEOUT_RECORD_TTL_S",
     "_APPROVAL_TIMEOUT_SNAPSHOT_TTL_S",
     "_APPROVAL_TYPE",
+    "_ARCHIVED_BY_KEEP_WARM",
+    "_ARCHIVED_BY_LABEL_KEY",
+    "_ARCHIVE_EXEMPT_SINCE_LABEL_KEY",
+    "_ARCHIVE_REASON_HOST_OFFLINE",
+    "_ARCHIVE_REASON_LABEL_KEY",
     "_ASSISTANT_TAIL_LIMIT",
     "_BROWSER_ACTION_AWAIT_S",
     "_BROWSER_ACTION_CLAIM_GRACE_S",
