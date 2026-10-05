@@ -2006,6 +2006,43 @@ def test_create_worktree_frame_path_template_absent_decodes_none() -> None:
     assert decoded.path_template is None
 
 
+def test_create_worktree_frame_path_template_is_additive_for_older_hosts() -> None:
+    """The template is one extra key; without it the frame reads as an older server's.
+
+    An older host's decoder reads only the keys it knows, so it sees exactly
+    this entry-bearing frame and keeps its legacy placement.
+    """
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(
+            request_id="req_wt_7",
+            repo_path="/Users/alice/myrepo",
+            branch_name="feature/login",
+            entry="/Users/alice/project",
+            path_template="{entry}/.worktrees/{repo}/{branch}",
+        )
+    )
+    msg = json.loads(encoded)
+    assert set(msg) == {
+        "kind",
+        "request_id",
+        "repo_path",
+        "branch_name",
+        "base_branch",
+        "existing_branch",
+        "entry",
+        "path_template",
+    }
+    del msg["path_template"]
+    msg["future_field"] = "ignored"
+    decoded = decode_host_frame(json.dumps(msg))
+    assert decoded == HostCreateWorktreeFrame(
+        request_id="req_wt_7",
+        repo_path="/Users/alice/myrepo",
+        branch_name="feature/login",
+        entry="/Users/alice/project",
+    )
+
+
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
