@@ -1,6 +1,7 @@
 import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,7 @@ import { useSession } from "@/hooks/useSession";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
+import { useHostWorktrees, type HostWorktree } from "@/hooks/useHostWorktrees";
 import {
   checkHostDirectory,
   hostDirectoryMissing,
@@ -48,6 +50,12 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   checkHostDirectory: vi.fn(),
   hostDirectoryMissing: vi.fn(),
+}));
+// The host's worktree list — mocked like the file's other data hooks, with
+// `pathIsWithinWorktree` kept real (the dialog filters rows with it).
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
+  useHostWorktrees: vi.fn(),
 }));
 // The tree browser only mounts when browsing; coding-fork tests rely on the
 // directory being prefilled from the source, so the real picker never opens —
@@ -80,6 +88,7 @@ const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
 const hostDirectoryMissingMock = vi.mocked(hostDirectoryMissing);
 const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
+const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -93,6 +102,31 @@ function host(overrides: Partial<Host> = {}): Host {
 
 function setHosts(hosts: Host[]): void {
   useHostsMock.mockReturnValue({ data: hosts } as ReturnType<typeof useHosts>);
+}
+
+/** One row of the mocked host's ``GET /v1/hosts/{id}/worktrees`` listing. */
+function worktreeRow(path: string, overrides: Partial<HostWorktree> = {}): HostWorktree {
+  return { path, branch: null, is_main: false, detached: false, ...overrides };
+}
+
+// Listings the mocked useHostWorktrees returns, keyed by requested workspace.
+let hostWorktreesByPath: Record<string, HostWorktree[]>;
+
+function setHostWorktrees(byPath: Record<string, HostWorktree[]>): void {
+  hostWorktreesByPath = byPath;
+}
+
+/** Resolve the mocked host-worktrees hook synchronously from the fixture map. */
+function mockHostWorktrees(): void {
+  useHostWorktreesMock.mockImplementation(
+    (hostId, path) =>
+      ({
+        data: hostId !== null && path !== null ? (hostWorktreesByPath[path] ?? []) : undefined,
+        isPending: false,
+        isSuccess: true,
+        isError: false,
+      }) as unknown as ReturnType<typeof useHostWorktrees>,
+  );
 }
 
 // Source session runs claude-sdk (anthropic). The picker should keep all
@@ -135,7 +169,7 @@ function renderDialog(
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-  const dialog = (
+  const dialogElement = () => (
     <ForkSessionDialog
       sourceSessionId="conv_src"
       sourceTitle={props.sourceTitle}
@@ -147,22 +181,25 @@ function renderDialog(
       onOpenChange={vi.fn()}
     />
   );
-  const utils = render(
+  // Fresh elements per call so a rerender with changed hook mocks isn't
+  // skipped on referential equality.
+  const tree = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter>
           {props.info === undefined ? (
-            dialog
+            dialogElement()
           ) : (
             <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
-              {dialog}
+              {dialogElement()}
             </CapabilitiesProvider>
           )}
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { ...utils, invalidateSpy };
+  const utils = render(tree());
+  return { ...utils, invalidateSpy, rerenderDialog: () => utils.rerender(tree()) };
 }
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
@@ -221,6 +258,17 @@ beforeEach(() => {
     isLoading: false,
     error: null,
   } as unknown as ReturnType<typeof useHostFilesystem>);
+  // Host worktree listings resolve synchronously through the mocked hook. The
+  // legacy `-worktrees` path stays recognisable so the pre-existing worktree
+  // tests keep their prefill.
+  setHostWorktrees({
+    "/Users/a/repo-worktrees/fix-1": [
+      worktreeRow("/Users/a/repo", { is_main: true }),
+      worktreeRow("/Users/a/repo-worktrees/fix-1", { branch: "fix-1" }),
+    ],
+  });
+  useHostWorktreesMock.mockReset();
+  mockHostWorktrees();
 });
 
 afterEach(cleanup);
@@ -826,6 +874,12 @@ describe("ForkSessionDialog", () => {
           : "The working directory /Users/a/repo-worktrees/fix-1 doesn't exist on this host (or isn't a directory).",
       );
       hostDirectoryMissingMock.mockResolvedValue(true);
+      // The deleted worktree is listed from its nearest surviving parent, so
+      // the source-path lookup has no containing row; the `-worktrees` parse
+      // must still recover the repo and branch for the recreate.
+      setHostWorktrees({
+        "/Users/a/repo-worktrees/fix-1": [worktreeRow("/Users/a/repo", { is_main: true })],
+      });
       renderDialog(WORKTREE_CODING);
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
@@ -902,11 +956,10 @@ describe("ForkSessionDialog", () => {
       });
     });
 
-    it("recognizes a worktree source without gitBranch (fork-of-fork) via the path", async () => {
+    it("recognizes a worktree source without gitBranch (fork-of-fork) via the host list", async () => {
       // A fork bound into an existing worktree carries NO git_branch (the
       // bind sends no git options), so forking the fork must recover both
-      // the repo and the branch from the worktree path convention — the
-      // branch falls back to the worktree's directory name.
+      // the repo and the branch — here from the host's worktree row.
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
@@ -928,6 +981,252 @@ describe("ForkSessionDialog", () => {
         "/Users/a/repo-worktrees/fix-1",
         undefined,
       );
+    });
+
+    it("prefills the source repo and branch from the host's worktree row", () => {
+      // A worktree placed by any template: the host's own list is
+      // authoritative for both the original repo and the checked-out branch —
+      // the branch is never derived from the worktree directory name.
+      const workspace = "/Users/a/proj/.worktrees/proj/fix-1";
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow(workspace, { branch: "fix/one" }),
+        ],
+      });
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/proj");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix/one");
+    });
+
+    it("keeps the workspace's subdirectory when recognising the source worktree", async () => {
+      // A source started in a subdirectory of a worktree keeps that subpath
+      // under the ORIGINAL repo: <main>/pkg, not the raw worktree path.
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      const worktreePath = "/Users/a/proj/.worktrees/proj/fix-1";
+      const workspace = `${worktreePath}/pkg`;
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow(worktreePath, { branch: "fix/one" }),
+        ],
+      });
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/proj/pkg");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix/one");
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Untouched → the clone binds the source's exact (subdirectory) path.
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", workspace, undefined);
+    });
+
+    it("binds a Windows worktree source untouched (backslashed prefill compares equal)", async () => {
+      // The host reports native backslashes and resolveWorkspacePath keeps
+      // them, so the recovered repo must be backslashed too. A forward-slash
+      // repo would read as changed and the fork would ask the host to create
+      // the already-existing branch.
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      const workspace = "C:\\Users\\a\\proj\\.worktrees\\proj\\fix-1";
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("C:\\Users\\a\\proj", { is_main: true }),
+          worktreeRow(workspace, { branch: "fix/one" }),
+        ],
+      });
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("C:\\Users\\a\\proj");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix/one");
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // Untouched → same aliasing as the POSIX source: no git options, the
+      // clone binds the source's exact worktree directory.
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", workspace, undefined);
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", workspace);
+    });
+
+    it("binds a Windows source untouched when the host lists a lower-case forward-slash main row", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      const workspace = "C:\\Users\\a\\proj\\.worktrees\\proj\\fix-1";
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("c:/Users/a/proj", { is_main: true }),
+          worktreeRow("c:/Users/a/proj/.worktrees/proj/fix-1", { branch: "fix/one" }),
+        ],
+      });
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("C:\\Users\\a\\proj");
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", workspace, undefined);
+    });
+
+    it("keeps the source base for a renamed Windows worktree branch", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      const workspace = "C:\\Users\\a\\proj\\.worktrees\\proj\\fix-1";
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("C:\\Users\\a\\proj", { is_main: true }),
+          worktreeRow(workspace, { branch: "fix/one" }),
+        ],
+      });
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "feature/x" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "C:\\Users\\a\\proj", {
+        branchName: "feature/x",
+        baseBranch: "fix/one",
+      });
+    });
+
+    it("waits for the host worktree list before prefilling the repo", async () => {
+      // A cold cache must not lock the raw worktree path into the directory
+      // field before the host answers.
+      const workspace = "/Users/a/proj/.worktrees/proj/fix-1";
+      useHostWorktreesMock.mockReturnValue({
+        data: undefined,
+        isPending: true,
+        isSuccess: false,
+        isError: false,
+      } as unknown as ReturnType<typeof useHostWorktrees>);
+      const { rerenderDialog } = renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+
+      // The user names a branch while the list is still in flight.
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "feature/typed" },
+      });
+
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow(workspace, { branch: "fix/one" }),
+        ],
+      });
+      mockHostWorktrees();
+      rerenderDialog();
+
+      await waitFor(() =>
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/proj"),
+      );
+      // The resolved list fills the repo but does not clobber the typed branch.
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("feature/typed");
+
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      // The typed branch becomes the new worktree, based on the source's row
+      // branch (not the overwritten prefill value).
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/proj", {
+        branchName: "feature/typed",
+        baseBranch: "fix/one",
+      });
+    });
+
+    it("takes no branch from a detached host worktree row", () => {
+      // A detached row has no branch to alias; the raw workspace is the only
+      // safe prefill and the worktree field stays empty.
+      const workspace = "/Users/a/proj/.worktrees/proj/fix-1";
+      setHostWorktrees({
+        [workspace]: [
+          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow(workspace, { branch: null, detached: true }),
+        ],
+      });
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue(workspace);
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
+    });
+
+    it("falls back to the -worktrees parse when the host list has no containing row", () => {
+      // The upstream layout stays recognisable when the host list yields no
+      // containing row — a deleted worktree is listed from its nearest
+      // surviving parent — and when the source host is offline (no lookup).
+      const workspace = "/Users/a/repo-worktrees/fix-1";
+      setHostWorktrees({ [workspace]: [] });
+      const { rerenderDialog } = renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: workspace,
+        sourceHostId: "host_1",
+      });
+
+      openAdvanced();
+      // Online, no containing row → the path parse recovers repo + branch.
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
+
+      // The source host goes offline; no lookup applies, so clearing the
+      // directory re-prefills from the same parse.
+      setHosts([host({ host_id: "host_1", status: "offline" })]);
+      rerenderDialog();
+      fireEvent.change(screen.getByTestId("workspace-path-input"), { target: { value: "" } });
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
     });
 
     it("enables the submit for a typed tilde path without opening the browser", async () => {

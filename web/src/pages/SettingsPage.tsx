@@ -263,6 +263,10 @@ import {
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
+  fetchWorktreePathTemplate,
+  saveWorktreePathTemplate,
+} from "@/lib/worktreeLocationPreference";
+import {
   archivedAtSeconds,
   readRetentionDays,
   writeRetentionDays,
@@ -397,7 +401,6 @@ export function SettingsPage() {
   }
 
   if (section === "archived") return <ArchivedSection />;
-
 
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem" {...pageWrapperSettings}>
@@ -825,9 +828,7 @@ function HealthCheckSettingsForm({ settings }: { settings: SystemStatusSettings 
           id="health-check-prompt"
           value={draft.prompt}
           rows={10}
-          onChange={(event) =>
-            setDraft((current) => ({ ...current, prompt: event.target.value }))
-          }
+          onChange={(event) => setDraft((current) => ({ ...current, prompt: event.target.value }))}
         />
         <span className="text-xs text-muted-foreground">
           Sent as the first message, followed by the monitor snapshot.
@@ -1644,6 +1645,9 @@ function GitSection() {
           <div className="mt-4 border-t border-border pt-4">
             <DefaultBaseBranchControl />
           </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <WorktreeLocationControl />
+          </div>
         </div>
       </div>
     </Section>
@@ -2255,6 +2259,125 @@ function DefaultBaseBranchControl() {
         onChange={(e) => update(e.target.value)}
         componentId="settings.git.default_branch"
       />
+    </div>
+  );
+}
+
+const WORKTREE_LOCATION_TOKEN_HELP =
+  "Tokens: {entry} (project folder on the host, else the repository), {repo_parent}, " +
+  "{repo}, {branch}; start with {entry}, {repo_parent}, ~ or an absolute path.";
+
+/**
+ * Worktree location template for new sessions on every host. Kept on the
+ * server (not the localStorage sync) because a refused template must show the
+ * server's message; the sync retries silently.
+ */
+function WorktreeLocationControl() {
+  const [stored, setStored] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchWorktreePathTemplate()
+      .then((template) => {
+        if (!alive) return;
+        setStored(template);
+        setDraft(template ?? "");
+      })
+      .catch(() => {
+        if (alive) setLoadFailed(true);
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const save = useCallback(async (next: string | null) => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await saveWorktreePathTemplate(next);
+      setStored(next);
+      setDraft(next ?? "");
+    } catch (e) {
+      // Keep the draft so a refused template can be corrected in place.
+      setSaveError(e instanceof Error ? e.message : "Saving the worktree location failed.");
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+
+  const trimmed = draft.trim();
+  const controlsDisabled = loading || loadFailed || saving;
+  const canSave = !controlsDisabled && trimmed !== "" && trimmed !== (stored ?? "");
+  const error = loadFailed ? "Could not load the worktree location." : saveError;
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-ui font-medium">Worktree location</span>
+          <span className="text-ui text-muted-foreground">
+            Where Omnigent creates new worktrees, on every host. Leave unset for the default next to
+            the repository.
+          </span>
+          <span className="text-ui text-muted-foreground">{WORKTREE_LOCATION_TOKEN_HELP}</span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Input
+            type="text"
+            aria-label="Worktree location template"
+            data-testid="settings-worktree-location-input"
+            placeholder="{repo_parent}/{repo}-worktrees/{branch}"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            className="h-9 w-80 shrink-0"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            disabled={controlsDisabled}
+            componentId="settings.git.worktree_location"
+          />
+          <Button
+            size="sm"
+            className="h-9"
+            disabled={!canSave}
+            loading={saving}
+            data-testid="settings-worktree-location-save"
+            onClick={() => void save(trimmed)}
+            componentId="settings.git.worktree_location_save"
+          >
+            Save
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-9"
+            disabled={controlsDisabled || stored === null}
+            data-testid="settings-worktree-location-reset"
+            onClick={() => void save(null)}
+            componentId="settings.git.worktree_location_reset"
+          >
+            Use default
+          </Button>
+        </div>
+      </div>
+      {error !== null && (
+        <p
+          role="alert"
+          data-testid="settings-worktree-location-error"
+          className="text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
     </div>
   );
 }
