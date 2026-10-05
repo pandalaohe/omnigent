@@ -4831,12 +4831,9 @@ class TestToolCallPolicyGate(unittest.TestCase):
 
         _run(_t())
 
-    def test_gate_installed_without_evaluator_or_handler(self):
-        """With neither a policy evaluator nor an elicitation handler the gate
-        is still installed so the keep-warm maintenance veto is reachable:
-        it denies during a ping and allows otherwise."""
-        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
-
+    def test_gate_not_installed_without_evaluator_or_handler(self):
+        """With neither a policy evaluator nor an elicitation handler, no
+        can_use_tool callback is installed (unchanged baseline)."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         async def _t():
@@ -4856,22 +4853,7 @@ class TestToolCallPolicyGate(unittest.TestCase):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            gate = captured["can_use_tool"]
-            self.assertIsNotNone(gate)
-            self.assertEqual(gate.func, executor._can_use_tool_gate)
-            self.assertEqual(gate.keywords["session_key"], "default")
-
-            slot = executor._query_slot("default")
-            slot.maintenance = True
-            try:
-                denied = await gate("Bash", {"command": "ls"}, None)
-            finally:
-                slot.maintenance = False
-            self.assertIsInstance(denied, PermissionResultDeny)
-            self.assertTrue(denied.interrupt)
-
-            allowed = await gate("Bash", {"command": "ls"}, None)
-            self.assertIsInstance(allowed, PermissionResultAllow)
+            self.assertIsNone(captured["can_use_tool"])
 
         _run(_t())
 
@@ -5830,6 +5812,18 @@ def _ping_sdk():
     return _FakeSDK
 
 
+def _find_maintenance_hook(options):
+    """Return the keep-warm maintenance ``PreToolUse`` callback from the
+    client options ``run_turn`` configured (the catch-all matcher)."""
+    matchers = [
+        matcher
+        for matcher in (getattr(options, "hooks", None) or {}).get("PreToolUse", [])
+        if getattr(matcher, "matcher", None) is None
+    ]
+    assert len(matchers) == 1, "expected exactly one catch-all PreToolUse matcher"
+    return matchers[0].hooks[0]
+
+
 async def _stream_messages(*messages):
     """Async generator yielding the scripted messages, then ending."""
     for message in messages:
@@ -5969,79 +5963,128 @@ async def test_keep_warm_skips_busy_while_a_turn_marks_the_session_busy() -> Non
     assert client.queries == []
 
 
-@pytest.mark.parametrize("mode", ["bypassPermissions", "default"])
 @pytest.mark.asyncio
-async def test_keep_warm_gate_vetoes_tools_during_maintenance(mode: str) -> None:
-    """The maintenance veto denies with interrupt before policy and elicitation."""
-    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+async def test_keep_warm_maintenance_hook_installed_without_collaborators() -> None:
+    """With neither a policy evaluator nor an elicitation handler ``run_turn``
+    installs a catch-all maintenance ``PreToolUse`` hook (not ``can_use_tool``)
+    that denies tools during a ping and has no opinion otherwise."""
+    from claude_agent_sdk import HookMatcher
+    from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
-    executor = ClaudeSDKExecutor(permission_mode=mode)
-    policy = AsyncMock(return_value=PolicyVerdictPayload(action="POLICY_ACTION_ALLOW"))
-    elicit = AsyncMock(return_value=True)
-    executor._policy_evaluator = policy
-    executor._elicitation_handler = elicit
-    slot = executor._query_slot("s1")
+    class _FakeSDK(_sdk_types()):
+        pass
+
+    _FakeSDK.HookMatcher = HookMatcher
+    _FakeSDK.ClaudeAgentOptions = SDKClaudeAgentOptions
+
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+    captured = {}
+
+    async def fake_get_or_create_client(sdk, *, session_key, options, model):
+        captured["options"] = options
+        raise RuntimeError("stop after options build")
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        with patch.object(
+            executor, "_get_or_create_client", side_effect=fake_get_or_create_client
+        ):
+            with pytest.raises(RuntimeError):
+                async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                    pass
+
+    options = captured["options"]
+    assert options.can_use_tool is None
+    hook = _find_maintenance_hook(options)
+
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "tool_use_id": "tu_1",
+    }
+    slot = executor._query_slot("default")
     slot.maintenance = True
-    perm_ctx = SimpleNamespace(tool_use_id="tu_1", agent_id=None, suggestions=[])
+    try:
+        denial = await hook(payload, "tu_1", {"signal": None})
+    finally:
+        slot.maintenance = False
 
-    denial = await executor._can_use_tool_gate(
-        "Bash", {"command": "ls"}, perm_ctx, permission_mode=mode, session_key="s1"
-    )
-
-    assert isinstance(denial, PermissionResultDeny)
-    assert denial.message == "keep-warm maintenance turn: tools are disabled"
-    assert denial.interrupt is True
-    policy.assert_not_awaited()
-    elicit.assert_not_awaited()
+    assert denial["hookSpecificOutput"] == {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "keep-warm maintenance turn: tools are disabled",
+    }
+    assert denial["continue_"] is False
     assert slot.tool_attempted is True
 
-    # Once the ping ends the gate behaves exactly as before.
-    slot.maintenance = False
-    allowed = await executor._can_use_tool_gate(
-        "Bash", {"command": "ls"}, perm_ctx, permission_mode=mode, session_key="s1"
-    )
-    assert isinstance(allowed, PermissionResultAllow)
-    policy.assert_awaited_once()
+    # Outside maintenance the hook has no opinion and records nothing.
+    slot.tool_attempted = False
+    assert await hook(payload, "tu_1", {"signal": None}) == {}
+    assert slot.tool_attempted is False
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_tool_attempt_reports_tool_attempt() -> None:
-    """A tool call during the ping is denied and the receipt says ``tool_attempt``."""
-    from claude_agent_sdk import PermissionResultDeny
+async def test_keep_warm_tool_attempt_through_configured_hook_reports_tool_attempt() -> None:
+    """A tool attempted during a ping is denied by the ``PreToolUse`` hook
+    installed on the client options; the receipt says ``failed`` / ``tool_attempt``."""
+    from claude_agent_sdk import HookMatcher
+    from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 
+    class _FakeSDK(_sdk_types()):
+        pass
+
+    _FakeSDK.HookMatcher = HookMatcher
+    _FakeSDK.ClaudeAgentOptions = SDKClaudeAgentOptions
+
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+    captured = {}
+
+    async def fake_get_or_create_client(sdk, *, session_key, options, model):
+        captured["options"] = options
+        raise RuntimeError("stop after options build")
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        with patch.object(
+            executor, "_get_or_create_client", side_effect=fake_get_or_create_client
+        ):
+            with pytest.raises(RuntimeError):
+                async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                    pass
+
+    hook = _find_maintenance_hook(captured["options"])
     denied: list[object] = []
 
     async def _attempt_tool_stream():
         denied.append(
-            await executor._can_use_tool_gate(
-                "Bash",
-                {"command": "ls"},
-                SimpleNamespace(tool_use_id="tu_1", agent_id=None, suggestions=[]),
-                permission_mode="bypassPermissions",
-                session_key="s1",
+            await hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "ls"},
+                    "tool_use_id": "tu_1",
+                },
+                "tu_1",
+                {"signal": None},
             )
         )
         yield _PingResultMessage(usage={"input_tokens": 5}, total_cost_usd=0.0)
 
     client = _PingClient(_attempt_tool_stream())
-    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
-    executor._clients["s1"] = _ClaudeClientState(
+    executor._clients["default"] = _ClaudeClientState(
         client=client, model=None, permission_mode="bypassPermissions"
     )
 
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
         receipt = await executor.keep_warm(attempt_id="att-5", family="claude")
 
-    assert isinstance(denied[0], PermissionResultDeny)
-    assert denied[0].interrupt is True
+    assert denied[0]["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert receipt["outcome"] == "failed"
     assert receipt["reason"] == "tool_attempt"
-    slot = executor._query_slot("s1")
+    slot = executor._query_slot("default")
     assert not slot.lock.locked()
     assert not slot.maintenance and not slot.tool_attempted
 
@@ -6589,3 +6632,162 @@ async def test_keep_warm_fallback_replays_full_history_on_the_replacement_client
     assert "first question" in prompt
     assert "first answer" in prompt
     assert "second question" in prompt
+
+
+@pytest.mark.asyncio
+async def test_turn_revalidates_client_retired_while_awaiting_policy() -> None:
+    """A ping that retires the client while a real turn awaits its policy gate
+    must leave the turn querying a fresh client with full history, not the
+    retired one."""
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import (
+        _KEEP_WARM_PING_PROMPT,
+        ClaudeSDKExecutor,
+        _ClaudeClientState,
+    )
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    class _Sentinel:
+        pass
+
+    result = SDKResultMessage(
+        subtype="result",
+        session_id="s1",
+        result="done",
+        total_cost_usd=0.0,
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        usage={"input_tokens": 3},
+    )
+
+    class _CapturedClient:
+        """The turn captures this client before its policy gate; the ping's
+        empty drain then retires it."""
+
+        def __init__(self):
+            self.options = None
+            self.prompts = []
+            self.streams = 0
+            self.disconnects = 0
+            self._transport = _make_transport_with_process(None)
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt, session_id="default"):
+            self.prompts.append(prompt)
+
+        async def receive_response(self):
+            self.streams += 1
+            if self.streams > 1:
+                yield result
+
+        async def interrupt(self):
+            return None
+
+        async def disconnect(self):
+            self.disconnects += 1
+
+        async def set_model(self, model):
+            return None
+
+    class _FreshClient:
+        created: list["_FreshClient"] = []
+
+        def __init__(self, options):
+            self.options = options
+            self.prompts = []
+            self.disconnects = 0
+            self._transport = _make_transport_with_process(None)
+            _FreshClient.created.append(self)
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt, session_id="default"):
+            self.prompts.append(prompt)
+
+        async def receive_response(self):
+            yield result
+
+        async def interrupt(self):
+            return None
+
+        async def disconnect(self):
+            self.disconnects += 1
+
+        async def set_model(self, model):
+            return None
+
+    class _FakeSDK(_sdk_types()):
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        ClaudeSDKClient = _FreshClient
+
+    policy_entered = asyncio.Event()
+    policy_release = asyncio.Event()
+
+    async def policy(phase, data):
+        if phase == "PHASE_LLM_REQUEST":
+            policy_entered.set()
+            await policy_release.wait()
+        return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+
+    executor = ClaudeSDKExecutor()
+    captured = _CapturedClient()
+    executor._clients["s1"] = _ClaudeClientState(
+        client=captured, model=None, permission_mode="auto"
+    )
+    executor._policy_evaluator = policy
+    messages = [
+        {"role": "user", "content": "first question", "session_id": "s1"},
+        {"role": "assistant", "content": "first answer", "session_id": "s1"},
+        {"role": "user", "content": "second question", "session_id": "s1"},
+    ]
+
+    async def _collect():
+        return [event async for event in executor.run_turn(messages, [], "")]
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        turn_task = asyncio.create_task(_collect())
+        await asyncio.wait_for(policy_entered.wait(), timeout=1.0)
+
+        # The ping reuses the client the turn captured and its drain ends
+        # without a ResultMessage, retiring the client while the turn is
+        # still parked in policy evaluation.
+        receipt = await executor.keep_warm(attempt_id="att-14", family="claude")
+        assert receipt["outcome"] == "failed"
+        assert receipt["reason"] == "harness_error"
+        assert "s1" not in executor._clients
+
+        policy_release.set()
+        events = await asyncio.wait_for(turn_task, timeout=2.0)
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    # The retired client served only the ping; the turn queried a fresh one
+    # with the whole conversation.
+    assert captured.prompts == [_KEEP_WARM_PING_PROMPT]
+    assert captured.streams == 1
+    assert captured.disconnects == 1
+    assert executor._clients["s1"].client is not captured
+    assert len(_FreshClient.created) == 1
+    fresh = _FreshClient.created[0]
+    assert len(fresh.prompts) == 1
+    prompt = fresh.prompts[0]
+    assert isinstance(prompt, str)
+    assert "first question" in prompt
+    assert "first answer" in prompt
+    assert "second question" in prompt
+    assert executor._query_slot("s1").busy == 0

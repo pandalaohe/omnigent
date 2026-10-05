@@ -371,6 +371,8 @@ _KEEP_WARM_DRAIN_S = 5.0
 # it closes the live client and starts a fresh one.
 _KEEP_WARM_PREEMPT_WAIT_S = 15.0
 _KEEP_WARM_PING_PROMPT = "[System: keep-warm. Reply with only: ok]"
+# Reason on the PreToolUse deny that guards a ping's maintenance turn.
+_KEEP_WARM_MAINTENANCE_DENY_REASON = "keep-warm maintenance turn: tools are disabled"
 
 # ── Multimodal content block conversion ──────────────────────
 
@@ -2585,6 +2587,52 @@ class ClaudeSDKExecutor(Executor):
         hooks.setdefault("UserPromptSubmit", []).append(hook_matcher(hooks=[add_context]))
         options.hooks = hooks
 
+    def _install_keep_warm_maintenance_hook(
+        self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str
+    ) -> None:
+        """
+        Register the catch-all ``PreToolUse`` hook guarding a keep-warm ping.
+
+        ``can_use_tool`` only fires for calls the CLI would otherwise prompt
+        for — never for bypass mode or already-allowed tools — so the
+        maintenance veto needs a hook, which runs for every tool call
+        regardless of permission rules. Outside maintenance the hook has no
+        opinion, so ordinary tool flow is untouched.
+
+        :param sdk: The ``claude_agent_sdk`` module (or a test double).
+        :param options: ``ClaudeAgentOptions`` to mutate.
+        :param session_key: Session whose maintenance flag this hook reads.
+        """
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            return
+
+        async def veto_tool(
+            _payload: object, _tool_use_id: str | None, _context: object
+        ) -> _JsonObject:
+            slot = self._query_slots.get(session_key)
+            if slot is None or not slot.maintenance:
+                return {}
+            slot.tool_attempted = True
+            logger.info("keep-warm maintenance turn attempted a tool; denying and stopping")
+            return {
+                # Precedence over permissionDecision: stop the maintenance
+                # turn outright so the model cannot keep trying tools.
+                "continue_": False,
+                "stopReason": _KEEP_WARM_MAINTENANCE_DENY_REASON,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": _KEEP_WARM_MAINTENANCE_DENY_REASON,
+                },
+            }
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        entries = list(hooks.get("PreToolUse") or [])
+        entries.append(hook_matcher(hooks=[veto_tool]))
+        hooks["PreToolUse"] = entries
+        options.hooks = hooks
+
     def _install_subagent_router_hook(
         self,
         sdk: _ClaudeSDK,
@@ -2791,25 +2839,20 @@ class ClaudeSDKExecutor(Executor):
         perm_ctx: object,
         *,
         permission_mode: str | None = None,
-        session_key: str | None = None,
     ) -> object:
         """
         Unified ``options.can_use_tool`` callback for the claude-sdk path.
 
-        Composes three independent gates, in order:
+        Composes two independent gates, in order:
 
-        1. **Keep-warm maintenance veto**: while a keep-warm ping owns the
-           session's query slot, every tool call is denied with
-           ``interrupt=True`` under every permission mode — the fixed
-           maintenance turn must never do real work.
-        2. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
+        1. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
            wired): a hard DENY short-circuits to
            :class:`~claude_agent_sdk.PermissionResultDeny`. This runs in
            EVERY permission mode — including ``bypassPermissions`` — so
            connector-native MCP tools can't slip past policy. ALLOW /
            no-match falls through with no human interaction, preserving
            ``bypassPermissions`` ergonomics for un-gated tools.
-        3. **Human-consent elicitation** (only when the permission mode is
+        2. **Human-consent elicitation** (only when the permission mode is
            NOT ``bypassPermissions`` and an elicitation handler is wired):
            the pre-existing per-tool approval prompt. Under
            ``bypassPermissions`` this step is skipped entirely, so the
@@ -2821,23 +2864,10 @@ class ClaudeSDKExecutor(Executor):
         :param perm_ctx: :class:`claude_agent_sdk.ToolPermissionContext`.
         :param permission_mode: This client's mode, or the executor default
             for a direct call.
-        :param session_key: Session this callback was installed for;
-            ``None`` for a direct call, which skips the maintenance veto.
         :returns: A :class:`~claude_agent_sdk.PermissionResult`.
         """
-        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+        from claude_agent_sdk import PermissionResultAllow
 
-        slot = self._query_slots.get(session_key) if session_key is not None else None
-        if slot is not None and slot.maintenance:
-            slot.tool_attempted = True
-            logger.info(
-                "keep-warm maintenance turn attempted tool %s; denying and interrupting",
-                tool_name,
-            )
-            return PermissionResultDeny(
-                message="keep-warm maintenance turn: tools are disabled",
-                interrupt=True,
-            )
         policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
         if policy_result is not None:
             # Hard DENY from policy — block before execution.
@@ -3102,19 +3132,21 @@ class ClaudeSDKExecutor(Executor):
         # tools. The human-consent elicitation half of the gate still only
         # fires for non-bypass modes (see ``_can_use_tool_gate``).
         #
-        # Install unconditionally: with no policy evaluator and no
-        # elicitation handler the gate allows everything except during a
-        # keep-warm ping, whose maintenance veto must be reachable on every
-        # client shape. Previously this only installed when one of those
-        # collaborators was wired, so a bare session had no maintenance veto.
-        options.can_use_tool = partial(
-            self._can_use_tool_gate,
-            permission_mode=permission_mode,
-            session_key=session_key,
-        )
+        # Install whenever EITHER a policy evaluator OR an elicitation
+        # handler is wired. Previously this only installed for non-bypass
+        # modes, which is why default ``claude-sdk`` sessions (which
+        # default to ``bypassPermissions``) had no per-tool TOOL_CALL gate.
+        if (
+            getattr(self, "_policy_evaluator", None) is not None
+            or self._elicitation_handler is not None
+        ):
+            options.can_use_tool = partial(
+                self._can_use_tool_gate, permission_mode=permission_mode
+            )
 
         self._install_subagent_router_hook(sdk, options, model)
         self._install_framework_context_hook(sdk, options, session_key)
+        self._install_keep_warm_maintenance_hook(sdk, options, session_key)
 
         # Log the full configuration for debugging
         logger.info(
@@ -3331,19 +3363,20 @@ class ClaudeSDKExecutor(Executor):
                     slot.maintenance = False
                     slot.tool_attempted = False
                     await self._close_live_client(session_key)
-                # An incomplete ping retires the client, so this turn may
-                # hold a stale reference; take a live one and, because a
-                # replacement has no prior session state, replay full history.
-                live_state = self._clients.get(session_key)
-                if live_state is None or live_state.client is not client:
-                    client = await self._get_or_create_client(
-                        sdk,
-                        session_key=session_key,
-                        options=options,
-                        model=model,
-                    )
-                    prompt = self._build_prompt(messages, resume_session=False)
-                    notice_messages = messages
+            # Revalidate regardless of maintenance: a ping may have retired
+            # the client this turn captured (before or while it yielded the
+            # slot). Take the live one and, because a replacement has no
+            # prior session state, replay full history.
+            live_state = self._clients.get(session_key)
+            if live_state is None or live_state.client is not client:
+                client = await self._get_or_create_client(
+                    sdk,
+                    session_key=session_key,
+                    options=options,
+                    model=model,
+                )
+                prompt = self._build_prompt(messages, resume_session=False)
+                notice_messages = messages
             self._pending_framework_context[session_key] = "\n\n".join(
                 notice
                 for message in notice_messages
