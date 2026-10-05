@@ -1,8 +1,13 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { NumericField, SettingRow } from "@/components/SettingsFields";
 import { Switch } from "@/components/ui/switch";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  prefetchAvailableAgentDetails,
+  useAvailableAgents,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { useKeepWarmPreferences } from "@/hooks/useKeepWarmPreferences";
 import {
   clampHostOfflineArchiveSeconds,
@@ -54,7 +59,16 @@ interface SupportedAgent {
 
 export function KeepWarmSettings() {
   const preferences = useKeepWarmPreferences();
-  const { data: agents, isLoading } = useAvailableAgents();
+  const queryClient = useQueryClient();
+  const { data: agents, isLoading, isPlaceholderData } = useAvailableAgents();
+  // Session-discovered agents arrive with a null harness; resolve them through
+  // the pickers' own prefetch, which patches the shared cache in place and
+  // rerenders this list with the resolved harness.
+  useEffect(() => {
+    for (const agent of agents ?? []) {
+      void prefetchAvailableAgentDetails(agent, queryClient);
+    }
+  }, [agents, queryClient]);
   const supported = useMemo(() => {
     const rows: SupportedAgent[] = [];
     for (const agent of agents ?? []) {
@@ -65,81 +79,84 @@ export function KeepWarmSettings() {
   }, [agents]);
 
   const update = (next: KeepWarmPreferences) => writeKeepWarmPreferences(next, agents ?? []);
-  // The legacy mirror needs the harness of every stored row, so no write may
-  // happen before the agent list is known (otherwise it could clear the
-  // mirrored switch for a native agent that is simply still loading).
-  const agentsReady = agents !== undefined;
+  // The catalog-only placeholder omits session-discovered agents, so it is not
+  // a complete list: no rows and no stored-row writes until the merged list
+  // lands. An unresolved harness is left out of `supported` until prefetch
+  // fills it rather than dropped from the source list.
+  const agentsReady = agents !== undefined && !isPlaceholderData;
+  const agentsLoading = !agentsReady && (isLoading || isPlaceholderData);
 
   return (
     <div className="flex flex-col gap-3" data-testid="keep-warm-settings">
-      {isLoading && supported.length === 0 && (
+      {agentsLoading && (
         <p role="status" className="text-sm text-muted-foreground">
           Loading agents…
         </p>
       )}
-      {!isLoading && supported.length === 0 && (
+      {!agentsLoading && supported.length === 0 && (
         <p className="text-sm text-muted-foreground">No agents on this server support keep-warm.</p>
       )}
-      {supported.map(({ agent, family }) => {
-        const row = resolveKeepWarmAgent(preferences, agent.id, family);
-        const intervalBounds = keepWarmIntervalBoundsSeconds(family);
-        const inactive = !row.main && !row.child;
-        const patch = (next: AgentKeepWarmPatch) =>
-          update(setKeepWarmAgent(preferences, agent.id, family, next));
-        return (
-          <div
-            key={agent.id}
-            className="rounded-xl border border-border bg-card p-4"
-            data-testid="keep-warm-agent-row"
-            data-agent-id={agent.id}
-          >
-            <SettingRow label={agent.display_name} hint={<AgentHint />}>
-              <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                Main
-                <Switch
-                  aria-label={`Keep main sessions warm for ${agent.display_name}`}
-                  checked={row.main}
-                  onCheckedChange={(main) => patch({ main })}
-                  className="shrink-0"
-                />
-              </span>
-              <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                Children
-                <Switch
-                  aria-label={`Keep children warm for ${agent.display_name}`}
-                  checked={row.child}
-                  onCheckedChange={(child) => patch({ child })}
-                  className="shrink-0"
-                />
-              </span>
-              <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                Every
-                <NumericField
-                  ariaLabel={`Keep-warm interval for ${agent.display_name} in minutes`}
-                  value={row.intervalSeconds / 60}
-                  min={intervalBounds.min / 60}
-                  max={intervalBounds.max / 60}
-                  disabled={inactive}
-                  onCommit={(minutes) => patch({ intervalSeconds: minutes * 60 })}
-                />
-                min
-              </span>
-              <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                Longest
-                <NumericField
-                  ariaLabel={`Longest keep-warm run for ${agent.display_name} in hours`}
-                  value={row.maxSeconds / 3600}
-                  min={KEEP_WARM_MAX_BOUNDS_SECONDS.min / 3600}
-                  max={KEEP_WARM_MAX_BOUNDS_SECONDS.max / 3600}
-                  disabled={inactive}
-                  onCommit={(hours) => patch({ maxSeconds: hours * 3600 })}
-                />
-                hours
-              </span>
-            </SettingRow>
-          </div>
-        );
-      })}
+      {agentsReady &&
+        supported.map(({ agent, family }) => {
+          const row = resolveKeepWarmAgent(preferences, agent.id, family);
+          const intervalBounds = keepWarmIntervalBoundsSeconds(family);
+          const inactive = !row.main && !row.child;
+          const patch = (next: AgentKeepWarmPatch) =>
+            update(setKeepWarmAgent(preferences, agent.id, family, next));
+          return (
+            <div
+              key={agent.id}
+              className="rounded-xl border border-border bg-card p-4"
+              data-testid="keep-warm-agent-row"
+              data-agent-id={agent.id}
+            >
+              <SettingRow label={agent.display_name} hint={<AgentHint />}>
+                <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                  Main
+                  <Switch
+                    aria-label={`Keep main sessions warm for ${agent.display_name}`}
+                    checked={row.main}
+                    onCheckedChange={(main) => patch({ main })}
+                    className="shrink-0"
+                  />
+                </span>
+                <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                  Children
+                  <Switch
+                    aria-label={`Keep children warm for ${agent.display_name}`}
+                    checked={row.child}
+                    onCheckedChange={(child) => patch({ child })}
+                    className="shrink-0"
+                  />
+                </span>
+                <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                  Every
+                  <NumericField
+                    ariaLabel={`Keep-warm interval for ${agent.display_name} in minutes`}
+                    value={row.intervalSeconds / 60}
+                    min={intervalBounds.min / 60}
+                    max={intervalBounds.max / 60}
+                    disabled={inactive}
+                    onCommit={(minutes) => patch({ intervalSeconds: minutes * 60 })}
+                  />
+                  min
+                </span>
+                <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                  Longest
+                  <NumericField
+                    ariaLabel={`Longest keep-warm run for ${agent.display_name} in hours`}
+                    value={row.maxSeconds / 3600}
+                    min={KEEP_WARM_MAX_BOUNDS_SECONDS.min / 3600}
+                    max={KEEP_WARM_MAX_BOUNDS_SECONDS.max / 3600}
+                    disabled={inactive}
+                    onCommit={(hours) => patch({ maxSeconds: hours * 3600 })}
+                  />
+                  hours
+                </span>
+              </SettingRow>
+            </div>
+          );
+        })}
 
       <h2 className="mt-3 text-ui font-medium">Hosts</h2>
       <div className="rounded-xl border border-border bg-card p-4">

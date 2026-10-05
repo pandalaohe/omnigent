@@ -167,6 +167,48 @@ describe("keep-warm preferences", () => {
     ).toBe(false);
   });
 
+  it("keeps the legacy mirror on an archive-delay save while the only child row is unresolved", () => {
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({ childKeepWarmEnabled: true }),
+    );
+
+    writeKeepWarmPreferences(
+      {
+        agents: {
+          "uploaded-agent": { main: false, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
+        },
+        hostOfflineArchiveSeconds: 7200,
+      },
+      [{ id: "uploaded-agent", harness: null }],
+    );
+
+    expect(
+      JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
+    ).toBe(true);
+  });
+
+  it("keeps the legacy mirror when a stored child row is absent from the agent list", () => {
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({ childKeepWarmEnabled: true }),
+    );
+
+    writeKeepWarmPreferences(
+      {
+        agents: {
+          "removed-agent": { main: false, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
+        },
+        hostOfflineArchiveSeconds: 7200,
+      },
+      NATIVE_CLAUDE,
+    );
+
+    expect(
+      JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").childKeepWarmEnabled,
+    ).toBe(true);
+  });
+
   it("preserves every existing legacy key while mirroring", () => {
     localStorage.setItem(
       SESSION_COLLAB_STORAGE_KEY,

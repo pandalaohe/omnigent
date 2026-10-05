@@ -4,7 +4,10 @@
 // (`omnigent/server/user_preferences_store.py`) owns the wire contract and the
 // clamps, so the constants below mirror it in one place.
 
-import { mirrorLegacyChildKeepWarm } from "./sessionCollabPreferences";
+import {
+  mirrorLegacyChildKeepWarm,
+  readSessionCollabPreferences,
+} from "./sessionCollabPreferences";
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
 export const KEEP_WARM_STORAGE_KEY = "omnigent:keep-warm";
@@ -232,14 +235,25 @@ export function writeKeepWarmPreferences(
 ): void {
   if (typeof window === "undefined") return;
   const normalized = normalizeKeepWarmPreferences(preferences);
-  const nativeAgentIds = new Set(
-    agentIdentities
-      .filter((agent) => isLegacyNativeKeepWarmHarness(agent.harness))
-      .map((agent) => agent.id),
-  );
-  const legacyChildKeepWarmEnabled = Object.entries(normalized.agents).some(
-    ([agentId, row]) => row.child && nativeAgentIds.has(agentId),
-  );
+  const harnessById = new Map(agentIdentities.map((agent) => [agent.id, agent.harness]));
+  let hasUnclassifiableChild = false;
+  let hasNativeChild = false;
+  for (const [agentId, row] of Object.entries(normalized.agents)) {
+    if (!row.child) continue;
+    if (!harnessById.has(agentId) || harnessById.get(agentId) == null) {
+      hasUnclassifiableChild = true;
+      continue;
+    }
+    if (isLegacyNativeKeepWarmHarness(harnessById.get(agentId))) hasNativeChild = true;
+  }
+  // A known native child proves the mirror on; otherwise a stored row whose
+  // agent is absent or still unresolved cannot be proven non-native, so keep
+  // the legacy value instead of mirroring a partial false.
+  const legacyChildKeepWarmEnabled = hasNativeChild
+    ? true
+    : hasUnclassifiableChild
+      ? readSessionCollabPreferences().childKeepWarmEnabled
+      : false;
   mirrorLegacyChildKeepWarm(legacyChildKeepWarmEnabled);
 
   const isDefault = isKeepWarmPreferencesDefault(normalized);

@@ -12,6 +12,7 @@ import {
   writeApprovalTimeoutPreferences,
 } from "./approvalTimeoutPreferences";
 import { patchHostColor, readHostColorPreferences } from "./hostColorPreferences";
+import { KEEP_WARM_STORAGE_KEY, writeKeepWarmPreferences } from "./keepWarmPreferences";
 
 beforeEach(() => {
   localStorage.clear();
@@ -160,6 +161,44 @@ describe("user preference synchronization", () => {
     });
     expect(JSON.parse(localStorage.getItem("omnigent:calling-last") ?? "null")).toEqual({
       enabled: false,
+    });
+  });
+
+  it("patches and hydrates the keep-warm namespace", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    const preferences = {
+      agents: {
+        "claude-native-ui": { main: true, child: true, intervalSeconds: 3300, maxSeconds: 14400 },
+      },
+      hostOfflineArchiveSeconds: 7200,
+    };
+    writeKeepWarmPreferences(preferences, [{ id: "claude-native-ui", harness: "claude-native" }]);
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(collectLocalUserPreferences().settings.keep_warm).toEqual(preferences);
+    expect(fetcher.mock.calls.filter(([url]) => url === "/v1/me/preferences/keep_warm")).toEqual([
+      [
+        "/v1/me/preferences/keep_warm",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ value: preferences }) }),
+      ],
+    ]);
+
+    resetUserPreferencesSyncForTests();
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: { keep_warm: { ...preferences, hostOfflineArchiveSeconds: 3600 } },
+      },
+      vi.fn(),
+      "alice",
+    );
+
+    expect(JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY) ?? "null")).toEqual({
+      ...preferences,
+      hostOfflineArchiveSeconds: 3600,
     });
   });
 

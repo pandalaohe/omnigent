@@ -1,51 +1,100 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
+import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { KEEP_WARM_STORAGE_KEY } from "@/lib/keepWarmPreferences";
+import { KeepWarmSettings } from "./KeepWarmSettings";
+
+const { queuePatchMock, prefetchMock, mocks } = vi.hoisted(() => ({
+  queuePatchMock: vi.fn(),
+  prefetchMock: vi.fn(),
+  mocks: {
+    agents: [] as AvailableAgent[],
+    isLoading: false,
+    isPlaceholderData: false,
+  },
+}));
+
 vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatchMock }));
 
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: () => ({
-    data: [
-      {
-        id: "claude-native-ui",
-        name: "claude-native-ui",
-        display_name: "Claude Code",
-        harness: "claude-native",
-      },
-      {
-        id: "codex-native-ui",
-        name: "codex-native-ui",
-        display_name: "Codex",
-        harness: "codex-native",
-      },
-      {
-        id: "opencode-native-ui",
-        name: "opencode-native-ui",
-        display_name: "OpenCode",
-        harness: "opencode-native",
-      },
-    ],
-    isLoading: false,
+    data: mocks.agents,
+    isLoading: mocks.isLoading,
+    isPlaceholderData: mocks.isPlaceholderData,
   }),
+  prefetchAvailableAgentDetails: prefetchMock,
 }));
 
-import { KEEP_WARM_STORAGE_KEY } from "@/lib/keepWarmPreferences";
-import { KeepWarmSettings } from "./KeepWarmSettings";
+const claudeNative: AvailableAgent = {
+  id: "claude-native-ui",
+  name: "claude-native-ui",
+  display_name: "Claude Code",
+  description: null,
+  harness: "claude-native",
+  skills: [],
+};
+
+const codexNative: AvailableAgent = {
+  id: "codex-native-ui",
+  name: "codex-native-ui",
+  display_name: "Codex",
+  description: null,
+  harness: "codex-native",
+  skills: [],
+};
+
+const SUPPORTED_AGENTS: AvailableAgent[] = [
+  claudeNative,
+  codexNative,
+  {
+    id: "opencode-native-ui",
+    name: "opencode-native-ui",
+    display_name: "OpenCode",
+    description: null,
+    harness: "opencode-native",
+    skills: [],
+  },
+];
 
 function storedKeepWarm() {
   return JSON.parse(localStorage.getItem(KEEP_WARM_STORAGE_KEY) ?? "null");
 }
 
-beforeEach(() => localStorage.clear());
+function renderSettings() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <KeepWarmSettings />
+    </QueryClientProvider>,
+  );
+  const rerenderSettings = () =>
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <KeepWarmSettings />
+      </QueryClientProvider>,
+    );
+  return { ...view, rerenderSettings };
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  mocks.agents = [...SUPPORTED_AGENTS];
+  mocks.isLoading = false;
+  mocks.isPlaceholderData = false;
+});
 afterEach(() => {
   cleanup();
   queuePatchMock.mockReset();
+  prefetchMock.mockReset();
 });
 
 describe("KeepWarmSettings", () => {
   it("renders one row per supported agent and skips unsupported harnesses", () => {
-    render(<KeepWarmSettings />);
+    renderSettings();
 
     expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(2);
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
@@ -54,7 +103,7 @@ describe("KeepWarmSettings", () => {
   });
 
   it("writes a main-session row with the family default when switched on", () => {
-    render(<KeepWarmSettings />);
+    renderSettings();
 
     fireEvent.click(
       screen.getByRole("switch", { name: "Keep main sessions warm for Claude Code" }),
@@ -70,7 +119,7 @@ describe("KeepWarmSettings", () => {
   });
 
   it("writes children and interval edits and mirrors the legacy switch", () => {
-    render(<KeepWarmSettings />);
+    renderSettings();
 
     fireEvent.click(screen.getByRole("switch", { name: "Keep children warm for Codex" }));
     const interval = screen.getByLabelText("Keep-warm interval for Codex in minutes");
@@ -87,7 +136,7 @@ describe("KeepWarmSettings", () => {
   });
 
   it("writes 0 for the offline-archive Off choice", () => {
-    render(<KeepWarmSettings />);
+    renderSettings();
     const archive = screen.getByLabelText("Archive children of an offline host after in hours");
     expect(archive).toHaveValue(4);
 
@@ -98,7 +147,7 @@ describe("KeepWarmSettings", () => {
   });
 
   it("disables the interval and cap until an agent is switched on", () => {
-    render(<KeepWarmSettings />);
+    renderSettings();
     expect(screen.getByLabelText("Keep-warm interval for Claude Code in minutes")).toBeDisabled();
     expect(screen.getByLabelText("Longest keep-warm run for Claude Code in hours")).toBeDisabled();
 
@@ -106,5 +155,41 @@ describe("KeepWarmSettings", () => {
 
     expect(screen.getByLabelText("Keep-warm interval for Claude Code in minutes")).toBeEnabled();
     expect(screen.getByLabelText("Longest keep-warm run for Claude Code in hours")).toBeEnabled();
+  });
+
+  it("resolves a session-discovered harness and shows its row once resolved", () => {
+    const uploaded: AvailableAgent = {
+      id: "ag_uploaded",
+      name: "uploaded",
+      display_name: "Uploaded",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "sess_uploaded",
+    };
+    mocks.agents = [...SUPPORTED_AGENTS, uploaded];
+    const { rerenderSettings } = renderSettings();
+
+    expect(prefetchMock).toHaveBeenCalledWith(uploaded, expect.anything());
+    expect(screen.queryByText("Uploaded")).toBeNull();
+    expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(2);
+
+    mocks.agents = [...SUPPORTED_AGENTS, { ...uploaded, harness: "claude-native" }];
+    rerenderSettings();
+
+    expect(screen.getByText("Uploaded")).toBeInTheDocument();
+    expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(3);
+  });
+
+  it("renders no agent rows while the list is a catalog-only placeholder", () => {
+    mocks.isPlaceholderData = true;
+    renderSettings();
+
+    expect(screen.queryAllByTestId("keep-warm-agent-row")).toHaveLength(0);
+    expect(screen.getByText("Loading agents…")).toBeInTheDocument();
+    expect(screen.queryByText("No agents on this server support keep-warm.")).toBeNull();
+    expect(
+      screen.getByLabelText("Archive children of an offline host after in hours"),
+    ).toBeDisabled();
   });
 });
