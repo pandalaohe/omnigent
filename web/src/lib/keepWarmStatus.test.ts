@@ -48,7 +48,9 @@ describe("keepWarmStopReason", () => {
     expect(keepWarmStopReason(status())).toBeNull();
   });
 
-  it("names the measured warming duration for a cap stop", () => {
+  it("reports a cap stop as 'cap reached' regardless of episode age", () => {
+    // `started_at` predates any cold time after the stop, so it must not feed
+    // an elapsed-hours label.
     const startedAt = NOW_MS / 1000 - 4 * 3600;
     expect(
       keepWarmStopReason(
@@ -56,12 +58,8 @@ describe("keepWarmStopReason", () => {
           stop_reason: "cap",
           episode: { pings: 4, cost_usd: 0, estimated: false, started_at: startedAt },
         }),
-        NOW_MS,
       ),
-    ).toBe("4 h cap");
-  });
-
-  it("falls back to 'cap reached' when the episode start is missing", () => {
+    ).toBe("cap reached");
     expect(keepWarmStopReason(status({ stop_reason: "cap" }))).toBe("cap reached");
   });
 
@@ -98,9 +96,8 @@ describe("keepWarmTooltipLine", () => {
           stop_reason: "cap",
           episode: { pings: 4, cost_usd: 0.038, estimated: true, started_at: startedAt },
         }),
-        NOW_MS,
       ),
-    ).toBe("Keep-warm stopped: 4 h cap · 4 pings ≈$0.04");
+    ).toBe("Keep-warm stopped: cap reached · 4 pings ≈$0.04");
   });
 
   it("renders a paused failure with the raw reason and its cost", () => {

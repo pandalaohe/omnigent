@@ -5,6 +5,8 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
+import type { Conversation, KeepWarmStatus } from "@/hooks/useConversations";
+import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { useChatStore } from "@/store/chatStore";
 
@@ -670,28 +672,45 @@ function renderContent(
 }
 
 describe("AgentInfoContent keep-warm block", () => {
-  it("renders the state, reason, counters and last return for a keep-warm session", () => {
-    // The block reads the session's sidebar row (here seeded into the
-    // conversation cache) rather than a dedicated status endpoint.
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    qc.setQueryData(["conversation-backfill", "conv_keep_warm"], {
-      id: "conv_keep_warm",
-      object: "conversation",
-      title: "Keep-warm session",
-      created_at: 1,
-      updated_at: 2,
-      labels: {},
-      permission_level: null,
-      warm_state: "warm",
-      keep_warm: {
-        state: "paused",
-        stop_reason: "failures",
-        episode: { pings: 4, cost_usd: 0.038, estimated: true, started_at: 100 },
-        total: { pings: 12, cost_usd: 0.42, estimated: false },
-        last_return: { at: 1_700_000_000, result: "hit" },
-        last_reason: "btw_unavailable",
-      },
+  const keepWarmStatus: KeepWarmStatus = {
+    state: "paused",
+    stop_reason: "failures",
+    episode: { pings: 4, cost_usd: 0.038, estimated: true, started_at: 100 },
+    total: { pings: 12, cost_usd: 0.42, estimated: false },
+    last_return: { at: 1_700_000_000, result: "hit" },
+    last_reason: "btw_unavailable",
+  };
+  const keepWarmConversation: Conversation = {
+    id: "conv_keep_warm",
+    object: "conversation",
+    title: "Keep-warm session",
+    created_at: 1,
+    updated_at: 2,
+    labels: {},
+    permission_level: null,
+    warm_state: "warm",
+    keep_warm: keepWarmStatus,
+  };
+  /** Seed the row into the sidebar list cache the live-updates stream patches. */
+  function seedListCache(qc: QueryClient, keepWarm: KeepWarmStatus = keepWarmStatus) {
+    qc.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [
+        {
+          data: [{ ...keepWarmConversation, keep_warm: keepWarm }],
+          first_id: keepWarmConversation.id,
+          last_id: keepWarmConversation.id,
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
     });
+  }
+
+  it("renders the state, reason, counters and last return for a keep-warm session", () => {
+    // The block reads the session's row from the sidebar list caches it
+    // shares with the stream, not a dedicated status endpoint.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seedListCache(qc);
     renderContent("conv_keep_warm", LEVEL_OWNER, qc);
 
     const block = screen.getByTestId("agent-info-keep-warm");
@@ -700,6 +719,43 @@ describe("AgentInfoContent keep-warm block", () => {
     expect(block).toHaveTextContent("4 pings ≈$0.04");
     expect(block).toHaveTextContent("12 pings $0.42");
     expect(block).toHaveTextContent("hit");
+  });
+
+  it("re-renders when the stream patches the cached row's keep-warm counters", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seedListCache(qc);
+    renderContent("conv_keep_warm", LEVEL_OWNER, qc);
+    expect(screen.getByTestId("agent-info-keep-warm")).toHaveTextContent("4 pings ≈$0.04");
+
+    // Mirror the stream's in-place list merge: replace the row object in the
+    // list cache, then let the block read the new counters without remounting.
+    act(() => {
+      qc.setQueryData<ConversationsInfiniteData>(["conversations", "", false], (old) =>
+        old === undefined
+          ? old
+          : {
+              ...old,
+              pages: old.pages.map((page) => ({
+                ...page,
+                data: page.data.map((row) =>
+                  row.id === "conv_keep_warm"
+                    ? {
+                        ...row,
+                        keep_warm: {
+                          ...keepWarmStatus,
+                          episode: { ...keepWarmStatus.episode, pings: 9, cost_usd: 0.09 },
+                        },
+                      }
+                    : row,
+                ),
+              })),
+            },
+      );
+    });
+
+    const block = screen.getByTestId("agent-info-keep-warm");
+    expect(block).toHaveTextContent("9 pings ≈$0.09");
+    expect(block).not.toHaveTextContent("4 pings ≈$0.04");
   });
 });
 

@@ -1,16 +1,15 @@
 // User-facing copy for the server's keep-warm status object
-// (`KeepWarmStatus`). Pure and clock-injectable so tooltips and the Agent
-// info panel render the same wording, and tests can pin "now".
+// (`KeepWarmStatus`). Pure, with the last-return label clock-injectable so
+// tooltips and the Agent info panel render the same wording and tests can pin
+// "now".
 //
 // The server sends counters, not prose: state is on/off/paused/stopped and
 // stop_reason is a small vocabulary. This module turns those into the one
-// line the sidebar tooltip shows (e.g. "Keep-warm stopped: 4 h cap ·
+// line the sidebar tooltip shows (e.g. "Keep-warm stopped: cap reached ·
 // 4 pings ≈$0.04") and the pieces the info panel lists.
 
 import type { KeepWarmLastReturn, KeepWarmStatus } from "@/hooks/useConversations";
 import { relativeTime } from "@/lib/relativeTime";
-
-const HOUR_MS = 3_600_000;
 
 /** `$0.04`, prefixed with `≈` when any summed ping was an estimate. */
 export function formatKeepWarmCost(costUsd: number, estimated: boolean): string {
@@ -27,23 +26,15 @@ export function formatKeepWarmCounters(pings: number, costUsd: number, estimated
 /**
  * Human wording for a stop/pause reason, or `null` when none is stored.
  *
- * `cap` names the measured warming duration when the payload has an episode
- * start; without one it degrades to "cap reached" rather than inventing the
- * configured cap. `failures` carries the raw skip/fail code (`last_reason`)
+ * `cap` always reads "cap reached": `episode.started_at` predates any cold
+ * time after the stop, so clocking the cap from now overstates the measured
+ * warming duration. `failures` carries the raw skip/fail code (`last_reason`)
  * so the pause names its cause.
  */
-export function keepWarmStopReason(
-  status: KeepWarmStatus,
-  now: number = Date.now(),
-): string | null {
+export function keepWarmStopReason(status: KeepWarmStatus): string | null {
   switch (status.stop_reason) {
-    case "cap": {
-      const startedAt = status.episode.started_at;
-      if (startedAt == null) return "cap reached";
-      const elapsedMs = now - startedAt * 1000;
-      const hours = Math.round(elapsedMs / HOUR_MS);
-      return elapsedMs > 0 && hours >= 1 ? `${hours} h cap` : "cap reached";
-    }
+    case "cap":
+      return "cap reached";
     case "misses":
       return "cache misses";
     case "failures":
@@ -66,12 +57,9 @@ export function keepWarmStopReason(
  * server could not read a keep-warm label at all, so the cache is likely
  * simply cold rather than stopped for a reason.
  */
-export function keepWarmTooltipLine(
-  status: KeepWarmStatus | null,
-  now: number = Date.now(),
-): string {
+export function keepWarmTooltipLine(status: KeepWarmStatus | null): string {
   if (status === null) return "Prompt cache likely cold";
-  const reason = keepWarmStopReason(status, now);
+  const reason = keepWarmStopReason(status);
   let line = `Keep-warm ${status.state}`;
   if (reason !== null) line += `: ${reason}`;
   // "off" is a terminal state with no episode worth counting.

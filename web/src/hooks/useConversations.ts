@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef } from "react";
+import { useCallback, useContext, useEffect, useRef, useSyncExternalStore } from "react";
 import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
@@ -620,23 +620,32 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
 
 /**
  * Read one session's sidebar-shaped row for surfaces that hold only its id
- * (the Agent info panel). Prefers the freshest row already cached by the
- * sidebar lists / pinned section, and backfills through
- * {@link fetchConversationById} for a session no cached list holds. Shares
- * the `["conversation-backfill", id]` cache the pin overlays patch.
+ * (the Agent info panel). Subscribes to the query cache so the row tracks the
+ * sidebar list caches the live-updates stream patches in place, rather than
+ * freezing at a one-time `initialData` seed. When no list cache holds the
+ * session, backfills through {@link fetchConversationById}.
  */
 export function useConversationRow(id: string | null | undefined): Conversation | null {
   const queryClient = useQueryClient();
   const rowId = id ?? null;
+  const cachedRow = useSyncExternalStore(
+    useCallback(
+      (onStoreChange: () => void) => queryClient.getQueryCache().subscribe(onStoreChange),
+      [queryClient],
+    ),
+    useCallback(
+      () => (rowId === null ? undefined : findListCachedConversationRow(queryClient, rowId)),
+      [queryClient, rowId],
+    ),
+  );
   const query = useQuery<Conversation | null>({
     queryKey: ["conversation-backfill", rowId],
-    enabled: rowId !== null,
+    enabled: rowId !== null && cachedRow === undefined,
     staleTime: 30_000,
     retry: false,
     queryFn: () => fetchConversationById(rowId as string),
-    initialData: () => (rowId === null ? undefined : findCachedConversationRow(queryClient, rowId)),
   });
-  return query.data ?? null;
+  return cachedRow ?? query.data ?? null;
 }
 
 export async function fetchConversationsPage({
@@ -2068,13 +2077,15 @@ export async function setConversationPinned(
 }
 
 /**
- * Locate the fullest cached copy of a session row across the sidebar's list
- * caches: the pinned section, every `["conversations", ...]` variant, and the
- * `["project-sessions", name]` folder lists (a filed session outside the main
- * window lives only in its folder's cache). Used by the pin and move overlays
- * to read the row's current fields before patching them optimistically.
+ * Locate a session row in the sidebar's list caches: the pinned section, every
+ * `["conversations", ...]` variant, and the `["project-sessions", name]` folder
+ * lists (a filed session outside the main window lives only in its folder's
+ * cache). These are the caches the live-updates stream patches in place.
  */
-function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
+function findListCachedConversationRow(
+  queryClient: QueryClient,
+  id: string,
+): Conversation | undefined {
   return (
     queryClient
       .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
@@ -2086,7 +2097,19 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
     queryClient
       .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
       .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id) ??
+      .find((c) => c.id === id)
+  );
+}
+
+/**
+ * The fullest cached copy of a session row across the sidebar's list caches,
+ * plus the backfill query and the per-session snapshot. Used by the pin and
+ * move overlays to read the row's current fields before patching them
+ * optimistically.
+ */
+function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  return (
+    findListCachedConversationRow(queryClient, id) ??
     queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]) ??
     cachedSessionRow(queryClient, id)
   );
