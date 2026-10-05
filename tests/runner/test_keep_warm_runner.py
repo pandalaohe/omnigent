@@ -29,6 +29,7 @@ from omnigent.runtime.harnesses.process_manager import (
     NoLiveHarnessError,
 )
 from omnigent.terminals.registry import TerminalRegistry
+from tests.runner.conftest import _drain_session_event_queue
 from tests.runner.helpers import NullServerClient
 
 _CONV = "conv_x"
@@ -188,6 +189,34 @@ class _ReceiptHarnessClient:
         return httpx.Response(self._status_code, json=self._receipt)
 
 
+class _StatusEdgeHarnessClient:
+    """
+    Harness client stub firing scripted ``session.status`` edges mid-ping.
+
+    Its ``post`` runs each ``(session_id, status, blocked_on)`` edge
+    through the runner's registered status publisher — the status-file
+    poller's path into ``_publish_session_status`` — while the keep-warm
+    ping is in flight, then answers the ok receipt.
+
+    :param edges: Edges to publish mid-ping.
+    """
+
+    def __init__(self, edges: list[tuple[str, str, str | None]]) -> None:
+        self._edges = edges
+        self.app: FastAPI | None = None
+
+    async def post(
+        self, url: str, *, json: dict[str, Any], timeout: float | None = None
+    ) -> httpx.Response:
+        del url, json, timeout
+        assert self.app is not None, "bind the app before the ping runs"
+        publisher = self.app.state.session_resource_registry._session_status_publisher
+        assert publisher is not None
+        for session_id, status, blocked_on in self._edges:
+            publisher(session_id, status, blocked_on)
+        return httpx.Response(200, json=_OK_RECEIPT)
+
+
 class _TimeoutHarnessClient:
     """Harness client stub whose POST always times out."""
 
@@ -245,6 +274,19 @@ async def _await_keep_warm_task(conv: str, *, timeout: float = 5.0) -> None:
     )
     if task is not None:
         await asyncio.wait_for(task, timeout=timeout)
+
+
+def _status_events(app: FastAPI, conv: str) -> list[dict[str, Any]]:
+    """Drain and return the ``session.status`` events queued for *conv*."""
+    drained = _drain_session_event_queue(app.state.session_event_queues.get(conv))
+    return [event for event in drained if event.get("type") == "session.status"]
+
+
+def _status_publisher(app: FastAPI) -> Any:
+    """The runner's registered session-status publisher (the poller's target)."""
+    publisher = app.state.session_resource_registry._session_status_publisher
+    assert publisher is not None
+    return publisher
 
 
 @pytest.mark.asyncio
@@ -356,6 +398,104 @@ async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(tmp_path
     # The ping re-arms both idle clocks even though the work is delegated.
     assert mgr.noted == [_CONV]
     assert app.state.native_pane_reaper.noted == [_CONV]
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ping_holds_its_own_dialog_open_status_edge(tmp_path: Path) -> None:
+    """
+    The ping's own /btw overlay reads running|waiting/"dialog open" on the
+    status file: that edge stays inside the runner (no event, pane status
+    untouched) so the server never reads the ping as a new real turn.
+    """
+    harness = _StatusEdgeHarnessClient(
+        [(_CONV, "running", "dialog open"), (_CONV, "waiting", "dialog open")]
+    )
+    mgr = _KeepWarmProcessManager(harness_client=harness)
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    harness.app = app
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={"type": "keep_warm_ping", "attempt_id": "att-1", "family": "claude"},
+        )
+    await _await_keep_warm_task(_CONV)
+
+    assert resp.status_code == 202
+    assert _status_events(app, _CONV) == []
+    assert app.state.native_pane_status.get(_CONV) is None
+    assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ping_publishes_a_real_busy_edge_mid_ping(tmp_path: Path) -> None:
+    """A running/waiting edge with no (or another) reason is a real turn: it publishes."""
+    harness = _StatusEdgeHarnessClient(
+        [(_CONV, "running", None), (_CONV, "waiting", "permission prompt")]
+    )
+    mgr = _KeepWarmProcessManager(harness_client=harness)
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    harness.app = app
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={"type": "keep_warm_ping", "attempt_id": "att-1", "family": "claude"},
+        )
+    await _await_keep_warm_task(_CONV)
+
+    assert resp.status_code == 202
+    assert _status_events(app, _CONV) == [
+        {"type": "session.status", "status": "running"},
+        {"type": "session.status", "status": "waiting", "blocked_on": "permission prompt"},
+    ]
+    assert app.state.native_pane_status.get(_CONV) == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_dialog_open_edge_publishes_after_the_grace(tmp_path: Path) -> None:
+    """Once the receipt is past the settle grace, a dialog-open edge is a real dialog."""
+    harness = _StatusEdgeHarnessClient([])
+    mgr = _KeepWarmProcessManager(harness_client=harness)
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    harness.app = app
+    async with _runner_test_client(app) as http:
+        await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={"type": "keep_warm_ping", "attempt_id": "att-1", "family": "claude"},
+        )
+    await _await_keep_warm_task(_CONV)
+    assert _CONV in app.state.keep_warm_status_hold
+
+    app.state.keep_warm_status_hold[_CONV] = 0.0  # the grace has elapsed
+    _status_publisher(app)(_CONV, "running", "dialog open")
+
+    assert _status_events(app, _CONV) == [
+        {"type": "session.status", "status": "running", "blocked_on": "dialog open"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_hold_does_not_suppress_other_conversations(tmp_path: Path) -> None:
+    """The hold is per-conversation: another session's dialog-open edge publishes mid-ping."""
+    harness = _StatusEdgeHarnessClient([("conv_other", "running", "dialog open")])
+    mgr = _KeepWarmProcessManager(harness_client=harness)
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    harness.app = app
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={"type": "keep_warm_ping", "attempt_id": "att-1", "family": "claude"},
+        )
+    await _await_keep_warm_task(_CONV)
+
+    assert resp.status_code == 202
+    assert _status_events(app, "conv_other") == [
+        {"type": "session.status", "status": "running", "blocked_on": "dialog open"}
+    ]
+    assert _status_events(app, _CONV) == []
 
 
 @pytest.mark.asyncio

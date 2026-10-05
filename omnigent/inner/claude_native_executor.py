@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
@@ -55,6 +56,15 @@ from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
+
+# An ok keep-warm ping moves the statusLine's cumulative ``total_cost_usd``
+# once Claude Code settles the side question; the receipt polls the snapshot
+# at this cadence/budget before falling back to the cache-read estimate.
+_KEEP_WARM_COST_POLL_INTERVAL_S = 0.5
+_KEEP_WARM_COST_POLL_TIMEOUT_S = 10.0
+# A measured ping cost above this multiple of the cache-read estimate means
+# the ping rebuilt the prompt cache instead of reading it.
+_KEEP_WARM_MISS_COST_FACTOR = 4
 
 
 class ClaudeNativeExecutor(Executor):
@@ -142,10 +152,14 @@ class ClaudeNativeExecutor(Executor):
         Cancellation sets a stop flag the bridge checks before every
         key it sends, and the lock is released only after the worker
         thread finished. ``/btw`` answers have no tool access, so the
-        ping can never do real work. Claude Code reports no usage for
-        side questions, so the receipt estimates cost: the session's
-        current context tokens (the statusLine snapshot) priced as
-        cache reads.
+        ping can never do real work. Claude Code's statusLine
+        ``total_cost_usd`` includes the side question's cost
+        (``current_usage`` does not change), so an ok ping polls the
+        snapshot for the moved cumulative total and reports the real
+        delta with a measured ``cache_result`` (a delta far above the
+        cache-read estimate means the ping missed the cache). When the
+        delta never lands, the receipt falls back to today's estimate:
+        the session's current context tokens priced as cache reads.
 
         :param attempt_id: Server-allocated ping attempt id, echoed on
             the receipt.
@@ -154,6 +168,7 @@ class ClaudeNativeExecutor(Executor):
         :returns: The normalized receipt dict.
         """
         del family
+        cost_before = _total_cost_usd(read_claude_context_state(self._bridge_dir))
         async with self._inject_lock:
             try:
                 result = await self._keep_warm_btw()
@@ -166,12 +181,31 @@ class ClaudeNativeExecutor(Executor):
         if result.outcome != "ok":
             return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
         cache_read = _current_context_tokens(self._bridge_dir)
+        estimate_usd = await asyncio.to_thread(_keep_warm_cost_usd, self._bridge_dir, cache_read)
+        if cost_before is not None:
+            cost_after = await asyncio.to_thread(
+                _poll_total_cost_usd, self._bridge_dir, cost_before
+            )
+            if cost_after is not None:
+                delta = cost_after - cost_before
+                missed = (
+                    estimate_usd is not None and delta > _KEEP_WARM_MISS_COST_FACTOR * estimate_usd
+                )
+                return _keep_warm_receipt(
+                    attempt_id,
+                    outcome="ok",
+                    reason=None,
+                    cache_read=cache_read,
+                    cost_usd=delta,
+                    estimated=False,
+                    cache_result="miss" if missed else "hit",
+                )
         return _keep_warm_receipt(
             attempt_id,
             outcome="ok",
             reason=None,
             cache_read=cache_read,
-            cost_usd=await asyncio.to_thread(_keep_warm_cost_usd, self._bridge_dir, cache_read),
+            cost_usd=estimate_usd,
             estimated=True,
         )
 
@@ -524,6 +558,7 @@ def _keep_warm_receipt(
     cache_read: int | None = None,
     cost_usd: float | None = None,
     estimated: bool = False,
+    cache_result: str | None = None,
 ) -> dict[str, Any]:
     """
     Build one normalized keep-warm receipt.
@@ -532,11 +567,14 @@ def _keep_warm_receipt(
     :param outcome: ``"ok"`` / ``"skipped"`` / ``"failed"``.
     :param reason: Machine reason; ``None`` on ``"ok"``.
     :param cache_read: Context tokens the ping read, when known.
-    :param cost_usd: Estimated cost, when priceable.
+    :param cost_usd: Estimated or measured cost, when priceable.
     :param estimated: Whether the usage figures are estimates.
+    :param cache_result: Measured cache outcome (``"hit"`` / ``"miss"``)
+        from the statusLine cost delta; the key is omitted when no
+        measurement landed.
     :returns: The receipt dict the runner relays to the server.
     """
-    return {
+    receipt: dict[str, Any] = {
         "attempt_id": attempt_id,
         "outcome": outcome,
         "reason": reason,
@@ -546,6 +584,50 @@ def _keep_warm_receipt(
         "cost_usd": cost_usd,
         "estimated": estimated,
     }
+    if cache_result is not None:
+        receipt["cache_result"] = cache_result
+    return receipt
+
+
+def _total_cost_usd(state: dict[str, Any] | None) -> float | None:
+    """
+    Extract Claude Code's cumulative session cost from a statusLine snapshot.
+
+    :param state: Parsed ``context.json`` payload from
+        :func:`read_claude_context_state`, or ``None``.
+    :returns: ``state["total_cost_usd"]`` as a non-negative float, or
+        ``None`` when absent / malformed.
+    """
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("total_cost_usd")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if raw < 0:
+        return None
+    return float(raw)
+
+
+def _poll_total_cost_usd(bridge_dir: Path, before: float) -> float | None:
+    """
+    Poll the statusLine snapshot for a cumulative cost larger than *before*.
+
+    Runs on a worker thread; Claude Code settles the side question's cost
+    into ``total_cost_usd`` a moment after the overlay closes.
+
+    :param bridge_dir: Bridge directory path.
+    :param before: The cumulative cost read before the ping.
+    :returns: The first larger total, or ``None`` when none landed inside
+        the budget.
+    """
+    deadline = time.monotonic() + _KEEP_WARM_COST_POLL_TIMEOUT_S
+    while True:
+        after = _total_cost_usd(read_claude_context_state(bridge_dir))
+        if after is not None and after > before:
+            return after
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_KEEP_WARM_COST_POLL_INTERVAL_S)
 
 
 def _current_context_tokens(bridge_dir: Path) -> int | None:

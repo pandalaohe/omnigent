@@ -2171,6 +2171,135 @@ async def test_keep_warm_cost_prices_on_a_worker_thread_not_the_event_loop(
     assert priced_on and all(ident != loop_thread for ident in priced_on)
 
 
+def _keep_warm_context_file(bridge_dir: Path, *, total_cost_usd: float) -> None:
+    """Write a statusLine snapshot carrying the given cumulative session cost."""
+    (bridge_dir / "context.json").write_text(
+        json.dumps(
+            {
+                "context_window_size": 1000000,
+                "model": "claude-sonnet-4-6",
+                "current_usage": {
+                    "input_tokens": 1000,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 34000,
+                },
+                "total_cost_usd": total_cost_usd,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _keep_warm_pricing(model: str) -> ModelPricing:
+    """The fixed price sheet the estimate assertions are worked from."""
+    del model
+    return ModelPricing(
+        input_per_token=3e-6,
+        output_per_token=15e-6,
+        cache_read_per_token=3e-7,
+        cache_write_per_token=3.75e-6,
+    )
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_receipt_reports_the_measured_statusline_cost_delta(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The statusLine's cumulative ``total_cost_usd`` includes the side
+    question: when it moves after an ok ping, the receipt carries the real
+    delta, ``estimated=False``, and a measured ``cache_result`` — here a
+    $0.02 delta against a $0.0111 cache-read estimate is a hit.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        # Claude Code settles the side question's cost into the snapshot.
+        _keep_warm_context_file(bridge_dir_arg, total_cost_usd=1.02)
+        return claude_bridge.KeepWarmBtwResult("ok", None)
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", _keep_warm_pricing)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": None,
+        "cache_read": 37000,
+        "cache_write": None,
+        "cost_usd": pytest.approx(0.02),
+        "estimated": False,
+        "cache_result": "hit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_receipt_marks_a_measured_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A delta past 4x the cache-read estimate means the ping rebuilt the cache: ``miss``."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        _keep_warm_context_file(bridge_dir_arg, total_cost_usd=1.10)
+        return claude_bridge.KeepWarmBtwResult("ok", None)
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", _keep_warm_pricing)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    # Estimate: 37000 tokens x $3e-7 = $0.0111; the $0.10 delta is > 4x that.
+    assert receipt["cost_usd"] == pytest.approx(0.10)
+    assert receipt["estimated"] is False
+    assert receipt["cache_result"] == "miss"
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_receipt_falls_back_to_the_estimate_when_no_delta_lands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cumulative cost that never moves leaves today's estimate, with no ``cache_result``."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "run_keep_warm_btw",
+        lambda _: claude_bridge.KeepWarmBtwResult("ok", None),
+    )
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", _keep_warm_pricing)
+    # Keep the settle poll's real-time cost at test scale.
+    monkeypatch.setattr(claude_native_executor, "_KEEP_WARM_COST_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_executor, "_KEEP_WARM_COST_POLL_TIMEOUT_S", 0.05)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": None,
+        "cache_read": 37000,
+        "cache_write": None,
+        "cost_usd": pytest.approx(0.0111),
+        "estimated": True,
+    }
+
+
 @pytest.mark.asyncio
 async def test_keep_warm_bridge_failure_reports_harness_error(
     monkeypatch: pytest.MonkeyPatch,

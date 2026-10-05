@@ -13441,6 +13441,30 @@ _KEEP_WARM_OVERLAY_PANE = _btw_pane(
     "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
 )
 
+# The marked overlay while the answer is still generating: the question is
+# on screen, the footer carries no copy/fork, and the spinner line shows.
+_KEEP_WARM_ANSWERING_PANE = _btw_pane(
+    "",
+    f"    {_KEEP_WARM_TEXT}",
+    "      ✻ Answering…",
+    "    ↑/↓ to scroll · Esc to close",
+)
+
+# A settled marked overlay with an earlier /btw exchange threaded in: only
+# then does the footer offer "x to clear history".
+_KEEP_WARM_HISTORY_OVERLAY_PANE = _btw_pane(
+    "",
+    "    /btw earlier side chat",
+    "",
+    "      earlier answer",
+    "",
+    f"    {_KEEP_WARM_TEXT}",
+    "",
+    "      ok",
+    "",
+    "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
+)
+
 _IDLE_SESSION_STATUS = SessionStatus(runner_status=IDLE, raw_status="idle", status_updated_at=None)
 _BUSY_SESSION_STATUS = SessionStatus(
     runner_status=RUNNING, raw_status="busy", status_updated_at=None
@@ -13604,6 +13628,7 @@ def test_keep_warm_btw_happy_path_pastes_enters_and_dismisses(
             _composer_pane(_KEEP_WARM_TEXT),  # paste committed, exactly
             _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
             _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+            _IDLE_PANE,  # the Escape closed the overlay
         ],
     )
 
@@ -13623,6 +13648,8 @@ def test_keep_warm_btw_happy_path_pastes_enters_and_dismisses(
     assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
     assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
     assert len(sends) == 4
+    # No history hint in the footer → no "x" key, ever.
+    assert ["send-keys", "-t", "claude:0.0", "x"] not in sends
     # The real-message pre-clear must NOT run: the composer was verified empty.
     assert ["send-keys", "-l", "-t", "claude:0.0", "\x1b[97;5u"] not in sends
     assert ["send-keys", "-l", "-t", "claude:0.0", "\x1b[107;5u"] not in sends
@@ -13717,6 +13744,7 @@ def test_keep_warm_btw_blank_composer_rows_read_empty(
             _composer_pane(_KEEP_WARM_TEXT),  # paste committed, exactly
             _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
             _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+            _IDLE_PANE,  # the Escape closed the overlay
         ],
     )
 
@@ -13750,6 +13778,7 @@ def test_keep_warm_btw_blank_row_below_the_paste_still_exact(
             tall_paste,  # paste committed; the row below it is blank box height
             _KEEP_WARM_OVERLAY_PANE,
             _KEEP_WARM_OVERLAY_PANE,
+            _IDLE_PANE,  # the Escape closed the overlay
         ],
     )
 
@@ -13854,6 +13883,7 @@ def test_keep_warm_btw_trailing_padding_spaces_still_exact(
             padded,
             _KEEP_WARM_OVERLAY_PANE,
             _KEEP_WARM_OVERLAY_PANE,
+            _IDLE_PANE,  # the Escape closed the overlay
         ],
     )
 
@@ -13960,7 +13990,7 @@ def test_keep_warm_btw_failed_dismissal_is_not_ok(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
 
@@ -13991,7 +14021,7 @@ def test_keep_warm_btw_running_turn_at_dismissal_blocks_escape(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
@@ -14021,7 +14051,7 @@ def test_keep_warm_btw_unreadable_status_at_dismissal_blocks_escape(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
@@ -14051,7 +14081,7 @@ def test_keep_warm_btw_permission_wait_at_dismissal_blocks_escape(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
@@ -14078,6 +14108,7 @@ def test_keep_warm_btw_dialog_open_status_behind_the_overlay_dismisses(
             _composer_pane(_KEEP_WARM_TEXT),
             _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
             _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+            _IDLE_PANE,  # the Escape closed the overlay
         ],
     )
 
@@ -14109,6 +14140,7 @@ def test_keep_warm_btw_overlay_poll_never_aborts_on_a_status_read(
         _IDLE_PANE,  # the overlay is still answering
         _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
         _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+        _IDLE_PANE,  # the Escape closed the overlay
     ]
     current = {"pane": "", "captures": 0}
     sends: list[list[str]] = []
@@ -14189,6 +14221,150 @@ def test_keep_warm_btw_no_overlay_fails_btw_unavailable(
     assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
     # No Escape: only a verifiably-present overlay may be dismissed.
     assert len(sends) == 3
+
+
+def test_keep_warm_btw_slow_answer_settles_and_dismisses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A 40 s answer still settles inside the widened budget → ``ok``, overlay closed."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,  # pane-idle + composer-empty guards
+            _composer_pane(_KEEP_WARM_TEXT),  # paste committed, exactly
+            # 80 poll frames at 0.5 s: the answer settles after 40 s.
+            *[_KEEP_WARM_ANSWERING_PANE] * 80,
+            _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay
+            _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+            _IDLE_PANE,  # the Escape closed the overlay
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 4
+
+
+def test_keep_warm_btw_still_answering_at_the_budget_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Still generating at the 70 s budget: our overlay is Escaped and closed → ``timeout``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT)]
+    sends: list[list[str]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        sends.append(list(args))
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if frames:
+            return frames.pop(0)
+        if any(args[-1] == "Escape" for args in sends):
+            return _IDLE_PANE  # the Escape closed the overlay
+        return _KEEP_WARM_ANSWERING_PANE
+
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "timeout")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    # One Escape closed it — no second key; the ping ended at the 70 s budget
+    # plus one 0.25 s close-verify poll.
+    assert [args[-1] for args in sends].count("Escape") == 1
+    assert clock.now == 70.25
+
+
+def test_keep_warm_btw_overlay_that_ignores_escape_fails_dismiss_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """The settled overlay stays on screen after two Escapes → ``dismiss_failed``, no third key."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,  # settled marked overlay ...
+            _KEEP_WARM_OVERLAY_PANE,  # ... and it never closes
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert sends[4] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 5
+
+
+def test_keep_warm_btw_clear_history_hint_sends_x_before_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A settled overlay threaded with earlier chats: ``x`` clears them before the Escape."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_HISTORY_OVERLAY_PANE,  # settled; footer offers "x to clear history"
+            _KEEP_WARM_OVERLAY_PANE,  # the x took: only our exchange remains
+            _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+            _IDLE_PANE,  # the Escape closed the overlay
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
+    assert sends[3] == ["send-keys", "-t", "claude:0.0", "x"]
+    assert sends[4] == ["send-keys", "-t", "claude:0.0", "Escape"]
+    assert len(sends) == 5
+
+
+def test_keep_warm_btw_history_hint_that_stays_sends_one_x_and_still_dismisses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A hint that persists after ``x`` is never re-keyed; the Escape still closes the overlay."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            # Settled with the hint, which then survives the whole 2 s
+            # post-x poll (8 captures) and the dismiss re-read.
+            *[_KEEP_WARM_HISTORY_OVERLAY_PANE] * 10,
+            _IDLE_PANE,  # the Escape closed the overlay
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert [args[-1] for args in sends].count("x") == 1
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
 
 
 def test_tmux_pane_pid_parses_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
