@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
-import type { AnyBlock } from "@/lib/blocks";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 import { isConversationUnseen, seedReadState } from "@/hooks/useUnseenConversations";
@@ -18,75 +17,6 @@ export function dispatchPollSessions(): void {
 
 export function dispatchArchiveSession(): void {
   if (typeof window !== "undefined") window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT));
-}
-
-// Seen-card counts live client-side because the server deliberately does not
-// bump `updated_at` when a card arrives, so "the user saw the card" has no
-// timestamp to derive from. In-memory only: a reload re-raises rows whose
-// cards are still open.
-const elicitationAcknowledgements = new Map<string, number>();
-
-/**
- * Records how many of the open session's pending cards the user has seen.
- * ChatPage calls it on the same refresh cadence as useMarkConversationSeen;
- * a later count above the recorded one puts the row back in the
- * needs-response tier.
- */
-export function useAcknowledgePendingElicitations(
-  conversationId: string | undefined,
-  pendingCount: number | undefined,
-): void {
-  useEffect(() => {
-    if (!conversationId || pendingCount === undefined) return;
-    elicitationAcknowledgements.set(conversationId, pendingCount);
-  }, [conversationId, pendingCount]);
-}
-
-/**
- * How many pending cards the open session should acknowledge. `blocks` is the
- * chat store's active transcript and `blocksConversationId` names the session
- * it belongs to; a route switch leaves the previous session's blocks in the
- * store briefly, so they only count once the store names the open session.
- * The sidebar row can be unloaded (a deep link outside the loaded pages), so
- * the loaded row's count seeds the fallback; the transcript's own pending
- * cards win when larger. Child/sub-agent cards mirrored into an ancestor chat
- * carry the child's session id, so they don't count against the ancestor's
- * row.
- */
-export function pendingCardsToAcknowledge(
-  blocks: readonly AnyBlock[],
-  conversationId: string | undefined,
-  loadedPendingCount: number | undefined,
-  blocksConversationId: string | null | undefined,
-): number {
-  const loaded = loadedPendingCount ?? 0;
-  if (!conversationId || blocksConversationId !== conversationId) return loaded;
-  let count = 0;
-  for (const block of blocks) {
-    if (block.type !== "elicitation" || block.status !== "pending") continue;
-    if (block.targetSessionId && block.targetSessionId !== conversationId) continue;
-    count += 1;
-  }
-  return Math.max(count, loaded);
-}
-
-// A count can only drop because cards were answered. Keep the acknowledged
-// baseline at the lowest observed count so the NEXT card re-raises the row
-// instead of hiding behind an answered-then-equal total.
-function observeElicitationCounts(rows: readonly Conversation[]): void {
-  for (const row of rows) {
-    const stored = elicitationAcknowledgements.get(row.id);
-    if (stored === undefined) continue;
-    const count = row.pending_elicitations_count ?? 0;
-    if (count >= stored) continue;
-    if (count === 0) elicitationAcknowledgements.delete(row.id);
-    else elicitationAcknowledgements.set(row.id, count);
-  }
-}
-
-/** Test-only: the acknowledgement map is module state; clear it between specs. */
-export function resetElicitationAcknowledgementsForTests(): void {
-  elicitationAcknowledgements.clear();
 }
 
 /** B/G rows: background activity or an active/paused goal. A foreground spinner is neither. */
@@ -109,7 +39,7 @@ function oldestFirst(rows: readonly Conversation[]): Conversation {
 
 export interface PollingChoice {
   isUnread: (conversation: Conversation) => boolean;
-  /** Rows with a card the user has not opened since it arrived (tier 0). */
+  /** Rows with a pending card (tier 0). */
   needsResponse?: (conversation: Conversation) => boolean;
   /** Rows hidden inside a collapsed section/folder: the plain cycle skips them. */
   isCollapsed?: (conversation: Conversation) => boolean;
@@ -122,11 +52,11 @@ export interface PollingChoice {
 }
 
 /**
- * The next Poll target: unacknowledged needs-response rows first (any row,
- * oldest first), then unread rows (windowed, oldest first; background rows
- * only when not deprioritized), then the plain circular cycle after the
- * active row, skipping collapsed and visited rows. The active row is never
- * its own target.
+ * The next Poll target: rows with a pending card first (any row, oldest
+ * first), then unread rows (windowed, oldest first; background rows only
+ * when not deprioritized), then the plain circular cycle after the active
+ * row, skipping collapsed and visited rows. The active row is never its own
+ * target.
  */
 export function choosePolledConversation(
   conversations: readonly Conversation[],
@@ -209,7 +139,6 @@ export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions):
   useEffect(() => {
     const loadRows = async (operation: typeof latest.current) => {
       const allRows = (await operation.getConversations()).filter((row) => row.archived !== true);
-      observeElicitationCounts(allRows);
       // The sidebar normally seeds this mirror after React commits its freshly
       // loaded pages. Polling can run in that gap, so seed synchronously from
       // the complete list before reading the unread tier.
@@ -228,8 +157,7 @@ export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions):
       const choose = (visited?: ReadonlySet<string>) =>
         choosePolledConversation(allRows, operation.activeId, {
           isUnread: unread,
-          needsResponse: (row) =>
-            (row.pending_elicitations_count ?? 0) > (elicitationAcknowledgements.get(row.id) ?? 0),
+          needsResponse: (row) => (row.pending_elicitations_count ?? 0) > 0,
           isCollapsed: (row) => operation.isCollapsed?.(row) ?? false,
           isInsideWindow: (row) => eligibleIds.has(row.id),
           deprioritizeBackgroundSessions: operation.deprioritizeBackgroundSessions,
