@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef } from "react";
+import { useCallback, useContext, useEffect, useRef, useSyncExternalStore } from "react";
 import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
@@ -181,6 +181,44 @@ export class BulkConversationMutationError extends Error {
   }
 }
 
+/** Whether keep-warm currently holds this session's prompt cache. */
+export type WarmState = "warm" | "cold";
+
+/** Mirrors the server's `KeepWarmEpisode`. */
+export interface KeepWarmEpisode {
+  pings: number;
+  cost_usd: number;
+  estimated: boolean;
+  started_at: number | null;
+}
+
+/** Mirrors the server's `KeepWarmTotal`. */
+export interface KeepWarmTotal {
+  pings: number;
+  cost_usd: number;
+  estimated: boolean;
+}
+
+/** Mirrors the server's `KeepWarmLastReturn`. */
+export interface KeepWarmLastReturn {
+  at: number;
+  result: "hit" | "miss" | "unknown";
+}
+
+/** Why warming stopped or paused, mirroring the server's vocabulary. */
+export type KeepWarmStopReason =
+  "cap" | "misses" | "failures" | "card" | "host" | "switch_off" | "runner_version";
+
+/** Mirrors the server's `KeepWarmStatus`. */
+export interface KeepWarmStatus {
+  state: "on" | "off" | "paused" | "stopped";
+  stop_reason: KeepWarmStopReason | null;
+  episode: KeepWarmEpisode;
+  total: KeepWarmTotal;
+  last_return: KeepWarmLastReturn | null;
+  last_reason: string | null;
+}
+
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
   id: string;
@@ -225,6 +263,17 @@ export interface Conversation {
   background_activity_count?: number;
   /** Provider-neutral Goal marker reported by Codex or Claude. */
   goal_state?: "active" | "paused" | null;
+  /**
+   * Whether keep-warm currently holds this session's prompt cache.
+   * `null`/absent when the harness has no keep-warm or the session is
+   * archived; `"cold"` drives the sidebar's blue indicators.
+   */
+  warm_state?: WarmState | null;
+  /**
+   * Keep-warm episode / lifetime counters and the last measured return.
+   * `null`/absent when the session has no keep-warm label or is archived.
+   */
+  keep_warm?: KeepWarmStatus | null;
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
    * `GET /v1/sessions` and the `WS /v1/sessions/updates` stream include
@@ -564,7 +613,39 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     host_online: wire.host_online ?? undefined,
     git_branch: wire.git_branch ?? null,
     archived: wire.archived ?? false,
+    warm_state: wire.warm_state ?? null,
+    keep_warm: wire.keep_warm ?? null,
   };
+}
+
+/**
+ * Read one session's sidebar-shaped row for surfaces that hold only its id
+ * (the Agent info panel). Subscribes to the query cache so the row tracks the
+ * sidebar list caches the live-updates stream patches in place, rather than
+ * freezing at a one-time `initialData` seed. When no list cache holds the
+ * session, backfills through {@link fetchConversationById}.
+ */
+export function useConversationRow(id: string | null | undefined): Conversation | null {
+  const queryClient = useQueryClient();
+  const rowId = id ?? null;
+  const cachedRow = useSyncExternalStore(
+    useCallback(
+      (onStoreChange: () => void) => queryClient.getQueryCache().subscribe(onStoreChange),
+      [queryClient],
+    ),
+    useCallback(
+      () => (rowId === null ? undefined : findListCachedConversationRow(queryClient, rowId)),
+      [queryClient, rowId],
+    ),
+  );
+  const query = useQuery<Conversation | null>({
+    queryKey: ["conversation-backfill", rowId],
+    enabled: rowId !== null && cachedRow === undefined,
+    staleTime: 30_000,
+    retry: false,
+    queryFn: () => fetchConversationById(rowId as string),
+  });
+  return cachedRow ?? query.data ?? null;
 }
 
 export async function fetchConversationsPage({
@@ -1996,13 +2077,15 @@ export async function setConversationPinned(
 }
 
 /**
- * Locate the fullest cached copy of a session row across the sidebar's list
- * caches: the pinned section, every `["conversations", ...]` variant, and the
- * `["project-sessions", name]` folder lists (a filed session outside the main
- * window lives only in its folder's cache). Used by the pin and move overlays
- * to read the row's current fields before patching them optimistically.
+ * Locate a session row in the sidebar's list caches: the pinned section, every
+ * `["conversations", ...]` variant, and the `["project-sessions", name]` folder
+ * lists (a filed session outside the main window lives only in its folder's
+ * cache). These are the caches the live-updates stream patches in place.
  */
-function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
+function findListCachedConversationRow(
+  queryClient: QueryClient,
+  id: string,
+): Conversation | undefined {
   return (
     queryClient
       .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
@@ -2014,7 +2097,19 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
     queryClient
       .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
       .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id) ??
+      .find((c) => c.id === id)
+  );
+}
+
+/**
+ * The fullest cached copy of a session row across the sidebar's list caches,
+ * plus the backfill query and the per-session snapshot. Used by the pin and
+ * move overlays to read the row's current fields before patching them
+ * optimistically.
+ */
+function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  return (
+    findListCachedConversationRow(queryClient, id) ??
     queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]) ??
     cachedSessionRow(queryClient, id)
   );

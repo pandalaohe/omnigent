@@ -16,6 +16,7 @@ import {
   CpuIcon,
   DownloadIcon,
   FileTextIcon,
+  FlameIcon,
   GaugeIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -40,6 +41,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "agents"
+  | "keep-warm"
   | "appearance"
   | "calling-defaults"
   | "session-collab"
@@ -63,6 +65,7 @@ export type SettingsSectionId =
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "agents",
+  "keep-warm",
   "appearance",
   "calling-defaults",
   "session-collab",
@@ -119,6 +122,7 @@ export function settingsNavGroups(
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "agents", label: "Agents", icon: BotIcon },
+    { id: "keep-warm", label: "Keep-warm", icon: FlameIcon },
     { id: "calling-defaults", label: "Calling defaults", icon: SlidersHorizontalIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },

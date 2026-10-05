@@ -131,6 +131,7 @@ import { ApprovalTimeoutSettings } from "@/components/ApprovalTimeoutSettings";
 import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
 import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
+import { KeepWarmSettings } from "@/components/KeepWarmSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { SessionCollabSettings } from "@/components/SessionCollabSettings";
@@ -406,6 +407,7 @@ export function SettingsPage() {
     <PageScroll contentClassName="px-8" extraBottom="2.5rem" {...pageWrapperSettings}>
       {section === "appearance" && <AppearanceSection />}
       {section === "agents" && <AgentsSettings />}
+      {section === "keep-warm" && <KeepWarmSettingsSection />}
       {section === "calling-defaults" && <CallingDefaultsSettingsSection />}
       {section === "session-collab" && <SessionCollabSettingsSection />}
       {section === "general" && <GeneralSection />}
@@ -2817,6 +2819,17 @@ function CallingDefaultsSettingsSection() {
       description="Model and reasoning effort defaults per host and harness. Projects can override them per host."
     >
       <CallingDefaultsSection />
+    </Section>
+  );
+}
+
+function KeepWarmSettingsSection() {
+  return (
+    <Section
+      title="Keep-warm"
+      description="Keep each agent's prompt cache warm so its next real turn starts fast."
+    >
+      <KeepWarmSettings />
     </Section>
   );
 }

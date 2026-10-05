@@ -22,6 +22,14 @@ consecutive measured cache misses pause it stickily (a harness whose cache is
 shorter than the assumed window), lifting only after the session leaves and
 re-enters the active zone.
 
+Every tenth tick the sweeper also archives live sub-agent children whose
+effective host has been offline past the owner's ``host_offline_archive_s``
+setting (``0`` disables), stamping ``omnigent.archive_reason`` /
+``omnigent.archived_by`` provenance. A user unarchive of such a row pins
+``omnigent.archive_exempt_since`` to the host's last-seen stamp, so the same
+offline spell never re-archives it; a reconnect bumps the stamp and re-arms
+the pass.
+
 The loop is shaped like :class:`~omnigent.server.peer_sweeper.PeerSweeper`:
 ``start``/``shutdown`` own one task, ``_run`` loops ``_tick`` plus
 ``asyncio.sleep`` swallowing errors, and tests drive ``_tick`` directly with
@@ -36,7 +44,7 @@ import asyncio
 import json
 import logging
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
@@ -46,6 +54,11 @@ from omnigent.entities import Conversation
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runtime.pending_elicitations import snapshot_for
 from omnigent.server.routes._sessions.common import (
+    _ARCHIVE_EXEMPT_SINCE_LABEL_KEY,
+    _ARCHIVE_REASON_HOST_OFFLINE,
+    _ARCHIVE_REASON_LABEL_KEY,
+    _ARCHIVED_BY_KEEP_WARM,
+    _ARCHIVED_BY_LABEL_KEY,
     _KEEP_WARM_LABEL_KEY,
     _KEEP_WARM_STATS_LABEL_KEY,
     _LAST_CACHE_LABEL_KEY,
@@ -56,9 +69,11 @@ from omnigent.server.routes._sessions.helpers import (
     _child_summary_identity,
     _effective_placement,
     _inherited_placement,
+    _prune_session_read_state,
     _publish_child_status_to_parent,
     _resolve_harness,
     _session_status_from_cache,
+    effective_host_id,
 )
 from omnigent.server.session_collab import collab_owner_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
@@ -73,6 +88,7 @@ from omnigent.server.user_preferences_store import (
     read_keep_warm_settings,
 )
 from omnigent.stores import ConversationStore
+from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed, title_without_closed_marker
 
@@ -81,6 +97,9 @@ _logger = logging.getLogger(__name__)
 KEEP_WARM_LABEL = _KEEP_WARM_LABEL_KEY
 KEEP_WARM_STATS_LABEL = _KEEP_WARM_STATS_LABEL_KEY
 LAST_CACHE_LABEL = _LAST_CACHE_LABEL_KEY
+ARCHIVE_REASON_LABEL = _ARCHIVE_REASON_LABEL_KEY
+ARCHIVED_BY_LABEL = _ARCHIVED_BY_LABEL_KEY
+ARCHIVE_EXEMPT_SINCE_LABEL = _ARCHIVE_EXEMPT_SINCE_LABEL_KEY
 
 _SLACK_S = 300
 _TICK_INTERVAL_S = 60.0
@@ -97,6 +116,15 @@ _CODEX_DEFAULT_STALENESS_S = 1800
 #: Only Claude and Codex sessions have a provider cache worth keeping. This
 #: map is the single place a later keep-warm channel registers.
 _SUPPORTED_HARNESSES: dict[str, Literal["claude", "codex"]] = {
+    "claude-native": "claude",
+    "claude-sdk": "claude",
+    "codex-native": "codex",
+    "codex": "codex",
+}
+#: The legacy settings predate keep-warm channels beyond the two native
+#: CLIs, so the one-time migration only ever covers those agents — never an
+#: SDK harness that joined ``_SUPPORTED_HARNESSES`` later.
+_MIGRATION_HARNESSES: dict[str, Literal["claude", "codex"]] = {
     "claude-native": "claude",
     "codex-native": "codex",
 }
@@ -115,6 +143,12 @@ _EMPTY_PLACEMENT = Placement(None, None, None)
 #: A turn whose usage reading never lands stops retrying this long after the
 #: episode opened.
 _LATE_USAGE_GRACE_S = 300
+#: The host-offline archive pass runs on every Nth tick: it scans every live
+#: child, so it does not need the ping pass's per-tick cadence.
+_ARCHIVE_PASS_TICK_INTERVAL = 10
+#: Bound on archives per pass: a dead host with a huge child fleet spreads
+#: the writes across passes instead of one burst.
+_ARCHIVE_PASS_MAX_ARCHIVES = 50
 #: Receipt stop reasons store as one of these bounded ASCII codes (``other``
 #: otherwise) so a long or non-ASCII reason cannot break the 256-char label.
 _STOP_REASON_CODES = frozenset(
@@ -158,18 +192,20 @@ class _WarmState:
 
     Short keys keep the serialized label well under the 256-character
     label bound: ``s`` state (``w`` warm / ``c`` cold / ``p`` paused),
-    ``why`` reason, ``t`` last-seen ``running_since``, ``c`` episode start,
-    ``u`` last cache touch, ``p`` ping attempt time, ``a`` pending attempt
-    id, ``f`` failures, ``m`` misses, ``b`` usage baseline, ``v``
-    ``archive_revision`` at a miss pause, ``w`` warm-until, ``o`` latest
-    cache observation ``[epoch, 1=hit|0=miss]``, ``r`` late-usage retry
-    pending, ``e`` pending late reading may count as a miss, ``k`` stop
-    reason.
+    ``why`` reason, ``y`` model family, ``t`` last-seen ``running_since``,
+    ``c`` episode start, ``u`` last cache touch, ``p`` ping attempt time,
+    ``a`` pending attempt id, ``f`` failures, ``m`` misses, ``b`` usage
+    baseline, ``v`` ``archive_revision`` at a miss pause, ``w``
+    warm-until, ``o`` latest cache observation ``[epoch, 1=hit|0=miss]``,
+    ``r`` late-usage retry pending, ``e`` pending late reading may count
+    as a miss, ``k`` stop reason.
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
         ``fail``, ``miss``, ``rev`` (``pol`` / ``mom`` parse from SCC19
         labels but are never written).
+    :param y: Model family (``claude`` / ``codex``), written on every label
+        write so readers can derive the warm rule without a harness lookup.
     :param t: ``running_since`` of the last turn seen.
     :param c: Epoch seconds the last real turn was seen settled.
     :param u: Epoch seconds the last turn (real or ok ping) was seen settled.
@@ -194,6 +230,7 @@ class _WarmState:
 
     s: str
     why: str | None = None
+    y: Literal["claude", "codex"] | None = None
     t: int | None = None
     c: int | None = None
     u: int | None = None
@@ -214,6 +251,8 @@ class _WarmState:
         data: dict[str, object] = {"s": self.s}
         if self.why is not None:
             data["why"] = self.why
+        if self.y is not None:
+            data["y"] = self.y
         if self.t is not None:
             data["t"] = self.t
         if self.c is not None:
@@ -264,6 +303,10 @@ class _WarmState:
         if state not in ("w", "c", "p"):
             return None
         why = data.get("why")
+        family = data.get("y")
+        parsed_family: Literal["claude", "codex"] | None = (
+            family if family == "claude" or family == "codex" else None
+        )
         baseline = data.get("b")
         if (
             not isinstance(baseline, (int, list))
@@ -283,6 +326,7 @@ class _WarmState:
         return cls(
             s=state,
             why=why if isinstance(why, str) and why in _WHY_CODES else None,
+            y=parsed_family,
             t=_as_int(data.get("t")),
             c=_as_int(data.get("c")),
             u=_as_int(data.get("u")),
@@ -441,9 +485,10 @@ def warm_state_from_label(
     the label says (its running turn touches the provider cache). Otherwise
     the rule is per family: Claude is a clock estimate (``warm`` while the
     episode is warm and the last touch is inside the 1 h cache window); Codex
-    is observation-based (``warm`` only while the latest usage observation —
+    is observation-based (``warm`` while the latest usage observation —
     ping receipt or real turn — is a hit younger than the staleness bound,
-    the agent's interval + 300 s).
+    the agent's interval + 300 s; with no observation at all, a real turn
+    settled inside that bound also reads warm).
 
     :param raw: The ``omnigent.keep_warm`` label value, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -454,9 +499,11 @@ def warm_state_from_label(
     :param codex_staleness_s: Codex observation staleness bound in seconds.
     :returns: ``"warm"``, ``"cold"``, or ``None``.
     """
-    if archived or harness not in _SUPPORTED_HARNESSES:
+    if archived:
         return None
     if family is None:
+        if harness not in _SUPPORTED_HARNESSES:
+            return None
         family = _SUPPORTED_HARNESSES[harness]
     if busy:
         return "warm"
@@ -465,16 +512,200 @@ def warm_state_from_label(
         return None
     if family == "codex":
         observation = state.o
-        if (
-            observation is not None
-            and observation[1] == 1
-            and now - observation[0] < codex_staleness_s
-        ):
+        if observation is None:
+            # No observation this episode: a real turn that just settled put
+            # its prefix in the provider cache.
+            if state.c is not None and now - state.c < codex_staleness_s:
+                return "warm"
+            return "cold"
+        if observation[1] == 1 and now - observation[0] < codex_staleness_s:
             return "warm"
         return "cold"
     if state.s == "w" and state.u is not None and now - state.u < _CLAUDE_TTL_S:
         return "warm"
     return "cold"
+
+
+#: Warm-episode gate codes → the state read while the sweeper keeps ``s == "w"``
+#: (``stop_reason`` comes from :data:`_STOP_REASON_STATUS`).
+_WARM_GATE_STATUS: dict[str, str] = {
+    "switch": "off",
+    "runner": "paused",
+    "host": "paused",
+    "card": "paused",
+}
+
+#: Label reason codes → status object ``stop_reason``. ``runner`` is the
+#: runner-liveness gate; ``runner_version`` stays schema-only, never produced.
+_STOP_REASON_STATUS: dict[str, str] = {
+    "cap": "cap",
+    "miss": "misses",
+    "fail": "failures",
+    "card": "card",
+    "host": "host",
+    "switch": "switch_off",
+    "runner": "host",
+}
+
+
+def keep_warm_family_for_harness(harness: str | None) -> Literal["claude", "codex"] | None:
+    """
+    Map a canonical harness onto the keep-warm family it belongs to.
+
+    :param harness: Canonical harness id, e.g. ``"claude-native"``; ``None``
+        for an unresolved session.
+    :returns: ``"claude"`` / ``"codex"`` for a harness with a keep-warm
+        channel, else ``None``.
+    """
+    return _SUPPORTED_HARNESSES.get(harness or "")
+
+
+def keep_warm_family_from_labels(
+    labels: Mapping[str, str] | None,
+) -> Literal["claude", "codex"] | None:
+    """
+    Return the family the sweeper stamped on a session's keep-warm label.
+
+    :param labels: Conversation labels, or ``None``.
+    :returns: The label's ``y`` family, or ``None`` when the label is
+        missing, malformed, or predates the stamp.
+    """
+    if not labels:
+        return None
+    state = _WarmState.parse(labels.get(KEEP_WARM_LABEL))
+    return state.y if state is not None else None
+
+
+def warm_state_for_labels(
+    labels: Mapping[str, str] | None,
+    *,
+    archived: bool,
+    busy: bool,
+    now: int,
+    family: Literal["claude", "codex"] | None = None,
+) -> Literal["warm", "cold"] | None:
+    """
+    Derive the rail pill state from raw labels plus a resolved harness family.
+
+    ``None`` only for an archived session, a mirrored native sub-agent row,
+    or a session whose harness has no known keep-warm family. The label's
+    ``y`` stamp wins when present; otherwise the caller's ``family`` —
+    resolved from the session's harness — supplies the per-family rule. A
+    session outside the sweeper's scan window carries no label at all and
+    reads ``warm`` while busy, ``cold`` otherwise.
+
+    :param labels: Conversation labels, or ``None``.
+    :param archived: Whether the session row itself is archived.
+    :param busy: Whether the session's status is ``running`` / ``waiting``.
+    :param now: Current epoch seconds.
+    :param family: Model family resolved from the session's harness, used
+        when the label carries no ``y`` stamp.
+    :returns: ``"warm"``, ``"cold"``, or ``None``.
+    """
+    if archived:
+        return None
+    if labels and labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS:
+        return None
+    stamped = keep_warm_family_from_labels(labels)
+    if stamped is not None:
+        family = stamped
+    raw = labels.get(KEEP_WARM_LABEL) if labels else None
+    if raw is None:
+        if family is None:
+            return None
+        return "warm" if busy else "cold"
+    if family is None:
+        return None
+    return warm_state_from_label(
+        raw,
+        archived=False,
+        harness=None,
+        busy=busy,
+        now=now,
+        family=family,
+    )
+
+
+def keep_warm_status_from_labels(
+    labels: Mapping[str, str] | None,
+    *,
+    archived: bool,
+    now: int,  # noqa: ARG001 — state comes from the label, not the clock
+) -> dict[str, Any] | None:
+    """
+    Build the ``keep_warm`` status object from a session's labels.
+
+    ``state`` mirrors the episode label: ``s == "w"`` reads ``on`` unless a
+    gate blocks the ping (``switch`` → ``off``; ``runner`` / ``host`` /
+    ``card`` → ``paused``), ``s == "p"`` reads ``paused``, and ``s == "c"``
+    reads ``stopped`` when the label records a reason (``why`` / ``k``), else
+    ``off``. ``stop_reason`` is the first recognized reason mapped onto the
+    status vocabulary; an unrecognized code reads ``None``, never an error.
+    ``last_reason`` always carries the label's raw ``k`` code (the last ping's
+    skip / fail reason). Costs convert integer micro-USD to float USD.
+
+    :param labels: Conversation labels, or ``None``.
+    :param archived: Whether the session row itself is archived.
+    :param now: Current epoch seconds.
+    :returns: The status object, or ``None`` when the session is archived or
+        carries no keep-warm label.
+    """
+    if archived or not labels:
+        return None
+    state = _WarmState.parse(labels.get(KEEP_WARM_LABEL))
+    if state is None:
+        return None
+    if state.s == "w":
+        # A blocked warm episode reports the gate, not ``on``; a receipt
+        # code (``busy``, ``btw_unavailable``) keeps reading ``on``.
+        status = _WARM_GATE_STATUS.get(state.k or "", "on")
+    elif state.s == "p":
+        status = "paused"
+    elif state.why is not None or state.k is not None:
+        status = "stopped"
+    else:
+        status = "off"
+    stop_reason: str | None = None
+    if status != "on":
+        stop_reason = _STOP_REASON_STATUS.get(state.why or "") or _STOP_REASON_STATUS.get(
+            state.k or ""
+        )
+    stats = _WarmStats.parse(labels.get(KEEP_WARM_STATS_LABEL))
+    last_return = (
+        {"at": stats.lr_at, "result": stats.lr_r or "unknown"} if stats.lr_at is not None else None
+    )
+    return {
+        "state": status,
+        "stop_reason": stop_reason,
+        "episode": {
+            "pings": stats.ep_p,
+            "cost_usd": stats.ep_c / 1_000_000,
+            "estimated": stats.ep_e,
+            "started_at": stats.ep_s,
+        },
+        "total": {
+            "pings": stats.tot_p,
+            "cost_usd": stats.tot_c / 1_000_000,
+            "estimated": stats.tot_e,
+        },
+        "last_return": last_return,
+        "last_reason": state.k,
+    }
+
+
+def keep_warm_episode_active(labels: Mapping[str, str] | None) -> bool:
+    """Return whether the labels carry an active (``s == "w"``) keep-warm episode.
+
+    Settings-free: this reads only the episode label, so callers protecting a
+    warm session (e.g. the idle CLI pool) never need the owner's settings.
+
+    :param labels: Conversation labels, or ``None``.
+    :returns: ``True`` while the episode state is warm.
+    """
+    if not labels:
+        return False
+    state = _WarmState.parse(labels.get(KEEP_WARM_LABEL))
+    return state is not None and state.s == "w"
 
 
 def _receipt_measurement(
@@ -587,6 +818,8 @@ class ChildKeepWarmSweeper:
         self._session_lock = asyncio.Lock()
         # Owners whose legacy migration already ran in this process.
         self._migrated_owners: set[str] = set()
+        # Ticks since the last host-offline archive pass.
+        self._ticks_since_archive_pass = 0
         # Candidate scan window: the largest configured cap seen (at least
         # the default) plus slack; grows as settings are read.
         self._scan_window_s = KEEP_WARM_DEFAULT_MAX_S + _SLACK_S
@@ -669,6 +902,13 @@ class ChildKeepWarmSweeper:
                 await self._process_session(session_id, now, settings_cache, harness_cache)
             except Exception:
                 _logger.exception("Child keep-warm failed to process session %s", session_id)
+        self._ticks_since_archive_pass += 1
+        if self._ticks_since_archive_pass >= _ARCHIVE_PASS_TICK_INTERVAL:
+            self._ticks_since_archive_pass = 0
+            try:
+                await self._archive_offline_host_children(now)
+            except Exception:
+                _logger.exception("Child keep-warm host-offline archive pass failed")
 
     def _list_ping_candidates(self, now: int) -> set[str]:
         """Return sessions updated inside the candidate window (paged)."""
@@ -688,6 +928,124 @@ class ChildKeepWarmSweeper:
                 break
             after = page.last_id
         return ids
+
+    async def _archive_offline_host_children(self, now: int) -> None:
+        """Archive live children whose host stayed offline past the owner's setting.
+
+        Runs every :data:`_ARCHIVE_PASS_TICK_INTERVAL` ticks over ALL
+        non-archived children — no recency window, since a child untouched for
+        days under a dead host is exactly the row worth retiring. Bounded to
+        :data:`_ARCHIVE_PASS_MAX_ARCHIVES` archives per pass; never raises.
+        """
+        host_store = getattr(getattr(self._app, "state", None), "host_store", None)
+        if host_store is None:
+            return
+        try:
+            children = await asyncio.to_thread(self._list_live_children)
+        except Exception:
+            _logger.exception("Child keep-warm host-offline archive scan failed")
+            return
+        settings_cache: dict[str, KeepWarmSettings] = {}
+        host_cache: dict[str, Any] = {}
+        archived = 0
+        for conv in children:
+            if archived >= _ARCHIVE_PASS_MAX_ARCHIVES:
+                break
+            try:
+                if await self._maybe_archive_offline_child(
+                    conv, now, host_store, settings_cache, host_cache
+                ):
+                    archived += 1
+            except Exception:
+                _logger.exception("Child keep-warm host-offline archive failed for %s", conv.id)
+
+    def _list_live_children(self) -> list[Conversation]:
+        """Page every non-archived sub-agent row (blocking; run in a thread)."""
+        children: list[Conversation] = []
+        after: str | None = None
+        for _ in range(_MAX_PAGES):
+            page = self._conversation_store.list_conversations(
+                limit=_PAGE_LIMIT,
+                after=after,
+                kind="sub_agent",
+                include_archived=False,
+            )
+            children.extend(page.data)
+            if not page.has_more or page.last_id is None:
+                break
+            after = page.last_id
+        return children
+
+    async def _maybe_archive_offline_child(
+        self,
+        conv: Conversation,
+        now: int,
+        host_store: Any,
+        settings_cache: dict[str, KeepWarmSettings],
+        host_cache: dict[str, Any],
+    ) -> bool:
+        """Archive one child when its effective host is offline past the setting."""
+        store = self._conversation_store
+        host_id = await asyncio.to_thread(effective_host_id, store, conv)
+        if host_id is None:
+            return False
+        if host_id not in host_cache:
+            host_cache[host_id] = await asyncio.to_thread(host_store.get_host, host_id)
+        host = host_cache[host_id]
+        # A missing row proves nothing; a live host needs no cleanup. The age
+        # check below catches a hard-crashed host whose status stayed online.
+        if host is None or host_is_live(host, now):
+            return False
+        owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
+        settings = await self._settings_for(owner, now, settings_cache)
+        threshold_s = settings.host_offline_archive_s
+        if threshold_s <= 0 or now - host.updated_at < threshold_s:
+            return False
+        # A user unarchive pins the host's last-seen stamp; the same offline
+        # spell must not re-archive the row.
+        if conv.labels.get(ARCHIVE_EXEMPT_SINCE_LABEL) == str(host.updated_at):
+            return False
+
+        async def _clear_provenance() -> None:
+            """Best-effort removal so a live row never keeps stale provenance."""
+            for key in (ARCHIVE_REASON_LABEL, ARCHIVED_BY_LABEL):
+                try:
+                    await asyncio.to_thread(store.delete_label, conv.id, key)
+                except Exception:  # noqa: BLE001 — must not mask the archive failure
+                    _logger.warning(
+                        "Child keep-warm could not clear label %s on session %s",
+                        key,
+                        conv.id,
+                        exc_info=True,
+                    )
+
+        # Provenance lands before the archive flag: an unarchive arriving in
+        # between must see it to install the current outage's exemption.
+        await asyncio.to_thread(
+            store.set_labels,
+            conv.id,
+            {
+                ARCHIVE_REASON_LABEL: _ARCHIVE_REASON_HOST_OFFLINE,
+                ARCHIVED_BY_LABEL: _ARCHIVED_BY_KEEP_WARM,
+            },
+        )
+        try:
+            updated = await asyncio.to_thread(
+                store.update_conversation,
+                conv.id,
+                archived=True,
+                close_cli_on_archive=False,
+            )
+        except Exception:
+            await _clear_provenance()
+            raise
+        if updated is None:
+            await _clear_provenance()
+            return False
+        if conv.parent_conversation_id is not None:
+            _publish_child_status_to_parent(conv.id, None)
+        _prune_session_read_state(conv.id)
+        return True
 
     async def _settings_for(
         self, owner: str, now: int, cache: dict[str, KeepWarmSettings]
@@ -750,7 +1108,7 @@ class ChildKeepWarmSweeper:
             page = agent_store.list(limit=_PAGE_LIMIT, after=after)
             for agent in page.data:
                 harness = self._agent_harness(agent, agent_cache, canonicalize_harness)
-                family = _SUPPORTED_HARNESSES.get(harness or "")
+                family = _MIGRATION_HARNESSES.get(harness or "")
                 if family is not None:
                     agents.append((agent.id, family))
             if not page.has_more or page.last_id is None:
@@ -830,6 +1188,10 @@ class ChildKeepWarmSweeper:
         mirrored = conv.labels.get(_WRAPPER_LABEL_KEY) in _MIRRORED_WRAPPER_LABELS
         harness = await self._harness_for(conv, harness_cache)
         family = _SUPPORTED_HARNESSES.get(harness or "")
+        # Stamp the family on every write so later readers derive the warm
+        # rule from the label alone.
+        if state is not None and family is not None:
+            state.y = family
         inspectable = family is not None and not mirrored
         if not inspectable and state is None:
             self._drop_tracking(session_id)
@@ -972,6 +1334,7 @@ class ChildKeepWarmSweeper:
                             misses = 0
                     state = _WarmState(
                         s="w",
+                        y=family,
                         t=running_since,
                         c=settle,
                         u=settle,
@@ -1171,6 +1534,8 @@ class ChildKeepWarmSweeper:
         busy = status == "running"
         harness = await asyncio.to_thread(_resolve_harness, conv)
         family = _SUPPORTED_HARNESSES.get(harness or "")
+        if family is not None:
+            state.y = family
         is_child = conv.parent_conversation_id is not None
         owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
         settings = await self._settings_for(owner, now, {})
@@ -1490,9 +1855,17 @@ def _running_since(conv: Conversation) -> int | None:
 
 
 __all__ = [
+    "ARCHIVED_BY_LABEL",
+    "ARCHIVE_EXEMPT_SINCE_LABEL",
+    "ARCHIVE_REASON_LABEL",
     "KEEP_WARM_LABEL",
     "KEEP_WARM_STATS_LABEL",
     "LAST_CACHE_LABEL",
     "ChildKeepWarmSweeper",
+    "keep_warm_episode_active",
+    "keep_warm_family_for_harness",
+    "keep_warm_family_from_labels",
+    "keep_warm_status_from_labels",
+    "warm_state_for_labels",
     "warm_state_from_label",
 ]

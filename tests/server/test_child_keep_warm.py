@@ -25,15 +25,21 @@ from omnigent.runtime import pending_elicitations
 from omnigent.server import child_keep_warm
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.child_keep_warm import (
+    ARCHIVE_EXEMPT_SINCE_LABEL,
+    ARCHIVE_REASON_LABEL,
+    ARCHIVED_BY_LABEL,
     KEEP_WARM_LABEL,
     KEEP_WARM_STATS_LABEL,
     LAST_CACHE_LABEL,
     ChildKeepWarmSweeper,
+    keep_warm_status_from_labels,
+    warm_state_for_labels,
     warm_state_from_label,
 )
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import Host
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 pytestmark = pytest.mark.asyncio
@@ -48,6 +54,7 @@ _MIRRORED_CODEX_WRAPPER = "codex-native-ui-subagent"
 _HOST_ID = "0123456789abcdef0123456789abcdef"
 _CLAUDE_AGENT = "c0ffee" * 5 + "c0"
 _CODEX_AGENT = "badcad" * 5 + "ba"
+_CLAUDE_SDK_AGENT = "decafe" * 5 + "de"
 
 
 # ── Fakes ────────────────────────────────────────────────
@@ -179,6 +186,19 @@ class _FakeAgentCache:
 
     def load(self, agent_id: str, bundle_location: str, *, expand_env: bool) -> Any:
         executor = SimpleNamespace(config={"harness": self.harness}, type="native")
+        return SimpleNamespace(spec=SimpleNamespace(executor=executor))
+
+
+class _HarnessByAgentCache:
+    """Agent cache resolving each agent id to its own scripted harness."""
+
+    def __init__(self, harness_by_agent: dict[str, str]) -> None:
+        self._harness_by_agent = harness_by_agent
+
+    def load(self, agent_id: str, bundle_location: str, *, expand_env: bool) -> Any:
+        del bundle_location, expand_env
+        harness = self._harness_by_agent.get(agent_id, "claude-native")
+        executor = SimpleNamespace(config={"harness": harness}, type="native")
         return SimpleNamespace(spec=SimpleNamespace(executor=executor))
 
 
@@ -442,6 +462,27 @@ async def test_due_main_session_is_pinged_and_the_label_carries_the_attempt(
     assert not any(items.values())
 
 
+async def test_claude_sdk_main_session_is_pinged(harness: _Harness) -> None:
+    """A top-level claude-sdk session gets a claude-family ping on the SDK harness."""
+    u = harness.now - 55 * 60
+    main = _main(
+        harness,
+        harness_override="claude-sdk",
+        labels={KEEP_WARM_LABEL: _warm_label(t=u)},
+        running_since=u,
+    )
+
+    await _tick(harness)
+
+    pings = harness.forward.pings()
+    assert len(pings) == 1
+    assert pings[0]["session_id"] == main.id
+    body = pings[0]["body"]
+    assert body["type"] == "keep_warm_ping"
+    assert body["harness"] == "claude-sdk"
+    assert body["family"] == "claude"
+
+
 async def test_child_is_pinged_without_the_mother_present(harness: _Harness) -> None:
     """Scenario 2: no parent-presence gate — a long-idle mother changes nothing."""
     parent = _parent(harness, live_status="idle")
@@ -573,6 +614,26 @@ async def test_codex_session_uses_the_shorter_interval(harness: _Harness) -> Non
     assert len(pings) == 1
     assert pings[0]["body"]["family"] == "codex"
     assert pings[0]["body"]["harness"] == "codex-native"
+
+
+async def test_codex_sdk_session_is_pinged_with_its_own_harness(harness: _Harness) -> None:
+    """The SDK Codex harness shares the family and interval, on its own harness id."""
+    u = harness.now - 25 * 60
+    session = _main(
+        harness,
+        harness_override="codex",
+        agent_id=_CODEX_AGENT,
+        labels={KEEP_WARM_LABEL: _warm_label(t=u, interval=_CODEX_INTERVAL_S)},
+        running_since=u,
+    )
+
+    await _tick(harness)
+
+    pings = harness.forward.pings()
+    assert len(pings) == 1
+    assert pings[0]["session_id"] == session.id
+    assert pings[0]["body"]["family"] == "codex"
+    assert pings[0]["body"]["harness"] == "codex"
 
 
 async def test_main_switch_off_keeps_the_main_session_cold(harness: _Harness) -> None:
@@ -1863,6 +1924,42 @@ async def test_migration_defers_when_agent_enumeration_fails(
     assert row is not None and row["child"] is True and row["main"] is False
 
 
+async def test_migration_ignores_sdk_agents(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy migration covers the native agents only, never the SDK agents."""
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_cache",
+        lambda: _HarnessByAgentCache(
+            {
+                _CLAUDE_AGENT: "claude-native",
+                _CODEX_AGENT: "codex",
+                _CLAUDE_SDK_AGENT: "claude-sdk",
+            }
+        ),
+    )
+    native = SimpleNamespace(id=_CLAUDE_AGENT, bundle_location="/fake/claude.zip", session_id=None)
+    sdk_codex = SimpleNamespace(
+        id=_CODEX_AGENT, bundle_location="/fake/codex.zip", session_id=None
+    )
+    sdk_claude = SimpleNamespace(
+        id=_CLAUDE_SDK_AGENT, bundle_location="/fake/claude-sdk.zip", session_id=None
+    )
+    harness.sweeper._app.state.agent_store = _AgentListStore([native, sdk_codex, sdk_claude])
+    harness.prefs.keep_warm = None
+    harness.prefs.collab = {"enabled": True, "childKeepWarmEnabled": True}
+    _main(harness, running_since=harness.now - 120)
+
+    await _tick(harness)
+
+    assert len(harness.prefs.patches) == 1
+    _owner, namespace, value = harness.prefs.patches[0]
+    assert namespace == "keep_warm"
+    assert _CLAUDE_AGENT in value["agents"]
+    assert _CODEX_AGENT not in value["agents"]
+    assert _CLAUDE_SDK_AGENT not in value["agents"]
+
+
 # ── warm_state rule ──────────────────────────────────────
 
 
@@ -1962,6 +2059,272 @@ async def test_codex_warm_state_follows_the_latest_observation() -> None:
         warm_state_from_label(hit, archived=False, harness="codex-native", busy=True, now=now)
         == "warm"
     )
+
+
+async def test_codex_warm_state_reads_a_fresh_settle_without_an_observation() -> None:
+    """An observation-less codex episode reads warm while its real turn's
+    settle is inside the staleness bound; a recorded o still outranks it."""
+    now = 1_000_000
+    fresh_settle = _label(s="w", t=1, c=now - 60, u=now - 60)
+    stale_settle = _label(s="w", t=1, c=now - 1801, u=now - 1801)
+    miss_with_fresh_settle = _label(s="w", t=1, c=now - 60, u=now - 60, o=[now - 120, 0])
+    hit_with_fresh_settle = _label(s="w", t=1, c=now - 60, u=now - 60, o=[now - 120, 1])
+
+    def state(label: str, **kwargs: int) -> str | None:
+        return warm_state_from_label(
+            label,
+            archived=False,
+            harness="codex-native",
+            busy=False,
+            now=now,
+            **kwargs,
+        )
+
+    assert state(fresh_settle) == "warm"
+    assert state(stale_settle) == "cold"
+    assert state(miss_with_fresh_settle) == "cold"
+    assert state(hit_with_fresh_settle) == "warm"
+    # The staleness bound is the agent's interval + 300 s when configured.
+    assert state(stale_settle, codex_staleness_s=3600) == "warm"
+
+
+async def test_warm_state_label_round_trips_the_family() -> None:
+    """The family stamp survives a serialize / parse cycle; bad values drop."""
+    state = child_keep_warm._WarmState(s="w", y="claude", t=1)
+    serialized = state.to_label()
+    parsed = child_keep_warm._WarmState.parse(serialized)
+    assert parsed is not None
+    assert parsed.y == "claude"
+    assert '"y":"claude"' in serialized
+    # A label without the stamp, or with an unknown family, reads no family.
+    assert child_keep_warm._WarmState.parse(_label(s="w", t=1)).y is None
+    assert child_keep_warm._WarmState.parse(_label(s="w", y="other", t=1)).y is None
+
+
+async def test_warm_state_for_labels_uses_the_family_stamp() -> None:
+    """No harness lookup: the label's ``y`` picks the per-family rule."""
+    now = 1_000_000
+    claude_warm = _label(s="w", y="claude", t=1, u=now - 100, w=now + 100)
+    claude_stale = _label(s="w", y="claude", t=1, u=now - 3601, w=now + 100)
+    codex_hit = _label(s="w", y="codex", t=1, u=now - 1200, w=now, o=[now - 1200, 1])
+    codex_stale = _label(s="w", y="codex", t=1, u=now - 2400, w=now, o=[now - 2400, 1])
+    codex_miss = _label(s="w", y="codex", t=1, u=now - 1200, w=now, o=[now - 1200, 0])
+
+    def _state(labels: dict[str, str], *, archived: bool = False, busy: bool = False) -> Any:
+        return warm_state_for_labels(labels, archived=archived, busy=busy, now=now)
+
+    assert _state({KEEP_WARM_LABEL: claude_warm}) == "warm"
+    assert _state({KEEP_WARM_LABEL: claude_stale}) == "cold"
+    assert _state({KEEP_WARM_LABEL: codex_hit}) == "warm"
+    assert _state({KEEP_WARM_LABEL: codex_stale}) == "cold"
+    assert _state({KEEP_WARM_LABEL: codex_miss}) == "cold"
+    # Busy wins over the clock / observation: the next turn touches the cache.
+    assert _state({KEEP_WARM_LABEL: claude_stale}, busy=True) == "warm"
+    assert _state({}, busy=True) is None
+    # Archived, no labels, and a label predating the family stamp read None.
+    assert _state({KEEP_WARM_LABEL: claude_warm}, archived=True) is None
+    assert _state({}) is None
+    assert _state({KEEP_WARM_LABEL: _label(s="w", t=1, u=now - 100)}) is None
+    assert _state({"omnigent.keep_warm_stats": "{}"}) is None
+
+
+async def test_warm_state_for_labels_falls_back_to_the_harness_family() -> None:
+    """No label or a pre-stamp label reads per the resolved harness family."""
+    now = 1_000_000
+    # No label: cold when idle, warm while busy, None without a family.
+    assert (
+        warm_state_for_labels({}, archived=False, busy=False, now=now, family="claude") == "cold"
+    )
+    assert warm_state_for_labels({}, archived=False, busy=True, now=now, family="claude") == "warm"
+    assert warm_state_for_labels({}, archived=False, busy=False, now=now) is None
+    # A label predating the family stamp uses the resolved family's rule.
+    stale_codex = _label(s="w", t=1, u=now - 1200, o=[now - 2400, 1])
+    hit_codex = _label(s="w", t=1, u=now - 1200, o=[now - 1200, 1])
+    assert (
+        warm_state_for_labels(
+            {KEEP_WARM_LABEL: stale_codex}, archived=False, busy=False, now=now, family="codex"
+        )
+        == "cold"
+    )
+    assert (
+        warm_state_for_labels(
+            {KEEP_WARM_LABEL: hit_codex}, archived=False, busy=False, now=now, family="codex"
+        )
+        == "warm"
+    )
+    # Archived and mirrored rows read None whatever the family says.
+    assert warm_state_for_labels({}, archived=True, busy=False, now=now, family="claude") is None
+    assert (
+        warm_state_for_labels(
+            {_WRAPPER_LABEL_KEY: _MIRRORED_CLAUDE_WRAPPER},
+            archived=False,
+            busy=False,
+            now=now,
+            family="claude",
+        )
+        is None
+    )
+
+
+async def test_keep_warm_family_helpers_read_harness_and_label() -> None:
+    """The family helpers map supported harnesses and the label's ``y`` stamp."""
+    assert child_keep_warm.keep_warm_family_for_harness("claude-native") == "claude"
+    assert child_keep_warm.keep_warm_family_for_harness("claude-sdk") == "claude"
+    assert child_keep_warm.keep_warm_family_for_harness("codex") == "codex"
+    assert child_keep_warm.keep_warm_family_for_harness("opencode-native") is None
+    assert child_keep_warm.keep_warm_family_for_harness(None) is None
+    assert (
+        child_keep_warm.keep_warm_family_from_labels({KEEP_WARM_LABEL: _label(s="w", y="codex")})
+        == "codex"
+    )
+    assert child_keep_warm.keep_warm_family_from_labels({KEEP_WARM_LABEL: _label(s="w")}) is None
+    assert child_keep_warm.keep_warm_family_from_labels({}) is None
+
+
+async def test_sweeper_stamps_the_family_on_label_writes(harness: _Harness) -> None:
+    """A fresh episode and a due ping both persist ``y`` for label readers."""
+    main = _main(harness, running_since=harness.now - 50)
+    await _tick(harness)
+    opened = _read_label(harness, main.id)
+    assert opened is not None and opened.y == "claude"
+
+    child = _child(
+        harness,
+        main.id,
+        labels={
+            KEEP_WARM_LABEL: _warm_label(
+                t=harness.now - 100, u=harness.now - _CLAUDE_INTERVAL_S - 1
+            )
+        },
+        running_since=harness.now - 100,
+    )
+    assert _read_label(harness, child.id).y is None
+    await _tick(harness)
+    due = _read_label(harness, child.id)
+    assert due is not None and due.y == "claude"
+    assert due.a is not None
+
+
+async def test_keep_warm_status_maps_state_reasons_and_costs() -> None:
+    """The status object reads on / paused / stopped / off from the label."""
+    now = 1_000_000
+    stats = child_keep_warm._WarmStats(
+        ep_p=3,
+        ep_c=40_000,
+        ep_e=True,
+        ep_s=now - 3600,
+        tot_p=9,
+        tot_c=120_000,
+        tot_e=True,
+        lr_at=now - 50,
+        lr_r="hit",
+    ).to_label()
+
+    def _status(raw: str | None, *, archived: bool = False) -> dict[str, Any] | None:
+        labels = {} if raw is None else {KEEP_WARM_LABEL: raw, KEEP_WARM_STATS_LABEL: stats}
+        return keep_warm_status_from_labels(labels, archived=archived, now=now)
+
+    on = _status(_label(s="w", y="claude", t=1, u=now - 100, w=now + 100))
+    assert on is not None
+    assert on["state"] == "on"
+    assert on["stop_reason"] is None
+    # Micro-USD converts to float USD; the last return passes through.
+    assert on["episode"] == {
+        "pings": 3,
+        "cost_usd": pytest.approx(0.04),
+        "estimated": True,
+        "started_at": now - 3600,
+    }
+    assert on["total"] == {"pings": 9, "cost_usd": pytest.approx(0.12), "estimated": True}
+    assert on["last_return"] == {"at": now - 50, "result": "hit"}
+    assert on["last_reason"] is None
+
+    paused = _status(_label(s="p", why="miss", y="claude", t=1))
+    assert paused is not None
+    assert paused["state"] == "paused"
+    assert paused["stop_reason"] == "misses"
+
+    stopped = _status(_label(s="c", why="cap", y="claude", t=1))
+    assert stopped is not None
+    assert stopped["state"] == "stopped"
+    assert stopped["stop_reason"] == "cap"
+
+    off = _status(_label(s="c", y="claude", t=1))
+    assert off is not None
+    assert off["state"] == "off"
+    assert off["stop_reason"] is None
+
+    # An unrecognized stored code never errors; it reads a null stop reason.
+    unknown = _status(_label(s="c", why="exp", y="claude", t=1))
+    assert unknown is not None
+    assert unknown["state"] == "stopped"
+    assert unknown["stop_reason"] is None
+
+    assert _status(None) is None
+    assert _status(_label(s="w", y="claude", t=1), archived=True) is None
+
+
+async def test_keep_warm_status_reports_a_blocking_gate() -> None:
+    """A warm label blocked by a gate reads off / paused with its gate reason."""
+    now = 1_000_000
+
+    def _gate(k: str) -> dict[str, Any] | None:
+        return keep_warm_status_from_labels(
+            {KEEP_WARM_LABEL: _label(s="w", k=k, y="claude", t=1, u=now - 100)},
+            archived=False,
+            now=now,
+        )
+
+    switch = _gate("switch")
+    assert switch is not None
+    assert switch["state"] == "off"
+    assert switch["stop_reason"] == "switch_off"
+    assert switch["last_reason"] == "switch"
+
+    runner = _gate("runner")
+    assert runner is not None
+    assert runner["state"] == "paused"
+    assert runner["stop_reason"] == "host"
+    assert runner["last_reason"] == "runner"
+
+    host = _gate("host")
+    assert host is not None
+    assert host["state"] == "paused"
+    assert host["stop_reason"] == "host"
+    assert host["last_reason"] == "host"
+
+    card = _gate("card")
+    assert card is not None
+    assert card["state"] == "paused"
+    assert card["stop_reason"] == "card"
+    assert card["last_reason"] == "card"
+
+
+async def test_keep_warm_status_keeps_a_receipt_code_on() -> None:
+    """A non-gate receipt code leaves a warm episode on with no stop reason."""
+    now = 1_000_000
+    status = keep_warm_status_from_labels(
+        {KEEP_WARM_LABEL: _label(s="w", k="btw_unavailable", y="claude", t=1, u=now - 100)},
+        archived=False,
+        now=now,
+    )
+    assert status is not None
+    assert status["state"] == "on"
+    assert status["stop_reason"] is None
+    assert status["last_reason"] == "btw_unavailable"
+
+
+async def test_keep_warm_status_names_the_failure_cause() -> None:
+    """A failures pause carries the last ping's raw skip / fail code."""
+    status = keep_warm_status_from_labels(
+        {KEEP_WARM_LABEL: _label(s="p", why="fail", k="btw_unavailable", y="claude", t=1, f=3)},
+        archived=False,
+        now=1_000_000,
+    )
+    assert status is not None
+    assert status["state"] == "paused"
+    assert status["stop_reason"] == "failures"
+    assert status["last_reason"] == "btw_unavailable"
 
 
 # ── Label mechanics ──────────────────────────────────────
@@ -2072,3 +2435,241 @@ async def test_legacy_why_codes_round_trip() -> None:
     for why in ("mom", "pol"):
         state = child_keep_warm._WarmState(s="c", why=why, t=1, c=1, u=1, w=1)
         assert child_keep_warm._WarmState.parse(state.to_label()) == state
+
+
+# ── Host-offline archive pass ────────────────────────────
+
+
+class _HostStore:
+    """Host store fake with scripted rows."""
+
+    def __init__(self, hosts: dict[str, Host]) -> None:
+        self._hosts = hosts
+
+    def get_host(self, host_id: str) -> Host | None:
+        return self._hosts.get(host_id)
+
+
+def _wire_host(harness: _Harness, host_id: str, *, status: str, updated_at: int) -> Host:
+    """Attach a scripted host row to the sweeper's app state."""
+    host = Host(
+        host_id=host_id,
+        name="keep-warm-test-host",
+        user_id=RESERVED_USER_LOCAL,
+        status=status,
+        created_at=updated_at,
+        updated_at=updated_at,
+    )
+    harness.sweeper._app.state.host_store = _HostStore({host_id: host})
+    return host
+
+
+async def _tick_archive_pass(harness: _Harness) -> None:
+    """Drive enough ticks to run the host-offline archive pass exactly once."""
+    for _ in range(child_keep_warm._ARCHIVE_PASS_TICK_INTERVAL):
+        await _tick(harness)
+
+
+def _archived(harness: _Harness, session_id: str) -> bool:
+    conv = harness.store.get_conversation(session_id)
+    assert conv is not None
+    return bool(conv.archived)
+
+
+async def test_host_offline_past_threshold_archives_the_child(harness: _Harness) -> None:
+    """A child whose host is offline past the 4 h default is archived, stamped."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    assert conv.labels[ARCHIVE_REASON_LABEL] == "host_offline"
+    assert conv.labels[ARCHIVED_BY_LABEL] == "keep_warm"
+    assert (child.id, None) in harness.published
+    # The mother is a top-level row: never touched by the pass.
+    assert _archived(harness, parent.id) is False
+
+
+async def test_host_offline_archive_stamps_provenance_before_the_archive_flag(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The labels are already stored when the archive flag is committed."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+    original = harness.store.update_conversation
+    observed: list[dict[str, str]] = []
+
+    def _spy(session_id: str, **kwargs: Any) -> Conversation | None:
+        if kwargs.get("archived") is True:
+            conv = harness.store.get_conversation(session_id)
+            assert conv is not None
+            observed.append(dict(conv.labels))
+        return original(session_id, **kwargs)
+
+    monkeypatch.setattr(harness.store, "update_conversation", _spy)
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+    assert len(observed) == 1
+    assert observed[0][ARCHIVE_REASON_LABEL] == "host_offline"
+    assert observed[0][ARCHIVED_BY_LABEL] == "keep_warm"
+
+
+async def test_host_offline_archive_clears_provenance_when_the_update_returns_none(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused archive update leaves the live row with neither label."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+    original = harness.store.update_conversation
+
+    def _refuse(session_id: str, **kwargs: Any) -> Conversation | None:
+        if kwargs.get("archived") is True:
+            return None
+        return original(session_id, **kwargs)
+
+    monkeypatch.setattr(harness.store, "update_conversation", _refuse)
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    assert ARCHIVE_REASON_LABEL not in conv.labels
+    assert ARCHIVED_BY_LABEL not in conv.labels
+
+
+async def test_host_offline_under_threshold_leaves_the_child(harness: _Harness) -> None:
+    """One minute short of the 4 h default, nothing is archived."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 - 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+
+
+async def test_host_offline_archive_never_touches_top_level_sessions(
+    harness: _Harness,
+) -> None:
+    """The pass scans ``kind="sub_agent"`` only, even for a host-bound main."""
+    main = harness.store.create_conversation(
+        agent_id=_CLAUDE_AGENT,
+        host_id=_HOST_ID,
+        workspace="/tmp/kw-main",
+    )
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, main.id) is False
+
+
+async def test_host_offline_archive_setting_zero_disables(harness: _Harness) -> None:
+    """``hostOfflineArchiveSeconds: 0`` turns the pass off for that owner."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True}},
+        "hostOfflineArchiveSeconds": 0,
+    }
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+
+
+async def test_host_offline_archive_has_no_recency_window(harness: _Harness) -> None:
+    """A child untouched for days is still archived — the pass has no updated_after."""
+    from sqlalchemy import update as sql_update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlConversation
+
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+    # Backdate the row three days, well outside the ping candidate window.
+    with Session(harness.store._engine) as session:
+        session.execute(
+            sql_update(SqlConversation)
+            .where(SqlConversation.id == child.id)
+            .values(updated_at=harness.now - 3 * 86400)
+        )
+        session.commit()
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+
+
+async def test_unarchive_exemption_skips_the_same_offline_spell(harness: _Harness) -> None:
+    """A row pinned to the host's current last-seen stamp is not re-archived."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    host = _wire_host(
+        harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60)
+    )
+    harness.store.set_labels(child.id, {ARCHIVE_EXEMPT_SINCE_LABEL: str(host.updated_at)})
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+
+
+async def test_unarchive_exemption_expires_when_the_host_last_seen_moves(
+    harness: _Harness,
+) -> None:
+    """A stamp from a PREVIOUS offline spell no longer exempts the row."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    host = _wire_host(
+        harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60)
+    )
+    # The exemption names an older last-seen stamp: the host reconnected (and
+    # died again) since the user unarchived, so the pass applies once more.
+    harness.store.set_labels(child.id, {ARCHIVE_EXEMPT_SINCE_LABEL: str(host.updated_at - 7200)})
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+
+
+async def test_host_offline_archive_caps_a_pass_at_fifty(harness: _Harness) -> None:
+    """A dead host's fleet archives in bounded batches, not one burst."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    children = [
+        _child(harness, parent.id, live_status=None, title=f"researcher:task{i}")
+        for i in range(55)
+    ]
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    await _tick_archive_pass(harness)
+
+    archived = [child.id for child in children if _archived(harness, child.id)]
+    assert len(archived) == child_keep_warm._ARCHIVE_PASS_MAX_ARCHIVES
+
+
+async def test_host_offline_archive_runs_only_every_tenth_tick(harness: _Harness) -> None:
+    """The pass cadence: ticks before the interval boundary archive nothing."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    for _ in range(child_keep_warm._ARCHIVE_PASS_TICK_INTERVAL - 1):
+        await _tick(harness)
+    assert _archived(harness, child.id) is False
+
+    await _tick(harness)
+    assert _archived(harness, child.id) is True

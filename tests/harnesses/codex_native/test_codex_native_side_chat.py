@@ -169,6 +169,52 @@ def test_is_omnigent_side_fork_discriminates_fork_from_system_ephemeral() -> Non
 
 
 # --------------------------------------------------------------------------- #
+# is_keep_warm_fork — keep-warm ping fork discriminator
+# --------------------------------------------------------------------------- #
+def _keep_warm_started(thread_id: str = "thread_fork") -> _JsonObject:
+    """A keep-warm fork's ``thread/started``: ephemeral with the marker source."""
+    event = _fork_started(thread_id=thread_id, forked_from="thread_parent")
+    event["params"]["thread"]["threadSource"] = side_chat.KEEP_WARM_THREAD_SOURCE
+    return event
+
+
+def test_is_keep_warm_fork_matches_only_the_marked_ephemeral_fork() -> None:
+    assert side_chat.is_keep_warm_fork(_keep_warm_started())
+    # a /side fork (ephemeral, but no keep-warm threadSource) must NOT match
+    assert not side_chat.is_keep_warm_fork(
+        _fork_started(thread_id="s", forked_from="thread_parent")
+    )
+    # a marked but persistent thread must NOT match
+    persistent = _keep_warm_started()
+    persistent["params"]["thread"]["ephemeral"] = False
+    assert not side_chat.is_keep_warm_fork(persistent)
+    # non-thread/started
+    assert not side_chat.is_keep_warm_fork({"method": "turn/started", "params": {}})
+
+
+@pytest.mark.asyncio
+async def test_register_side_fork_child_ignores_a_keep_warm_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A keep-warm fork matches the side-fork shape but never surfaces as a child."""
+    ensure = _ensure_stub("conv_side")
+    monkeypatch.setattr(fwd, "_ensure_child_session", ensure)
+    state = fwd._CodexForwarderState()
+
+    child_session = await side_chat.register_side_fork_child(
+        object(),
+        forwarder_state=state,
+        parent_session_id="conv_parent",
+        parent_thread_id="thread_parent",
+        event=_keep_warm_started(),
+    )
+
+    assert child_session is None
+    assert state.session_for_child_thread("thread_fork") is None
+    ensure.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- #
 # register_side_fork_child — forwarder auto-surface
 # --------------------------------------------------------------------------- #
 def _ensure_stub(child_session_id: str | None) -> AsyncMock:

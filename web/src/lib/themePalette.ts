@@ -86,6 +86,8 @@ export interface PaletteTokens {
   input: string;
   ring: string;
   brandAccent: string;
+  /** Clear blue marking a cold keep-warm cache (sidebar indicators). */
+  keepCold: string;
   sidebar: string;
   sidebarForeground: string;
   sidebarPrimary: string;
@@ -126,6 +128,7 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   input: "input",
   ring: "ring",
   brandAccent: "brand-accent",
+  keepCold: "keep-cold",
   sidebar: "sidebar",
   sidebarForeground: "sidebar-foreground",
   sidebarPrimary: "sidebar-primary",
@@ -178,6 +181,9 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     buttonBorder: tokens.border,
     input: tokens.border,
     brandAccent: tokens.ring,
+    // A fixed status blue, not the palette accent: cold means "cache likely
+    // lost" on every theme, so it must not shift with the brand color.
+    keepCold: tokens.keepCold ?? "#2f7fd4",
     sidebarForeground: tokens.foreground,
     sidebarPrimary: tokens.ring,
     sidebarPrimaryForeground: tokens.primaryForeground,

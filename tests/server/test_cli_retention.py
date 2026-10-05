@@ -1,8 +1,10 @@
 """Server coordination for Host-scoped idle CLI pools."""
 
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -876,3 +878,116 @@ async def test_release_host_after_delete_skips_reset_without_known_revision(
     assert posts == []
     warnings = [record.message for record in caplog.records if record.levelno >= logging.WARNING]
     assert any("host-gone" in message and "3" in message for message in warnings)
+
+
+async def _reconcile_keep_warm_session(
+    keep_warm_label: str, *, archived: bool = False
+) -> tuple[dict[str, Any], Any]:
+    """Reconcile one idle-eligible session carrying the given keep-warm label."""
+    conversation = SimpleNamespace(
+        id="keep-warm-root",
+        runner_id="runner-root",
+        host_id="host-a",
+        archived=archived,
+        labels={"omnigent.keep_warm": keep_warm_label},
+    )
+    policy = CliRetentionPolicy(max_idle_clis=0, close_on_archive=not archived)
+
+    class _HostStore:
+        def get_host(self, host_id):
+            assert host_id == "host-a"
+            return SimpleNamespace(cli_retention_revision=0, cli_retention_policy=policy)
+
+    class _ConversationStore:
+        def list_conversations(self, **kwargs):
+            assert kwargs["include_archived"] is archived
+            return PagedList(data=[conversation])
+
+        def list_child_conversation_ids_by_parent(self, parent_ids):
+            return {parent_id: [] for parent_id in parent_ids}
+
+        def get_conversations(self, conversation_ids):
+            assert conversation_ids == []
+            return {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "session_id": "keep-warm-root",
+                "present": True,
+                "supported": True,
+                "family": "claude",
+                "busy": False,
+                "eligible": True,
+                "idle_seconds": 7200.0,
+                "activity_token": "root-idle",
+                "runtime_generation": "boot:root",
+                "host_id": "host-a",
+                "policy_revision": 0,
+            }
+
+    class _Client:
+        def __init__(self):
+            self.posts = []
+
+        async def get(self, _url, *, params, timeout):
+            del params, timeout
+            return _Response()
+
+        async def post(self, url, *, json, timeout):
+            del timeout
+            self.posts.append((url, json))
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "released"})
+
+    client = _Client()
+
+    class _Router:
+        def client_for_session_resources(self, session_id, *, conversation):
+            assert session_id == conversation.id == "keep-warm-root"
+            return SimpleNamespace(client=client, runner_id="runner-root")
+
+    coordinator = CliRetentionCoordinator(
+        host_store=_HostStore(),
+        conversation_store=_ConversationStore(),
+        runner_router=_Router(),
+    )
+    result = await coordinator.reconcile_host_once("host-a")
+    return result, client
+
+
+@pytest.mark.asyncio
+async def test_active_keep_warm_episode_protects_idle_session() -> None:
+    """A session mid warm episode is never released out from under the warming."""
+    result, client = await _reconcile_keep_warm_session(json.dumps({"s": "w"}))
+
+    assert result["families"] == {
+        "claude": {"idle": 0, "active": 1, "below_threshold": 0, "total": 1}
+    }
+    assert result["released"] == []
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_archived_keep_warm_episode_does_not_protect_idle_session() -> None:
+    """An archived row's stale warm label must not pin its idle CLI forever."""
+    result, client = await _reconcile_keep_warm_session(json.dumps({"s": "w"}), archived=True)
+
+    assert result["families"] == {
+        "claude": {"idle": 1, "active": 0, "below_threshold": 0, "total": 1}
+    }
+    assert result["released"] == ["keep-warm-root"]
+    assert len(client.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_cold_keep_warm_episode_is_released_normally() -> None:
+    """A cold episode no longer yields the pool: the idle session is released."""
+    result, client = await _reconcile_keep_warm_session(json.dumps({"s": "c"}))
+
+    assert result["families"] == {
+        "claude": {"idle": 1, "active": 0, "below_threshold": 0, "total": 1}
+    }
+    assert result["released"] == ["keep-warm-root"]
+    assert len(client.posts) == 1

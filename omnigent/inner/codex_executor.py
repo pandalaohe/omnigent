@@ -41,6 +41,15 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.errors import HarnessTransportClosedError
+from omnigent.harnesses.codex_native.keep_warm import (
+    KeepWarmPingResult,
+    drive_keep_warm_ping,
+    keep_warm_receipt,
+    keep_warm_result_receipt,
+)
+from omnigent.harnesses.codex_native.side_chat import (
+    is_keep_warm_fork as _is_keep_warm_fork,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -151,6 +160,10 @@ CodexToolExecutor: TypeAlias = Callable[
 CodexElicitationHandler: TypeAlias = Callable[
     ["ElicitationRequestParams"], Awaitable["ElicitationResult | None"]
 ]
+
+# Retired keep-warm fork ids whose late messages are still dropped; bounded
+# because a session pings at most once per provider cache window.
+_KEEP_WARM_RETIRED_LIMIT = 32
 
 # When the app-server is silent for this long we emit a warning,
 # but keep waiting — a long-running tool or model call can legitimately
@@ -2876,6 +2889,14 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+async def _keep_warm_queue_events(
+    queue: asyncio.Queue[CodexMessage],
+) -> AsyncIterator[CodexMessage]:
+    """Yield a keep-warm fork's diverted messages; the ping driver stops it."""
+    while True:
+        yield await queue.get()
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -2978,6 +2999,17 @@ class _CodexAppServerSession:
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
         self._supports_direct_tool_namespaces = False
+        # Keep-warm ping fork traffic is diverted out of ``_events`` into a
+        # per-fork queue the ping drains, so a fork turn never bumps the
+        # session's turn counters or reaches ``run_turn``. A retired fork id
+        # (its ping ended) drops late messages; both maps stay bounded since
+        # pings are rare (one per provider cache window).
+        self._keep_warm_queues: dict[str, asyncio.Queue[CodexMessage]] = {}
+        self._keep_warm_retired: dict[str, None] = {}
+        # One ping at a time per session: an overlapping ping's snapshot-based
+        # retirement would otherwise retire the first ping's live fork queue.
+        # Held across the whole ping, including the cleanup retirement.
+        self._keep_warm_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
@@ -4505,6 +4537,100 @@ class _CodexAppServerSession:
         # Buffered terminal/output events must be consumed before EOF.
         self._events.put_nowait(error)
 
+    def _keep_warm_fork_id_for(self, message: CodexMessage) -> str | None:
+        """
+        Return the keep-warm fork thread id *message* belongs to, else None.
+
+        A keep-warm ``thread/started`` registers its fork id with a fresh
+        queue (the ping may have registered it first, off the fork
+        response); later messages route by ``params.threadId``. A retired id
+        (its ping ended) still counts so its stragglers are dropped, never
+        delivered to ``_events``.
+
+        :param message: Decoded app-server frame (notification or request).
+        :returns: The fork thread id, or ``None`` for regular traffic.
+        """
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return None
+        if _is_keep_warm_fork(message):
+            thread = params.get("thread")
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            if isinstance(thread_id, str) and thread_id:
+                if thread_id not in self._keep_warm_retired:
+                    self._keep_warm_queues.setdefault(thread_id, asyncio.Queue())
+                return thread_id
+            return None
+        # Legacy server requests identify the thread by ``conversationId``.
+        thread_id = params.get("threadId") or params.get("conversationId")
+        if not isinstance(thread_id, str) or not thread_id:
+            return None
+        if thread_id in self._keep_warm_queues or thread_id in self._keep_warm_retired:
+            return thread_id
+        return None
+
+    @property
+    def keep_warm_busy(self) -> bool:
+        """Whether a keep-warm ping currently owns this session (lock held)."""
+        return self._keep_warm_lock.locked()
+
+    async def keep_warm_ping(self) -> KeepWarmPingResult:
+        """
+        Run one guarded keep-warm ping on this session's live connection.
+
+        Serialized per session: the lock is held across the whole ping
+        including the fork retirement, so overlapping callers cannot retire
+        each other's fork queues.
+
+        :returns: The ping outcome and raw usage.
+        """
+        async with self._keep_warm_lock:
+            return await self._keep_warm_ping_locked()
+
+    async def _keep_warm_ping_locked(self) -> KeepWarmPingResult:
+        """
+        Run the ping while ``_keep_warm_lock`` is held.
+
+        Whoever calls ``thread/fork`` owns the fork's event stream, so the
+        fork rides this connection: its messages are diverted into the
+        per-fork queue the ping drains, and a real turn running meanwhile is
+        untouched. The fork is retired when the ping ends.
+
+        :returns: The ping outcome and raw usage.
+        """
+        assert self.thread_id is not None  # the executor gates on a live thread
+        queue: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        fork_id_holder: list[str] = []
+        # The reader may divert the fork's early ``thread/started`` into its
+        # own queue before the fork RPC answers — or before it fails, when
+        # ``events_for`` never runs. Snapshot the existing registrations so
+        # every exit also retires the ones the reader created during the ping.
+        registered_before = set(self._keep_warm_queues)
+
+        def _events_for(fork_id: str) -> AsyncIterator[CodexMessage]:
+            # The reader may already have seen the fork's thread/started and
+            # created its queue; reuse it so those messages are not stranded.
+            fork_id_holder.append(fork_id)
+            return _keep_warm_queue_events(self._keep_warm_queues.setdefault(fork_id, queue))
+
+        try:
+            return await drive_keep_warm_ping(
+                request=self._request,
+                respond=self._send_response,
+                events_for=_events_for,
+                parent_thread_id=self.thread_id,
+            )
+        finally:
+            retired_ids = set(fork_id_holder)
+            retired_ids.update(
+                fork_id for fork_id in self._keep_warm_queues if fork_id not in registered_before
+            )
+            for fork_id in retired_ids:
+                self._keep_warm_queues.pop(fork_id, None)
+                self._keep_warm_retired[fork_id] = None
+                while len(self._keep_warm_retired) > _KEEP_WARM_RETIRED_LIMIT:
+                    self._keep_warm_retired.pop(next(iter(self._keep_warm_retired)))
+
     async def _reader_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         try:
@@ -4523,6 +4649,14 @@ class _CodexAppServerSession:
                     future = self._pending_requests.pop(int(message["id"]), None)
                     if future is not None and not future.done():
                         future.set_result(message)
+                    continue
+                # A keep-warm ping fork's stream belongs to the ping, not to
+                # the session: divert it before it notes activity or queues.
+                keep_warm_fork_id = self._keep_warm_fork_id_for(message)
+                if keep_warm_fork_id is not None:
+                    queue = self._keep_warm_queues.get(keep_warm_fork_id)
+                    if queue is not None:
+                        queue.put_nowait(message)
                     continue
                 self._note_native_activity(message)
                 await self._events.put(message)
@@ -4988,6 +5122,56 @@ class CodexExecutor(Executor):
         if state is None or state.app_session is None:
             return False
         return await state.app_session.enqueue_message(content)
+
+    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
+        """
+        Ping the live Codex session with a guarded ephemeral-fork turn
+        (keep-warm).
+
+        Only ever reuses the live app-server subprocess — a ping never
+        starts or rebuilds one. A turn in flight, or a ping already running
+        on this session, skips ``busy`` without waiting; a real ``run_turn``
+        arriving during the ping runs normally (the fork is a separate
+        thread whose events ride a separate queue).
+
+        :param attempt_id: Server-allocated ping attempt id, echoed on the
+            receipt.
+        :param family: Model family from the server; unused — this channel
+            only ever serves ``"codex"``.
+        :returns: The normalized receipt dict.
+        """
+        del family
+        app_session = self._live_app_session()
+        if app_session is None:
+            return keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
+        if app_session.active_turn_id is not None:
+            return keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
+        if app_session.keep_warm_busy:
+            return keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
+        try:
+            result = await app_session.keep_warm_ping()
+        except Exception:
+            logger.exception("codex: keep-warm ping failed")
+            return keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+        return keep_warm_result_receipt(attempt_id, result)
+
+    def _live_app_session(self) -> _CodexAppServerSession | None:
+        """
+        Return the live app-server session when one is usable; never starts one.
+
+        :returns: The started, transport-healthy session with a thread, or
+            ``None``.
+        """
+        for state in self._session_states.values():
+            app_session = state.app_session
+            if app_session is None or app_session.thread_id is None:
+                continue
+            if not app_session._started or app_session._closing:
+                continue
+            if app_session._transport_error is not None:
+                continue
+            return app_session
+        return None
 
     async def close_session(self, session_key: str) -> None:
         state = self._session_states.get(session_key)

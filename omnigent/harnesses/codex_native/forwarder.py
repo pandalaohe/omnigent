@@ -194,6 +194,9 @@ _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
 _CODEX_SERVER_REQUEST_RESOLVED_METHOD = "serverRequest/resolved"
 _EXTERNAL_SESSION_INTERRUPTED_TYPE = "external_session_interrupted"
 _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
+# Bound on recorded keep-warm fork thread ids; pings are rare (one per cache
+# window per session), so the cap is never reached in practice.
+_KEEP_WARM_FORK_THREAD_LIMIT = 64
 # Sessions event carrying a Codex plan mapped to the todo-list schema so the
 # web TodoPanel renders it like Claude's TodoWrite output.
 _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
@@ -779,6 +782,32 @@ class _CodexForwarderState:
     mcp_startup_settled: bool = False
     posted_goal_state: str | None = None
     posted_goal_state_known: bool = False
+    # Keep-warm ping fork thread ids (insertion-ordered) whose whole event
+    # stream this connection skips: the ping driver owns it on its own
+    # connection, so nothing here may surface (no card, item, usage, child).
+    keep_warm_fork_threads: dict[str, None] = field(default_factory=dict)
+
+    def note_keep_warm_fork_thread(self, thread_id: str) -> None:
+        """
+        Record a keep-warm ping fork thread whose events are all skipped.
+
+        :param thread_id: The fork's Codex thread id, e.g. ``"thread_fork"``.
+        :returns: None.
+        """
+        self.keep_warm_fork_threads.pop(thread_id, None)
+        self.keep_warm_fork_threads[thread_id] = None
+        while len(self.keep_warm_fork_threads) > _KEEP_WARM_FORK_THREAD_LIMIT:
+            oldest = next(iter(self.keep_warm_fork_threads))
+            self.keep_warm_fork_threads.pop(oldest)
+
+    def is_keep_warm_fork_thread(self, thread_id: str | None) -> bool:
+        """
+        Return whether *thread_id* is a recorded keep-warm ping fork.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_fork"``.
+        :returns: ``True`` when the thread's events must be skipped.
+        """
+        return thread_id is not None and thread_id in self.keep_warm_fork_threads
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -2529,6 +2558,10 @@ async def supervise_forwarder(
                                 exc_info=True,
                             )
                         continue
+                    # A keep-warm ping fork's whole stream stays invisible
+                    # here — the ping driver owns it on its own connection.
+                    if _skip_keep_warm_fork_event(event, forwarder_state):
+                        continue
                     # Release the subscribe task as soon as the thread shows
                     # activity (rollout now exists), so it resumes instead of
                     # waiting forever on an idle fresh thread.
@@ -3084,6 +3117,39 @@ async def _subscribe_until_ready_inner(
             replay_from_turn_id=replay_from_turn_id,
         )
         return
+
+
+def _skip_keep_warm_fork_event(event: CodexMessage, forwarder_state: _CodexForwarderState) -> bool:
+    """
+    Return whether *event* belongs to a keep-warm ping fork's stream.
+
+    The fork's ``thread/started`` records its thread id and is itself
+    skipped; every later message (notification or server request) whose
+    thread id is recorded is skipped entirely — no elicitation tracking, no
+    card, no item, no usage, no ``thread_active``. The ping driver owns the
+    fork on its own connection; anything reaching this connection (the
+    app-server broadcasts ``thread/started`` to every listener) must stay
+    invisible.
+
+    :param event: Codex app-server message envelope.
+    :param forwarder_state: Live forwarder state (keep-warm fork set).
+    :returns: ``True`` when the event must be skipped.
+    """
+    if side_chat.is_keep_warm_fork(event):
+        thread_id = _thread_id_from_started_event(event)
+        if thread_id is not None:
+            forwarder_state.note_keep_warm_fork_thread(thread_id)
+        return True
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread_id = _thread_id_from_params(params)
+    if thread_id is None:
+        # Legacy server requests identify the thread by ``conversationId``.
+        legacy_thread_id = params.get("conversationId")
+        if isinstance(legacy_thread_id, str) and legacy_thread_id:
+            thread_id = legacy_thread_id
+    return forwarder_state.is_keep_warm_fork_thread(thread_id)
 
 
 def _event_indicates_thread_active(event: CodexMessage) -> bool:

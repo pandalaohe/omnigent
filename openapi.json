@@ -4200,6 +4200,175 @@
         "type": "object"
       },
       "JsonValue": {},
+      "KeepWarmEpisode": {
+        "description": "Keep-warm ping counters for the episode since the last real turn.",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "description": "Episode spend in USD (integer micro-USD in the label, converted for the wire).",
+            "format": "double",
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "estimated": {
+            "default": false,
+            "description": "Whether any summed ping was an estimated cost (a channel that reports no usage).",
+            "title": "Estimated",
+            "type": "boolean"
+          },
+          "pings": {
+            "default": 0,
+            "description": "Pings forwarded in the current episode.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Pings",
+            "type": "integer"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Episode start epoch seconds, or `None` when no episode label has been written.",
+            "title": "Started At"
+          }
+        },
+        "title": "KeepWarmEpisode",
+        "type": "object"
+      },
+      "KeepWarmLastReturn": {
+        "description": "Cache result of the first real turn after an absence longer than the\nfamily's prompt-cache TTL.",
+        "properties": {
+          "at": {
+            "description": "Epoch seconds the return turn settled.",
+            "format": "int64",
+            "title": "At",
+            "type": "integer"
+          },
+          "result": {
+            "default": "unknown",
+            "description": "`\"hit\"` / `\"miss\"` / `\"unknown\"` from the turn's cache reading.",
+            "enum": [
+              "hit",
+              "miss",
+              "unknown"
+            ],
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "at"
+        ],
+        "title": "KeepWarmLastReturn",
+        "type": "object"
+      },
+      "KeepWarmStatus": {
+        "description": "Keep-warm status object for a session row.\n\nBuilt from the `omnigent.keep_warm` / `omnigent.keep_warm_stats`\nlabels with no settings read. `None` is used at the field level when a\nsession has no keep-warm label or is archived.",
+        "properties": {
+          "episode": {
+            "$ref": "#/components/schemas/KeepWarmEpisode",
+            "description": "Pings / cost since the last real turn."
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The label's raw `k` code \u2014 the last ping's skip / fail reason, e.g. `\"btw_unavailable\"` \u2014 so a `failures` pause names its cause. `None` when no code is stored.",
+            "title": "Last Reason"
+          },
+          "last_return": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KeepWarmLastReturn"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The measured first turn after an absence, or `None` when none was recorded."
+          },
+          "state": {
+            "description": "Episode state \u2014 `\"on\"` while warming is active, `\"off\"` with no episode, `\"paused\"` after repeated failures or measured cache misses, `\"stopped\"` when the cap / window ended.",
+            "enum": [
+              "on",
+              "off",
+              "paused",
+              "stopped"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "stop_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "cap",
+                  "misses",
+                  "failures",
+                  "card",
+                  "host",
+                  "switch_off",
+                  "runner_version"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why warming stopped or paused, or `None` when the stored code has no vocabulary entry.",
+            "title": "Stop Reason"
+          },
+          "total": {
+            "$ref": "#/components/schemas/KeepWarmTotal",
+            "description": "Pings / cost over the session's lifetime."
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "KeepWarmStatus",
+        "type": "object"
+      },
+      "KeepWarmTotal": {
+        "description": "Lifetime keep-warm ping counters for one session.",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "description": "Lifetime spend in USD.",
+            "format": "double",
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "estimated": {
+            "default": false,
+            "description": "Whether any summed ping was an estimated cost.",
+            "title": "Estimated",
+            "type": "boolean"
+          },
+          "pings": {
+            "default": 0,
+            "description": "Pings forwarded over the session's lifetime.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Pings",
+            "type": "integer"
+          }
+        },
+        "title": "KeepWarmTotal",
+        "type": "object"
+      },
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
@@ -7432,6 +7601,17 @@
             "title": "Id",
             "type": "string"
           },
+          "keep_warm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KeepWarmStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Keep-warm episode status object (state, stop reason, pings, cost, last return), or `None` when the session has no keep-warm label or is archived."
+          },
           "labels": {
             "additionalProperties": {
               "type": "string"
@@ -7618,6 +7798,22 @@
             "description": "Whether the *requesting user* explicitly marked this session unread. Per-viewer; lifts the active-row dot suppression on the client. `False` by default.",
             "title": "Viewer Unread",
             "type": "boolean"
+          },
+          "warm_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "warm",
+                  "cold"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the session's provider prompt cache is being kept warm (`\"warm\"` / `\"cold\"`), read from its `omnigent.keep_warm` label without a harness lookup. `None` when the session has no keep-warm label, is archived, or carries a label written before the family stamp existed.",
+            "title": "Warm State"
           },
           "workspace": {
             "anyOf": [
@@ -8185,6 +8381,18 @@
             ],
             "title": "Agent Template Id"
           },
+          "archive_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the session was archived, read from the `omnigent.archive_reason` label (e.g. `\"host_offline\"` when the keep-warm sweeper retired a child under an offline host). `None` when the user archived it or the row is not archived.",
+            "title": "Archive Reason"
+          },
           "archived": {
             "default": false,
             "description": "Whether the session is archived. Archived sessions are hidden from the default sidebar listing and surface only behind the \"Show archived\" toggle. `False` for normal sessions. Toggled via `PATCH /v1/sessions/{id}`.",
@@ -8404,6 +8612,17 @@
             },
             "title": "Items",
             "type": "array"
+          },
+          "keep_warm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KeepWarmStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Keep-warm episode status object (state, stop reason, pings, cost, last return), or `None` when the session has no keep-warm label or is archived."
           },
           "kind": {
             "default": "default",
@@ -8783,6 +9002,22 @@
             "description": "`False` when the caller skipped usage aggregation with `include_usage=false`. Both usage fields are then unknown, not zero or this session's own-only spend. Display clients can load them with a separate `GET /v1/sessions/{id}` using `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
             "title": "Usage Included",
             "type": "boolean"
+          },
+          "warm_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "warm",
+                  "cold"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the session's provider prompt cache is being kept warm (`\"warm\"` / `\"cold\"`), read from its `omnigent.keep_warm` label without a harness lookup. `None` when the session has no keep-warm label, is archived, or carries a label written before the family stamp existed.",
+            "title": "Warm State"
           },
           "workspace": {
             "anyOf": [

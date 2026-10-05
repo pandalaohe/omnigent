@@ -29,7 +29,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import generate_agent_id, generate_task_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -145,6 +145,12 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.child_keep_warm import (
+    ARCHIVE_REASON_LABEL,
+    keep_warm_family_for_harness,
+    keep_warm_status_from_labels,
+    warm_state_for_labels,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -2109,6 +2115,10 @@ def _build_session_list_item(
     activity_unverified_child_ids: set[str] | None = None,
     agent_template_ids: Mapping[str, str] | None = None,
     last_message_preview: str | None = None,
+    keep_warm_families: (
+        Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]
+        | None
+    ) = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -2153,6 +2163,10 @@ def _build_session_list_item(
     :param last_message_preview: Single-line excerpt of the newest
         visible message, or ``None`` when the list request did not ask
         for previews.
+    :param keep_warm_families: Optional lookup from ``(agent_id,
+        harness_override, sub_agent_name)`` to the keep-warm family
+        resolved from that harness, used when the keep-warm label carries
+        no ``y`` stamp. ``None`` skips the fallback.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -2165,29 +2179,40 @@ def _build_session_list_item(
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
     own_activity_unverified = conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    own_status = (
+        "idle"
+        if own_activity_unverified
+        else _session_status_from_cache(conv.id, conv.live_status)
+    )
+    derived_status = _list_status_with_starting(
+        (
+            "idle"
+            if own_activity_unverified
+            else _session_status_with_child_rollup(
+                conv.id,
+                child_session_ids,
+                conv.live_status,
+                activity_unverified_child_ids,
+            )
+        ),
+        conv.id,
+    )
+    # Only this session's own turn refreshes its provider cache; a child's
+    # activity rolls up into ``status`` but must not read as busy here.
+    busy = own_status in ("running", "waiting")
+    now = now_epoch()
+    warm_family = (
+        keep_warm_families.get((conv.agent_id, conv.harness_override, conv.sub_agent_name))
+        if keep_warm_families is not None
+        else None
+    )
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
         agent_template_id=(agent_template_ids or {}).get(conv.agent_id),
-        status=_list_status_with_starting(
-            (
-                "idle"
-                if own_activity_unverified
-                else _session_status_with_child_rollup(
-                    conv.id,
-                    child_session_ids,
-                    conv.live_status,
-                    activity_unverified_child_ids,
-                )
-            ),
-            conv.id,
-        ),
-        foreground_status=(
-            "idle"
-            if own_activity_unverified
-            else _session_status_from_cache(conv.id, conv.live_status)
-        ),
+        status=derived_status,
+        foreground_status=own_status,
         background_activity_count=_session_background_activity_count(
             conv.id,
             child_session_ids,
@@ -2257,6 +2282,14 @@ def _build_session_list_item(
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
         last_message_preview=last_message_preview,
+        warm_state=warm_state_for_labels(
+            conv.labels,
+            archived=bool(conv.archived),
+            busy=busy,
+            now=now,
+            family=warm_family,
+        ),
+        keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
     )
 
 
@@ -2476,6 +2509,8 @@ def _build_session_response(
     # vanished thread. Computed per-response (not persisted) — self-heals.
     if side_chat_sealed:
         labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    busy = status in ("running", "waiting")
+    now = now_epoch()
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2579,6 +2614,15 @@ def _build_session_response(
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
+        warm_state=warm_state_for_labels(
+            conv.labels,
+            archived=bool(conv.archived),
+            busy=busy,
+            now=now,
+            family=keep_warm_family_for_harness(harness),
+        ),
+        keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
+        archive_reason=conv.labels.get(ARCHIVE_REASON_LABEL),
     )
 
 

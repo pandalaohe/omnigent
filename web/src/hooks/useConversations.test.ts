@@ -3582,6 +3582,36 @@ it("defaults worktree to null when backfilling a legacy row", async () => {
   expect(await fetchConversationById("conv_legacy")).toMatchObject({ worktree: null });
 });
 
+it("carries warm_state and keep_warm from the wire to a backfilled row", async () => {
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      id: "conv_cold",
+      created_at: 1,
+      warm_state: "cold",
+      keep_warm: {
+        state: "stopped",
+        stop_reason: "cap",
+        episode: { pings: 4, cost_usd: 0.04, estimated: true, started_at: 100 },
+        total: { pings: 12, cost_usd: 0.2, estimated: true },
+        last_return: { at: 200, result: "miss" },
+        last_reason: null,
+      },
+    }),
+  );
+  expect(await fetchConversationById("conv_cold")).toMatchObject({
+    warm_state: "cold",
+    keep_warm: { state: "stopped", stop_reason: "cap" },
+  });
+});
+
+it("maps absent warm_state and keep_warm to null on a backfilled row", async () => {
+  fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_plain", created_at: 1 }));
+  expect(await fetchConversationById("conv_plain")).toMatchObject({
+    warm_state: null,
+    keep_warm: null,
+  });
+});
+
 describe("undoArchiveConversations optimistic restore", () => {
   it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

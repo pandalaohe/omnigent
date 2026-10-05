@@ -655,6 +655,62 @@ describe("Sidebar session list", () => {
     expect(slot).not.toHaveClass("w-6");
   });
 
+  it("shows a blue cold dot on a cold row with nothing unread", () => {
+    mockConversations([
+      conv("conv_cold_idle", "Claude Code", { title: "Cold idle", warm_state: "cold" }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Cold idle").closest("li")!;
+    const dot = within(row).getByTestId("session-state-badge");
+    expect(dot).toHaveAttribute("data-state", "cold");
+    expect(dot).toHaveAttribute("data-cold", "true");
+    expect(dot.querySelector(".bg-keep-cold")).not.toBeNull();
+    // The cold dot counts as a compact marker, so it takes the unseen dot's
+    // fixed centered slot rather than the wider pill geometry.
+    expect(dot.parentElement).toHaveClass("w-6", "justify-center");
+  });
+
+  it("recolors the unseen dot blue on a cold row", () => {
+    const row = conv("conv_cold_unread", "Claude Code", {
+      title: "Cold unread",
+      status: "idle",
+      warm_state: "cold",
+      updated_at: 20,
+      viewer_last_seen: 10,
+    });
+    seedReadState([row]);
+    mockConversations([row]);
+    renderSidebar();
+
+    const rendered = screen.getByText("Cold unread").closest("li")!;
+    const dot = within(rendered).getByTestId("session-state-badge");
+    expect(dot).toHaveAttribute("data-state", "unseen");
+    expect(dot).toHaveAttribute("data-cold", "true");
+    expect(dot.querySelector(".bg-keep-cold")).not.toBeNull();
+  });
+
+  it("shows no cold indicator on a warm row", () => {
+    mockConversations([
+      conv("conv_warm_idle", "Claude Code", {
+        title: "Warm idle",
+        warm_state: "warm",
+        keep_warm: {
+          state: "on",
+          stop_reason: null,
+          episode: { pings: 2, cost_usd: 0.01, estimated: false, started_at: 1 },
+          total: { pings: 2, cost_usd: 0.01, estimated: false },
+          last_return: null,
+          last_reason: null,
+        },
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Warm idle").closest("li")!;
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+  });
+
   it("shows B independently beside foreground and response states", () => {
     mockConversations([
       conv("conv_background", "Claude Code", {

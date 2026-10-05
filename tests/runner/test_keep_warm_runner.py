@@ -349,7 +349,7 @@ async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(tmp_path
         {
             "url": f"/v1/sessions/{_CONV}/events",
             "json": {"type": "keep_warm", "attempt_id": "att-1", "family": "claude"},
-            "timeout": 60.0,
+            "timeout": 120.0,
         }
     ]
     assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]
@@ -411,7 +411,12 @@ async def test_keep_warm_ping_without_pane_tracker_skips_unknown() -> None:
     async with _runner_test_client(app) as http:
         resp = await http.post(
             f"/v1/sessions/{_CONV}/events",
-            json={"type": "keep_warm_ping", "attempt_id": "att-1", "family": "claude"},
+            json={
+                "type": "keep_warm_ping",
+                "attempt_id": "att-1",
+                "family": "claude",
+                "harness": "claude-native",
+            },
         )
     await _await_keep_warm_task(_CONV)
 
@@ -419,6 +424,36 @@ async def test_keep_warm_ping_without_pane_tracker_skips_unknown() -> None:
     assert mgr.get_client_calls == []
     assert harness.posts == []
     assert server.posts == [{"type": "external_keep_warm_receipt", "data": _UNKNOWN_RECEIPT}]
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ping_for_sdk_harness_forwards_without_a_pane_tracker() -> None:
+    """An SDK harness has no pane, so a missing tracker never blocks it as ``unknown``."""
+    harness = _ReceiptHarnessClient(_OK_RECEIPT)
+    mgr = _KeepWarmProcessManager(harness_client=harness)
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server)
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={
+                "type": "keep_warm_ping",
+                "attempt_id": "att-1",
+                "family": "codex",
+                "harness": "codex",
+            },
+        )
+    await _await_keep_warm_task(_CONV)
+
+    assert resp.status_code == 202
+    assert harness.posts == [
+        {
+            "url": f"/v1/sessions/{_CONV}/events",
+            "json": {"type": "keep_warm", "attempt_id": "att-1", "family": "codex"},
+            "timeout": 120.0,
+        }
+    ]
+    assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]
 
 
 @pytest.mark.asyncio

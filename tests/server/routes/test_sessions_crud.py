@@ -9,15 +9,20 @@ the stores.
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
 import signal
 import sys
+import tarfile
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import pytest_asyncio
+import yaml
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
@@ -26,6 +31,7 @@ from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -42,6 +48,25 @@ async def session_id(db_uri: str) -> str:
     agent_store.create(agent_id, name="test-agent", bundle_location="test:///bundle")
     conv = conv_store.create_conversation(agent_id=agent_id)
     return conv.id
+
+
+def _harness_bundle(harness: str) -> bytes:
+    """A minimal valid agent bundle whose executor declares *harness*."""
+    config = yaml.safe_dump(
+        {
+            "spec_version": 1,
+            "name": "keep-warm-harness-agent",
+            "executor": {"type": "omnigent", "config": {"harness": harness}},
+            "prompt": "hi",
+        }
+    )
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        data = config.encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
 
 
 # ── GET /v1/sessions (list) ─────────────────────────────────────────
@@ -66,6 +91,119 @@ async def test_list_sessions_after_create(
     body = resp.json()
     ids = [s["id"] for s in body["data"]]
     assert session_id in ids
+
+
+async def test_list_sessions_carries_keep_warm_state(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A labelled row exposes warm_state / keep_warm; a bare row stays null."""
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="kw-agent", bundle_location="test:///bundle")
+    labelled = conv_store.create_conversation(agent_id=agent_id)
+    bare = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(
+        labelled.id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 100, "u": now - 100, "w": now + 3600}
+            ),
+            "omnigent.keep_warm_stats": json.dumps(
+                {"ep": {"p": 3, "c": 40000, "e": 1, "s": now - 600}}
+            ),
+        },
+    )
+
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+
+    assert rows[labelled.id]["warm_state"] == "warm"
+    keep_warm = rows[labelled.id]["keep_warm"]
+    assert keep_warm["state"] == "on"
+    assert keep_warm.get("stop_reason") is None
+    assert keep_warm["episode"]["pings"] == 3
+    assert keep_warm["episode"]["cost_usd"] == pytest.approx(0.04)
+    assert keep_warm["episode"]["estimated"] is True
+    assert keep_warm["episode"]["started_at"] == now - 600
+
+    assert rows[bare.id].get("warm_state") is None
+    assert rows[bare.id].get("keep_warm") is None
+
+
+async def test_list_sessions_keep_warm_state_uses_harness_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A session the sweeper never labelled reads cold on a supported harness
+    and no state on a harness with no keep-warm channel."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    supported_agent = generate_agent_id()
+    unsupported_agent = generate_agent_id()
+    for agent_id, harness in (
+        (supported_agent, "claude-native"),
+        (unsupported_agent, "opencode-native"),
+    ):
+        location = f"{agent_id}/bundle"
+        artifacts.put(location, _harness_bundle(harness))
+        agent_store.create(agent_id, name=f"kw-{harness}", bundle_location=location)
+    supported = conv_store.create_conversation(agent_id=supported_agent)
+    unsupported = conv_store.create_conversation(agent_id=unsupported_agent)
+
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    assert rows[supported.id]["warm_state"] == "cold"
+    assert rows[unsupported.id].get("warm_state") is None
+
+
+async def test_list_sessions_warm_state_ignores_a_running_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Child activity rolls up the spinner but not the parent's warm state.
+
+    A child's running turn never refreshes the parent's own provider cache,
+    so an idle parent with an expired label reads cold while ``status`` still
+    rolls up to running for the sidebar spinner.
+    """
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="kw-parent-agent", bundle_location="test:///bundle")
+    parent = conv_store.create_conversation(agent_id=agent_id)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=parent.id,
+    )
+    conv_store.set_labels(
+        parent.id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 7200, "u": now - 7200, "w": now - 3600}
+            )
+        },
+    )
+
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        resp = await client.get("/v1/sessions")
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    assert rows[parent.id]["status"] == "running"
+    assert rows[parent.id]["foreground_status"] == "idle"
+    assert rows[parent.id]["warm_state"] == "cold"
 
 
 async def test_list_sessions_pagination(
@@ -895,3 +1033,74 @@ async def test_patch_rejects_forged_worktree_identity(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+
+
+# ── Unarchive exemption for keep-warm host-offline archives ─────────
+
+
+async def test_unarchive_after_host_offline_archive_pins_exemption(
+    app,
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Unarchiving a session the keep-warm sweep archived for an offline host
+    clears the provenance labels and pins the host's current last-seen stamp,
+    so the same offline spell does not immediately re-archive it."""
+    from omnigent.server.child_keep_warm import (
+        ARCHIVE_EXEMPT_SINCE_LABEL,
+        ARCHIVE_REASON_LABEL,
+        ARCHIVED_BY_LABEL,
+    )
+    from omnigent.stores.host_store import HostStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_id = "7a2b3c4d5e6f1234567890abcdef0123"
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.upsert_on_connect(host_id, "kw-exempt-host", "local")
+    conv_store.set_host_id(session_id, host_id, workspace="/tmp/kw-exempt")
+    conv_store.set_labels(
+        session_id,
+        {ARCHIVE_REASON_LABEL: "host_offline", ARCHIVED_BY_LABEL: "keep_warm"},
+    )
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+    assert resp.status_code == 200, resp.text
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.archived is False
+    assert ARCHIVE_REASON_LABEL not in conv.labels
+    assert ARCHIVED_BY_LABEL not in conv.labels
+    host = host_store.get_host(host_id)
+    assert host is not None
+    assert conv.labels.get(ARCHIVE_EXEMPT_SINCE_LABEL) == str(host.updated_at)
+
+
+async def test_unarchive_with_other_archive_reason_leaves_labels_alone(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """The exemption only fires for the keep-warm host-offline provenance; an
+    archive with any other reason keeps its labels and gains no exemption."""
+    from omnigent.server.child_keep_warm import (
+        ARCHIVE_EXEMPT_SINCE_LABEL,
+        ARCHIVE_REASON_LABEL,
+    )
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(session_id, {ARCHIVE_REASON_LABEL: "user"})
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+    assert resp.status_code == 200, resp.text
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(ARCHIVE_REASON_LABEL) == "user"
+    assert ARCHIVE_EXEMPT_SINCE_LABEL not in conv.labels

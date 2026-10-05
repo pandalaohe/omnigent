@@ -413,6 +413,8 @@ function rebaseVariant(
     input: rebaseColor(base.input, reference.border, current.border),
     ring: primaryChanged ? primary : base.ring,
     brandAccent: primaryChanged ? primary : base.brandAccent,
+    // Status blue, never tinted by the custom accent.
+    keepCold: base.keepCold,
     sidebar: translucentSidebar ? setAlpha(sidebar, 0.72) : sidebar,
     sidebarForeground: rebaseColor(
       base.sidebarForeground,

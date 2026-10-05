@@ -8290,8 +8290,8 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
             return KeepWarmBtwResult("failed", "aborted")
         time.sleep(_KEEP_WARM_OVERLAY_POLL_INTERVAL_S)
     # The question is in and may still be answering; leave the overlay
-    # for the next injected message to dismiss. A later slice adds the
-    # quiet-turn fallback after repeated btw_unavailable failures.
+    # for the next injected message to dismiss. No fallback: repeated
+    # btw_unavailable failures pause keep-warm for the session.
     return KeepWarmBtwResult("failed", "btw_unavailable")
 
 

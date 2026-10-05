@@ -183,6 +183,14 @@ describe("settingsNavGroups", () => {
     expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
   });
 
+  it("includes Keep-warm for every deploy, right after Agents and not gated on peer messaging", () => {
+    const ids = settingsNavGroups(false, false)
+      .find((group) => group.title === "General")
+      ?.items.map((item) => item.id);
+    expect(ids).toContain("keep-warm");
+    expect(ids?.indexOf("keep-warm")).toBe((ids?.indexOf("agents") ?? -1) + 1);
+  });
+
   it("includes Session collaboration right after Calling defaults only when peer messaging is on", () => {
     // 7th arg is sessionCollabEnabled (the `session_peer_messaging` feature).
     const generalIds = (sessionCollabEnabled: boolean) =>
@@ -502,6 +510,10 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: "general",
     });
+  });
+
+  it("keeps the keep-warm deep link valid in every deploy", () => {
+    expect(routeHook("/settings/keep-warm")).toEqual({ inSettings: true, section: "keep-warm" });
   });
 
   it("gates the session-collab deep link on the peer-messaging feature", () => {

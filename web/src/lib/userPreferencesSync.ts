@@ -10,7 +10,8 @@ export type UserPreferenceNamespace =
   | "calling_defaults"
   | "calling_last"
   | "session_collab"
-  | "host_colors";
+  | "host_colors"
+  | "keep_warm";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -68,6 +69,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     host_colors: {
       storageKey: "omnigent:host-colors",
       eventName: "omnigent:host-colors-changed",
+    },
+    keep_warm: {
+      storageKey: "omnigent:keep-warm",
+      eventName: "omnigent:keep-warm-changed",
     },
   };
 

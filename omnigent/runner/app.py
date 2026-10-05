@@ -4773,6 +4773,7 @@ def create_runner_app(
         *,
         attempt_id: str,
         family: Any,
+        harness: Any,
         card: bool,
     ) -> None:
         """
@@ -4781,10 +4782,12 @@ def create_runner_app(
         The runner only gates, forwards and reports; the harness runs
         the channel. Gates, in order: a pending synchronous prompt
         (``card``), then human-at-the-pane evidence (``user_active``;
-        an unreadable tracker is ``unknown``, never "no activity"). A
-        ping never spawns a harness subprocess — ``get_client(...,
-        "any")`` only reuses a live one. The receipt goes to the
-        server as an ``external_keep_warm_receipt`` event (no
+        an unreadable tracker is ``unknown``, never "no activity"). The
+        pane gate only applies to native harnesses — an SDK harness has
+        no pane to watch, so its ping skips the check instead of
+        answering ``unknown``. A ping never spawns a harness subprocess —
+        ``get_client(..., "any")`` only reuses a live one. The receipt
+        goes to the server as an ``external_keep_warm_receipt`` event (no
         conversation item), best-effort: the server's own attempt
         timeout settles a receipt that never arrives.
         """
@@ -4794,7 +4797,12 @@ def create_runner_app(
         elif process_manager is None:
             receipt = _keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
         else:
-            user_active = await _keep_warm_pane_user_active(conversation_id)
+            if isinstance(harness, str) and harness and not is_native_harness(harness):
+                # SDK harness: no pane exists to watch — the human gate is
+                # vacuous, never "unknown".
+                user_active = False
+            else:
+                user_active = await _keep_warm_pane_user_active(conversation_id)
             if user_active is None:
                 receipt = _keep_warm_receipt(attempt_id, outcome="skipped", reason="unknown")
             elif user_active:
@@ -4815,7 +4823,10 @@ def create_runner_app(
                         resp = await harness_client.post(
                             f"/v1/sessions/{conversation_id}/events",
                             json={"type": "keep_warm", "attempt_id": attempt_id, "family": family},
-                            timeout=60.0,
+                            # Must exceed every harness channel's own ping budget
+                            # (90 s): the channel's deadline, not this client cut,
+                            # decides a slow ping's outcome.
+                            timeout=120.0,
                         )
                         payload: Any = resp.json() if resp.status_code == 200 else None
                     except httpx.TimeoutException:
@@ -8938,6 +8949,7 @@ def create_runner_app(
                     conversation_id,
                     attempt_id=attempt_id,
                     family=body.get("family"),
+                    harness=body.get("harness"),
                     card=card,
                 ),
                 name=f"keep-warm-{conversation_id}",
