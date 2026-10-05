@@ -8,6 +8,7 @@
  */
 
 import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 const WORKTREE_LOCATION_NAMESPACE = "worktree_location";
 
@@ -41,18 +42,5 @@ export async function saveWorktreePathTemplate(template: string | null): Promise
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value: template === null ? null : { pathTemplate: template } }),
   });
-  if (response.ok) return;
-  let message = `Saving the worktree location failed (${response.status})`;
-  try {
-    const body = await response.json();
-    if (typeof body.error?.message === "string") {
-      message = body.error.message;
-    } else if (typeof body.detail === "string") {
-      /* FastAPI's HTTPException shape, e.g. the template validation 422. */
-      message = body.detail;
-    }
-  } catch {
-    /* Keep the status when the server returns a non-JSON error. */
-  }
-  throw new Error(message);
+  if (!response.ok) throw await apiErrorFromResponse(response);
 }

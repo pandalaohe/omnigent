@@ -557,13 +557,6 @@ def _check_host_path_components(path: Path, *, windows: bool) -> None:
             )
 
 
-def _anchor_escape_message(path_template: str, anchor: Path, parent: Path) -> str:
-    """Build the containment-refusal message for a rendered template anchor."""
-    if _TEMPLATE_SEGMENT_SPLIT.split(path_template.strip())[0] == "{entry}":
-        return f"worktree directory escapes the project entry: {parent}"
-    return f"worktree directory escapes the template anchor {anchor}: {parent}"
-
-
 def _resolve_worktree_path(
     repo_root: str,
     branch_name: str,
@@ -794,33 +787,29 @@ def create_worktree(
     worktree_path, anchor = _resolve_worktree_path(
         repo_root, branch_name, path_template=path_template, entry=entry
     )
-    if path_template is not None:
+    if path_template is None:
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
         _check_host_path_components(worktree_path, windows=os.name == "nt")
+        escape = f"worktree directory {worktree_path.parent} escapes the template anchor {anchor}"
         if anchor is not None and not _contained_inside(
             os.path.realpath(worktree_path.parent), os.path.realpath(anchor)
         ):
             # Checked before creating anything too, so a symlinked
             # directory under the anchor leaves no directory behind.
+            raise WorktreeError(escape)
+        try:
+            worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
             raise WorktreeError(
-                _anchor_escape_message(path_template, anchor, worktree_path.parent)
-            )
-    try:
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise WorktreeError(
-            f"could not create worktree directory {worktree_path.parent}: {exc}"
-        ) from exc
-    if path_template is not None:
-        if anchor is not None:
-            # Re-checked after ``makedirs``: a component that resolved
-            # inside the anchor may be replaced by a link before the
-            # directory exists.
-            if not _contained_inside(
-                os.path.realpath(worktree_path.parent), os.path.realpath(anchor)
-            ):
-                raise WorktreeError(
-                    _anchor_escape_message(path_template, anchor, worktree_path.parent)
-                )
+                f"could not create worktree directory {worktree_path.parent}: {exc}"
+            ) from exc
+        # Re-checked after ``makedirs``: a component that resolved inside
+        # the anchor may be replaced by a link before the directory exists.
+        if anchor is not None and not _contained_inside(
+            os.path.realpath(worktree_path.parent), os.path.realpath(anchor)
+        ):
+            raise WorktreeError(escape)
         _exclude_worktree_dir(worktree_path)
 
     if existing_branch:

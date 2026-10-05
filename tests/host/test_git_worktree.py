@@ -475,8 +475,9 @@ def test_create_worktree_entry_refuses_symlinked_worktrees_dir(
             path_template=_ENTRY_TEMPLATE,
         )
 
-    assert "escapes the project entry" in exc.value.message
-    assert str(entry / ".worktrees") in exc.value.message
+    assert "escapes the template anchor" in exc.value.message
+    assert str(entry) in exc.value.message
+    assert str(entry / ".worktrees" / "myrepo") in exc.value.message
     assert list(elsewhere.iterdir()) == []
     assert _worktree_count(git_repo) == 1
 
@@ -745,7 +746,7 @@ def test_create_worktree_home_template_refuses_symlink_escape(
 def test_create_worktree_mkdir_failure_is_worktree_error(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A refused parent-directory creation surfaces as a WorktreeError naming the path."""
+    """With a template, a refused parent-directory creation is a WorktreeError naming the path."""
     real_mkdir = Path.mkdir
 
     def refuse_worktrees_dir(self: Path, *args: object, **kwargs: object) -> None:
@@ -755,7 +756,11 @@ def test_create_worktree_mkdir_failure_is_worktree_error(
 
     monkeypatch.setattr(Path, "mkdir", refuse_worktrees_dir)
     with pytest.raises(WorktreeError) as exc:
-        create_worktree(repo_path=str(git_repo), branch_name="x")
+        create_worktree(
+            repo_path=str(git_repo),
+            branch_name="x",
+            path_template="{repo_parent}/{repo}-worktrees/{branch}",
+        )
     assert "could not create worktree directory" in exc.value.message
     assert "myrepo-worktrees" in exc.value.message
 
