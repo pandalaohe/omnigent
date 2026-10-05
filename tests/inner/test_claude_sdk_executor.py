@@ -5830,10 +5830,18 @@ class _PingResultMessage:
         self.result = "ok"
 
 
+class _PingAssistantMessage:
+    """Minimal ``AssistantMessage`` stand-in carrying the reported model."""
+
+    def __init__(self, *, model=None):
+        self.model = model
+
+
 def _ping_sdk():
     """Fake SDK module exposing only what the ping drain narrows on."""
 
     class _FakeSDK:
+        AssistantMessage = _PingAssistantMessage
         ResultMessage = _PingResultMessage
 
     return _FakeSDK
@@ -5918,25 +5926,36 @@ class _PingClient:
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_pings_the_live_client_and_reports_usage() -> None:
+async def test_keep_warm_pings_the_live_client_and_reports_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """One ping: one query with the session key, drain discarded, usage normalized."""
+    from omnigent.inner import claude_sdk_executor as cse
     from omnigent.inner.claude_sdk_executor import (
         _KEEP_WARM_PING_PROMPT,
         ClaudeSDKExecutor,
         _ClaudeClientState,
     )
+    from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 
-    result_msg = _PingResultMessage(
-        usage={
-            "input_tokens": 120,
-            "cache_read_input_tokens": 9_000,
-            "cache_creation_input_tokens": 400,
-        },
-        total_cost_usd=0.125,
+    pricing = ModelPricing(
+        input_per_token=3e-6,
+        output_per_token=15e-6,
+        cache_read_per_token=0.3e-6,
+        cache_write_per_token=3.75e-6,
     )
+    monkeypatch.setattr(cse, "fetch_model_pricing", lambda model: pricing)
+
+    usage = {
+        "input_tokens": 120,
+        "cache_read_input_tokens": 9_000,
+        "cache_creation_input_tokens": 400,
+    }
+    expected_cost = compute_llm_cost(usage, pricing)
+    result_msg = _PingResultMessage(usage=usage, total_cost_usd=0.125)
     client = _PingClient(_stream_messages(result_msg))
     executor = ClaudeSDKExecutor()
-    executor._clients["s1"] = _ClaudeClientState(client=client, model=None)
+    executor._clients["s1"] = _ClaudeClientState(client=client, model="claude-configured-model")
     executor._pending_framework_context["s1"] = "keep me"
 
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
@@ -5951,7 +5970,7 @@ async def test_keep_warm_pings_the_live_client_and_reports_usage() -> None:
         "input_total": 120 + 9_000 + 400,
         "cache_read": 9_000,
         "cache_write": 400,
-        "cost_usd": 0.125,
+        "cost_usd": expected_cost,
         "estimated": False,
     }
     # The ping never touches transcript / framework state or the client cache.
@@ -5965,13 +5984,27 @@ async def test_keep_warm_pings_the_live_client_and_reports_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_ok_without_usage_reports_none_fields() -> None:
-    """A ResultMessage with no usage still yields an ``ok`` receipt with None fields."""
+async def test_keep_warm_ok_without_usage_reports_none_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ResultMessage with no usage still yields an ``ok`` receipt with None
+    fields; the cumulative ``total_cost_usd`` is never read as a fallback."""
+    from omnigent.inner import claude_sdk_executor as cse
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+    from omnigent.llms.context_window import ModelPricing
 
-    client = _PingClient(_stream_messages(_PingResultMessage(usage=None, total_cost_usd=None)))
+    asked: list[str] = []
+    monkeypatch.setattr(
+        cse,
+        "fetch_model_pricing",
+        lambda model: (
+            asked.append(model) or ModelPricing(input_per_token=3e-6, output_per_token=15e-6)
+        ),
+    )
+
+    client = _PingClient(_stream_messages(_PingResultMessage(usage=None, total_cost_usd=0.5)))
     executor = ClaudeSDKExecutor()
-    executor._clients["s1"] = _ClaudeClientState(client=client, model=None)
+    executor._clients["s1"] = _ClaudeClientState(client=client, model="claude-configured-model")
 
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
         receipt = await executor.keep_warm(attempt_id="att-2", family="claude")
@@ -5981,6 +6014,51 @@ async def test_keep_warm_ok_without_usage_reports_none_fields() -> None:
     assert receipt["cache_read"] is None
     assert receipt["cache_write"] is None
     assert receipt["cost_usd"] is None
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ok_receipt_prices_its_own_usage_not_the_cumulative_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ping is priced from its own per-call usage under the model its drain
+    reported; the streaming client's cumulative ``total_cost_usd`` is ignored."""
+    from omnigent.inner import claude_sdk_executor as cse
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+    from omnigent.llms.context_window import ModelPricing, compute_llm_cost
+
+    pricing = ModelPricing(
+        input_per_token=3e-6,
+        output_per_token=15e-6,
+        cache_read_per_token=0.3e-6,
+        cache_write_per_token=3.75e-6,
+    )
+    asked: list[str] = []
+    monkeypatch.setattr(cse, "fetch_model_pricing", lambda model: asked.append(model) or pricing)
+
+    usage = {
+        "input_tokens": 10,
+        "cache_read_input_tokens": 40_000,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 5,
+    }
+    client = _PingClient(
+        _stream_messages(
+            _PingAssistantMessage(model="claude-reported-model"),
+            _PingResultMessage(usage=usage, total_cost_usd=0.5),
+        )
+    )
+    executor = ClaudeSDKExecutor()
+    executor._clients["s1"] = _ClaudeClientState(client=client, model="claude-configured-model")
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+        receipt = await executor.keep_warm(attempt_id="att-usage", family="claude")
+
+    assert receipt["outcome"] == "ok"
+    assert asked == ["claude-reported-model"]
+    assert receipt["cost_usd"] == compute_llm_cost(usage, pricing)
+    assert receipt["cost_usd"] < 0.5
+    assert receipt["estimated"] is False
 
 
 @pytest.mark.asyncio

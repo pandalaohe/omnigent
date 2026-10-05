@@ -485,9 +485,10 @@ def warm_state_from_label(
     the label says (its running turn touches the provider cache). Otherwise
     the rule is per family: Claude is a clock estimate (``warm`` while the
     episode is warm and the last touch is inside the 1 h cache window); Codex
-    is observation-based (``warm`` only while the latest usage observation —
+    is observation-based (``warm`` while the latest usage observation —
     ping receipt or real turn — is a hit younger than the staleness bound,
-    the agent's interval + 300 s).
+    the agent's interval + 300 s; with no observation at all, a real turn
+    settled inside that bound also reads warm).
 
     :param raw: The ``omnigent.keep_warm`` label value, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -511,11 +512,13 @@ def warm_state_from_label(
         return None
     if family == "codex":
         observation = state.o
-        if (
-            observation is not None
-            and observation[1] == 1
-            and now - observation[0] < codex_staleness_s
-        ):
+        if observation is None:
+            # No observation this episode: a real turn that just settled put
+            # its prefix in the provider cache.
+            if state.c is not None and now - state.c < codex_staleness_s:
+                return "warm"
+            return "cold"
+        if observation[1] == 1 and now - observation[0] < codex_staleness_s:
             return "warm"
         return "cold"
     if state.s == "w" and state.u is not None and now - state.u < _CLAUDE_TTL_S:

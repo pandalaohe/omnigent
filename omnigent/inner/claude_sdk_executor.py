@@ -51,6 +51,7 @@ from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
+from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models import model_catalog
 from omnigent.models.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
@@ -888,12 +889,14 @@ class _KeepWarmPingOutcome(NamedTuple):
     One drained keep-warm ping, receipt-ready.
 
     :param result: The turn's ``ResultMessage``, when one arrived.
+    :param model: The model the drain's ``AssistantMessage`` reported, if any.
     :param timed_out: ``True`` when the ping budget lapsed.
     :param preempted: ``True`` when a real turn claimed the slot mid-ping.
     :param tool_attempted: ``True`` when the ping turn tried to call a tool.
     """
 
     result: object | None = None
+    model: str | None = None
     timed_out: bool = False
     preempted: bool = False
     tool_attempted: bool = False
@@ -2264,31 +2267,39 @@ class ClaudeSDKExecutor(Executor):
             # A terminal ResultMessage can still report a harness failure;
             # it is no more a warm session than an absent result.
             return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
-        return self._keep_warm_ok_receipt(attempt_id, outcome.result)
+        return self._keep_warm_ok_receipt(attempt_id, outcome.result, outcome.model or state.model)
 
     @staticmethod
-    def _keep_warm_ok_receipt(attempt_id: str, result: object) -> dict[str, Any]:
+    def _keep_warm_ok_receipt(
+        attempt_id: str, result: object, model: str | None
+    ) -> dict[str, Any]:
         """
         Normalize a completed ping's ``ResultMessage`` into an ``ok`` receipt.
 
+        The ping is priced from its own per-call ``usage`` under *model*'s
+        catalog rates; with streaming input the ``ResultMessage``'s
+        ``total_cost_usd`` is cumulative for the whole session and is never
+        read.
+
         :param attempt_id: Ping attempt id to echo.
         :param result: The ping turn's ``ResultMessage``.
+        :param model: Model the ping's drain reported, else the session's
+            configured model; pricing is skipped when ``None``.
         :returns: The receipt dict; usage fields are ``None`` when the
-            message carried no usage.
+            message carried no usage, and ``cost_usd`` is ``None`` when
+            usage is absent or pricing is unavailable.
         """
         usage = getattr(result, "usage", None)
         input_total = cache_read = cache_write = None
+        cost_usd: float | None = None
         if isinstance(usage, dict) and usage:
             cache_read = _usage_token(usage.get("cache_read_input_tokens"))
             cache_write = _usage_token(usage.get("cache_creation_input_tokens"))
             input_tokens = _usage_token(usage.get("input_tokens"))
             input_total = (input_tokens or 0) + (cache_read or 0) + (cache_write or 0)
-        raw_cost = getattr(result, "total_cost_usd", None)
-        cost_usd = (
-            float(raw_cost)
-            if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool)
-            else None
-        )
+            pricing = fetch_model_pricing(model) if model else None
+            if pricing is not None:
+                cost_usd = compute_llm_cost(usage, pricing)
         return _keep_warm_receipt(
             attempt_id,
             outcome="ok",
@@ -2347,6 +2358,7 @@ class ClaudeSDKExecutor(Executor):
 
         stream = client.receive_response()
         result: object | None = None
+        ping_model: str | None = None
         timed_out = False
         preempted = False
         interrupted = False
@@ -2383,7 +2395,11 @@ class ClaudeSDKExecutor(Executor):
                     message = next_task.result()
                 except StopAsyncIteration:
                     break
-                if isinstance(message, sdk.ResultMessage):
+                if isinstance(message, sdk.AssistantMessage):
+                    ping_model = (
+                        concrete_reported_model(getattr(message, "model", None)) or ping_model
+                    )
+                elif isinstance(message, sdk.ResultMessage):
                     result = message
                     break
                 next_task = asyncio.ensure_future(anext(stream))
@@ -2401,6 +2417,7 @@ class ClaudeSDKExecutor(Executor):
                     await aclose()
         return _KeepWarmPingOutcome(
             result=result,
+            model=ping_model,
             timed_out=timed_out,
             preempted=preempted,
             tool_attempted=slot.tool_attempted,

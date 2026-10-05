@@ -2061,6 +2061,33 @@ async def test_codex_warm_state_follows_the_latest_observation() -> None:
     )
 
 
+async def test_codex_warm_state_reads_a_fresh_settle_without_an_observation() -> None:
+    """An observation-less codex episode reads warm while its real turn's
+    settle is inside the staleness bound; a recorded o still outranks it."""
+    now = 1_000_000
+    fresh_settle = _label(s="w", t=1, c=now - 60, u=now - 60)
+    stale_settle = _label(s="w", t=1, c=now - 1801, u=now - 1801)
+    miss_with_fresh_settle = _label(s="w", t=1, c=now - 60, u=now - 60, o=[now - 120, 0])
+    hit_with_fresh_settle = _label(s="w", t=1, c=now - 60, u=now - 60, o=[now - 120, 1])
+
+    def state(label: str, **kwargs: int) -> str | None:
+        return warm_state_from_label(
+            label,
+            archived=False,
+            harness="codex-native",
+            busy=False,
+            now=now,
+            **kwargs,
+        )
+
+    assert state(fresh_settle) == "warm"
+    assert state(stale_settle) == "cold"
+    assert state(miss_with_fresh_settle) == "cold"
+    assert state(hit_with_fresh_settle) == "warm"
+    # The staleness bound is the agent's interval + 300 s when configured.
+    assert state(stale_settle, codex_staleness_s=3600) == "warm"
+
+
 async def test_warm_state_label_round_trips_the_family() -> None:
     """The family stamp survives a serialize / parse cycle; bad values drop."""
     state = child_keep_warm._WarmState(s="w", y="claude", t=1)
