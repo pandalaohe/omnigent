@@ -842,11 +842,11 @@ class CliRetentionCoordinator:
                 unknown_count += 1
                 continue
             supported_count += 1
-            # A warm keep-warm episode yields the pool the same way a live
-            # descendant does: never counted against max_idle_clis, never
-            # released out from under the warming.
-            if conversation.id in protected_by_descendant or keep_warm_episode_active(
-                getattr(conversation, "labels", None)
+            # A warm keep-warm episode yields the pool like a live descendant —
+            # unless archived, where the sweeper no longer settles its label.
+            if conversation.id in protected_by_descendant or (
+                not getattr(conversation, "archived", False)
+                and keep_warm_episode_active(getattr(conversation, "labels", None))
             ):
                 busy = True
                 eligible = False

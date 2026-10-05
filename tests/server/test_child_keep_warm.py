@@ -2226,6 +2226,60 @@ async def test_host_offline_past_threshold_archives_the_child(harness: _Harness)
     assert _archived(harness, parent.id) is False
 
 
+async def test_host_offline_archive_stamps_provenance_before_the_archive_flag(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The labels are already stored when the archive flag is committed."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+    original = harness.store.update_conversation
+    observed: list[dict[str, str]] = []
+
+    def _spy(session_id: str, **kwargs: Any) -> Conversation | None:
+        if kwargs.get("archived") is True:
+            conv = harness.store.get_conversation(session_id)
+            assert conv is not None
+            observed.append(dict(conv.labels))
+        return original(session_id, **kwargs)
+
+    monkeypatch.setattr(harness.store, "update_conversation", _spy)
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is True
+    assert len(observed) == 1
+    assert observed[0][ARCHIVE_REASON_LABEL] == "host_offline"
+    assert observed[0][ARCHIVED_BY_LABEL] == "keep_warm"
+
+
+async def test_host_offline_archive_clears_provenance_when_the_update_returns_none(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused archive update leaves the live row with neither label."""
+    parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")
+    child = _child(harness, parent.id, live_status="idle")
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+    original = harness.store.update_conversation
+
+    def _refuse(session_id: str, **kwargs: Any) -> Conversation | None:
+        if kwargs.get("archived") is True:
+            return None
+        return original(session_id, **kwargs)
+
+    monkeypatch.setattr(harness.store, "update_conversation", _refuse)
+
+    await _tick_archive_pass(harness)
+
+    assert _archived(harness, child.id) is False
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    assert ARCHIVE_REASON_LABEL not in conv.labels
+    assert ARCHIVED_BY_LABEL not in conv.labels
+
+
 async def test_host_offline_under_threshold_leaves_the_child(harness: _Harness) -> None:
     """One minute short of the 4 h default, nothing is archived."""
     parent = _parent(harness, host_id=_HOST_ID, workspace="/tmp/kw-archive", live_status="idle")

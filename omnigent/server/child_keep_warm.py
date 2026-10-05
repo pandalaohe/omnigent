@@ -823,14 +823,22 @@ class ChildKeepWarmSweeper:
         # spell must not re-archive the row.
         if conv.labels.get(ARCHIVE_EXEMPT_SINCE_LABEL) == str(host.updated_at):
             return False
-        updated = await asyncio.to_thread(
-            store.update_conversation,
-            conv.id,
-            archived=True,
-            close_cli_on_archive=False,
-        )
-        if updated is None:
-            return False
+
+        async def _clear_provenance() -> None:
+            """Best-effort removal so a live row never keeps stale provenance."""
+            for key in (ARCHIVE_REASON_LABEL, ARCHIVED_BY_LABEL):
+                try:
+                    await asyncio.to_thread(store.delete_label, conv.id, key)
+                except Exception:  # noqa: BLE001 — must not mask the archive failure
+                    _logger.warning(
+                        "Child keep-warm could not clear label %s on session %s",
+                        key,
+                        conv.id,
+                        exc_info=True,
+                    )
+
+        # Provenance lands before the archive flag: an unarchive arriving in
+        # between must see it to install the current outage's exemption.
         await asyncio.to_thread(
             store.set_labels,
             conv.id,
@@ -839,6 +847,19 @@ class ChildKeepWarmSweeper:
                 ARCHIVED_BY_LABEL: _ARCHIVED_BY_KEEP_WARM,
             },
         )
+        try:
+            updated = await asyncio.to_thread(
+                store.update_conversation,
+                conv.id,
+                archived=True,
+                close_cli_on_archive=False,
+            )
+        except Exception:
+            await _clear_provenance()
+            raise
+        if updated is None:
+            await _clear_provenance()
+            return False
         if conv.parent_conversation_id is not None:
             _publish_child_status_to_parent(conv.id, None)
         _prune_session_read_state(conv.id)

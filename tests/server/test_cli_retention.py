@@ -880,15 +880,18 @@ async def test_release_host_after_delete_skips_reset_without_known_revision(
     assert any("host-gone" in message and "3" in message for message in warnings)
 
 
-async def _reconcile_keep_warm_session(keep_warm_label: str) -> tuple[dict[str, Any], Any]:
+async def _reconcile_keep_warm_session(
+    keep_warm_label: str, *, archived: bool = False
+) -> tuple[dict[str, Any], Any]:
     """Reconcile one idle-eligible session carrying the given keep-warm label."""
     conversation = SimpleNamespace(
         id="keep-warm-root",
         runner_id="runner-root",
         host_id="host-a",
+        archived=archived,
         labels={"omnigent.keep_warm": keep_warm_label},
     )
-    policy = CliRetentionPolicy(max_idle_clis=0)
+    policy = CliRetentionPolicy(max_idle_clis=0, close_on_archive=not archived)
 
     class _HostStore:
         def get_host(self, host_id):
@@ -897,6 +900,7 @@ async def _reconcile_keep_warm_session(keep_warm_label: str) -> tuple[dict[str, 
 
     class _ConversationStore:
         def list_conversations(self, **kwargs):
+            assert kwargs["include_archived"] is archived
             return PagedList(data=[conversation])
 
         def list_child_conversation_ids_by_parent(self, parent_ids):
@@ -963,6 +967,18 @@ async def test_active_keep_warm_episode_protects_idle_session() -> None:
     }
     assert result["released"] == []
     assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_archived_keep_warm_episode_does_not_protect_idle_session() -> None:
+    """An archived row's stale warm label must not pin its idle CLI forever."""
+    result, client = await _reconcile_keep_warm_session(json.dumps({"s": "w"}), archived=True)
+
+    assert result["families"] == {
+        "claude": {"idle": 1, "active": 0, "below_threshold": 0, "total": 1}
+    }
+    assert result["released"] == ["keep-warm-root"]
+    assert len(client.posts) == 1
 
 
 @pytest.mark.asyncio
