@@ -795,7 +795,7 @@ def build_native_controls(
             return
         try:
             await _ensure_native_terminal_for_turn(conv_id, "claude-native")
-        except (RuntimeError, OSError, httpx.HTTPError) as exc:
+        except Exception as exc:  # noqa: BLE001 — a failed heal must not become a 500
             # The ensure raises on a failed recreate; inject answers its own 503.
             _logger.warning(
                 "claude-native pane heal failed for session=%s: %s",

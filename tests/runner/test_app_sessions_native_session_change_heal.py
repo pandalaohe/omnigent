@@ -708,12 +708,14 @@ async def test_failed_recreate_does_not_wait(
     ],
     ids=["model_change", "effort_change", "permission_mode_change", "compact"],
 )
+@pytest.mark.parametrize("failure", ["recreate_answers_error", "recreate_raises"])
 async def test_failed_pane_heal_surfaces_handler_503(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     event: dict[str, Any],
     conv_id: str,
     expected_error: str,
+    failure: str,
 ) -> None:
     """A failed recreate must surface the handler's 503, not a bare 500.
 
@@ -722,7 +724,8 @@ async def test_failed_pane_heal_surfaces_handler_503(
     raise escapes ``_prepare_claude_native_pane_for_injection`` the route
     answers a bare 500; the handlers only answer their own
     ``claude_native_*_failed`` 503 when the heal returns and the injection
-    into the still-dead pane fails on the missing tmux socket.
+    into the still-dead pane fails on the missing tmux socket. A recreate
+    raising a type outside the ensure's own error set must 503 the same way.
     """
     auto_create_calls: list[str] = []
     app, registry = await _open_claude_native_session(
@@ -730,14 +733,24 @@ async def test_failed_pane_heal_surfaces_handler_503(
     )
     auto_create_calls.clear()
 
-    # A raising launch adapter (e.g. the claude CLI vanished) fails the recreate;
-    # the ensure step turns that 500 into a RuntimeError. The provider resolves
-    # only ``omnigent.runner.native:_launch_claude``.
-    async def _failing_launch(ctx: Any) -> SessionResourceView:
-        del ctx
-        raise ImportError("Native Claude requires the 'claude' CLI on PATH.")
+    if failure == "recreate_raises":
+        # A raise inside the recreate passes through the ensure step unchanged;
+        # a type the runner maps to no status would surface as a bare 500.
+        async def _failing_ensure(*args: Any, **kwargs: Any) -> None:
+            raise LookupError("unexpected recreate failure")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_claude", _failing_launch)
+        monkeypatch.setattr(
+            "omnigent.runner.resource_routes._ensure_native_terminal", _failing_ensure
+        )
+    else:
+        # A raising launch adapter (e.g. the claude CLI vanished) fails the
+        # recreate; the ensure step turns that 500 into a RuntimeError. The
+        # provider resolves only ``omnigent.runner.native:_launch_claude``.
+        async def _failing_launch(ctx: Any) -> SessionResourceView:
+            del ctx
+            raise ImportError("Native Claude requires the 'claude' CLI on PATH.")
+
+        monkeypatch.setattr("omnigent.runner.native._launch_claude", _failing_launch)
 
     bridge_dir = bridge_dir_for_conversation_id(conv_id)
     _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
