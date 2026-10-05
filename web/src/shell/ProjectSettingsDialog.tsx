@@ -40,7 +40,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { useHosts, type Host } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isSdkAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import { CALLING_DEFAULT_HARNESSES, callingHarnessLabel } from "@/lib/callingDefaults";
@@ -51,7 +51,6 @@ import {
 } from "@/lib/callingDefaultsApi";
 import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { harnessReadinessOnHost } from "@/lib/harnessSetup";
@@ -281,6 +280,11 @@ function catalogFor(
   return catalogs.find((row) => row.host_id === hostId && row.harness === harness);
 }
 
+/** Whether a catalog row accepts *model*: the server matches `id` or `model`. */
+function catalogAccepts(row: CallingDefaultsCatalogRow, model: string): boolean {
+  return row.models.some((option) => option.id === model || option.model === model);
+}
+
 /** Merge filtered-sync rows over the loaded list, replacing matching pairs. */
 function mergeCatalogRows(
   previous: readonly CallingDefaultsCatalogRow[],
@@ -359,13 +363,21 @@ interface EntryHookOutcome {
   source: "save" | "run";
 }
 
+const SYNC_ALL_KEY = ["calling-defaults", "sync-all"] as const;
+const SYNC_ALL_STALE_MS = 5 * 60_000;
+
 /**
- * The cached `(host, harness)` catalogs behind the per-host dropdowns: one list
- * when the dialog opens, then at most one filtered sync per missing pair.
- * Failures are ignored — a missing pair still offers the stored value + Default.
+ * The cached `(host, harness)` catalogs behind the model dropdowns. Opening
+ * the dialog lists the cached rows and starts one full sync (every online
+ * host × configured harness, same as Settings › Calling defaults › "Sync
+ * models"), replacing the list when it lands. Failures are ignored — the
+ * cached rows stay, and a missing pair still offers the stored value +
+ * Default. Reopens within five minutes share the in-flight / fresh sync.
  */
 function useCallingDefaultCatalogs(open: boolean) {
+  const queryClient = useQueryClient();
   const [catalogs, setCatalogs] = useState<CallingDefaultsCatalogRow[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
   const requestedPairs = useRef(new Set<string>());
   const alive = useRef(true);
   useEffect(() => {
@@ -376,15 +388,55 @@ function useCallingDefaultCatalogs(open: boolean) {
   }, []);
   useEffect(() => {
     if (!open) return;
+    // Scoped to this opening: responses from an earlier opening are dropped,
+    // and a list answering after the sync must not overwrite its rows.
+    let active = true;
+    let synced = false;
     requestedPairs.current.clear();
     void listCallingDefaultCatalogs()
       .then((rows) => {
-        if (alive.current) setCatalogs(rows);
+        if (active && !synced) setCatalogs(rows);
       })
       .catch(() => {
         // Dropdowns fall back to the stored value + Default.
       });
-  }, [open]);
+    const lastSync = queryClient.getQueryState(SYNC_ALL_KEY);
+    const fresh =
+      lastSync?.status === "success" && Date.now() - lastSync.dataUpdatedAt < SYNC_ALL_STALE_MS;
+    if (!fresh) {
+      setRefreshing(true);
+      void queryClient
+        .fetchQuery({
+          queryKey: SYNC_ALL_KEY,
+          queryFn: () => syncCallingDefaults(),
+          staleTime: SYNC_ALL_STALE_MS,
+        })
+        .then((rows) => {
+          if (!active) return;
+          synced = true;
+          // The sync is the snapshot; only pairs a per-host dropdown synced
+          // during this opening survive it.
+          setCatalogs((previous) =>
+            mergeCatalogRows(
+              previous.filter((row) =>
+                requestedPairs.current.has(pairKey(row.host_id, row.harness)),
+              ),
+              rows,
+            ),
+          );
+        })
+        .catch(() => {
+          // A failed sync leaves the cached rows in place.
+        })
+        .finally(() => {
+          if (active) setRefreshing(false);
+        });
+    }
+    return () => {
+      active = false;
+      setRefreshing(false);
+    };
+  }, [open, queryClient]);
   const ensureCatalog = (hostId: string, harness: string) => {
     if (catalogFor(catalogs, hostId, harness) !== undefined) return;
     const key = pairKey(hostId, harness);
@@ -398,7 +450,7 @@ function useCallingDefaultCatalogs(open: boolean) {
         // A failed sync leaves the pair absent; the dropdown stays usable.
       });
   };
-  return { catalogs, ensureCatalog };
+  return { catalogs, ensureCatalog, refreshing };
 }
 
 /** A "Default"-clearing model dropdown for one (host, harness) catalog pair. */
@@ -590,7 +642,7 @@ export function ProjectSettingsDialog({
   const [model, setModel] = useState<string>(NONE);
   const [activeTab, setActiveTab] = useState("defaults");
   const tabsId = useId();
-  const { catalogs, ensureCatalog } = useCallingDefaultCatalogs(open);
+  const { catalogs, ensureCatalog, refreshing } = useCallingDefaultCatalogs(open);
   // The single host-row set. A label-only folder has no stored project yet, so
   // there is nothing to fetch until Save promotes it.
   const {
@@ -984,34 +1036,45 @@ export function ProjectSettingsDialog({
   const harnessTakesModel =
     nativeAgentHasCapability(selectedAgent, "modelPicker") ||
     selectedNativeSpec?.harness === "codex-native";
-  // Live host-resolved model options. The project's default host when set,
-  // else the first online host (the composer's auto-pick) — without the
-  // fallback a Codex project (no static catalog) could never populate the
-  // picker unless a host default was also stored.
-  const modelCatalogHostId = browsableHostId ?? onlineHosts[0]?.host_id ?? null;
-  const { data: hostModelOptions } = useHostModelOptions(
-    modelCatalogHostId,
-    selectedNativeSpec?.harness ?? "",
-    harnessTakesModel && modelCatalogHostId !== null,
+  // Mirror the server's create-time offered check: it reads each placement
+  // host's cached catalog, skips errored / empty rows, and matches `id` or `model`.
+  const offerRows = useMemo(
+    () =>
+      catalogs.filter(
+        (row) =>
+          row.harness === selectedNativeSpec?.harness &&
+          row.error === null &&
+          row.models.length > 0,
+      ),
+    [catalogs, selectedNativeSpec],
   );
   const modelOptions = useMemo(() => {
-    const live = (hostModelOptions ?? []).map((o) => ({
-      id: o.id,
-      label: o.displayName ?? o.id,
-    }));
-    if (live.length > 0) return live;
-    return selectedNativeSpec?.harness === "claude-native"
-      ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
-      : [];
-  }, [hostModelOptions, selectedNativeSpec]);
-  // Keep a stored model the current options don't list as a labeled fallback
-  // item, so opening + saving the dialog doesn't silently drop the default.
+    const [first, ...rest] = offerRows;
+    if (!first) return [];
+    return first.models
+      .filter((option) => rest.every((row) => catalogAccepts(row, option.id)))
+      .map((option) => ({ id: option.id, label: nativeModelLabel(option) }));
+  }, [offerRows]);
+  // Keep a stored model the offer doesn't list as a labeled fallback item, so
+  // opening + saving the dialog doesn't silently drop the default.
   const storedModelMissing = model !== NONE && !modelOptions.some((m) => m.id === model);
-  // With no catalog resolved and nothing stored, the select could only offer
-  // "No default" — an action it can't perform. Degrade honestly (documented
-  // catalog gap for host-resolved harnesses): disable it and say why, rather
-  // than hide the field the harness legitimately supports.
+  // Flag only what the server would refuse; with no qualifying row it checks nothing.
+  const storedModelNotOffered =
+    storedModelMissing &&
+    offerRows.length > 0 &&
+    !offerRows.every((row) => catalogAccepts(row, model));
+  // With no options and nothing stored, the select could only render "No
+  // default" — an action it can't perform. Disable it and say why.
   const modelPickerEmpty = modelOptions.length === 0 && model === NONE;
+  const modelHint = refreshing
+    ? "Refreshing models…"
+    : storedModelNotOffered
+      ? "Not offered by every host — pick another model or set it per host below"
+      : modelPickerEmpty
+        ? offerRows.length === 0
+          ? "No model catalog available — connect a host to choose from its models"
+          : "No model is offered by every host — set the model per host below"
+        : "Default model for new sessions with this agent";
   // Offer the control only for a model-taking harness; when it can only render
   // "No default" it stays visible but disabled with an explanatory hint.
   const supportsModelDefault = harnessTakesModel;
@@ -1571,14 +1634,7 @@ export function ProjectSettingsDialog({
         </div>
       </Field>
       {supportsModelDefault && (
-        <Field
-          label="Model"
-          hint={
-            modelPickerEmpty
-              ? "No model catalog available — pick a Host default (or connect a host) to choose from its models"
-              : "Default model for new sessions with this agent"
-          }
-        >
+        <Field label="Model" hint={modelHint}>
           <Select
             value={model}
             onValueChange={setModel}
@@ -1595,7 +1651,11 @@ export function ProjectSettingsDialog({
                   {m.label}
                 </SelectItem>
               ))}
-              {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
+              {storedModelMissing && (
+                <SelectItem value={model}>
+                  {storedModelNotOffered ? `${model} (not offered by every host)` : model}
+                </SelectItem>
+              )}
             </SelectContent>
           </Select>
         </Field>

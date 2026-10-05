@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -828,6 +828,9 @@ describe("ProjectSettingsDialog", () => {
 
   it("round-trips a stored model default on save", async () => {
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    const catalogRows = [catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }])];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -835,9 +838,9 @@ describe("ProjectSettingsDialog", () => {
     });
     renderDialog();
     await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
-    // The stored alias seeds the control (the static Claude vocab labels it).
+    // The stored model is in the hosts' offer and seeds the control.
     await waitFor(() =>
-      expect(screen.getByTestId("project-settings-model")).toHaveTextContent(/opus/i),
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("Opus"),
     );
 
     // Save untouched — the model rides back out unchanged.
@@ -886,6 +889,337 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+    );
+  });
+
+  // The All hosts model field lists from the cached per-host catalogs (the
+  // same rows the server's create-time offered check reads), refreshed by one
+  // full sync each time the dialog opens.
+  it("syncs all catalogs on open and lists the model offer from the synced rows", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    // The cached list is older (opus only); the sync widens the offer. The
+    // list resolves after the sync and must not overwrite its rows.
+    let resolveList!: (rows: unknown[]) => void;
+    listCatalogsMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveList = resolve;
+        }),
+    );
+    syncCatalogsMock.mockResolvedValue([
+      catalogRow("h1", "claude-native", [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet" },
+      ]),
+      catalogRow("h2", "claude-native", [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet" },
+      ]),
+    ]);
+    renderDialog();
+    await waitFor(() => expect(syncCatalogsMock).toHaveBeenCalledTimes(1));
+    expect(syncCatalogsMock).toHaveBeenCalledWith(undefined);
+
+    // The synced rows are applied once the field's hint leaves the empty /
+    // refreshing states.
+    await waitFor(() =>
+      expect(
+        screen.getByText("Default model for new sessions with this agent"),
+      ).toBeInTheDocument(),
+    );
+    resolveList([catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }])]);
+
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "No default",
+        "Opus",
+        "Sonnet",
+      ]),
+    );
+  });
+
+  it("offers only the models every host's catalog lists, skipping errored rows", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    const catalogRows = [
+      catalogRow("h1", "claude-native", [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet" },
+      ]),
+      catalogRow("h2", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+      // An errored row is stale: it neither narrows nor widens the offer.
+      {
+        ...catalogRow("h3", "claude-native", [{ id: "haiku" }]),
+        stale: true,
+        error: "unsupported",
+      },
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
+    renderDialog();
+    await waitFor(() =>
+      expect(
+        screen.getByText("Default model for new sessions with this agent"),
+      ).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "No default",
+        "Opus",
+      ]),
+    );
+  });
+
+  it("does not re-sync when the dialog reopens inside the freshness window", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    const { rerenderOpen } = renderDialog();
+    await waitFor(() => expect(syncCatalogsMock).toHaveBeenCalledTimes(1));
+    // Let the resolved sync land in the shared query cache before reopening.
+    await act(async () => {});
+
+    rerenderOpen(false);
+    rerenderOpen(true);
+    // The reopen re-lists the cached rows but skips the still-fresh sync.
+    await waitFor(() => expect(listCatalogsMock).toHaveBeenCalledTimes(2));
+    expect(syncCatalogsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks a stored model the offer lacks as not offered by every host", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    const catalogRows = [
+      catalogRow("h1", "claude-native", [{ id: "sonnet", displayName: "Sonnet" }]),
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(
+        screen.getByText("Not offered by every host — pick another model or set it per host below"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("project-settings-model")).toHaveTextContent(
+      "opus (not offered by every host)",
+    );
+
+    // The stored value stays selectable so an unrelated save can't drop it.
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+    );
+  });
+
+  it("does not flag a stored model when no host has a catalog for the harness", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    listCatalogsMock.mockResolvedValue([]);
+    syncCatalogsMock.mockResolvedValue([]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(
+        screen.getByText("Default model for new sessions with this agent"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("project-settings-model")).toHaveTextContent("opus");
+    expect(screen.getByTestId("project-settings-model")).not.toHaveTextContent("not offered");
+  });
+
+  it("does not flag a stored model every host accepts by its wire model", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    const catalogRows = [
+      catalogRow("h1", "claude-native", [
+        { id: "opus", model: "claude-opus-5-5", displayName: "Opus" },
+      ]),
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "claude-opus-5-5" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(
+        screen.getByText("Default model for new sessions with this agent"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("project-settings-model")).toHaveTextContent("claude-opus-5-5");
+    expect(screen.getByTestId("project-settings-model")).not.toHaveTextContent("not offered");
+  });
+
+  it("drops a list answer from an earlier opening after a reopen", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    const current = [catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }])];
+    let resolveFirstList!: (rows: unknown[]) => void;
+    listCatalogsMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirstList = resolve;
+        }),
+    );
+    listCatalogsMock.mockResolvedValue(current);
+    syncCatalogsMock.mockResolvedValue(current);
+    const { rerenderOpen } = renderDialog();
+    await waitFor(() => expect(syncCatalogsMock).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+
+    rerenderOpen(false);
+    rerenderOpen(true);
+    await waitFor(() => expect(listCatalogsMock).toHaveBeenCalledTimes(2));
+    // The first opening's list answers last, with rows older than the sync's.
+    await act(async () => {
+      resolveFirstList([
+        catalogRow("h1", "claude-native", [{ id: "opus[1m]", displayName: "Opus (1M context)" }]),
+      ]);
+    });
+
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "No default",
+        "Opus",
+      ]),
+    );
+  });
+
+  it("drops a listed catalog the full sync no longer returns", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    const laptop = catalogRow("h1", "claude-native", [
+      { id: "opus", displayName: "Opus" },
+      { id: "sonnet", displayName: "Sonnet" },
+    ]);
+    // h2 was removed after the cached list was read; the sync omits it.
+    listCatalogsMock.mockResolvedValue([
+      laptop,
+      catalogRow("h2", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+    ]);
+    let resolveFullSync!: (rows: unknown[]) => void;
+    syncCatalogsMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFullSync = resolve;
+        }),
+    );
+    renderDialog();
+    await waitFor(() => expect(listCatalogsMock).toHaveBeenCalledTimes(1));
+    // Let the list land first, so the stale h2 row is in state when the sync answers.
+    await act(async () => {});
+    await act(async () => {
+      resolveFullSync([laptop]);
+    });
+    await waitFor(() => expect(screen.queryByText("Refreshing models…")).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "No default",
+        "Opus",
+        "Sonnet",
+      ]),
+    );
+  });
+
+  it("keeps a per-host catalog synced while the open-time sync was running", async () => {
+    hostsMock.mockReturnValue({
+      data: [{ ...LAPTOP, configured_harnesses: { "claude-native": true } }],
+    });
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    let resolveFullSync!: (rows: unknown[]) => void;
+    syncCatalogsMock.mockImplementation((options?: { hostId?: string }) =>
+      options?.hostId
+        ? Promise.resolve([
+            catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+          ])
+        : new Promise((resolve) => {
+            resolveFullSync = resolve;
+          }),
+    );
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-add-host"));
+    fireEvent.click(await screen.findByRole("option", { name: "Laptop" }));
+    await pickOption("project-settings-host-agent-h1", "Claude Code");
+    await pickOption("project-settings-host-model-h1", "Opus");
+
+    // The full sync answers last and its snapshot lacks the pair.
+    await act(async () => {
+      resolveFullSync([]);
+    });
+    fireEvent.click(screen.getByTestId("project-settings-host-model-h1"));
+    expect(await screen.findByRole("option", { name: "Opus" })).toBeInTheDocument();
+  });
+
+  it("hints Refreshing models… while the open-time sync is in flight", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    listCatalogsMock.mockResolvedValue([
+      catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+    ]);
+    let resolveSync!: (rows: unknown[]) => void;
+    syncCatalogsMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSync = resolve;
+        }),
+    );
+    renderDialog();
+    expect(await screen.findByText("Refreshing models…")).toBeInTheDocument();
+
+    resolveSync([
+      catalogRow("h1", "claude-native", [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet" },
+      ]),
+    ]);
+    await waitFor(() => expect(screen.queryByText("Refreshing models…")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+        "No default",
+        "Opus",
+        "Sonnet",
+      ]),
     );
   });
 
@@ -1012,9 +1346,13 @@ describe("ProjectSettingsDialog", () => {
         },
       },
     });
-    listCatalogsMock.mockResolvedValue([
+    const catalogRows = [
       catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
-    ]);
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    // The dialog's open-time full sync replaces the listed rows, so it must
+    // return them too.
+    syncCatalogsMock.mockResolvedValue(catalogRows);
     renderDialog();
 
     await waitFor(() =>
@@ -1055,9 +1393,13 @@ describe("ProjectSettingsDialog", () => {
       ],
     });
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
-    syncCatalogsMock.mockResolvedValue([
-      catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }]),
-    ]);
+    // The open-time full sync (no filter) returns nothing; only the per-pair
+    // sync below fills (h1, claude-native).
+    syncCatalogsMock.mockImplementation(async (options?: { hostId?: string }) =>
+      options?.hostId
+        ? [catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }])]
+        : [],
+    );
     renderDialog();
     await waitFor(() =>
       expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
@@ -1077,12 +1419,16 @@ describe("ProjectSettingsDialog", () => {
 
     // Opening the model dropdown syncs the missing (h1, claude-native) pair
     // once; the now-cached pair is not re-synced by the sibling dropdown.
+    // The open-time full sync also calls the mock, so count the filtered
+    // (per-pair) calls specifically.
+    const pairSyncs = () =>
+      syncCatalogsMock.mock.calls.filter(([options]) => options !== undefined);
     await pickOption("project-settings-host-model-h1", "Opus");
-    expect(syncCatalogsMock).toHaveBeenCalledTimes(1);
+    expect(pairSyncs()).toHaveLength(1);
     expect(syncCatalogsMock).toHaveBeenCalledWith({ hostId: "h1", harness: "claude-native" });
     fireEvent.click(screen.getByTestId("project-settings-host-effort-h1"));
     fireEvent.click(await screen.findByRole("option", { name: "High" }));
-    expect(syncCatalogsMock).toHaveBeenCalledTimes(1);
+    expect(pairSyncs()).toHaveLength(1);
 
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
@@ -1112,9 +1458,13 @@ describe("ProjectSettingsDialog", () => {
         },
       },
     });
-    listCatalogsMock.mockResolvedValue([
+    const catalogRows = [
       catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
-    ]);
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    // The dialog's open-time full sync replaces the listed rows, so it must
+    // return them too.
+    syncCatalogsMock.mockResolvedValue(catalogRows);
     renderDialog();
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-host-summary-h1")).toHaveTextContent(
@@ -1200,6 +1550,9 @@ describe("ProjectSettingsDialog", () => {
 
   it("moves the legacy agent / model into the All hosts row and round-trips them", async () => {
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    const catalogRows = [catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }])];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
     listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
     getProjectMock.mockResolvedValue({
       id: "p_1",
