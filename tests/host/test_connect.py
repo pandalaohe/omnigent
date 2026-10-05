@@ -8960,6 +8960,46 @@ async def test_dispatch_create_worktree_passes_entry_to_creator(
     _cleanup_host(host)
 
 
+async def test_dispatch_create_worktree_passes_path_template_to_creator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create-worktree dispatch forwards the frame's path_template to the host op."""
+    from omnigent.host import connect as connect_module
+
+    host = _make_host_process()
+    seen: dict[str, object] = {}
+
+    def _fake_create_worktree(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return SimpleNamespace(
+            worktree_path="/Users/alice/project/.worktrees/myrepo/x",
+            branch="x",
+            workspace="/Users/alice/project/.worktrees/myrepo/x",
+        )
+
+    monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        ws,
+        HostCreateWorktreeFrame(
+            request_id="req_wt_10",
+            repo_path="/Users/alice/myrepo",
+            branch_name="x",
+            entry="/Users/alice/project",
+            path_template="{entry}/.worktrees/{repo}/{branch}",
+        ),
+    )
+
+    assert seen["path_template"] == "{entry}/.worktrees/{repo}/{branch}"
+    assert seen["entry"] == "/Users/alice/project"
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostCreateWorktreeResultFrame)
+    assert result.request_id == "req_wt_10"
+    assert result.status == "ok"
+    _cleanup_host(host)
+
+
 # ── host.post_bind_hook dispatch ──────────────────────────
 
 

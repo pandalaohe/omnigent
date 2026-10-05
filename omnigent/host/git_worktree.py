@@ -30,6 +30,26 @@ _MAX_DIR_COLLISION_SUFFIX: int = 50
 # checked separately.)
 _INVALID_BRANCH_CHARS = re.compile(r"[\x00-\x20~^:?*\[\\\x7f]")
 
+# Longest accepted worktree location template (after trimming).
+WORKTREE_PATH_TEMPLATE_MAX_CHARS: int = 512
+
+# Tokens a worktree location template may substitute on the host.
+WORKTREE_PATH_TEMPLATE_TOKENS: tuple[str, ...] = ("entry", "repo_parent", "repo", "branch")
+
+_TEMPLATE_TOKEN_PATTERN = re.compile(r"\{([^{}]*)\}")
+_TEMPLATE_DRIVE_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
+_TEMPLATE_SEGMENT_SPLIT = re.compile(r"[/\\]")
+_GITIGNORE_SPECIAL = re.compile(r"[*?\[\\]")
+
+# Component names Windows reserves for devices; the name before the
+# first dot is what counts (``con.txt`` is still ``CON``).
+_WINDOWS_RESERVED_COMPONENTS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+_WINDOWS_INVALID_COMPONENT_CHARS = frozenset('<>:"|?*')
+
 
 class WorktreeError(Exception):
     """Raised when a git worktree operation fails.
@@ -174,34 +194,44 @@ def _contained_inside(candidate: str, root: str) -> bool:
         return False
 
 
-def ensure_entry_excluded(entry: str) -> None:
-    """Add the entry's ``.worktrees/`` directory to the enclosing repo's exclude file.
+def _exclude_worktree_dir(worktree_path: Path) -> None:
+    """Add the worktree directory to the enclosing repo's exclude file.
 
-    Worktree directories Omnigent creates under the entry would
-    otherwise show as untracked noise in the enclosing repository's
-    status. The line is ``/<entry relative to the tree's top level>/.worktrees/``,
-    matching the ``/.omnigent/`` mechanism assignments already use, and is
-    written at most once. Tracked ignore files (``.gitignore``) are never
-    touched, and an entry outside any git working tree writes nothing.
+    A worktree directory Omnigent creates inside another git working
+    tree would otherwise show as untracked noise in that repository's
+    status. The line is ``/<worktree dir relative to the tree's top
+    level>/`` — only the worktree directory itself, never a container
+    the template merely passes through — and is written at most once.
+    Nothing is written when git already ignores the path, when the
+    worktree lies outside any git working tree, and tracked ignore
+    files (``.gitignore``) are never touched.
 
-    :param entry: Absolute entry directory on the host, e.g.
-        ``"/Users/alice/project"``.
+    :param worktree_path: Absolute worktree directory about to be
+        created, e.g. ``Path("/Users/alice/project/.worktrees/myrepo/x")``.
     :raises WorktreeError: If the exclude file cannot be written.
     """
-    if not os.path.isdir(entry):
-        return
-    top = _run_git(["rev-parse", "--show-toplevel"], cwd=entry)
+    parent = str(worktree_path.parent)
+    top = _run_git(["rev-parse", "--show-toplevel"], cwd=parent)
     if top.returncode != 0:
         return
     toplevel = top.stdout.strip()
-    common = _run_git(["rev-parse", "--git-common-dir"], cwd=entry)
+    # git reports a realpath top level (macOS /var -> /private/var).
+    real_path = os.path.join(os.path.realpath(parent), worktree_path.name)
+    relative = os.path.relpath(real_path, toplevel).replace(os.sep, "/")
+    if relative.startswith("../") or relative == "..":
+        return
+    # Trailing slash: the directory does not exist yet, and directory-only rules need it.
+    ignored = _run_git(["check-ignore", "-q", "--", relative + "/"], cwd=toplevel)
+    if ignored.returncode == 0:
+        return
+    common = _run_git(["rev-parse", "--git-common-dir"], cwd=parent)
     if common.returncode != 0:
         return
     common_dir = common.stdout.strip()
     if not os.path.isabs(common_dir):
-        common_dir = os.path.join(entry, common_dir)
-    relative = os.path.relpath(os.path.join(entry, ".worktrees"), toplevel)
-    line = "/" + relative.replace(os.sep, "/") + "/"
+        common_dir = os.path.join(parent, common_dir)
+    # Escaped so a name like ``[ab]`` matches itself, not ``a`` and ``b`` beside it.
+    line = "/" + _GITIGNORE_SPECIAL.sub(r"\\\g<0>", relative) + "/"
     exclude = Path(common_dir) / "info" / "exclude"
     try:
         exclude.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +243,7 @@ def ensure_entry_excluded(entry: str) -> None:
                 handle.write(b"\n")
             handle.write(line.encode("utf-8") + b"\n")
     except OSError as exc:
-        raise WorktreeError(f"could not write git exclude for {entry}: {exc}") from exc
+        raise WorktreeError(f"could not write git exclude for {worktree_path}: {exc}") from exc
 
 
 def _main_work_tree(repo_path: str) -> str:
@@ -397,41 +427,189 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     )
 
 
-def _resolve_worktree_path(repo_root: str, branch_name: str, *, entry: str | None = None) -> Path:
+def validate_worktree_path_template(template: str) -> None:
+    """Validate a worktree location template against the placement grammar.
+
+    The grammar: segments separated by ``/`` (a Windows host also
+    accepts ``\\``); the only substitutions are the four
+    :data:`WORKTREE_PATH_TEMPLATE_TOKENS`; the first segment is exactly
+    ``{entry}``, ``{repo_parent}`` or ``~``, or the whole template is an
+    absolute literal (``/…`` or a drive ``X:/…`` / ``X:\\…``); the
+    template must place worktrees per repository and branch, so
+    ``{repo}`` and ``{branch}`` are both required. The server runs this
+    when the setting is saved and the host again before rendering, so
+    the message is user-facing.
+
+    :param template: Raw template string, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``.
+    :raises WorktreeError: If any rule is broken; the message names
+        the rule.
+    """
+    template = template.strip()
+    if not template:
+        raise WorktreeError("worktree location template must not be empty")
+    if len(template) > WORKTREE_PATH_TEMPLATE_MAX_CHARS:
+        raise WorktreeError(
+            f"worktree location template must be at most "
+            f"{WORKTREE_PATH_TEMPLATE_MAX_CHARS} characters"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in template):
+        raise WorktreeError("worktree location template must not contain control characters")
+    for match in _TEMPLATE_TOKEN_PATTERN.finditer(template):
+        name = match.group(1)
+        if name not in WORKTREE_PATH_TEMPLATE_TOKENS:
+            raise WorktreeError(
+                f"worktree location template has unknown token {{{name}}}; "
+                f"allowed tokens: {{entry}}, {{repo_parent}}, {{repo}}, {{branch}}"
+            )
+    remainder = template
+    for token in WORKTREE_PATH_TEMPLATE_TOKENS:
+        remainder = remainder.replace("{" + token + "}", "")
+    if "{" in remainder or "}" in remainder:
+        raise WorktreeError("worktree location template has a stray '{' or '}'")
+    if "{repo}" not in template:
+        raise WorktreeError("worktree location template must contain {repo}")
+    if "{branch}" not in template:
+        raise WorktreeError("worktree location template must contain {branch}")
+    segments = _TEMPLATE_SEGMENT_SPLIT.split(template)
+    first = segments[0]
+    absolute = template.startswith("/") or _TEMPLATE_DRIVE_ABSOLUTE.match(template) is not None
+    if first not in ("{entry}", "{repo_parent}", "~") and not absolute:
+        raise WorktreeError(
+            "worktree location template must start with {entry}, {repo_parent}, ~, "
+            "or an absolute path"
+        )
+    if any("~" in segment for segment in segments[1:]):
+        raise WorktreeError("worktree location template may use ~ only as the whole first segment")
+    if any(segment in (".", "..") for segment in segments):
+        raise WorktreeError("worktree location template must not contain '.' or '..' segments")
+
+
+def _render_worktree_path_template(
+    template: str, repo_root: str, branch_name: str, entry: str | None
+) -> tuple[Path, Path | None]:
+    """Substitute the template tokens into an absolute worktree path.
+
+    ``{entry}`` falls back to the main work tree when the session has
+    no entry. The anchor is the rendered first segment when that
+    segment is ``{entry}``, ``{repo_parent}`` or ``~`` — the directory
+    the worktree must stay inside — and ``None`` for an absolute
+    literal.
+
+    :param template: Validated template, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``.
+    :param repo_root: Absolute main work-tree root, e.g.
+        ``"/Users/alice/myrepo"``.
+    :param branch_name: Validated branch name, e.g. ``"feature/login"``.
+    :param entry: Project entry directory on the host, or ``None``.
+    :returns: ``(path, anchor)``, both absolute; ``anchor`` is ``None``
+        for an absolute-literal template.
+    :raises WorktreeError: If the rendered path is not absolute.
+    """
+    root = Path(repo_root)
+    values = {
+        "entry": entry if entry is not None else repo_root,
+        "repo_parent": str(root.parent),
+        "repo": root.name,
+        "branch": _sanitize_dirname(branch_name),
+    }
+    # One pass, so a substituted value that itself contains ``{repo}`` is never re-expanded.
+    rendered = _TEMPLATE_TOKEN_PATTERN.sub(lambda match: values[match.group(1)], template.strip())
+    rendered = os.path.normpath(os.path.expanduser(rendered))
+    if not os.path.isabs(rendered):
+        raise WorktreeError(
+            f"worktree location template renders to a non-absolute path: {rendered}"
+        )
+    first = _TEMPLATE_SEGMENT_SPLIT.split(template.strip())[0]
+    anchor: Path | None = None
+    if first == "~":
+        anchor = Path(os.path.normpath(os.path.expanduser("~")))
+    elif first in ("{entry}", "{repo_parent}"):
+        anchor = Path(os.path.normpath(values[first.strip("{}")]))
+    return Path(rendered), anchor
+
+
+def _check_host_path_components(path: Path, *, windows: bool) -> None:
+    """Refuse path components the host filesystem would reject.
+
+    Only Windows needs the check: no component after the drive may be a
+    reserved device name (``CON`` … ``LPT9``, the part before the first
+    dot decides) or hold ``<>:"|?*``. Runs on the rendered path before
+    any directory is created.
+
+    :param path: Rendered worktree path.
+    :param windows: Whether the host is Windows (``os.name == "nt"``).
+    :raises WorktreeError: Naming the offending component.
+    """
+    if not windows:
+        return
+    for component in path.parts[1:]:
+        stem = component.split(".", 1)[0].upper()
+        if stem in _WINDOWS_RESERVED_COMPONENTS:
+            raise WorktreeError(
+                f"worktree location template renders a path component that is "
+                f"reserved on Windows: {component}"
+            )
+        if any(char in _WINDOWS_INVALID_COMPONENT_CHARS for char in component):
+            raise WorktreeError(
+                f"worktree location template renders a path component with a "
+                f"character Windows forbids: {component}"
+            )
+
+
+def _resolve_worktree_path(
+    repo_root: str,
+    branch_name: str,
+    *,
+    path_template: str | None = None,
+    entry: str | None = None,
+) -> tuple[Path, Path | None]:
     """Compute a collision-free worktree directory path.
 
-    With ``entry`` the worktree goes to
-    ``<entry>/.worktrees/<repo-name>/<sanitized-branch>``; without it, to
-    today's sibling location
-    ``<parent-of-repo-root>/<repo-name>-worktrees/<sanitized-branch>``.
-    Either way a numeric suffix is appended if the path already exists on
-    disk.
+    Without ``path_template`` the worktree goes to the sibling location
+    ``<parent-of-repo-root>/<repo-name>-worktrees/<sanitized-branch>``
+    (``entry`` is ignored). With ``path_template`` the template is
+    validated and rendered and the worktree goes to the rendered path.
+    Either way a numeric suffix is appended if the path already exists
+    on disk.
 
     :param repo_root: Absolute repo work-tree root, e.g.
         ``"/Users/alice/myrepo"``.
     :param branch_name: Validated branch name, e.g.
         ``"feature/login"``.
-    :param entry: Project entry directory on the host, or ``None`` for
-        the sibling layout, e.g. ``"/Users/alice/project"``.
-    :returns: A path that does not yet exist, e.g.
-        ``Path("/Users/alice/project/.worktrees/myrepo/feature-login")``.
-    :raises WorktreeError: If no free path is found within
+    :param path_template: Worktree location template, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``, or ``None`` for the
+        sibling layout.
+    :param entry: Project entry directory on the host, e.g.
+        ``"/Users/alice/project"``; only fills the template's
+        ``{entry}`` token.
+    :returns: ``(path, anchor)`` — a path that does not yet exist, e.g.
+        ``Path("/Users/alice/project/.worktrees/myrepo/feature-login")``,
+        and the template's anchor directory (``None`` without a
+        template or for an absolute-literal template).
+    :raises WorktreeError: If the template is invalid, renders a
+        non-absolute path, or no free path is found within
         :data:`_MAX_DIR_COLLISION_SUFFIX` attempts.
     """
     root = Path(repo_root)
-    base_dir = (
-        Path(entry) / ".worktrees" / root.name
-        if entry is not None
-        else root.parent / f"{root.name}-worktrees"
-    )
-    dirname = _sanitize_dirname(branch_name)
+    anchor: Path | None = None
+    if path_template is None:
+        base_dir = root.parent / f"{root.name}-worktrees"
+        dirname = _sanitize_dirname(branch_name)
+    else:
+        validate_worktree_path_template(path_template)
+        rendered, anchor = _render_worktree_path_template(
+            path_template, repo_root, branch_name, entry
+        )
+        base_dir = rendered.parent
+        dirname = rendered.name
     candidate = base_dir / dirname
     if not candidate.exists():
-        return candidate
+        return candidate, anchor
     for suffix in range(2, _MAX_DIR_COLLISION_SUFFIX + 1):
         candidate = base_dir / f"{dirname}-{suffix}"
         if not candidate.exists():
-            return candidate
+            return candidate, anchor
     raise WorktreeError(
         f"could not find a free worktree directory under {base_dir} "
         f"after {_MAX_DIR_COLLISION_SUFFIX} attempts"
@@ -499,6 +677,7 @@ def create_worktree(
     base_branch: str | None = None,
     existing_branch: bool = False,
     entry: str | None = None,
+    path_template: str | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new — or existing — branch checked out.
 
@@ -521,18 +700,24 @@ def create_worktree(
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree instead of creating a new
         branch.
-    :param entry: The session project's entry directory on the host.
-        When set, the worktree is created at
-        ``<entry>/.worktrees/<main repo name>/<topic>`` and the entry's
-        repository gains an ``info/exclude`` line for it; when ``None``,
-        today's sibling location under the repo's parent is used.
+    :param entry: The session project's entry directory on the host,
+        e.g. ``"/Users/alice/project"``. Only fills the template's
+        ``{entry}`` token.
+    :param path_template: The user's worktree location template, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``. When set, the
+        worktree is created at the rendered path (refused when it
+        resolves outside the template's anchor) and, if it lands inside
+        another git working tree, that repository gains an
+        ``info/exclude`` line naming the worktree directory. ``None``
+        keeps the upstream sibling location under the repo's parent,
+        with neither check.
     :returns: The worktree root, branch, and relocated selected directory.
     :raises WorktreeError: If the branch name is invalid, the path is
         not a git repo, the base ref can't be resolved,
         ``git worktree add`` fails (e.g. the branch already exists in
         create mode, is missing or still checked out in
-        existing-branch mode), or the worktree directory would resolve
-        outside the entry.
+        existing-branch mode), the template is invalid, or the
+        worktree directory would resolve outside the template's anchor.
     """
     validate_branch_name(branch_name)
     if existing_branch and base_branch is not None:
@@ -599,24 +784,33 @@ def create_worktree(
                 f"selected path {relative_directory!r} is not a directory in {revision!r}; "
                 "choose another directory or base branch"
             )
-    worktree_path = _resolve_worktree_path(repo_root, branch_name, entry=entry)
-    if entry is not None and not _contained_inside(
-        os.path.realpath(worktree_path.parent), os.path.realpath(entry)
-    ):
-        # Checked before creating anything too, so a ``.worktrees`` symlink
-        # out of the entry leaves no directory behind.
-        raise WorktreeError(
-            f"worktree directory escapes the project entry: {worktree_path.parent}"
-        )
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    if entry is not None:
-        # Re-checked after ``makedirs``: a component that resolved inside
-        # the entry may be replaced by a link before the directory exists.
-        if not _contained_inside(os.path.realpath(worktree_path.parent), os.path.realpath(entry)):
+    worktree_path, anchor = _resolve_worktree_path(
+        repo_root, branch_name, path_template=path_template, entry=entry
+    )
+    if path_template is None:
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        _check_host_path_components(worktree_path, windows=os.name == "nt")
+        escape = f"worktree directory {worktree_path.parent} escapes the template anchor {anchor}"
+        if anchor is not None and not _contained_inside(
+            os.path.realpath(worktree_path.parent), os.path.realpath(anchor)
+        ):
+            # Checked before creating anything too, so a symlinked
+            # directory under the anchor leaves no directory behind.
+            raise WorktreeError(escape)
+        try:
+            worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
             raise WorktreeError(
-                f"worktree directory escapes the project entry: {worktree_path.parent}"
-            )
-        ensure_entry_excluded(entry)
+                f"could not create worktree directory {worktree_path.parent}: {exc}"
+            ) from exc
+        # Re-checked after ``makedirs``: a component that resolved inside
+        # the anchor may be replaced by a link before the directory exists.
+        if anchor is not None and not _contained_inside(
+            os.path.realpath(worktree_path.parent), os.path.realpath(anchor)
+        ):
+            raise WorktreeError(escape)
+        _exclude_worktree_dir(worktree_path)
 
     if existing_branch:
         # --end-of-options: treat the branch as a rev, never a git flag

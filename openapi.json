@@ -10663,7 +10663,8 @@
                 "calling_last",
                 "session_collab",
                 "host_colors",
-                "keep_warm"
+                "keep_warm",
+                "worktree_location"
               ]
             },
             "title": "Settings",
@@ -12962,7 +12963,8 @@
                         "mobile_assistant",
                         "session_collab",
                         "session_navigation",
-                        "usage_context"
+                        "usage_context",
+                        "worktree_location"
                       ]
                     },
                     "type": "object"
@@ -13041,7 +13043,8 @@
                 "calling_last",
                 "session_collab",
                 "host_colors",
-                "keep_warm"
+                "keep_warm",
+                "worktree_location"
               ],
               "title": "Namespace",
               "type": "string"

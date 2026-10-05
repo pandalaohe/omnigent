@@ -36,6 +36,7 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
+from omnigent.host.git_worktree import WorktreeError, validate_worktree_path_template
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "session_collab",
         "host_colors",
         "keep_warm",
+        "worktree_location",
     }
 )
 
@@ -597,6 +599,85 @@ def migrate_legacy_keep_warm(
     return True
 
 
+WORKTREE_LOCATION_NAMESPACE = "worktree_location"
+
+
+def _validate_worktree_location(value: Any) -> None:
+    """Validate one incoming ``worktree_location`` namespace value.
+
+    Runs on writes only (``patch_namespace`` and ``initialize``), never in
+    :func:`validate_preferences_envelope`, so a value stored under an older
+    template rule still reads back and the host's refusal names the rule.
+    The value is an object whose only key is ``pathTemplate`` — a template
+    string passing :func:`validate_worktree_path_template`, or ``null``.
+
+    :param value: The namespace value being written.
+    :raises UserPreferencesValidationError: Naming the broken rule; the
+        template validator's message is surfaced unchanged.
+    """
+    if not isinstance(value, dict):
+        raise UserPreferencesValidationError("worktree_location must be an object")
+    unknown = set(value) - {"pathTemplate"}
+    if unknown:
+        raise UserPreferencesValidationError(
+            f"unsupported worktree_location key: {sorted(unknown)[0]}"
+        )
+    template = value.get("pathTemplate")
+    if template is None:
+        return
+    if not isinstance(template, str):
+        raise UserPreferencesValidationError(
+            "worktree_location.pathTemplate must be a string or null"
+        )
+    try:
+        validate_worktree_path_template(template)
+    except WorktreeError as exc:
+        raise UserPreferencesValidationError(exc.message) from exc
+
+
+def read_worktree_path_template(
+    store: SqlAlchemyUserPreferencesStore | None,
+    owner: str | None,
+) -> str | None:
+    """Read one owner's worktree location template, ``None`` on any gap.
+
+    The worktree-create path must never fail on a malformed preference
+    row: a missing store / owner / namespace, a non-object value, a
+    missing or non-string ``pathTemplate``, a row that cannot be decoded
+    or fails store validation, or a database error (all logged) resolve
+    to ``None`` — the upstream sibling layout. A stored string is
+    returned as is; the host re-validates it before rendering.
+
+    :param store: Preferences store, or ``None`` when the server has no
+        synced preferences.
+    :param owner: Creating request's owner whose setting applies, or
+        ``None`` when it has no resolvable owner.
+    :returns: The stored template, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``, or ``None``.
+    """
+    if store is None or owner is None:
+        return None
+    try:
+        envelope = store.get(owner)
+    except (UserPreferencesValidationError, ValueError, SQLAlchemyError):
+        logger.warning(
+            "Failed to read the worktree location preference for %s", owner, exc_info=True
+        )
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    settings = envelope.get("settings")
+    if not isinstance(settings, dict):
+        return None
+    value = settings.get(WORKTREE_LOCATION_NAMESPACE)
+    if not isinstance(value, dict):
+        return None
+    template = value.get("pathTemplate")
+    if not isinstance(template, str) or not template:
+        return None
+    return template
+
+
 def _validate_json(value: Any, *, depth: int = 0) -> None:
     """Reject non-JSON values and pathological nesting before serialization."""
     if depth > 32:
@@ -818,6 +899,9 @@ class SqlAlchemyUserPreferencesStore:
         loser retries into the winner's envelope.
         """
         validated = validate_preferences_envelope(envelope)
+        worktree_location = validated["settings"].get(WORKTREE_LOCATION_NAMESPACE)
+        if worktree_location is not None:
+            _validate_worktree_location(worktree_location)
 
         def write(session: Session) -> PreferencesEnvelope:
             _require_user_row(session, user_id, create_if_missing)
@@ -867,6 +951,8 @@ class SqlAlchemyUserPreferencesStore:
             raise UserPreferencesValidationError(f"unsupported preferences namespace: {namespace}")
         if value is not None:
             _validate_json(value)
+            if namespace == WORKTREE_LOCATION_NAMESPACE:
+                _validate_worktree_location(value)
 
         def write(session: Session) -> PreferencesEnvelope:
             _require_user_row(session, user_id, create_if_missing)

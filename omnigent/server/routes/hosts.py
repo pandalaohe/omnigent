@@ -59,7 +59,7 @@ from omnigent.onboarding.harness_install import (
 )
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.cli_retention import (
     CliRetentionHostLeaseBusy,
     CliRetentionHostLeaseLost,
@@ -1453,6 +1453,9 @@ def create_hosts_router(
                         WorktreeProxyError,
                         create_worktree_on_host,
                     )
+                    from omnigent.server.user_preferences_store import (
+                        read_worktree_path_template,
+                    )
 
                     # A worktree made from the entry is sourced from the
                     # project's checkout, not the entry itself.
@@ -1486,6 +1489,13 @@ def create_hosts_router(
                             except WorkspaceValidationError as exc:
                                 raise HTTPException(status_code=400, detail=exc.message) from exc
                     try:
+                        # The owner's worktree location template rides the
+                        # frame; unset keeps the upstream sibling layout.
+                        path_template = await asyncio.to_thread(
+                            read_worktree_path_template,
+                            getattr(request.app.state, "user_preferences_store", None),
+                            user_id or RESERVED_USER_LOCAL,
+                        )
                         worktree = await create_worktree_on_host(
                             host_registry=host_registry,
                             host_conn=conn,
@@ -1494,6 +1504,7 @@ def create_hosts_router(
                             base_branch=body.git.base_branch,
                             existing_branch=body.git.existing_branch,
                             entry=entry,
+                            path_template=path_template,
                         )
                     except WorktreeHostUnavailableError as exc:
                         raise HTTPException(status_code=409, detail=exc.message) from exc

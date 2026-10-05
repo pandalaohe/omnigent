@@ -733,9 +733,11 @@ class HostCreateWorktreeFrame:
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
     :param entry: The project's entry directory on the host, e.g.
-        ``"/Users/alice/project"``. When set, the worktree is created at
-        ``<entry>/.worktrees/<main repo name>/<topic>``; ``None`` keeps
-        today's sibling layout
+        ``"/Users/alice/project"``. Only fills the ``{entry}`` token of
+        ``path_template``; it no longer decides the layout on its own.
+    :param path_template: The user's worktree location template, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``. ``None`` keeps the
+        upstream sibling layout
         ``<repo parent>/<repo name>-worktrees/<topic>``.
     """
 
@@ -745,6 +747,7 @@ class HostCreateWorktreeFrame:
     base_branch: str | None = None
     existing_branch: bool = False
     entry: str | None = None
+    path_template: str | None = None
 
 
 @dataclass
@@ -1662,6 +1665,11 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "base_branch": frame.base_branch,
                 "existing_branch": frame.existing_branch,
                 **({"entry": frame.entry} if frame.entry is not None else {}),
+                **(
+                    {"path_template": frame.path_template}
+                    if frame.path_template is not None
+                    else {}
+                ),
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -2642,6 +2650,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         base_branch=_optional_nullable_str(msg, "base_branch"),
         existing_branch=existing_branch is True,
         entry=_optional_nullable_str(msg, "entry"),
+        path_template=_optional_nullable_str(msg, "path_template"),
     )
 
 

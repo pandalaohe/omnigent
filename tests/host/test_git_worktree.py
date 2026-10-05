@@ -23,7 +23,12 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
     validate_branch_name,
+    validate_worktree_path_template,
 )
+
+# The fork's worktree layout, now expressed as a location template
+# (was hard-coded behind ``entry=``).
+_ENTRY_TEMPLATE = "{entry}/.worktrees/{repo}/{branch}"
 
 # Deterministic identity + config so the tests don't depend on the
 # developer's global git config (user.name / init.defaultBranch).
@@ -124,6 +129,20 @@ def _worktree_count(repo: Path) -> int:
     ).stdout
     # --porcelain emits one "worktree <path>" line per worktree.
     return out.count("worktree ")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_git_ignores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's global and system git config out of every test.
+
+    A global ignore such as ``/.worktrees/`` would otherwise decide
+    whether the exclude tests see a line written.
+    """
+    empty = tmp_path / "empty-gitconfig"
+    empty.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
 
 
 @pytest.fixture()
@@ -383,10 +402,13 @@ def test_create_worktree_non_repo_fails(tmp_path: Path) -> None:
 
 
 def test_create_worktree_entry_places_under_the_entry(git_repo: Path, tmp_path: Path) -> None:
-    """With an entry the worktree lands at ``<entry>/.worktrees/<repo>/<branch>``."""
+    """With our template the worktree lands at ``<entry>/.worktrees/<repo>/<branch>``."""
     entry = (tmp_path / "project").resolve()
     created = create_worktree(
-        repo_path=str(git_repo), branch_name="feature/login", entry=str(entry)
+        repo_path=str(git_repo),
+        branch_name="feature/login",
+        entry=str(entry),
+        path_template=_ENTRY_TEMPLATE,
     )
     assert created.worktree_path == str(entry / ".worktrees" / "myrepo" / "feature-login")
     assert Path(created.worktree_path).is_dir()
@@ -400,7 +422,10 @@ def test_create_worktree_entry_from_linked_worktree_names_main_repo(
     first = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
     entry = (tmp_path / "project").resolve()
     second = create_worktree(
-        repo_path=first.worktree_path, branch_name="feature/b", entry=str(entry)
+        repo_path=first.worktree_path,
+        branch_name="feature/b",
+        entry=str(entry),
+        path_template=_ENTRY_TEMPLATE,
     )
     # ``myrepo`` is the main checkout's directory name, not ``feature-a``.
     assert second.worktree_path == str(entry / ".worktrees" / "myrepo" / "feature-b")
@@ -414,7 +439,12 @@ def test_create_worktree_entry_collision_gets_numeric_suffix(
     base = entry / ".worktrees" / "myrepo"
     base.mkdir(parents=True)
     (base / "feat-x").mkdir()
-    created = create_worktree(repo_path=str(git_repo), branch_name="feat/x", entry=str(entry))
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feat/x",
+        entry=str(entry),
+        path_template=_ENTRY_TEMPLATE,
+    )
     assert created.worktree_path == str(base / "feat-x-2")
     assert _current_branch(Path(created.worktree_path)) == "feat/x"
 
@@ -438,10 +468,16 @@ def test_create_worktree_entry_refuses_symlinked_worktrees_dir(
     (entry / ".worktrees").symlink_to(elsewhere)
 
     with pytest.raises(WorktreeError) as exc:
-        create_worktree(repo_path=str(git_repo), branch_name="escape", entry=str(entry))
+        create_worktree(
+            repo_path=str(git_repo),
+            branch_name="escape",
+            entry=str(entry),
+            path_template=_ENTRY_TEMPLATE,
+        )
 
-    assert "escapes the project entry" in exc.value.message
-    assert str(entry / ".worktrees") in exc.value.message
+    assert "escapes the template anchor" in exc.value.message
+    assert str(entry) in exc.value.message
+    assert str(entry / ".worktrees" / "myrepo") in exc.value.message
     assert list(elsewhere.iterdir()) == []
     assert _worktree_count(git_repo) == 1
 
@@ -453,10 +489,19 @@ def test_create_worktree_existing_branch_entry_places_under_the_entry(
     import shutil
 
     entry = (tmp_path / "project").resolve()
-    created = create_worktree(repo_path=str(git_repo), branch_name="fix-1", entry=str(entry))
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="fix-1",
+        entry=str(entry),
+        path_template=_ENTRY_TEMPLATE,
+    )
     shutil.rmtree(created.worktree_path)
     recreated = create_worktree(
-        repo_path=str(git_repo), branch_name="fix-1", existing_branch=True, entry=str(entry)
+        repo_path=str(git_repo),
+        branch_name="fix-1",
+        existing_branch=True,
+        entry=str(entry),
+        path_template=_ENTRY_TEMPLATE,
     )
     assert recreated.worktree_path == str(entry / ".worktrees" / "myrepo" / "fix-1")
     assert _current_branch(Path(recreated.worktree_path)) == "fix-1"
@@ -473,14 +518,41 @@ def test_create_worktree_bare_main_repository_refused(tmp_path: Path) -> None:
 
 
 def test_create_worktree_entry_writes_exclude_at_repo_root(git_repo: Path, tmp_path: Path) -> None:
-    """An entry at a repo root gains ``/.worktrees/`` in its exclude, once."""
+    """A fresh entry repo gains one exclude line per worktree, never the container."""
     entry = (tmp_path / "project").resolve()
     entry.mkdir()
     _git(entry, "init", "-q", "-b", "main")
-    create_worktree(repo_path=str(git_repo), branch_name="one", entry=str(entry))
-    create_worktree(repo_path=str(git_repo), branch_name="two", entry=str(entry))
+    create_worktree(
+        repo_path=str(git_repo), branch_name="one", entry=str(entry), path_template=_ENTRY_TEMPLATE
+    )
+    create_worktree(
+        repo_path=str(git_repo), branch_name="two", entry=str(entry), path_template=_ENTRY_TEMPLATE
+    )
     lines = (entry / ".git" / "info" / "exclude").read_text().splitlines()
-    assert lines.count("/.worktrees/") == 1
+    assert "/.worktrees/myrepo/one/" in lines
+    assert "/.worktrees/myrepo/two/" in lines
+    assert "/.worktrees/" not in lines
+    # git init seeds the file with comment lines; the two worktree
+    # lines are the only non-comment content.
+    assert [line for line in lines if not line.startswith("#")] == [
+        "/.worktrees/myrepo/one/",
+        "/.worktrees/myrepo/two/",
+    ]
+
+
+def test_create_worktree_entry_exclude_already_ignored_writes_no_line(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A repo already ignoring ``/.worktrees/`` gains no new exclude line."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    _git(entry, "init", "-q", "-b", "main")
+    exclude = entry / ".git" / "info" / "exclude"
+    exclude.write_text("/.worktrees/\n")
+    create_worktree(
+        repo_path=str(git_repo), branch_name="one", entry=str(entry), path_template=_ENTRY_TEMPLATE
+    )
+    assert exclude.read_text().splitlines() == ["/.worktrees/"]
 
 
 def test_create_worktree_entry_writes_exclude_from_subdirectory(
@@ -491,9 +563,13 @@ def test_create_worktree_entry_writes_exclude_from_subdirectory(
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     entry = repo / "sub" / "project"
-    create_worktree(repo_path=str(git_repo), branch_name="one", entry=str(entry))
+    create_worktree(
+        repo_path=str(git_repo), branch_name="one", entry=str(entry), path_template=_ENTRY_TEMPLATE
+    )
     lines = (repo / ".git" / "info" / "exclude").read_text().splitlines()
-    assert lines.count("/sub/project/.worktrees/") == 1
+    assert [line for line in lines if not line.startswith("#")] == [
+        "/sub/project/.worktrees/myrepo/one/"
+    ]
 
 
 def test_create_worktree_entry_outside_git_writes_no_exclude(
@@ -501,9 +577,258 @@ def test_create_worktree_entry_outside_git_writes_no_exclude(
 ) -> None:
     """An entry outside any git working tree writes no exclude file."""
     entry = (tmp_path / "plain-project").resolve()
-    created = create_worktree(repo_path=str(git_repo), branch_name="one", entry=str(entry))
+    created = create_worktree(
+        repo_path=str(git_repo), branch_name="one", entry=str(entry), path_template=_ENTRY_TEMPLATE
+    )
     assert Path(created.worktree_path).is_dir()
     assert not (entry / ".git").exists()
+
+
+def test_create_worktree_unset_template_ignores_entry(git_repo: Path, tmp_path: Path) -> None:
+    """Unset template keeps the sibling layout even with an entry; the entry is untouched."""
+    entry = (tmp_path / "project").resolve()
+    created = create_worktree(repo_path=str(git_repo), branch_name="wip", entry=str(entry))
+    assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+    assert not entry.exists()
+
+
+def test_create_worktree_upstream_template_matches_unset(git_repo: Path) -> None:
+    """The upstream layout written as a template renders the same path as unset."""
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="wip",
+        path_template="{repo_parent}/{repo}-worktrees/{branch}",
+    )
+    assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+
+
+def test_create_worktree_entry_template_without_entry_uses_repo_root(git_repo: Path) -> None:
+    """``{entry}`` falls back to the main work tree when the session has no entry."""
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feature/login",
+        entry=None,
+        path_template=_ENTRY_TEMPLATE,
+    )
+    assert created.worktree_path == str(git_repo / ".worktrees" / "myrepo" / "feature-login")
+    assert _current_branch(Path(created.worktree_path)) == "feature/login"
+
+
+def test_create_worktree_home_template_expands_user(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leading ``~`` renders under the host user's home directory."""
+    home = (tmp_path / "home").resolve()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    created = create_worktree(
+        repo_path=str(git_repo), branch_name="wip", path_template="~/wt/{repo}/{branch}"
+    )
+    assert created.worktree_path == str(home / "wt" / "myrepo" / "wip")
+    assert _current_branch(Path(created.worktree_path)) == "wip"
+
+
+def test_create_worktree_unset_template_matches_upstream_formula(git_repo: Path) -> None:
+    """Unset keeps upstream's sibling path for every source shape."""
+    import shutil
+
+    # A linked-worktree source anchors at the main repo.
+    first = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
+    second = create_worktree(repo_path=first.worktree_path, branch_name="feature/b")
+    assert second.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "feature-b")
+
+    # A subdirectory source relocates ``workspace`` into the same subdirectory.
+    sub = git_repo / "pkg"
+    sub.mkdir()
+    (sub / "README.md").write_text("nested")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add pkg")
+    nested = create_worktree(repo_path=str(sub), branch_name="wip")
+    assert nested.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+    assert nested.workspace == str(Path(nested.worktree_path) / "pkg")
+    assert (Path(nested.workspace) / "README.md").read_text() == "nested"
+
+    # An existing-branch recreate lands at the same sibling path.
+    shutil.rmtree(nested.worktree_path)
+    recreated = create_worktree(repo_path=str(git_repo), branch_name="wip", existing_branch=True)
+    assert recreated.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+
+
+def test_create_worktree_template_exclude_names_only_the_worktree_dir(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A template passing through a container excludes the worktree dir, not the container."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    _git(entry, "init", "-q", "-b", "main")
+    created = create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feat",
+        entry=str(entry),
+        path_template="{entry}/src/wt/{repo}/{branch}",
+    )
+    assert created.worktree_path == str(entry / "src" / "wt" / "myrepo" / "feat")
+    lines = (entry / ".git" / "info" / "exclude").read_text().splitlines()
+    assert [line for line in lines if not line.startswith("#")] == ["/src/wt/myrepo/feat/"]
+    assert "/src/" not in lines
+
+
+def _ignored(repo: Path, relative: str) -> bool:
+    """Whether git ignores ``relative`` (a directory path) inside ``repo``."""
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--", relative], cwd=repo, capture_output=True, check=False
+    )
+    return result.returncode == 0
+
+
+def test_create_worktree_template_exclude_escapes_glob_characters(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A ``[ab]`` directory in the path is excluded literally, never as a glob over siblings."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    _git(entry, "init", "-q", "-b", "main")
+    create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feat",
+        entry=str(entry),
+        path_template="{entry}/src/[ab]/{repo}/{branch}",
+    )
+    lines = (entry / ".git" / "info" / "exclude").read_text().splitlines()
+    assert [line for line in lines if not line.startswith("#")] == ["/src/\\[ab]/myrepo/feat/"]
+    assert _ignored(entry, "src/[ab]/myrepo/feat/")
+    assert not _ignored(entry, "src/a/myrepo/feat/")
+    assert not _ignored(entry, "src/b/myrepo/feat/")
+
+
+def test_create_worktree_template_exclude_respects_directory_rule(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    """A ``.gitignore`` rule naming the worktree directory itself means no exclude line."""
+    entry = (tmp_path / "project").resolve()
+    entry.mkdir()
+    _git(entry, "init", "-q", "-b", "main")
+    (entry / ".gitignore").write_text("/src/wt/myrepo/feat/\n")
+    create_worktree(
+        repo_path=str(git_repo),
+        branch_name="feat",
+        entry=str(entry),
+        path_template="{entry}/src/wt/{repo}/{branch}",
+    )
+    exclude = entry / ".git" / "info" / "exclude"
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    assert [line for line in lines if not line.startswith("#")] == []
+
+
+def test_create_worktree_home_template_refuses_symlink_escape(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlinked directory escaping a non-entry anchor is refused; nothing is created."""
+    home = (tmp_path / "home").resolve()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (home / "wt").symlink_to(outside)
+
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(
+            repo_path=str(git_repo), branch_name="escape", path_template="~/wt/{repo}/{branch}"
+        )
+
+    assert "escapes the template anchor" in exc.value.message
+    assert str(home) in exc.value.message
+    assert str(home / "wt" / "myrepo") in exc.value.message
+    assert list(outside.iterdir()) == []
+    assert _worktree_count(git_repo) == 1
+
+
+def test_create_worktree_mkdir_failure_is_worktree_error(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a template, a refused parent-directory creation is a WorktreeError naming the path."""
+    real_mkdir = Path.mkdir
+
+    def refuse_worktrees_dir(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name == "myrepo-worktrees":
+            raise PermissionError("denied")
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", refuse_worktrees_dir)
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(
+            repo_path=str(git_repo),
+            branch_name="x",
+            path_template="{repo_parent}/{repo}-worktrees/{branch}",
+        )
+    assert "could not create worktree directory" in exc.value.message
+    assert "myrepo-worktrees" in exc.value.message
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # Relative: no anchor token, no absolute path.
+        "wt/{repo}/{branch}",
+        # A token outside the four allowed names.
+        "{entry}/{foo}/{repo}/{branch}",
+        # {branch} is required so worktrees of one repo stay distinct.
+        "{entry}/.worktrees/{repo}",
+        # {repo} is required so worktrees of different repos stay distinct.
+        "{entry}/.worktrees/{branch}",
+        # No '..' segments.
+        "{entry}/../{repo}/{branch}",
+        # A brace that is not part of a token.
+        "{entry}/{repo}/{branch}{",
+        # '~' is only valid as the whole first segment.
+        "~x/{repo}/{branch}",
+        # A first-segment token must be the whole segment.
+        "{entry}x/{repo}/{branch}",
+        # 513 characters after trimming.
+        "{entry}/" + "a" * 489 + "/{repo}/{branch}",
+        # A control character.
+        "{entry}/bad\tdir/{repo}/{branch}",
+    ],
+)
+def test_validate_worktree_path_template_rejects_bad(template: str) -> None:
+    """Broken templates are refused with a message naming the rule."""
+    with pytest.raises(WorktreeError, match="worktree location template"):
+        validate_worktree_path_template(template)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        _ENTRY_TEMPLATE,
+        "{repo_parent}/{repo}-worktrees/{branch}",
+        "~/wt/{repo}/{branch}",
+        "/data/wt/{repo}/{branch}",
+        "C:/wt/{repo}/{branch}",
+    ],
+)
+def test_validate_worktree_path_template_accepts_good(template: str) -> None:
+    """The fork value, the upstream layout, and home / absolute forms pass."""
+    validate_worktree_path_template(template)  # must not raise
+
+
+@pytest.mark.parametrize(
+    ("path", "component"),
+    [
+        ("C:/wt/CON/x", "CON"),
+        ("C:/wt/con.txt/x", "con.txt"),
+        ("C:/wt/a:b/x", "a:b"),
+    ],
+)
+def test_check_host_path_components_windows_rejects(path: str, component: str) -> None:
+    """A reserved device name (any extension) or a forbidden char is refused."""
+    with pytest.raises(WorktreeError) as exc:
+        git_worktree_module._check_host_path_components(Path(path), windows=True)
+    assert component in exc.value.message
+
+
+def test_check_host_path_components_windows_accepts_ordinary_names() -> None:
+    """``console`` merely starts with a reserved name; it is not one."""
+    git_worktree_module._check_host_path_components(Path("C:/wt/console/x"), windows=True)
 
 
 def test_remove_worktree_deletes_dir_and_branch(git_repo: Path) -> None:

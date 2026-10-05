@@ -53,6 +53,9 @@ const mocks = vi.hoisted(() => ({
   archivedFilters: undefined as Record<string, unknown> | undefined,
   getUserSettings: vi.fn(),
   updateUserSettings: vi.fn(),
+  // Network for the server-backed worktree location preference; each test
+  // overrides the response it needs.
+  authenticatedFetch: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -74,6 +77,7 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
+  authenticatedFetch: mocks.authenticatedFetch,
 }));
 vi.mock("@/hooks/useConversations", async () => {
   return {
@@ -316,6 +320,12 @@ beforeEach(() => {
   mocks.agentNames = [];
   mocks.hosts = [];
   mocks.archivedFilters = undefined;
+  mocks.authenticatedFetch.mockReset();
+  // Default: `/v1/me` reports no worktree location preference, so sections
+  // that don't opt into a fixture still mount the control in its ready state.
+  mocks.authenticatedFetch.mockResolvedValue(
+    new Response(JSON.stringify({ preferences: { settings: {} } }), { status: 200 }),
+  );
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
@@ -1210,6 +1220,108 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "" } });
     expect(input.value).toBe("");
     expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
+  });
+
+  /** A `/v1/me` response carrying the given worktree location (null = unset). */
+  function meResponse(template: string | null): Response {
+    return new Response(
+      JSON.stringify({
+        preferences: {
+          settings: template === null ? {} : { worktree_location: { pathTemplate: template } },
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  /** The worktree location PATCH from the mocked fetch, parsed. */
+  function worktreeLocationPatch(): { url: string; body: unknown } | undefined {
+    const call = mocks.authenticatedFetch.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    if (!call) return undefined;
+    return {
+      url: call[0] as string,
+      body: JSON.parse((call[1] as RequestInit).body as string),
+    };
+  }
+
+  it("loads and shows the stored worktree location template", async () => {
+    mocks.authenticatedFetch.mockResolvedValue(meResponse("{entry}/.worktrees/{repo}/{branch}"));
+    renderPage("/settings/git");
+
+    const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("{entry}/.worktrees/{repo}/{branch}"));
+  });
+
+  it("saves the worktree location template and keeps the saved value", async () => {
+    mocks.authenticatedFetch.mockImplementation(async (_url, init) => {
+      if ((init as RequestInit | undefined)?.method === "PATCH") {
+        return new Response(JSON.stringify({ object: "preferences" }), { status: 200 });
+      }
+      return meResponse(null);
+    });
+    renderPage("/settings/git");
+
+    const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
+    await waitFor(() => expect(input).not.toBeDisabled());
+    fireEvent.change(input, { target: { value: "{entry}/.worktrees/{repo}/{branch}" } });
+    fireEvent.click(screen.getByTestId("settings-worktree-location-save"));
+
+    await waitFor(() =>
+      expect(worktreeLocationPatch()).toEqual({
+        url: "/v1/me/preferences/worktree_location",
+        body: { value: { pathTemplate: "{entry}/.worktrees/{repo}/{branch}" } },
+      }),
+    );
+    expect(screen.queryByTestId("settings-worktree-location-error")).toBeNull();
+    expect(input).toHaveValue("{entry}/.worktrees/{repo}/{branch}");
+  });
+
+  it("shows a refused template and keeps the draft", async () => {
+    mocks.authenticatedFetch.mockImplementation(async (_url, init) => {
+      if ((init as RequestInit | undefined)?.method === "PATCH") {
+        return new Response(
+          JSON.stringify({ detail: "worktree location template must contain {branch}" }),
+          { status: 422, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return meResponse(null);
+    });
+    renderPage("/settings/git");
+
+    const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
+    await waitFor(() => expect(input).not.toBeDisabled());
+    fireEvent.change(input, { target: { value: "wt/{repo}" } });
+    fireEvent.click(screen.getByTestId("settings-worktree-location-save"));
+
+    expect(await screen.findByTestId("settings-worktree-location-error")).toHaveTextContent(
+      "worktree location template must contain {branch}",
+    );
+    // The draft stays so the user can fix the refused template in place.
+    expect(input).toHaveValue("wt/{repo}");
+  });
+
+  it("clears the worktree location with a null value", async () => {
+    mocks.authenticatedFetch.mockImplementation(async (_url, init) => {
+      if ((init as RequestInit | undefined)?.method === "PATCH") {
+        return new Response(JSON.stringify({ object: "preferences" }), { status: 200 });
+      }
+      return meResponse("{entry}/.worktrees/{repo}/{branch}");
+    });
+    renderPage("/settings/git");
+
+    const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
+    await waitFor(() => expect(input).toHaveValue("{entry}/.worktrees/{repo}/{branch}"));
+    fireEvent.click(screen.getByTestId("settings-worktree-location-reset"));
+
+    await waitFor(() =>
+      expect(worktreeLocationPatch()).toEqual({
+        url: "/v1/me/preferences/worktree_location",
+        body: { value: null },
+      }),
+    );
+    await waitFor(() => expect(input).toHaveValue(""));
   });
 
   it("lists archived sessions and unarchives on click", () => {

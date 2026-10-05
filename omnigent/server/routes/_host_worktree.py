@@ -182,6 +182,7 @@ async def create_worktree_on_host(
     base_branch: str | None,
     existing_branch: bool = False,
     entry: str | None = None,
+    path_template: str | None = None,
 ) -> CreatedWorktree:
     """
     Send a ``host.create_worktree`` frame and await the result.
@@ -199,8 +200,11 @@ async def create_worktree_on_host(
         pre-existing ``branch_name`` into a fresh worktree (the
         deleted-worktree recreate path) instead of creating a branch.
     :param entry: The session project's entry directory on the host, or
-        ``None`` for the legacy sibling location. When set, the host
-        creates the worktree under ``<entry>/.worktrees/``.
+        ``None``. Only fills the template's ``{entry}`` token; on its
+        own it no longer decides the location.
+    :param path_template: The owner's worktree location template, e.g.
+        ``"{entry}/.worktrees/{repo}/{branch}"``, or ``None`` for the
+        upstream sibling layout. The host validates and renders it.
     :returns: The created worktree's path and branch.
     :raises WorktreeHostUnavailableError: If the host connection drops
         or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
@@ -215,6 +219,7 @@ async def create_worktree_on_host(
             base_branch=base_branch,
             existing_branch=existing_branch,
             entry=entry,
+            path_template=path_template,
         )
     )
     result = await _await_host_worktree_result(

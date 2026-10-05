@@ -71,6 +71,11 @@ import {
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import {
+  pathIsWithinWorktree,
+  useHostWorktrees,
+  type HostWorktree,
+} from "@/hooks/useHostWorktrees";
 import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
@@ -147,6 +152,41 @@ function splitWorktreePath(workspace: string): { repo: string; branchDir: string
   const repo = parent.slice(0, -"-worktrees".length);
   if (!repo.includes("/") || repo.endsWith("/")) return null;
   return { repo, branchDir: workspace.slice(slash + 1) };
+}
+
+/**
+ * Recognise the worktree a source workspace lives in from the host's own
+ * worktree list: the longest non-main row containing the workspace, plus the
+ * main row's path with the workspace's relative subpath appended (a worktree
+ * cut from a subdirectory relocates the same way). The branch comes from the
+ * row — null for a detached worktree, never from the directory name.
+ */
+function worktreeFromHostList(
+  workspace: string,
+  rows: HostWorktree[],
+): { repo: string; branch: string | null } | null {
+  const containing = rows
+    .filter((row) => !row.is_main && pathIsWithinWorktree(workspace, row.path))
+    .reduce<HostWorktree | null>(
+      (best, row) => (best === null || row.path.length > best.path.length ? row : best),
+      null,
+    );
+  const main = rows.find((row) => row.is_main);
+  if (containing === null || main === undefined) return null;
+  // Compare lexically with one separator; a Windows repo then goes through
+  // resolveWorkspacePath so an untouched prefill equals the field's canonical
+  // form (backslashes, upper-case drive).
+  const toForward = (path: string) => path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const rowRoot = toForward(containing.path);
+  const mainRoot = toForward(main.path);
+  const relative = toForward(workspace).slice(rowRoot.length);
+  const forwardRepo = relative === "" ? mainRoot : `${mainRoot}/${relative.replace(/^\/+/, "")}`;
+  const windows = /^[A-Za-z]:[\\/]/.test(workspace) || workspace.startsWith("\\\\");
+  const windowsRepo = forwardRepo.replace(/\//g, "\\");
+  return {
+    repo: windows ? (resolveWorkspacePath(windowsRepo, null) ?? windowsRepo) : forwardRepo,
+    branch: containing.branch,
+  };
 }
 
 /**
@@ -731,6 +771,9 @@ export function ForkSessionForm({
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
   const [branchName, setBranchName] = useState("");
+  // True once the user has typed in the branch field, so a host-list prefill
+  // that lands later fills the repo without overwriting their branch.
+  const [branchEdited, setBranchEdited] = useState(false);
   const [browsing, setBrowsing] = useState(false);
   // True when the user picked a server-provisioned sandbox instead of a
   // connected host — the fork then carries host_type "managed" and the
@@ -794,19 +837,35 @@ export function ForkSessionForm({
     selectedHostId !== sourceHostId;
 
   const sourceWorkspaceNorm = sourceWorkspace ? normalizeWorkspacePath(sourceWorkspace) : null;
-  // Source ran in a server-created git worktree (its effective worktree is
-  // the worktree dir). Recover the repo the worktree was created from so the
-  // form can present the pair as "original repo + worktree" rather than
-  // the worktree path as the working directory. Recognized from the path
-  // convention alone: a fork bound into an existing worktree carries no
-  // gitBranch, so requiring one would miss fork-of-fork sources.
-  const sourceWorktree =
-    sourceWorkspaceNorm !== null ? splitWorktreePath(sourceWorkspaceNorm) : null;
+  // Recover the repo a worktree-backed source came from: the source host's
+  // own list when a row contains the workspace (a subdirectory keeps its
+  // relative path); with no containing row (empty list, lookup error, or a
+  // deleted worktree listed from its nearest surviving parent) the
+  // `-worktrees` parse still recovers it, keeping recreation working.
+  const sourceWorktreeLookupEnabled =
+    sourceHostId != null && sourceHostOnline && sourceWorkspaceNorm !== null;
+  const sourceWorktreeLookup = useHostWorktrees(
+    sourceWorktreeLookupEnabled ? sourceHostId : null,
+    sourceWorktreeLookupEnabled ? sourceWorkspaceNorm : null,
+  );
+  const sourceWorktree = useMemo(() => {
+    if (sourceWorkspaceNorm === null) return null;
+    const fromList =
+      sourceWorktreeLookupEnabled && sourceWorktreeLookup.data !== undefined
+        ? worktreeFromHostList(sourceWorkspaceNorm, sourceWorktreeLookup.data)
+        : null;
+    if (fromList !== null) return fromList;
+    const split = splitWorktreePath(sourceWorkspaceNorm);
+    return split !== null ? { repo: split.repo, branch: split.branchDir } : null;
+  }, [sourceWorkspaceNorm, sourceWorktreeLookupEnabled, sourceWorktreeLookup.data]);
   const sourceRepo = sourceWorktree?.repo ?? null;
-  // Branch shown in the worktree field (and used as the new-branch base):
-  // the session's recorded branch when present, else the worktree's
-  // directory name — the sanitized branch it was created from.
-  const sourceBranch = sourceGitBranch ?? sourceWorktree?.branchDir ?? null;
+  // Branch shown in the worktree field (and used as the new-branch base): the
+  // session's recorded branch when present, else the host row's branch (the
+  // fallback parse's directory name only applies with no containing row).
+  const sourceBranch = sourceGitBranch ?? sourceWorktree?.branch ?? null;
+  // The prefill must not decide from a list that is still loading.
+  const sourceWorktreeLookupSettled =
+    !sourceWorktreeLookupEnabled || sourceWorktreeLookup.isSuccess || sourceWorktreeLookup.isError;
 
   // The source's bound agent, reduced to its ROOT name by peeling every
   // " (fork <id>)" / " (switch <id>)" clone suffix the fork/switch routes
@@ -940,20 +999,29 @@ export function ForkSessionForm({
     sandboxProviderRows,
   ]);
 
-  // Prefill the directory with the source's workspace — but only when staying
-  // on the source host. On a different host that path is a different machine,
-  // so leave it blank for the user to pick. A worktree-backed source prefills
-  // as its ORIGINAL repo + the source branch in the worktree field (the pair
-  // its workspace was created from), not the raw worktree path.
+  // Prefill the directory with the source's workspace — only on the source
+  // host, and only once a host-list lookup (when one applies) has settled so
+  // a cold cache can't lock the raw worktree path in. A worktree source
+  // prefills as its ORIGINAL repo + source branch pair; another host stays
+  // blank (that path is a different machine).
   useEffect(() => {
     if (!onSourceHost || workspace !== "" || !sourceWorkspace) return;
+    if (!sourceWorktreeLookupSettled) return;
     if (sourceRepo !== null && sourceBranch !== null) {
       setWorkspace(sourceRepo);
-      setBranchName(sourceBranch);
+      if (!branchEdited) setBranchName(sourceBranch);
     } else {
       setWorkspace(sourceWorkspace);
     }
-  }, [onSourceHost, workspace, sourceWorkspace, sourceRepo, sourceBranch]);
+  }, [
+    onSourceHost,
+    workspace,
+    sourceWorkspace,
+    sourceRepo,
+    sourceBranch,
+    sourceWorktreeLookupSettled,
+    branchEdited,
+  ]);
 
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
@@ -1122,6 +1190,7 @@ export function ForkSessionForm({
     // re-seeds them if the user switches back.)
     setWorkspace("");
     setBranchName("");
+    setBranchEdited(false);
     setBrowsing(false);
   }
 
@@ -1134,6 +1203,7 @@ export function ForkSessionForm({
     // host-backed listing has nothing left to browse.
     setWorkspace("");
     setBranchName("");
+    setBranchEdited(false);
     setBrowsing(false);
   }
 
@@ -1715,7 +1785,10 @@ export function ForkSessionForm({
                       id="fork-session-branch"
                       type="text"
                       value={branchName}
-                      onChange={(e) => setBranchName(e.target.value)}
+                      onChange={(e) => {
+                        setBranchEdited(true);
+                        setBranchName(e.target.value);
+                      }}
                       placeholder="feature/my-branch"
                       data-testid="fork-session-branch-input"
                       className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
