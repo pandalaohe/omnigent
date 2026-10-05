@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -77,7 +77,7 @@ function renderSettings() {
         <KeepWarmSettings />
       </QueryClientProvider>,
     );
-  return { ...view, rerenderSettings };
+  return { ...view, client, rerenderSettings };
 }
 
 beforeEach(() => {
@@ -90,6 +90,7 @@ afterEach(() => {
   cleanup();
   queuePatchMock.mockReset();
   prefetchMock.mockReset();
+  vi.unstubAllGlobals();
 });
 
 describe("KeepWarmSettings", () => {
@@ -157,7 +158,7 @@ describe("KeepWarmSettings", () => {
     expect(screen.getByLabelText("Longest keep-warm run for Claude Code in hours")).toBeEnabled();
   });
 
-  it("resolves a session-discovered harness and shows its row once resolved", () => {
+  it("resolves a session-discovered harness and shows its row once resolved", async () => {
     const uploaded: AvailableAgent = {
       id: "ag_uploaded",
       name: "uploaded",
@@ -168,17 +169,33 @@ describe("KeepWarmSettings", () => {
       sessionId: "sess_uploaded",
     };
     mocks.agents = [...SUPPORTED_AGENTS, uploaded];
-    const { rerenderSettings } = renderSettings();
+    const fetchStub = vi.fn((url: string) => {
+      if (url === "/v1/sessions/sess_uploaded/agent") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            id: "ag_uploaded",
+            object: "agent",
+            name: "uploaded",
+            harness: "claude-sdk",
+            skills: [],
+          }),
+        } as Response);
+      }
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchStub);
+    renderSettings();
 
-    expect(prefetchMock).toHaveBeenCalledWith(uploaded, expect.anything());
+    // The unresolved harness keeps the row out until the detail query lands.
     expect(screen.queryByText("Uploaded")).toBeNull();
     expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(2);
 
-    mocks.agents = [...SUPPORTED_AGENTS, { ...uploaded, harness: "claude-native" }];
-    rerenderSettings();
+    await waitFor(() => expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(3));
 
     expect(screen.getByText("Uploaded")).toBeInTheDocument();
-    expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(3);
   });
 
   it("renders no agent rows while the list is a catalog-only placeholder", () => {
@@ -191,5 +208,127 @@ describe("KeepWarmSettings", () => {
     expect(
       screen.getByLabelText("Archive children of an offline host after in hours"),
     ).toBeDisabled();
+  });
+
+  it("keeps an uploaded agent that resolves to a native harness next to the built-in", async () => {
+    // Regression: Settings resolves harnesses locally through the per-session
+    // agent query and must not patch the shared ["available-agents"] cache —
+    // a resolved harness there would make the pickers' own prefetch return
+    // early and skip the native-duplicate removal.
+    const uploaded: AvailableAgent = {
+      id: "ag_uploaded",
+      name: "my-claude-upload",
+      display_name: "My-claude-upload",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "sess_uploaded",
+    };
+    mocks.agents = [claudeNative, uploaded];
+    const fetchStub = vi.fn((url: string) => {
+      if (url === "/v1/sessions/sess_uploaded/agent") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            id: "ag_uploaded",
+            object: "agent",
+            name: "my-claude-upload",
+            harness: "claude-native",
+            skills: [],
+          }),
+        } as Response);
+      }
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchStub);
+
+    const { client } = renderSettings();
+    client.setQueryData<AvailableAgent[]>(["available-agents"], [claudeNative, uploaded]);
+
+    // Only the built-in has a resolved harness until the detail fetch lands.
+    expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(1);
+
+    await waitFor(() => expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(2));
+
+    expect(screen.getAllByTestId("keep-warm-agent-row").map((row) => row.dataset.agentId)).toEqual([
+      "claude-native-ui",
+      "ag_uploaded",
+    ]);
+    // The shared cache entry for the uploaded agent still has harness: null —
+    // Settings resolved it read-only, and the pickers' prefetch stays live.
+    expect(
+      client
+        .getQueryData<AvailableAgent[]>(["available-agents"])
+        ?.find((a) => a.id === "ag_uploaded")?.harness,
+    ).toBeNull();
+    expect(prefetchMock).not.toHaveBeenCalled();
+    expect(
+      fetchStub.mock.calls.filter(([url]) => url === "/v1/sessions/sess_uploaded/agent"),
+    ).toHaveLength(1);
+  });
+
+  it("issues exactly one detail request per unresolved agent when a sibling resolves first", async () => {
+    // A resolving while B is still pending re-renders the list; React Query's
+    // per-key sharing must reuse B's in-flight request rather than refetch.
+    const agentA: AvailableAgent = {
+      id: "ag_a",
+      name: "agent-a",
+      display_name: "Agent A",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "sess_a",
+    };
+    const agentB: AvailableAgent = {
+      id: "ag_b",
+      name: "agent-b",
+      display_name: "Agent B",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "sess_b",
+    };
+    mocks.agents = [agentA, agentB];
+
+    let resolveA!: (r: Response) => void;
+    let resolveB!: (r: Response) => void;
+    const fetchStub = vi.fn((url: string) => {
+      if (url === "/v1/sessions/sess_a/agent")
+        return new Promise<Response>((resolve) => {
+          resolveA = resolve;
+        });
+      if (url === "/v1/sessions/sess_b/agent")
+        return new Promise<Response>((resolve) => {
+          resolveB = resolve;
+        });
+      return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchStub);
+
+    renderSettings();
+    expect(screen.queryAllByTestId("keep-warm-agent-row")).toHaveLength(0);
+
+    resolveA({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "ag_a", object: "agent", name: "agent-a", harness: "claude-sdk" }),
+    } as Response);
+    await waitFor(() => expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(1));
+    expect(screen.getAllByTestId("keep-warm-agent-row")[0].dataset.agentId).toBe("ag_a");
+
+    resolveB({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "ag_b", object: "agent", name: "agent-b", harness: "codex" }),
+    } as Response);
+    await waitFor(() => expect(screen.getAllByTestId("keep-warm-agent-row")).toHaveLength(2));
+
+    const requested = fetchStub.mock.calls.map(([url]) => url);
+    expect(requested.filter((url) => url === "/v1/sessions/sess_a/agent")).toHaveLength(1);
+    expect(requested.filter((url) => url === "/v1/sessions/sess_b/agent")).toHaveLength(1);
   });
 });

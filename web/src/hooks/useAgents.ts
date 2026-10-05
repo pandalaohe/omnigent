@@ -102,6 +102,15 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
   };
 }
 
+/** Shared query options for the per-session agent read, cached forever. */
+export function sessionAgentQueryOptions(sessionId: string) {
+  return {
+    queryKey: ["session-agent", sessionId],
+    queryFn: () => fetchSessionAgent(sessionId),
+    staleTime: Infinity,
+  };
+}
+
 /**
  * Fetch a single agent by session id. Used for session-scoped agents
  * created by `omnigent run --server` which may not appear in the
@@ -112,10 +121,9 @@ export function useSessionAgent(sessionId: string | null) {
   // never fetch its agent.
   const serverId = isTempConvId(sessionId) ? null : sessionId;
   return useQuery({
+    ...sessionAgentQueryOptions(serverId ?? ""),
     queryKey: ["session-agent", serverId],
-    queryFn: () => fetchSessionAgent(serverId!),
     enabled: serverId !== null,
-    staleTime: Infinity,
   });
 }
 

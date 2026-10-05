@@ -1,13 +1,10 @@
-import { useEffect, useMemo } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
+import { useQueries } from "@tanstack/react-query";
 
 import { NumericField, SettingRow } from "@/components/SettingsFields";
 import { Switch } from "@/components/ui/switch";
-import {
-  prefetchAvailableAgentDetails,
-  useAvailableAgents,
-  type AvailableAgent,
-} from "@/hooks/useAvailableAgents";
+import { sessionAgentQueryOptions } from "@/hooks/useAgents";
+import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useKeepWarmPreferences } from "@/hooks/useKeepWarmPreferences";
 import {
   clampHostOfflineArchiveSeconds,
@@ -59,30 +56,52 @@ interface SupportedAgent {
 
 export function KeepWarmSettings() {
   const preferences = useKeepWarmPreferences();
-  const queryClient = useQueryClient();
   const { data: agents, isLoading, isPlaceholderData } = useAvailableAgents();
-  // Session-discovered agents arrive with a null harness; resolve them through
-  // the pickers' own prefetch, which patches the shared cache in place and
-  // rerenders this list with the resolved harness.
-  useEffect(() => {
-    for (const agent of agents ?? []) {
-      void prefetchAvailableAgentDetails(agent, queryClient);
-    }
-  }, [agents, queryClient]);
+  // Session-discovered agents arrive with a null harness; resolve them read-only
+  // so the pickers' shared cache and native-duplicate dedup stay untouched.
+  const unresolved = useMemo(
+    () =>
+      (agents ?? []).filter(
+        (agent): agent is AvailableAgent & { sessionId: string } =>
+          agent.harness === null && agent.sessionId !== undefined,
+      ),
+    [agents],
+  );
+  const resolvedHarnessById = useQueries({
+    queries: unresolved.map((agent) => sessionAgentQueryOptions(agent.sessionId)),
+    // Structurally shared, so the record keeps its identity until a detail lands.
+    combine: (results) => {
+      const byId: Record<string, string | null> = {};
+      results.forEach((result, index) => {
+        const detail = result.data;
+        if (detail) byId[unresolved[index].id] = detail.harness ?? null;
+      });
+      return byId;
+    },
+  });
+  const resolvedAgents = useMemo(() => {
+    if (agents === undefined || Object.keys(resolvedHarnessById).length === 0) return agents;
+    return agents.map((agent) =>
+      agent.harness === null && agent.id in resolvedHarnessById
+        ? { ...agent, harness: resolvedHarnessById[agent.id] }
+        : agent,
+    );
+  }, [agents, resolvedHarnessById]);
   const supported = useMemo(() => {
     const rows: SupportedAgent[] = [];
-    for (const agent of agents ?? []) {
+    for (const agent of resolvedAgents ?? []) {
       const family = keepWarmFamilyForHarness(agent.harness);
       if (family) rows.push({ agent, family });
     }
     return rows;
-  }, [agents]);
+  }, [resolvedAgents]);
 
-  const update = (next: KeepWarmPreferences) => writeKeepWarmPreferences(next, agents ?? []);
+  const update = (next: KeepWarmPreferences) =>
+    writeKeepWarmPreferences(next, resolvedAgents ?? []);
   // The catalog-only placeholder omits session-discovered agents, so it is not
   // a complete list: no rows and no stored-row writes until the merged list
-  // lands. An unresolved harness is left out of `supported` until prefetch
-  // fills it rather than dropped from the source list.
+  // lands. An unresolved harness is left out of `supported` until its detail
+  // query resolves rather than dropped from the source list.
   const agentsReady = agents !== undefined && !isPlaceholderData;
   const agentsLoading = !agentsReady && (isLoading || isPlaceholderData);
 
