@@ -24,10 +24,6 @@ const LABELS = [
   "Duplicate message window",
   "Undelivered message lifetime",
   "Timed flows",
-  "Keep idle children warm",
-  "Claude keep-warm interval",
-  "Codex keep-warm interval",
-  "Longest keep-warm run",
 ];
 
 function renderSettings() {
@@ -42,13 +38,12 @@ beforeEach(() => localStorage.clear());
 afterEach(cleanup);
 
 describe("SessionCollabSettings", () => {
-  it("renders the setting labels with keep-warm off by default", () => {
+  it("renders the setting labels", () => {
     renderSettings();
 
     for (const label of LABELS) {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
-    expect(screen.getByRole("switch", { name: "Keep idle children warm" })).not.toBeChecked();
   });
 
   it("switching row 0 off disables the rows below", () => {
@@ -61,37 +56,19 @@ describe("SessionCollabSettings", () => {
     expect(screen.getByLabelText("Rate per session pair")).toBeDisabled();
     expect(screen.getByLabelText("Undelivered message lifetime in minutes")).toBeDisabled();
     expect(screen.getByRole("switch", { name: "Timed flows" })).toBeDisabled();
-    expect(screen.getByRole("switch", { name: "Keep idle children warm" })).toBeDisabled();
-    expect(screen.getByLabelText("Claude keep-warm interval in minutes")).toBeDisabled();
-    expect(screen.getByLabelText("Codex keep-warm interval in minutes")).toBeDisabled();
-    expect(screen.getByLabelText("Longest keep-warm run in hours")).toBeDisabled();
   });
 
-  it("writes keep-warm intervals entered in minutes and hours", () => {
+  it("points at the Keep-warm settings section instead of the old controls", () => {
     renderSettings();
-    fireEvent.click(screen.getByRole("switch", { name: "Keep idle children warm" }));
-    expect(readSessionCollabPreferences().childKeepWarmEnabled).toBe(true);
-    const claude = screen.getByLabelText("Claude keep-warm interval in minutes");
-    const codex = screen.getByLabelText("Codex keep-warm interval in minutes");
-    const longest = screen.getByLabelText("Longest keep-warm run in hours");
 
-    expect(claude).toHaveValue(55);
-    expect(codex).toHaveValue(25);
-    expect(longest).toHaveValue(8);
-
-    fireEvent.change(claude, { target: { value: "30" } });
-    fireEvent.change(codex, { target: { value: "5" } });
-    fireEvent.change(longest, { target: { value: "4" } });
-
-    expect(readSessionCollabPreferences().childKeepWarmClaudeIntervalSeconds).toBe(1800);
-    expect(readSessionCollabPreferences().childKeepWarmCodexIntervalSeconds).toBe(300);
-    expect(readSessionCollabPreferences().childKeepWarmMaxSeconds).toBe(14400);
-
-    fireEvent.change(claude, { target: { value: "55" } });
-    fireEvent.change(longest, { target: { value: "8" } });
-
-    expect(readSessionCollabPreferences().childKeepWarmClaudeIntervalSeconds).toBe(3300);
-    expect(readSessionCollabPreferences().childKeepWarmMaxSeconds).toBe(28800);
+    expect(screen.queryByRole("switch", { name: "Keep idle children warm" })).toBeNull();
+    expect(screen.getByTestId("keep-warm-moved")).toHaveTextContent(
+      "Keep-warm moved to Settings > Keep-warm",
+    );
+    expect(screen.getByRole("link", { name: "Settings > Keep-warm" })).toHaveAttribute(
+      "href",
+      "/settings/keep-warm",
+    );
   });
 
   it("writes a valid relay depth while typing", () => {

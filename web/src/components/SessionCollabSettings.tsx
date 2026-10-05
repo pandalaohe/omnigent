@@ -1,7 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
-
-import { HelpTip } from "@/components/HelpTip";
-import { Input } from "@/components/ui/input";
+import { NumericField, SettingRow } from "@/components/SettingsFields";
 import { Switch } from "@/components/ui/switch";
 import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { useHosts, type Host } from "@/hooks/useHosts";
@@ -33,79 +30,7 @@ const HINTS = {
     "An identical message on the same thread to the same session is dropped while the earlier copy is still undelivered, or inside this window.",
   undelivered: "A queued or held message not delivered within this time expires.",
   flowTimer: "Lets agents run timed flows and timed wake-ups.",
-  keepWarm:
-    "Sends idle Claude Code and Codex children in the active zone a short quiet turn so their prompt cache stays warm.",
-  keepWarmClaude:
-    "A Claude Code child takes a quiet keep-warm turn after this long without a real turn.",
-  keepWarmCodex: "A Codex child takes a quiet keep-warm turn after this long without a real turn.",
-  keepWarmMax:
-    "Warming stops this long after the child's last real turn; its next real turn restarts the clock.",
 };
-
-interface NumericFieldProps {
-  value: number;
-  min: number;
-  max: number;
-  ariaLabel: string;
-  disabled: boolean;
-  onCommit: (value: number) => void;
-}
-
-/**
- * Numeric input with a local draft: only a valid in-range integer is
- * committed while typing; blur restores the last committed value.
- */
-function NumericField({ value, min, max, ariaLabel, disabled, onCommit }: NumericFieldProps) {
-  const [draft, setDraft] = useState(value.toString());
-
-  useEffect(() => {
-    setDraft(value.toString());
-  }, [value]);
-
-  const update = (text: string) => {
-    setDraft(text);
-    if (!/^\d+$/.test(text)) return;
-    const parsed = Number(text);
-    if (parsed < min || parsed > max) return;
-    onCommit(parsed);
-  };
-
-  return (
-    <Input
-      type="number"
-      inputMode="numeric"
-      min={min}
-      max={max}
-      step={1}
-      aria-label={ariaLabel}
-      disabled={disabled}
-      value={draft}
-      onChange={(event) => update(event.target.value)}
-      onBlur={() => setDraft(value.toString())}
-      className="h-9 w-20"
-    />
-  );
-}
-
-function SettingRow({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-6">
-      <div className="flex min-w-0 items-center gap-1.5">
-        <span className="text-sm font-medium text-foreground">{label}</span>
-        <HelpTip label={`About ${label}`}>{hint}</HelpTip>
-      </div>
-      <div className="flex shrink-0 items-center gap-2">{children}</div>
-    </div>
-  );
-}
 
 /**
  * One host's colour picker: eight palette swatches and a reset back to the
@@ -302,58 +227,16 @@ export function SessionCollabSettings() {
       </div>
 
       <h2 className="mt-3 text-ui font-medium">Keeping children warm</h2>
-      <div className="rounded-xl border border-border bg-card p-4">
-        <SettingRow label="Keep idle children warm" hint={HINTS.keepWarm}>
-          <Switch
-            aria-label="Keep idle children warm"
-            checked={preferences.childKeepWarmEnabled}
-            disabled={disabled}
-            onCheckedChange={(childKeepWarmEnabled) => update({ childKeepWarmEnabled })}
-            className="shrink-0"
-          />
-        </SettingRow>
-
-        <div className="mt-4 border-t border-border pt-4">
-          <SettingRow label="Claude keep-warm interval" hint={HINTS.keepWarmClaude}>
-            <NumericField
-              ariaLabel="Claude keep-warm interval in minutes"
-              value={preferences.childKeepWarmClaudeIntervalSeconds / 60}
-              min={SESSION_COLLAB_BOUNDS.childKeepWarmClaudeIntervalSeconds.min / 60}
-              max={SESSION_COLLAB_BOUNDS.childKeepWarmClaudeIntervalSeconds.max / 60}
-              disabled={disabled}
-              onCommit={(minutes) => update({ childKeepWarmClaudeIntervalSeconds: minutes * 60 })}
-            />
-            <span className="text-sm text-muted-foreground">min</span>
-          </SettingRow>
-        </div>
-
-        <div className="mt-4 border-t border-border pt-4">
-          <SettingRow label="Codex keep-warm interval" hint={HINTS.keepWarmCodex}>
-            <NumericField
-              ariaLabel="Codex keep-warm interval in minutes"
-              value={preferences.childKeepWarmCodexIntervalSeconds / 60}
-              min={SESSION_COLLAB_BOUNDS.childKeepWarmCodexIntervalSeconds.min / 60}
-              max={SESSION_COLLAB_BOUNDS.childKeepWarmCodexIntervalSeconds.max / 60}
-              disabled={disabled}
-              onCommit={(minutes) => update({ childKeepWarmCodexIntervalSeconds: minutes * 60 })}
-            />
-            <span className="text-sm text-muted-foreground">min</span>
-          </SettingRow>
-        </div>
-
-        <div className="mt-4 border-t border-border pt-4">
-          <SettingRow label="Longest keep-warm run" hint={HINTS.keepWarmMax}>
-            <NumericField
-              ariaLabel="Longest keep-warm run in hours"
-              value={preferences.childKeepWarmMaxSeconds / 3600}
-              min={SESSION_COLLAB_BOUNDS.childKeepWarmMaxSeconds.min / 3600}
-              max={SESSION_COLLAB_BOUNDS.childKeepWarmMaxSeconds.max / 3600}
-              disabled={disabled}
-              onCommit={(hours) => update({ childKeepWarmMaxSeconds: hours * 3600 })}
-            />
-            <span className="text-sm text-muted-foreground">hours</span>
-          </SettingRow>
-        </div>
+      <div className="rounded-xl border border-border bg-card p-4" data-testid="keep-warm-moved">
+        <p className="text-sm text-muted-foreground">
+          Keep-warm moved to{" "}
+          <Link
+            to="/settings/keep-warm"
+            className="font-medium text-foreground underline underline-offset-2"
+          >
+            Settings &gt; Keep-warm
+          </Link>
+        </p>
       </div>
 
       <h2 className="mt-3 text-ui font-medium">Host colours</h2>

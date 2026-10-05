@@ -142,6 +142,36 @@ export function readSessionCollabPreferences(): SessionCollabPreferences {
   }
 }
 
+/**
+ * Mirror the keep-warm child switch into the legacy namespace.
+ *
+ * Used by the keep-warm settings, which own that switch now: a rolled-back
+ * client still sees the same behaviour. The stored object is merged, never
+ * replaced, so every legacy key survives; the namespace is patched even when
+ * the merged value equals the defaults (a full write would delete it).
+ */
+export function mirrorLegacyChildKeepWarm(childKeepWarmEnabled: boolean): void {
+  if (typeof window === "undefined") return;
+  let merged: Record<string, unknown> = {};
+  try {
+    const raw = window.localStorage.getItem(SESSION_COLLAB_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      merged = { ...(parsed as Record<string, unknown>) };
+    }
+  } catch {
+    // A corrupt cache is simply replaced by the merged value below.
+  }
+  merged.childKeepWarmEnabled = childKeepWarmEnabled;
+  try {
+    window.localStorage.setItem(SESSION_COLLAB_STORAGE_KEY, JSON.stringify(merged));
+  } catch {
+    // Storage denial or quota exhaustion must not break the keep-warm save.
+  }
+  window.dispatchEvent(new Event(SESSION_COLLAB_CHANGED_EVENT));
+  queueUserPreferencePatch("session_collab", merged);
+}
+
 export function writeSessionCollabPreferences(preferences: SessionCollabPreferences): void {
   if (typeof window === "undefined") return;
   const normalized = normalizePreferences(preferences);
