@@ -3753,6 +3753,7 @@ class HostProcess:
                     base_branch=frame.base_branch,
                     existing_branch=frame.existing_branch,
                     entry=frame.entry,
+                    path_template=frame.path_template,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
