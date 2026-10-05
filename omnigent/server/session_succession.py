@@ -60,8 +60,11 @@ _PEER_UNDELIVERED_STATES: tuple[str, ...] = ("pending", "queued", "held")
 _RETRY_BACKOFFS_S: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 30.0)
 
 # One resumer lock per receipt; a phase is never run concurrently in-process.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _resumer_locks: dict[str, asyncio.Lock] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _retry_attempts: dict[str, int] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _retry_tasks: dict[str, asyncio.Task[None]] = {}
 
 
