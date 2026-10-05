@@ -6062,6 +6062,41 @@ async def test_keep_warm_ok_receipt_prices_its_own_usage_not_the_cumulative_tota
 
 
 @pytest.mark.asyncio
+async def test_keep_warm_prices_on_a_worker_thread_not_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The catalog lookup may hit the network, so pricing must not block the loop."""
+    from omnigent.inner import claude_sdk_executor as cse
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+    from omnigent.llms.context_window import ModelPricing
+
+    loop_thread = threading.get_ident()
+    priced_on: list[int] = []
+
+    def fake_pricing(model: str) -> ModelPricing:
+        del model
+        priced_on.append(threading.get_ident())
+        return ModelPricing(
+            input_per_token=3e-6,
+            output_per_token=15e-6,
+            cache_read_per_token=0.3e-6,
+            cache_write_per_token=3.75e-6,
+        )
+
+    monkeypatch.setattr(cse, "fetch_model_pricing", fake_pricing)
+    usage = {"input_tokens": 10, "output_tokens": 1}
+    client = _PingClient(_stream_messages(_PingResultMessage(usage=usage, total_cost_usd=0.0)))
+    executor = ClaudeSDKExecutor()
+    executor._clients["s1"] = _ClaudeClientState(client=client, model="claude-model")
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_ping_sdk()):
+        receipt = await executor.keep_warm(attempt_id="att-thread", family="claude")
+
+    assert receipt["cost_usd"] is not None
+    assert priced_on and all(ident != loop_thread for ident in priced_on)
+
+
+@pytest.mark.asyncio
 async def test_keep_warm_without_live_client_skips_and_creates_nothing() -> None:
     """No cached client → ``no_live_client``; the ping never resolves the SDK."""
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor

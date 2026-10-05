@@ -909,6 +909,27 @@ def _usage_token(value: object) -> int | None:
     return value
 
 
+def _keep_warm_ping_cost(usage: object, model: str | None) -> float | None:
+    """
+    Price a ping's own per-call *usage* under *model*'s catalog rates.
+
+    Called through ``asyncio.to_thread`` because ``fetch_model_pricing``
+    may refresh the catalog over the network.
+
+    :param usage: The ping ``ResultMessage``'s usage dict, when present.
+    :param model: Model the ping's drain reported, else the session's;
+        pricing is skipped when ``None``.
+    :returns: The priced cost, or ``None`` when usage is absent or
+        pricing is unavailable.
+    """
+    if not isinstance(usage, dict) or not usage or not model:
+        return None
+    pricing = fetch_model_pricing(model)
+    if pricing is None:
+        return None
+    return compute_llm_cost(usage, pricing)
+
+
 def _keep_warm_receipt(
     attempt_id: str,
     *,
@@ -2267,39 +2288,36 @@ class ClaudeSDKExecutor(Executor):
             # A terminal ResultMessage can still report a harness failure;
             # it is no more a warm session than an absent result.
             return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
-        return self._keep_warm_ok_receipt(attempt_id, outcome.result, outcome.model or state.model)
+        model = outcome.model or state.model
+        usage = getattr(outcome.result, "usage", None)
+        cost_usd = await asyncio.to_thread(_keep_warm_ping_cost, usage, model)
+        return self._keep_warm_ok_receipt(attempt_id, outcome.result, cost_usd)
 
     @staticmethod
     def _keep_warm_ok_receipt(
-        attempt_id: str, result: object, model: str | None
+        attempt_id: str, result: object, cost_usd: float | None
     ) -> dict[str, Any]:
         """
         Normalize a completed ping's ``ResultMessage`` into an ``ok`` receipt.
 
-        The ping is priced from its own per-call ``usage`` under *model*'s
-        catalog rates; with streaming input the ``ResultMessage``'s
-        ``total_cost_usd`` is cumulative for the whole session and is never
-        read.
+        The ping is priced from its own per-call ``usage`` — by the caller,
+        off the event loop; the ``ResultMessage``'s ``total_cost_usd`` is
+        cumulative for the whole session and is never read.
 
         :param attempt_id: Ping attempt id to echo.
         :param result: The ping turn's ``ResultMessage``.
-        :param model: Model the ping's drain reported, else the session's
-            configured model; pricing is skipped when ``None``.
+        :param cost_usd: Per-call cost priced by :func:`_keep_warm_ping_cost`.
         :returns: The receipt dict; usage fields are ``None`` when the
             message carried no usage, and ``cost_usd`` is ``None`` when
             usage is absent or pricing is unavailable.
         """
         usage = getattr(result, "usage", None)
         input_total = cache_read = cache_write = None
-        cost_usd: float | None = None
         if isinstance(usage, dict) and usage:
             cache_read = _usage_token(usage.get("cache_read_input_tokens"))
             cache_write = _usage_token(usage.get("cache_creation_input_tokens"))
             input_tokens = _usage_token(usage.get("input_tokens"))
             input_total = (input_tokens or 0) + (cache_read or 0) + (cache_write or 0)
-            pricing = fetch_model_pricing(model) if model else None
-            if pricing is not None:
-                cost_usd = compute_llm_cost(usage, pricing)
         return _keep_warm_receipt(
             attempt_id,
             outcome="ok",

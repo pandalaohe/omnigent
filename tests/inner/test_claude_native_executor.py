@@ -2127,6 +2127,51 @@ async def test_keep_warm_ok_receipt_leaves_cost_none_when_unpriceable(
 
 
 @pytest.mark.asyncio
+async def test_keep_warm_cost_prices_on_a_worker_thread_not_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The catalog lookup may hit the network, so pricing must not block the loop."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "context.json").write_text(
+        json.dumps(
+            {
+                "context_window_size": 1000000,
+                "model": "claude-sonnet-4-6",
+                "current_usage": {"input_tokens": 1000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "run_keep_warm_btw",
+        lambda _: claude_bridge.KeepWarmBtwResult("ok", None),
+    )
+    loop_thread = threading.get_ident()
+    priced_on: list[int] = []
+
+    def fake_pricing(model: str) -> ModelPricing:
+        del model
+        priced_on.append(threading.get_ident())
+        return ModelPricing(
+            input_per_token=3e-6,
+            output_per_token=15e-6,
+            cache_read_per_token=3e-7,
+            cache_write_per_token=3.75e-6,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", fake_pricing)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-thread", family="claude")
+
+    assert receipt["cost_usd"] is not None
+    assert priced_on and all(ident != loop_thread for ident in priced_on)
+
+
+@pytest.mark.asyncio
 async def test_keep_warm_bridge_failure_reports_harness_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

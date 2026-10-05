@@ -171,7 +171,7 @@ class ClaudeNativeExecutor(Executor):
             outcome="ok",
             reason=None,
             cache_read=cache_read,
-            cost_usd=_keep_warm_cost_usd(self._bridge_dir, cache_read),
+            cost_usd=await asyncio.to_thread(_keep_warm_cost_usd, self._bridge_dir, cache_read),
             estimated=True,
         )
 
