@@ -344,10 +344,8 @@ async def _await_within_budget(
     loop: asyncio.AbstractEventLoop,
 ) -> _T:
     """Await *awaitable* under the ping deadline, cancelling it on expiry."""
-    remaining = deadline - loop.time()
-    if remaining <= 0:
-        raise TimeoutError
-    return await asyncio.wait_for(awaitable, timeout=remaining)
+    # wait_for closes the awaitable even when the deadline has already passed.
+    return await asyncio.wait_for(awaitable, timeout=max(0.0, deadline - loop.time()))
 
 
 async def _interrupt_keep_warm_turn(
