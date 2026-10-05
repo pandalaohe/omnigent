@@ -855,19 +855,28 @@ class _QuerySlot:
     """Per-session query slot shared by ``run_turn`` and the keep-warm ping.
 
     A real turn and a ping never have a query in flight on the same client
-    at once: ``lock`` serializes them, ``preempt`` tells an in-flight ping
-    that a real turn is waiting, ``maintenance`` marks the ping's turn (and
-    disables tools), and ``tool_attempted`` records a model tool call so the
-    ping's receipt can report ``tool_attempt``.
+    at once. A real turn never blocks on another real turn: it only marks
+    the session busy (``busy``), which pings refuse. The ping takes ``lock``
+    exclusively; ``preempt`` tells an in-flight ping that a real turn is
+    waiting, ``ping_done`` signals that ping has fully yielded (its client
+    retired if its drain never reached a result), ``maintenance`` marks the
+    ping's turn (and disables tools), and ``tool_attempted`` records a model
+    tool call so the ping's receipt can report ``tool_attempt``.
 
-    :param lock: Held from just before ``query`` until the drain ends.
+    :param lock: Held by a ping from its claim until its drain ends.
     :param preempt: Set by a waiting ``run_turn``; watched by the ping.
+    :param ping_done: Set by the ping once it has released the slot; a
+        waiting turn wakes on it instead of blocking on any turn's lock.
+    :param busy: Count of real turns in flight (stale on abandonment, which
+        only ever makes pings skip).
     :param maintenance: ``True`` while a keep-warm ping owns the slot.
     :param tool_attempted: ``True`` once the ping turn tried to call a tool.
     """
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     preempt: asyncio.Event = field(default_factory=asyncio.Event)
+    ping_done: asyncio.Event = field(default_factory=asyncio.Event)
+    busy: int = 0
     maintenance: bool = False
     tool_attempted: bool = False
 
@@ -2069,12 +2078,6 @@ class ClaudeSDKExecutor(Executor):
             self._query_slots[session_key] = slot
         return slot
 
-    def _reset_query_slot(self, session_key: str) -> _QuerySlot:
-        """Replace a wedged session slot so a turn can proceed on a fresh one."""
-        slot = _QuerySlot()
-        self._query_slots[session_key] = slot
-        return slot
-
     async def _close_live_client(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
@@ -2190,7 +2193,7 @@ class ClaudeSDKExecutor(Executor):
 
         The ping reuses the session's existing ``ClaudeSDKClient`` only — it
         never creates or reconnects one. A missing or terminated client skips
-        ``no_live_client``; a real turn holding the session's query slot skips
+        ``no_live_client``; a session with a real turn in flight skips
         ``busy``. While the ping owns the slot the session's maintenance flag
         denies every tool call, so the fixed one-line turn can never do real
         work; a real turn arriving mid-ping preempts it, and the ping yields
@@ -2210,14 +2213,24 @@ class ClaudeSDKExecutor(Executor):
             return _keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
         session_key, state = live
         slot = self._query_slot(session_key)
-        if slot.lock.locked():
+        if slot.busy or slot.maintenance or slot.lock.locked():
             return _keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
-        await slot.lock.acquire()
+        # Claim before the first await, clearing the previous completion
+        # signal in the same synchronous step, so no turn can observe the
+        # slot as free while this ping is about to query.
+        slot.ping_done.clear()
         slot.maintenance = True
+        try:
+            await slot.lock.acquire()
+        except BaseException:
+            slot.maintenance = False
+            raise
         slot.tool_attempted = False
         slot.preempt.clear()
+        reached_result = False
         try:
             outcome = await self._drive_keep_warm_ping(state.client, slot, session_key)
+            reached_result = outcome.result is not None
         except Exception:
             logger.exception("claude-sdk: keep-warm ping failed for session %s", session_key)
             return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
@@ -2225,7 +2238,18 @@ class ClaudeSDKExecutor(Executor):
             slot.maintenance = False
             slot.tool_attempted = False
             slot.preempt.clear()
-            slot.lock.release()
+            try:
+                # An incomplete drain leaves a response in flight on the
+                # client; retire it so a late response can never reach a real
+                # turn. Only if this ping's client is still the live one —
+                # a turn that timed out the ping may already have replaced it.
+                if not reached_result:
+                    current = self._clients.get(session_key)
+                    if current is not None and current.client is state.client:
+                        await self._close_live_client(session_key)
+            finally:
+                slot.lock.release()
+                slot.ping_done.set()
         if outcome.preempted:
             return _keep_warm_receipt(attempt_id, outcome="skipped", reason="preempted")
         if outcome.tool_attempted:
@@ -2233,6 +2257,10 @@ class ClaudeSDKExecutor(Executor):
         if outcome.timed_out:
             return _keep_warm_receipt(attempt_id, outcome="failed", reason="timeout")
         if outcome.result is None:
+            return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+        if getattr(outcome.result, "is_error", False):
+            # A terminal ResultMessage can still report a harness failure;
+            # it is no more a warm session than an absent result.
             return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
         return self._keep_warm_ok_receipt(attempt_id, outcome.result)
 
@@ -3074,19 +3102,16 @@ class ClaudeSDKExecutor(Executor):
         # tools. The human-consent elicitation half of the gate still only
         # fires for non-bypass modes (see ``_can_use_tool_gate``).
         #
-        # Install whenever EITHER a policy evaluator OR an elicitation
-        # handler is wired. Previously this only installed for non-bypass
-        # modes, which is why default ``claude-sdk`` sessions (which
-        # default to ``bypassPermissions``) had no per-tool TOOL_CALL gate.
-        if (
-            getattr(self, "_policy_evaluator", None) is not None
-            or self._elicitation_handler is not None
-        ):
-            options.can_use_tool = partial(
-                self._can_use_tool_gate,
-                permission_mode=permission_mode,
-                session_key=session_key,
-            )
+        # Install unconditionally: with no policy evaluator and no
+        # elicitation handler the gate allows everything except during a
+        # keep-warm ping, whose maintenance veto must be reachable on every
+        # client shape. Previously this only installed when one of those
+        # collaborators was wired, so a bare session had no maintenance veto.
+        options.can_use_tool = partial(
+            self._can_use_tool_gate,
+            permission_mode=permission_mode,
+            session_key=session_key,
+        )
 
         self._install_subagent_router_hook(sdk, options, model)
         self._install_framework_context_hook(sdk, options, session_key)
@@ -3281,32 +3306,44 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
-        # Claim the session's query slot before setting per-turn context: a
-        # keep-warm ping owning the slot yields to this turn, and no ping may
-        # interleave a query on the same client while this turn streams.
+        # Mark the session busy for this turn's duration. A real turn never
+        # waits on the slot lock, so an abandoned generator cannot block a
+        # later turn; its stale busy mark only makes pings skip.
         slot = self._query_slot(session_key)
-        if slot.maintenance:
-            slot.preempt.set()
-            try:
-                await asyncio.wait_for(slot.lock.acquire(), timeout=_KEEP_WARM_PREEMPT_WAIT_S)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Claude SDK keep-warm ping did not yield for session %s; "
-                    "closing the live client so the turn starts fresh",
-                    session_key,
-                )
-                await self._close_live_client(session_key)
-                client = await self._get_or_create_client(
-                    sdk,
-                    session_key=session_key,
-                    options=options,
-                    model=model,
-                )
-                slot = self._reset_query_slot(session_key)
-                await slot.lock.acquire()
-        else:
-            await slot.lock.acquire()
+        slot.busy += 1
         try:
+            if slot.maintenance:
+                # A keep-warm ping owns the client: ask it to yield, then
+                # wait (bounded) for its completion signal before querying.
+                slot.preempt.set()
+                try:
+                    await asyncio.wait_for(
+                        slot.ping_done.wait(), timeout=_KEEP_WARM_PREEMPT_WAIT_S
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Claude SDK keep-warm ping did not yield for session %s; "
+                        "closing the live client so the turn starts fresh",
+                        session_key,
+                    )
+                    # This turn takes the client over; the ping's late
+                    # finalizer must not keep denying this turn's tools.
+                    slot.maintenance = False
+                    slot.tool_attempted = False
+                    await self._close_live_client(session_key)
+                # An incomplete ping retires the client, so this turn may
+                # hold a stale reference; take a live one and, because a
+                # replacement has no prior session state, replay full history.
+                live_state = self._clients.get(session_key)
+                if live_state is None or live_state.client is not client:
+                    client = await self._get_or_create_client(
+                        sdk,
+                        session_key=session_key,
+                        options=options,
+                        model=model,
+                    )
+                    prompt = self._build_prompt(messages, resume_session=False)
+                    notice_messages = messages
             self._pending_framework_context[session_key] = "\n\n".join(
                 notice
                 for message in notice_messages
@@ -3725,7 +3762,7 @@ class ClaudeSDKExecutor(Executor):
             return
         finally:
             self._pending_framework_context.pop(session_key, None)
-            slot.lock.release()
+            slot.busy -= 1
         # A turn can end without ``ResultMessage`` usage — the CLI can close
         # the stream early, fail terminally (auth failure, rejected retries),
         # or be cut short before its final usage is reported. In all of those
