@@ -4980,20 +4980,6 @@ _KEEP_WARM_CLIENT_INPUT_WINDOW_S = 60.0
 # treated as unavailable for this attempt.
 _KEEP_WARM_OVERLAY_TIMEOUT_S = 30.0
 _KEEP_WARM_OVERLAY_POLL_INTERVAL_S = 0.5
-# The quiet-turn fallback (a session where /btw proved unavailable) is a
-# real maintenance turn; the fixed text asks for a one-word answer. While
-# it runs, a marker in the bridge dir makes both policy hook paths deny
-# every tool, so the ping can never do real work.
-KEEP_WARM_QUIET_TURN_TEXT = (
-    "[System: Omnigent keep-warm check. Do not use any tools. Reply with only: [quiet]]"
-)
-KEEP_WARM_MAINTENANCE_FILE = "keep_warm_maintenance.json"
-# The marker outlives the turn budget, so a runner or harness that dies
-# mid-turn cannot leave tools disabled much longer than the attempt.
-KEEP_WARM_MAINTENANCE_TTL_S = 240.0
-KEEP_WARM_MAINTENANCE_DENY_REASON = "keep-warm maintenance turn: tools are disabled"
-# Budget for the maintenance turn to go running and settle again.
-_KEEP_WARM_QUIET_TURN_TIMEOUT_S = 180.0
 # Read-only capture cannot tell a complete tall answer from one the pane
 # clipped (both end in a blank + footer), so an overlay whose border→footer
 # span reaches this many rows is flagged possibly-truncated. This
@@ -6982,16 +6968,6 @@ def _tool_relay_handler_factory(
 
             raw_event = payload.get("hook_event_name")
             hook_event = raw_event if isinstance(raw_event, str) else ""
-            # A quiet keep-warm turn denies every tool before any policy
-            # evaluation, so the ping can never do real work.
-            if (
-                hook_event == _PRE_TOOL_USE
-                and bridge_dir is not None
-                and read_keep_warm_maintenance_marker(bridge_dir) is not None
-            ):
-                record_keep_warm_tool_attempt(bridge_dir)
-                self._respond_hook_output(keep_warm_maintenance_deny_output(hook_event))
-                return
             if policy_client is None or session_id is None:
                 self._respond_hook_output(None)
                 return
@@ -8242,9 +8218,34 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     :returns: The attempt's outcome; guard refusals return, never raise.
     :raises RuntimeError: If a ``tmux`` invocation fails mid-sequence.
     """
-    refusal, socket_path, tmux_target = _keep_warm_pre_guards(bridge_dir)
-    if refusal is not None:
-        return refusal
+    if has_pending_user_prompt(bridge_dir):
+        return KeepWarmBtwResult("skipped", "card")
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return KeepWarmBtwResult("skipped", "unknown")
+    running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
+    if running is None:
+        return KeepWarmBtwResult("skipped", "unknown")
+    if running:
+        return KeepWarmBtwResult("skipped", "busy")
+    pane = _capture_pane(socket_path, tmux_target)
+    if not claude_pane_text_ready(pane):
+        return KeepWarmBtwResult("skipped", "busy")
+    draft = _composer_region_text(pane)
+    if draft is None:
+        return KeepWarmBtwResult("skipped", "unknown")
+    if draft:
+        return KeepWarmBtwResult("skipped", "composer_draft")
+    readable, last_input_at = _tmux_last_client_input(socket_path, tmux_target)
+    if not readable:
+        return KeepWarmBtwResult("skipped", "unknown")
+    if (
+        last_input_at is not None
+        and time.time() - last_input_at < _KEEP_WARM_CLIENT_INPUT_WINDOW_S
+    ):
+        return KeepWarmBtwResult("skipped", "user_active")
     _paste_keep_warm_btw(bridge_dir, socket_path, tmux_target)
     # Enter goes out only while one fresh capture shows no pending
     # prompt, no running turn, and the composer holding exactly the
@@ -8289,253 +8290,9 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
             return KeepWarmBtwResult("failed", "aborted")
         time.sleep(_KEEP_WARM_OVERLAY_POLL_INTERVAL_S)
     # The question is in and may still be answering; leave the overlay
-    # for the next injected message to dismiss.
+    # for the next injected message to dismiss. A later slice adds the
+    # quiet-turn fallback after repeated btw_unavailable failures.
     return KeepWarmBtwResult("failed", "btw_unavailable")
-
-
-def _keep_warm_pre_guards(bridge_dir: Path) -> tuple[KeepWarmBtwResult | None, str, str]:
-    """
-    Run the unattended-pane guards shared by both keep-warm channels.
-
-    Guards, in order: a pending Claude question / permission prompt →
-    ``card``; tmux metadata missing → ``unknown``; Claude's status file
-    says a turn is generating → ``busy``, and an unreadable file →
-    ``unknown`` (never evidence of idle); no mounted, uncovered chat
-    input → ``busy``; the composer region unreadable → ``unknown``, or a
-    draft on any of its rows → ``composer_draft``; a regular tmux client
-    took input within :data:`_KEEP_WARM_CLIENT_INPUT_WINDOW_S` →
-    ``user_active``, and an unreadable client-activity query →
-    ``unknown``.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: ``(refusal, socket_path, tmux_target)``; *refusal* is the
-        guard result the caller returns, or ``None`` with the advertised
-        tmux target when the pane is safe to type on.
-    """
-    if has_pending_user_prompt(bridge_dir):
-        return KeepWarmBtwResult("skipped", "card"), "", ""
-    payload = _read_json_file(bridge_dir / _TMUX_FILE)
-    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
-    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
-    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
-        return KeepWarmBtwResult("skipped", "unknown"), "", ""
-    running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
-    if running is None:
-        return KeepWarmBtwResult("skipped", "unknown"), "", ""
-    if running:
-        return KeepWarmBtwResult("skipped", "busy"), "", ""
-    pane = _capture_pane(socket_path, tmux_target)
-    if not claude_pane_text_ready(pane):
-        return KeepWarmBtwResult("skipped", "busy"), "", ""
-    draft = _composer_region_text(pane)
-    if draft is None:
-        return KeepWarmBtwResult("skipped", "unknown"), "", ""
-    if draft:
-        return KeepWarmBtwResult("skipped", "composer_draft"), "", ""
-    readable, last_input_at = _tmux_last_client_input(socket_path, tmux_target)
-    if not readable:
-        return KeepWarmBtwResult("skipped", "unknown"), "", ""
-    if (
-        last_input_at is not None
-        and time.time() - last_input_at < _KEEP_WARM_CLIENT_INPUT_WINDOW_S
-    ):
-        return KeepWarmBtwResult("skipped", "user_active"), "", ""
-    return None, socket_path, tmux_target
-
-
-def write_keep_warm_maintenance_marker(bridge_dir: Path, attempt_id: str) -> None:
-    """
-    Write the tool-veto marker for one quiet keep-warm turn.
-
-    The payload carries the ping attempt id and an ``expires_at`` bound
-    above the turn budget, so a runner or harness that dies mid-turn
-    cannot leave tools disabled much longer than the attempt.
-
-    :param bridge_dir: Bridge directory path.
-    :param attempt_id: Ping attempt id owning the maintenance turn.
-    :returns: None.
-    """
-    _write_json_file(
-        bridge_dir / KEEP_WARM_MAINTENANCE_FILE,
-        {
-            "attempt_id": attempt_id,
-            "expires_at": time.time() + KEEP_WARM_MAINTENANCE_TTL_S,
-        },
-    )
-
-
-def clear_keep_warm_maintenance_marker(bridge_dir: Path) -> None:
-    """
-    Remove the maintenance marker at the end of a quiet keep-warm turn.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: None.
-    """
-    with contextlib.suppress(OSError):
-        (bridge_dir / KEEP_WARM_MAINTENANCE_FILE).unlink(missing_ok=True)
-
-
-def read_keep_warm_maintenance_marker(bridge_dir: Path) -> _JsonObject | None:
-    """
-    Read the quiet-turn maintenance marker while it is still in effect.
-
-    The marker payload (``attempt_id``, ``expires_at``, and
-    ``tool_attempt`` once a hook recorded a denied tool) is returned only
-    while ``expires_at`` is in the future. An absent, malformed, or
-    expired marker removes any file on the way and reads ``None`` —
-    expired means the veto is off, exactly like absent.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: The live marker payload, or ``None``.
-    """
-    path = bridge_dir / KEEP_WARM_MAINTENANCE_FILE
-    payload = _read_json_file(path)
-    expires_at = payload.get("expires_at")
-    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
-        return None
-    if time.time() >= float(expires_at):
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
-        return None
-    return payload
-
-
-def record_keep_warm_tool_attempt(bridge_dir: Path) -> None:
-    """
-    Note on the maintenance marker that the turn tried to use a tool.
-
-    Both policy hook paths call this just before denying a tool, so the
-    waiting quiet turn can report ``failed`` / ``tool_attempt``. The
-    rewrite keeps the original ``expires_at``: a burst of tool attempts
-    cannot extend the veto.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: None.
-    """
-    payload = read_keep_warm_maintenance_marker(bridge_dir)
-    if payload is None or payload.get("tool_attempt") is True:
-        return
-    payload["tool_attempt"] = True
-    _write_json_file(bridge_dir / KEEP_WARM_MAINTENANCE_FILE, payload)
-
-
-def keep_warm_maintenance_deny_output(hook_event: str) -> _JsonObject | None:
-    """
-    Build the hook output denying one tool during a quiet keep-warm turn.
-
-    :param hook_event: Hook event name; only ``PreToolUse`` yields output.
-    :returns: The same deny shape a policy DENY uses, or ``None``.
-    """
-    from omnigent.native.native_policy_hook import evaluation_response_to_hook_output
-
-    return evaluation_response_to_hook_output(
-        hook_event,
-        {"result": "POLICY_ACTION_DENY", "reason": KEEP_WARM_MAINTENANCE_DENY_REASON},
-    )
-
-
-@dataclass(frozen=True)
-class KeepWarmQuietTurnResult:
-    """
-    Outcome of one guarded keep-warm quiet-turn attempt.
-
-    :param outcome: ``"ok"`` when the maintenance turn ran and settled,
-        ``"skipped"`` when a guard refused before any effect, ``"failed"``
-        when the turn tried a tool or never settled.
-    :param reason: ``"quiet_turn"`` on ``"ok"``; the shared guard reason
-        (``"card"``, ``"unknown"``, ``"busy"``, ``"composer_draft"``,
-        ``"user_active"``) on ``"skipped"``; ``"tool_attempt"`` or
-        ``"timeout"`` on ``"failed"``.
-    """
-
-    outcome: str
-    reason: str | None = None
-
-
-def run_keep_warm_quiet_turn(
-    bridge_dir: Path,
-    attempt_id: str,
-    *,
-    inject: Callable[[str], None],
-) -> KeepWarmQuietTurnResult:
-    """
-    Drive one guarded keep-warm quiet turn on the live pane.
-
-    The fallback channel for a session where ``/btw`` proved unavailable:
-    instead of a side question it injects
-    :data:`KEEP_WARM_QUIET_TURN_TEXT` through *inject* (the executor's
-    normal message path) as a real maintenance turn. The exchange lands
-    in the transcript — one system line and one reply — but re-reads the
-    cached prefix, which is what keeps the cache warm.
-
-    The shared unattended-pane guards run first, and a refusal returns
-    the same result the ``/btw`` channel would. For the life of the turn
-    a maintenance marker makes both policy hook paths deny every tool
-    (:func:`read_keep_warm_maintenance_marker`), so the ping can never do
-    real work; a recorded denial becomes ``failed`` / ``"tool_attempt"``.
-    The turn is watched on Claude's status file and must go running and
-    then idle within :data:`_KEEP_WARM_QUIET_TURN_TIMEOUT_S`, else the
-    attempt fails ``"timeout"``. The marker is removed in a ``finally``.
-
-    The caller holds the executor's injection lock; cancellation makes
-    the wait stop at its next poll.
-
-    :param bridge_dir: Bridge directory path.
-    :param attempt_id: Ping attempt id owning the maintenance turn.
-    :param inject: Callback that delivers the quiet-turn text as a user
-        message, e.g. the executor's normal inject path.
-    :returns: The attempt's outcome; guard refusals return, never raise.
-    """
-    refusal, socket_path, tmux_target = _keep_warm_pre_guards(bridge_dir)
-    if refusal is not None:
-        return KeepWarmQuietTurnResult(refusal.outcome, refusal.reason)
-    write_keep_warm_maintenance_marker(bridge_dir, attempt_id)
-    try:
-        inject(KEEP_WARM_QUIET_TURN_TEXT)
-        return _wait_keep_warm_quiet_turn(bridge_dir, socket_path, tmux_target)
-    finally:
-        clear_keep_warm_maintenance_marker(bridge_dir)
-
-
-def _wait_keep_warm_quiet_turn(
-    bridge_dir: Path, socket_path: str, tmux_target: str
-) -> KeepWarmQuietTurnResult:
-    """
-    Watch the maintenance turn go running and settle on Claude's status file.
-
-    The injected text starts a real turn, so the status file reports
-    ``running`` while it generates and ``idle`` when it settles. A tool
-    the model tried during the turn was denied by the marker's veto and
-    recorded there, so the marker is checked before an ok is reported.
-    Never seeing the turn run — the read stays unreadable or idle — is a
-    timeout, as is a turn still generating when the budget ends.
-
-    :param bridge_dir: Bridge directory path.
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string.
-    :returns: ``ok`` / ``quiet_turn``, ``failed`` / ``tool_attempt``, or
-        ``failed`` / ``timeout``.
-    """
-    deadline = time.monotonic() + _KEEP_WARM_QUIET_TURN_TIMEOUT_S
-    running_seen = False
-    settled = False
-    while time.monotonic() < deadline:
-        _check_injection_cancelled()
-        running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
-        if running:
-            running_seen = True
-        elif running_seen:
-            settled = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    marker = read_keep_warm_maintenance_marker(bridge_dir)
-    if marker is not None and marker.get("tool_attempt") is True:
-        return KeepWarmQuietTurnResult("failed", "tool_attempt")
-    if running_seen and settled:
-        return KeepWarmQuietTurnResult("ok", "quiet_turn")
-    return KeepWarmQuietTurnResult("failed", "timeout")
 
 
 def read_claude_status_model(bridge_dir: Path) -> str | None:

@@ -1095,17 +1095,7 @@ class ChildKeepWarmSweeper:
         # here. The turn's cache reading (when measurable) classifies the
         # return after an absence and feeds the Codex warm_state observation.
         if inspectable and running_since is not None and status == "idle":
-            # The quiet-turn fallback's own maintenance turn moves
-            # ``running_since`` while its attempt is pending; its receipt (or
-            # the attempt timeout) settles that turn, so rule 3 must not read
-            # it as a real turn here.
-            ping_turn = (
-                state is not None
-                and state.a is not None
-                and state.p is not None
-                and running_since >= state.p
-            )
-            new_episode = (state is None or running_since != state.t) and not ping_turn
+            new_episode = state is None or running_since != state.t
             if new_episode:
                 sticky_miss = (
                     state is not None
@@ -1173,7 +1163,7 @@ class ChildKeepWarmSweeper:
                     # The reaper-yield touch protects an episode that will be
                     # pinged; with the switch off there is nothing to protect.
                     touch = switch_on and runner_online is True and host_ok
-            elif not ping_turn and state is not None and state.r and state.s == "w":
+            elif state is not None and state.r and state.s == "w":
                 # The episode opened with an unmeasurable reading; retry the
                 # same turn's classification against the stored baseline
                 # (running_since still matches state.t here) until the grace
@@ -1298,10 +1288,7 @@ class ChildKeepWarmSweeper:
         on the normalized usage fields; ``skipped`` clears the attempt with
         no other change (the cache may expire); ``failed`` counts a failure
         (three pause warming). A ``skipped`` / ``failed`` receipt's
-        ``reason`` is recorded as the stop reason. A fallback receipt's
-        ``turn: true`` adopts the ping turn's ``running_since`` as already
-        seen, so the ping's own maintenance turn starts no new episode and
-        leaves the cap clock and miss accounting unchanged.
+        ``reason`` is recorded as the stop reason.
 
         :param session_id: Session the receipt belongs to.
         :param data: The ``external_keep_warm_receipt`` payload.
@@ -1368,14 +1355,6 @@ class ChildKeepWarmSweeper:
         notices: list[tuple[str, dict[str, int]]] = []
         stats = _WarmStats.parse(conv.labels.get(KEEP_WARM_STATS_LABEL))
         stats_dirty = False
-        if data.get("turn") is True:
-            # A quiet-turn fallback receipt: the ping's own maintenance turn
-            # moved ``running_since``. Adopt it as already seen so rule 3
-            # never reads the ping's turn as a real turn; the episode, its
-            # cap clock and the miss accounting stay unchanged.
-            running_since = _running_since(conv)
-            if running_since is not None:
-                state.t = running_since
         if outcome == "ok":
             state.u = now
             state.f = 0

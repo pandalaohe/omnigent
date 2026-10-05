@@ -10,7 +10,7 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -34,7 +34,6 @@ from omnigent.harnesses.claude_native.bridge import (
     read_model_env,
     read_model_picker_values,
     run_keep_warm_btw,
-    run_keep_warm_quiet_turn,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -56,12 +55,6 @@ from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
-
-# Consecutive ``btw_unavailable`` results after which a session's pings
-# fall back to the quiet turn.
-_QUIET_TURN_AFTER_BTW_UNAVAILABLE = 2
-
-_WorkerResult = TypeVar("_WorkerResult")
 
 
 class ClaudeNativeExecutor(Executor):
@@ -99,11 +92,6 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
         self._applied_model: str | None = None
-        # Consecutive failed ``/btw`` pings that found the overlay channel
-        # unavailable; an ok ``/btw`` resets it. From
-        # :data:`_QUIET_TURN_AFTER_BTW_UNAVAILABLE` on, this session's pings
-        # use the quiet-turn fallback instead.
-        self._btw_unavailable_failures = 0
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -146,24 +134,18 @@ class ClaudeNativeExecutor(Executor):
 
     async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
         """
-        Ping the pane to keep the provider prompt cache warm.
+        Ping the pane with a guarded ``/btw`` side question (keep-warm).
 
-        Prefers a guarded ``/btw`` side question: it reads the cached
-        prefix, has no tool access, and leaves no transcript item. After
-        :data:`_QUIET_TURN_AFTER_BTW_UNAVAILABLE` consecutive
-        ``btw_unavailable`` results this session falls back to the guarded
-        quiet turn — a real maintenance turn, allowed to add one system
-        line and one reply, whose receipt carries ``turn: true``. Both
-        channels run under ``_inject_lock``, so a real message arriving
-        meanwhile simply waits the exchange out — keystrokes never
-        interleave. Cancellation sets a stop flag the bridge checks before
-        every key it sends, and the lock is released only after the worker
-        thread finished.
-
-        Since Claude Code reports no usage for side questions, an ok
-        ``/btw`` receipt estimates cost from the session's current context
-        tokens (the statusLine snapshot) priced as cache reads; the quiet
-        turn uses the same estimate.
+        The whole guard-and-paste sequence runs under ``_inject_lock``,
+        so a real message arriving meanwhile simply waits the few
+        seconds the exchange takes — keystrokes never interleave.
+        Cancellation sets a stop flag the bridge checks before every
+        key it sends, and the lock is released only after the worker
+        thread finished. ``/btw`` answers have no tool access, so the
+        ping can never do real work. Claude Code reports no usage for
+        side questions, so the receipt estimates cost: the session's
+        current context tokens (the statusLine snapshot) priced as
+        cache reads.
 
         :param attempt_id: Server-allocated ping attempt id, echoed on
             the receipt.
@@ -174,13 +156,7 @@ class ClaudeNativeExecutor(Executor):
         del family
         async with self._inject_lock:
             try:
-                if self._btw_unavailable_failures >= _QUIET_TURN_AFTER_BTW_UNAVAILABLE:
-                    return await self._keep_warm_quiet_turn(attempt_id)
                 result = await self._keep_warm_btw()
-                if result.outcome == "ok":
-                    self._btw_unavailable_failures = 0
-                elif result.outcome == "failed" and result.reason == "btw_unavailable":
-                    self._btw_unavailable_failures += 1
             except Exception:
                 _logger.exception(
                     "claude-native: keep-warm ping failed",
@@ -201,61 +177,9 @@ class ClaudeNativeExecutor(Executor):
 
     async def _keep_warm_btw(self) -> KeepWarmBtwResult:
         """Run the bridge sequence in a worker drained before return (no ``_inject`` pane reap)."""
-        return await self._run_keep_warm_worker(partial(run_keep_warm_btw, self._bridge_dir))
-
-    async def _keep_warm_quiet_turn(self, attempt_id: str) -> dict[str, Any]:
-        """
-        Run the fallback maintenance turn after repeated ``/btw`` failures.
-
-        The bridge guards the pane and writes the tool-veto marker for the
-        turn's duration; the fixed text goes in through this executor's
-        normal message inject, so a real message can never interleave.
-        Every fallback receipt carries ``turn: true`` so the server can
-        tell the ping's own turn from a real one.
-
-        :param attempt_id: Ping attempt id to echo.
-        :returns: The normalized receipt dict.
-        """
-
-        def inject(text: str) -> None:
-            self._clear_framework_context()
-            inject_user_message(self._bridge_dir, content=text)
-
-        result = await self._run_keep_warm_worker(
-            partial(
-                run_keep_warm_quiet_turn,
-                self._bridge_dir,
-                attempt_id,
-                inject=inject,
-            )
-        )
-        if result.outcome != "ok":
-            return _keep_warm_receipt(
-                attempt_id,
-                outcome=result.outcome,
-                reason=result.reason,
-                turn=True,
-            )
-        cache_read = _current_context_tokens(self._bridge_dir)
-        return _keep_warm_receipt(
-            attempt_id,
-            outcome="ok",
-            reason=result.reason,
-            cache_read=cache_read,
-            cost_usd=_keep_warm_cost_usd(self._bridge_dir, cache_read),
-            estimated=True,
-            turn=True,
-        )
-
-    def _clear_framework_context(self) -> None:
-        """Drop any stale one-shot framework context before an injected message."""
-        (self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE).unlink(missing_ok=True)
-
-    async def _run_keep_warm_worker(self, operation: Callable[[], _WorkerResult]) -> _WorkerResult:
-        """Run one bridge sequence in a worker drained before return (no pane reap)."""
         cancelled = threading.Event()
         with cancellable_injection(cancelled):
-            worker = asyncio.create_task(asyncio.to_thread(operation))
+            worker = asyncio.create_task(asyncio.to_thread(run_keep_warm_btw, self._bridge_dir))
         try:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
@@ -600,7 +524,6 @@ def _keep_warm_receipt(
     cache_read: int | None = None,
     cost_usd: float | None = None,
     estimated: bool = False,
-    turn: bool = False,
 ) -> dict[str, Any]:
     """
     Build one normalized keep-warm receipt.
@@ -611,11 +534,9 @@ def _keep_warm_receipt(
     :param cache_read: Context tokens the ping read, when known.
     :param cost_usd: Estimated cost, when priceable.
     :param estimated: Whether the usage figures are estimates.
-    :param turn: Whether the ping ran as the quiet-turn fallback, whose
-        real maintenance turn must not be read as a real user turn.
     :returns: The receipt dict the runner relays to the server.
     """
-    receipt = {
+    return {
         "attempt_id": attempt_id,
         "outcome": outcome,
         "reason": reason,
@@ -625,9 +546,6 @@ def _keep_warm_receipt(
         "cost_usd": cost_usd,
         "estimated": estimated,
     }
-    if turn:
-        receipt["turn"] = True
-    return receipt
 
 
 def _current_context_tokens(bridge_dir: Path) -> int | None:

@@ -15,20 +15,16 @@ import pytest
 
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
-    KEEP_WARM_MAINTENANCE_DENY_REASON,
-    KEEP_WARM_MAINTENANCE_FILE,
     OBSERVER_HOOK_STDERR_FILE,
     ClaudeNativeHookInterpreterMismatchError,
     approval_wait_is_fresh,
     approval_wait_marker_path,
     build_hook_settings,
     prepare_bridge_dir,
-    read_keep_warm_maintenance_marker,
     read_transcript_path,
     record_hook_event,
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
-    write_keep_warm_maintenance_marker,
 )
 from omnigent.native import native_policy_hook
 from tests.native_hook_helpers import make_failing_client
@@ -1394,122 +1390,6 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
     # fail closed on an unresolved model.
     assert context["model"] == "claude-sonnet-4-6"
     assert context["harness"] == "claude-native"
-
-
-def test_evaluate_policy_maintenance_marker_denies_before_policy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """
-    An unexpired quiet-turn marker denies PreToolUse without posting.
-
-    This is the fallback path beside the relay's own veto: when the hook
-    cannot use the relay it must still refuse every tool during the
-    maintenance turn, and record the denial for the ping's receipt.
-    """
-    calls: list[str] = []
-
-    class _NoPostClient:
-        """Client that fails the test if the veto lets a policy call through."""
-
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            """Record constructor inputs. :returns: None."""
-            del headers, timeout
-
-        def __enter__(self) -> _NoPostClient:
-            """:returns: This fake client."""
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            """:returns: None."""
-            del args
-
-        def post(self, url: str, *, json: object) -> object:
-            """Fail: the maintenance veto must answer before any policy call."""
-            del json
-            calls.append(url)
-            raise AssertionError("policy must not be evaluated during a maintenance turn")
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _NoPostClient)
-    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_active")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
-    write_keep_warm_maintenance_marker(bridge_dir, "att-quiet")
-    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    output = json.loads(captured.out)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert (
-        output["hookSpecificOutput"]["permissionDecisionReason"]
-        == KEEP_WARM_MAINTENANCE_DENY_REASON
-    )
-    assert calls == []
-    marker = read_keep_warm_maintenance_marker(bridge_dir)
-    assert marker is not None and marker["tool_attempt"] is True
-
-
-def test_evaluate_policy_expired_maintenance_marker_uses_policy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """An expired marker is ignored (and pruned); the policy verdict is used."""
-    posted: dict[str, object] = {}
-
-    class _FakeHttpxClient:
-        """Sync HTTP client stub returning a policy DENY."""
-
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            """Record constructor inputs. :returns: None."""
-            del headers, timeout
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """:returns: This fake client."""
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            """:returns: None."""
-            del args
-
-        def post(self, url: str, *, json: dict[str, object]) -> object:
-            """Record the outgoing request and return a DENY verdict. :returns: response."""
-            import httpx
-
-            posted["url"] = url
-            posted["json"] = json
-            return httpx.Response(
-                200,
-                text='{"result":"POLICY_ACTION_DENY","reason":"Blocked by policy"}',
-                request=httpx.Request("POST", url),
-            )
-
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
-    write_active_session_id(bridge_dir, "conv_active")
-    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
-    marker_path = bridge_dir / KEEP_WARM_MAINTENANCE_FILE
-    marker_path.write_text(
-        json.dumps({"attempt_id": "att-old", "expires_at": time.time() - 1}),
-        encoding="utf-8",
-    )
-    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    output = json.loads(captured.out)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert output["hookSpecificOutput"]["permissionDecisionReason"] == "Blocked by policy"
-    assert str(posted["url"]).endswith("/v1/sessions/conv_active/policies/evaluate")
-    assert not marker_path.exists(), "the expired marker is pruned"
 
 
 def test_evaluate_policy_post_tool_use_converts_and_returns_context(
