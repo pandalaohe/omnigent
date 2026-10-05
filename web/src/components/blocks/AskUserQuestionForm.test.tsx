@@ -56,7 +56,10 @@ describe("AskUserQuestionForm — async card", () => {
     renderForm(payload.questions, payload.context);
 
     // A rule under the context separates the recap from the question.
-    expect(screen.getByTestId("ask-user-question-context")).toHaveClass("border-b");
+    expect(screen.getByTestId("ask-user-question-context")).toHaveClass(
+      "border-b",
+      "border-border-strong",
+    );
     const link = screen.getByRole("button", { name: "r" });
     expect(link.tagName).toBe("A");
     expect(link).toHaveAttribute("data-streamdown", "link");
