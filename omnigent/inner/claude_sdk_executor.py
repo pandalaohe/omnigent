@@ -2573,6 +2573,10 @@ class ClaudeSDKExecutor(Executor):
         async def add_context(
             _payload: object, _tool_use_id: str | None, _context: object
         ) -> _JsonObject:
+            slot = self._query_slots.get(session_key)
+            if slot is not None and slot.maintenance:
+                # A keep-warm ping must not consume a real turn's context.
+                return {}
             text = self._pending_framework_context.pop(session_key, "")
             if not text:
                 return {}
@@ -2638,6 +2642,7 @@ class ClaudeSDKExecutor(Executor):
         sdk: _ClaudeSDK,
         options: Any,  # type: ignore[explicit-any]  # ClaudeAgentOptions — avoid a hard sdk import
         model: str | None,
+        session_key: str | None = None,
     ) -> None:
         """
         Register the in-process subagent-routing ``PreToolUse`` hook.
@@ -2651,6 +2656,8 @@ class ClaudeSDKExecutor(Executor):
         :param options: ``ClaudeAgentOptions`` to mutate.
         :param model: Model this session runs on, sent as the spawn's
             parent model.
+        :param session_key: Session whose keep-warm maintenance flag
+            suppresses routing; a ping never asks the router for a decision.
         """
         hook_matcher_cls = getattr(sdk, "HookMatcher", None)
         if hook_matcher_cls is None:
@@ -2666,6 +2673,11 @@ class ClaudeSDKExecutor(Executor):
         ) -> dict[str, Any]:  # type: ignore[explicit-any]  # HookJSONOutput
             if not isinstance(payload, dict):
                 return {}
+            if session_key is not None:
+                slot = self._query_slots.get(session_key)
+                # The maintenance veto denies the call; skip the routing request.
+                if slot is not None and slot.maintenance:
+                    return {}
             output = await asyncio.to_thread(
                 subagent_router.route_pre_tool_use,
                 payload,
@@ -3144,7 +3156,7 @@ class ClaudeSDKExecutor(Executor):
                 self._can_use_tool_gate, permission_mode=permission_mode
             )
 
-        self._install_subagent_router_hook(sdk, options, model)
+        self._install_subagent_router_hook(sdk, options, model, session_key)
         self._install_framework_context_hook(sdk, options, session_key)
         self._install_keep_warm_maintenance_hook(sdk, options, session_key)
 

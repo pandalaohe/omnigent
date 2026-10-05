@@ -4857,6 +4857,33 @@ class TestToolCallPolicyGate(unittest.TestCase):
 
         _run(_t())
 
+    def test_gate_not_installed_in_default_mode_without_evaluator_or_handler(self):
+        """Non-bypass baseline: with neither a policy evaluator nor an
+        elicitation handler, a ``default``-mode session gets no can_use_tool
+        callback either."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t():
+            executor = ClaudeSDKExecutor(permission_mode="default")
+            captured = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["can_use_tool"] = options.can_use_tool
+                raise RuntimeError("stop after options build")
+
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            self.assertIsNone(captured["can_use_tool"])
+
+        _run(_t())
+
 
 # ---------------------------------------------------------------------------
 # Tests: Compaction detection via PreCompact hook
@@ -5824,6 +5851,38 @@ def _find_maintenance_hook(options):
     return matchers[0].hooks[0]
 
 
+def _hook_aware_sdk():
+    """Fake SDK module backed by the real ``HookMatcher``/``ClaudeAgentOptions``
+    so ``run_turn`` configures real hook matchers on the built options."""
+    from claude_agent_sdk import HookMatcher
+    from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
+
+    class _FakeSDK(_sdk_types()):
+        pass
+
+    _FakeSDK.HookMatcher = HookMatcher
+    _FakeSDK.ClaudeAgentOptions = SDKClaudeAgentOptions
+    return _FakeSDK
+
+
+async def _capture_turn_options(executor, fake_sdk):
+    """Drive ``run_turn`` up to the client build and return the options it made."""
+    captured = {}
+
+    async def fake_get_or_create_client(sdk, *, session_key, options, model):
+        captured["options"] = options
+        raise RuntimeError("stop after options build")
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        with patch.object(
+            executor, "_get_or_create_client", side_effect=fake_get_or_create_client
+        ):
+            with pytest.raises(RuntimeError):
+                async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                    pass
+    return captured["options"]
+
+
 async def _stream_messages(*messages):
     """Async generator yielding the scripted messages, then ending."""
     for message in messages:
@@ -6087,6 +6146,101 @@ async def test_keep_warm_tool_attempt_through_configured_hook_reports_tool_attem
     slot = executor._query_slot("default")
     assert not slot.lock.locked()
     assert not slot.maintenance and not slot.tool_attempted
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ping_suppresses_subagent_routing_while_veto_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """During a ping the SDK runs the router and veto ``PreToolUse`` hooks
+    concurrently: the veto denies the Agent call while the router hook returns
+    ``{}`` without ever calling ``route_pre_tool_use``. Outside maintenance the
+    router answers and the veto has no opinion."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.hook_scripts import subagent_router
+    from tests.inner.conftest import advertise_router
+
+    advertise_router(tmp_path)
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    route_calls: list[dict] = []
+
+    def fake_route_pre_tool_use(payload, **kwargs):
+        route_calls.append(payload)
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+
+    monkeypatch.setattr(subagent_router, "route_pre_tool_use", fake_route_pre_tool_use)
+
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+    options = await _capture_turn_options(executor, _hook_aware_sdk())
+
+    matchers = (getattr(options, "hooks", None) or {}).get("PreToolUse", [])
+    router_matchers = [m for m in matchers if getattr(m, "matcher", None) is not None]
+    veto_matchers = [m for m in matchers if getattr(m, "matcher", None) is None]
+    assert len(router_matchers) == 1 and len(veto_matchers) == 1
+    assert router_matchers[0].matcher == subagent_router.AGENT_TOOL_MATCHER
+    route_spawn = router_matchers[0].hooks[0]
+    veto_tool = veto_matchers[0].hooks[0]
+
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"subagent_type": "code-reviewer", "prompt": "review the diff"},
+        "tool_use_id": "tu_1",
+    }
+    slot = executor._query_slot("default")
+    slot.maintenance = True
+    try:
+        routed, vetoed = await asyncio.gather(
+            route_spawn(payload, "tu_1", {"signal": None}),
+            veto_tool(payload, "tu_1", {"signal": None}),
+        )
+    finally:
+        slot.maintenance = False
+
+    assert routed == {}
+    assert route_calls == []
+    assert vetoed["continue_"] is False
+    assert vetoed["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    routed, vetoed = await asyncio.gather(
+        route_spawn(payload, "tu_1", {"signal": None}),
+        veto_tool(payload, "tu_1", {"signal": None}),
+    )
+    assert vetoed == {}
+    assert len(route_calls) == 1
+    assert routed == {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_ping_does_not_consume_framework_context() -> None:
+    """During a ping ``add_context`` returns ``{}`` and leaves the pending
+    framework context in place; a real turn pops it as ``additionalContext``."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+    options = await _capture_turn_options(executor, _hook_aware_sdk())
+
+    submit_matchers = (getattr(options, "hooks", None) or {}).get("UserPromptSubmit", [])
+    assert len(submit_matchers) == 1
+    add_context = submit_matchers[0].hooks[0]
+
+    executor._pending_framework_context["default"] = "framework context text"
+    slot = executor._query_slot("default")
+    slot.maintenance = True
+    try:
+        assert await add_context({}, None, {"signal": None}) == {}
+        assert executor._pending_framework_context["default"] == "framework context text"
+    finally:
+        slot.maintenance = False
+
+    output = await add_context({}, None, {"signal": None})
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "framework context text",
+        }
+    }
+    assert "default" not in executor._pending_framework_context
 
 
 @pytest.mark.asyncio
