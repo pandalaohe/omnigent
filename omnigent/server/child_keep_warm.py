@@ -99,6 +99,14 @@ _CODEX_DEFAULT_STALENESS_S = 1800
 _SUPPORTED_HARNESSES: dict[str, Literal["claude", "codex"]] = {
     "claude-native": "claude",
     "codex-native": "codex",
+    "codex": "codex",
+}
+#: The legacy settings predate keep-warm channels beyond the two native
+#: CLIs, so the one-time migration only ever covers those agents — never an
+#: SDK harness that joined ``_SUPPORTED_HARNESSES`` later.
+_MIGRATION_HARNESSES: dict[str, Literal["claude", "codex"]] = {
+    "claude-native": "claude",
+    "codex-native": "codex",
 }
 #: Reasons a cold / paused label may carry. ``pol`` and ``mom`` are legacy
 #: (SCC19) codes — never written any more, still parsed from old labels.
@@ -750,7 +758,7 @@ class ChildKeepWarmSweeper:
             page = agent_store.list(limit=_PAGE_LIMIT, after=after)
             for agent in page.data:
                 harness = self._agent_harness(agent, agent_cache, canonicalize_harness)
-                family = _SUPPORTED_HARNESSES.get(harness or "")
+                family = _MIGRATION_HARNESSES.get(harness or "")
                 if family is not None:
                     agents.append((agent.id, family))
             if not page.has_more or page.last_id is None:

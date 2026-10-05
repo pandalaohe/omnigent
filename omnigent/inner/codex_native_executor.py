@@ -10,7 +10,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native import side_chat
@@ -37,6 +37,11 @@ from omnigent.harnesses.codex_native.bridge import (
     update_active_turn_id,
     write_codex_config_effort,
     write_codex_config_model,
+)
+from omnigent.harnesses.codex_native.keep_warm import (
+    drive_keep_warm_ping,
+    keep_warm_receipt,
+    keep_warm_result_receipt,
 )
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,
@@ -415,6 +420,54 @@ class CodexNativeExecutor(Executor):
         finally:
             await client.close()
         return True
+
+    async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
+        """
+        Ping the live Codex thread with a guarded ephemeral-fork turn
+        (keep-warm).
+
+        The fork runs on its own thread, so the main thread stays fully
+        usable during the ping — no inject lock is held, and a real message
+        arriving meanwhile reaches the pane undisturbed. A running turn
+        (``active_turn_id`` set) skips ``busy``: Codex approvals and
+        user-input requests only exist inside a turn, so this also keeps a
+        pending synchronous card undisturbed. The receipt's usage is the
+        fork turn's last ``thread/tokenUsage/updated`` breakdown.
+
+        :param attempt_id: Server-allocated ping attempt id, echoed on the
+            receipt.
+        :param family: Model family from the server; unused — this channel
+            only ever serves ``"codex"``.
+        :returns: The normalized receipt dict.
+        """
+        del family
+        try:
+            state = read_bridge_state(self._bridge_dir)
+            if state is None:
+                return keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
+            if state.active_turn_id is not None:
+                return keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
+            client = client_for_transport(
+                state.socket_path,
+                client_name="omnigent-codex-native",
+            )
+            await client.connect()
+            try:
+                result = await drive_keep_warm_ping(
+                    request=client.request,
+                    respond=client.respond,
+                    events_for=lambda _fork_id: client.iter_events(),
+                    parent_thread_id=state.thread_id,
+                )
+            finally:
+                await client.close()
+        except Exception:
+            _logger.exception(
+                "codex-native: keep-warm ping failed",
+                extra={"session_id": self._request_session_id},
+            )
+            return keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+        return keep_warm_result_receipt(attempt_id, result)
 
     async def run_turn(
         self,

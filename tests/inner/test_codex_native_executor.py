@@ -2261,3 +2261,400 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+class _FakeKeepWarmClient:
+    """
+    Fake Codex app-server client for keep-warm fork pings.
+
+    ``iter_events`` drains a per-instance queue the test feeds with
+    :meth:`feed`; ``respond`` records the answer given to a server
+    request. Class-level ``created`` collects every instance so a test
+    can assert on the one the executor opened (and closed).
+
+    :param socket_path: Unix app-server socket path, or ``None``.
+    :param ws_url: Loopback WebSocket URL, or ``None``.
+    :param client_name: JSON-RPC client name.
+    """
+
+    created: list[_FakeKeepWarmClient] = []
+
+    def __init__(
+        self,
+        socket_path: Path | None = None,
+        *,
+        ws_url: str | None = None,
+        client_name: str = "omnigent",
+    ) -> None:
+        """
+        Initialize one fake client with an empty event queue.
+
+        :param socket_path: Unix app-server socket path, or ``None``.
+        :param ws_url: Loopback WebSocket URL, or ``None``.
+        :param client_name: JSON-RPC client name.
+        """
+        self.socket_path = socket_path
+        self.ws_url = ws_url
+        self.client_name = client_name
+        self.closed = False
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.responses: list[tuple[Any, dict[str, Any]]] = []
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        type(self).created.append(self)
+
+    async def connect(self) -> None:
+        """
+        Accept the connection (no handshake to fake).
+
+        :returns: None.
+        """
+
+    async def close(self) -> None:
+        """
+        Mark closed and end the event stream.
+
+        :returns: None.
+        """
+        self.closed = True
+        self._queue.put_nowait(None)
+
+    def feed(self, message: dict[str, Any]) -> None:
+        """Queue one app-server message for the driver's stream."""
+        self._queue.put_nowait(message)
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Capture a Codex JSON-RPC request and answer the fork/turn RPCs.
+
+        :param method: JSON-RPC method, e.g. ``"thread/fork"``.
+        :param params: JSON-RPC params.
+        :returns: Codex-shaped response payload.
+        """
+        self.requests.append((method, params))
+        if method == "thread/fork":
+            return {
+                "result": {
+                    "thread": {
+                        "id": "thread_fork",
+                        "model": "gpt-keep-warm-test",
+                        "ephemeral": True,
+                        "forkedFromId": "thread_123",
+                    }
+                }
+            }
+        if method == "turn/start":
+            return {"result": {"turn": {"id": "turn_fork"}}}
+        return {"result": {}}
+
+    async def respond(self, request_id: Any, result: dict[str, Any]) -> None:
+        """
+        Record one JSON-RPC response sent for an app-server request.
+
+        :param request_id: The app-server's request id.
+        :param result: The result payload answered with.
+        :returns: None.
+        """
+        self.responses.append((request_id, result))
+
+    async def iter_events(self) -> Any:
+        """
+        Yield queued messages until ``close`` ends the stream.
+
+        :returns: Async iterator of app-server message envelopes.
+        """
+        while True:
+            message = await self._queue.get()
+            if message is None:
+                return
+            yield message
+
+
+def _keep_warm_fork_started() -> dict[str, Any]:
+    """The fork's ``thread/started`` notification (marked keep-warm, ephemeral)."""
+    return {
+        "method": "thread/started",
+        "params": {
+            "thread": {
+                "id": "thread_fork",
+                "ephemeral": True,
+                "threadSource": "omnigent-keep-warm",
+                "forkedFromId": "thread_123",
+            }
+        },
+    }
+
+
+def _seed_keep_warm_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, active_turn_id: str | None = None
+) -> CodexNativeExecutor:
+    """
+    Seed an idle bridge and patch in the keep-warm fake client.
+
+    :param monkeypatch: Test monkeypatch.
+    :param tmp_path: Bridge directory.
+    :param active_turn_id: Active turn id to seed, or ``None`` for idle.
+    :returns: The executor under test.
+    """
+    _FakeKeepWarmClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeKeepWarmClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    return CodexNativeExecutor(bridge_dir=tmp_path)
+
+
+def test_keep_warm_ping_forks_and_reports_the_fork_turn_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Happy path: an ephemeral fork, one guarded ping turn, an ok receipt.
+
+    The fork params carry the keep-warm ``threadSource`` and no
+    ``developerInstructions``; the turn starts with the ping text plus the
+    ``untrusted`` / read-only guard overrides. The receipt normalizes the
+    fork's last ``tokenUsage`` (``inputTokens`` inclusive of cached;
+    ``cache_write`` always ``None``; an unpriced model leaves ``cost_usd``
+    ``None``). A parent-thread message mid-stream is ignored, and the
+    client is closed at the end.
+    """
+    executor = _seed_keep_warm_client(monkeypatch, tmp_path)
+
+    async def run() -> dict[str, Any]:
+        receipt_task = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="codex"))
+        # The client only exists once keep_warm opened it.
+        while not _FakeKeepWarmClient.created:
+            await asyncio.sleep(0)
+        client = _FakeKeepWarmClient.created[0]
+        while len(client.requests) < 2:
+            await asyncio.sleep(0)
+        client.feed(_keep_warm_fork_started())
+        client.feed(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread_123",
+                    "turnId": "turn_parent",
+                    "item": {"id": "item_p", "type": "commandExecution"},
+                },
+            }
+        )
+        client.feed(
+            {
+                "method": "turn/started",
+                "params": {"threadId": "thread_fork", "turn": {"id": "turn_fork"}},
+            }
+        )
+        client.feed(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread_fork",
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 29534,
+                            "cachedInputTokens": 29056,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 4,
+                        }
+                    },
+                },
+            }
+        )
+        client.feed(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thread_fork", "turn": {"id": "turn_fork"}},
+            }
+        )
+        return await receipt_task
+
+    receipt = asyncio.run(run())
+
+    client = _FakeKeepWarmClient.created[0]
+    assert client.requests == [
+        (
+            "thread/fork",
+            {
+                "threadId": "thread_123",
+                "ephemeral": True,
+                "excludeTurns": True,
+                "threadSource": "omnigent-keep-warm",
+            },
+        ),
+        (
+            "turn/start",
+            {
+                "threadId": "thread_fork",
+                "input": [{"type": "text", "text": "[System: keep-warm. Reply with only: ok]"}],
+                "approvalPolicy": "untrusted",
+                "sandboxPolicy": {"type": "readOnly"},
+            },
+        ),
+    ]
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": 29534,
+        "cache_read": 29056,
+        "cache_write": None,
+        "cost_usd": None,
+        "estimated": False,
+    }
+    assert client.closed is True
+
+
+def test_keep_warm_ping_with_active_turn_skips_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A running turn skips ``busy`` — Codex cards only exist inside a turn."""
+    executor = _seed_keep_warm_client(monkeypatch, tmp_path, active_turn_id="turn_active")
+
+    receipt = asyncio.run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+    assert receipt["outcome"] == "skipped" and receipt["reason"] == "busy"
+    assert _FakeKeepWarmClient.created == []
+
+
+def test_keep_warm_ping_without_bridge_state_skips_no_live_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No bridge state (no live app-server) skips ``no_live_client``; no client opens."""
+    _FakeKeepWarmClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeKeepWarmClient,
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    receipt = asyncio.run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+    assert receipt["outcome"] == "skipped" and receipt["reason"] == "no_live_client"
+    assert _FakeKeepWarmClient.created == []
+
+
+def test_keep_warm_ping_tool_item_interrupts_and_fails_tool_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A tool item on the fork means the model tried to work: interrupt, fail."""
+    executor = _seed_keep_warm_client(monkeypatch, tmp_path)
+
+    async def run() -> dict[str, Any]:
+        receipt_task = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="codex"))
+        while not _FakeKeepWarmClient.created:
+            await asyncio.sleep(0)
+        client = _FakeKeepWarmClient.created[0]
+        while len(client.requests) < 2:
+            await asyncio.sleep(0)
+        client.feed(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread_fork",
+                    "turnId": "turn_fork",
+                    "item": {"id": "item_1", "type": "commandExecution"},
+                },
+            }
+        )
+        return await receipt_task
+
+    receipt = asyncio.run(run())
+
+    client = _FakeKeepWarmClient.created[0]
+    assert receipt["outcome"] == "failed" and receipt["reason"] == "tool_attempt"
+    assert client.requests[-1] == (
+        "turn/interrupt",
+        {"threadId": "thread_fork", "turnId": "turn_fork"},
+    )
+    assert client.responses == []
+    assert client.closed is True
+
+
+def test_keep_warm_ping_server_request_is_declined_then_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An approval request on the fork is answered ``decline``, then interrupted."""
+    executor = _seed_keep_warm_client(monkeypatch, tmp_path)
+
+    async def run() -> dict[str, Any]:
+        receipt_task = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="codex"))
+        while not _FakeKeepWarmClient.created:
+            await asyncio.sleep(0)
+        client = _FakeKeepWarmClient.created[0]
+        while len(client.requests) < 2:
+            await asyncio.sleep(0)
+        client.feed(
+            {
+                "id": 7,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread_fork",
+                    "turnId": "turn_fork",
+                    "itemId": "item_1",
+                },
+            }
+        )
+        return await receipt_task
+
+    receipt = asyncio.run(run())
+
+    client = _FakeKeepWarmClient.created[0]
+    assert receipt["outcome"] == "failed" and receipt["reason"] == "tool_attempt"
+    assert client.responses == [(7, {"decision": "decline"})]
+    assert client.requests[-1] == (
+        "turn/interrupt",
+        {"threadId": "thread_fork", "turnId": "turn_fork"},
+    )
+    assert client.closed is True
+
+
+def test_keep_warm_ping_past_budget_interrupts_and_fails_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A fork turn that never completes is interrupted at the budget."""
+    monkeypatch.setattr("omnigent.harnesses.codex_native.keep_warm.KEEP_WARM_PING_BUDGET_S", 0.05)
+    executor = _seed_keep_warm_client(monkeypatch, tmp_path)
+
+    receipt = asyncio.run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+    client = _FakeKeepWarmClient.created[0]
+    assert receipt["outcome"] == "failed" and receipt["reason"] == "timeout"
+    assert client.requests[-1] == (
+        "turn/interrupt",
+        {"threadId": "thread_fork", "turnId": "turn_fork"},
+    )
+    assert client.closed is True
+
+
+def test_keep_warm_ping_fork_rpc_failure_reports_harness_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A transport-level failure is ``harness_error`` — never raised, client closed."""
+
+    class _FailingForkClient(_FakeKeepWarmClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Fail the fork RPC; answer everything else."""
+            if method == "thread/fork":
+                raise CodexAppServerResponseError({"code": -32603, "message": "boom"})
+            return await super().request(method, params)
+
+    _FakeKeepWarmClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FailingForkClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    receipt = asyncio.run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+    assert receipt["outcome"] == "failed" and receipt["reason"] == "harness_error"
+    assert _FakeKeepWarmClient.created[0].closed is True

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.harnesses.codex_native.keep_warm import KeepWarmPingResult
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
@@ -159,6 +160,21 @@ class _ChunkedPipe:
         if not self._chunks:
             return b""
         return self._chunks.pop(0)
+
+
+class _QueuedStdoutPipe(_FakePipe):
+    """Stdout the test feeds one JSON frame at a time, staying open."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._frames: asyncio.Queue[bytes] = asyncio.Queue()
+
+    def feed(self, message: dict) -> None:
+        """Queue one JSON-RPC frame for the reader loop."""
+        self._frames.put_nowait((json.dumps(message) + "\n").encode("utf-8"))
+
+    async def read(self, n: int) -> bytes:
+        return await self._frames.get()
 
 
 class _FakeProcess:
@@ -1166,6 +1182,254 @@ class TestCodexExecutor(unittest.TestCase):
             terminate_tree.assert_called_once()
 
         _run(_t())
+
+    def test_reader_loop_diverts_keep_warm_fork_traffic(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            proc = _FakeProcess()
+            proc.stdout = _QueuedStdoutPipe()
+            session._proc = proc
+            reader = asyncio.create_task(session._reader_loop())
+            try:
+                proc.stdout.feed(
+                    {
+                        "method": "thread/started",
+                        "params": {
+                            "thread": {
+                                "id": "thread_fork",
+                                "ephemeral": True,
+                                "threadSource": "omnigent-keep-warm",
+                                "forkedFromId": "thread-1",
+                            }
+                        },
+                    }
+                )
+                while "thread_fork" not in session._keep_warm_queues:
+                    await asyncio.sleep(0)
+                fork_queue = session._keep_warm_queues["thread_fork"]
+                proc.stdout.feed(
+                    {
+                        "method": "turn/started",
+                        "params": {"threadId": "thread_fork", "turn": {"id": "turn_fork"}},
+                    }
+                )
+                proc.stdout.feed(
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread_fork",
+                            "tokenUsage": {"last": {"inputTokens": 10}},
+                        },
+                    }
+                )
+                while fork_queue.qsize() < 2:
+                    await asyncio.sleep(0)
+                # Fork traffic reached only the fork queue: the session stream
+                # stayed empty and no activity/turn counters moved.
+                self.assertTrue(session._events.empty())
+                self.assertIsNone(session._reader_started_turn)
+                self.assertFalse(session._native_progress_observed)
+                # A parent-thread event between fork events still lands.
+                proc.stdout.feed(
+                    {
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {"id": "item-1", "type": "agentMessage"},
+                        },
+                    }
+                )
+                parent = await asyncio.wait_for(session._events.get(), timeout=1)
+                self.assertEqual(parent["method"], "item/started")
+                self.assertTrue(session._native_progress_observed)
+            finally:
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
+
+        _run(_t())
+
+    def test_keep_warm_ping_forks_turns_and_retires_the_fork(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._proc = _FakeProcess()
+            session._started = True
+            session.thread_id = "thread-1"
+            requests: list[tuple[str, dict]] = []
+
+            async def _request(method: str, params: dict) -> dict:
+                requests.append((method, params))
+                if method == "thread/fork":
+                    return {
+                        "result": {"thread": {"id": "thread_fork", "model": "gpt-keep-warm-test"}}
+                    }
+                if method == "turn/start":
+                    return {"result": {"turn": {"id": "turn_fork"}}}
+                return {"result": {}}
+
+            session._request = _request  # type: ignore[assignment]
+            session._send_response = AsyncMock()
+
+            ping = asyncio.create_task(session.keep_warm_ping())
+            while "thread_fork" not in session._keep_warm_queues:
+                await asyncio.sleep(0)
+            fork_queue = session._keep_warm_queues["thread_fork"]
+            fork_queue.put_nowait(
+                {
+                    "method": "turn/started",
+                    "params": {"threadId": "thread_fork", "turn": {"id": "turn_fork"}},
+                }
+            )
+            fork_queue.put_nowait(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread_fork",
+                        "tokenUsage": {
+                            "last": {
+                                "inputTokens": 120,
+                                "cachedInputTokens": 100,
+                                "cacheWriteInputTokens": 0,
+                                "outputTokens": 3,
+                            }
+                        },
+                    },
+                }
+            )
+            fork_queue.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread_fork", "turn": {"id": "turn_fork"}},
+                }
+            )
+            result = await asyncio.wait_for(ping, timeout=5)
+
+            self.assertEqual(result.outcome, "ok")
+            self.assertEqual(result.input_total, 120)
+            self.assertEqual(result.cache_read, 100)
+            self.assertEqual(result.output_tokens, 3)
+            self.assertEqual(result.model, "gpt-keep-warm-test")
+            self.assertEqual(
+                requests,
+                [
+                    (
+                        "thread/fork",
+                        {
+                            "threadId": "thread-1",
+                            "ephemeral": True,
+                            "excludeTurns": True,
+                            "threadSource": "omnigent-keep-warm",
+                        },
+                    ),
+                    (
+                        "turn/start",
+                        {
+                            "threadId": "thread_fork",
+                            "input": [
+                                {
+                                    "type": "text",
+                                    "text": "[System: keep-warm. Reply with only: ok]",
+                                }
+                            ],
+                            "approvalPolicy": "untrusted",
+                            "sandboxPolicy": {"type": "readOnly"},
+                        },
+                    ),
+                ],
+            )
+            # The fork retired with the ping: a late message is dropped, never
+            # delivered to the session stream.
+            self.assertNotIn("thread_fork", session._keep_warm_queues)
+            late = {
+                "method": "thread/tokenUsage/updated",
+                "params": {"threadId": "thread_fork", "tokenUsage": {"last": {}}},
+            }
+            self.assertEqual(session._keep_warm_fork_id_for(late), "thread_fork")
+            self.assertIsNone(session._keep_warm_queues.get("thread_fork"))
+            self.assertTrue(session._events.empty())
+
+        _run(_t())
+
+    def test_keep_warm_without_live_session_skips_no_live_client(self):
+        """No session ever started → ``no_live_client``; the factory never runs."""
+        factory = AsyncMock()
+        executor = CodexExecutor(codex_path="/bin/echo", app_session_factory=factory)
+
+        receipt = _run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+        self.assertEqual(receipt["outcome"], "skipped")
+        self.assertEqual(receipt["reason"], "no_live_client")
+        factory.assert_not_called()
+
+    def test_keep_warm_with_turn_in_flight_skips_busy(self):
+        """A session mid-turn skips ``busy``; the ping is never attempted."""
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+        )
+        session._started = True
+        session.thread_id = "thread-1"
+        session.active_turn_id = "turn-1"
+        session.keep_warm_ping = AsyncMock()  # type: ignore[assignment]
+        state = _CodexSessionState()
+        state.app_session = session
+        executor = CodexExecutor(codex_path="/bin/echo", app_session_factory=AsyncMock())
+        executor._session_states["default"] = state
+
+        receipt = _run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+        self.assertEqual(receipt["outcome"], "skipped")
+        self.assertEqual(receipt["reason"], "busy")
+        session.keep_warm_ping.assert_not_called()
+
+    def test_keep_warm_ok_ping_normalizes_the_receipt(self):
+        """The session's ping outcome maps onto the normalized Codex receipt."""
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+        )
+        session._started = True
+        session.thread_id = "thread-1"
+        session.keep_warm_ping = AsyncMock(  # type: ignore[assignment]
+            return_value=KeepWarmPingResult(
+                "ok", input_total=120, cache_read=100, output_tokens=3, model=None
+            )
+        )
+        state = _CodexSessionState()
+        state.app_session = session
+        executor = CodexExecutor(codex_path="/bin/echo", app_session_factory=AsyncMock())
+        executor._session_states["default"] = state
+
+        receipt = _run(executor.keep_warm(attempt_id="att-1", family="codex"))
+
+        self.assertEqual(
+            receipt,
+            {
+                "attempt_id": "att-1",
+                "outcome": "ok",
+                "reason": None,
+                "input_total": 120,
+                "cache_read": 100,
+                "cache_write": None,
+                "cost_usd": None,
+                "estimated": False,
+            },
+        )
 
     def test_signature_change_recreates_app_session(self):
         async def _t():

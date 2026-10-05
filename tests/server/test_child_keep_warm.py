@@ -182,6 +182,19 @@ class _FakeAgentCache:
         return SimpleNamespace(spec=SimpleNamespace(executor=executor))
 
 
+class _HarnessByAgentCache:
+    """Agent cache resolving each agent id to its own scripted harness."""
+
+    def __init__(self, harness_by_agent: dict[str, str]) -> None:
+        self._harness_by_agent = harness_by_agent
+
+    def load(self, agent_id: str, bundle_location: str, *, expand_env: bool) -> Any:
+        del bundle_location, expand_env
+        harness = self._harness_by_agent.get(agent_id, "claude-native")
+        executor = SimpleNamespace(config={"harness": harness}, type="native")
+        return SimpleNamespace(spec=SimpleNamespace(executor=executor))
+
+
 @dataclass
 class _Harness:
     store: SqlAlchemyConversationStore
@@ -573,6 +586,26 @@ async def test_codex_session_uses_the_shorter_interval(harness: _Harness) -> Non
     assert len(pings) == 1
     assert pings[0]["body"]["family"] == "codex"
     assert pings[0]["body"]["harness"] == "codex-native"
+
+
+async def test_codex_sdk_session_is_pinged_with_its_own_harness(harness: _Harness) -> None:
+    """The SDK Codex harness shares the family and interval, on its own harness id."""
+    u = harness.now - 25 * 60
+    session = _main(
+        harness,
+        harness_override="codex",
+        agent_id=_CODEX_AGENT,
+        labels={KEEP_WARM_LABEL: _warm_label(t=u, interval=_CODEX_INTERVAL_S)},
+        running_since=u,
+    )
+
+    await _tick(harness)
+
+    pings = harness.forward.pings()
+    assert len(pings) == 1
+    assert pings[0]["session_id"] == session.id
+    assert pings[0]["body"]["family"] == "codex"
+    assert pings[0]["body"]["harness"] == "codex"
 
 
 async def test_main_switch_off_keeps_the_main_session_cold(harness: _Harness) -> None:
@@ -1861,6 +1894,30 @@ async def test_migration_defers_when_agent_enumeration_fails(
     assert owner == RESERVED_USER_LOCAL and namespace == "keep_warm"
     row = value["agents"].get(_CLAUDE_AGENT)
     assert row is not None and row["child"] is True and row["main"] is False
+
+
+async def test_migration_ignores_sdk_agents(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy migration covers the native agents only, never the SDK Codex agent."""
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_cache",
+        lambda: _HarnessByAgentCache({_CLAUDE_AGENT: "claude-native", _CODEX_AGENT: "codex"}),
+    )
+    native = SimpleNamespace(id=_CLAUDE_AGENT, bundle_location="/fake/claude.zip", session_id=None)
+    sdk = SimpleNamespace(id=_CODEX_AGENT, bundle_location="/fake/codex.zip", session_id=None)
+    harness.sweeper._app.state.agent_store = _AgentListStore([native, sdk])
+    harness.prefs.keep_warm = None
+    harness.prefs.collab = {"enabled": True, "childKeepWarmEnabled": True}
+    _main(harness, running_since=harness.now - 120)
+
+    await _tick(harness)
+
+    assert len(harness.prefs.patches) == 1
+    _owner, namespace, value = harness.prefs.patches[0]
+    assert namespace == "keep_warm"
+    assert _CLAUDE_AGENT in value["agents"]
+    assert _CODEX_AGENT not in value["agents"]
 
 
 # ── warm_state rule ──────────────────────────────────────

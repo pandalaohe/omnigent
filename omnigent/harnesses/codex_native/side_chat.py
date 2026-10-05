@@ -36,7 +36,7 @@ import contextlib
 import json
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -59,6 +59,14 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 # Codex-spawned sub-agent (drives the "this is a side chat" banner).
 SIDE_CHAT_DISPLAY_NAME = "Side chat"
 _NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
+
+# ``threadSource`` stamped on a keep-warm ping's ephemeral fork, so every
+# listener (forwarder, SDK reader) can tell its stream apart from a real
+# conversation and never surface it.
+KEEP_WARM_THREAD_SOURCE = "omnigent-keep-warm"
+# The whole ping turn: the fork inherits the parent as reference context, so a
+# one-word reply still re-reads (and re-warms) the provider prompt cache.
+KEEP_WARM_PING_TEXT = "[System: keep-warm. Reply with only: ok]"
 
 _SIDE_PREFIX = "/side "
 
@@ -271,6 +279,95 @@ def is_omnigent_side_fork(event: _JsonObject) -> bool:
     return thread.get("ephemeral") is True and isinstance(forked_from, str) and bool(forked_from)
 
 
+def is_keep_warm_fork(event: _JsonObject) -> bool:
+    """
+    Return whether a ``thread/started`` event announces a keep-warm ping fork.
+
+    The fork is ephemeral and stamped with ``KEEP_WARM_THREAD_SOURCE``; both
+    the ``thread/fork`` response and this notification carry the marker.
+
+    :param event: Codex app-server notification envelope.
+    :returns: ``True`` when the started thread is a keep-warm ping fork.
+    """
+    if event.get("method") != "thread/started":
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread")
+    if not isinstance(thread, dict):
+        return False
+    return (
+        thread.get("ephemeral") is True and thread.get("threadSource") == KEEP_WARM_THREAD_SOURCE
+    )
+
+
+# One JSON-RPC request round-trip — ``CodexAppServerClient.request`` on a
+# native connection, the SDK session's ``_request`` on an SDK one.
+KeepWarmRequestFn = Callable[[str, _JsonObject], Awaitable[_JsonObject]]
+
+
+async def fork_keep_warm_thread(
+    request: KeepWarmRequestFn, parent_thread_id: str
+) -> tuple[str, str | None] | None:
+    """
+    Fork ``parent_thread_id`` into the ephemeral thread a keep-warm ping uses.
+
+    No ``developerInstructions``: the ping is one fixed text, so the fork
+    carries only the inherited reference context.
+
+    :param request: JSON-RPC request callable of an app-server connection.
+    :param parent_thread_id: Codex thread id to fork from, e.g. ``"thread_abc"``.
+    :returns: ``(fork thread id, fork model)``, or ``None`` when the response
+        carried no thread id.
+    """
+    response = await request(
+        "thread/fork",
+        {
+            "threadId": parent_thread_id,
+            "ephemeral": True,
+            "excludeTurns": True,
+            "threadSource": KEEP_WARM_THREAD_SOURCE,
+        },
+    )
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if not isinstance(thread, dict):
+        return None
+    fork_thread_id = thread.get("id")
+    if not isinstance(fork_thread_id, str) or not fork_thread_id:
+        return None
+    model = thread.get("model")
+    return fork_thread_id, model if isinstance(model, str) and model else None
+
+
+async def submit_keep_warm_turn(request: KeepWarmRequestFn, fork_thread_id: str) -> str | None:
+    """
+    Start the guarded ping turn on a keep-warm fork.
+
+    ``untrusted`` approval plus a read-only sandbox make every tool call stop
+    at a server request the ping driver refuses, so the ping can never do
+    real work (the fork counterpart of claude-native's tool-less ``/btw``).
+
+    :param request: JSON-RPC request callable of an app-server connection.
+    :param fork_thread_id: The keep-warm fork's Codex thread id.
+    :returns: The started turn id, or ``None`` when absent.
+    """
+    response = await request(
+        "turn/start",
+        {
+            "threadId": fork_thread_id,
+            "input": [{"type": "text", "text": KEEP_WARM_PING_TEXT}],
+            "approvalPolicy": "untrusted",
+            "sandboxPolicy": {"type": "readOnly"},
+        },
+    )
+    result = response.get("result")
+    turn = result.get("turn") if isinstance(result, dict) else None
+    turn_id = turn.get("id") if isinstance(turn, dict) else None
+    return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
 async def register_side_fork_child(
     ap_client: httpx.AsyncClient,
     *,
@@ -297,6 +394,10 @@ async def register_side_fork_child(
         or registration failed.
     """
     if not is_omnigent_side_fork(event):
+        return None
+    # A keep-warm ping fork matches the side-fork shape (ephemeral with a
+    # parent) but is never surfaced: its whole stream stays invisible.
+    if is_keep_warm_fork(event):
         return None
     thread = event["params"]["thread"]
     if thread.get("forkedFromId") != parent_thread_id:
