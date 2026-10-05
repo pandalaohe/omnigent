@@ -679,3 +679,85 @@ async def test_failed_recreate_does_not_wait(
         f"a recreate that made no pane must not be polled; got {pane_ready_calls!r}"
     )
     assert elapsed < 5.0, f"failed recreate stalled {elapsed:.1f}s instead of failing fast"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "conv_id", "expected_error"),
+    [
+        (
+            {"type": "model_change", "model": "claude-opus-4-7"},
+            "4d5e6f708192a3b4c5d6e7f8091a2b3c",
+            "claude_native_model_failed",
+        ),
+        (
+            {"type": "effort_change", "effort": "high"},
+            "5e6f708192a3b4c5d6e7f8091a2b3c4d",
+            "claude_native_effort_failed",
+        ),
+        (
+            {"type": "permission_mode_change", "permission_mode": "acceptEdits"},
+            "6f708192a3b4c5d6e7f8091a2b3c4d5e",
+            "claude_native_permission_mode_failed",
+        ),
+        (
+            {"type": "compact"},
+            "708192a3b4c5d6e7f8091a2b3c4d5e6f",
+            "claude_native_compact_failed",
+        ),
+    ],
+    ids=["model_change", "effort_change", "permission_mode_change", "compact"],
+)
+async def test_failed_pane_heal_surfaces_handler_503(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event: dict[str, Any],
+    conv_id: str,
+    expected_error: str,
+) -> None:
+    """A failed recreate must surface the handler's 503, not a bare 500.
+
+    ``_ensure_native_terminal_for_turn`` raises when its recreate fails
+    (timeout, or ``create_session_terminal`` answering >= 400). When that
+    raise escapes ``_prepare_claude_native_pane_for_injection`` the route
+    answers a bare 500; the handlers only answer their own
+    ``claude_native_*_failed`` 503 when the heal returns and the injection
+    into the still-dead pane fails on the missing tmux socket.
+    """
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+
+    # A raising launch adapter (e.g. the claude CLI vanished) fails the recreate;
+    # the ensure step turns that 500 into a RuntimeError. The provider resolves
+    # only ``omnigent.runner.native:_launch_claude``.
+    async def _failing_launch(ctx: Any) -> SessionResourceView:
+        del ctx
+        raise ImportError("Native Claude requires the 'claude' CLI on PATH.")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", _failing_launch)
+
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+
+    pane_ready_calls: list[Path] = []
+
+    def _ready(bridge_dir: Path) -> bool:
+        pane_ready_calls.append(bridge_dir)
+        return True
+
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _ready)
+
+    async with _runner_client(app) as client:
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+
+    assert resp.status_code == 503, (
+        f"a failed heal must surface the handler's 503, not a bare 500; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert resp.json()["error"] == expected_error, resp.text
+    assert pane_ready_calls == [], (
+        f"a failed heal must not burn the readiness budget; got {pane_ready_calls!r}"
+    )

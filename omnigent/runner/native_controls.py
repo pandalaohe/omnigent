@@ -775,9 +775,10 @@ def build_native_controls(
         itself in ``_restore_occupied_input``. Waiting here would stall the
         case inject already handles for the whole budget, then inject anyway.
 
-        No terminal registry means there is nothing to heal, and a recreate that
-        produced no pane is not waited on either (inject keeps its own short
-        advertisement timeout in both cases).
+        No terminal registry means there is nothing to heal; a failed recreate
+        (the ensure step raises) and a recreate that produced no pane are not
+        waited on either (inject keeps its own short advertisement timeout in
+        those cases).
         """
         from omnigent.harnesses.claude_native.bridge import claude_pane_ready
 
@@ -792,7 +793,17 @@ def build_native_controls(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
             return
-        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        try:
+            await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        except (RuntimeError, OSError, httpx.HTTPError) as exc:
+            # The ensure raises on a failed recreate; inject answers its own 503.
+            _logger.warning(
+                "claude-native pane heal failed for session=%s: %s",
+                conv_id,
+                exc,
+                extra={"session_id": conv_id},
+            )
+            return
         if terminal_registry.get(conv_id, terminal_name, "main") is None:
             # Nothing was registered, so waiting for the pane cannot help.
             return
