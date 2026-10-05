@@ -814,6 +814,34 @@ async def test_fresh_catalog_missing_default_model_refused(
     assert f"host '{HDS}'" in message
     assert "codex" in message
     assert "last sync" in message
+    assert "Sync models" in message
+
+
+async def test_fresh_catalog_missing_legacy_all_hosts_model_refused(
+    calling_app: FastAPI,
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """The legacy All hosts row model is refused when the fresh catalog lacks it."""
+    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_model_catalog_cache_store.upsert(
+        HDS, "codex", [{"id": "gpt-5.5"}], 1700000000
+    )
+    project_id = await _project(
+        calling_client,
+        {"agent_id": CODEX_AGENT_ID, "model": "gpt-6-sol"},
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert "Default model 'gpt-6-sol'" in message
+    assert "All hosts row" in message
+    assert "is not offered by host" in message
+    assert "Sync models" in message
 
 
 async def test_stale_catalog_does_not_block(
