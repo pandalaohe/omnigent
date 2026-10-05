@@ -162,28 +162,45 @@ async def drive_keep_warm_ping(
         raise RuntimeError("Codex keep-warm fork returned no thread id")
     fork_id, model = forked
     events = events_for(fork_id)
-    try:
-        turn_id = await _await_within_budget(
-            submit_keep_warm_turn(request, fork_id), deadline, loop
-        )
-    except TimeoutError:
-        return KeepWarmPingResult("failed", "timeout")
-    last_usage: _JsonObject | None = None
     iterator = events.__aiter__()
+    turn_start: asyncio.Task[str | None] | None = None
+    pending_event: asyncio.Task[_JsonObject] | None = None
+    last_usage: _JsonObject | None = None
     turn_finished = False
+    turn_id: str | None = None
     try:
+        # Submit the turn as a task so a stalled ``turn/start`` reply cannot
+        # hide the turn: the fork's ``turn/started`` notification still
+        # teaches us the turn id the bounded interrupt cleanup needs.
+        turn_start = asyncio.ensure_future(submit_keep_warm_turn(request, fork_id))
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return KeepWarmPingResult("failed", "timeout")
-            try:
-                message = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
-            except TimeoutError:
+            if pending_event is None:
+                pending_event = asyncio.ensure_future(iterator.__anext__())
+            pending: set[asyncio.Task[Any]] = {pending_event}
+            if turn_start is not None:
+                pending.add(turn_start)
+            done, _ = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
                 return KeepWarmPingResult("failed", "timeout")
+            if turn_start is not None and turn_start in done:
+                started_turn_id = turn_start.result()
+                if started_turn_id:
+                    turn_id = started_turn_id
+                turn_start = None
+            if pending_event is None or pending_event not in done:
+                continue
+            try:
+                message = pending_event.result()
             except StopAsyncIteration:
                 raise RuntimeError(
                     "Codex keep-warm event stream ended before the ping turn completed"
                 ) from None
+            pending_event = None
             if _fork_thread_id(message) != fork_id:
                 # Another thread's traffic on a shared stream (e.g. a real
                 # turn that started on the parent mid-ping) is not ours.
@@ -192,8 +209,14 @@ async def drive_keep_warm_ping(
             if request_id is not None and message.get("method") is not None:
                 # The turn asked for something (approval, input, a tool
                 # call): refuse so the app-server never hangs; the cleanup
-                # below tears the turn down.
-                await respond(request_id, refusal_payload(message))
+                # below tears the turn down. A stalled write is itself a
+                # timeout, not a tool attempt.
+                try:
+                    await _await_within_budget(
+                        respond(request_id, refusal_payload(message)), deadline, loop
+                    )
+                except TimeoutError:
+                    return KeepWarmPingResult("failed", "timeout")
                 return KeepWarmPingResult("failed", "tool_attempt")
             method = message.get("method")
             params = message.get("params")
@@ -205,9 +228,9 @@ async def drive_keep_warm_ping(
                     if isinstance(started_model, str) and started_model:
                         model = started_model
             elif method == "turn/started":
-                turn = params.get("turn")
-                if isinstance(turn, dict) and isinstance(turn.get("id"), str) and turn["id"]:
-                    turn_id = turn["id"]
+                started_turn_id = _turn_id_from_message(message)
+                if started_turn_id:
+                    turn_id = started_turn_id
             elif method == "thread/tokenUsage/updated":
                 token_usage = params.get("tokenUsage")
                 if isinstance(token_usage, dict):
@@ -226,6 +249,21 @@ async def drive_keep_warm_ping(
                 turn_finished = True
                 return KeepWarmPingResult("failed", "harness_error", model=model)
     finally:
+        for task in (pending_event, turn_start):
+            if task is None or task.cancelled():
+                continue
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                value = await task
+                # A reply or notification already in hand still names the
+                # turn the interrupt below must stop.
+                if isinstance(value, str) and value:
+                    turn_id = value
+                elif isinstance(value, dict) and _fork_thread_id(value) == fork_id:
+                    learned = _turn_id_from_message(value)
+                    if learned:
+                        turn_id = learned
         try:
             aclose = getattr(iterator, "aclose", None)
             if aclose is not None:
@@ -234,9 +272,9 @@ async def drive_keep_warm_ping(
         finally:
             if not turn_finished:
                 # Every exit that leaves the fork turn running — timeout,
-                # refusal, stream end, a failed respond, cancellation — tears
-                # it down. The cleanup is bounded and never masks the ping's
-                # own outcome.
+                # refusal, stream end, a failed respond, cancellation, a
+                # stalled turn start — tears it down. The cleanup is bounded
+                # and never masks the ping's own outcome.
                 await _interrupt_keep_warm_turn(request, fork_id, turn_id)
 
 
@@ -364,6 +402,18 @@ def _fork_thread_id(message: _JsonObject) -> str | None:
         if isinstance(nested, str) and nested:
             return nested
     return None
+
+
+def _turn_id_from_message(message: _JsonObject) -> str | None:
+    """The turn id a ``turn/started`` notification carries, else ``None``."""
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return None
+    turn_id = turn.get("id")
+    return turn_id if isinstance(turn_id, str) and turn_id else None
 
 
 def _keep_warm_cost_usd(result: KeepWarmPingResult) -> float | None:

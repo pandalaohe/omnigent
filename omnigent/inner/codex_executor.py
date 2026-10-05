@@ -2855,6 +2855,10 @@ class _CodexAppServerSession:
         # pings are rare (one per provider cache window).
         self._keep_warm_queues: dict[str, asyncio.Queue[CodexMessage]] = {}
         self._keep_warm_retired: dict[str, None] = {}
+        # One ping at a time per session: an overlapping ping's snapshot-based
+        # retirement would otherwise retire the first ping's live fork queue.
+        # Held across the whole ping, including the cleanup retirement.
+        self._keep_warm_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
@@ -4407,9 +4411,27 @@ class _CodexAppServerSession:
             return thread_id
         return None
 
+    @property
+    def keep_warm_busy(self) -> bool:
+        """Whether a keep-warm ping currently owns this session (lock held)."""
+        return self._keep_warm_lock.locked()
+
     async def keep_warm_ping(self) -> KeepWarmPingResult:
         """
         Run one guarded keep-warm ping on this session's live connection.
+
+        Serialized per session: the lock is held across the whole ping
+        including the fork retirement, so overlapping callers cannot retire
+        each other's fork queues.
+
+        :returns: The ping outcome and raw usage.
+        """
+        async with self._keep_warm_lock:
+            return await self._keep_warm_ping_locked()
+
+    async def _keep_warm_ping_locked(self) -> KeepWarmPingResult:
+        """
+        Run the ping while ``_keep_warm_lock`` is held.
 
         Whoever calls ``thread/fork`` owns the fork's event stream, so the
         fork rides this connection: its messages are diverted into the
@@ -4949,9 +4971,10 @@ class CodexExecutor(Executor):
         (keep-warm).
 
         Only ever reuses the live app-server subprocess — a ping never
-        starts or rebuilds one. A turn in flight skips ``busy``; a real
-        ``run_turn`` arriving during the ping runs normally (the fork is a
-        separate thread whose events ride a separate queue).
+        starts or rebuilds one. A turn in flight, or a ping already running
+        on this session, skips ``busy`` without waiting; a real ``run_turn``
+        arriving during the ping runs normally (the fork is a separate
+        thread whose events ride a separate queue).
 
         :param attempt_id: Server-allocated ping attempt id, echoed on the
             receipt.
@@ -4964,6 +4987,8 @@ class CodexExecutor(Executor):
         if app_session is None:
             return keep_warm_receipt(attempt_id, outcome="skipped", reason="no_live_client")
         if app_session.active_turn_id is not None:
+            return keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
+        if app_session.keep_warm_busy:
             return keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
         try:
             result = await app_session.keep_warm_ping()

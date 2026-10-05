@@ -312,22 +312,13 @@ async def test_stalled_fork_rpc_times_out_within_the_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stalled_turn_start_rpc_times_out_within_the_budget() -> None:
-    """A ``turn/start`` that never answers ends ``failed``/``timeout`` in time."""
-    requests: list[tuple[str, _JsonObject]] = []
-
-    async def stalling_turn_request(method: str, params: _JsonObject) -> _JsonObject:
-        requests.append((method, params))
-        if method == "thread/fork":
-            return _fork_response()
-        await asyncio.Event().wait()
-        return {}  # pragma: no cover — the wait never returns
-
-    side = _PingSide(_blocking_events)
+async def test_stalled_turn_start_rpc_still_interrupts_the_started_fork_turn() -> None:
+    """A stalled ``turn/start`` reply is interrupted via its ``turn/started`` id."""
+    side = _TurnStartStallingSide(_turn_started_events)
     started = time.monotonic()
 
     result = await drive_keep_warm_ping(
-        request=stalling_turn_request,
+        request=side.request,
         respond=side.respond,
         events_for=side.events_for,
         parent_thread_id=_PARENT_ID,
@@ -336,4 +327,87 @@ async def test_stalled_turn_start_rpc_times_out_within_the_budget() -> None:
 
     assert result.outcome == "failed" and result.reason == "timeout"
     assert time.monotonic() - started < 1.0
-    assert [method for method, _ in requests] == ["thread/fork", "turn/start"]
+    assert [method for method, _ in side.requests] == [
+        "thread/fork",
+        "turn/start",
+        "turn/interrupt",
+    ]
+    assert side.interrupt_calls == [("turn/interrupt", {"threadId": _FORK_ID, "turnId": _TURN_ID})]
+
+
+class _TurnStartStallingSide(_PingSide):
+    """A ping side whose ``turn/start`` reply never lands."""
+
+    async def request(self, method: str, params: _JsonObject) -> _JsonObject:
+        """Stall the turn RPC; answer the fork and interrupt RPCs normally."""
+        if method == "turn/start":
+            self.requests.append((method, params))
+            await asyncio.Event().wait()
+        return await super().request(method, params)
+
+
+async def _turn_started_events(fork_id: str) -> AsyncIterator[_JsonObject]:
+    """The fork's ``turn/started``, then a stream that never ends."""
+    yield {
+        "method": "turn/started",
+        "params": {"threadId": fork_id, "turn": {"id": _TURN_ID}},
+    }
+    await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ping_awaiting_the_turn_start_reply_interrupts_the_started_turn() -> None:
+    """Cancellation while the ``turn/start`` reply stalls still interrupts."""
+    processed = asyncio.Event()
+
+    async def events(fork_id: str) -> AsyncIterator[_JsonObject]:
+        yield {
+            "method": "turn/started",
+            "params": {"threadId": fork_id, "turn": {"id": _TURN_ID}},
+        }
+        # Resumed only after the driver consumed the notification above, so
+        # the learned turn id is in place before the test cancels the ping.
+        processed.set()
+        await asyncio.Event().wait()
+
+    side = _TurnStartStallingSide(events)
+    task = asyncio.create_task(
+        drive_keep_warm_ping(
+            request=side.request,
+            respond=side.respond,
+            events_for=side.events_for,
+            parent_thread_id=_PARENT_ID,
+            budget_s=60.0,
+        )
+    )
+    await asyncio.wait_for(processed.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert side.interrupt_calls == [("turn/interrupt", {"threadId": _FORK_ID, "turnId": _TURN_ID})]
+
+
+@pytest.mark.asyncio
+async def test_stalled_refusal_write_times_out_through_the_interrupt_cleanup() -> None:
+    """A ``respond`` that never answers is cut by the budget and interrupted."""
+    side = _PingSide(_approval_request_events)
+
+    async def stalling_respond(request_id: int | str, result: _JsonObject) -> None:
+        await asyncio.Event().wait()
+
+    result = await asyncio.wait_for(
+        drive_keep_warm_ping(
+            request=side.request,
+            respond=stalling_respond,
+            events_for=side.events_for,
+            parent_thread_id=_PARENT_ID,
+            budget_s=0.05,
+        ),
+        timeout=1.0,
+    )
+
+    assert result.outcome == "failed" and result.reason == "timeout"
+    assert side.responses == []
+    assert side.interrupt_calls == [("turn/interrupt", {"threadId": _FORK_ID, "turnId": _TURN_ID})]

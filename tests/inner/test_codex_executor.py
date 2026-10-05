@@ -1547,6 +1547,68 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertEqual(receipt["reason"], "busy")
         session.keep_warm_ping.assert_not_called()
 
+    def test_keep_warm_overlapping_ping_skips_busy_and_leaves_the_first_fork_alone(self):
+        """A second ping skips ``busy`` without touching the first ping's fork."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session._proc = _FakeProcess()
+            session._started = True
+            session.thread_id = "thread-1"
+            requests: list[tuple[str, dict]] = []
+            turn_started = asyncio.Event()
+
+            async def _request(method: str, params: dict) -> dict:
+                requests.append((method, params))
+                if method == "thread/fork":
+                    return {
+                        "result": {"thread": {"id": "thread_fork", "model": "gpt-keep-warm-test"}}
+                    }
+                if method == "turn/start":
+                    turn_started.set()
+                    return {"result": {"turn": {"id": "turn_fork"}}}
+                return {"result": {}}
+
+            session._request = _request  # type: ignore[assignment]
+            session._send_response = AsyncMock()
+            state = _CodexSessionState()
+            state.app_session = session
+            executor = CodexExecutor(codex_path="/bin/echo", app_session_factory=AsyncMock())
+            executor._session_states["default"] = state
+
+            first = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="codex"))
+            await asyncio.wait_for(turn_started.wait(), timeout=1)
+            first_queue = session._keep_warm_queues["thread_fork"]
+
+            second = await asyncio.wait_for(
+                executor.keep_warm(attempt_id="att-2", family="codex"), timeout=1
+            )
+
+            self.assertEqual(second["outcome"], "skipped")
+            self.assertEqual(second["reason"], "busy")
+            # The first ping still owns its live fork queue, and the second
+            # never forked or started a turn on the connection.
+            self.assertIs(session._keep_warm_queues.get("thread_fork"), first_queue)
+            self.assertEqual([method for method, _ in requests], ["thread/fork", "turn/start"])
+
+            first_queue.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread_fork", "turn": {"id": "turn_fork"}},
+                }
+            )
+            receipt = await asyncio.wait_for(first, timeout=5)
+
+            self.assertEqual(receipt["outcome"], "ok")
+            self.assertNotIn("thread_fork", session._keep_warm_queues)
+
+        _run(_t())
+
     def test_keep_warm_ok_ping_normalizes_the_receipt(self):
         """The session's ping outcome maps onto the normalized Codex receipt."""
         session = _CodexAppServerSession(
