@@ -2,14 +2,10 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation } from "./useConversations";
-import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
 import {
   ARCHIVE_SESSION_ACTION_EVENT,
   POLL_SESSIONS_ACTION_EVENT,
   choosePolledConversation,
-  pendingCardsToAcknowledge,
-  resetElicitationAcknowledgementsForTests,
-  useAcknowledgePendingElicitations,
   useSessionPollingHotkeys,
 } from "./useSessionPollingHotkeys";
 import {
@@ -45,28 +41,9 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function elicitation(id: string, overrides: Partial<ElicitationBlock> = {}): AnyBlock {
-  return {
-    type: "elicitation",
-    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
-    elicitationId: id,
-    targetSessionId: null,
-    message: "Allow shell command?",
-    phase: "tool_call",
-    policyName: "ask-before-shell",
-    contentPreview: "{}",
-    requestedSchema: {},
-    url: null,
-    status: "pending",
-    response: null,
-    ...overrides,
-  };
-}
-
 beforeEach(() => {
   localStorage.clear();
   resetReadStateForTests();
-  resetElicitationAcknowledgementsForTests();
   navigate.mockReset();
 });
 
@@ -234,35 +211,6 @@ describe("choosePolledConversation", () => {
         },
       ),
     ).toBeNull();
-  });
-});
-
-describe("pendingCardsToAcknowledge", () => {
-  it("counts the session's own pending cards and excludes child mirrors and answered cards", () => {
-    const blocks = [
-      elicitation("own-1"),
-      elicitation("own-2", { targetSessionId: "conv_self" }),
-      elicitation("child", { targetSessionId: "conv_child" }),
-      elicitation("answered", { status: "responded", response: { action: "accept" } }),
-    ];
-    expect(pendingCardsToAcknowledge(blocks, "conv_self", undefined, "conv_self")).toBe(2);
-  });
-
-  it("keeps the loaded row's count when it is larger than the transcript's", () => {
-    expect(pendingCardsToAcknowledge([elicitation("own-1")], "conv_self", 3, "conv_self")).toBe(3);
-  });
-
-  it("returns zero without an active conversation", () => {
-    expect(pendingCardsToAcknowledge([elicitation("own-1")], undefined, undefined, undefined)).toBe(
-      0,
-    );
-  });
-
-  it("ignores the previous conversation's blocks while the route switch is in flight", () => {
-    const stale = [elicitation("old-card")];
-    expect(pendingCardsToAcknowledge(stale, "conv_new", undefined, "conv_old")).toBe(0);
-    // A loaded row for the incoming session still acknowledges.
-    expect(pendingCardsToAcknowledge(stale, "conv_new", 2, "conv_old")).toBe(2);
   });
 });
 
@@ -512,152 +460,26 @@ describe("useSessionPollingHotkeys", () => {
     }
   });
 
-  it("stops prioritizing a needs-response row once opened, until a new card arrives", async () => {
-    let currentRows = [
+  it("returns to a row whose card is still pending after polling to the next row", async () => {
+    const rows = [
       conversation("active", 3),
       conversation("next", 2),
       conversation("card", 1, { pending_elicitations_count: 1 }),
     ];
-    const polling = renderHook(
-      ({ activeId }) =>
-        useSessionPollingHotkeys({
-          activeId,
-          getConversations: async () => currentRows,
-          isUnread: () => false,
-          onArchive: vi.fn(),
-        }),
+    const props = {
+      getConversations: async () => rows,
+      isUnread: () => false,
+      onArchive: vi.fn(),
+    };
+    const { rerender } = renderHook(
+      ({ activeId }) => useSessionPollingHotkeys({ ...props, activeId }),
       { initialProps: { activeId: "active" } },
     );
 
     await pressAndExpect("card");
-
-    // Opening the session acknowledges the cards it currently shows (ChatPage's
-    // call on the open route).
-    renderHook(() => useAcknowledgePendingElicitations("card", 1));
-    polling.rerender({ activeId: "card" });
+    rerender({ activeId: "card" });
     await pressAndExpect("next");
-
-    currentRows = [
-      conversation("active", 3),
-      conversation("next", 2),
-      conversation("card", 1, { pending_elicitations_count: 2 }),
-    ];
-    polling.rerender({ activeId: "next" });
-    await pressAndExpect("card");
-  });
-
-  it("acknowledges a card on a row outside the loaded list, so Poll moves on", async () => {
-    const currentRows = [
-      conversation("card", 3, { pending_elicitations_count: 1 }),
-      conversation("next", 2),
-      conversation("active", 1),
-    ];
-    const polling = renderHook(
-      ({ activeId }) =>
-        useSessionPollingHotkeys({
-          activeId,
-          getConversations: async () => currentRows,
-          isUnread: () => false,
-          onArchive: vi.fn(),
-        }),
-      { initialProps: { activeId: "active" } },
-    );
-
-    await pressAndExpect("card");
-    polling.rerender({ activeId: "card" });
-
-    // ChatPage's acknowledgement call when the row is absent from
-    // useLoadedConversations(): the open transcript's own pending blocks are
-    // the only count available.
-    renderHook(() =>
-      useAcknowledgePendingElicitations(
-        "card",
-        pendingCardsToAcknowledge([elicitation("card-1")], "card", undefined, "card"),
-      ),
-    );
-
-    // Moving on by hand, then polling, must not pull back to the acknowledged
-    // card; it continues the fresh round from next.
-    polling.rerender({ activeId: "next" });
-    await pressAndExpect("active");
-  });
-
-  it("lowers the acknowledged baseline when the observed card count drops", async () => {
-    // Opened while showing two cards, then left.
-    const ack = renderHook(({ count }) => useAcknowledgePendingElicitations("card", count), {
-      initialProps: { count: 2 },
-    });
-    ack.unmount();
-
-    let currentRows = [
-      conversation("active", 4),
-      conversation("next", 3),
-      conversation("other", 2),
-      conversation("card", 1, { pending_elicitations_count: 1 }),
-    ];
-    const polling = renderHook(
-      ({ activeId }) =>
-        useSessionPollingHotkeys({
-          activeId,
-          getConversations: async () => currentRows,
-          isUnread: () => false,
-          onArchive: vi.fn(),
-        }),
-      { initialProps: { activeId: "active" } },
-    );
-
-    // One card was answered elsewhere: observed 1 < stored 2 lowers the
-    // baseline, so the row polls as a regular row.
-    await pressAndExpect("next");
-
-    // A fresh card (back to 2) exceeds the lowered baseline: needs-response again.
-    currentRows = [
-      conversation("active", 4),
-      conversation("next", 3),
-      conversation("other", 2),
-      conversation("card", 1, { pending_elicitations_count: 2 }),
-    ];
-    polling.rerender({ activeId: "next" });
-    await pressAndExpect("card");
-  });
-
-  it("clears the acknowledgement when no cards remain, so any new card re-raises the row", async () => {
-    const ack = renderHook(() => useAcknowledgePendingElicitations("card", 1));
-    ack.unmount();
-
-    const withoutCards = [
-      conversation("active", 5),
-      conversation("next", 4),
-      conversation("other", 3),
-      conversation("tail", 2),
-      conversation("card", 1, { pending_elicitations_count: 0 }),
-    ];
-    const withCard = withoutCards.map((row) =>
-      row.id === "card" ? conversation("card", 1, { pending_elicitations_count: 1 }) : row,
-    );
-    let currentRows = withCard;
-    const polling = renderHook(
-      ({ activeId }) =>
-        useSessionPollingHotkeys({
-          activeId,
-          getConversations: async () => currentRows,
-          isUnread: () => false,
-          onArchive: vi.fn(),
-        }),
-      { initialProps: { activeId: "active" } },
-    );
-
-    // Already acknowledged: the row polls as a regular row.
-    await pressAndExpect("next");
-
-    // The last card was answered elsewhere; the observation clears the baseline.
-    currentRows = withoutCards;
-    polling.rerender({ activeId: "next" });
-    await pressAndExpect("other");
-
-    // Any new card on the row is needs-response again.
-    currentRows = withCard;
-    polling.rerender({ activeId: "other" });
+    rerender({ activeId: "next" });
     await pressAndExpect("card");
   });
 
