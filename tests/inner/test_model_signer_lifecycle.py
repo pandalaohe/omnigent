@@ -325,6 +325,45 @@ async def test_signer_backed_home_rejects_symlink_temp_root(
     assert not list(real_root.iterdir())
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="simulates Windows from a POSIX host")
+@pytest.mark.parametrize("platform", ["posix", "windows"])
+async def test_signer_temp_root_writable_refusal_is_posix_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    platform: str,
+) -> None:
+    """Windows dirs always read back group/other-writable with no sticky bit,
+    so the temp-root writability refusal applies only on POSIX."""
+    writable_root = tmp_path / "world-writable-temp"
+    writable_root.mkdir()
+    writable_root.chmod(0o777)
+    signer = _Signer([])
+    monkeypatch.setattr("tempfile.gettempdir", lambda: os.fspath(writable_root))
+
+    if platform == "windows":
+        monkeypatch.delattr(os, "getuid")
+        monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+        monkeypatch.setattr(
+            "omnigent.inner.codex_executor.prepare_codex_worker",
+            Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
+        )
+        monkeypatch.setattr(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            AsyncMock(return_value=_Process()),
+        )
+
+    session = _session(tmp_path, signer)
+    session._request = AsyncMock(return_value={"result": {}})
+
+    if platform == "posix":
+        with pytest.raises(OSError, match="unsafe signer session temp root"):
+            await session.start()
+        assert signer.closed
+    else:
+        await session.start()
+        await session.close()
+
+
 def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> None:
     source = tmp_path / "source"
     target = tmp_path / "target"

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -5134,6 +5134,46 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
             ):
                 self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
         self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="simulates Windows from a POSIX host")
+@pytest.mark.parametrize("platform", ["posix", "windows"])
+async def test_codex_home_private_mode_refusal_is_posix_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str
+) -> None:
+    """Windows cannot chmod a directory private (it reads back 0o777), so the
+    CODEX_HOME mode refusal applies only where POSIX mode bits exist."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    real_chmod = os.chmod
+
+    def _windows_chmod(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        real_chmod(path, 0o777 if os.path.isdir(path) else mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _windows_chmod)
+    if platform == "windows":
+        monkeypatch.delattr(os, "getuid")
+    spawn = AsyncMock(side_effect=RuntimeError("stop before worker spawn"))
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: None,
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+    )
+
+    if platform == "posix":
+        with pytest.raises(OSError, match="unsafe signer CODEX_HOME"):
+            await session.start()
+        spawn.assert_not_awaited()
+    else:
+        with pytest.raises(RuntimeError, match="stop before worker spawn"):
+            await session.start()
+        spawn.assert_awaited_once()
 
 
 def test_run_turn_cli_config_uses_binary_default_until_model_picked():
