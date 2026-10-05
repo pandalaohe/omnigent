@@ -523,9 +523,17 @@ def warm_state_from_label(
     return "cold"
 
 
-#: Label reason codes mapped onto the status object's ``stop_reason``
-#: vocabulary. ``runner`` is the sweeper's runner-liveness gate (the design's
-#: old-runner stop); codes with no vocabulary entry read as ``None``.
+#: Warm-episode gate codes → the state read while the sweeper keeps ``s == "w"``
+#: (``stop_reason`` comes from :data:`_STOP_REASON_STATUS`).
+_WARM_GATE_STATUS: dict[str, str] = {
+    "switch": "off",
+    "runner": "paused",
+    "host": "paused",
+    "card": "paused",
+}
+
+#: Label reason codes → status object ``stop_reason``. ``runner`` is the
+#: runner-liveness gate; ``runner_version`` stays schema-only, never produced.
 _STOP_REASON_STATUS: dict[str, str] = {
     "cap": "cap",
     "miss": "misses",
@@ -533,7 +541,7 @@ _STOP_REASON_STATUS: dict[str, str] = {
     "card": "card",
     "host": "host",
     "switch": "switch_off",
-    "runner": "runner_version",
+    "runner": "host",
 }
 
 
@@ -624,13 +632,14 @@ def keep_warm_status_from_labels(
     """
     Build the ``keep_warm`` status object from a session's labels.
 
-    ``state`` mirrors the episode label: ``s == "w"`` reads ``on``,
-    ``s == "p"`` reads ``paused``, and ``s == "c"`` reads ``stopped`` when the
-    label records a reason (``why`` / ``k``), else ``off``. ``stop_reason`` is
-    the first recognized reason mapped onto the status vocabulary; an
-    unrecognized code reads ``None``, never an error. ``last_reason`` always
-    carries the label's raw ``k`` code (the last ping's skip / fail reason).
-    Costs convert integer micro-USD to float USD.
+    ``state`` mirrors the episode label: ``s == "w"`` reads ``on`` unless a
+    gate blocks the ping (``switch`` → ``off``; ``runner`` / ``host`` /
+    ``card`` → ``paused``), ``s == "p"`` reads ``paused``, and ``s == "c"``
+    reads ``stopped`` when the label records a reason (``why`` / ``k``), else
+    ``off``. ``stop_reason`` is the first recognized reason mapped onto the
+    status vocabulary; an unrecognized code reads ``None``, never an error.
+    ``last_reason`` always carries the label's raw ``k`` code (the last ping's
+    skip / fail reason). Costs convert integer micro-USD to float USD.
 
     :param labels: Conversation labels, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -644,7 +653,9 @@ def keep_warm_status_from_labels(
     if state is None:
         return None
     if state.s == "w":
-        status = "on"
+        # A blocked warm episode reports the gate, not ``on``; a receipt
+        # code (``busy``, ``btw_unavailable``) keeps reading ``on``.
+        status = _WARM_GATE_STATUS.get(state.k or "", "on")
     elif state.s == "p":
         status = "paused"
     elif state.why is not None or state.k is not None:

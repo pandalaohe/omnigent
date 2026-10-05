@@ -2237,6 +2237,56 @@ async def test_keep_warm_status_maps_state_reasons_and_costs() -> None:
     assert _status(_label(s="w", y="claude", t=1), archived=True) is None
 
 
+async def test_keep_warm_status_reports_a_blocking_gate() -> None:
+    """A warm label blocked by a gate reads off / paused with its gate reason."""
+    now = 1_000_000
+
+    def _gate(k: str) -> dict[str, Any] | None:
+        return keep_warm_status_from_labels(
+            {KEEP_WARM_LABEL: _label(s="w", k=k, y="claude", t=1, u=now - 100)},
+            archived=False,
+            now=now,
+        )
+
+    switch = _gate("switch")
+    assert switch is not None
+    assert switch["state"] == "off"
+    assert switch["stop_reason"] == "switch_off"
+    assert switch["last_reason"] == "switch"
+
+    runner = _gate("runner")
+    assert runner is not None
+    assert runner["state"] == "paused"
+    assert runner["stop_reason"] == "host"
+    assert runner["last_reason"] == "runner"
+
+    host = _gate("host")
+    assert host is not None
+    assert host["state"] == "paused"
+    assert host["stop_reason"] == "host"
+    assert host["last_reason"] == "host"
+
+    card = _gate("card")
+    assert card is not None
+    assert card["state"] == "paused"
+    assert card["stop_reason"] == "card"
+    assert card["last_reason"] == "card"
+
+
+async def test_keep_warm_status_keeps_a_receipt_code_on() -> None:
+    """A non-gate receipt code leaves a warm episode on with no stop reason."""
+    now = 1_000_000
+    status = keep_warm_status_from_labels(
+        {KEEP_WARM_LABEL: _label(s="w", k="btw_unavailable", y="claude", t=1, u=now - 100)},
+        archived=False,
+        now=now,
+    )
+    assert status is not None
+    assert status["state"] == "on"
+    assert status["stop_reason"] is None
+    assert status["last_reason"] == "btw_unavailable"
+
+
 async def test_keep_warm_status_names_the_failure_cause() -> None:
     """A failures pause carries the last ping's raw skip / fail code."""
     status = keep_warm_status_from_labels(

@@ -163,6 +163,49 @@ async def test_list_sessions_keep_warm_state_uses_harness_family(
     assert rows[unsupported.id].get("warm_state") is None
 
 
+async def test_list_sessions_warm_state_ignores_a_running_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Child activity rolls up the spinner but not the parent's warm state.
+
+    A child's running turn never refreshes the parent's own provider cache,
+    so an idle parent with an expired label reads cold while ``status`` still
+    rolls up to running for the sidebar spinner.
+    """
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="kw-parent-agent", bundle_location="test:///bundle")
+    parent = conv_store.create_conversation(agent_id=agent_id)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=parent.id,
+    )
+    conv_store.set_labels(
+        parent.id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 7200, "u": now - 7200, "w": now - 3600}
+            )
+        },
+    )
+
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        resp = await client.get("/v1/sessions")
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    assert rows[parent.id]["status"] == "running"
+    assert rows[parent.id]["foreground_status"] == "idle"
+    assert rows[parent.id]["warm_state"] == "cold"
+
+
 async def test_list_sessions_pagination(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -2177,6 +2177,11 @@ def _build_session_list_item(
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
     own_activity_unverified = conv.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+    own_status = (
+        "idle"
+        if own_activity_unverified
+        else _session_status_from_cache(conv.id, conv.live_status)
+    )
     derived_status = _list_status_with_starting(
         (
             "idle"
@@ -2190,9 +2195,9 @@ def _build_session_list_item(
         ),
         conv.id,
     )
-    # A running / waiting row is warming its cache with real work; the same
-    # busy rule the child summary uses.
-    busy = derived_status in ("running", "waiting")
+    # Only this session's own turn refreshes its provider cache; a child's
+    # activity rolls up into ``status`` but must not read as busy here.
+    busy = own_status in ("running", "waiting")
     now = now_epoch()
     warm_family = (
         keep_warm_families.get((conv.agent_id, conv.harness_override, conv.sub_agent_name))
@@ -2205,11 +2210,7 @@ def _build_session_list_item(
         agent_name=agent_names_by_id.get(conv.agent_id),
         agent_template_id=(agent_template_ids or {}).get(conv.agent_id),
         status=derived_status,
-        foreground_status=(
-            "idle"
-            if own_activity_unverified
-            else _session_status_from_cache(conv.id, conv.live_status)
-        ),
+        foreground_status=own_status,
         background_activity_count=_session_background_activity_count(
             conv.id,
             child_session_ids,
