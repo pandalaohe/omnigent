@@ -2282,12 +2282,14 @@ async def test_keep_warm_cost_prices_on_a_worker_thread_not_the_event_loop(
     assert priced_on and all(ident != loop_thread for ident in priced_on)
 
 
-def _keep_warm_context_file(bridge_dir: Path, *, total_cost_usd: float) -> None:
+def _keep_warm_context_file(
+    bridge_dir: Path, *, total_cost_usd: float, model: str = "claude-sonnet-4-6"
+) -> None:
     """Write a statusLine snapshot carrying the given cumulative session cost."""
     payload = json.dumps(
         {
             "context_window_size": 1000000,
-            "model": "claude-sonnet-4-6",
+            "model": model,
             "current_usage": {
                 "input_tokens": 1000,
                 "cache_creation_input_tokens": 2000,
@@ -2462,8 +2464,8 @@ async def test_keep_warm_slow_pricing_outlives_the_budget_and_reads_as_no_estima
         _keep_warm_context_file(bridge_dir_arg, total_cost_usd=1.02)
         return claude_bridge.KeepWarmBtwResult("ok", None)
 
-    def slow_cost(bridge_dir_arg: Path, cache_read: int | None) -> float:
-        del bridge_dir_arg, cache_read
+    def slow_cost(model: str | None, cache_read: int | None) -> float:
+        del model, cache_read
         time.sleep(5.0)  # outlives the remaining ping budget
         return 0.01
 
@@ -2488,6 +2490,51 @@ async def test_keep_warm_slow_pricing_outlives_the_budget_and_reads_as_no_estima
         "estimated": False,
     }
     assert "cache_result" not in receipt
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_estimate_prices_the_model_read_under_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A model switch landing after the ping's exchange (here mid settle
+    poll, before the off-lock estimate runs) must not reprice the ping: the
+    estimate — and so the hit/miss call — follows the model snapshot read
+    under the lock."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        del bridge_dir_arg
+        return claude_bridge.KeepWarmBtwResult("ok", None)
+
+    def flipping_poll(bridge_dir_arg: Path, before: float, timeout_s: float) -> float | None:
+        del before, timeout_s
+        # The person switches to a far cheaper model right after the ping.
+        _keep_warm_context_file(bridge_dir_arg, model="claude-cheap-1", total_cost_usd=1.02)
+        return 1.02
+
+    def fake_pricing(model: str) -> ModelPricing:
+        return ModelPricing(
+            input_per_token=3e-6,
+            output_per_token=15e-6,
+            cache_read_per_token=3e-7 if model == "claude-sonnet-4-6" else 3e-9,
+            cache_write_per_token=3.75e-6,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    monkeypatch.setattr(claude_native_executor, "_poll_total_cost_usd", flipping_poll)
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", fake_pricing)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    # Priced from the snapshot model: 37000 x $3e-7 = $0.0111, so the $0.02
+    # delta is a hit; the switched model's $0.000111 estimate would read miss.
+    assert receipt["cost_usd"] == pytest.approx(0.02)
+    assert receipt["estimated"] is False
+    assert receipt["cache_result"] == "hit"
 
 
 @pytest.mark.asyncio

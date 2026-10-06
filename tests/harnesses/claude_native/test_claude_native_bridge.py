@@ -14349,7 +14349,9 @@ def test_keep_warm_btw_stalled_tmux_returns_within_the_bridge_budget(
 ) -> None:
     """A tmux server stalling every capture 9 s keeps the ping inside its
     hard budget: each subprocess is clipped to the deadline, and no key is
-    sent after it."""
+    sent after it. The Escape goes out from the reserve (the settle loop's
+    last readable capture showed our overlay), but its close never verifies
+    inside the budget → ``dismiss_failed``."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     clock = _VirtualClock()
     frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), _KEEP_WARM_ANSWERING_PANE]
@@ -14378,10 +14380,151 @@ def test_keep_warm_btw_stalled_tmux_returns_within_the_bridge_budget(
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
     budget = claude_native_bridge._KEEP_WARM_BRIDGE_BUDGET_S
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "btw_unavailable")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert clock.now <= budget
     key_sends = [sent_at for sent_at, cmd in calls if "send-keys" in cmd]
     assert key_sends and all(sent_at <= budget for sent_at in key_sends)
+
+
+def _stalled_capture_tmux(
+    clock: _VirtualClock,
+    frames: list[str],
+    calls: list[tuple[float, list[str]]],
+) -> object:
+    """
+    Fake ``subprocess.run``: keys/queries answer at once, captures stall 9 s.
+
+    A capture whose (deadline-clipped) timeout is under 9 s is killed by the
+    clip, advancing the clock by the timeout; otherwise it answers after 9 s
+    with the next frame. Mirrors the real stalled-tmux server the keep-warm
+    deadline exists for.
+
+    :param clock: Virtual clock the stall advances.
+    :param frames: Pane frames to return in order; the last one repeats.
+    :param calls: Recorded ``(started_at, argv)`` for every invocation.
+    :returns: The fake callable.
+    """
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs.get("timeout")
+        assert isinstance(timeout, float)
+        calls.append((clock.now, list(cmd)))
+        if "capture-pane" not in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if timeout < 9.0:
+            # The clipped timeout kills the stall before it answers.
+            clock.sleep(timeout)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        clock.sleep(9.0)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=frames.pop(0) if len(frames) > 1 else frames[0],
+            stderr="",
+        )
+
+    return _fake_run
+
+
+def test_keep_warm_btw_slow_captures_still_escape_the_answering_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Every capture stalling 9 s must not eat the close reserve: the settle
+    loop stops at the pre-close deadline, and the dismissal — rebound to the
+    full deadline, gated on the loop's last readable capture (our marked
+    overlay still answering) — gets its Escape out inside the budget."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), _KEEP_WARM_ANSWERING_PANE]
+    calls: list[tuple[float, list[str]]] = []
+    monkeypatch.setattr("subprocess.run", _stalled_capture_tmux(clock, frames, calls))
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    started = clock.now
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    budget = claude_native_bridge._KEEP_WARM_BRIDGE_BUDGET_S
+    assert result in (
+        claude_native_bridge.KeepWarmBtwResult("failed", "timeout"),
+        claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed"),
+    )
+    escapes = [sent_at for sent_at, cmd in calls if "send-keys" in cmd and cmd[-1] == "Escape"]
+    assert escapes, "the stalled captures must not eat the Escape's reserve"
+    assert clock.now <= started + budget
+    assert all(sent_at <= started + budget for sent_at in escapes)
+
+
+def test_keep_warm_btw_slow_captures_still_escape_the_settled_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Same 9 s capture stall, but the overlay settles (with the history
+    hint) late in the settle budget: the history clear stays inside the
+    pre-close deadline and the dismissal's Escape still goes out."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    frames = [
+        _IDLE_PANE,
+        _composer_pane(_KEEP_WARM_TEXT),
+        *[_KEEP_WARM_ANSWERING_PANE] * 4,
+        # Settles with the "x to clear history" hint late in the settle budget.
+        _KEEP_WARM_HISTORY_OVERLAY_PANE,
+    ]
+    calls: list[tuple[float, list[str]]] = []
+    monkeypatch.setattr("subprocess.run", _stalled_capture_tmux(clock, frames, calls))
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    started = clock.now
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    budget = claude_native_bridge._KEEP_WARM_BRIDGE_BUDGET_S
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
+    assert [cmd[-1] for _, cmd in calls if "send-keys" in cmd].count("x") == 1
+    escapes = [sent_at for sent_at, cmd in calls if "send-keys" in cmd and cmd[-1] == "Escape"]
+    assert escapes, "a late settle must not cost the overlay its Escape"
+    assert clock.now <= started + budget
+    assert all(sent_at <= started + budget for sent_at in escapes)
+
+
+def test_keep_warm_btw_history_x_failure_still_dismisses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A tmux stall on the history ``x`` send raises ``RuntimeError``; the
+    clear is abandoned (only cancellation propagates) so the overlay's
+    dismissal still runs and closes it."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends: list[list[str]] = []
+    frames = [
+        _IDLE_PANE,
+        _composer_pane(_KEEP_WARM_TEXT),
+        _KEEP_WARM_HISTORY_OVERLAY_PANE,  # settled; footer offers "x to clear history"
+        _KEEP_WARM_OVERLAY_PANE,  # dismiss re-read
+        _IDLE_PANE,  # the Escape closed the overlay
+    ]
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        sends.append(list(args))
+        if args[-1] == "x":
+            raise RuntimeError("tmux command timed out after 2.0s")
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        return frames.pop(0) if len(frames) > 1 else frames[0]
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert [args[-1] for args in sends].count("x") == 1
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
 
 
 def test_keep_warm_btw_overlay_that_ignores_escape_fails_dismiss_failed(

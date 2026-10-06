@@ -173,7 +173,8 @@ class ClaudeNativeExecutor(Executor):
         is still held, so a real turn settling meanwhile can never be
         billed to the ping. When the delta never lands, the receipt
         falls back to today's estimate: the session's current context
-        tokens priced as cache reads. The whole ping is bounded by
+        tokens priced as cache reads on the model snapshotted under the
+        lock. The whole ping is bounded by
         :data:`_KEEP_WARM_PING_BUDGET_S`: the settle poll is clipped to
         it, and the estimate is priced off the lock under the remaining
         budget — a slow catalog lookup reads as no estimate rather than
@@ -209,6 +210,9 @@ class ClaudeNativeExecutor(Executor):
             # The measured window stays under the lock, so no injected
             # message can start a turn whose cost lands in the delta.
             cache_read = _current_context_tokens(self._bridge_dir)
+            # The model is snapshotted with the tokens: a switch landing
+            # before the off-lock estimate must not reprice this ping.
+            model = read_claude_status_model(self._bridge_dir)
             poll_timeout = min(
                 _KEEP_WARM_COST_POLL_TIMEOUT_S,
                 max(0.0, deadline - time.monotonic()),
@@ -222,16 +226,15 @@ class ClaudeNativeExecutor(Executor):
             )
         finally:
             self._inject_lock.release()
-        # Priced off the lock and bounded by the remaining ping budget: a
-        # slow catalog lookup must not stretch the ping past it.
+        # Priced off the lock — from the model snapshotted under it — and
+        # bounded by the remaining ping budget: a slow catalog lookup must
+        # not stretch the ping past it.
         estimate_usd: float | None = None
         remaining = deadline - time.monotonic()
         if remaining > 0:
             try:
                 async with asyncio.timeout(remaining):
-                    estimate_usd = await asyncio.to_thread(
-                        _keep_warm_cost_usd, self._bridge_dir, cache_read
-                    )
+                    estimate_usd = await asyncio.to_thread(_keep_warm_cost_usd, model, cache_read)
             except TimeoutError:
                 estimate_usd = None
         if cost_before is not None and cost_after is not None:
@@ -714,20 +717,17 @@ def _current_context_tokens(bridge_dir: Path) -> int | None:
     )
 
 
-def _keep_warm_cost_usd(bridge_dir: Path, cache_read: int | None) -> float | None:
+def _keep_warm_cost_usd(model: str | None, cache_read: int | None) -> float | None:
     """
-    Price *cache_read* context tokens as cache reads on the session's live model.
+    Price *cache_read* context tokens as cache reads on *model*.
 
-    :param bridge_dir: Bridge directory path.
+    :param model: The statusLine model the ping saw, snapshotted under the
+        injection lock, or ``None``.
     :param cache_read: Context tokens the ping read, or ``None``.
-    :returns: The estimated USD cost, or ``None`` when the tokens are
-        unknown, the statusLine never captured a model, or the catalog
-        can't price it.
+    :returns: The estimated USD cost, or ``None`` when the tokens or the
+        model are unknown, or the catalog can't price it.
     """
-    if cache_read is None:
-        return None
-    model = read_claude_status_model(bridge_dir)
-    if model is None:
+    if cache_read is None or model is None:
         return None
     pricing = fetch_model_pricing(model)
     if pricing is None:

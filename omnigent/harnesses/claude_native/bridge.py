@@ -4980,13 +4980,12 @@ KEEP_WARM_BTW_TEXT = f"/btw {KEEP_WARM_BTW_MARKER} reply with only: ok"
 # A regular tmux client taking input (attach or keypress) this recently
 # means a person may be at the pane; the ping skips instead of typing.
 _KEEP_WARM_CLIENT_INPUT_WINDOW_S = 60.0
-# Hard budget for one run_keep_warm_btw call — every tmux subprocess the
-# keep-warm path reaches is clipped to it. Worst-case ping: 1 s executor lock
-# wait + 78 s here + ≤ 6 s clipped cost poll + pricing = 85 s < 90 s channel limit.
+# Hard budget for one run_keep_warm_btw call: every tmux call is clipped to
+# the deadline. Thread scheduling latency sits inside the 5 s margin
+# (1 + 78 + ≤ 6 = 85 s < 90 s channel limit).
 _KEEP_WARM_BRIDGE_BUDGET_S = 78.0
-# Close time kept back from the budget: 2 s history poll + two dismissal
-# attempts × (3 s verify + ~1 s capture / status read / key). The overlay
-# settle deadline is the bridge deadline minus this reserve.
+# Kept back for the dismissal alone: two attempts × (3 s verify + ~1 s
+# capture / status / key). History clearing comes out of the settle budget.
 _KEEP_WARM_CLOSE_RESERVE_S = 10.0
 _KEEP_WARM_OVERLAY_POLL_INTERVAL_S = 0.5
 # Post-Escape / post-x re-render polls: the TUI takes a moment to apply
@@ -8249,6 +8248,9 @@ def _clear_keep_warm_btw_history(
     sent once and fresh captures are polled for the hint to disappear. A
     hint that stays is logged and left — never re-keyed — because the
     dismiss that follows closes the overlay either way. No hint → no key.
+    The clear spends settle budget only: it is skipped when less than its
+    own poll timeout remains before the pre-close deadline, and a stalled
+    ``x`` send is logged and abandoned, so the dismissal keeps its reserve.
 
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
@@ -8262,11 +8264,24 @@ def _clear_keep_warm_btw_history(
     )
     if _BTW_CLEAR_HISTORY_HINT not in footer:
         return
+    remaining = _keep_warm_tmux_remaining_s()
+    if remaining is not None and remaining < _KEEP_WARM_HISTORY_TIMEOUT_S:
+        _logger.info(
+            "keep-warm: skipping /btw history clear; %.1fs left in the settle budget",
+            remaining,
+        )
+        return
     if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
         return
     if not _claude_free_behind_keep_warm_overlay(bridge_dir, socket_path, tmux_target):
         return
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "x")
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "x")
+    except ClaudeInjectionCancelled:
+        raise
+    except RuntimeError as exc:
+        _logger.info("keep-warm: /btw history x failed (%s); dismissing anyway", exc)
+        return
     deadline = time.monotonic() + _keep_warm_poll_timeout(_KEEP_WARM_HISTORY_TIMEOUT_S)
     while time.monotonic() < deadline:
         time.sleep(_KEEP_WARM_DISMISS_POLL_INTERVAL_S)
@@ -8377,7 +8392,8 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     ``dismiss_failed``). If the answer outlives the overlay settle
     deadline — the call's hard :data:`_KEEP_WARM_BRIDGE_BUDGET_S`
     budget minus the :data:`_KEEP_WARM_CLOSE_RESERVE_S` close time —
-    our marked overlay in ANY state is Escaped the same way →
+    our marked overlay in ANY state (seen on the settle loop's last
+    readable capture) is Escaped the same way →
     ``timeout`` (closed) or ``dismiss_failed`` — the ping always
     closes what it opened, so the session never reads running until a
     person presses Esc. Keys go only into our own marked overlay on a
@@ -8391,22 +8407,27 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     The caller holds the executor's injection lock, so a real message
     arriving meanwhile waits the few seconds this takes instead of
     interleaving keystrokes; cancellation sets a flag every tmux call
-    checks before sending. Every tmux call is also clipped to the
-    budget deadline (:func:`_keep_warm_tmux_deadline`): past it a
-    capture reads ``""`` and a key raises, so a stalled tmux server
-    can never stretch the ping and no key is sent after the deadline.
+    checks before sending. Every tmux call is also clipped to a bound
+    deadline (:func:`_keep_warm_tmux_deadline`) — the steps before the
+    close to the budget minus the close reserve, the two close steps to
+    the full budget: past the bound deadline a capture reads ``""`` and
+    a key raises, so a stalled tmux server can never stretch the ping
+    and no key is sent after it.
 
     :param bridge_dir: Bridge directory path.
     :returns: The attempt's outcome; guard refusals return, never raise.
     :raises RuntimeError: If a ``tmux`` invocation fails mid-sequence.
     """
     deadline = time.monotonic() + _KEEP_WARM_BRIDGE_BUDGET_S
-    with _keep_warm_tmux_deadline(deadline):
+    # Pre-close steps are bound to the budget minus the close reserve; the
+    # two close steps re-bind the full deadline where they run.
+    with _keep_warm_tmux_deadline(deadline - _KEEP_WARM_CLOSE_RESERVE_S):
         return _guarded_keep_warm_btw(bridge_dir, deadline)
 
 
 def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResult:
-    """The attempt body of :func:`run_keep_warm_btw`, under its bound tmux deadline."""
+    """The attempt body of :func:`run_keep_warm_btw`, under the bound pre-close deadline."""
+    pre_close_deadline = deadline - _KEEP_WARM_CLOSE_RESERVE_S
     if has_pending_user_prompt(bridge_dir):
         return KeepWarmBtwResult("skipped", "card")
     payload = _read_json_file(bridge_dir / _TMUX_FILE)
@@ -8427,7 +8448,7 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
         return KeepWarmBtwResult("skipped", "unknown")
     if draft:
         return KeepWarmBtwResult("skipped", "composer_draft")
-    if deadline - time.monotonic() < _TMUX_LIST_TIMEOUT_S:
+    if pre_close_deadline - time.monotonic() < _TMUX_LIST_TIMEOUT_S:
         # The client-activity query's own timeout no longer fits the ping's
         # budget; an unreadable answer never evidences an unattended pane.
         return KeepWarmBtwResult("skipped", "unknown")
@@ -8466,9 +8487,12 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     # The answer must settle early enough for the close reserve to fit.
-    settle_deadline = deadline - _KEEP_WARM_CLOSE_RESERVE_S
+    settle_deadline = pre_close_deadline
+    last_readable_pane: str | None = None
     while time.monotonic() < settle_deadline:
         pane = _capture_pane(socket_path, tmux_target)
+        if pane != "":
+            last_readable_pane = pane
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
             return KeepWarmBtwResult("failed", "aborted")
         # No status read here: our own open /btw overlay reports
@@ -8480,14 +8504,22 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
             and KEEP_WARM_BTW_MARKER in overlay.question
         ):
             _clear_keep_warm_btw_history(bridge_dir, socket_path, tmux_target, pane)
-            if _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target):
+            # The close owns the reserve: re-bind the full deadline so a
+            # slow settle cannot eat the Escape's budget.
+            with _keep_warm_tmux_deadline(deadline):
+                dismissed = _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target)
+            if dismissed:
                 return KeepWarmBtwResult("ok")
             return KeepWarmBtwResult("failed", "dismiss_failed")
         time.sleep(_KEEP_WARM_OVERLAY_POLL_INTERVAL_S)
     # The answer outlived its budget: interrupt and close our marked
-    # overlay in any state so the session never stays running on it.
-    if _keep_warm_btw_overlay_present(_capture_pane(socket_path, tmux_target)):
-        if _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target):
+    # overlay in any state so the session never stays running on it. The
+    # settle loop's last readable capture decides — the dismissal
+    # re-captures first anyway, so the reserve buys no detection capture.
+    if last_readable_pane is not None and _keep_warm_btw_overlay_present(last_readable_pane):
+        with _keep_warm_tmux_deadline(deadline):
+            dismissed = _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target)
+        if dismissed:
             return KeepWarmBtwResult("failed", "timeout")
         return KeepWarmBtwResult("failed", "dismiss_failed")
     # Not ours / not present: leave it alone. No fallback: repeated
