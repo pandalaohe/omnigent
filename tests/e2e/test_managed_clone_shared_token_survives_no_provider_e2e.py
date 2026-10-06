@@ -197,12 +197,21 @@ def _await_capture(capture_path: Path, call: str, log_path: Path) -> dict:
 def _write_image_git_identity(tmp_path: Path) -> Path:
     """Materialize the host image's system-scope git credential helper."""
     system_cfg = tmp_path / "image-system.gitconfig"
+    # An empty helper resets previously collected helpers — including the
+    # host's built-in osxkeychain — so the image helper must come after it.
+    subprocess.run(
+        ["git", "config", "--file", str(system_cfg), "--add", "credential.helper", ""],
+        check=True,
+        capture_output=True,
+        timeout=30.0,
+    )
     subprocess.run(
         [
             "git",
             "config",
             "--file",
             str(system_cfg),
+            "--add",
             "credential.helper",
             _IMAGE_CREDENTIAL_HELPER,
         ],
@@ -211,6 +220,14 @@ def _write_image_git_identity(tmp_path: Path) -> Path:
         timeout=30.0,
     )
     return system_cfg
+
+
+def _effective_credential_helpers(values: list[str]) -> list[str]:
+    """Git's reset semantics: only helpers after the last empty value apply."""
+    for index in range(len(values) - 1, -1, -1):
+        if values[index] == "":
+            return values[index + 1 :]
+    return values
 
 
 def _prepare_pod_home(tmp_path: Path) -> Path:
@@ -310,9 +327,23 @@ def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> No
             # Prove the shared token works before running workspace-prep.
             control_home = tmp_path / "control-home"
             control_home.mkdir()
+            control_env = {**env, "HOME": str(control_home)}
+            configured = subprocess.run(
+                ["git", "config", "--get-all", "credential.helper"],
+                env=control_env,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+            )
+            raw_helpers = configured.stdout.splitlines()
+            effective_helpers = _effective_credential_helpers(raw_helpers)
+            assert effective_helpers == [_IMAGE_CREDENTIAL_HELPER], (
+                f"effective credential helpers {effective_helpers!r} do not "
+                f"isolate the image helper; raw values: {raw_helpers!r}"
+            )
             control = subprocess.run(
                 ["git", "clone", "--", _CLONE_URL, str(tmp_path / "control-clone")],
-                env={**env, "HOME": str(control_home)},
+                env=control_env,
                 capture_output=True,
                 text=True,
                 timeout=_PREP_TIMEOUT_S,
