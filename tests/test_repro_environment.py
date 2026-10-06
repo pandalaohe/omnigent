@@ -20,6 +20,7 @@ def test_isolates_inherited_native_state(tmp_path):
             "LLM_API_KEY": "placeholder",
             "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD": "999",
             "OMNIGENT_CONFIG_HOME": "/parent",
+            "OMNIGENT_ADMIN_CREDENTIALS_PATH": "/parent/admin-credentials",
             "OMNIGENT_PROCESS_LOG_FILE": "/parent/logs/runner.log",
             "CLAUDE_CONFIG_DIR": "/parent-claude",
             "OPENAI_API_KEY": "parent-key",
@@ -34,6 +35,10 @@ def test_isolates_inherited_native_state(tmp_path):
     assert env["OMNIGENT_CONFIG_HOME"] == str(tmp_path / "config")
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
     assert "127.0.0.1" in env["NO_PROXY"]
+    from omnigent.server.admin_list import resolve_data_dir
+
+    with patch.dict(os.environ, env, clear=True):
+        assert resolve_data_dir() == tmp_path / "data"
 
 
 def test_onboarding_uses_selected_claude_directory(monkeypatch, tmp_path):

@@ -67,6 +67,9 @@ def isolated_env(environ: dict[str, str], output: Path) -> dict[str, str]:
             "CLAUDE_CONFIG_DIR": str(output / "claude-config"),
             "CODEX_HOME": str(output / "codex-config"),
             "OMNIGENT_DATA_DIR": str(output / "data"),
+            # The server resolves its state dir from this path's parent, not
+            # from OMNIGENT_DATA_DIR; no file is written at the path itself.
+            "OMNIGENT_ADMIN_CREDENTIALS_PATH": str(output / "data" / "admin-credentials"),
             "OMNIGENT_AUTH_PROVIDER": "header",
             "OMNIGENT_LOCAL_SINGLE_USER": "1",
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
