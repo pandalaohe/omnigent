@@ -8512,11 +8512,10 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
                 return KeepWarmBtwResult("ok")
             return KeepWarmBtwResult("failed", "dismiss_failed")
         time.sleep(_KEEP_WARM_OVERLAY_POLL_INTERVAL_S)
-    # The answer outlived its budget: interrupt and close our marked
-    # overlay in any state so the session never stays running on it. The
-    # settle loop's last readable capture decides — the dismissal
-    # re-captures first anyway, so the reserve buys no detection capture.
-    if last_readable_pane is not None and _keep_warm_btw_overlay_present(last_readable_pane):
+    # The answer outlived its budget: close our marked overlay. The last
+    # readable capture decides; an unreadable window still enters the
+    # dismissal, whose own fresh capture verifies ownership before a key.
+    if last_readable_pane is None or _keep_warm_btw_overlay_present(last_readable_pane):
         with _keep_warm_tmux_deadline(deadline):
             dismissed = _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target)
         if dismissed:

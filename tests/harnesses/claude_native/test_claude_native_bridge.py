@@ -14455,6 +14455,55 @@ def test_keep_warm_btw_slow_captures_still_escape_the_answering_overlay(
     assert all(sent_at <= started + budget for sent_at in escapes)
 
 
+def test_keep_warm_btw_unreadable_settle_window_still_escapes_the_answering_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """Every capture after Enter fails, so the settle loop stores no readable
+    pane; the close step's own fresh capture still verifies our marked overlay
+    and gets the Escape out inside the budget → ``timeout``."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), _KEEP_WARM_ANSWERING_PANE, _IDLE_PANE]
+    calls: list[tuple[float, list[str]]] = []
+    entered = False
+    pre_close_deadline = (
+        claude_native_bridge._KEEP_WARM_BRIDGE_BUDGET_S
+        - claude_native_bridge._KEEP_WARM_CLOSE_RESERVE_S
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal entered
+        del kwargs
+        calls.append((clock.now, list(cmd)))
+        if "capture-pane" not in cmd:
+            if "send-keys" in cmd and cmd[-1] == "Enter":
+                entered = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if entered and clock.now < pre_close_deadline:
+            # The whole settle window is unreadable — nothing may be inferred.
+            return SimpleNamespace(returncode=1, stdout="", stderr="no server")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=frames.pop(0) if len(frames) > 1 else frames[0],
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    started = clock.now
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    budget = claude_native_bridge._KEEP_WARM_BRIDGE_BUDGET_S
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "timeout")
+    escapes = [sent_at for sent_at, cmd in calls if "send-keys" in cmd and cmd[-1] == "Escape"]
+    assert len(escapes) == 1
+    assert clock.now <= started + budget
+    assert all(sent_at <= started + budget for sent_at in escapes)
+
+
 def test_keep_warm_btw_slow_captures_still_escape_the_settled_overlay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
