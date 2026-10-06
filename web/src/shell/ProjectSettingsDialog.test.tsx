@@ -1482,6 +1482,104 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  // Inside the dialog's <form>, Radix mirrors each Select into a hidden native
+  // <select>; a value it has no option for yet must not come back as a pick.
+  it("keeps a host's stored agent and model when its row is selected", async () => {
+    hostsMock.mockReturnValue({
+      data: [{ ...LAPTOP, configured_harnesses: { "claude-native": false } }, DESKTOP],
+    });
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo/one"), entry("h2", "/repo/two")]);
+    const callingDefaults = {
+      h1: {
+        agent_id: "ag_codex_sdk",
+        harnesses: { codex: { model: "gpt-6-sol", effort: "high" } },
+      },
+      h2: {
+        agent_id: "ag_claude",
+        harnesses: { "claude-native": { model: "opus", effort: "xhigh" } },
+      },
+    };
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { calling_defaults: callingDefaults },
+    });
+    const catalogRows = [
+      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+      catalogRow("h2", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-summary-h2")).toHaveTextContent(
+        "Claude Code · Opus · xHigh",
+      ),
+    );
+
+    fireEvent.click(screen.getByTestId("project-settings-entry-h2"));
+    await screen.findByTestId("project-settings-host-detail-h2");
+
+    expect(screen.getByTestId("project-settings-host-summary-h2")).toHaveTextContent(
+      "Claude Code · Opus · xHigh",
+    );
+    expect(screen.getByTestId("project-settings-host-agent-h2")).toHaveTextContent("Claude Code");
+    expect(screen.getByTestId("project-settings-host-model-h2")).toHaveTextContent("Opus");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { calling_defaults: callingDefaults }),
+    );
+  });
+
+  it("shows the new harness's stored model when a host row's agent changes", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/repo/one")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: {
+              codex: { model: "gpt-6-sol", effort: "high" },
+              "claude-native": { model: "opus" },
+            },
+          },
+        },
+      },
+    });
+    const catalogRows = [
+      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+      catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }]),
+    ];
+    listCatalogsMock.mockResolvedValue(catalogRows);
+    syncCatalogsMock.mockResolvedValue(catalogRows);
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent("GPT-6-Sol"),
+    );
+
+    await pickOption("project-settings-host-agent-h1", "Claude Code");
+
+    expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent("Opus");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_claude",
+            harnesses: {
+              codex: { model: "gpt-6-sol", effort: "high" },
+              "claude-native": { model: "opus" },
+            },
+          },
+        },
+      }),
+    );
+  });
+
   it("deletes a host row and drops both its entry and its calling_defaults key", async () => {
     hostsMock.mockReturnValue({ data: [LAPTOP, DESKTOP] });
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
