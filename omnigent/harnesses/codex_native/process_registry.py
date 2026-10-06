@@ -140,7 +140,7 @@ def acquire_codex_native_process_owner_lock() -> CodexNativeProcessOwnerLock | N
 
 def codex_native_session_tag_cmdline_arg(session_tag: str) -> str:
     """
-    Return an inert command-line marker carrying the crash-reap tag.
+    Carry the crash-reap tag in a recognized Codex telemetry setting.
 
     :param session_tag: Unique per-process tag.
     :returns: Command-line marker value.
@@ -148,7 +148,17 @@ def codex_native_session_tag_cmdline_arg(session_tag: str) -> str:
     """
     if not session_tag:
         raise ValueError("session_tag must be non-empty")
-    return f"{_TAG_ARG_PREFIX}{session_tag}"
+    return f"otel.environment={json.dumps(f'{_TAG_ARG_PREFIX}{session_tag}')}"
+
+
+def _cmdline_has_teardown_tag(command: str, session_tag: str, *, prefix: bool = False) -> bool:
+    # Legacy children can outlive an upgrade, so retain their bare markers.
+    legacy = f"{_TAG_ARG_PREFIX}{session_tag}"
+    wrapped = codex_native_session_tag_cmdline_arg(session_tag)
+    needles = (legacy, wrapped[:-1] if prefix else wrapped)
+    return any(
+        token.startswith(needles) if prefix else token in needles for token in command.split()
+    )
 
 
 def register_codex_native_process(
@@ -413,7 +423,7 @@ def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
     cmdline = _process_cmdline(entry.pid)
     if not cmdline:
         return None
-    return codex_native_session_tag_cmdline_arg(entry.session_tag) in cmdline.split()
+    return _cmdline_has_teardown_tag(cmdline, entry.session_tag)
 
 
 def _process_start_identity(pid: int) -> str | None:
@@ -441,9 +451,8 @@ def _process_start_identity(pid: int) -> str | None:
 
 
 def _process_cmdline_has_tag(pid: int, session_tag: str) -> bool:
-    needle = codex_native_session_tag_cmdline_arg(session_tag)
     cmdline = _process_cmdline(pid)
-    return needle in cmdline.split()
+    return _cmdline_has_teardown_tag(cmdline, session_tag)
 
 
 def _ps_output(columns: str) -> str | None:
@@ -529,7 +538,6 @@ def _tagged_process_group_members(
     """Return same-UID group members carrying a whole teardown-tag token."""
     if os.name != "posix" or pgid <= 1 or pgid == os.getpgrp():
         return []
-    needle = codex_native_session_tag_cmdline_arg(session_tag)
     rows = _ps_rows("pid=,pgid=,uid=,command=", 4)
     if rows is None:
         return None
@@ -539,8 +547,7 @@ def _tagged_process_group_members(
             pid, member_pgid, uid = int(pid_text), int(pgid_text), int(uid_text)
         except ValueError:
             continue
-        tokens = command.split()
-        tagged = any(token.startswith(needle) for token in tokens) if prefix else needle in tokens
+        tagged = _cmdline_has_teardown_tag(command, session_tag, prefix=prefix)
         if member_pgid == pgid and uid == os.getuid() and tagged:
             members.append(pid)
     return members
@@ -734,7 +741,6 @@ def reap_orphaned_codex_model_probes(
     if os.name != "posix":
         return 0
     tag_prefix = _model_probe_tag_prefix()
-    needle = f"{_TAG_ARG_PREFIX}{tag_prefix}"
     own_uid = os.getuid()
     own_pgid = os.getpgrp()
     victims: dict[int, int] = {}
@@ -756,7 +762,7 @@ def reap_orphaned_codex_model_probes(
         if (
             pgid <= 1
             or pgid == own_pgid
-            or not any(token.startswith(needle) for token in command.split())
+            or not _cmdline_has_teardown_tag(command, tag_prefix, prefix=True)
         ):
             continue
         age_s = _parse_ps_elapsed_seconds(etime_text)

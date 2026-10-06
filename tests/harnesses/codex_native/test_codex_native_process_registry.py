@@ -9,6 +9,7 @@ import signal
 from pathlib import Path
 
 import pytest
+import tomllib
 
 from omnigent.harnesses.codex_native import process_registry as registry
 
@@ -478,42 +479,46 @@ def test_ps_elapsed_seconds_parsing(value: str, expected: float | None) -> None:
     assert registry._parse_ps_elapsed_seconds(value) == expected
 
 
-def test_orphaned_model_probe_backstop_reaps_only_stale_orphans(monkeypatch) -> None:
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_orphaned_model_probe_backstop_reaps_only_stale_orphans(
+    monkeypatch, wrapped: bool
+) -> None:
     """The registry-independent scan matches only stale, tagged, owned probes."""
     own_uid = os.getuid()
     prefix = registry._model_probe_tag_prefix()
+
+    def marker(tag: str) -> str:
+        legacy = f"omnigent_crash_teardown_tag={tag}"
+        return f'otel.environment="{legacy}"' if wrapped else legacy
+
     alive = {222: True}
     table = (
         # Fresh orphan: still inside the probe budget.
         f"  111  1  111  {own_uid}  00:10  node "
-        f"omnigent_crash_teardown_tag={prefix}fresh app-server\n"
+        f"{marker(prefix + 'fresh')} app-server\n"
         # Stale orphan: the only victim.
         f"  222  1  222  {own_uid}  2-11:49:33  node "
-        f"omnigent_crash_teardown_tag={prefix}stale app-server\n"
+        f"{marker(prefix + 'stale')} app-server\n"
         # Stale but a different tag family.
         f"  333  1  333  {own_uid}  2-11:49:33  node "
-        "omnigent_crash_teardown_tag=codex-native-other app-server\n"
+        f"{marker('codex-native-other')} app-server\n"
         # Stale and tagged, but still parented to a live launcher.
         f"  444  55  444  {own_uid}  2-11:49:33  node "
-        f"omnigent_crash_teardown_tag={prefix}parented app-server\n"
+        f"{marker(prefix + 'parented')} app-server\n"
         # Stale and tagged, but owned by another user.
         f"  555  1  555  {own_uid + 1}  2-11:49:33  node "
-        f"omnigent_crash_teardown_tag={prefix}notmine app-server\n"
+        f"{marker(prefix + 'notmine')} app-server\n"
         f"  666  1  1  {own_uid}  2-11:49:33  node "
-        f"omnigent_crash_teardown_tag={prefix}unsafe app-server\n"
+        f"{marker(prefix + 'unsafe')} app-server\n"
         f"  777  1  777  {own_uid}  2-11:49:33  node "
-        f"not_omnigent_crash_teardown_tag={prefix}substring app-server\n"
+        f"not_{marker(prefix + 'substring')} app-server\n"
     )
     killed: list[tuple[int, signal.Signals]] = []
 
     def _ps(columns: str) -> str:
         if columns == "pid=,ppid=,pgid=,uid=,etime=,command=":
             return table
-        return (
-            f" 222 222 {own_uid} node omnigent_crash_teardown_tag={prefix}stale\n"
-            if alive[222]
-            else ""
-        )
+        return f" 222 222 {own_uid} node {marker(prefix + 'stale')}\n" if alive[222] else ""
 
     def _killpg(pgid: int, sig: signal.Signals) -> None:
         killed.append((pgid, sig))
@@ -525,6 +530,28 @@ def test_orphaned_model_probe_backstop_reaps_only_stale_orphans(monkeypatch) -> 
 
     assert registry.reap_orphaned_codex_model_probes() == 1
     assert killed == [(222, signal.SIGTERM), (222, signal.SIGKILL)]
+
+
+def test_session_tag_override_is_a_recognized_string_setting() -> None:
+    assert tomllib.loads(registry.codex_native_session_tag_cmdline_arg("tag-123")) == {
+        "otel": {"environment": "omnigent_crash_teardown_tag=tag-123"}
+    }
+
+
+def test_wrapped_group_marker_requires_whole_token_and_owner(monkeypatch) -> None:
+    uid = os.getuid()
+    monkeypatch.setattr(
+        registry,
+        "_ps_output",
+        lambda _columns: (
+            f' 11 456 {uid} node xotel.environment="omnigent_crash_teardown_tag=tag-123"\n'
+            f' 12 456 {uid} node otel.environment="omnigent_crash_teardown_tag=tag-123-extra"\n'
+            f' 13 456 {uid + 1} node otel.environment="omnigent_crash_teardown_tag=tag-123"\n'
+            f' 14 456 {uid} node otel.environment="omnigent_crash_teardown_tag=tag-123"\n'
+            f' 15 999 {uid} node otel.environment="omnigent_crash_teardown_tag=tag-123"\n'
+        ),
+    )
+    assert registry._tagged_process_group_members(456, "tag-123") == [14]
 
 
 def test_probe_tag_uses_resolved_state_root(tmp_path: Path, monkeypatch) -> None:
