@@ -57,7 +57,7 @@ from omnigent.harness_aliases import (
     native_terminal_name,
 )
 from omnigent.inner.executor import ToolCallStatus, classify_tool_result
-from omnigent.member_snapshot import member_entries_from_labels
+from omnigent.member_snapshot import member_entries_from_labels, member_lock_applies
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -3454,16 +3454,14 @@ async def _execute_subagent_tool(
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
 
-    # Joint-agent session member snapshot: the session froze each member's
-    # harness / model / effort at create and may have marked a member
-    # unavailable. Enforce it before any harness / readiness / model handling;
-    # a session without member labels, or a role with no snapshot entry,
-    # behaves exactly as before.
+    # Only a session launched from a user's saved library agent (``ca_``
+    # template label) locks members to their create-time snapshot; other
+    # sessions keep per-dispatch choice and parent-model inheritance.
     member_entry: _JsonObject | None = None
     session_labels = await _runner_app._fetch_current_session_labels(
         server_client, conversation_id
     )
-    if session_labels:
+    if member_lock_applies(session_labels):
         member_entry = member_entries_from_labels(session_labels).get(str(sub_agent_name))
     if member_entry is not None:
         lock_error = _member_dispatch_lock_error(

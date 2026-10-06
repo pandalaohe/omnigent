@@ -1,11 +1,12 @@
 """Runner-side member snapshot lock for joint-agent dispatches (SCC06 F1a).
 
-A session that froze a member snapshot (``omnigent.member.<role>`` labels)
-locks the member's harness / model / effort: an explicit ``sys_session_send``
-value that differs is rejected, a member the server marked unavailable
-refuses the dispatch, and a dispatch naming none of them runs the snapshot's
-model / effort instead of parent inheritance. Sessions without member labels
-behave exactly as before.
+A session launched from a saved library joint agent (the ``ca_`` template
+label) freezes a member snapshot (``omnigent.member.<role>`` labels) and locks
+the member's harness / model / effort: an explicit ``sys_session_send`` value
+that differs is rejected, a member the server marked unavailable refuses the
+dispatch, and a dispatch naming none of them runs the snapshot's model / effort
+instead of parent inheritance. Other sessions keep per-dispatch choice and
+parent-model inheritance.
 """
 
 from __future__ import annotations
@@ -18,7 +19,12 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.member_snapshot import encode_member_entry, member_label_key
+from omnigent.member_snapshot import (
+    LIBRARY_AGENT_TEMPLATE_LABEL_KEY,
+    encode_member_entry,
+    member_label_key,
+    member_lock_applies,
+)
 
 _MEMBER_MODEL = "databricks-claude-haiku-4-5"
 _PARENT_MODEL = "databricks-claude-sonnet-4-6"
@@ -59,8 +65,17 @@ def _stub_worker_launchable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(harness_install, "missing_harness_cli", lambda _harness: None)
 
 
-def _member_labels(role: str = "worker", **entry: object) -> dict[str, str]:
-    """One member snapshot label for *role* with sensible overrides."""
+def _member_labels(
+    role: str = "worker",
+    *,
+    template_id: str | None = "ca_test_agent",
+    **entry: object,
+) -> dict[str, str]:
+    """One member snapshot label for *role* with sensible overrides.
+
+    :param template_id: Value of the library-agent template label; ``None``
+        omits it (a session not started from a saved library joint agent).
+    """
     payload: dict[str, object] = {
         "host": None,
         "harness": "claude-sdk",
@@ -69,7 +84,10 @@ def _member_labels(role: str = "worker", **entry: object) -> dict[str, str]:
         "lead": False,
     }
     payload.update(entry)
-    return {member_label_key(role): encode_member_entry(payload)}
+    labels = {member_label_key(role): encode_member_entry(payload)}
+    if template_id is not None:
+        labels[LIBRARY_AGENT_TEMPLATE_LABEL_KEY] = template_id
+    return labels
 
 
 async def _dispatch(
@@ -413,6 +431,58 @@ async def test_session_without_member_labels_still_inherits_parent_model(
 
 
 @pytest.mark.asyncio
+async def test_member_labels_without_template_keep_choice_and_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Member labels alone do not lock: explicit choice and inheritance apply."""
+    _stub_worker_launchable(monkeypatch)
+
+    _output, explicit_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_no_template_explicit",
+        labels=_member_labels(template_id=None),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+    assert explicit_bodies[0]["model_override"] == _PARENT_MODEL
+
+    _output, inherited_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_no_template_inherit",
+        labels=_member_labels(template_id=None),
+        parent_snapshot={
+            "id": "conv_member_no_template_inherit",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+    )
+    assert inherited_bodies[0]["model_override"] == _PARENT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_non_library_template_label_does_not_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-``ca_`` template label (built-in / uploaded) keeps per-dispatch choice."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_builtin_template",
+        labels=_member_labels(template_id="ag_builtin"),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _PARENT_MODEL
+
+
+@pytest.mark.asyncio
 async def test_builtin_member_takes_the_calling_defaults_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,3 +601,14 @@ async def test_malformed_member_label_is_ignored(monkeypatch: pytest.MonkeyPatch
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert bodies[0]["model_override"] == _PARENT_MODEL
+
+
+def test_member_lock_applies_only_to_library_template_labels() -> None:
+    """Only a ``ca_`` id under the template label marks a locked session."""
+    assert member_lock_applies(None) is False
+    assert member_lock_applies({}) is False
+    assert member_lock_applies({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_abc"}) is True
+    assert member_lock_applies({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin"}) is False
+    assert member_lock_applies({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "polly"}) is False
+    non_str: dict[str, Any] = {LIBRARY_AGENT_TEMPLATE_LABEL_KEY: 7}
+    assert member_lock_applies(non_str) is False

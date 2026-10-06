@@ -22,6 +22,7 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
+from omnigent.member_snapshot import LIBRARY_AGENT_TEMPLATE_LABEL_KEY
 from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
@@ -42,7 +43,7 @@ _LIBRARY_AGENT_ID_PREFIX = "ca_"
 # The label marking the saved Agent a session was created from, so the picker
 # can associate a launched session with its library template. Value is the
 # ``ca_`` id, matching the interactive New Chat launch and the web constant.
-AGENT_TEMPLATE_LABEL_KEY = "omnigent:agent-template-id"
+AGENT_TEMPLATE_LABEL_KEY = LIBRARY_AGENT_TEMPLATE_LABEL_KEY
 
 
 def is_library_agent_id(agent_id: str) -> bool:

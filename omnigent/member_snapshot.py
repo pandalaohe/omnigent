@@ -20,6 +20,10 @@ MEMBER_LABEL_PREFIX = "omnigent.member."
 MEMBER_LABEL_KEY_MAX_CHARS = 128
 MEMBER_LABEL_VALUE_MAX_CHARS = 256
 
+# Session label recording the saved library Agent (``ca_`` id) a session was
+# created from. Only such a session locks members to the frozen snapshot.
+LIBRARY_AGENT_TEMPLATE_LABEL_KEY = "omnigent:agent-template-id"
+
 # Reason codes stored in a member entry's ``unavailable`` field.
 MEMBER_UNAVAILABLE_HOST_OFFLINE = "host_offline"
 MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED = "harness_not_configured"
@@ -56,6 +60,18 @@ def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, di
         if role and entry is not None:
             entries[role] = entry
     return entries
+
+
+def member_lock_applies(labels: Mapping[str, str] | None) -> bool:
+    """Return whether *labels* mark a session whose members stay locked.
+
+    Only a session started from a user's saved library joint agent (the
+    template label carries its ``ca_`` id) locks members to the frozen
+    snapshot; built-in and uploaded joint agents keep per-dispatch choice and
+    parent-model inheritance.
+    """
+    template_id = (labels or {}).get(LIBRARY_AGENT_TEMPLATE_LABEL_KEY)
+    return isinstance(template_id, str) and template_id.startswith("ca_")
 
 
 # The web composer's attachment preamble. Its text can carry ``@`` inside a
