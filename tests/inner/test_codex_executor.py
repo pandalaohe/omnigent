@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_native.keep_warm import KeepWarmPingResult
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
@@ -2042,23 +2043,27 @@ class TestCodexExecutor(unittest.TestCase):
                 }
             )
 
-            events = [
-                event
-                async for event in session.run_turn(
-                    messages=[{"role": "user", "content": "hi"}],
-                    tools=[],
-                    system_prompt="",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
-                )
-            ]
+            # Shrink the post-final-answer drain window: this turn emits no
+            # tail events, so the drain can only end on its deadline.
+            with patch("omnigent.inner.codex_executor._TURN_COMPLETED_DRAIN_SECONDS", 0.05):
+                events = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model="gpt-5.4-mini",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
 
             self.assertEqual(len(events), 2)
             self.assertIsInstance(events[0], TextChunk)
             self.assertEqual(events[0].text, "done")
             self.assertIsInstance(events[1], TurnComplete)
             self.assertEqual(events[1].response, "done")
+            self.assertIsNone(events[1].usage)
             self.assertIsNone(session.active_turn_id)
 
         _run(_t())
@@ -2149,6 +2154,460 @@ class TestCodexExecutor(unittest.TestCase):
             # The cached usage must be cleared after consumption so the next
             # turn doesn't inherit stale numbers.
             self.assertIsNone(session._last_turn_usage)
+
+        _run(_t())
+
+    def test_app_server_run_turn_final_answer_tail_captures_token_usage(self):
+        """Real Codex order: final_answer item, then tokenUsage, then turn/completed.
+
+        The app-server emits the turn's ``thread/tokenUsage/updated`` only
+        after the final-answer ``item/completed``, so the turn must keep
+        draining briefly after the answer instead of locking in ``usage=None``.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "done",
+                            },
+                        },
+                    }
+                )
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "tokenUsage": {
+                                "last": {
+                                    "inputTokens": 500,
+                                    "cachedInputTokens": 300,
+                                    "outputTokens": 60,
+                                    "totalTokens": 560,
+                                    "reasoningOutputTokens": 0,
+                                },
+                                "total": {
+                                    "inputTokens": 500,
+                                    "cachedInputTokens": 300,
+                                    "outputTokens": 60,
+                                    "totalTokens": 560,
+                                    "reasoningOutputTokens": 0,
+                                },
+                            },
+                        },
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1"}},
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject_events())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "done")
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(events[1].response, "done")
+            self.assertEqual(
+                events[1].usage,
+                {
+                    "input_tokens": 200,
+                    "cache_read_input_tokens": 300,
+                    "output_tokens": 60,
+                    "total_tokens": 560,
+                    "context_tokens": 560,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+        _run(_t())
+
+    def test_app_server_next_turn_usage_excludes_prior_turns_in_real_order(self):
+        """Two real-order turns on one thread: usage is each turn's own growth.
+
+        Both turns emit final_answer -> tokenUsage -> turn/completed with
+        cumulative ``total`` counters, so the second turn's usage must be the
+        growth since the first turn's boundary, not the thread total.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            turn_ids = iter(("turn-1", "turn-2"))
+
+            async def _request(method: str, params: dict) -> dict:
+                if method == "turn/start":
+                    return {"result": {"turn": {"id": next(turn_ids)}}}
+                return {"result": {}}
+
+            session._request = _request  # type: ignore[assignment]
+
+            async def _run_one_turn(
+                turn_id: str, last: dict[str, int], total: dict[str, int]
+            ) -> TurnComplete:
+                async def _inject_events() -> None:
+                    await asyncio.sleep(0.01)
+                    session._events.put_nowait(
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "turnId": turn_id,
+                                "item": {
+                                    "id": "msg-1",
+                                    "type": "agentMessage",
+                                    "phase": "final_answer",
+                                    "text": "done",
+                                },
+                            },
+                        }
+                    )
+                    await asyncio.sleep(0.01)
+                    session._events.put_nowait(
+                        self._usage_update_event(turn_id, last=last, total=total)
+                    )
+                    session._events.put_nowait(
+                        {
+                            "method": "turn/completed",
+                            "params": {"turn": {"id": turn_id}},
+                        }
+                    )
+
+                inject_task = asyncio.create_task(_inject_events())
+                events = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model="gpt-5.4-mini",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+                await inject_task
+                self.assertEqual(len(events), 2)
+                self.assertIsInstance(events[0], TextChunk)
+                self.assertIsInstance(events[1], TurnComplete)
+                return events[1]
+
+            first = await _run_one_turn(
+                "turn-1",
+                last={
+                    "inputTokens": 1000,
+                    "cachedInputTokens": 800,
+                    "outputTokens": 100,
+                    "totalTokens": 1100,
+                },
+                total={
+                    "inputTokens": 1000,
+                    "cachedInputTokens": 800,
+                    "outputTokens": 100,
+                    "totalTokens": 1100,
+                },
+            )
+            self.assertEqual(
+                first.usage,
+                {
+                    "input_tokens": 200,
+                    "cache_read_input_tokens": 800,
+                    "output_tokens": 100,
+                    "total_tokens": 1100,
+                    "context_tokens": 1100,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+            second = await _run_one_turn(
+                "turn-2",
+                last={
+                    "inputTokens": 1200,
+                    "cachedInputTokens": 1000,
+                    "outputTokens": 150,
+                    "totalTokens": 1350,
+                },
+                total={
+                    "inputTokens": 2200,
+                    "cachedInputTokens": 1800,
+                    "outputTokens": 250,
+                    "totalTokens": 2450,
+                },
+            )
+            self.assertEqual(
+                second.usage,
+                {
+                    "input_tokens": 200,
+                    "cache_read_input_tokens": 1000,
+                    "output_tokens": 150,
+                    "total_tokens": 1350,
+                    "context_tokens": 1350,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+        _run(_t())
+
+    def test_app_server_run_turn_releases_active_turn_while_tail_drains(self):
+        """The answered turn refuses steer/interrupt while its tail drains."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            session._events.put_nowait(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "msg-1",
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "done",
+                        },
+                    },
+                }
+            )
+
+            agen = session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+            first = await agen.__anext__()
+            self.assertIsInstance(first, TextChunk)
+
+            # Advance into the tail drain, which blocks waiting for tail events.
+            pending = asyncio.ensure_future(agen.__anext__())
+            await asyncio.sleep(0.02)
+            self.assertIsNone(session.active_turn_id)
+            self.assertFalse(await session.enqueue_message("x"))
+
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1"}},
+                }
+            )
+            second = await pending
+            self.assertIsInstance(second, TurnComplete)
+            self.assertEqual(second.response, "done")
+            with self.assertRaises(StopAsyncIteration):
+                await agen.__anext__()
+
+        _run(_t())
+
+    def test_app_server_run_turn_tail_keeps_transport_closed_queued(self):
+        """A transport close arriving in the tail survives for the next turn."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            session._events.put_nowait(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "msg-1",
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "done",
+                        },
+                    },
+                }
+            )
+            session._events.put_nowait(HarnessTransportClosedError("process exited"))
+
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(events[1].response, "done")
+            self.assertIsNone(events[1].usage)
+            self.assertEqual(session._events.qsize(), 1)
+            self.assertIsInstance(session._events.get_nowait(), HarnessTransportClosedError)
+
+        _run(_t())
+
+    def test_app_server_final_answer_tail_leaves_server_requests_queued(self):
+        """A Codex server request arriving in the tail stays queued, unanswered.
+
+        Replying mid-drain writes to stdin without a timeout and could stall
+        the bounded tail past ``TurnComplete``, so the drain sets the request
+        aside and re-queues it for the next turn's start-of-turn purge.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+            session._send_response = AsyncMock()
+            session._send_error = AsyncMock()
+
+            approval_request = {
+                "id": 42,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"turnId": "turn-1", "command": "pwd"},
+            }
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "done",
+                            },
+                        },
+                    }
+                )
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(approval_request)
+                session._events.put_nowait(
+                    self._usage_update_event(
+                        "turn-1",
+                        last={
+                            "inputTokens": 500,
+                            "cachedInputTokens": 300,
+                            "outputTokens": 60,
+                            "totalTokens": 560,
+                        },
+                        total={
+                            "inputTokens": 500,
+                            "cachedInputTokens": 300,
+                            "outputTokens": 60,
+                            "totalTokens": 560,
+                        },
+                    )
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1"}},
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject_events())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "done")
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(
+                events[1].usage,
+                {
+                    "input_tokens": 200,
+                    "cache_read_input_tokens": 300,
+                    "output_tokens": 60,
+                    "total_tokens": 560,
+                    "context_tokens": 560,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+            session._send_response.assert_not_called()
+            session._send_error.assert_not_called()
+            self.assertEqual(session._proc.stdin.writes, [])
+            self.assertEqual(session._events.qsize(), 1)
+            self.assertIs(session._events.get_nowait(), approval_request)
 
         _run(_t())
 

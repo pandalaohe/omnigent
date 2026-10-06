@@ -3634,6 +3634,26 @@ class _CodexAppServerSession:
         if len(self._recent_events) > 20:
             self._recent_events.pop(0)
 
+    def _observe_token_usage(self, params: object, model: str | None) -> None:
+        total_raw = _extract_codex_thread_total_usage(params)
+        if total_raw is not None:
+            self._thread_usage_total_raw = total_raw
+            self._last_turn_usage = _codex_turn_usage_from_totals(
+                total_raw, self._thread_usage_baseline_raw, model
+            )
+        else:
+            # No cumulative breakdown — fall back to the newest
+            # request's ``last`` (under-reports multi-request turns).
+            self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+        # context_tokens is window fill: a snapshot of the latest
+        # request from ``last``, carried alongside the billing
+        # figures so the occupancy meter reads it rather than the
+        # summable ``total_tokens``.
+        if self._last_turn_usage is not None:
+            context_tokens = _extract_codex_context_tokens(params)
+            if context_tokens is not None:
+                self._last_turn_usage["context_tokens"] = context_tokens
+
     def _consume_turn_usage(self) -> dict[str, object] | None:
         """Return the finished turn's usage and advance the thread baseline
         so the next turn's delta excludes everything reported so far."""
@@ -3779,6 +3799,69 @@ class _CodexAppServerSession:
                 final_response = completed_text
             if phase == "final_answer":
                 return final_response
+
+    async def _drain_final_answer_tail(self, *, active_turn_id: str, model: str | None) -> None:
+        """Drain the events Codex emits after the final-answer item.
+
+        Real app-server turns emit ``thread/tokenUsage/updated`` and
+        ``turn/completed`` only after the terminal ``item/completed`` with
+        ``phase="final_answer"``; drain a short tail window so the turn's
+        usage is captured before ``TurnComplete`` is yielded.
+
+        :param active_turn_id: The turn id whose tail is being drained.
+        :param model: The resolved model, stamped into captured usage.
+        """
+        deadline = time.monotonic() + _TURN_COMPLETED_DRAIN_SECONDS
+        # Server requests are not answered here: replying writes to stdin
+        # without a timeout and could stall the bounded drain. They go back on
+        # the queue, where the next turn's start-of-turn purge keeps them.
+        set_aside: list[CodexMessage | HarnessTransportClosedError] = []
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    message = await asyncio.wait_for(self._events.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return
+                if isinstance(message, HarnessTransportClosedError):
+                    # Re-queue so the next turn still observes the closed transport.
+                    set_aside.append(message)
+                    return
+                self._record_event(message)
+                if "id" in message and "method" in message:
+                    set_aside.append(message)
+                    continue
+                params = message.get("params", {})
+                if not isinstance(params, dict):
+                    continue
+                event_turn_id = params.get("turnId")
+                if (
+                    isinstance(event_turn_id, str)
+                    and event_turn_id
+                    and event_turn_id != active_turn_id
+                ):
+                    continue
+                method = message.get("method")
+                if method == "thread/tokenUsage/updated":
+                    self._observe_token_usage(params, model)
+                    continue
+                if method in ("turn/completed", "turn/failed", "error"):
+                    turn = params.get("turn", {})
+                    raw_ended_turn_id = turn.get("id") if isinstance(turn, dict) else None
+                    ended_turn_id: str | None = (
+                        raw_ended_turn_id
+                        if isinstance(raw_ended_turn_id, str) and raw_ended_turn_id
+                        else None
+                    )
+                    if ended_turn_id is not None and ended_turn_id != active_turn_id:
+                        continue
+                    # The answer was already delivered; the tail adds nothing more.
+                    return
+        finally:
+            for message in set_aside:
+                self._events.put_nowait(message)
 
     async def run_turn(
         self,
@@ -4248,6 +4331,12 @@ class _CodexAppServerSession:
                                 active_turn_id,
                                 final_response[:120],
                             )
+                            # Codex sends the turn's usage after the final-answer
+                            # item; the turn is answered, so release it and drain.
+                            self.active_turn_id = None
+                            await self._drain_final_answer_tail(
+                                active_turn_id=active_turn_id, model=model
+                            )
                             turn_usage = self._consume_turn_usage()
                             _notify_usage_from_dict(model=model, usage=turn_usage)
                             yield TurnComplete(response=final_response, usage=turn_usage)
@@ -4261,24 +4350,7 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    total_raw = _extract_codex_thread_total_usage(params)
-                    if total_raw is not None:
-                        self._thread_usage_total_raw = total_raw
-                        self._last_turn_usage = _codex_turn_usage_from_totals(
-                            total_raw, self._thread_usage_baseline_raw, model
-                        )
-                    else:
-                        # No cumulative breakdown — fall back to the newest
-                        # request's ``last`` (under-reports multi-request turns).
-                        self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
-                    # context_tokens is window fill: a snapshot of the latest
-                    # request from ``last``, carried alongside the billing
-                    # figures so the occupancy meter reads it rather than the
-                    # summable ``total_tokens``.
-                    if self._last_turn_usage is not None:
-                        context_tokens = _extract_codex_context_tokens(params)
-                        if context_tokens is not None:
-                            self._last_turn_usage["context_tokens"] = context_tokens
+                    self._observe_token_usage(params, model)
                     continue
 
                 if method == "turn/completed":
