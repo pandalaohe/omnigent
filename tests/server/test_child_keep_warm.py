@@ -1039,6 +1039,34 @@ async def test_codex_two_measured_misses_pause_and_record_the_observation(
     assert paused.o == [harness.clock.now, 0]
 
 
+async def test_claude_two_measured_cost_misses_pause_warming(harness: _Harness) -> None:
+    """A measured ``cache_result`` wins over the token fields: two misses → sticky pause."""
+    parent = _parent(harness)
+    u = harness.now - 55 * 60
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+
+    await _tick(harness)
+    await _settle(harness, child.id, cache_result="miss", cost_usd=0.08)
+    after_first = _read_label(harness, child.id)
+    assert after_first is not None
+    assert after_first.s == "w" and after_first.m == 1 and after_first.f == 0
+    assert after_first.u == harness.now
+    assert harness.notices.lines == []
+
+    first_u = after_first.u
+    assert first_u is not None
+    harness.clock.now = first_u + _CLAUDE_INTERVAL_S
+    await _tick(harness)
+    await _settle(harness, child.id, cache_result="miss", cost_usd=0.09)
+
+    paused = _read_label(harness, child.id)
+    assert paused is not None
+    assert paused.s == "p" and paused.why == "miss" and paused.m == 2
+    assert paused.v == child.archive_revision
+    assert len(harness.notices.lines) == 1
+    assert (child.id, None) in harness.published
+
+
 async def test_measured_hit_resets_the_miss_count(harness: _Harness) -> None:
     """A hit between two misses keeps warming (consecutive, not cumulative)."""
     parent = _parent(harness)
@@ -1284,6 +1312,53 @@ async def test_pings_do_not_reset_the_cap(harness: _Harness) -> None:
     harness.clock.now = t0 + 241 * 60
     await _tick(harness)
 
+    assert len(harness.forward.pings()) == 4
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "c" and state.why == "cap"
+
+
+async def test_ok_pings_with_unchanged_running_since_hold_the_episode_start(
+    harness: _Harness,
+) -> None:
+    """
+    An idle claude-native child whose ok ping receipts settle while
+    ``running_since`` never changes keeps its episode start (``c``); at
+    ``c + max_s`` the label is cold/``cap`` and nothing more is due. A
+    ping that reads as a new real turn would restart the 4 h cap on
+    every ping.
+    """
+    parent = _parent(harness)
+    child = _child(harness, parent.id, running_since=harness.now - 120)
+
+    await _tick(harness)  # the real turn settles: the episode opens
+    opened = _read_label(harness, child.id)
+    assert opened is not None and opened.s == "w"
+    c0 = opened.c
+    assert c0 is not None
+
+    last_u = opened.u
+    assert last_u is not None
+    for _ in range(4):
+        harness.clock.now = last_u + _CLAUDE_INTERVAL_S
+        await _tick(harness)
+        await _settle(harness, child.id, cost_usd=0.01)
+        state = _read_label(harness, child.id)
+        # running_since never moved: no new episode, the cap clock stands.
+        assert state is not None and state.c == c0 and state.t == opened.t
+        last_u = state.u
+        assert last_u is not None
+
+    harness.clock.now = c0 + _MAX_S
+    await _tick(harness)
+
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "c" and state.why == "cap"
+    assert len(harness.forward.pings()) == 4
+
+    harness.clock.now = c0 + _MAX_S + _CLAUDE_INTERVAL_S
+    await _tick(harness)
+
+    # Cold stays cold: no new real turn, so no further ping is due.
     assert len(harness.forward.pings()) == 4
     state = _read_label(harness, child.id)
     assert state is not None and state.s == "c" and state.why == "cap"

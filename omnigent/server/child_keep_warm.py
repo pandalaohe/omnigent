@@ -162,6 +162,7 @@ _STOP_REASON_CODES = frozenset(
         "user_active",
         "no_live_client",
         "btw_unavailable",
+        "dismiss_failed",
         "aborted",
         "tool_attempt",
         "timeout",
@@ -716,10 +717,15 @@ def _receipt_measurement(
 
     Claude miss = ``cache_write > cache_read``; Codex miss =
     ``cache_read / input_total < 0.5``. A missing field never reads as a
-    miss — the measurement is simply unknown.
+    miss — the measurement is simply unknown. For the Claude family a
+    measured ``cache_result`` (the statusLine cost delta) wins over the
+    token fields.
     """
     read = _as_int(data.get("cache_read"))
     if family == "claude":
+        cache_result = data.get("cache_result")
+        if cache_result in ("hit", "miss"):
+            return cache_result
         write = _as_int(data.get("cache_write"))
         if read is None or write is None:
             return None

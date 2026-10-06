@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
@@ -55,6 +56,21 @@ from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
+
+# An ok keep-warm ping moves the statusLine's cumulative ``total_cost_usd``
+# once Claude Code settles the side question; the receipt polls the snapshot
+# at this cadence/budget before falling back to the cache-read estimate.
+_KEEP_WARM_COST_POLL_INTERVAL_S = 0.5
+_KEEP_WARM_COST_POLL_TIMEOUT_S = 5.0
+# A real injection holding the pane's lock past this bounded acquire wait
+# skips the ping busy instead of letting it queue behind the injection.
+_KEEP_WARM_LOCK_WAIT_S = 1.0
+# Hard budget for the whole ping, measured from keep_warm entry; the
+# worst-case arithmetic lives at the bridge's _KEEP_WARM_BRIDGE_BUDGET_S.
+_KEEP_WARM_PING_BUDGET_S = 85.0
+# A measured ping cost above this multiple of the cache-read estimate means
+# the ping rebuilt the prompt cache instead of reading it.
+_KEEP_WARM_MISS_COST_FACTOR = 4
 
 
 class ClaudeNativeExecutor(Executor):
@@ -136,16 +152,33 @@ class ClaudeNativeExecutor(Executor):
         """
         Ping the pane with a guarded ``/btw`` side question (keep-warm).
 
-        The whole guard-and-paste sequence runs under ``_inject_lock``,
-        so a real message arriving meanwhile simply waits the few
-        seconds the exchange takes — keystrokes never interleave.
+        The ping takes ``_inject_lock`` only when it comes free within a
+        short bounded wait (:data:`_KEEP_WARM_LOCK_WAIT_S`); a lock that
+        stays held past it — a real injection owning the pane, or one
+        queued ahead of the ping — skips the ping ``busy`` instead of
+        letting it queue behind the injection. Once held, the whole
+        guard-and-paste sequence runs under the lock, so a real message
+        arriving meanwhile simply waits the few seconds the exchange
+        takes — keystrokes never interleave.
         Cancellation sets a stop flag the bridge checks before every
         key it sends, and the lock is released only after the worker
         thread finished. ``/btw`` answers have no tool access, so the
-        ping can never do real work. Claude Code reports no usage for
-        side questions, so the receipt estimates cost: the session's
-        current context tokens (the statusLine snapshot) priced as
-        cache reads.
+        ping can never do real work. Claude Code's statusLine
+        ``total_cost_usd`` includes the side question's cost
+        (``current_usage`` does not change), so an ok ping polls the
+        snapshot for the moved cumulative total and reports the real
+        delta with a measured ``cache_result`` (a delta far above the
+        cache-read estimate means the ping missed the cache). The
+        window's before-read and that settle poll run while the lock
+        is still held, so a real turn settling meanwhile can never be
+        billed to the ping. When the delta never lands, the receipt
+        falls back to today's estimate: the session's current context
+        tokens priced as cache reads on the model snapshotted under the
+        lock. The whole ping is bounded by
+        :data:`_KEEP_WARM_PING_BUDGET_S`: the settle poll is clipped to
+        it, and the estimate is priced off the lock under the remaining
+        budget — a slow catalog lookup reads as no estimate rather than
+        stretching the ping.
 
         :param attempt_id: Server-allocated ping attempt id, echoed on
             the receipt.
@@ -154,7 +187,16 @@ class ClaudeNativeExecutor(Executor):
         :returns: The normalized receipt dict.
         """
         del family
-        async with self._inject_lock:
+        deadline = time.monotonic() + _KEEP_WARM_PING_BUDGET_S
+        try:
+            async with asyncio.timeout(_KEEP_WARM_LOCK_WAIT_S):
+                await self._inject_lock.acquire()
+        except TimeoutError:
+            # A real injection owns the pane (or a queued waiter beat the
+            # ping to the release): skip instead of queueing behind it.
+            return _keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
+        try:
+            cost_before = _total_cost_usd(read_claude_context_state(self._bridge_dir))
             try:
                 result = await self._keep_warm_btw()
             except Exception:
@@ -163,15 +205,62 @@ class ClaudeNativeExecutor(Executor):
                     extra={"session_id": self._request_session_id},
                 )
                 return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
-        if result.outcome != "ok":
-            return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
-        cache_read = _current_context_tokens(self._bridge_dir)
+            if result.outcome != "ok":
+                return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
+            # The measured window stays under the lock, so no injected
+            # message can start a turn whose cost lands in the delta.
+            cache_read = _current_context_tokens(self._bridge_dir)
+            # The model is snapshotted with the tokens: a switch landing
+            # before the off-lock estimate must not reprice this ping.
+            model = read_claude_status_model(self._bridge_dir)
+            poll_timeout = min(
+                _KEEP_WARM_COST_POLL_TIMEOUT_S,
+                max(0.0, deadline - time.monotonic()),
+            )
+            cost_after = (
+                await asyncio.to_thread(
+                    _poll_total_cost_usd, self._bridge_dir, cost_before, poll_timeout
+                )
+                if cost_before is not None
+                else None
+            )
+        finally:
+            self._inject_lock.release()
+        # Priced off the lock — from the model snapshotted under it — and
+        # bounded by the remaining ping budget: a slow catalog lookup must
+        # not stretch the ping past it.
+        estimate_usd: float | None = None
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                async with asyncio.timeout(remaining):
+                    estimate_usd = await asyncio.to_thread(_keep_warm_cost_usd, model, cache_read)
+            except TimeoutError:
+                estimate_usd = None
+        if cost_before is not None and cost_after is not None:
+            delta = cost_after - cost_before
+            # No estimate → the measured delta still lands, but there is
+            # no baseline to call it a hit or a miss against.
+            cache_result = None
+            if estimate_usd is not None:
+                cache_result = (
+                    "miss" if delta > _KEEP_WARM_MISS_COST_FACTOR * estimate_usd else "hit"
+                )
+            return _keep_warm_receipt(
+                attempt_id,
+                outcome="ok",
+                reason=None,
+                cache_read=cache_read,
+                cost_usd=delta,
+                estimated=False,
+                cache_result=cache_result,
+            )
         return _keep_warm_receipt(
             attempt_id,
             outcome="ok",
             reason=None,
             cache_read=cache_read,
-            cost_usd=await asyncio.to_thread(_keep_warm_cost_usd, self._bridge_dir, cache_read),
+            cost_usd=estimate_usd,
             estimated=True,
         )
 
@@ -524,6 +613,7 @@ def _keep_warm_receipt(
     cache_read: int | None = None,
     cost_usd: float | None = None,
     estimated: bool = False,
+    cache_result: str | None = None,
 ) -> dict[str, Any]:
     """
     Build one normalized keep-warm receipt.
@@ -532,11 +622,14 @@ def _keep_warm_receipt(
     :param outcome: ``"ok"`` / ``"skipped"`` / ``"failed"``.
     :param reason: Machine reason; ``None`` on ``"ok"``.
     :param cache_read: Context tokens the ping read, when known.
-    :param cost_usd: Estimated cost, when priceable.
+    :param cost_usd: Estimated or measured cost, when priceable.
     :param estimated: Whether the usage figures are estimates.
+    :param cache_result: Measured cache outcome (``"hit"`` / ``"miss"``)
+        from the statusLine cost delta; the key is omitted when no
+        measurement landed.
     :returns: The receipt dict the runner relays to the server.
     """
-    return {
+    receipt: dict[str, Any] = {
         "attempt_id": attempt_id,
         "outcome": outcome,
         "reason": reason,
@@ -546,6 +639,52 @@ def _keep_warm_receipt(
         "cost_usd": cost_usd,
         "estimated": estimated,
     }
+    if cache_result is not None:
+        receipt["cache_result"] = cache_result
+    return receipt
+
+
+def _total_cost_usd(state: dict[str, Any] | None) -> float | None:
+    """
+    Extract Claude Code's cumulative session cost from a statusLine snapshot.
+
+    :param state: Parsed ``context.json`` payload from
+        :func:`read_claude_context_state`, or ``None``.
+    :returns: ``state["total_cost_usd"]`` as a non-negative float, or
+        ``None`` when absent / malformed.
+    """
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("total_cost_usd")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if raw < 0:
+        return None
+    return float(raw)
+
+
+def _poll_total_cost_usd(bridge_dir: Path, before: float, timeout_s: float) -> float | None:
+    """
+    Poll the statusLine snapshot for a cumulative cost larger than *before*.
+
+    Runs on a worker thread; Claude Code settles the side question's cost
+    into ``total_cost_usd`` a moment after the overlay closes.
+
+    :param bridge_dir: Bridge directory path.
+    :param before: The cumulative cost read before the ping.
+    :param timeout_s: Poll budget; the caller clips it to the ping's
+        remaining budget (:data:`_KEEP_WARM_COST_POLL_TIMEOUT_S` at most).
+    :returns: The first larger total, or ``None`` when none landed inside
+        the budget.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        after = _total_cost_usd(read_claude_context_state(bridge_dir))
+        if after is not None and after > before:
+            return after
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_KEEP_WARM_COST_POLL_INTERVAL_S)
 
 
 def _current_context_tokens(bridge_dir: Path) -> int | None:
@@ -578,20 +717,17 @@ def _current_context_tokens(bridge_dir: Path) -> int | None:
     )
 
 
-def _keep_warm_cost_usd(bridge_dir: Path, cache_read: int | None) -> float | None:
+def _keep_warm_cost_usd(model: str | None, cache_read: int | None) -> float | None:
     """
-    Price *cache_read* context tokens as cache reads on the session's live model.
+    Price *cache_read* context tokens as cache reads on *model*.
 
-    :param bridge_dir: Bridge directory path.
+    :param model: The statusLine model the ping saw, snapshotted under the
+        injection lock, or ``None``.
     :param cache_read: Context tokens the ping read, or ``None``.
-    :returns: The estimated USD cost, or ``None`` when the tokens are
-        unknown, the statusLine never captured a model, or the catalog
-        can't price it.
+    :returns: The estimated USD cost, or ``None`` when the tokens or the
+        model are unknown, or the catalog can't price it.
     """
-    if cache_read is None:
-        return None
-    model = read_claude_status_model(bridge_dir)
-    if model is None:
+    if cache_read is None or model is None:
         return None
     pricing = fetch_model_pricing(model)
     if pricing is None:

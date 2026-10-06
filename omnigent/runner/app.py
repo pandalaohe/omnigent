@@ -2097,6 +2097,12 @@ def create_runner_app(
     app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
+    # A keep-warm ping's own /btw overlay reads running/"dialog open" on the
+    # pane's status file; while the hold (monotonic deadline) is active that
+    # edge is the ping's, not a real turn — plus a settle grace (the file lags).
+    _KEEP_WARM_STATUS_GRACE_S = 5.0
+    _keep_warm_status_hold: dict[str, float] = {}
+    app.state.keep_warm_status_hold = _keep_warm_status_hold
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
@@ -2386,6 +2392,19 @@ def create_runner_app(
         background_task_count: int | None = None,
         background_tasks: list[dict[str, object]] | None = None,
     ) -> None:
+        hold_until = _keep_warm_status_hold.get(session_id)
+        if hold_until is not None:
+            if time.monotonic() < hold_until:
+                if status in ("running", "waiting") and blocked_on == "dialog open":
+                    # The ping's own overlay edge: held so _native_pane_status
+                    # keeps its pre-ping value and no fake turn reaches the server.
+                    _logger.debug(
+                        "keep-warm: holding the ping's own dialog-open edge",
+                        extra={"session_id": session_id},
+                    )
+                    return
+            else:
+                _keep_warm_status_hold.pop(session_id, None)
         pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if pane_reaper is not None:
             pane_reaper.note_activity(session_id)
@@ -4789,7 +4808,15 @@ def create_runner_app(
         ``get_client(..., "any")`` only reuses a live one. The receipt
         goes to the server as an ``external_keep_warm_receipt`` event (no
         conversation item), best-effort: the server's own attempt
-        timeout settles a receipt that never arrives.
+        timeout settles a receipt that never arrives. While the ping is
+        in flight (plus a short grace), the conversation's own
+        running/"dialog open" status edge is the ping's /btw overlay, so
+        ``_publish_session_status`` holds it — otherwise the sweeper
+        reads the overlay as a new real turn and the episode cap never
+        lands. Accepted residual: a person's own dialog-open edge that
+        arrives inside the grace is not published until the session's
+        next status change (no real busy edge is ever held: busy edges
+        carry no "dialog open").
         """
         receipt: dict[str, Any]
         if card:
@@ -4819,6 +4846,7 @@ def create_runner_app(
                         attempt_id, outcome="failed", reason="harness_error"
                     )
                 else:
+                    _keep_warm_status_hold[conversation_id] = math.inf
                     try:
                         resp = await harness_client.post(
                             f"/v1/sessions/{conversation_id}/events",
@@ -4846,6 +4874,10 @@ def create_runner_app(
                             receipt = _keep_warm_receipt(
                                 attempt_id, outcome="failed", reason="harness_error"
                             )
+                    finally:
+                        _keep_warm_status_hold[conversation_id] = (
+                            time.monotonic() + _KEEP_WARM_STATUS_GRACE_S
+                        )
         try:
             await server_client.post(
                 f"/v1/sessions/{conversation_id}/events",
