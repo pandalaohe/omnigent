@@ -59,6 +59,10 @@ from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
 
+# e2e subprocesses inherit this even when HOME/OMNIGENT_CONFIG_HOME point at a
+# fresh config, so interactive `omnigent run` never opens the host browser.
+os.environ["OMNIGENT_AUTO_OPEN_CONVERSATION"] = "false"
+
 
 @pytest.fixture(autouse=True)
 def _skip_when_harness_cli_missing(request: pytest.FixtureRequest) -> None:

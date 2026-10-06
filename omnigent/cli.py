@@ -636,6 +636,8 @@ _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
 # User-facing keys that ``omnigent config`` accepts. Most mirror ``run``
 # options; session-title guidance configures server-owned metadata generation.
 _AUTO_OPEN_CONVERSATION_CONFIG_KEY = "auto_open_conversation"
+# Env override for browser auto-open; needed when the config dir is fresh.
+_AUTO_OPEN_CONVERSATION_ENV_VAR = "OMNIGENT_AUTO_OPEN_CONVERSATION"
 _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "default_agent",
@@ -1075,21 +1077,31 @@ def _parse_config_bool(key: str, value: _ConfigValue) -> bool:
 
 def _resolve_auto_open_conversation_setting(cfg: dict[str, Any]) -> bool | None:  # type: ignore[explicit-any]
     """
-    Resolve the explicit ``auto_open_conversation`` config value, if set.
+    Resolve the explicit ``auto_open_conversation`` setting, if set.
 
     Tri-state on purpose so callers can distinguish "the user has not
     expressed a preference" (``None``) from an explicit opt-in/opt-out.
-    ``omnigent run`` uses this to default the browser-open ON for
-    interactive launches while still honoring an explicit
-    ``auto_open_conversation: false``; see :func:`run`.
+    The ``OMNIGENT_AUTO_OPEN_CONVERSATION`` env var wins over the
+    ``auto_open_conversation`` config key, and every caller of this
+    resolver honors it — ``omnigent run``'s interactive default, the
+    native wrappers via
+    :func:`_resolve_auto_open_conversation_from_config`, and the host
+    web-UI open check. ``omnigent run`` uses the tri-state to default the
+    browser-open ON for interactive launches while still honoring an
+    explicit opt-out; see :func:`run`.
 
     :param cfg: Effective config dict from :func:`_load_effective_config`,
         e.g. ``{"auto_open_conversation": True}``.
-    :returns: ``True`` / ``False`` when the key is present, or ``None``
-        when the user has not configured it.
+    :returns: ``True`` / ``False`` when the env var or the config key is
+        set, or ``None`` when neither expresses a preference.
     :raises click.ClickException: If the configured value is not a
         supported boolean.
     """
+    env_raw = os.environ.get(_AUTO_OPEN_CONVERSATION_ENV_VAR, "").strip().lower()
+    if env_raw in _CONFIG_TRUE_VALUES:
+        return True
+    if env_raw in _CONFIG_FALSE_VALUES:
+        return False
     raw = cfg.get(_AUTO_OPEN_CONVERSATION_CONFIG_KEY)
     if raw is None:
         return None
