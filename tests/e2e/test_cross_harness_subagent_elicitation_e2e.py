@@ -1,8 +1,8 @@
-"""Real native sessions forward a cross-harness elicitation with mock models.
+"""A Claude child under a Codex parent runs without AskUserQuestion.
 
-Codex creates a Claude child through MCP. Claude calls AskUserQuestion via
-its real permission hook, and the parent snapshot exposes the child's card.
-The answer must reach Claude's next Messages API request as a tool result.
+Codex creates a Claude child through MCP. The child session launches with
+AskUserQuestion disallowed, so the child's call is refused with a tool error
+and no elicitation card ever reaches the parent.
 
 The model APIs are mocked; the server, runner, native CLIs, and hooks are real.
 The flow runs with clean and conflicting dummy provider environments.
@@ -367,12 +367,12 @@ def test_waits_share_deadline_and_collect_diagnostics(
         assert "last child message" in str(failure.value)
 
 
-def test_codex_parent_answers_real_claude_child_elicitation(
+def test_codex_parent_claude_child_cannot_ask_the_user_directly(
     cross_harness_deadline: float,
     cross_harness_rig: tuple[httpx.Client, Path, str, str],
     tmp_path: Path,
 ) -> None:
-    """A different parent harness preserves the child's prompt and native answer."""
+    """A Claude child runs without AskUserQuestion and mirrors no card to the parent."""
     client, workspace, runner_id, mock_url = cross_harness_rig
     name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
     parent = {
@@ -520,54 +520,17 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         assert child_snapshot["harness"] == "claude-native", child_snapshot
         assert child_snapshot["parent_session_id"] == parent_id
 
-        def mirrored_question() -> dict[str, Any] | None:
-            return next(
-                (
-                    event
-                    for event in _snapshot(client, parent_id).get("pending_elicitations", [])
-                    if event["params"].get("target_session_id") == child_id
-                    and event["params"].get("ask_user_question")
-                ),
-                None,
-            )
-
-        event = _wait_for(
-            mirrored_question,
-            description="the real Claude question in the Codex parent snapshot",
-            deadline=cross_harness_deadline,
-            client=client,
-            session_ids=session_ids,
-        )
-        elicitation_id = event["elicitation_id"]
-        params = event["params"]
-        assert params["policy_name"] == "claude_native_permission"
-        assert elicitation_id.startswith("elicit_claude_")
-        assert any(
-            pending["elicitation_id"] == elicitation_id
-            for pending in _snapshot(client, child_id)["pending_elicitations"]
-        )
-        questions = params["ask_user_question"]["questions"]
-        assert len(questions) == 1, questions
-        assert questions[0]["question"] == _QUESTION
-        answer = f"custom-color-{uuid.uuid4().hex}"
-        # Use the target from the parent's card, exactly as chatStore does.
-        response = client.post(
-            f"/v1/sessions/{params['target_session_id']}/elicitations/{elicitation_id}/resolve",
-            json={"action": "accept", "content": {questions[0]["question"]: answer}},
-        )
-        assert response.status_code == 202, response.text
-
         _wait_for(
             lambda: any(
                 block.get("type") == "tool_result"
                 and block.get("tool_use_id") == "ask-color"
-                and answer in json.dumps(block.get("content"))
+                and "No such tool available: AskUserQuestion" in json.dumps(block.get("content"))
                 for body in get_mock_requests(mock_url, key=_CHILD_MODEL)
                 for message in body.get("messages", [])
                 for block in message.get("content", [])
                 if isinstance(block, dict)
             ),
-            description="Claude to send the actual answer back to the model as a tool result",
+            description="Claude to refuse AskUserQuestion in the child",
             deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
@@ -584,20 +547,12 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             client=client,
             session_ids=session_ids,
         )
-        _wait_for(
-            lambda: all(
-                not any(
-                    pending["elicitation_id"] == elicitation_id
-                    for pending in _snapshot(client, sid).get("pending_elicitations", [])
-                )
-                for sid in session_ids
-            ),
-            description="the resolved card to clear from both parent and child",
-            deadline=cross_harness_deadline,
-            client=client,
-            session_ids=session_ids,
-            timeout=30,
-        )
+        # The refused call never becomes an elicitation card on either session.
+        for sid in session_ids:
+            assert not any(
+                event["params"].get("ask_user_question")
+                for event in _snapshot(client, sid).get("pending_elicitations", [])
+            )
     finally:
         for sid in reversed(session_ids):
             with contextlib.suppress(httpx.HTTPError):
