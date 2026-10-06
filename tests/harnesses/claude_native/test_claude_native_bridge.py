@@ -13971,12 +13971,12 @@ def test_keep_warm_btw_prompt_during_overlay_poll_aborts(
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
 
-def test_keep_warm_btw_failed_dismissal_is_not_ok(
+def test_keep_warm_btw_dismissal_first_capture_already_closed_is_ok(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """The overlay is gone at the dismissal's own capture — no Escape, not ``ok``."""
+    """The overlay already gone at the dismissal's first capture reads closed — ``ok``, no key."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
@@ -13990,8 +13990,61 @@ def test_keep_warm_btw_failed_dismissal_is_not_ok(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_dismissal_unreadable_verify_capture_keeps_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """
+    A failed capture after the Escape is unknown, never "closed": the poll
+    rides out its deadline, and the still-open overlay earns a second Escape.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,  # the poll sees our settled overlay
+            _KEEP_WARM_OVERLAY_PANE,  # the dismissal's capture: still ours
+            "",  # the post-Escape capture fails ...
+            _KEEP_WARM_OVERLAY_PANE,  # ... and the overlay stays until both deadlines
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
+    assert [args[-1] for args in sends].count("Escape") == 2
+
+
+def test_keep_warm_btw_dismissal_unreadable_capture_then_closed_is_ok(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A failed capture after the Escape is skipped; the next readable closed pane ends it."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_OVERLAY_PANE,  # the poll sees our settled overlay
+            _KEEP_WARM_OVERLAY_PANE,  # the dismissal's capture: still ours
+            "",  # the post-Escape capture fails — keep polling
+            _IDLE_PANE,  # a readable capture: the overlay verifiably closed
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
+    assert [args[-1] for args in sends].count("Escape") == 1
 
 
 def test_keep_warm_btw_running_turn_at_dismissal_blocks_escape(

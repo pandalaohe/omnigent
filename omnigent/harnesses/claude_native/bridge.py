@@ -4982,8 +4982,7 @@ KEEP_WARM_BTW_TEXT = f"/btw {KEEP_WARM_BTW_MARKER} reply with only: ok"
 _KEEP_WARM_CLIENT_INPUT_WINDOW_S = 60.0
 # Budget for the /btw answer's overlay to settle. Past it a marked overlay
 # in any state is interrupted and dismissed (failed/timeout) so the ping
-# always closes what it opened; the total stays under the runner's 90 s
-# channel contract.
+# always closes what it opened; the total stays under the 90 s channel contract.
 _KEEP_WARM_OVERLAY_TIMEOUT_S = 70.0
 _KEEP_WARM_OVERLAY_POLL_INTERVAL_S = 0.5
 # Post-Escape / post-x re-render polls: the TUI takes a moment to apply
@@ -8229,17 +8228,22 @@ def _clear_keep_warm_btw_history(
 
 def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_target: str) -> bool:
     """
-    Escape keep-warm's own overlay until it verifiably closes; ``False`` spends no key.
+    Escape keep-warm's own overlay until a readable capture shows it gone.
 
-    Each attempt re-reads a fresh capture: our marked overlay on screen in
-    any state (:func:`_keep_warm_btw_overlay_present`), no pending user
-    prompt, and Claude free behind the overlay
-    (:func:`_claude_free_behind_keep_warm_overlay`). After an Escape,
-    fresh captures are polled (:data:`_KEEP_WARM_DISMISS_POLL_INTERVAL_S`,
-    up to :data:`_KEEP_WARM_DISMISS_TIMEOUT_S`) until the overlay is gone
-    → ``True``. Still present → the gates are re-checked on a fresh
-    capture and one more Escape goes out; still present → ``False``.
-    Claude reports its own ``/btw`` overlay as ``waiting`` /
+    Each attempt re-reads a fresh capture. A failed capture (``""``) is
+    unknown, never evidence: as an attempt's first capture it returns
+    ``False`` with no key spent; inside the post-Escape poll it keeps
+    polling until the deadline. A readable capture without our marked
+    overlay (:func:`_keep_warm_btw_overlay_present`) is closed —
+    ``True``, no key spent. A readable capture still showing it gates
+    the Escape on no pending user prompt and Claude free behind the
+    overlay (:func:`_claude_free_behind_keep_warm_overlay`). After an
+    Escape, fresh captures are polled
+    (:data:`_KEEP_WARM_DISMISS_POLL_INTERVAL_S`, up to
+    :data:`_KEEP_WARM_DISMISS_TIMEOUT_S`) until the overlay verifiably
+    closes → ``True``. Still present → the gates are re-checked on a
+    fresh capture and one more Escape goes out; still present →
+    ``False``. Claude reports its own ``/btw`` overlay as ``waiting`` /
     ``"dialog open"``, which this accepts only behind our marked
     overlay on the same capture; accepted residual: a real turn that
     starts behind our overlay and is reported as ``"dialog open"``
@@ -8251,24 +8255,29 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string.
-    :returns: ``True`` when the overlay verifiably closed after an Escape.
+    :returns: ``True`` when our overlay is verifiably not on screen on a
+        readable capture; ``False`` when closed could not be verified (a
+        gate refused, the capture unreadable, or it stays open after two
+        Escapes).
     """
-    escaped = False
     for _ in range(2):
         pane = _capture_pane(socket_path, tmux_target)
+        if pane == "":
+            # A failed capture is unknown — never evidence of closed; spend no key.
+            return False
         if not _keep_warm_btw_overlay_present(pane):
-            # Nothing opened → no key spent; a sent Escape closed it between polls.
-            return escaped
+            # Readable, and ours is not on screen: closed (a sent Escape did it, or it never was).
+            return True
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
             return False
         if not _claude_free_behind_keep_warm_overlay(bridge_dir, socket_path, tmux_target):
             return False
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
-        escaped = True
         deadline = time.monotonic() + _KEEP_WARM_DISMISS_TIMEOUT_S
         while time.monotonic() < deadline:
             time.sleep(_KEEP_WARM_DISMISS_POLL_INTERVAL_S)
-            if not _keep_warm_btw_overlay_present(_capture_pane(socket_path, tmux_target)):
+            pane = _capture_pane(socket_path, tmux_target)
+            if pane != "" and not _keep_warm_btw_overlay_present(pane):
                 return True
     return False
 

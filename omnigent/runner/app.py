@@ -2098,9 +2098,8 @@ def create_runner_app(
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     # A keep-warm ping's own /btw overlay reads running/"dialog open" on the
-    # pane's status file; while the conversation's hold (monotonic deadline)
-    # is active that edge is the ping's, not a real turn. The hold covers
-    # the ping plus a settle grace (the file lags the overlay closing).
+    # pane's status file; while the hold (monotonic deadline) is active that
+    # edge is the ping's, not a real turn — plus a settle grace (the file lags).
     _KEEP_WARM_STATUS_GRACE_S = 5.0
     _keep_warm_status_hold: dict[str, float] = {}
     app.state.keep_warm_status_hold = _keep_warm_status_hold
@@ -4814,7 +4813,10 @@ def create_runner_app(
         running/"dialog open" status edge is the ping's /btw overlay, so
         ``_publish_session_status`` holds it — otherwise the sweeper
         reads the overlay as a new real turn and the episode cap never
-        lands.
+        lands. Accepted residual: a person's own dialog-open edge that
+        arrives inside the grace is not published until the session's
+        next status change (no real busy edge is ever held: busy edges
+        carry no "dialog open").
         """
         receipt: dict[str, Any]
         if card:

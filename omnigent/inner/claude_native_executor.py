@@ -61,7 +61,7 @@ _logger = logging.getLogger(__name__)
 # once Claude Code settles the side question; the receipt polls the snapshot
 # at this cadence/budget before falling back to the cache-read estimate.
 _KEEP_WARM_COST_POLL_INTERVAL_S = 0.5
-_KEEP_WARM_COST_POLL_TIMEOUT_S = 10.0
+_KEEP_WARM_COST_POLL_TIMEOUT_S = 5.0
 # A measured ping cost above this multiple of the cache-read estimate means
 # the ping rebuilt the prompt cache instead of reading it.
 _KEEP_WARM_MISS_COST_FACTOR = 4
@@ -157,9 +157,12 @@ class ClaudeNativeExecutor(Executor):
         (``current_usage`` does not change), so an ok ping polls the
         snapshot for the moved cumulative total and reports the real
         delta with a measured ``cache_result`` (a delta far above the
-        cache-read estimate means the ping missed the cache). When the
-        delta never lands, the receipt falls back to today's estimate:
-        the session's current context tokens priced as cache reads.
+        cache-read estimate means the ping missed the cache). The
+        window's before-read and that settle poll run while the lock
+        is still held, so a real turn settling meanwhile can never be
+        billed to the ping. When the delta never lands, the receipt
+        falls back to today's estimate: the session's current context
+        tokens priced as cache reads.
 
         :param attempt_id: Server-allocated ping attempt id, echoed on
             the receipt.
@@ -168,8 +171,8 @@ class ClaudeNativeExecutor(Executor):
         :returns: The normalized receipt dict.
         """
         del family
-        cost_before = _total_cost_usd(read_claude_context_state(self._bridge_dir))
         async with self._inject_lock:
+            cost_before = _total_cost_usd(read_claude_context_state(self._bridge_dir))
             try:
                 result = await self._keep_warm_btw()
             except Exception:
@@ -178,28 +181,37 @@ class ClaudeNativeExecutor(Executor):
                     extra={"session_id": self._request_session_id},
                 )
                 return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
-        if result.outcome != "ok":
-            return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
-        cache_read = _current_context_tokens(self._bridge_dir)
-        estimate_usd = await asyncio.to_thread(_keep_warm_cost_usd, self._bridge_dir, cache_read)
-        if cost_before is not None:
-            cost_after = await asyncio.to_thread(
-                _poll_total_cost_usd, self._bridge_dir, cost_before
+            if result.outcome != "ok":
+                return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
+            # The measured window stays under the lock, so no injected
+            # message can start a turn whose cost lands in the delta.
+            cache_read = _current_context_tokens(self._bridge_dir)
+            estimate_usd = await asyncio.to_thread(
+                _keep_warm_cost_usd, self._bridge_dir, cache_read
             )
-            if cost_after is not None:
-                delta = cost_after - cost_before
-                missed = (
-                    estimate_usd is not None and delta > _KEEP_WARM_MISS_COST_FACTOR * estimate_usd
+            cost_after = (
+                await asyncio.to_thread(_poll_total_cost_usd, self._bridge_dir, cost_before)
+                if cost_before is not None
+                else None
+            )
+        if cost_before is not None and cost_after is not None:
+            delta = cost_after - cost_before
+            # No estimate → the measured delta still lands, but there is
+            # no baseline to call it a hit or a miss against.
+            cache_result = None
+            if estimate_usd is not None:
+                cache_result = (
+                    "miss" if delta > _KEEP_WARM_MISS_COST_FACTOR * estimate_usd else "hit"
                 )
-                return _keep_warm_receipt(
-                    attempt_id,
-                    outcome="ok",
-                    reason=None,
-                    cache_read=cache_read,
-                    cost_usd=delta,
-                    estimated=False,
-                    cache_result="miss" if missed else "hit",
-                )
+            return _keep_warm_receipt(
+                attempt_id,
+                outcome="ok",
+                reason=None,
+                cache_read=cache_read,
+                cost_usd=delta,
+                estimated=False,
+                cache_result=cache_result,
+            )
         return _keep_warm_receipt(
             attempt_id,
             outcome="ok",

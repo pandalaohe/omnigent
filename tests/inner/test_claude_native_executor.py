@@ -2301,6 +2301,93 @@ async def test_keep_warm_ok_receipt_falls_back_to_the_estimate_when_no_delta_lan
 
 
 @pytest.mark.asyncio
+async def test_keep_warm_measured_delta_without_an_estimate_carries_no_cache_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No priceable estimate: the real delta still lands, but no hit/miss is claimed."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        _keep_warm_context_file(bridge_dir_arg, total_cost_usd=1.02)
+        return claude_bridge.KeepWarmBtwResult("ok", None)
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    monkeypatch.setattr(claude_native_executor, "_keep_warm_cost_usd", lambda *_: None)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": None,
+        "cache_read": 37000,
+        "cache_write": None,
+        "cost_usd": pytest.approx(0.02),
+        "estimated": False,
+    }
+    assert "cache_result" not in receipt
+
+
+@pytest.mark.asyncio
+async def test_keep_warm_cost_window_excludes_a_turn_settled_while_waiting_for_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A real turn settling +$0.50 while the ping waits for ``_inject_lock``
+    is not the ping's: the before-read happens under the lock, so the
+    measured delta is only the ping's own +$0.02.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
+
+    def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        # The ping's own side question settles +$0.02.
+        _keep_warm_context_file(bridge_dir_arg, total_cost_usd=1.52)
+        return claude_bridge.KeepWarmBtwResult("ok", None)
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", _keep_warm_pricing)
+    executor = ClaudeNativeExecutor(bridge_dir)
+    held = asyncio.Event()
+    ping_parked = asyncio.Event()
+
+    async def holder() -> None:
+        async with executor._inject_lock:
+            held.set()
+            await ping_parked.wait()
+            # A real turn settles +$0.50 while the ping waits on the lock.
+            _keep_warm_context_file(bridge_dir, total_cost_usd=1.50)
+
+    holder_task = asyncio.create_task(holder())
+    await held.wait()  # the holder owns the lock before the ping starts
+    ping = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="claude"))
+    await asyncio.sleep(0)  # the ping runs its first step and parks on the lock
+    ping_parked.set()
+
+    receipt = await ping
+    await holder_task
+
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "ok",
+        "reason": None,
+        "input_total": None,
+        "cache_read": 37000,
+        "cache_write": None,
+        "cost_usd": pytest.approx(0.02),
+        "estimated": False,
+        "cache_result": "hit",
+    }
+
+
+@pytest.mark.asyncio
 async def test_keep_warm_bridge_failure_reports_harness_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
