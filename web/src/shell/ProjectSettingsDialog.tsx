@@ -453,6 +453,14 @@ function useCallingDefaultCatalogs(open: boolean) {
   return { catalogs, ensureCatalog, refreshing };
 }
 
+// Inside the <form>, Radix's hidden native <select> reports a new controlled
+// value it has no option for yet as ""; no item has value "", so it's no pick.
+function onPick(handler: (value: string) => void): (value: string) => void {
+  return (value) => {
+    if (value !== "") handler(value);
+  };
+}
+
 /** A "Default"-clearing model dropdown for one (host, harness) catalog pair. */
 function HostModelSelect({
   value,
@@ -478,7 +486,7 @@ function HostModelSelect({
   return (
     <Select
       value={value ?? MODEL_SELECT_DEFAULT}
-      onValueChange={(next) => onChange(next === MODEL_SELECT_DEFAULT ? null : next)}
+      onValueChange={onPick((next) => onChange(next === MODEL_SELECT_DEFAULT ? null : next))}
       onOpenChange={(open) => {
         if (open) onOpen?.();
         onOpenChange?.(open);
@@ -523,7 +531,7 @@ function HostEffortSelect({
   return (
     <Select
       value={value ?? EFFORT_SELECT_NONE}
-      onValueChange={(next) => onChange(next === EFFORT_SELECT_NONE ? null : next)}
+      onValueChange={onPick((next) => onChange(next === EFFORT_SELECT_NONE ? null : next))}
       onOpenChange={(open) => {
         if (open) onOpen?.();
         onOpenChange?.(open);
@@ -1230,7 +1238,7 @@ export function ProjectSettingsDialog({
     return (
       <Select
         value={row.agentId ?? NONE}
-        onValueChange={(value) => setRowAgent(row.hostId, value === NONE ? null : value)}
+        onValueChange={onPick((value) => setRowAgent(row.hostId, value === NONE ? null : value))}
         onOpenChange={onDropdownOpenChange}
         disabled={isLoading || saving}
       >
