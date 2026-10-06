@@ -185,9 +185,11 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
 
 
 # Host browser-opener shims and the attempt log the autouse fixture reads;
-# both set by :func:`_install_browser_guard`.
+# both set by :func:`_install_browser_guard`. The fixture remembers the log
+# offset it already reported in `_BROWSER_GUARD_CHECKED`.
 _BROWSER_GUARD_DIR: str | None = None
 _BROWSER_GUARD_LOG: Path | None = None
+_BROWSER_GUARD_CHECKED: int = 0
 
 
 def _browser_guard_shim(name: str, tail: str, log_path: Path, url_exit: int) -> str:
@@ -251,21 +253,25 @@ def _install_browser_guard() -> None:
 
 @pytest.fixture(autouse=True)
 def _fail_on_host_browser_open() -> Generator[None, None, None]:
-    """Fail the test whose run recorded a host browser-open attempt.
+    """Fail the first test that finishes after a browser-open attempt.
 
-    The guard shims append one line per attempt; the size delta since setup
-    attributes an attempt to the test, reported as a teardown failure.
+    The guard shims append one line per attempt; lines since the offset last
+    reported are attributed to a finished test as a teardown failure. An
+    attempt not yet reported — including one made by a wider-scoped fixture's
+    setup — fails the first test that finishes after it.
 
     :returns: None.
     """
+    global _BROWSER_GUARD_CHECKED
+
     log_path = _BROWSER_GUARD_LOG
-    offset = log_path.stat().st_size if log_path is not None and log_path.exists() else 0
     yield
     if log_path is None or not log_path.exists():
         return
     with open(log_path, "rb") as log:
-        log.seek(offset)
+        log.seek(_BROWSER_GUARD_CHECKED)
         attempts = log.read().decode(errors="replace").splitlines()
+        _BROWSER_GUARD_CHECKED = log.tell()
     if attempts:
         pytest.fail("test tried to open a browser on the host: " + "\n".join(attempts))
 
