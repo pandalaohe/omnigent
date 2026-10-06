@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from omnigent.cli import (
     _AUTO_OPEN_CONVERSATION_ENV_VAR,
     _resolve_auto_open_conversation_from_config,
+    _resolve_auto_open_conversation_preference,
     _resolve_auto_open_conversation_setting,
     cli,
 )
@@ -46,7 +47,18 @@ def test_resolver_env_override(
     else:
         monkeypatch.setenv(_AUTO_OPEN_CONVERSATION_ENV_VAR, env_value)
 
-    assert _resolve_auto_open_conversation_setting(cfg) is expected
+    assert _resolve_auto_open_conversation_preference(cfg) is expected
+
+
+def test_config_resolver_ignores_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The config-only resolver ignores the env override.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv(_AUTO_OPEN_CONVERSATION_ENV_VAR, "false")
+
+    assert _resolve_auto_open_conversation_setting({}) is None
+    assert _resolve_auto_open_conversation_setting({"auto_open_conversation": True}) is True
 
 
 @pytest.mark.parametrize(

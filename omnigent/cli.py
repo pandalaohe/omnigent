@@ -636,7 +636,7 @@ _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
 # User-facing keys that ``omnigent config`` accepts. Most mirror ``run``
 # options; session-title guidance configures server-owned metadata generation.
 _AUTO_OPEN_CONVERSATION_CONFIG_KEY = "auto_open_conversation"
-# Env override for browser auto-open; needed when the config dir is fresh.
+# Overrides conversation auto-open only; the host web UI uses OMNIGENT_HOST_NO_OPEN.
 _AUTO_OPEN_CONVERSATION_ENV_VAR = "OMNIGENT_AUTO_OPEN_CONVERSATION"
 _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -1077,18 +1077,36 @@ def _parse_config_bool(key: str, value: _ConfigValue) -> bool:
 
 def _resolve_auto_open_conversation_setting(cfg: dict[str, Any]) -> bool | None:  # type: ignore[explicit-any]
     """
-    Resolve the explicit ``auto_open_conversation`` setting, if set.
+    Resolve the explicit ``auto_open_conversation`` config value, if set.
 
     Tri-state on purpose so callers can distinguish "the user has not
     expressed a preference" (``None``) from an explicit opt-in/opt-out.
+    ``omnigent run`` uses this to default the browser-open ON for
+    interactive launches while still honoring an explicit
+    ``auto_open_conversation: false``; see :func:`run`.
+
+    :param cfg: Effective config dict from :func:`_load_effective_config`,
+        e.g. ``{"auto_open_conversation": True}``.
+    :returns: ``True`` / ``False`` when the key is present, or ``None``
+        when the user has not configured it.
+    :raises click.ClickException: If the configured value is not a
+        supported boolean.
+    """
+    raw = cfg.get(_AUTO_OPEN_CONVERSATION_CONFIG_KEY)
+    if raw is None:
+        return None
+    return _parse_config_bool(_AUTO_OPEN_CONVERSATION_CONFIG_KEY, raw)
+
+
+def _resolve_auto_open_conversation_preference(cfg: dict[str, Any]) -> bool | None:  # type: ignore[explicit-any]
+    """
+    Resolve the conversation auto-open preference, env first.
+
     The ``OMNIGENT_AUTO_OPEN_CONVERSATION`` env var wins over the
-    ``auto_open_conversation`` config key, and every caller of this
-    resolver honors it — ``omnigent run``'s interactive default, the
-    native wrappers via
-    :func:`_resolve_auto_open_conversation_from_config`, and the host
-    web-UI open check. ``omnigent run`` uses the tri-state to default the
-    browser-open ON for interactive launches while still honoring an
-    explicit opt-out; see :func:`run`.
+    ``auto_open_conversation`` config key; unset, blank or unrecognized
+    falls through to :func:`_resolve_auto_open_conversation_setting`.
+    Governs conversation opens only — the host web UI has its own
+    ``OMNIGENT_HOST_NO_OPEN`` switch.
 
     :param cfg: Effective config dict from :func:`_load_effective_config`,
         e.g. ``{"auto_open_conversation": True}``.
@@ -1102,10 +1120,7 @@ def _resolve_auto_open_conversation_setting(cfg: dict[str, Any]) -> bool | None:
         return True
     if env_raw in _CONFIG_FALSE_VALUES:
         return False
-    raw = cfg.get(_AUTO_OPEN_CONVERSATION_CONFIG_KEY)
-    if raw is None:
-        return None
-    return _parse_config_bool(_AUTO_OPEN_CONVERSATION_CONFIG_KEY, raw)
+    return _resolve_auto_open_conversation_setting(cfg)
 
 
 def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  # type: ignore[explicit-any]
@@ -1124,7 +1139,7 @@ def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  #
     :raises click.ClickException: If the configured value is not a
         supported boolean.
     """
-    setting = _resolve_auto_open_conversation_setting(cfg)
+    setting = _resolve_auto_open_conversation_preference(cfg)
     return setting if setting is not None else False
 
 
@@ -8797,7 +8812,7 @@ def run(
     # ``auto_open_conversation`` config value (true/false) always wins, so
     # users who opted out stay opted out. Headless ``-p`` one-shots stay
     # quiet unless the user explicitly opted in.
-    auto_open_setting = _resolve_auto_open_conversation_setting(_global_cfg)
+    auto_open_setting = _resolve_auto_open_conversation_preference(_global_cfg)
     auto_open_conversation = auto_open_setting if auto_open_setting is not None else prompt is None
 
     # NOTE: the host daemon + Omnigent server are ensured inside ``run_chat``'s
