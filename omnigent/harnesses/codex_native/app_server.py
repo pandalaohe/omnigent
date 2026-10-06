@@ -15,6 +15,7 @@ import signal
 import socket
 import sys
 import tempfile
+import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -133,6 +134,9 @@ _PROCESS_GROUP_KILL_GRACE_SECONDS = 1.0
 _PROCESS_GROUP_REAP_POLL_SECONDS = 0.05
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
+# The Codex automatic-title hook reads this to reach the session's app-server.
+CODEX_AUTO_TITLE_SOCKET_ENV = "CODEX_AUTO_TITLE_SOCKET_PATH"
+_AUTO_TITLE_RELAY_CHUNK_BYTES = 64 * 1024
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
@@ -1810,6 +1814,74 @@ def _build_native_codex_app_server_argv(
     return argv
 
 
+async def _start_app_server_socket_relay(
+    socket_path: Path,
+    host: str,
+    port: int,
+) -> tuple[asyncio.Server, tuple[int, int]]:
+    """
+    Bind a unix socket that byte-relays each connection to a ws app-server.
+
+    The automatic-title hook only knows the bridge-dir socket, so in ws
+    mode this forwards it to the app-server's loopback port.
+
+    :param socket_path: Unix socket to bind; a stale file is replaced.
+    :param host: App-server host, e.g. ``"127.0.0.1"``.
+    :param port: App-server port.
+    :returns: The listening relay server and the bound socket's
+        ``(st_dev, st_ino)`` identity, so teardown unlinks the path only
+        while it is still this server's socket.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        socket_path.unlink()
+
+    async def _relay_connection(
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        upstream_writer: asyncio.StreamWriter | None = None
+        try:
+            try:
+                upstream_reader, upstream_writer = await asyncio.open_connection(host, port)
+            except OSError:
+                return
+            await asyncio.gather(
+                _pipe_relay_stream(client_reader, upstream_writer),
+                _pipe_relay_stream(upstream_reader, client_writer),
+            )
+        finally:
+            if upstream_writer is not None:
+                upstream_writer.close()
+            client_writer.close()
+
+    server = await asyncio.start_unix_server(_relay_connection, path=str(socket_path))
+    try:
+        os.chmod(socket_path, 0o600)
+        identity = os.stat(socket_path)
+    except BaseException:
+        # A failure after bind must not leak a listener close() cannot reach.
+        server.close()
+        with contextlib.suppress(FileNotFoundError):
+            socket_path.unlink()
+        raise
+    return server, (identity.st_dev, identity.st_ino)
+
+
+async def _pipe_relay_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Copy bytes until EOF or a connection error, then close the peer writer."""
+    try:
+        while True:
+            chunk = await reader.read(_AUTO_TITLE_RELAY_CHUNK_BYTES)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        writer.close()
+
+
 @dataclass
 class CodexNativeAppServer:
     """
@@ -1878,6 +1950,11 @@ class CodexNativeAppServer:
         it to the host janitor; standalone callers keep the safe default.
     :param config_profile: Codex user config-file profile materialized into
         the private user layer before app-server and terminal startup.
+    :param auto_title_relay: Unix-socket byte relay bound to
+        :attr:`socket_path` for the automatic-title hook, set by
+        :meth:`start` in ws mode on POSIX only; ``None`` in unix mode (the
+        socket is the app-server's own) or when relay setup failed. Not a
+        constructor input.
     """
 
     codex_path: str
@@ -1913,6 +1990,8 @@ class CodexNativeAppServer:
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+    auto_title_relay: asyncio.Server | None = field(default=None, init=False)
+    _auto_title_relay_identity: tuple[int, int] | None = field(default=None, init=False)
 
     async def start(self) -> None:
         """
@@ -2082,9 +2161,11 @@ class CodexNativeAppServer:
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
         )
-        proc_env = codex_app_server_diagnostic_env(
-            {**self.env, "CODEX_HOME": str(self.codex_home)}
-        )
+        app_server_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        if os.name == "posix":
+            # An inherited value would point at a different app-server.
+            app_server_env[CODEX_AUTO_TITLE_SOCKET_ENV] = str(self.socket_path)
+        proc_env = codex_app_server_diagnostic_env(app_server_env)
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
             self.proc = await asyncio.create_subprocess_exec(
@@ -2141,6 +2222,23 @@ class CodexNativeAppServer:
                     await startup_client.close()
                 except Exception:  # noqa: BLE001 - a dead control socket cannot undo trust
                     _logger.warning("Could not close Codex startup client", exc_info=True)
+            if os.name == "posix" and resolved_listen.startswith("ws://"):
+                try:
+                    relay_target = urllib.parse.urlsplit(resolved_listen)
+                    (
+                        self.auto_title_relay,
+                        self._auto_title_relay_identity,
+                    ) = await _start_app_server_socket_relay(
+                        self.socket_path,
+                        relay_target.hostname or "127.0.0.1",
+                        relay_target.port or 80,
+                    )
+                except Exception:  # noqa: BLE001 - the auto-title relay never blocks startup
+                    _logger.warning(
+                        "Could not start the Codex auto-title socket relay at %s",
+                        self.socket_path,
+                        exc_info=True,
+                    )
         except BaseException:
             await self.close()
             raise
@@ -2318,6 +2416,18 @@ class CodexNativeAppServer:
                 unregister_codex_native_process(self.process_registry_tag)
             if self.process_owner_lock is not None:
                 self.process_owner_lock.close()
+            if self.auto_title_relay is not None:
+                self.auto_title_relay.close()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.auto_title_relay.wait_closed(), timeout=1.0)
+                # A newer instance may have rebound the path: unlink only while
+                # it is still this object's relay socket.
+                with contextlib.suppress(FileNotFoundError):
+                    current = os.stat(self.socket_path)
+                    if (current.st_dev, current.st_ino) == self._auto_title_relay_identity:
+                        self.socket_path.unlink()
+                self.auto_title_relay = None
+                self._auto_title_relay_identity = None
             try:
                 if self.stderr_task is not None and self._stderr_diagnostics is not None:
                     # A descendant can hold the pipe open, so bound the wait.
