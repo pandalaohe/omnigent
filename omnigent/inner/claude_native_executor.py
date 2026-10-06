@@ -146,9 +146,12 @@ class ClaudeNativeExecutor(Executor):
         """
         Ping the pane with a guarded ``/btw`` side question (keep-warm).
 
-        The whole guard-and-paste sequence runs under ``_inject_lock``,
-        so a real message arriving meanwhile simply waits the few
-        seconds the exchange takes — keystrokes never interleave.
+        An ``_inject_lock`` already held on entry means a real injection
+        owns the pane right now, so the ping skips ``busy`` at once
+        instead of waiting. Otherwise the whole guard-and-paste sequence
+        runs under ``_inject_lock``, so a real message arriving meanwhile
+        simply waits the few seconds the exchange takes — keystrokes
+        never interleave.
         Cancellation sets a stop flag the bridge checks before every
         key it sends, and the lock is released only after the worker
         thread finished. ``/btw`` answers have no tool access, so the
@@ -171,6 +174,9 @@ class ClaudeNativeExecutor(Executor):
         :returns: The normalized receipt dict.
         """
         del family
+        if self._inject_lock.locked():
+            # A held lock = a real injection in flight: skip; acquire on a free lock never yields.
+            return _keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
         async with self._inject_lock:
             cost_before = _total_cost_usd(read_claude_context_state(self._bridge_dir))
             try:

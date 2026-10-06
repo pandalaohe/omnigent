@@ -4980,10 +4980,10 @@ KEEP_WARM_BTW_TEXT = f"/btw {KEEP_WARM_BTW_MARKER} reply with only: ok"
 # A regular tmux client taking input (attach or keypress) this recently
 # means a person may be at the pane; the ping skips instead of typing.
 _KEEP_WARM_CLIENT_INPUT_WINDOW_S = 60.0
-# Budget for the /btw answer's overlay to settle. Past it a marked overlay
-# in any state is interrupted and dismissed (failed/timeout) so the ping
-# always closes what it opened; the total stays under the 90 s channel contract.
-_KEEP_WARM_OVERLAY_TIMEOUT_S = 70.0
+# Budget for the /btw answer's overlay to settle. Past it a marked overlay in any
+# state is interrupted and dismissed (failed/timeout). Worst case: 5 s paste commit
+# + 65 s overlay + 2 s history + 2×3 s dismiss verifies + 5 s cost poll = 83 s < 90 s.
+_KEEP_WARM_OVERLAY_TIMEOUT_S = 65.0
 _KEEP_WARM_OVERLAY_POLL_INTERVAL_S = 0.5
 # Post-Escape / post-x re-render polls: the TUI takes a moment to apply
 # the key, so a closed overlay is verified on fresh captures.

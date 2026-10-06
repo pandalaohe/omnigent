@@ -2023,6 +2023,48 @@ async def test_keep_warm_maps_a_guard_skip_onto_the_receipt(
 
 
 @pytest.mark.asyncio
+async def test_keep_warm_with_an_injection_in_flight_skips_busy_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A held ``_inject_lock`` means a real injection owns the pane: the ping
+    answers ``skipped``/``busy`` at once — no wait for the holder, no bridge call."""
+    bridge_dir = tmp_path / "bridge"
+
+    def fail_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
+        del bridge_dir_arg
+        raise AssertionError("run_keep_warm_btw must not be called")
+
+    monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fail_run)
+    executor = ClaudeNativeExecutor(bridge_dir)
+    release = asyncio.Event()
+
+    async def holder() -> None:
+        async with executor._inject_lock:
+            await release.wait()
+
+    holder_task = asyncio.create_task(holder())
+    await asyncio.sleep(0)  # the holder owns the lock before the ping starts
+
+    receipt = await executor.keep_warm(attempt_id="att-1", family="claude")
+
+    # The receipt arrived while the holder was still holding: no wait happened.
+    assert executor._inject_lock.locked()
+    release.set()
+    await holder_task
+    assert receipt == {
+        "attempt_id": "att-1",
+        "outcome": "skipped",
+        "reason": "busy",
+        "input_total": None,
+        "cache_read": None,
+        "cache_write": None,
+        "cost_usd": None,
+        "estimated": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_keep_warm_ok_receipt_estimates_cost_from_the_statusline_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2334,46 +2376,62 @@ async def test_keep_warm_measured_delta_without_an_estimate_carries_no_cache_res
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_cost_window_excludes_a_turn_settled_while_waiting_for_the_lock(
+async def test_keep_warm_cost_window_excludes_an_injection_parked_behind_the_cost_poll(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    A real turn settling +$0.50 while the ping waits for ``_inject_lock``
-    is not the ping's: the before-read happens under the lock, so the
-    measured delta is only the ping's own +$0.02.
+    A real injection reaching ``_inject_lock`` while the ping's settle poll is
+    running only acquires it after the poll read the ping's own +$0.02, so the
+    injection's +$0.50 (written once it holds the lock) is not in the delta.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     _keep_warm_context_file(bridge_dir, total_cost_usd=1.00)
 
     def fake_run(bridge_dir_arg: Path) -> claude_bridge.KeepWarmBtwResult:
-        # The ping's own side question settles +$0.02.
-        _keep_warm_context_file(bridge_dir_arg, total_cost_usd=1.52)
+        del bridge_dir_arg
+        # Claude Code settles the side question's cost a moment later — mid-poll.
         return claude_bridge.KeepWarmBtwResult("ok", None)
 
+    real_poll = claude_native_executor._poll_total_cost_usd
+    poll_started = threading.Event()
+    finish_poll = threading.Event()
+    order: list[str] = []
+
+    def gated_poll(bridge_dir_arg: Path, before: float) -> float | None:
+        del bridge_dir_arg
+        poll_started.set()
+        assert finish_poll.wait(timeout=5.0), "test must release the poll"
+        after = real_poll(bridge_dir, before)
+        order.append("poll")
+        return after
+
     monkeypatch.setattr(claude_native_executor, "run_keep_warm_btw", fake_run)
+    monkeypatch.setattr(claude_native_executor, "_poll_total_cost_usd", gated_poll)
     monkeypatch.setattr(claude_native_executor, "fetch_model_pricing", _keep_warm_pricing)
     executor = ClaudeNativeExecutor(bridge_dir)
-    held = asyncio.Event()
-    ping_parked = asyncio.Event()
 
-    async def holder() -> None:
-        async with executor._inject_lock:
-            held.set()
-            await ping_parked.wait()
-            # A real turn settles +$0.50 while the ping waits on the lock.
-            _keep_warm_context_file(bridge_dir, total_cost_usd=1.50)
-
-    holder_task = asyncio.create_task(holder())
-    await held.wait()  # the holder owns the lock before the ping starts
     ping = asyncio.create_task(executor.keep_warm(attempt_id="att-1", family="claude"))
-    await asyncio.sleep(0)  # the ping runs its first step and parks on the lock
-    ping_parked.set()
+    assert await asyncio.to_thread(poll_started.wait, 5.0), "the settle poll must start"
+    # The ping's own increment lands while the poll is still reading.
+    _keep_warm_context_file(bridge_dir, total_cost_usd=1.02)
+
+    async def injection() -> None:
+        async with executor._inject_lock:
+            order.append("injection")
+            _keep_warm_context_file(bridge_dir, total_cost_usd=1.52)
+
+    injection_task = asyncio.create_task(injection())
+    for _ in range(10):
+        await asyncio.sleep(0)  # the injection runs to the acquire and parks
+    assert order == []  # still parked behind the ping's lock, poll not released yet
+    finish_poll.set()
 
     receipt = await ping
-    await holder_task
+    await injection_task
 
+    assert order == ["poll", "injection"]
     assert receipt == {
         "attempt_id": "att-1",
         "outcome": "ok",

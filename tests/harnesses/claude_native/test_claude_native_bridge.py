@@ -14309,7 +14309,7 @@ def test_keep_warm_btw_still_answering_at_the_budget_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """Still generating at the 70 s budget: our overlay is Escaped and closed → ``timeout``."""
+    """Still generating at the 65 s budget: our overlay is Escaped and closed → ``timeout``."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT)]
     sends: list[list[str]] = []
@@ -14335,10 +14335,10 @@ def test_keep_warm_btw_still_answering_at_the_budget_is_interrupted(
 
     assert result == claude_native_bridge.KeepWarmBtwResult("failed", "timeout")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
-    # One Escape closed it — no second key; the ping ended at the 70 s budget
+    # One Escape closed it — no second key; the ping ended at the 65 s budget
     # plus one 0.25 s close-verify poll.
     assert [args[-1] for args in sends].count("Escape") == 1
-    assert clock.now == 70.25
+    assert clock.now == 65.25
 
 
 def test_keep_warm_btw_overlay_that_ignores_escape_fails_dismiss_failed(
