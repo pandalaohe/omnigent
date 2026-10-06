@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -165,6 +166,7 @@ def pytest_configure(config: pytest.Config) -> None:
         _PROGRESS_LOG_PATH = os.path.join(log_dir, f"progress-{worker}.log")
 
     _run_test_environment_guardrails(config)
+    _install_browser_guard()
 
 
 def _run_test_environment_guardrails(config: pytest.Config) -> None:
@@ -180,6 +182,92 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
     db_uri = os.environ.get("OMNIGENT_DATABASE_URI", "")
     base_url = config.getoption("--omnigent-server-url", default=None)
     check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
+
+
+# Host browser-opener shims and the attempt log the autouse fixture reads;
+# both set by :func:`_install_browser_guard`.
+_BROWSER_GUARD_DIR: str | None = None
+_BROWSER_GUARD_LOG: Path | None = None
+
+
+def _browser_guard_shim(name: str, tail: str, log_path: Path, url_exit: int) -> str:
+    """Return a POSIX sh shim that records URL opens, then exits ``url_exit``.
+
+    :param name: Shim name recorded as the first log field.
+    :param tail: Shell commands for non-URL invocations.
+    :param log_path: Absolute attempt-log path baked into the script.
+    :param url_exit: Exit status used for URL arguments.
+    :returns: The shim's shell source.
+    """
+    return (
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        "    http://*|https://*)\n"
+        f'      printf \'%s\\t%s\\t%s\\n\' {name} "$*" "${{PYTEST_CURRENT_TEST}}"'
+        f" >> {shlex.quote(str(log_path))}\n"
+        f"      exit {url_exit}\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        f"{tail}"
+    )
+
+
+def _install_browser_guard() -> None:
+    """Refuse and record host browser opens for the whole test session.
+
+    Tests that drive the interactive REPL would otherwise pop a real browser
+    window on the developer's machine. Shims on ``PATH`` (and ``$BROWSER``
+    for in-process ``webbrowser`` calls) log the attempt and fail; the
+    per-test fixture turns a logged attempt into a teardown error. A
+    ``open`` invocation without a URL still reaches the real open(1).
+
+    :returns: None.
+    """
+    global _BROWSER_GUARD_DIR, _BROWSER_GUARD_LOG
+
+    guard_dir = Path(tempfile.mkdtemp(prefix="omni-browser-guard-"))
+    log_path = guard_dir / "browser-open-attempts.log"
+    _BROWSER_GUARD_DIR = str(guard_dir)
+    _BROWSER_GUARD_LOG = log_path
+
+    # browser-guard exits 0 so a failing $BROWSER can't make webbrowser fall
+    # through to the real OS opener; open/xdg-open keep failing to catch PATH use.
+    shims = {
+        "open": ('if [ -x /usr/bin/open ]; then\n  exec /usr/bin/open "$@"\nfi\nexit 1\n', 1),
+        "xdg-open": ("exit 1\n", 1),
+        "browser-guard": ("exit 1\n", 0),
+    }
+    for name, (tail, url_exit) in shims.items():
+        shim = guard_dir / name
+        shim.write_text(_browser_guard_shim(name, tail, log_path, url_exit))
+        shim.chmod(0o755)
+
+    os.environ["PATH"] = os.pathsep.join([str(guard_dir), os.environ.get("PATH", "")])
+    # Python's webbrowser consults $BROWSER before its platform opener table.
+    os.environ["BROWSER"] = str(guard_dir / "browser-guard")
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_host_browser_open() -> Generator[None, None, None]:
+    """Fail the test whose run recorded a host browser-open attempt.
+
+    The guard shims append one line per attempt; the size delta since setup
+    attributes an attempt to the test, reported as a teardown failure.
+
+    :returns: None.
+    """
+    log_path = _BROWSER_GUARD_LOG
+    offset = log_path.stat().st_size if log_path is not None and log_path.exists() else 0
+    yield
+    if log_path is None or not log_path.exists():
+        return
+    with open(log_path, "rb") as log:
+        log.seek(offset)
+        attempts = log.read().decode(errors="replace").splitlines()
+    if attempts:
+        pytest.fail("test tried to open a browser on the host: " + "\n".join(attempts))
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
@@ -199,6 +287,8 @@ def pytest_unconfigure(config: pytest.Config) -> None:
     for cmdline in survivors:
         print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
+    if _BROWSER_GUARD_DIR is not None:
+        shutil.rmtree(_BROWSER_GUARD_DIR, ignore_errors=True)
 
 
 # Per-worker progress logger: fsync'd START/END lines so a
