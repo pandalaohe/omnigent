@@ -51,6 +51,7 @@ def isolated_env(environ: dict[str, str], output: Path) -> dict[str, str]:
         "OPENAI_MODEL",
         "PYTEST_ADDOPTS",
         "OMNIGENT_CONFIG_HOME",
+        "OMNIGENT_PROCESS_LOG_FILE",
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_AUTH_PROVIDER",
     }
@@ -116,7 +117,10 @@ def write_model_config(
 
 
 def supervise(output: Path) -> None:
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.runner.identity import (
+        RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
+        token_bound_runner_id,
+    )
 
     state = json.loads((output / "environment.json").read_text())
     root = Path(state["workspace"])
@@ -239,6 +243,9 @@ def supervise(output: Path) -> None:
                 "OMNIGENT_RUNNER_ID": runner_id,
                 "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": token,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+                # The reproduction runner is a guest on the machine; machine-global
+                # cleanup stays with the machine's host.
+                RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR: "1",
             }
             spawn("runner", [sys.executable, "-m", "omnigent.runner._entry"], runner_env)
             ready(

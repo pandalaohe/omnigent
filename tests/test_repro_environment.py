@@ -1,10 +1,11 @@
 """Configuration and transport regressions for workflow-owned reproduction."""
 
 import json
+import os
 import socket
 import threading
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -19,6 +20,7 @@ def test_isolates_inherited_native_state(tmp_path):
             "LLM_API_KEY": "placeholder",
             "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD": "999",
             "OMNIGENT_CONFIG_HOME": "/parent",
+            "OMNIGENT_PROCESS_LOG_FILE": "/parent/logs/runner.log",
             "CLAUDE_CONFIG_DIR": "/parent-claude",
             "OPENAI_API_KEY": "parent-key",
             "NO_PROXY": "example.test",
@@ -27,6 +29,7 @@ def test_isolates_inherited_native_state(tmp_path):
     )
     assert "LLM_API_KEY" not in env
     assert "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD" not in env
+    assert "OMNIGENT_PROCESS_LOG_FILE" not in env
     assert "OPENAI_API_KEY" not in env
     assert env["OMNIGENT_CONFIG_HOME"] == str(tmp_path / "config")
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
@@ -277,6 +280,8 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
     import time
 
     from dev.repro_env import runtime
+    from omnigent.runner._entry import _runner_host_owns_global_cleanup_from_env
+    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
 
     monkeypatch.setattr("dev.repro_env.doctor.launch_observations", lambda root: {})
 
@@ -311,7 +316,19 @@ def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monke
         relay.__exit__ = Mock()
     relays[-1].__exit__.side_effect = TimeoutError("stuck relay")
     monkeypatch.setattr(runtime, "Relay", Mock(side_effect=relays))
+    # An ambient value (e.g. pytest started inside an Omnigent terminal) would
+    # make the guest-env assertion pass without the runner-env fix.
+    monkeypatch.delenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raising=False)
     runtime.supervise(tmp_path)
+    runner_call = next(
+        call
+        for call in runtime.subprocess.Popen.call_args_list
+        if call.args[0][-1] == "omnigent.runner._entry"
+    )
+    env = runner_call.kwargs["env"]
+    assert env[RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR] == "1"
+    with patch.dict(os.environ, env, clear=True):
+        assert _runner_host_owns_global_cleanup_from_env() is True
     model_command = runtime.subprocess.Popen.call_args_list[0].args[0]
     assert model_command[1:3] == ["-m", "tests.server.integration.mock_llm_server"]
     final = json.loads(state.read_text())
