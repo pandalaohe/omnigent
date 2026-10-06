@@ -100,7 +100,7 @@ from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
 from omnigent.native import native_bridge_common
-from omnigent.native.native_cost_popup import _tmux_last_client_input
+from omnigent.native.native_cost_popup import _TMUX_LIST_TIMEOUT_S, _tmux_last_client_input
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -4980,10 +4980,14 @@ KEEP_WARM_BTW_TEXT = f"/btw {KEEP_WARM_BTW_MARKER} reply with only: ok"
 # A regular tmux client taking input (attach or keypress) this recently
 # means a person may be at the pane; the ping skips instead of typing.
 _KEEP_WARM_CLIENT_INPUT_WINDOW_S = 60.0
-# Budget for the /btw answer's overlay to settle. Past it a marked overlay in any
-# state is interrupted and dismissed (failed/timeout). Worst case: 5 s paste commit
-# + 65 s overlay + 2 s history + 2×3 s dismiss verifies + 5 s cost poll = 83 s < 90 s.
-_KEEP_WARM_OVERLAY_TIMEOUT_S = 65.0
+# Hard budget for one run_keep_warm_btw call — every tmux subprocess the
+# keep-warm path reaches is clipped to it. Worst-case ping: 1 s executor lock
+# wait + 78 s here + ≤ 6 s clipped cost poll + pricing = 85 s < 90 s channel limit.
+_KEEP_WARM_BRIDGE_BUDGET_S = 78.0
+# Close time kept back from the budget: 2 s history poll + two dismissal
+# attempts × (3 s verify + ~1 s capture / status read / key). The overlay
+# settle deadline is the bridge deadline minus this reserve.
+_KEEP_WARM_CLOSE_RESERVE_S = 10.0
 _KEEP_WARM_OVERLAY_POLL_INTERVAL_S = 0.5
 # Post-Escape / post-x re-render polls: the TUI takes a moment to apply
 # the key, so a closed overlay is verified on fresh captures.
@@ -4996,6 +5000,47 @@ _KEEP_WARM_HISTORY_TIMEOUT_S = 2.0
 # over-flags long *complete* answers, which is acceptable for the
 # best-effort relay (the note points the reader at the terminal).
 _BTW_TRUNCATION_MIN_SPAN_ROWS = 12
+
+# Bound only by run_keep_warm_btw: the ping's hard deadline. Every tmux
+# subprocess the attempt reaches is clipped to it, so a stalled tmux server
+# can never stretch the ping past its budget and no key goes out past it.
+_KEEP_WARM_TMUX_DEADLINE: ContextVar[float | None] = ContextVar(
+    "claude_native_keep_warm_tmux_deadline", default=None
+)
+
+
+@contextlib.contextmanager
+def _keep_warm_tmux_deadline(deadline: float) -> Iterator[None]:
+    """Bind the ping's hard tmux deadline for the tmux helpers it reaches."""
+    token = _KEEP_WARM_TMUX_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _KEEP_WARM_TMUX_DEADLINE.reset(token)
+
+
+def _keep_warm_tmux_remaining_s() -> float | None:
+    """Seconds to the bound keep-warm deadline, or ``None`` when none is bound."""
+    deadline = _KEEP_WARM_TMUX_DEADLINE.get()
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _tmux_call_timeout_s() -> float:
+    """The next tmux subprocess's budget, clipped to a bound keep-warm deadline."""
+    remaining = _keep_warm_tmux_remaining_s()
+    if remaining is None:
+        return _TMUX_SEND_TIMEOUT_S
+    return min(_TMUX_SEND_TIMEOUT_S, remaining)
+
+
+def _keep_warm_poll_timeout(own_timeout_s: float) -> float:
+    """Clip a keep-warm poll loop's own budget to the bound deadline, when bound."""
+    remaining = _keep_warm_tmux_remaining_s()
+    if remaining is None:
+        return own_timeout_s
+    return min(own_timeout_s, remaining)
 
 
 @dataclass(frozen=True)
@@ -5549,6 +5594,10 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     import subprocess
 
     _check_injection_cancelled()
+    timeout = _tmux_call_timeout_s()
+    if timeout <= 0.0:
+        # Past the bound keep-warm deadline: no key may go out after it.
+        raise RuntimeError(f"tmux command timed out after {timeout}s")
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -5556,10 +5605,10 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+        raise RuntimeError(f"tmux command timed out after {timeout}s") from exc
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
@@ -5584,6 +5633,10 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
     import subprocess
 
     _check_injection_cancelled()
+    timeout = _tmux_call_timeout_s()
+    if timeout <= 0.0:
+        # Past the bound keep-warm deadline: unknown, as for any failed capture.
+        return ""
     args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
     if join_wrapped:
         args.append("-J")
@@ -5593,7 +5646,7 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout,
         )
     except (subprocess.SubprocessError, OSError):
         return ""
@@ -5690,13 +5743,17 @@ def _tmux_pane_pid(socket_path: str, tmux_target: str) -> int | None:
     import subprocess
 
     _check_injection_cancelled()
+    timeout = _tmux_call_timeout_s()
+    if timeout <= 0.0:
+        # Past the bound keep-warm deadline: unreadable, never evidence of idle.
+        return None
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout,
         )
     except (subprocess.SubprocessError, OSError):
         return None
@@ -8210,7 +8267,7 @@ def _clear_keep_warm_btw_history(
     if not _claude_free_behind_keep_warm_overlay(bridge_dir, socket_path, tmux_target):
         return
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "x")
-    deadline = time.monotonic() + _KEEP_WARM_HISTORY_TIMEOUT_S
+    deadline = time.monotonic() + _keep_warm_poll_timeout(_KEEP_WARM_HISTORY_TIMEOUT_S)
     while time.monotonic() < deadline:
         time.sleep(_KEEP_WARM_DISMISS_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
@@ -8273,7 +8330,7 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
         if not _claude_free_behind_keep_warm_overlay(bridge_dir, socket_path, tmux_target):
             return False
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
-        deadline = time.monotonic() + _KEEP_WARM_DISMISS_TIMEOUT_S
+        deadline = time.monotonic() + _keep_warm_poll_timeout(_KEEP_WARM_DISMISS_TIMEOUT_S)
         while time.monotonic() < deadline:
             time.sleep(_KEEP_WARM_DISMISS_POLL_INTERVAL_S)
             pane = _capture_pane(socket_path, tmux_target)
@@ -8317,7 +8374,9 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     marked overlay settles, earlier threaded exchanges are cleared
     (:func:`_clear_keep_warm_btw_history`) and the overlay is Escaped
     until it verifiably closes → ``ok`` (never closed →
-    ``dismiss_failed``). If the answer outlives the overlay budget,
+    ``dismiss_failed``). If the answer outlives the overlay settle
+    deadline — the call's hard :data:`_KEEP_WARM_BRIDGE_BUDGET_S`
+    budget minus the :data:`_KEEP_WARM_CLOSE_RESERVE_S` close time —
     our marked overlay in ANY state is Escaped the same way →
     ``timeout`` (closed) or ``dismiss_failed`` — the ping always
     closes what it opened, so the session never reads running until a
@@ -8332,12 +8391,22 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     The caller holds the executor's injection lock, so a real message
     arriving meanwhile waits the few seconds this takes instead of
     interleaving keystrokes; cancellation sets a flag every tmux call
-    checks before sending.
+    checks before sending. Every tmux call is also clipped to the
+    budget deadline (:func:`_keep_warm_tmux_deadline`): past it a
+    capture reads ``""`` and a key raises, so a stalled tmux server
+    can never stretch the ping and no key is sent after the deadline.
 
     :param bridge_dir: Bridge directory path.
     :returns: The attempt's outcome; guard refusals return, never raise.
     :raises RuntimeError: If a ``tmux`` invocation fails mid-sequence.
     """
+    deadline = time.monotonic() + _KEEP_WARM_BRIDGE_BUDGET_S
+    with _keep_warm_tmux_deadline(deadline):
+        return _guarded_keep_warm_btw(bridge_dir, deadline)
+
+
+def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResult:
+    """The attempt body of :func:`run_keep_warm_btw`, under its bound tmux deadline."""
     if has_pending_user_prompt(bridge_dir):
         return KeepWarmBtwResult("skipped", "card")
     payload = _read_json_file(bridge_dir / _TMUX_FILE)
@@ -8358,6 +8427,10 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
         return KeepWarmBtwResult("skipped", "unknown")
     if draft:
         return KeepWarmBtwResult("skipped", "composer_draft")
+    if deadline - time.monotonic() < _TMUX_LIST_TIMEOUT_S:
+        # The client-activity query's own timeout no longer fits the ping's
+        # budget; an unreadable answer never evidences an unattended pane.
+        return KeepWarmBtwResult("skipped", "unknown")
     readable, last_input_at = _tmux_last_client_input(socket_path, tmux_target)
     if not readable:
         return KeepWarmBtwResult("skipped", "unknown")
@@ -8373,7 +8446,7 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     # draft or confirm a dialog that just popped. A ``None``/empty
     # read is the paste still landing, so the poll waits out the
     # commit budget; every other read ends the attempt with no key.
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    paste_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
@@ -8388,12 +8461,13 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
             break
         if draft not in (None, ""):
             return KeepWarmBtwResult("skipped", "composer_changed")
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= paste_deadline:
             return KeepWarmBtwResult("skipped", "composer_changed")
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    deadline = time.monotonic() + _KEEP_WARM_OVERLAY_TIMEOUT_S
-    while time.monotonic() < deadline:
+    # The answer must settle early enough for the close reserve to fit.
+    settle_deadline = deadline - _KEEP_WARM_CLOSE_RESERVE_S
+    while time.monotonic() < settle_deadline:
         pane = _capture_pane(socket_path, tmux_target)
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
             return KeepWarmBtwResult("failed", "aborted")

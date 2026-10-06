@@ -14309,7 +14309,8 @@ def test_keep_warm_btw_still_answering_at_the_budget_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
     btw_guard_trackers: None,
 ) -> None:
-    """Still generating at the 65 s budget: our overlay is Escaped and closed → ``timeout``."""
+    """Still generating at the settle deadline (the 78 s budget minus the 10 s
+    close reserve): our overlay is Escaped and closed → ``timeout``."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT)]
     sends: list[list[str]] = []
@@ -14335,10 +14336,52 @@ def test_keep_warm_btw_still_answering_at_the_budget_is_interrupted(
 
     assert result == claude_native_bridge.KeepWarmBtwResult("failed", "timeout")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
-    # One Escape closed it — no second key; the ping ended at the 65 s budget
-    # plus one 0.25 s close-verify poll.
+    # One Escape closed it — no second key; the ping ended at the 68 s settle
+    # deadline plus one 0.25 s close-verify poll.
     assert [args[-1] for args in sends].count("Escape") == 1
-    assert clock.now == 65.25
+    assert clock.now == 68.25
+
+
+def test_keep_warm_btw_stalled_tmux_returns_within_the_bridge_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    btw_guard_trackers: None,
+) -> None:
+    """A tmux server stalling every capture 9 s keeps the ping inside its
+    hard budget: each subprocess is clipped to the deadline, and no key is
+    sent after it."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    clock = _VirtualClock()
+    frames = [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), _KEEP_WARM_ANSWERING_PANE]
+    calls: list[tuple[float, list[str]]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = kwargs.get("timeout")
+        assert isinstance(timeout, float)
+        calls.append((clock.now, list(cmd)))
+        if "capture-pane" not in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if timeout < 9.0:
+            # The clipped timeout kills the stall before it answers.
+            clock.sleep(timeout)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        clock.sleep(9.0)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=frames.pop(0) if len(frames) > 1 else frames[0],
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    budget = claude_native_bridge._KEEP_WARM_BRIDGE_BUDGET_S
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "btw_unavailable")
+    assert clock.now <= budget
+    key_sends = [sent_at for sent_at, cmd in calls if "send-keys" in cmd]
+    assert key_sends and all(sent_at <= budget for sent_at in key_sends)
 
 
 def test_keep_warm_btw_overlay_that_ignores_escape_fails_dismiss_failed(
@@ -14418,6 +14461,49 @@ def test_keep_warm_btw_history_hint_that_stays_sends_one_x_and_still_dismisses(
     assert result == claude_native_bridge.KeepWarmBtwResult("ok", None)
     assert [args[-1] for args in sends].count("x") == 1
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
+
+
+def test_keep_warm_tmux_deadline_clips_the_tmux_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound keep-warm deadline clips each tmux subprocess to the remaining
+    budget; past it a capture reads ``""`` without running tmux and a key
+    raises. With nothing bound both keep today's flat 10 s budget."""
+    clock = _VirtualClock()
+    calls: list[tuple[list[str], float]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((list(cmd), kwargs["timeout"]))
+        return SimpleNamespace(returncode=0, stdout="pane text", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    # Unbound: today's flat budget for every other caller.
+    assert claude_native_bridge._capture_pane("/tmp/s.sock", "claude:0.0") == "pane text"
+    assert calls[-1][1] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
+    claude_native_bridge._run_tmux("/tmp/s.sock", "send-keys", "-t", "claude:0.0", "Enter")
+    assert calls[-1][1] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
+
+    with claude_native_bridge._keep_warm_tmux_deadline(clock.monotonic() + 40.0):
+        clock.sleep(33.0)  # 7 s remain
+        claude_native_bridge._capture_pane("/tmp/s.sock", "claude:0.0")
+        assert calls[-1][1] == 7.0
+        clock.sleep(6.5)  # 0.5 s remains
+        claude_native_bridge._run_tmux("/tmp/s.sock", "send-keys", "-t", "claude:0.0", "Enter")
+        assert calls[-1][1] == 0.5
+        clock.sleep(1.0)  # past the deadline
+        calls.clear()
+        assert claude_native_bridge._capture_pane("/tmp/s.sock", "claude:0.0") == ""
+        with pytest.raises(RuntimeError, match="timed out"):
+            claude_native_bridge._run_tmux(
+                "/tmp/s.sock", "send-keys", "-t", "claude:0.0", "Escape"
+            )
+        assert calls == []  # tmux never ran for either
+
+    # Unbound again once the context exits.
+    claude_native_bridge._capture_pane("/tmp/s.sock", "claude:0.0")
+    assert calls[-1][1] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
 
 
 def test_tmux_pane_pid_parses_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:

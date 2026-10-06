@@ -62,6 +62,12 @@ _logger = logging.getLogger(__name__)
 # at this cadence/budget before falling back to the cache-read estimate.
 _KEEP_WARM_COST_POLL_INTERVAL_S = 0.5
 _KEEP_WARM_COST_POLL_TIMEOUT_S = 5.0
+# A real injection holding the pane's lock past this bounded acquire wait
+# skips the ping busy instead of letting it queue behind the injection.
+_KEEP_WARM_LOCK_WAIT_S = 1.0
+# Hard budget for the whole ping, measured from keep_warm entry; the
+# worst-case arithmetic lives at the bridge's _KEEP_WARM_BRIDGE_BUDGET_S.
+_KEEP_WARM_PING_BUDGET_S = 85.0
 # A measured ping cost above this multiple of the cache-read estimate means
 # the ping rebuilt the prompt cache instead of reading it.
 _KEEP_WARM_MISS_COST_FACTOR = 4
@@ -146,12 +152,14 @@ class ClaudeNativeExecutor(Executor):
         """
         Ping the pane with a guarded ``/btw`` side question (keep-warm).
 
-        An ``_inject_lock`` already held on entry means a real injection
-        owns the pane right now, so the ping skips ``busy`` at once
-        instead of waiting. Otherwise the whole guard-and-paste sequence
-        runs under ``_inject_lock``, so a real message arriving meanwhile
-        simply waits the few seconds the exchange takes — keystrokes
-        never interleave.
+        The ping takes ``_inject_lock`` only when it comes free within a
+        short bounded wait (:data:`_KEEP_WARM_LOCK_WAIT_S`); a lock that
+        stays held past it — a real injection owning the pane, or one
+        queued ahead of the ping — skips the ping ``busy`` instead of
+        letting it queue behind the injection. Once held, the whole
+        guard-and-paste sequence runs under the lock, so a real message
+        arriving meanwhile simply waits the few seconds the exchange
+        takes — keystrokes never interleave.
         Cancellation sets a stop flag the bridge checks before every
         key it sends, and the lock is released only after the worker
         thread finished. ``/btw`` answers have no tool access, so the
@@ -165,7 +173,11 @@ class ClaudeNativeExecutor(Executor):
         is still held, so a real turn settling meanwhile can never be
         billed to the ping. When the delta never lands, the receipt
         falls back to today's estimate: the session's current context
-        tokens priced as cache reads.
+        tokens priced as cache reads. The whole ping is bounded by
+        :data:`_KEEP_WARM_PING_BUDGET_S`: the settle poll is clipped to
+        it, and the estimate is priced off the lock under the remaining
+        budget — a slow catalog lookup reads as no estimate rather than
+        stretching the ping.
 
         :param attempt_id: Server-allocated ping attempt id, echoed on
             the receipt.
@@ -174,10 +186,15 @@ class ClaudeNativeExecutor(Executor):
         :returns: The normalized receipt dict.
         """
         del family
-        if self._inject_lock.locked():
-            # A held lock = a real injection in flight: skip; acquire on a free lock never yields.
+        deadline = time.monotonic() + _KEEP_WARM_PING_BUDGET_S
+        try:
+            async with asyncio.timeout(_KEEP_WARM_LOCK_WAIT_S):
+                await self._inject_lock.acquire()
+        except TimeoutError:
+            # A real injection owns the pane (or a queued waiter beat the
+            # ping to the release): skip instead of queueing behind it.
             return _keep_warm_receipt(attempt_id, outcome="skipped", reason="busy")
-        async with self._inject_lock:
+        try:
             cost_before = _total_cost_usd(read_claude_context_state(self._bridge_dir))
             try:
                 result = await self._keep_warm_btw()
@@ -192,14 +209,31 @@ class ClaudeNativeExecutor(Executor):
             # The measured window stays under the lock, so no injected
             # message can start a turn whose cost lands in the delta.
             cache_read = _current_context_tokens(self._bridge_dir)
-            estimate_usd = await asyncio.to_thread(
-                _keep_warm_cost_usd, self._bridge_dir, cache_read
+            poll_timeout = min(
+                _KEEP_WARM_COST_POLL_TIMEOUT_S,
+                max(0.0, deadline - time.monotonic()),
             )
             cost_after = (
-                await asyncio.to_thread(_poll_total_cost_usd, self._bridge_dir, cost_before)
+                await asyncio.to_thread(
+                    _poll_total_cost_usd, self._bridge_dir, cost_before, poll_timeout
+                )
                 if cost_before is not None
                 else None
             )
+        finally:
+            self._inject_lock.release()
+        # Priced off the lock and bounded by the remaining ping budget: a
+        # slow catalog lookup must not stretch the ping past it.
+        estimate_usd: float | None = None
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                async with asyncio.timeout(remaining):
+                    estimate_usd = await asyncio.to_thread(
+                        _keep_warm_cost_usd, self._bridge_dir, cache_read
+                    )
+            except TimeoutError:
+                estimate_usd = None
         if cost_before is not None and cost_after is not None:
             delta = cost_after - cost_before
             # No estimate → the measured delta still lands, but there is
@@ -626,7 +660,7 @@ def _total_cost_usd(state: dict[str, Any] | None) -> float | None:
     return float(raw)
 
 
-def _poll_total_cost_usd(bridge_dir: Path, before: float) -> float | None:
+def _poll_total_cost_usd(bridge_dir: Path, before: float, timeout_s: float) -> float | None:
     """
     Poll the statusLine snapshot for a cumulative cost larger than *before*.
 
@@ -635,10 +669,12 @@ def _poll_total_cost_usd(bridge_dir: Path, before: float) -> float | None:
 
     :param bridge_dir: Bridge directory path.
     :param before: The cumulative cost read before the ping.
+    :param timeout_s: Poll budget; the caller clips it to the ping's
+        remaining budget (:data:`_KEEP_WARM_COST_POLL_TIMEOUT_S` at most).
     :returns: The first larger total, or ``None`` when none landed inside
         the budget.
     """
-    deadline = time.monotonic() + _KEEP_WARM_COST_POLL_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     while True:
         after = _total_cost_usd(read_claude_context_state(bridge_dir))
         if after is not None and after > before:
