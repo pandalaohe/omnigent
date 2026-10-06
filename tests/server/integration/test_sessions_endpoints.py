@@ -3861,6 +3861,58 @@ async def test_auto_title_replaces_only_the_deterministic_seed(
     }
 
 
+async def test_auto_title_keeps_the_first_automatic_title(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    seeded = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout in production",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    first = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json() == {
+        "renamed": True,
+        "title": "Debug authentication timeout",
+        "reason": None,
+    }
+
+    second = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "A second automatic title"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "title_changed",
+    }
+
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["title"] == "Debug authentication timeout"
+
+
 async def test_auto_title_does_not_replace_explicit_title(
     client: httpx.AsyncClient,
 ) -> None:

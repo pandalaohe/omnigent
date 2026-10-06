@@ -203,6 +203,7 @@ _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
 _EXTERNAL_GOAL_STATE_TYPE = "external_goal_state"
 _CODEX_GOAL_UPDATED_METHOD = "thread/goal/updated"
 _CODEX_GOAL_CLEARED_METHOD = "thread/goal/cleared"
+_CODEX_THREAD_NAME_UPDATED_METHOD = "thread/name/updated"
 # Codex ``hook/completed`` carries one native lifecycle-hook run; its
 # ``run.entries`` can include warning/error diagnostics worth surfacing.
 # Model-directed context/feedback/stop entries are not UI diagnostics.
@@ -3437,6 +3438,60 @@ async def _post_codex_goal_state_if_changed(
         forwarder_state.posted_goal_state_known = True
 
 
+async def _post_codex_thread_name_as_auto_title(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    thread_name: object,
+) -> None:
+    """
+    Offer a Codex thread name to Omnigent as the session's automatic title.
+
+    The endpoint replaces only the first-message seed title, so supplied,
+    manual and earlier automatic titles are kept.
+
+    :param client: HTTP client for Omnigent posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param thread_name: Raw ``threadName`` param from the notification.
+    :returns: None. Never raises: a failed post only loses one title.
+    """
+    if not isinstance(thread_name, str):
+        return
+    title = " ".join(thread_name.split())
+    if len(title) < 2:
+        return
+    try:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/auto-title",
+            json={"title": title},
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Codex thread-name auto-title post failed for session %s",
+            session_id,
+            exc_info=True,
+        )
+        return
+    if response.status_code >= 400:
+        _logger.warning(
+            "Codex thread-name auto-title post was rejected for session %s: status=%s",
+            session_id,
+            response.status_code,
+        )
+        return
+    body: object = None
+    with contextlib.suppress(ValueError):
+        body = response.json()
+    renamed = body.get("renamed") if isinstance(body, dict) else None
+    reason = body.get("reason") if isinstance(body, dict) else None
+    _logger.info(
+        "Codex thread-name auto-title for session %s: renamed=%s reason=%s",
+        session_id,
+        renamed,
+        reason,
+    )
+
+
 async def _reconcile_codex_goal_state(
     codex_client: CodexAppServerClient,
     ap_client: httpx.AsyncClient,
@@ -3548,6 +3603,19 @@ async def _handle_event(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
     )
     if route_session_id is None:
+        return
+    if method == _CODEX_THREAD_NAME_UPDATED_METHOD:
+        if (
+            not is_child
+            and not is_replay
+            and expected_thread_id is not None
+            and _thread_id_from_params(params) == expected_thread_id
+        ):
+            await _post_codex_thread_name_as_auto_title(
+                client,
+                session_id=route_session_id,
+                thread_name=params.get("threadName"),
+            )
         return
     if method == _CODEX_HOOK_COMPLETED_METHOD:
         await _handle_hook_completed(client, route_session_id, params)

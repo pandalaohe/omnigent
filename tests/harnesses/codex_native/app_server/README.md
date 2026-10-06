@@ -6,6 +6,7 @@ parameterization produces additional collected cases.
 
 | Module | Behavior | Test definitions |
 | --- | --- | ---: |
+| [test_auto_title_socket.py](test_auto_title_socket.py) | Auto title socket | 7 |
 | [test_catalog_cache.py](test_catalog_cache.py) | Catalog cache | 16 |
 | [test_catalog_resolution.py](test_catalog_resolution.py) | Catalog resolution | 5 |
 | [test_client.py](test_client.py) | Client | 5 |

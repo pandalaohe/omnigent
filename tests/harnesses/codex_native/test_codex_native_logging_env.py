@@ -112,7 +112,11 @@ async def test_app_server_start_passes_native_filter_only_to_enabled_subprocess(
     with pytest.raises(SpawnObserved):
         await server.start()
 
-    expected = {**original_env, "CODEX_HOME": str(server.codex_home)}
+    expected = {
+        **original_env,
+        "CODEX_HOME": str(server.codex_home),
+        "CODEX_AUTO_TITLE_SOCKET_PATH": str(tmp_path / "codex.sock"),
+    }
     if enabled:
         expected["RUST_LOG"] = (
             host_filter if host_filter is not None else CODEX_DIAGNOSTIC_RUST_LOG
