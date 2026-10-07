@@ -4644,16 +4644,20 @@ def test_temp_dir_names_survive_daemon_and_runner_hops(
     monkeypatch.setenv("UNRELATED_SECRET_TOKEN", "must-not-forward")
 
     daemon_env = _build_host_daemon_env(server_url=server_url)
-    runner_env = _build_runner_env(
-        daemon_env,
-        server_url=server_url or "http://localhost:8000",
-        runner_id="runner_abc",
-        binding_token="tok",
-        workspace="/ws",
-        parent_pid=42,
-    )
+    # A foreground host spawns runners from its own env, a daemon from its filtered one.
+    runner_envs = [
+        _build_runner_env(
+            base,
+            server_url=server_url or "http://localhost:8000",
+            runner_id="runner_abc",
+            binding_token="tok",
+            workspace="/ws",
+            parent_pid=42,
+        )
+        for base in (dict(os.environ), daemon_env)
+    ]
 
-    for env in (daemon_env, runner_env):
+    for env in (daemon_env, *runner_envs):
         assert env["TEMP"] == r"D:\scratch\temp"
         assert env["TMP"] == r"D:\scratch\tmp"
         assert "UNRELATED_SECRET_TOKEN" not in env
