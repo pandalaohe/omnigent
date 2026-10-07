@@ -30,6 +30,7 @@ from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
+from omnigent.entities import Conversation
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
@@ -99,6 +100,9 @@ RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY = "omnigent.runner_log_runaway_seen"
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
 
+RunnerLogRunawayCallback = Callable[[list[Conversation], str], Awaitable[None]]
+"""Async ``(sessions, observed_at)`` hook after a runaway report flags its sessions."""
+
 
 def log_runner_exited(
     host_id: str,
@@ -147,6 +151,7 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: RunnerExitedCallback | None = None,
+    on_runner_log_runaway: RunnerLogRunawayCallback | None = None,
     on_resource_snapshot: (
         Callable[[HostConnection, HostResourceSnapshotFrame], None] | None
     ) = None,
@@ -204,6 +209,10 @@ def create_host_tunnel_router(
         reported runaway log growth (``host.runner_log_runaway``); the label
         reaches the web over the session-updates stream. ``None`` (e.g.
         minimal test wiring) drops the flag.
+    :param on_runner_log_runaway: Optional async callback fired after a
+        runaway report flags its sessions, with the flagged sessions and the
+        frame's ``observed_at`` detection instant. Used to keep a dismissal
+        alive while the host still confirms the detection.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -418,6 +427,7 @@ def create_host_tunnel_router(
                     host_registry,
                     runner_exit_reports,
                     on_runner_exited,
+                    on_runner_log_runaway,
                     on_resource_snapshot,
                     on_host_update,
                     conversation_store,
@@ -614,7 +624,7 @@ async def _mark_runner_log_runaway_sessions(
     runner_id: str,
     bytes_last_hour: int,
     observed_at: str,
-) -> None:
+) -> list[Conversation]:
     """Flag every session bound to a runner reporting runaway log growth.
 
     The label value is the crossing instant, so a fresh detection changes the
@@ -629,6 +639,7 @@ async def _mark_runner_log_runaway_sessions(
     :param bytes_last_hour: Bytes the runner wrote in the last hour.
     :param observed_at: ISO-8601 crossing instant, e.g.
         ``"2026-09-23T09:25:00+00:00"``.
+    :returns: The sessions the labels were written to.
     """
     sessions = await asyncio.to_thread(
         conversation_store.list_conversations_by_runner_id, runner_id
@@ -642,6 +653,7 @@ async def _mark_runner_log_runaway_sessions(
     }
     for session in sessions:
         await asyncio.to_thread(conversation_store.set_labels, session.id, labels)
+    return sessions
 
 
 async def _receive_loop(
@@ -652,6 +664,7 @@ async def _receive_loop(
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
+    on_runner_log_runaway: RunnerLogRunawayCallback | None,
     on_resource_snapshot: Callable[[HostConnection, HostResourceSnapshotFrame], None] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
     conversation_store: ConversationStore | None,
@@ -671,6 +684,9 @@ async def _receive_loop(
     :param on_runner_exited: Callback fired with ``(host_id, runner_id,
         error)`` when a ``host.runner_exited`` frame arrives; ``None``
         logs the session-less ``runner_exited`` event here instead.
+    :param on_runner_log_runaway: Callback fired with the flagged sessions
+        and the frame's ``observed_at`` after a ``host.runner_log_runaway``
+        frame labels them; ``None`` skips it.
     :param on_resource_snapshot: Callback fired with the connection and
         frame for every ``host.resource_snapshot``; ``None`` drops it.
     :param on_host_update: Callback fired after readiness changes persist;
@@ -814,12 +830,22 @@ async def _receive_loop(
                 ),
             )
             if conversation_store is not None:
-                await _mark_runner_log_runaway_sessions(
+                sessions = await _mark_runner_log_runaway_sessions(
                     conversation_store,
                     frame.runner_id,
                     frame.bytes_last_hour,
                     frame.observed_at,
                 )
+                if on_runner_log_runaway is not None and sessions:
+                    try:
+                        await on_runner_log_runaway(sessions, frame.observed_at)
+                    except Exception:
+                        # One failed hook must not tear down the tunnel.
+                        _logger.exception(
+                            "on_runner_log_runaway callback failed for %s/%s",
+                            host_id,
+                            frame.runner_id,
+                        )
             continue
 
         if isinstance(frame, HostResourceSnapshotFrame):

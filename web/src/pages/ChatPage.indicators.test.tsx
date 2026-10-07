@@ -217,51 +217,6 @@ describe("RunnerLogRunawayBanner", () => {
     );
     expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
   });
-
-  it("re-touches a dismissed flag while the lease is still live", () => {
-    // WHY: the dismissal must outlast the server's 30-day retention, so a
-    // stale-but-confirmed episode's dismissal is refreshed rather than pruned.
-    const dismissedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
-    localStorage.setItem(
-      "omnigent:runner-log-warnings",
-      JSON.stringify({ [RUNWAY_FLAG]: dismissedAt }),
-    );
-
-    render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
-
-    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
-    const mirrored = JSON.parse(
-      localStorage.getItem("omnigent:runner-log-warnings") ?? "null",
-    ) as Record<string, number>;
-    expect(mirrored[RUNWAY_FLAG]).toBeGreaterThan(dismissedAt);
-    expect(queuePatchMock).toHaveBeenLastCalledWith("runner_log_warnings", {
-      [RUNWAY_FLAG]: mirrored[RUNWAY_FLAG],
-    });
-  });
-
-  it("does not touch a dismissed flag once the lease has ended", () => {
-    const dismissedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
-    localStorage.setItem(
-      "omnigent:runner-log-warnings",
-      JSON.stringify({ [RUNWAY_FLAG]: dismissedAt }),
-    );
-
-    render(
-      <RunnerLogRunawayBanner
-        labels={{
-          ...confirmedLabels("7"),
-          "omnigent.runner_log_runaway_seen": new Date(Date.now() - 16 * 60 * 1000).toISOString(),
-        }}
-      />,
-    );
-
-    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
-    const mirrored = JSON.parse(
-      localStorage.getItem("omnigent:runner-log-warnings") ?? "null",
-    ) as Record<string, number>;
-    expect(mirrored[RUNWAY_FLAG]).toBe(dismissedAt);
-    expect(queuePatchMock).not.toHaveBeenCalled();
-  });
 });
 
 describe("ConnectionIndicator", () => {

@@ -2,7 +2,6 @@ import { queueUserPreferencePatch } from "./userPreferencesSync";
 
 export const RUNNER_LOG_WARNINGS_STORAGE_KEY = "omnigent:runner-log-warnings";
 export const RUNNER_LOG_WARNINGS_CHANGED_EVENT = "omnigent:runner-log-warnings-changed";
-export const RUNNER_LOG_WARNING_RETOUCH_MS = 24 * 60 * 60 * 1000;
 
 /** Dismissed detection instants mapped to the epoch-ms time of dismissal. */
 export type RunnerLogWarningDismissals = Record<string, number>;
@@ -52,34 +51,4 @@ export function dismissRunnerLogWarning(flag: string): void {
   }
   window.dispatchEvent(new Event(RUNNER_LOG_WARNINGS_CHANGED_EVENT));
   queueUserPreferencePatch("runner_log_warnings", next);
-}
-
-/**
- * A dismissal holds until a new detection, so clients re-touch it daily while
- * the detection is still confirmed; the server drops only entries untouched
- * for 30 days. Flags that are not dismissed are never added.
- */
-export function touchRunnerLogWarningDismissals(
-  flags: Iterable<string>,
-  now: number = Date.now(),
-): boolean {
-  if (typeof window === "undefined") return false;
-  const dismissed = readDismissedRunnerLogWarnings();
-  let changed = false;
-  for (const flag of flags) {
-    const dismissedAt = dismissed[flag];
-    if (dismissedAt === undefined) continue;
-    if (dismissedAt >= now - RUNNER_LOG_WARNING_RETOUCH_MS) continue;
-    dismissed[flag] = now;
-    changed = true;
-  }
-  if (!changed) return false;
-  try {
-    window.localStorage.setItem(RUNNER_LOG_WARNINGS_STORAGE_KEY, JSON.stringify(dismissed));
-  } catch {
-    // Storage denial or quota exhaustion must not break the banner.
-  }
-  window.dispatchEvent(new Event(RUNNER_LOG_WARNINGS_CHANGED_EVENT));
-  queueUserPreferencePatch("runner_log_warnings", dismissed);
-  return true;
 }

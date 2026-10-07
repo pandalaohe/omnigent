@@ -45,6 +45,7 @@ from omnigent.server.user_preferences_store import (
     read_collab_settings,
     read_keep_warm_settings,
     read_worktree_path_template,
+    touch_runner_log_warning_dismissals,
     validate_preferences_envelope,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -1451,6 +1452,108 @@ async def test_preferences_api_keeps_a_retouched_runaway_dismissal_and_prunes_un
         )
         assert patched.status_code == 200, patched.text
         assert patched.json()["settings"]["runner_log_warnings"] == {flag_retouched: retouched_at}
+
+
+def test_touch_runner_log_warning_dismissals_refreshes_only_stale_dismissed_flags(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server touch refreshes a stale dismissal and never adds a flag."""
+    import omnigent.server.user_preferences_store as store_module
+
+    clock = SimpleNamespace(now=1_800_000_000.0)
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(time=lambda: clock.now))
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    flag = "2026-10-07T06:22:16+00:00"
+    other_flag = "2026-10-06T06:22:16+00:00"
+    now_ms = clock.now * 1000.0
+    day_ms = 24 * 60 * 60 * 1000
+
+    # The server-side touch writes fail-closed without an account row.
+    SqlAlchemyAccountStore(db_uri).create_user_with_password(
+        "stale@example.com", "test-password-hash"
+    )
+    store.patch_namespace(
+        "stale@example.com",
+        "runner_log_warnings",
+        {flag: now_ms - 2 * day_ms, other_flag: now_ms - 2 * day_ms},
+    )
+    store.patch_namespace("fresh@example.com", "runner_log_warnings", {flag: now_ms - day_ms / 2})
+    store.patch_namespace(
+        "undismissed@example.com", "runner_log_warnings", {other_flag: now_ms - 2 * day_ms}
+    )
+    # An envelope without a backing account row cannot be written; the touch
+    # skips it without adding a count.
+    store.patch_namespace(
+        "no-account@example.com", "runner_log_warnings", {flag: now_ms - 2 * day_ms}
+    )
+    store.patch_namespace("garbage@example.com", "runner_log_warnings", [1, 2])
+    store.initialize("empty@example.com", {"version": 1, "settings": {}})
+
+    touched = touch_runner_log_warning_dismissals(
+        store,
+        [
+            "stale@example.com",
+            "fresh@example.com",
+            "undismissed@example.com",
+            "no-account@example.com",
+            "garbage@example.com",
+            "empty@example.com",
+            "missing@example.com",
+            "stale@example.com",
+        ],
+        flag,
+        now_ms=now_ms,
+    )
+
+    assert touched == 1
+    assert store.get("stale@example.com")["settings"]["runner_log_warnings"] == {
+        flag: now_ms,
+        other_flag: now_ms - 2 * day_ms,
+    }
+    assert store.get("fresh@example.com")["settings"]["runner_log_warnings"] == {
+        flag: now_ms - day_ms / 2
+    }
+    assert store.get("undismissed@example.com")["settings"]["runner_log_warnings"] == {
+        other_flag: now_ms - 2 * day_ms
+    }
+    assert store.get("no-account@example.com")["settings"]["runner_log_warnings"] == {
+        flag: now_ms - 2 * day_ms
+    }
+    assert store.get("garbage@example.com")["settings"]["runner_log_warnings"] == [1, 2]
+    assert store.get("empty@example.com") == {"version": 1, "settings": {}}
+    assert store.get("missing@example.com") is None
+
+
+def test_server_touched_dismissal_survives_a_stale_device_patch(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device's 40-day-old snapshot cannot age a server touch back out."""
+    import omnigent.server.user_preferences_store as store_module
+
+    clock = SimpleNamespace(now=1_800_000_000.0)
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(time=lambda: clock.now))
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    owner = "stale-device@example.com"
+    flag = "2026-09-01T06:22:16+00:00"
+    day_s = 24 * 60 * 60
+
+    SqlAlchemyAccountStore(db_uri).create_user_with_password(owner, "test-password-hash")
+    clock.now -= 40 * day_s
+    stale_touch = int(clock.now * 1000)
+    store.patch_namespace(owner, "runner_log_warnings", {flag: stale_touch})
+
+    # The host keeps confirming the detection, so the server touches yesterday.
+    clock.now += 39 * day_s
+    touched_at = clock.now * 1000.0
+    assert touch_runner_log_warning_dismissals(store, [owner], flag, now_ms=touched_at) == 1
+
+    # The stale device patches its 40-day-old touch; the per-key merge keeps
+    # the newer server touch and the prune spares it.
+    clock.now += day_s
+    merged = store.patch_namespace(owner, "runner_log_warnings", {flag: stale_touch})
+    assert merged["settings"]["runner_log_warnings"] == {flag: touched_at}
 
 
 @pytest.mark.asyncio

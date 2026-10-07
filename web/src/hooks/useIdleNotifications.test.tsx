@@ -56,7 +56,6 @@ import {
   markConversationSeen,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
-import { RUNNER_LOG_WARNINGS_STORAGE_KEY } from "@/lib/runnerLogWarningPreferences";
 import { useIdleNotifications } from "./useIdleNotifications";
 
 const useConvMock = vi.mocked(useConversations);
@@ -364,44 +363,6 @@ describe("useIdleNotifications runner-log runaway transitions", () => {
           : { [FLAG]: flag, [MB]: mb, ...(seen === undefined ? {} : { [SEEN]: seen }) },
     };
   }
-
-  beforeEach(() => {
-    localStorage.removeItem(RUNNER_LOG_WARNINGS_STORAGE_KEY);
-  });
-
-  it("re-touches a confirmed, dismissed runaway flag from the conversation list", () => {
-    const flag = "2026-09-23T09:25:00Z";
-    const dismissedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
-    localStorage.setItem(RUNNER_LOG_WARNINGS_STORAGE_KEY, JSON.stringify({ [flag]: dismissedAt }));
-
-    setConversations([runawayConv("a", flag, "7", new Date().toISOString())]);
-    renderHook(() => useIdleNotifications());
-
-    const mirrored = JSON.parse(
-      localStorage.getItem(RUNNER_LOG_WARNINGS_STORAGE_KEY) ?? "null",
-    ) as Record<string, number>;
-    expect(mirrored[flag]).toBeGreaterThan(dismissedAt);
-    // Re-touching a dismissal must not change notification behavior.
-    expect(showMock).not.toHaveBeenCalled();
-  });
-
-  it("leaves dismissals alone when the report is unconfirmed or has lapsed", () => {
-    const flag = "2026-09-23T09:25:00Z";
-    const dismissedAt = Date.now() - 2 * 24 * 60 * 60 * 1000;
-    const stored: Record<string, number> = { [flag]: dismissedAt };
-    localStorage.setItem(RUNNER_LOG_WARNINGS_STORAGE_KEY, JSON.stringify(stored));
-
-    setConversations([
-      runawayConv("a", flag),
-      runawayConv("b", flag, "7", new Date(Date.now() - 16 * 60 * 1000).toISOString()),
-    ]);
-    renderHook(() => useIdleNotifications());
-
-    expect(JSON.parse(localStorage.getItem(RUNNER_LOG_WARNINGS_STORAGE_KEY) ?? "null")).toEqual(
-      stored,
-    );
-    expect(showMock).not.toHaveBeenCalled();
-  });
 
   it("notifies once when a session's runaway flag appears", () => {
     setConversations([runawayConv("a")]);

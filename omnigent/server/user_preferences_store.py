@@ -86,9 +86,13 @@ APPROVAL_TIMEOUT_DEFAULT_MINUTES = 50
 APPROVAL_TIMEOUT_MAX_MINUTES = 1380
 
 RUNNER_LOG_WARNINGS_NAMESPACE = "runner_log_warnings"
-# Clients re-touch a dismissal daily while its detection is still confirmed,
-# so an entry is dropped only when no client touched it for this long.
+# The server re-touches a dismissal daily while the host still confirms its
+# detection, so an entry is dropped only once its detection stopped being
+# confirmed for this long.
 _RUNNER_LOG_WARNINGS_RETENTION_S = 30 * 24 * 60 * 60
+
+# How stale a still-confirmed dismissal must be before the server refreshes it.
+_RUNNER_LOG_WARNINGS_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 
 def _merge_runner_log_warnings(
@@ -139,6 +143,59 @@ def _prune_runner_log_warnings(value: dict[str, Any]) -> dict[str, Any]:
         and not isinstance(dismissed_at, bool)
         and dismissed_at >= cutoff_ms
     }
+
+
+def touch_runner_log_warning_dismissals(
+    store: SqlAlchemyUserPreferencesStore,
+    owners: Iterable[str],
+    flag: str,
+    *,
+    now_ms: float | None = None,
+) -> int:
+    """Refresh the owners whose dismissal of *flag* is older than a day.
+
+    A dismissal holds until a new detection. The host re-confirms a live
+    detection every few minutes, so touching it here at most daily keeps it
+    out of the 30-day prune for exactly as long as the detection is
+    confirmed. A flag that no owner dismissed is never added.
+
+    :param store: Preferences store holding the dismissals.
+    :param owners: Candidate owners; each distinct owner is visited once.
+    :param flag: Detection instant whose dismissal is refreshed.
+    :param now_ms: Touch instant in epoch ms; defaults to now.
+    :returns: How many owners were touched.
+    """
+    if now_ms is None:
+        now_ms = time.time() * 1000.0
+    touched = 0
+    for owner in dict.fromkeys(owners):
+        try:
+            envelope = store.get(owner)
+            if not isinstance(envelope, dict):
+                continue
+            settings = envelope.get("settings")
+            if not isinstance(settings, dict):
+                continue
+            value = settings.get(RUNNER_LOG_WARNINGS_NAMESPACE)
+            if not isinstance(value, dict):
+                continue
+            dismissed_at = value.get(flag)
+            if (
+                not isinstance(dismissed_at, (int, float))
+                or isinstance(dismissed_at, bool)
+                or dismissed_at >= now_ms - _RUNNER_LOG_WARNINGS_TOUCH_INTERVAL_MS
+            ):
+                continue
+            store.patch_namespace(
+                owner,
+                RUNNER_LOG_WARNINGS_NAMESPACE,
+                {flag: now_ms},
+                create_if_missing=False,
+            )
+        except (UserPreferencesValidationError, UserPreferencesUserNotFoundError):
+            continue
+        touched += 1
+    return touched
 
 
 @dataclass(frozen=True)

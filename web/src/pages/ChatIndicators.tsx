@@ -12,10 +12,7 @@ import {
   runnerLogRunawayLeaseEnd,
   runnerLogRunawayNotice,
 } from "@/lib/runnerLogRunaway";
-import {
-  dismissRunnerLogWarning,
-  touchRunnerLogWarningDismissals,
-} from "@/lib/runnerLogWarningPreferences";
+import { dismissRunnerLogWarning } from "@/lib/runnerLogWarningPreferences";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -78,7 +75,6 @@ export function RunnerLogRunawayBanner({
   const flag = effectiveLabels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY];
   const leaseEnd = runnerLogRunawayLeaseEnd(effectiveLabels);
   const dismissed = useDismissedRunnerLogWarnings();
-  const dismissedAt = flag === undefined ? undefined : dismissed[flag];
   const [now, setNow] = useState(() => Date.now());
 
   // One timer just past the lease end flips `now`, so the band disappears on
@@ -91,15 +87,6 @@ export function RunnerLogRunawayBanner({
     );
     return () => window.clearTimeout(timer);
   }, [leaseEnd]);
-
-  // A dismissal holds until a new detection; keep re-touching it while the
-  // host still confirms the report so the server's retention never drops it
-  // mid-episode.
-  useEffect(() => {
-    if (flag === undefined || dismissedAt === undefined || leaseEnd === null) return;
-    if (leaseEnd <= Date.now()) return;
-    touchRunnerLogWarningDismissals([flag]);
-  }, [flag, leaseEnd, dismissedAt]);
 
   if (notice === null || leaseEnd === null || !flag || leaseEnd <= now) return null;
   if (dismissed[flag] !== undefined) return null;
