@@ -1,7 +1,14 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
-import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
+import {
+  CodeBlockSendContext,
+  Message,
+  MessageAction,
+  MessageActions,
+  MessageContent,
+  MessageResponse,
+} from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -233,5 +240,78 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse code-block send", () => {
+  it("sends the whole trimmed block through a button ahead of wrap and copy", async () => {
+    const send = vi.fn(() => true);
+    render(
+      <CodeBlockSendContext.Provider value={send}>
+        <MessageResponse sendCodeBlocks>{"```ts\nfirst line\nsecond line\n```"}</MessageResponse>
+      </CodeBlockSendContext.Provider>,
+    );
+
+    const sendButton = await screen.findByRole("button", { name: "Send as message" });
+    const wrapButton = screen.getByRole("button", { name: "Toggle word wrap" });
+    const copyButton = screen.getByRole("button", { name: "Copy Code" });
+    const follows = Node.DOCUMENT_POSITION_FOLLOWING;
+
+    expect(sendButton.parentElement).toBe(wrapButton.parentElement);
+    expect(sendButton.compareDocumentPosition(wrapButton) & follows).toBe(follows);
+    expect(wrapButton.compareDocumentPosition(copyButton) & follows).toBe(follows);
+
+    fireEvent.click(sendButton);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith("first line\nsecond line");
+  });
+
+  it("renders no send button without the opt-in or without a provider", async () => {
+    const { unmount } = render(
+      <CodeBlockSendContext.Provider value={vi.fn(() => true)}>
+        <MessageResponse>{"```ts\nconst value = 1;\n```"}</MessageResponse>
+      </CodeBlockSendContext.Provider>,
+    );
+    await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(screen.queryByRole("button", { name: "Send as message" })).toBeNull();
+    unmount();
+
+    render(<MessageResponse sendCodeBlocks>{"```ts\nconst value = 1;\n```"}</MessageResponse>);
+    await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(screen.queryByRole("button", { name: "Send as message" })).toBeNull();
+  });
+
+  it("shows the check state after a successful send and ignores clicks while it shows", async () => {
+    const send = vi.fn(() => true);
+    const { unmount } = render(
+      <CodeBlockSendContext.Provider value={send}>
+        <MessageResponse sendCodeBlocks>{"```ts\nconst value = 1;\n```"}</MessageResponse>
+      </CodeBlockSendContext.Provider>,
+    );
+    const button = await screen.findByRole("button", { name: "Send as message" });
+
+    fireEvent.click(button);
+
+    expect(button.querySelector("path")).toHaveAttribute(
+      "d",
+      "M15.5607 3.99999L15.0303 4.53032L6.23744 13.3232C5.55403 14.0066 4.44599 14.0066 3.76257 13.3232L4.2929 12.7929L3.76257 13.3232L0.969676 10.5303L0.439346 9.99999L1.50001 8.93933L2.03034 9.46966L4.82323 12.2626C4.92086 12.3602 5.07915 12.3602 5.17678 12.2626L13.9697 3.46966L14.5 2.93933L15.5607 3.99999Z",
+    );
+    fireEvent.click(button);
+    expect(send).toHaveBeenCalledTimes(1);
+    unmount();
+
+    const refuse = vi.fn(() => false);
+    render(
+      <CodeBlockSendContext.Provider value={refuse}>
+        <MessageResponse sendCodeBlocks>{"```ts\nconst value = 1;\n```"}</MessageResponse>
+      </CodeBlockSendContext.Provider>,
+    );
+    const refusedButton = await screen.findByRole("button", { name: "Send as message" });
+
+    fireEvent.click(refusedButton);
+    fireEvent.click(refusedButton);
+
+    expect(refuse).toHaveBeenCalledTimes(2);
+    expect(refuse).toHaveBeenLastCalledWith("const value = 1;");
   });
 });

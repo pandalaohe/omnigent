@@ -4998,6 +4998,99 @@ describe("Composer — editing queued messages", () => {
   });
 });
 
+describe("Composer sendText (code-block send)", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      restoredSendDraft: null,
+      pendingRetryStableId: null,
+      queuedMessages: [],
+      sessionHarness: null,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    vi.restoreAllMocks();
+  });
+
+  it("sends a block through the empty composer via the typed-message path", () => {
+    const onSend = vi.fn();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps({ onSend })} ref={ref} />);
+
+    let sent = false;
+    act(() => {
+      sent = ref.current?.sendText("  hello world \n") ?? false;
+    });
+
+    expect(sent).toBe(true);
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("hello world", undefined);
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("routes a block naming a known skill through onSendSlashCommand", () => {
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} ref={ref} />);
+
+    act(() => {
+      ref.current?.sendText("/deslop fix the bug");
+    });
+
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("keeps a draft in progress and sends the block on its own", () => {
+    const onSend = vi.fn();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps({ onSend })} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "my draft" } });
+
+    let sent = false;
+    act(() => {
+      sent = ref.current?.sendText("ok") ?? false;
+    });
+
+    expect(sent).toBe(true);
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("ok");
+    expect(textarea()).toHaveValue("my draft");
+  });
+
+  it.each([{ disabled: true }, { sendDisabledReason: "x" }])(
+    "refuses to send when the composer is gated: %j",
+    (overrides) => {
+      const onSend = vi.fn();
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      render(<Composer {...composerProps({ onSend, ...overrides })} ref={ref} />);
+
+      let sent = true;
+      act(() => {
+        sent = ref.current?.sendText("hello world") ?? true;
+      });
+
+      expect(sent).toBe(false);
+      expect(onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("");
+    },
+  );
+});
+
 describe("Composer config gear", () => {
   beforeEach(() => {
     setComposerState({
