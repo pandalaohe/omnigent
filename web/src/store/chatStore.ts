@@ -543,6 +543,23 @@ export interface PendingUserMessage {
 }
 
 /**
+ * Live progress of the attachment upload a send is currently running.
+ *
+ * Set while a file is transferring and cleared when it settles, so the
+ * composer can show one "Uploading <name> — <n>%" row. Unset when nothing is
+ * uploading.
+ */
+export interface UploadProgress {
+  filename: string;
+  /**
+   * Transfer fraction in [0, 1], or `null` when the transport cannot report
+   * progress (the authenticated fetch path); the composer then shows the
+   * upload without a percentage.
+   */
+  fraction: number | null;
+}
+
+/**
  * A message the user submitted while the agent was busy. It is held
  * client-side — NOT yet POSTed — and shown in the docked queue strip above
  * the composer until the agent goes idle, when the head is flushed FIFO (one
@@ -632,6 +649,12 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * The attachment upload a send is currently running, if any. One row for
+   * the whole send: uploads are sequential, so the newest progress event
+   * wins. Cleared when the upload settles (success or failure).
+   */
+  uploadProgress: UploadProgress | null;
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -1626,7 +1649,17 @@ const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
 async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBlock> {
   const cached = uploadedFileBlockCache.get(file)?.get(sessionId);
   if (cached !== undefined) return cached;
-  const uploaded = await uploadFile(sessionId, file);
+  const progressName = file.name || "file";
+  const uploaded = await (async () => {
+    try {
+      return await uploadFile(sessionId, file, (fraction) => {
+        setterFor(sessionId)({ uploadProgress: { filename: progressName, fraction } });
+      });
+    } finally {
+      // Clear on both paths so a failed upload can't strand the row.
+      setterFor(sessionId)({ uploadProgress: null });
+    }
+  })();
   const block: ContentBlock = file.type.startsWith("image/")
     ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
     : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
@@ -1850,6 +1883,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  uploadProgress: null,
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,

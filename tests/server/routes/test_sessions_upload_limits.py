@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import tracemalloc
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, BinaryIO
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -15,7 +19,6 @@ from fastapi.testclient import TestClient
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
-from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
@@ -257,10 +260,15 @@ def test_send_admits_stored_upload_for_any_harness(
 
 def test_upload_rejects_oversized_filesystem_file(
     upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A zip over the filesystem per-file cap is rejected with 413."""
+    """A zip over the configured per-file cap is rejected with 413."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_bytes": 1024},
+    )
     client, session_id = upload_client
-    oversized = b"\x00" * (MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES + 1)
+    oversized = b"\x00" * 1025
     resp = _upload(client, session_id, "huge.zip", oversized, "application/zip")
     assert resp.status_code == 413, resp.status_code
 
@@ -397,23 +405,24 @@ async def test_parallel_uploads_cannot_overspend_the_filesystem_quota(
 ) -> None:
     """Two uploads racing for the last free slot: exactly one is stored."""
     import asyncio
+    import time
 
     import httpx
 
-    from omnigent.server.routes.sessions import routes_resources
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
 
     monkeypatch.setattr(
         "omnigent.server.server_config.filesystem_attachment_file_limit",
         lambda: 1,
     )
-    real_read = routes_resources._read_upload_capped
+    real_put_stream = LocalArtifactStore.put_stream
 
-    async def slow_read(file, limit):  # type: ignore[no-untyped-def]
+    def slow_put_stream(store, key, fileobj, *, max_bytes):  # type: ignore[no-untyped-def]
         # Widen the gap between the quota check and the store.
-        await asyncio.sleep(0.05)
-        return await real_read(file, limit)
+        time.sleep(0.05)
+        return real_put_stream(store, key, fileobj, max_bytes=max_bytes)
 
-    monkeypatch.setattr(routes_resources, "_read_upload_capped", slow_read)
+    monkeypatch.setattr(LocalArtifactStore, "put_stream", slow_put_stream)
     client, session_id = upload_client
     transport = httpx.ASGITransport(app=client.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
@@ -635,10 +644,19 @@ def test_failed_upload_releases_quota_and_can_retry(
             original_put(store, key, data[:1])
         raise OSError("test storage write failure")
 
+    def fail_put_stream(
+        store: LocalArtifactStore, key: str, fileobj: BinaryIO, *, max_bytes: int | None
+    ) -> None:
+        attempted_ids.append(key)
+        if partial_write:
+            original_put(store, key, fileobj.read(1))
+        raise OSError("test storage write failure")
+
     url = f"/v1/sessions/{session_id}/resources/files"
     upload = {"file": (filename, b"data", "application/octet-stream")}
     with monkeypatch.context() as storage_failure:
         storage_failure.setattr(LocalArtifactStore, "put", fail_put)
+        storage_failure.setattr(LocalArtifactStore, "put_stream", fail_put_stream)
         failed = client.post(url, files=upload)
     assert failed.status_code == 500, failed.text
     assert "Failed to upload file" in failed.text
@@ -655,3 +673,290 @@ def test_failed_upload_releases_quota_and_can_retry(
     files = SqlAlchemyFileStore(db_uri).list(session_id).data
     assert [stored.id for stored in files] == [retried.json()["id"]]
     assert len(conversations.list_items(session_id, type="resource_event").data) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancellations", [1, 2])
+async def test_cancelled_upload_waits_for_worker_then_rolls_back(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancellations: int,
+) -> None:
+    """A client disconnect during put_stream leaves no row, blob, or held lock."""
+    import threading
+
+    from omnigent.server.routes.sessions import routes_resources
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+
+    client, session_id = upload_client
+    lock = routes_resources._attachment_upload_lock(session_id)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    lock_at_finish: list[bool] = []
+    real_put_stream = LocalArtifactStore.put_stream
+
+    def blocking_put_stream(
+        store: LocalArtifactStore, key: str, fileobj: BinaryIO, *, max_bytes: int | None
+    ) -> int:
+        started.set()
+        assert release.wait(timeout=5)
+        result = real_put_stream(store, key, fileobj, max_bytes=max_bytes)
+        lock_at_finish.append(lock.locked())
+        finished.set()
+        return result
+
+    monkeypatch.setattr(LocalArtifactStore, "put_stream", blocking_put_stream)
+
+    transport = httpx.ASGITransport(app=client.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        upload = asyncio.create_task(
+            http.post(
+                f"/v1/sessions/{session_id}/resources/files",
+                files={"file": ("clip.mp4", b"\x00\x00\x00 fake mp4", "video/mp4")},
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        for _ in range(cancellations):
+            upload.cancel()
+            # Let each cancellation reach the handler's shielded await before
+            # the worker finishes — the race this test pins.
+            await asyncio.sleep(0.05)
+        assert lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await upload
+
+    assert finished.is_set()
+    # The lock must survive until the worker's write returned.
+    assert lock_at_finish == [True]
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    assert [p for p in Path(artifacts.storage_location).rglob("*") if p.is_file()] == []
+    assert not lock.locked()
+
+
+# ── request-size limits (scenario 10) ──────────────────────────────
+
+
+def test_upload_declared_content_length_over_request_limit_is_early_413(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared 3 GiB body is rejected before the handler runs (scenario 10)."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    handler = Mock(side_effect=AssertionError("upload handler ran for a rejected request"))
+    monkeypatch.setattr(routes_resources, "_enforce_filesystem_attachment_policy", handler)
+
+    client, session_id = upload_client
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        headers={"Content-Length": str(3 * 1024**3)},
+    )
+
+    assert response.status_code == 413, response.text
+    assert "2 GiB" in response.text
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+    handler.assert_not_called()
+
+
+def test_upload_chunked_body_over_request_limit_is_413(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chunked body without Content-Length is bounded as it arrives."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"attachment_max_upload_bytes": 1024},
+    )
+    client, session_id = upload_client
+    boundary = "test-boundary"
+    prefix = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="clip.mp4"\r\n'
+        "Content-Type: video/mp4\r\n\r\n"
+    ).encode()
+    suffix = f"\r\n--{boundary}--\r\n".encode()
+    chunks = [prefix + b"x" * 600, b"y" * 600 + suffix]
+
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        content=iter(chunks),
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 413, response.text
+    assert "1 KiB" in response.text
+
+
+# ── configured per-file / per-session limits ───────────────────────
+
+
+def test_configured_per_file_limit_rejects_by_path_upload(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An 11 MB by-path upload under a 10 MiB cap leaves no row and no blob (scenario 11)."""
+    limit = 10 * 1024 * 1024
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_bytes": limit},
+    )
+    client, session_id = upload_client
+    payload = b"\x00" * (limit + 1024 * 1024)
+
+    response = client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("clip.mp4", payload, "video/mp4")},
+    )
+
+    assert response.status_code == 413, response.text
+    assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    assert [p for p in Path(artifacts.storage_location).rglob("*") if p.is_file()] == []
+
+
+def test_zero_file_count_limit_means_unlimited(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``filesystem_attachment_max_files: 0`` lifts the per-session count (scenario 12)."""
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_files": 0},
+    )
+    client, session_id = upload_client
+    for index in range(25):
+        response = _upload(
+            client, session_id, f"clip{index}.mp4", b"\x00\x00\x00\x00", "video/mp4"
+        )
+        assert response.status_code == 201, response.text
+
+
+# ── streamed content route (scenario 13) ───────────────────────────
+
+
+def _get_without_buffering(
+    app: Any,
+    path: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], int]:
+    """Drive the ASGI app directly, discarding body chunks as they arrive.
+
+    ``httpx.ASGITransport`` accumulates the whole response in memory, which
+    would hide the streaming bound this test measures.
+    """
+
+    async def run() -> tuple[int, dict[str, str], int]:
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (key.lower().encode(), value.encode()) for key, value in (headers or {}).items()
+            ],
+            "client": ("127.0.0.1", 44444),
+            "server": ("testserver", 80),
+        }
+        status = 0
+        response_headers: dict[str, str] = {}
+        total = 0
+        delivered = False
+
+        async def receive() -> dict[str, object]:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            # Park the disconnect listener until the response cancels it.
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def send(message: dict[str, object]) -> None:
+            nonlocal status, response_headers, total
+            if message["type"] == "http.response.start":
+                status = int(message["status"])  # type: ignore[call-overload]
+                response_headers = {
+                    key.decode("latin-1").lower(): value.decode("latin-1")
+                    for key, value in message["headers"]  # type: ignore[union-attr]
+                }
+            elif message["type"] == "http.response.body":
+                total += len(message.get("body", b""))
+
+        await app(scope, receive, send)
+        return status, response_headers, total
+
+    return asyncio.run(run())
+
+
+def test_content_route_streams_local_blob_with_bounded_memory(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A 100 MB local blob streams chunked, far below one whole-file buffer."""
+    client, session_id = upload_client
+    file_store = SqlAlchemyFileStore(db_uri)
+    stored = file_store.create(
+        session_id=session_id,
+        filename="big.mp4",
+        bytes=100 * 1024 * 1024,
+        content_type="video/mp4",
+    )
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    source = tmp_path / "source.bin"
+    with source.open("wb") as handle:
+        handle.truncate(100 * 1024 * 1024)
+    with source.open("rb") as handle:
+        artifacts.put_stream(stored.id, handle, max_bytes=None)
+
+    url = f"/v1/sessions/{session_id}/resources/files/{stored.id}/content"
+
+    tracemalloc.start()
+    try:
+        status, headers, total = _get_without_buffering(client.app, url)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert status == 200
+    assert headers["content-length"] == str(100 * 1024 * 1024)
+    assert headers["content-type"] == "video/mp4"
+    assert "etag" in headers
+    assert headers["content-disposition"].startswith("attachment;")
+    assert headers["x-content-type-options"] == "nosniff"
+    assert total == 100 * 1024 * 1024
+    assert peak < 8 * 1024 * 1024
+
+
+def test_content_route_streamed_path_keeps_etag_and_304(
+    upload_client: tuple[TestClient, str],
+) -> None:
+    """The streamed local path still revalidates from the cached ETag."""
+    client, session_id = upload_client
+    uploaded = _upload(client, session_id, "clip.mp4", b"\x00\x00\x00 fake mp4", "video/mp4")
+    assert uploaded.status_code == 201, uploaded.text
+    file_id = uploaded.json()["id"]
+    url = f"/v1/sessions/{session_id}/resources/files/{file_id}/content"
+
+    first = client.get(url)
+    assert first.status_code == 200
+    assert first.content == b"\x00\x00\x00 fake mp4"
+    etag = first.headers["etag"]
+
+    cached = client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert cached.content == b""
+    assert cached.headers["etag"] == etag

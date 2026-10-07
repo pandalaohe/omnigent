@@ -6217,6 +6217,21 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "attachment_limits": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "format": "int64",
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Attachment Limits",
+            "type": "object"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -6355,7 +6370,8 @@
           "installable_harnesses",
           "dictation_available",
           "dictation_punctuation_available",
-          "branding"
+          "branding",
+          "attachment_limits"
         ],
         "title": "ServerInfoResponse",
         "type": "object"

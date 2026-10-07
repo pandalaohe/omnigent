@@ -83,6 +83,7 @@ vi.mock("@/lib/routing", () => ({
 
 vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
+  useChatStore: () => null,
 }));
 
 vi.mock("@/lib/identity", () => ({

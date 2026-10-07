@@ -18,6 +18,7 @@
  * Unauthed by design — must work before any cookie is present.
  */
 
+import type { AttachmentLimits } from "./attachments";
 import { hostFetch } from "./host";
 
 /**
@@ -209,6 +210,48 @@ export interface ServerInfo {
   dictation_punctuation_available?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+  /**
+   * Attachment size limits in bytes the server enforces (``null`` =
+   * unlimited) for the web to apply before uploading. ``undefined`` on an
+   * older server or an invalid payload — validation then falls back to the
+   * fixed client ceilings.
+   */
+  attachment_limits?: AttachmentLimits;
+}
+
+/** Keys of the ``attachment_limits`` payload the web understands. */
+const ATTACHMENT_LIMIT_KEYS = [
+  "upload_bytes",
+  "file_bytes",
+  "session_files",
+  "session_bytes",
+  "image_bytes",
+  "uncompressed_image_bytes",
+  "pdf_bytes",
+  "text_bytes",
+] as const;
+
+/**
+ * Parse ``attachment_limits`` off the probe payload.
+ *
+ * A missing or malformed value yields ``undefined`` so callers fall back to
+ * the built-in client ceilings; each valid entry is a non-negative byte count
+ * or ``null`` (unlimited). Any malformed entry invalidates the whole payload
+ * — a partially understood limit set is not safe to enforce.
+ */
+function parseAttachmentLimits(raw: unknown): AttachmentLimits | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const source = raw as Record<string, unknown>;
+  const limits: Record<string, number | null> = {};
+  for (const key of ATTACHMENT_LIMIT_KEYS) {
+    const value = source[key];
+    if (value === undefined) continue;
+    const valid =
+      value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+    if (!valid) return undefined;
+    limits[key] = value;
+  }
+  return Object.keys(limits).length > 0 ? (limits as AttachmentLimits) : undefined;
 }
 
 function parseBranding(raw: unknown): Branding | null {
@@ -369,6 +412,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           dictation_punctuation_available: data.dictation_punctuation_available === true,
           branding: parseBranding(data.branding),
+          attachment_limits: parseAttachmentLimits(data.attachment_limits),
         };
         return cachedServerInfo;
       }

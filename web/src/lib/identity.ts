@@ -495,6 +495,49 @@ async function _isWrongReplica(res: Response): Promise<boolean> {
   }
 }
 
+/**
+ * Build the auth headers {@link authenticatedFetch} would send for *url*.
+ *
+ * For callers that cannot use `fetch` — the standalone attachment upload goes
+ * through `XMLHttpRequest` for `upload.onprogress` — but still must
+ * authenticate as the current user. The 401 redirect is reused via
+ * {@link handleUnauthorizedResponse}; the wrong-replica retry stays on the
+ * fetch path, which the upload takes whenever a Databricks workspace is in
+ * play.
+ *
+ * @param url Request path, e.g. ``"/v1/sessions/<id>/resources/files"``.
+ * @returns The headers to set on the outgoing request.
+ */
+export async function authenticatedRequestHeaders(url: string): Promise<Headers> {
+  const headers = new Headers();
+  const stampEpoch = identityEpoch;
+  const stampConnectionId = currentIdentityConnectionId();
+  if (
+    identityMatchesCurrentConnection() &&
+    currentUserId &&
+    currentUserId !== RESERVED_USER_LOCAL
+  ) {
+    headers.set("X-Forwarded-Email", currentUserId);
+  }
+  // Resolve this session's host before deriving the slice key, mirroring
+  // authenticatedFetch, so a first request keys to the right replica.
+  const hostResolve = beginSessionHostResolve(url);
+  if (hostResolve !== null) await hostResolve;
+  // The resolve can span a Server switch; never send the previous Server's
+  // user to the new one.
+  if (headers.has("X-Forwarded-Email") && !identityIsCurrent(stampEpoch, stampConnectionId)) {
+    headers.delete("X-Forwarded-Email");
+  }
+  if (isDatabricksWorkspace()) {
+    const scope = hostScopeForUrl(url);
+    const derivedHostId = scope.scoped ? scope.hostId : modalHostId();
+    if (derivedHostId && !isHostKeyless(derivedHostId)) {
+      headers.set(SLICE_KEY_HEADER, derivedHostId);
+    }
+  }
+  return headers;
+}
+
 export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -620,33 +663,41 @@ export async function authenticatedFetch(
     clearHostKeyless(derivedHostId);
   }
 
+  handleUnauthorizedResponse(input, res);
+  return res;
+}
+
+/**
+ * The 401 side effect of {@link authenticatedFetch}, extracted so callers
+ * that cannot use `fetch` (the XHR attachment upload) can map a 401 exactly
+ * as `authenticatedFetch` would instead of duplicating the redirect.
+ *
+ * Session expired or cookie invalid — redirect to login IFF the server
+ * actually has a login page. Never on /auth/* paths (the LoginPage POSTs
+ * /auth/login and handles 401 itself) or when already on a login page (avoid
+ * the loop). The login URL comes from the capabilities probe (/v1/info →
+ * login_url): "/login" for accounts, "/auth/login" for OIDC, and **null for
+ * header mode (no login)**; a header-mode 401 must surface to the caller
+ * rather than bounce to a phantom /login form. Once-only (see
+ * {@link redirectToLogin}): a burst of 401s from one page load would
+ * otherwise pile up navigations to a page we're already headed to.
+ *
+ * When embedded, the host owns auth (e.g. cookie/session via workspaceFetch)
+ * and a 401 should surface to the caller, not trigger web's standalone OIDC
+ * redirect.
+ *
+ * @param input The original request URL (the /v1/me and /auth/ gates read it).
+ * @param res The 401 response to map.
+ */
+export function handleUnauthorizedResponse(input: RequestInfo | URL, res: Response): void {
   if (
-    // When embedded, the host owns auth (e.g. cookie/session via
-    // workspaceFetch) and a 401 should surface to the caller, not
-    // trigger web's standalone OIDC redirect.
     !getOmnigentHostConfig().fetcher &&
     res.status === 401 &&
     !input.toString().includes("/v1/me") &&
     !input.toString().includes("/auth/") &&
     !isOnLoginPath()
   ) {
-    // Session expired or cookie invalid — redirect to login IFF the
-    // server actually has a login page. Don't redirect on /auth/*
-    // paths (the LoginPage POSTs /auth/login and handles 401 itself)
-    // or when we're already on a login page (avoid the loop).
-    //
-    // Source the login URL from the capabilities probe (/v1/info →
-    // login_url): "/login" for accounts, "/auth/login" for OIDC, and
-    // **null for header mode (no login)**. In header mode a stray 401
-    // must NOT bounce the user to a phantom /login form — header is
-    // the default for a bare local server, so we surface the 401 to
-    // the caller instead. (serverLoginUrl from the /v1/me probe is a
-    // fallback for the brief window before capabilities resolves.)
-    // Once-only (see redirectToLogin): a burst of 401s from one page load
-    // all reach here, and re-assigning the same URL per failure just piles
-    // up navigations to a page we're already going to.
     const loginUrl = getCachedServerInfo()?.login_url ?? serverLoginUrl;
     if (loginUrl) redirectToLogin(loginUrl);
   }
-  return res;
 }

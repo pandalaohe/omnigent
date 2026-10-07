@@ -89,12 +89,6 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
-# Upload limits for files that the harness opens with filesystem tools.
-# The server enforces these per session, including copies between sessions.
-MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
-MAX_SESSION_FILESYSTEM_ATTACHMENTS: int = 20
-MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
-
 # These formats require the harness's filesystem tools. Match by extension
 # because browsers can mislabel Office documents as ZIP or generic binary data.
 _FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(

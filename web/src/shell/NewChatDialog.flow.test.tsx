@@ -116,6 +116,7 @@ vi.mock("@/store/chatStore", () => ({
   hydrateLocalConversation: (...args: unknown[]) => hydrateLocalConversationMock(...args),
   removeLocalConversation: (...args: unknown[]) => removeLocalConversationMock(...args),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
+  useChatStore: () => null,
 }));
 
 // The create races the POST against the updates stream's announcement of the

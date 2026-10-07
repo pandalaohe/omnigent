@@ -46,9 +46,11 @@ _ATTACH_BODY = "composer attachment e2e sample\n"
 # A video is not inlined: it attaches as a file the agent host receives by path.
 _MEDIA_NAME = "clip.mp4"
 
-# Larger than the composer's file ceiling, so ``addFiles`` rejects it.
+# Larger than the upload-request ceiling the server publishes to the SPA
+# (``attachment_max_upload_bytes``, default 2 GiB), so ``addFiles`` rejects it
+# client-side. The sparse file costs ~no disk: only its size matters here.
 _OVERSIZED_NAME = "recording.mov"
-_OVERSIZED_BYTES = 50 * 1024 * 1024 + 1
+_OVERSIZED_BYTES = 2 * 1024**3 + 1
 
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'

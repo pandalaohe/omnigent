@@ -31,6 +31,7 @@ from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.artifact_store import ArtifactStore
 
 
 class _ConversationStore:
@@ -2018,8 +2019,12 @@ async def test_delete_terminal_surfaces_runner_404(
 # ── Phase 1c: session-scoped file endpoint tests ────────────────
 
 
-class _InMemoryArtifactStore:
-    """Minimal artifact store backed by a dict for tests."""
+class _InMemoryArtifactStore(ArtifactStore):
+    """Minimal artifact store backed by a dict for tests.
+
+    Subclasses :class:`ArtifactStore` so the inherited ``put_stream`` /
+    ``local_path`` fallbacks stay in sync with the real interface.
+    """
 
     def __init__(self) -> None:
         self._blobs: dict[str, bytes] = {}

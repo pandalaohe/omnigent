@@ -164,6 +164,37 @@ def _config_positive_int(key: str, default: int) -> int:
     return value
 
 
+def _config_limit(key: str, default: int | None) -> int | None:
+    """Read a nullable size/count limit from the server config.
+
+    An absent key yields *default*; an explicit ``0`` means unlimited
+    (``None``); a negative or non-int value falls back to *default* with a
+    warning. Floats and bools count as non-int: truncating ``0.9`` to ``0``
+    would silently turn a mis-typed cap into "unlimited".
+
+    :param key: Top-level config key, e.g. ``"attachment_max_upload_bytes"``.
+    :param default: Value used when the key is absent or invalid.
+    :returns: The configured limit, ``None`` for unlimited, or *default*.
+    """
+    raw = load_server_config().get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, (bool, float)):
+        logger.warning("server config %s=%r is not an int — using default %r", key, raw, default)
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("server config %s=%r is not an int — using default %r", key, raw, default)
+        return default
+    if value == 0:
+        return None
+    if value < 0:
+        logger.warning("server config %s=%d is negative — using default %r", key, value, default)
+        return default
+    return value
+
+
 def copy_file_count_limit() -> int:
     """Max number of files a single copy-at-spawn request may copy.
 
@@ -200,43 +231,72 @@ def image_compression_concurrency() -> int:
     return _config_positive_int("image_compression_concurrency", MAX_IMAGE_COMPRESSION_CONCURRENCY)
 
 
-def filesystem_attachment_upload_limit() -> int:
-    """Max byte size of a single filesystem attachment.
+def filesystem_attachment_upload_limit() -> int | None:
+    """Max byte size of a single filesystem attachment, or ``None`` unlimited.
 
-    Config key ``filesystem_attachment_max_bytes``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
+    Config key ``filesystem_attachment_max_bytes``; unlimited by default,
+    ``0`` also means unlimited.
     """
-    from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
-
-    return _config_positive_int(
-        "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
-    )
+    return _config_limit("filesystem_attachment_max_bytes", None)
 
 
-def filesystem_attachment_file_limit() -> int:
+def filesystem_attachment_file_limit() -> int | None:
     """Max number of filesystem attachments one session may hold.
 
-    Config key ``filesystem_attachment_max_files``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
+    Config key ``filesystem_attachment_max_files``; unlimited by default,
+    ``0`` also means unlimited.
     """
-    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
-
-    return _config_positive_int(
-        "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS
-    )
+    return _config_limit("filesystem_attachment_max_files", None)
 
 
-def filesystem_attachment_total_bytes_limit() -> int:
+def filesystem_attachment_total_bytes_limit() -> int | None:
     """Max summed bytes of filesystem attachments per session.
 
-    Config key ``filesystem_attachment_max_total_bytes``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
+    Config key ``filesystem_attachment_max_total_bytes``; unlimited by
+    default, ``0`` also means unlimited.
     """
-    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+    return _config_limit("filesystem_attachment_max_total_bytes", None)
 
-    return _config_positive_int(
-        "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+
+# One upload request carries the whole multipart body, so this bounds the
+# transient spool space a single attachment can cost before the handler runs.
+ATTACHMENT_UPLOAD_REQUEST_DEFAULT_BYTES = 2 * 1024**3
+
+
+def attachment_upload_request_limit() -> int | None:
+    """Max encoded bytes of one attachment upload request, or ``None``.
+
+    Config key ``attachment_max_upload_bytes``; defaults to 2 GiB, ``0``
+    means unlimited.
+    """
+    return _config_limit("attachment_max_upload_bytes", ATTACHMENT_UPLOAD_REQUEST_DEFAULT_BYTES)
+
+
+def attachment_limits() -> dict[str, int | None]:
+    """Every attachment size limit the web client should enforce.
+
+    Published verbatim by ``GET /v1/info`` as ``attachment_limits`` (``None``
+    = unlimited). The first four are deployment settings read per call; the
+    last four are the fixed inline per-type caps from
+    :mod:`omnigent.runtime.content_resolver`.
+    """
+    from omnigent.runtime.content_resolver import (
+        IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
+        MAX_IMAGE_UPLOAD_BYTES,
+        MAX_PDF_UPLOAD_BYTES,
+        MAX_TEXT_UPLOAD_BYTES,
     )
+
+    return {
+        "upload_bytes": attachment_upload_request_limit(),
+        "file_bytes": filesystem_attachment_upload_limit(),
+        "session_files": filesystem_attachment_file_limit(),
+        "session_bytes": filesystem_attachment_total_bytes_limit(),
+        "image_bytes": MAX_IMAGE_UPLOAD_BYTES,
+        "uncompressed_image_bytes": IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
+        "pdf_bytes": MAX_PDF_UPLOAD_BYTES,
+        "text_bytes": MAX_TEXT_UPLOAD_BYTES,
+    }
 
 
 def filesystem_attachment_denied_extensions() -> frozenset[str]:

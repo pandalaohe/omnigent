@@ -72,6 +72,21 @@ describe("useComposerAttachments", () => {
     expect(result.current.attachmentError).toBeNull();
   });
 
+  it("uses the server-published limits instead of the fixed ceilings", () => {
+    const clip = new File([new Uint8Array(30)], "clip.mp4", { type: "video/mp4" });
+
+    const capped = renderHook(() => useComposerAttachments({ limits: { file_bytes: 10 } }));
+    act(() => capped.result.current.addFiles([clip]));
+    expect(capped.result.current.files).toEqual([]);
+    expect(capped.result.current.attachmentError).toContain("clip.mp4");
+
+    // null = unlimited for that category.
+    const unlimited = renderHook(() => useComposerAttachments({ limits: { file_bytes: null } }));
+    act(() => unlimited.result.current.addFiles([clip]));
+    expect(unlimited.result.current.files).toEqual([clip]);
+    expect(unlimited.result.current.attachmentError).toBeNull();
+  });
+
   it("keeps the supported files from a mixed batch and names every rejection", () => {
     const { result } = renderHook(() => useComposerAttachments());
 

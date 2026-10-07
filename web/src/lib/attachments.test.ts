@@ -141,4 +141,49 @@ describe("validateAttachments", () => {
     expect(accepted).toEqual([ok, zip, video]);
     expect(errors).toHaveLength(1);
   });
+
+  it("uses the server-published limits when given", () => {
+    const oversizedClip = makeFile("clip.mp4", "video/mp4", 30 * MB);
+    const { accepted, errors } = validateAttachments([oversizedClip], { file_bytes: 10 * MB });
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("clip.mp4");
+    expect(errors[0]).toContain("10 MB");
+  });
+
+  it("treats a null limit as unlimited for that category", () => {
+    // A video far over the fixed 50 MB ceiling still passes when the server
+    // publishes no per-file cap and the upload-request cap does not bound it.
+    const clip = makeFile("clip.mp4", "video/mp4", 4 * 1024 * MB);
+    const { accepted, errors } = validateAttachments([clip], {
+      file_bytes: null,
+      upload_bytes: null,
+    });
+    expect(accepted).toEqual([clip]);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("applies whichever of the upload and category caps is smaller", () => {
+    const pdf = makeFile("report.pdf", "application/pdf", 8 * MB);
+    // pdf_bytes alone would admit it; the 5 MB request cap wins.
+    const { accepted, errors } = validateAttachments([pdf], {
+      pdf_bytes: 20 * MB,
+      upload_bytes: 5 * MB,
+    });
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("5 MB");
+  });
+
+  it("checks nothing when every published limit is null", () => {
+    const huge = makeFile("clip.mp4", "video/mp4", 900 * MB);
+    const { accepted, errors } = validateAttachments([huge], {
+      upload_bytes: null,
+      file_bytes: null,
+      image_bytes: null,
+      uncompressed_image_bytes: null,
+      pdf_bytes: null,
+      text_bytes: null,
+    });
+    expect(accepted).toEqual([huge]);
+    expect(errors).toHaveLength(0);
+  });
 });

@@ -5973,6 +5973,36 @@ describe("Composer attachment picker", () => {
     expect(input.accept).toBe("");
     expect(input.getAttribute("data-testid")).toBe("composer-file-input");
   });
+
+  it("shows the upload progress row while an upload runs and drops it after", () => {
+    render(<Composer {...composerProps()} />);
+
+    expect(screen.queryByTestId("composer-upload-progress")).toBeNull();
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: { filename: "clip.mp4", fraction: 0.42 } });
+    });
+    const row = screen.getByTestId("composer-upload-progress");
+    expect(row).toHaveTextContent("Uploading clip.mp4 — 42%");
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: null });
+    });
+    expect(screen.queryByTestId("composer-upload-progress")).toBeNull();
+  });
+
+  it("shows the upload row without a percentage when progress is unknown", () => {
+    render(<Composer {...composerProps()} />);
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: { filename: "clip.mp4", fraction: null } });
+    });
+    expect(screen.getByTestId("composer-upload-progress")).toHaveTextContent("Uploading clip.mp4…");
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: null });
+    });
+  });
 });
 
 describe("saved sandbox inference policy", () => {

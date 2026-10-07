@@ -157,6 +157,7 @@ import {
   hydrateLocalConversation,
   removeLocalConversation,
   setPendingInitialPrompt,
+  useChatStore,
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
@@ -2549,6 +2550,11 @@ export function NewChatLandingScreen() {
     textareaRef.current?.setSelectionRange(pending.caret, pending.caret);
   });
 
+  // The server probe feeds attachment validation (undefined on an older
+  // server → the built-in ceilings).
+  const info = useServerInfo();
+  const uploadProgress = useChatStore((s) => s.uploadProgress);
+
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn. Validation
@@ -2566,6 +2572,7 @@ export function NewChatLandingScreen() {
     clearError,
   } = useComposerAttachments({
     initialFiles: restoredDraft?.files ?? [],
+    limits: info !== "loading" ? info.attachment_limits : undefined,
     // MOD-s10: accepted files take their `[image N]` / `[file N]` label and a
     // visible token at the caret. Runs before the append commits, so `files`
     // is still the prior list the labels count from.
@@ -2598,7 +2605,6 @@ export function NewChatLandingScreen() {
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
-  const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
@@ -7267,6 +7273,18 @@ export function NewChatLandingScreen() {
                         data-testid="new-chat-landing-attachment-error"
                       >
                         {attachmentError}
+                      </ComposerFeedbackRow>
+                    )}
+                    {/* The first send's in-flight upload, one row for the
+                        batch. No percentage when the transport cannot report
+                        one (the embedded/Databricks fetch path). */}
+                    {uploadProgress !== null && (
+                      <ComposerFeedbackRow data-testid="new-chat-upload-progress">
+                        {uploadProgress.fraction === null
+                          ? `Uploading ${uploadProgress.filename}…`
+                          : `Uploading ${uploadProgress.filename} — ${Math.round(
+                              uploadProgress.fraction * 100,
+                            )}%`}
                       </ComposerFeedbackRow>
                     )}
                     {/* No own bg — the pill paints the surface. An explicit bg-card

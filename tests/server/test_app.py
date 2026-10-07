@@ -459,6 +459,39 @@ async def test_info_includes_server_version(
     assert body["server_version"] == VERSION
 
 
+@pytest.mark.asyncio
+async def test_info_publishes_default_attachment_limits(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/v1/info`` advertises the attachment caps the web should enforce.
+
+    No config file → unlimited per-file/session limits, the 2 GiB upload
+    request cap, and the fixed inline per-type caps.
+    """
+    from omnigent.runtime.content_resolver import (
+        IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
+        MAX_IMAGE_UPLOAD_BYTES,
+        MAX_PDF_UPLOAD_BYTES,
+        MAX_TEXT_UPLOAD_BYTES,
+    )
+
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", dict)
+    resp = await client.get("/v1/info")
+
+    assert resp.status_code == 200
+    assert resp.json()["attachment_limits"] == {
+        "upload_bytes": 2 * 1024**3,
+        "file_bytes": None,
+        "session_files": None,
+        "session_bytes": None,
+        "image_bytes": MAX_IMAGE_UPLOAD_BYTES,
+        "uncompressed_image_bytes": IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
+        "pdf_bytes": MAX_PDF_UPLOAD_BYTES,
+        "text_bytes": MAX_TEXT_UPLOAD_BYTES,
+    }
+
+
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     output = BytesIO()
     Image.new("RGBA", (2, 2), color).save(output, format="PNG")
@@ -601,26 +634,29 @@ async def test_branding_snapshot_performs_no_request_time_io_or_decode(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        responses = await asyncio.gather(
+        logo_responses = await asyncio.gather(
             *(
                 client.get(path, headers={"Cookie": ""})
                 for _ in range(8)
                 for path in (
-                    "/v1/info",
                     "/v1/branding/logo/main",
                     "/v1/branding/logo/loading",
                     "/v1/branding/logo/favicon",
                 )
             )
         )
+        # `/v1/info` intentionally re-reads the deploy settings per call (the
+        # published attachment limits pick up a config edit without a restart),
+        # so it is exercised separately from the branding no-I/O guarantee.
+        info_responses = await asyncio.gather(
+            *(client.get("/v1/info", headers={"Cookie": ""}) for _ in range(8))
+        )
 
-    assert all(response.status_code == 200 for response in responses)
-    assert all(
-        response.content == payload
-        for response in responses
-        if response.request.url.path.startswith("/v1/branding/logo/")
-    )
-    assert (config_loads, logo_reads, validations, pillow_opens) == startup_counts
+    assert all(response.status_code == 200 for response in [*logo_responses, *info_responses])
+    assert all(response.content == payload for response in logo_responses)
+    # The branding snapshot is captured at startup: serving its assets must
+    # never re-read, re-validate or re-decode them.
+    assert (logo_reads, validations, pillow_opens) == startup_counts[1:]
 
 
 @pytest.mark.asyncio

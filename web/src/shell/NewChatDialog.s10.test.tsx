@@ -79,6 +79,9 @@ vi.mock("@/store/chatStore", () => ({
   removeLocalConversation: vi.fn(),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
   hasPendingLocalMessage: () => true,
+  // The landing composer reads upload progress from the store; no test here
+  // starts an upload, so the selector stub returns its empty value.
+  useChatStore: () => null,
 }));
 
 vi.mock("@/lib/sessionUpdatesSocket", () => ({

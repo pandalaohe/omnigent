@@ -208,6 +208,97 @@ def test_config_str_list_strips_and_drops_empty() -> None:
     assert config_str_list(["  a@x.com  ", "", "  "]) == ["a@x.com"]
 
 
+# ── _config_limit / attachment limits ─────────────────────────────
+
+
+def _pin_values(monkeypatch: pytest.MonkeyPatch, values: dict[str, object]) -> None:
+    monkeypatch.setattr(server_config_module, "load_server_config", lambda: values)
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ({}, 17),  # absent → default
+        ({"limit": 0}, None),  # 0 → unlimited
+        ({"limit": 42}, 42),  # positive → value
+    ],
+)
+def test_config_limit_absent_zero_and_positive(
+    monkeypatch: pytest.MonkeyPatch, values: dict[str, object], expected: int | None
+) -> None:
+    _pin_values(monkeypatch, values)
+    assert server_config_module._config_limit("limit", 17) == expected
+
+
+@pytest.mark.parametrize("bad", [-1, -100])
+def test_config_limit_negative_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: int,
+) -> None:
+    _pin_values(monkeypatch, {"limit": bad})
+    with caplog.at_level("WARNING", logger=server_config_module.__name__):
+        assert server_config_module._config_limit("limit", 17) == 17
+    assert "is negative" in caplog.text
+
+
+@pytest.mark.parametrize("bad", ["lots", [1], {"n": 1}, 1.5, True])
+def test_config_limit_non_int_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: object,
+) -> None:
+    _pin_values(monkeypatch, {"limit": bad})
+    with caplog.at_level("WARNING", logger=server_config_module.__name__):
+        assert server_config_module._config_limit("limit", 17) == 17
+    assert "is not an int" in caplog.text
+
+
+def test_config_limit_default_may_be_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_values(monkeypatch, {})
+    assert server_config_module._config_limit("limit", None) is None
+
+
+def test_attachment_limits_shape_and_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The published limits carry every key: unlimited defaults + inline caps."""
+    from omnigent.runtime.content_resolver import (
+        IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
+        MAX_IMAGE_UPLOAD_BYTES,
+        MAX_PDF_UPLOAD_BYTES,
+        MAX_TEXT_UPLOAD_BYTES,
+    )
+
+    _pin_values(monkeypatch, {})
+    assert server_config_module.attachment_limits() == {
+        "upload_bytes": 2 * 1024**3,
+        "file_bytes": None,
+        "session_files": None,
+        "session_bytes": None,
+        "image_bytes": MAX_IMAGE_UPLOAD_BYTES,
+        "uncompressed_image_bytes": IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
+        "pdf_bytes": MAX_PDF_UPLOAD_BYTES,
+        "text_bytes": MAX_TEXT_UPLOAD_BYTES,
+    }
+
+
+def test_attachment_limits_reflect_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured values win; 0 lifts the cap; the request cap has its own key."""
+    _pin_values(
+        monkeypatch,
+        {
+            "attachment_max_upload_bytes": 1024,
+            "filesystem_attachment_max_bytes": 0,
+            "filesystem_attachment_max_files": 3,
+            "filesystem_attachment_max_total_bytes": 4096,
+        },
+    )
+    limits = server_config_module.attachment_limits()
+    assert limits["upload_bytes"] == 1024
+    assert limits["file_bytes"] is None
+    assert limits["session_files"] == 3
+    assert limits["session_bytes"] == 4096
+
+
 def test_session_title_instructions_accepts_trimmed_string() -> None:
     assert (
         session_title_instructions(

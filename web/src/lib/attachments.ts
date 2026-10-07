@@ -40,6 +40,23 @@ const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
+/**
+ * Server-published attachment size limits in bytes (``GET /v1/info`` →
+ * ``attachment_limits``). ``null`` means unlimited; an absent key is not
+ * checked. When the whole object is absent (an older server), validation
+ * falls back to the fixed ceilings above.
+ */
+export interface AttachmentLimits {
+  upload_bytes?: number | null;
+  file_bytes?: number | null;
+  session_files?: number | null;
+  session_bytes?: number | null;
+  image_bytes?: number | null;
+  uncompressed_image_bytes?: number | null;
+  pdf_bytes?: number | null;
+  text_bytes?: number | null;
+}
+
 /** Keep unnamed clipboard images consistent before and after upload. */
 export function attachmentFilename(file: File): string {
   return file.name || "image.png";
@@ -187,26 +204,78 @@ export interface AttachmentValidation {
   errors: string[];
 }
 
+/** Human label for a byte limit, e.g. ``2 GB`` / ``50 MB`` / ``900 KB``. */
+function formatLimitBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) {
+    return `${Math.round(bytes / 1024 ** 3)} GB`;
+  }
+  if (bytes >= 1024 ** 2) {
+    return `${Math.round(bytes / 1024 ** 2)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+  return `${bytes} bytes`;
+}
+
+/**
+ * Effective per-file byte limit, or ``null`` when nothing bounds this file.
+ *
+ * With ``limits`` the server's published values win: the category's cap and
+ * the upload-request cap both apply (whichever is smaller), and ``null``/
+ * absent means that dimension is not checked. Without ``limits`` (an older
+ * server), the fixed client ceilings apply.
+ */
+function limitBytesFor(file: File, limits: AttachmentLimits | undefined): number | null {
+  const category = classifyAttachment(file);
+  const compressible = COMPRESSIBLE_IMAGE_MIMES.has(file.type || "");
+  if (limits === undefined) {
+    // Non-compressible images (SVG, …) can't be shrunk server-side, so they
+    // keep the smaller cap; compressible raster images get the large cap.
+    const limitMb =
+      category === "image" && !compressible
+        ? UNCOMPRESSED_IMAGE_LIMIT_MB
+        : ATTACHMENT_SIZE_LIMITS_MB[category];
+    return limitMb * 1024 * 1024;
+  }
+  const categoryKey: keyof AttachmentLimits =
+    category === "image"
+      ? compressible
+        ? "image_bytes"
+        : "uncompressed_image_bytes"
+      : category === "pdf"
+        ? "pdf_bytes"
+        : category === "text"
+          ? "text_bytes"
+          : "file_bytes";
+  const candidates = [limits[categoryKey], limits.upload_bytes].filter(
+    (value): value is number => typeof value === "number",
+  );
+  return candidates.length > 0 ? Math.min(...candidates) : null;
+}
+
 /**
  * Split *files* into accepted attachments and rejection messages. A file is
- * rejected when it exceeds the per-category size limit.
+ * rejected when it exceeds the effective per-category size limit — the
+ * server's published ``attachment_limits`` when given, else the fixed
+ * ceilings above.
  */
-export function validateAttachments(files: File[]): AttachmentValidation {
+export function validateAttachments(
+  files: File[],
+  limits?: AttachmentLimits,
+): AttachmentValidation {
   const accepted: File[] = [];
   const errors: string[] = [];
 
   for (const file of files) {
     const name = file.name || "file";
     const category = classifyAttachment(file);
-    // Non-compressible images (SVG, …) can't be shrunk server-side, so they
-    // keep the smaller cap; compressible raster images get the large cap.
-    const limitMb =
-      category === "image" && !COMPRESSIBLE_IMAGE_MIMES.has(file.type || "")
-        ? UNCOMPRESSED_IMAGE_LIMIT_MB
-        : ATTACHMENT_SIZE_LIMITS_MB[category];
-    if (file.size > limitMb * 1024 * 1024) {
+    const limitBytes = limitBytesFor(file, limits);
+    if (limitBytes !== null && file.size > limitBytes) {
       const limitLabel = category === "file" ? "files" : `${category} files`;
-      errors.push(`"${name}" is too large — the limit for ${limitLabel} is ${limitMb} MB.`);
+      errors.push(
+        `"${name}" is too large — the limit for ${limitLabel} is ${formatLimitBytes(limitBytes)}.`,
+      );
       continue;
     }
     accepted.push(file);

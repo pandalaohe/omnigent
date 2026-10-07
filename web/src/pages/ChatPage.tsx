@@ -2854,6 +2854,10 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  // Attachment validation limits from the server probe (undefined on an
+  // older server → the built-in ceilings).
+  const serverInfo = useServerInfo();
+  const uploadProgress = useChatStore((s) => s.uploadProgress);
   const {
     draft,
     value,
@@ -3211,6 +3215,7 @@ function ComposerImpl(
     clearError,
     clear: clearAttachments,
   } = useComposerAttachments({
+    limits: serverInfo !== "loading" ? serverInfo.attachment_limits : undefined,
     onAccepted: (accepted) => {
       // MOD-s10: the hook calls this before it commits the append, so
       // filesRef still holds the prior list — label the batch against it and
@@ -4574,6 +4579,16 @@ function ComposerImpl(
               {/* Rejected-attachment feedback: unsupported type or too large */}
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
+              )}
+              {/* The send's in-flight upload, one row for the whole batch.
+                  No percentage when the transport cannot report one (the
+                  embedded/Databricks fetch path). */}
+              {uploadProgress !== null && (
+                <ComposerFeedbackRow data-testid="composer-upload-progress">
+                  {uploadProgress.fraction === null
+                    ? `Uploading ${uploadProgress.filename}…`
+                    : `Uploading ${uploadProgress.filename} — ${Math.round(uploadProgress.fraction * 100)}%`}
+                </ComposerFeedbackRow>
               )}
               {/* "@"-mention chips — one per tagged workspace file/folder. Each is
             delivered as a "[Attached: <path>]" marker at send time. Ranged

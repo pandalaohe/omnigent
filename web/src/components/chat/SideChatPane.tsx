@@ -22,12 +22,18 @@ import {
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
 } from "@/components/chat/chatBubbleParts";
-import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
+import {
+  ChatComposer,
+  ComposerFeedbackRow,
+  ComposerSendButton,
+} from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { Button } from "@/components/ui/button";
-import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
+import { useChatStore, ensureConversationStreamed, type UploadProgress } from "@/store/chatStore";
+import { validateAttachments } from "@/lib/attachments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
@@ -134,6 +140,7 @@ export function SideChatPane({
     boundAgentId,
     loadingConversation,
     conversationLoadError,
+    uploadProgress,
   } = state;
 
   // Hide the forked-in history: snapshot the item ids present once hydration
@@ -297,6 +304,7 @@ export function SideChatPane({
           ) : (
             <SideChatComposer
               childId={childId}
+              uploadProgress={uploadProgress}
               agentId={boundAgentId}
               responseId={activeResponse?.responseId}
               interruptReady={interruptReady}
@@ -321,6 +329,7 @@ export function SideChatPane({
  */
 function SideChatComposer({
   childId,
+  uploadProgress,
   agentId,
   responseId,
   interruptReady,
@@ -330,6 +339,7 @@ function SideChatComposer({
   onStart,
 }: {
   childId: string;
+  uploadProgress: UploadProgress | null;
   agentId: string | null;
   responseId: string | undefined;
   interruptReady: boolean;
@@ -341,8 +351,10 @@ function SideChatComposer({
   const send = useChatStore((s) => s.send);
   const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
+  const serverInfo = useServerInfo();
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [autoSend, setAutoSend] = useState<string | null>(null);
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -412,10 +424,15 @@ function SideChatComposer({
           multiple
           className="hidden"
           onChange={(event) => {
-            if (event.target.files) {
-              setFiles((prev) => [...prev, ...Array.from(event.target.files ?? [])]);
-              event.target.value = "";
-            }
+            const selected = Array.from(event.target.files ?? []);
+            event.target.value = "";
+            if (selected.length === 0) return;
+            const { accepted, errors } = validateAttachments(
+              selected,
+              serverInfo !== "loading" ? serverInfo.attachment_limits : undefined,
+            );
+            if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
+            setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
           }}
         />
       )}
@@ -437,11 +454,28 @@ function SideChatComposer({
         }}
         slots={{
           attachments:
-            !pending && files.length > 0 ? (
-              <ComposerAttachments
-                files={files}
-                onRemove={(index) => setFiles((prev) => prev.filter((_, i) => i !== index))}
-              />
+            !pending &&
+            (files.length > 0 || attachmentError !== null || uploadProgress !== null) ? (
+              <>
+                {files.length > 0 && (
+                  <ComposerAttachments
+                    files={files}
+                    onRemove={(index) => setFiles((prev) => prev.filter((_, i) => i !== index))}
+                  />
+                )}
+                {attachmentError !== null && (
+                  <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
+                )}
+                {uploadProgress !== null && (
+                  <ComposerFeedbackRow data-testid="side-chat-upload-progress">
+                    {uploadProgress.fraction === null
+                      ? `Uploading ${uploadProgress.filename}…`
+                      : `Uploading ${uploadProgress.filename} — ${Math.round(
+                          uploadProgress.fraction * 100,
+                        )}%`}
+                  </ComposerFeedbackRow>
+                )}
+              </>
             ) : undefined,
         }}
         actions={{

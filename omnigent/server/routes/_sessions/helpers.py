@@ -12428,23 +12428,26 @@ def _enforce_filesystem_attachment_policy(
     session_id: str | None,
     file_store: FileStore,
     sizes: Sequence[int] | None = None,
-) -> int:
+) -> int | None:
     """
     Apply deployment policy to files requiring filesystem tools entering a session.
 
     Enforces the operator denylist and the per-session file-count and total-byte
     quotas before any bytes are read, so a rejected upload or copy never
     buffers. The server accounts for all stored uploads, including files that
-    are not currently present in the runner cache.
+    are not currently present in the runner cache. ``None`` from any limit
+    reader means that dimension is unlimited and is not checked.
 
     :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
     :param session_id: Destination session, whose existing attachments are counted,
         or ``None`` for a new, empty destination.
     :param file_store: Store used to total the session's current usage.
-    :param sizes: The incoming files' byte sizes when already known (a copy),
-        checked against the per-file and remaining-session limits. ``None``
-        for an upload, whose size is enforced by the returned read cap.
-    :returns: The byte cap a single upload must stay within.
+    :param sizes: The incoming files' byte sizes when already known (a copy or a
+        spooled upload), checked against the per-file and remaining-session
+        limits. ``None`` for an as-yet-unread upload, whose size is enforced by
+        the returned read cap.
+    :returns: The byte cap a single upload must stay within, or ``None`` when
+        neither the per-file limit nor the session's remaining budget applies.
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
     """
@@ -12477,8 +12480,8 @@ def _enforce_filesystem_attachment_policy(
     # quota is already exhausted, since the answer can't change after that.
     while (
         session_id is not None
-        and used_files + len(filenames) <= max_files
-        and used_bytes < max_total_bytes
+        and (max_files is None or used_files + len(filenames) <= max_files)
+        and (max_total_bytes is None or used_bytes < max_total_bytes)
     ):
         page = file_store.list(
             session_id=session_id,
@@ -12495,7 +12498,7 @@ def _enforce_filesystem_attachment_policy(
             break
         after = page.last_id
 
-    if used_files + len(filenames) > max_files:
+    if max_files is not None and used_files + len(filenames) > max_files:
         raise HTTPException(
             status_code=413,
             detail=(
@@ -12503,17 +12506,19 @@ def _enforce_filesystem_attachment_policy(
                 f"(limit {max_files}). Remove one before attaching another."
             ),
         )
-    remaining = max_total_bytes - used_bytes
-    if remaining <= 0 or (sizes is not None and sum(sizes) > remaining):
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"This session's file attachments would exceed the "
-                f"{max_total_bytes // (1024 * 1024)} MB limit "
-                f"({used_bytes // (1024 * 1024)} MB already used)."
-            ),
-        )
-    if sizes is not None and any(size > per_file for size in sizes):
+    remaining: int | None = None
+    if max_total_bytes is not None:
+        remaining = max_total_bytes - used_bytes
+        if remaining <= 0 or (sizes is not None and sum(sizes) > remaining):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"This session's file attachments would exceed the "
+                    f"{max_total_bytes // (1024 * 1024)} MB limit "
+                    f"({used_bytes // (1024 * 1024)} MB already used)."
+                ),
+            )
+    if per_file is not None and sizes is not None and any(size > per_file for size in sizes):
         raise HTTPException(
             status_code=413,
             detail=(f"File attachments are limited to {per_file // (1024 * 1024)} MB each."),
@@ -12522,6 +12527,10 @@ def _enforce_filesystem_attachment_policy(
     # Cap an upload at whichever is smaller: the per-file limit, or the
     # session's remaining budget. Without the second term a single upload could
     # overshoot the session total by nearly a whole file.
+    if per_file is None:
+        return remaining
+    if remaining is None:
+        return per_file
     return min(per_file, remaining)
 
 
