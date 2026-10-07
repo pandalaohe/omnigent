@@ -12,8 +12,12 @@ from omnigent.spec.skill_sources import (
     _harness_family,
     generic_walk_includes_agents,
     resolve_harness_skills,
+    resolve_session_skill_registry,
+    resolve_session_skills,
+    session_skill_roots,
     skill_source_context_from_env,
 )
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
 
 
 def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = None) -> None:
@@ -1369,3 +1373,139 @@ def test_codex_menu_tolerates_unreadable_marker_and_tier(
     monkeypatch.setattr("os.stat", _stat)
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "codex-native")]
     assert "plan" in names
+
+
+# ---------------------------------------------------------------------------
+# session registry and roots
+# ---------------------------------------------------------------------------
+
+
+def _agent_spec(harness: str) -> AgentSpec:
+    """A skill-less spec carrying *harness* as its executor kind."""
+    return AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+
+def test_session_registry_keeps_a_non_invocable_claude_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry drops only the menu's invocability filter, nothing else."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    _write_skill(home / ".claude" / "skills", "helper", user_invocable=False)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+    roots = (workspace,)
+
+    registry = [s.name for s in resolve_session_skill_registry(spec, roots, None)]
+    menu = [s.name for s in resolve_session_skills(spec, roots, None)]
+
+    assert "helper" in registry
+    assert menu == []
+
+
+def test_pi_session_registry_keeps_the_generic_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi's registry is bundled + the generic walk; its empty provider never runs."""
+    from omnigent.spec.parser import discover_host_skills
+
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".claude" / "skills", "ws-skill")
+    _write_skill(home / ".claude" / "skills", "claude-skill")
+    _write_skill(home / ".agents" / "skills", "agents-skill")
+    spec = _agent_spec("pi-native")
+
+    registry = resolve_session_skill_registry(spec, (workspace,), None)
+
+    assert [s.name for s in registry] == [s.name for s in discover_host_skills(workspace, "all")]
+    assert {s.name for s in registry} == {"ws-skill", "claude-skill", "agents-skill"}
+
+
+def test_session_skill_roots_dedup_and_fallback(tmp_path: Path) -> None:
+    """Roots are resolved, deduped, and fall back to the process cwd."""
+    cwd = tmp_path / "cwd"
+    bundle = tmp_path / "bundle"
+    cwd.mkdir()
+    bundle.mkdir()
+
+    assert session_skill_roots(None, None) == (Path.cwd(),)
+    assert session_skill_roots(cwd, cwd) == (cwd.resolve(),)
+    assert session_skill_roots(cwd, bundle) == (cwd.resolve(), bundle.resolve())
+
+
+def test_session_registry_harness_keyword_overrides_the_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner-side harness override picks the overridden family's sources."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_skill(home / ".agents" / "skills", "agents-only")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+
+    declared = [s.name for s in resolve_session_skill_registry(spec, (workspace,), None)]
+    overridden = [
+        s.name
+        for s in resolve_session_skill_registry(spec, (workspace,), None, harness="codex-native")
+    ]
+
+    assert "agents-only" not in declared
+    assert "agents-only" in overridden
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi-native"])
+def test_session_registry_survives_a_deleted_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """With no session root and an unlinked process cwd, bundled skills still load."""
+    bundled = SkillSpec(name="bundled", description="Bundled.", content="Do it.")
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        skills=[bundled],
+    )
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    roots = session_skill_roots(None, None)
+
+    assert roots == ()
+    assert resolve_session_skill_registry(spec, roots, None) == [bundled]
+
+
+def test_session_registry_honors_the_claude_portable_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the host switch off, a claude-sdk session cannot load ``.agents`` skills."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    _write_skill(home / ".agents" / "skills", "api-design")
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".claude" / "skills", "plan")
+    spec = _agent_spec("claude-sdk")
+    off_config = tmp_path / "off-config"
+    _write_config(off_config, "skills:\n  claude_portable_skills: false\n")
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-config"))
+    on = {s.name for s in resolve_session_skill_registry(spec, (ws,), None)}
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(off_config))
+    off = {s.name for s in resolve_session_skill_registry(spec, (ws,), None)}
+
+    assert {"plan", "api-design"} <= on
+    assert "plan" in off
+    assert "api-design" not in off

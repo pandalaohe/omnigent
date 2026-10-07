@@ -343,3 +343,23 @@ def test_load_skill_tool_accepts_namespaced_alias(tmp_path: Path, tool_ctx: Tool
     tool = LoadSkillTool([skill])
     result = tool.invoke(json.dumps({"name": "myplugin:brand-review"}), tool_ctx)
     assert result == "Review the brand."
+
+
+def test_load_skill_discover_host_false_uses_only_the_given_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skill_no_resources: SkillSpec,
+) -> None:
+    """``discover_host=False`` treats the given skills as the whole registry."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    host_skill_dir = tmp_path / ".claude" / "skills" / "host-only"
+    host_skill_dir.mkdir(parents=True)
+    (host_skill_dir / "SKILL.md").write_text(
+        "---\nname: host-only\ndescription: Host only.\n---\nbody\n"
+    )
+
+    discovering = LoadSkillTool([skill_no_resources], agent_root=tmp_path)
+    tool = LoadSkillTool([skill_no_resources], agent_root=tmp_path, discover_host=False)
+
+    assert "host-only" in {s.name for s in discovering.skills}
+    assert tool.skills == [skill_no_resources]

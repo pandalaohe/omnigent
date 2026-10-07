@@ -585,6 +585,7 @@ def build_native_relay_tool_schemas(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    skill_registry: list[SkillSpec] | None = None,
 ) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
@@ -607,6 +608,8 @@ def build_native_relay_tool_schemas(
     :param session_open_enabled: When ``True`` (peer messaging on and the
         session top-level) the session also advertises
         ``sys_session_open``.
+    :param skill_registry: A precomputed session skill registry the relayed
+        ``load_skill`` advertises; ``None`` keeps the manager's own discovery.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -650,6 +653,7 @@ def build_native_relay_tool_schemas(
             peer_messaging_enabled=peer_messaging_enabled,
             session_open_enabled=session_open_enabled,
             os_env_schema_only=True,
+            skill_registry=skill_registry,
         ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
@@ -1123,11 +1127,17 @@ def _granted_tool_names(
         peer_messaging_enabled=peer_messaging_enabled,
         session_open_enabled=session_open_enabled,
         os_env_schema_only=True,
+        # Names only: keep skill discovery out of the per-call grant check.
+        skill_registry=[],
     )
     try:
         names = set(manager.get_tool_names())
     finally:
         manager.shutdown()
+    # read_skill_file only reads inside skills load_skill already serves;
+    # its registration depends on discovery, not on the spec.
+    if "load_skill" in names:
+        names.add("read_skill_file")
     names.update(info.name for info in agent_spec.local_tools)
     if is_native_harness(harness):
         names.update(_OS_ENV_TOOLS)
@@ -9329,6 +9339,7 @@ async def execute_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    skill_bundle_dir: Path | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -9356,6 +9367,8 @@ async def execute_tool(
         caller knows it (the server's per-session override outranks the
         spec's declaration). Decides whether the native relay's
         unconditional ``sys_os_*`` counts toward the granted surface.
+    :param skill_bundle_dir: The session's bundle workdir, the skill
+        registry's second discovery root.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -9612,11 +9625,14 @@ async def execute_tool(
                 server_client=server_client,
             )
         elif tool_name in _SKILL_TOOLS:
-            output = _execute_skill_tool(
+            output = await asyncio.to_thread(
+                _execute_skill_tool,
                 tool_name,
                 args,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                bundle_workdir=skill_bundle_dir,
+                effective_harness=effective_harness,
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -9787,6 +9803,7 @@ async def dispatch_tool_locally(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    skill_bundle_dir: Path | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -9810,6 +9827,8 @@ async def dispatch_tool_locally(
         observe tool-launched terminals.
     :param effective_harness: Harness the session actually runs, forwarded to
         ``execute_tool`` for the granted-surface check.
+    :param skill_bundle_dir: The session's bundle workdir, forwarded to
+        ``execute_tool`` for the skill registry.
     :returns: The tool output string.
     """
     if not conversation_id:
@@ -9837,6 +9856,7 @@ async def dispatch_tool_locally(
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
         effective_harness=effective_harness,
+        skill_bundle_dir=skill_bundle_dir,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -11835,45 +11855,89 @@ def _inject_orchestrator_skills(
     return skills
 
 
+def session_skill_registry(
+    spec: AgentSpec,
+    harness: str | None,
+    cwd: Path | None,
+    bundle_workdir: Path | None,
+) -> list[SkillSpec]:
+    """The session's full skill registry — what ``load_skill`` may load.
+
+    :param spec: The session's resolved agent spec.
+    :param harness: The session's effective harness, or ``None`` for the
+        spec's declared harness.
+    :param cwd: The session's runtime cwd, or ``None``.
+    :param bundle_workdir: The materialized bundle workdir, or ``None``.
+    :returns: Bundled skills plus the harness's host skills, deduped.
+    """
+    from omnigent.spec.skill_sources import (
+        resolve_session_skill_registry,
+        session_skill_roots,
+    )
+
+    skills = _inject_orchestrator_skills(list(spec.skills), spec)
+    return resolve_session_skill_registry(
+        dataclasses.replace(spec, skills=skills),
+        session_skill_roots(cwd, bundle_workdir),
+        bundle_workdir,
+        harness=harness,
+    )
+
+
 def _execute_skill_tool(
     tool_name: str,
     args: _JsonObject,
     *,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    bundle_workdir: Path | None = None,
+    effective_harness: str | None = None,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
-    Both tools are built from one registry — the agent spec's bundled
-    skills merged with host-scope discovery from the runner workspace —
-    so anything ``load_skill`` can load, ``read_skill_file`` can read.
+    Both tools are built from one registry — with a spec, the session
+    registry for the effective harness; without one, the spec-less bundled
+    plus host-scope discovery — so anything ``load_skill`` can load,
+    ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
     :param args: Parsed JSON arguments from the LLM.
-    :param agent_spec: The session's AgentSpec.
-    :param runner_workspace: The runner's workspace path for
-        host-scope skill discovery.
+    :param agent_spec: The session's AgentSpec, or ``None``/a partial
+        stand-in for the spec-less path.
+    :param runner_workspace: The session's runtime cwd — the registry's
+        first root and the spec-less discovery root.
+    :param bundle_workdir: The session's bundle workdir (the registry's
+        second root), or ``None``.
+    :param effective_harness: The harness the session actually runs, when
+        the caller knows it; ``None`` falls back to the spec's declaration.
     :returns: Tool output string.
     """
+    from omnigent.spec.types import AgentSpec as _AgentSpec
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
-    bundled_skills = list(getattr(agent_spec, "skills", None) or [])
-    skills_filter = getattr(agent_spec, "skills_filter", "all")
-    # Auto-inject the build-omnigent skill for agents that opt into the
-    # orchestration surface (tools.agents). This teaches the LLM how to
-    # author valid agent configs via sys_os_write without requiring the
-    # agent's own bundle to ship a skills/ directory.
-    bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
-
-    # Both tools must resolve the same registry: a skill load_skill can load
-    # from host scope must have its files readable too.
-    load_tool = LoadSkillTool(
-        bundled_skills,
-        agent_root=runner_workspace,
-        skills_filter=skills_filter,
-    )
+    if not isinstance(agent_spec, _AgentSpec):
+        bundled_skills = list(getattr(agent_spec, "skills", None) or [])
+        skills_filter = getattr(agent_spec, "skills_filter", "all")
+        # Auto-inject the build-omnigent skill for agents that opt into the
+        # orchestration surface (tools.agents). This teaches the LLM how to
+        # author valid agent configs via sys_os_write without requiring the
+        # agent's own bundle to ship a skills/ directory.
+        bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
+        load_tool = LoadSkillTool(
+            bundled_skills,
+            agent_root=runner_workspace,
+            skills_filter=skills_filter,
+        )
+    else:
+        registry = session_skill_registry(
+            agent_spec,
+            _effective_harness_name(agent_spec, effective_harness),
+            runner_workspace,
+            bundle_workdir,
+        )
+        load_tool = LoadSkillTool(registry, discover_host=False)
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 
     arguments_json = json.dumps(args)
