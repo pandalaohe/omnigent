@@ -1361,6 +1361,99 @@ async def test_preferences_api_merges_stale_device_dismissals_and_prunes_old_one
 
 
 @pytest.mark.asyncio
+async def test_preferences_api_never_moves_a_runaway_dismissal_touch_backwards(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale device's older dismissed-at cannot lower the stored touch."""
+    import omnigent.server.user_preferences_store as store_module
+
+    clock = SimpleNamespace(now=1_800_000_000.0)
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(time=lambda: clock.now))
+
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    flag = "2026-10-07T06:22:16+00:00"
+    stored_touch = int(clock.now * 1000)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "runaway-stale@example.com"}
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": {flag: stored_touch}},
+        )
+        assert patched.status_code == 200, patched.text
+
+        # A second device still holds the previous day's snapshot of the key.
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": {flag: stored_touch - 24 * 60 * 60 * 1000}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["runner_log_warnings"] == {flag: stored_touch}
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_keeps_a_retouched_runaway_dismissal_and_prunes_untouched_ones(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daily re-touches keep an entry past 30 days; untouched ones still drop."""
+    import omnigent.server.user_preferences_store as store_module
+
+    clock = SimpleNamespace(now=1_800_000_000.0)
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(time=lambda: clock.now))
+
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    day_s = 24 * 60 * 60
+    flag_retouched = "2026-09-01T06:22:16+00:00"
+    flag_untouched = "2026-09-02T06:22:16+00:00"
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "runaway-retouch@example.com"}
+        # Both episodes were dismissed 40 days ago.
+        clock.now -= 40 * day_s
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={
+                "value": {
+                    flag_retouched: int(clock.now * 1000),
+                    flag_untouched: int(clock.now * 1000),
+                }
+            },
+        )
+        assert patched.status_code == 200, patched.text
+
+        # One was re-touched yesterday while its detection stayed confirmed.
+        clock.now += 39 * day_s
+        retouched_at = int(clock.now * 1000)
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": {flag_retouched: retouched_at}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["runner_log_warnings"] == {flag_retouched: retouched_at}
+
+        # The next write drops the entry no client touched for over 30 days
+        # while the re-touched entry survives.
+        clock.now += day_s
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": {}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["runner_log_warnings"] == {flag_retouched: retouched_at}
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_accepts_the_keep_warm_namespace(
     db_uri: str,
     runtime_init: None,

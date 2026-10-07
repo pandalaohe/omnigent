@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  RUNNER_LOG_WARNING_RETOUCH_MS,
   RUNNER_LOG_WARNINGS_STORAGE_KEY,
   dismissRunnerLogWarning,
   normalizeRunnerLogWarningPreferences,
   readDismissedRunnerLogWarnings,
+  touchRunnerLogWarningDismissals,
 } from "./runnerLogWarningPreferences";
 
 const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
@@ -105,6 +107,58 @@ describe("runnerLogWarningPreferences", () => {
     try {
       dismissRunnerLogWarning(FLAG_A);
       expect(changed).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener("omnigent:runner-log-warnings-changed", changed);
+    }
+  });
+
+  it("re-touches a dismissal older than a day and queues the full map", () => {
+    const now = DISMISSED_AT_A + 2 * RUNNER_LOG_WARNING_RETOUCH_MS;
+    localStorage.setItem(
+      RUNNER_LOG_WARNINGS_STORAGE_KEY,
+      JSON.stringify({ [FLAG_A]: DISMISSED_AT_A, [FLAG_B]: now - 60_000 }),
+    );
+
+    expect(touchRunnerLogWarningDismissals([FLAG_A], now)).toBe(true);
+    expect(readDismissedRunnerLogWarnings()).toEqual({
+      [FLAG_A]: now,
+      [FLAG_B]: now - 60_000,
+    });
+    expect(queuePatchMock).toHaveBeenLastCalledWith("runner_log_warnings", {
+      [FLAG_A]: now,
+      [FLAG_B]: now - 60_000,
+    });
+  });
+
+  it("leaves a dismissal touched within the last day alone and queues nothing", () => {
+    const now = DISMISSED_AT_A + 2 * RUNNER_LOG_WARNING_RETOUCH_MS;
+    const fresh = now - RUNNER_LOG_WARNING_RETOUCH_MS;
+    localStorage.setItem(RUNNER_LOG_WARNINGS_STORAGE_KEY, JSON.stringify({ [FLAG_A]: fresh }));
+
+    expect(touchRunnerLogWarningDismissals([FLAG_A], now)).toBe(false);
+    expect(readDismissedRunnerLogWarnings()).toEqual({ [FLAG_A]: fresh });
+    expect(queuePatchMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores flags that were never dismissed", () => {
+    localStorage.setItem(
+      RUNNER_LOG_WARNINGS_STORAGE_KEY,
+      JSON.stringify({ [FLAG_A]: DISMISSED_AT_A }),
+    );
+
+    expect(
+      touchRunnerLogWarningDismissals([FLAG_B], DISMISSED_AT_A + 2 * RUNNER_LOG_WARNING_RETOUCH_MS),
+    ).toBe(false);
+    expect(readDismissedRunnerLogWarnings()).toEqual({ [FLAG_A]: DISMISSED_AT_A });
+    expect(queuePatchMock).not.toHaveBeenCalled();
+  });
+
+  it("announces and returns false when nothing needs a touch", () => {
+    const changed = vi.fn();
+    window.addEventListener("omnigent:runner-log-warnings-changed", changed);
+    try {
+      expect(touchRunnerLogWarningDismissals([FLAG_A], DISMISSED_AT_A)).toBe(false);
+      expect(changed).not.toHaveBeenCalled();
     } finally {
       window.removeEventListener("omnigent:runner-log-warnings-changed", changed);
     }

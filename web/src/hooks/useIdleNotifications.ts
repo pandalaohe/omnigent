@@ -64,7 +64,12 @@ import {
   detectNewElicitations,
   detectNewRunnerLogRunaways,
 } from "@/lib/idleTransitions";
-import { runnerLogRunawayNotice } from "@/lib/runnerLogRunaway";
+import {
+  RUNNER_LOG_RUNAWAY_LABEL_KEY,
+  runnerLogRunawayLeaseEnd,
+  runnerLogRunawayNotice,
+} from "@/lib/runnerLogRunaway";
+import { touchRunnerLogWarningDismissals } from "@/lib/runnerLogWarningPreferences";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -282,6 +287,20 @@ export function useIdleNotifications(activeConversationId?: string): void {
     if (data === undefined) return;
     const conversations = data.pages.flatMap((page) => page.data);
     latestConversations.current = conversations;
+
+    // Keep dismissals of still-confirmed runaways alive across the server's
+    // retention window even while their sessions stay closed. The touch is a
+    // no-op for flags that are not dismissed or were touched in the last day.
+    const nowMs = Date.now();
+    const confirmedRunawayFlags: string[] = [];
+    for (const conversation of conversations) {
+      if (conversation.archived) continue;
+      const flag = conversation.labels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY];
+      const leaseEnd = runnerLogRunawayLeaseEnd(conversation.labels);
+      if (flag === undefined || leaseEnd === null || leaseEnd <= nowMs) continue;
+      confirmedRunawayFlags.push(flag);
+    }
+    touchRunnerLogWarningDismissals(confirmedRunawayFlags);
 
     // Badge first, before the empty-list bail below: an empty list must
     // still send 0 so a stale nonzero badge clears.

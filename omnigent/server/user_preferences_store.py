@@ -86,9 +86,38 @@ APPROVAL_TIMEOUT_DEFAULT_MINUTES = 50
 APPROVAL_TIMEOUT_MAX_MINUTES = 1380
 
 RUNNER_LOG_WARNINGS_NAMESPACE = "runner_log_warnings"
-# A detection instant cannot stay confirmed for weeks, so dismissal entries
-# older than this are pruned instead of evicting recently dismissed episodes.
+# Clients re-touch a dismissal daily while its detection is still confirmed,
+# so an entry is dropped only when no client touched it for this long.
 _RUNNER_LOG_WARNINGS_RETENTION_S = 30 * 24 * 60 * 60
+
+
+def _merge_runner_log_warnings(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge one device's dismissals, never moving a key's touch backwards.
+
+    A device holding a stale snapshot can carry an older dismissed-at for a
+    key another device already re-touched, so the larger numeric value wins.
+    Entries whose incoming value is not a number are dropped, which is what
+    pruning would do to them anyway.
+
+    :param existing: Stored ``runner_log_warnings`` map.
+    :param incoming: Incoming map for the same namespace.
+    :returns: A new merged map, ready for :func:`_prune_runner_log_warnings`.
+    """
+    merged: dict[str, Any] = dict(existing)
+    for flag, incoming_at in incoming.items():
+        if not isinstance(incoming_at, (int, float)) or isinstance(incoming_at, bool):
+            merged.pop(flag, None)
+            continue
+        stored_at = merged.get(flag)
+        if (
+            not isinstance(stored_at, (int, float))
+            or isinstance(stored_at, bool)
+            or incoming_at > stored_at
+        ):
+            merged[flag] = incoming_at
+    return merged
 
 
 def _prune_runner_log_warnings(value: dict[str, Any]) -> dict[str, Any]:
@@ -1014,7 +1043,10 @@ class SqlAlchemyUserPreferencesStore:
             else:
                 existing = settings.get(namespace)
                 if isinstance(existing, dict) and isinstance(value, dict):
-                    settings[namespace] = {**existing, **deepcopy(value)}
+                    if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
+                        settings[namespace] = _merge_runner_log_warnings(existing, value)
+                    else:
+                        settings[namespace] = {**existing, **deepcopy(value)}
                 else:
                     settings[namespace] = deepcopy(value)
             if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
