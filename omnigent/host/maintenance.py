@@ -10,10 +10,12 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -56,9 +58,24 @@ _RUNNER_LOG_NAME_RE = re.compile(
     r"^runner-(?P<session>.+?)-(?P<ts>\d{8}-\d{6}-\d{6})\.log(?:\.(?P<archive>\d+))?$"
 )
 
-# Runner-log runaway detection (see :class:`RunnerLogRunawayTracker`).
-_RUNNER_LOG_RUNAWAY_BYTES = 5 * 1024 * 1024
+# Runner-log runaway detection (see :class:`RunnerLogWarningCounter`).
+# Warning/error bytes (WARN/ERROR/CRIT records and their header-less traceback
+# lines) per sliding hour: healthy runners stay under 1 MB/h, while error
+# loops write 7-17 MB/h.
+_RUNNER_LOG_RUNAWAY_BYTES = 2 * 1024 * 1024
 _RUNNER_LOG_RUNAWAY_WINDOW_S = 60 * 60
+
+# Bytes read per chunk while classifying appended output; bounds the memory a
+# probe holds while still appending a pathological record.
+_RUNNER_LOG_WARNING_CHUNK_BYTES = 1024 * 1024
+
+# ``WARN  10-04 23:01:02`` record header, with an optional ANSI colour prefix
+# and reset around the level token.
+_RUNNER_LOG_HEADER_RE = re.compile(
+    rb"^(?:\x1b\[[\d;]*m)?(DEBUG|INFO|WARN|ERROR|CRIT)"
+    rb"(?:\x1b\[[\d;]*m)?\s+\d\d-\d\d \d\d:\d\d:\d\d"
+)
+_RUNNER_LOG_WARNING_LEVELS = (b"WARN", b"ERROR", b"CRIT")
 
 MaintenanceStage = tuple[str, Callable[[], Awaitable[object]]]
 _LockOutcome = Literal["acquired", "busy", "failed"]
@@ -358,17 +375,171 @@ def sweep_runner_logs(
     return counts
 
 
-class RunnerLogRunawayTracker:
-    """Detect runners whose logs grow faster than the runaway threshold.
+@dataclass
+class _RunnerLogWarningState:
+    """Warning-byte read state for one runner log."""
 
-    A host-owned state machine: the caller samples each live runner's log
-    size on a fixed cadence and feeds the samples here. Sizes accumulate into
-    a cumulative byte counter, so an in-place copytruncate — which resets the
-    file size to zero — never resets the measured rate; growth is measured
-    over a sliding window. A runner is reported once per crossing: after a
-    report, the tracker re-arms only when the windowed bytes fall back to or
-    below the threshold. :meth:`over_threshold` lets the caller re-confirm
-    the report on every sample while the runner stays over.
+    file_id: tuple[int, int]
+    offset: int
+    warning_bytes: int = 0
+    record_is_warning: bool = False
+    shrink_offset: int | None = None
+    carry: bytes = b""
+
+
+class RunnerLogWarningCounter:
+    """Count WARN/ERROR/CRIT bytes each runner appends to its log.
+
+    A runaway is a flood of warnings and errors, not raw log volume, so only
+    warning-level records and the header-less lines that follow them
+    (tracebacks, a child's raw stderr) count. A runner's first sighting starts
+    at the current end of its log: existing content is not this window's
+    output. A copytruncate keeps the count — bytes copied to ``<name>.1`` are
+    classified once, whether the shrink or the rotation report is seen first —
+    and a new file identity restarts at the beginning of the new file.
+
+    :meth:`advance` runs in a worker thread and may race the event loop's
+    :meth:`note_rotated`; the pending-rotation handoff is lock-protected.
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, _RunnerLogWarningState] = {}
+        self._pending_rotations: dict[str, tuple[int, tuple[int, int]]] = {}
+        self._lock = threading.Lock()
+
+    def advance(self, runner_id: str, path: Path) -> int | None:
+        """Classify the log bytes appended since the last call.
+
+        :param runner_id: Runner whose log is sampled.
+        :param path: Live log file.
+        :returns: Cumulative warning bytes, or ``None`` when the log cannot
+            be stat'ed.
+        """
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        file_id = (info.st_dev, info.st_ino)
+        size = info.st_size
+        with self._lock:
+            pending = self._pending_rotations.pop(runner_id, None)
+        state = self._states.get(runner_id)
+        if state is None:
+            # First sighting: existing content is not this window's output.
+            self._states[runner_id] = _RunnerLogWarningState(file_id=file_id, offset=size)
+            return 0
+        if pending is not None and pending[1] == state.file_id:
+            self._account_rotation(state, path, pending[0])
+        else:
+            # The rotation report follows its truncate within milliseconds, so
+            # a shrink still unreported a probe later was an outside truncate.
+            state.shrink_offset = None
+        if state.file_id != file_id:
+            # A replaced file: read the new file from its start.
+            state.file_id = file_id
+            state.offset = 0
+            state.shrink_offset = None
+            state.record_is_warning = False
+            state.carry = b""
+        elif size < state.offset:
+            # An in-place truncate this probe has not seen reported yet:
+            # remember where the archived copy resumes and restart the live
+            # read at zero.
+            state.shrink_offset = state.offset
+            state.offset = 0
+            state.record_is_warning = False
+            state.carry = b""
+        state.offset = self._read_lines(state, path, state.offset, size)
+        return state.warning_bytes
+
+    def note_rotated(self, runner_id: str, copied_size: int, file_id: tuple[int, int]) -> None:
+        """Record a copytruncate for the next :meth:`advance` to classify.
+
+        Called on the event loop thread right after the live file was copied
+        to ``<name>.1`` and truncated. No file I/O happens here.
+
+        :param runner_id: Runner whose log was rotated.
+        :param copied_size: Bytes the live file held when it was copied.
+        :param file_id: Source file identity, so a stale report is ignored.
+        """
+        with self._lock:
+            self._pending_rotations[runner_id] = (copied_size, file_id)
+
+    def retain(self, runner_ids: Collection[str]) -> None:
+        """Drop state (and pending rotations) for runners no longer owned.
+
+        :param runner_ids: Runner ids still tracked by the caller.
+        """
+        keep = set(runner_ids)
+        for runner_id in [rid for rid in self._states if rid not in keep]:
+            del self._states[runner_id]
+        with self._lock:
+            for runner_id in [rid for rid in self._pending_rotations if rid not in keep]:
+                del self._pending_rotations[runner_id]
+
+    def _account_rotation(
+        self, state: _RunnerLogWarningState, path: Path, copied_size: int
+    ) -> None:
+        """Classify the archived bytes the live file no longer holds."""
+        if state.shrink_offset is not None:
+            # The shrink was seen first: resume the archive where the live
+            # offset stopped and keep the live offset for post-rotation bytes.
+            start = state.shrink_offset
+            state.shrink_offset = None
+        else:
+            # The report was seen first: the live read restarts at zero.
+            start = state.offset
+            state.offset = 0
+        self._read_lines(state, _archive_path(path, 1), start, copied_size)
+
+    def _read_lines(self, state: _RunnerLogWarningState, path: Path, start: int, end: int) -> int:
+        """Classify ``[start, end)`` of *path*; return the bytes consumed."""
+        position = start
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                while position < end:
+                    chunk = handle.read(min(_RUNNER_LOG_WARNING_CHUNK_BYTES, end - position))
+                    if not chunk:
+                        break
+                    self._consume(state, chunk)
+                    position += len(chunk)
+        except OSError:
+            _logger.debug("runner log warning read failed: %s", path, exc_info=True)
+        return position
+
+    def _consume(self, state: _RunnerLogWarningState, data: bytes) -> None:
+        """Classify the complete lines in *data*, keeping a partial tail."""
+        buffer = state.carry + data
+        start = 0
+        while (newline := buffer.find(b"\n", start)) >= 0:
+            self._count_line(state, buffer[start : newline + 1])
+            start = newline + 1
+        state.carry = buffer[start:]
+        if len(state.carry) > _RUNNER_LOG_WARNING_CHUNK_BYTES:
+            # A record longer than a read chunk: count what is here as one
+            # line so memory stays bounded.
+            self._count_line(state, state.carry)
+            state.carry = b""
+
+    def _count_line(self, state: _RunnerLogWarningState, line: bytes) -> None:
+        header = _RUNNER_LOG_HEADER_RE.match(line)
+        if header is not None:
+            state.record_is_warning = header.group(1) in _RUNNER_LOG_WARNING_LEVELS
+        if state.record_is_warning:
+            state.warning_bytes += len(line)
+
+
+class RunnerLogRunawayTracker:
+    """Detect runners whose warning/error output exceeds the runaway threshold.
+
+    A host-owned state machine: the caller samples each live runner's
+    cumulative warning-byte count on a fixed cadence and feeds the totals
+    here. Growth is measured over a sliding window, so a copytruncate or a new
+    log file never resets the measured rate. A runner is reported once per
+    crossing: after a report, the tracker re-arms only when the windowed bytes
+    fall back to or below the threshold. :meth:`over_threshold` lets the caller
+    re-confirm the report on every sample while the runner stays over.
     """
 
     def __init__(
@@ -380,50 +551,26 @@ class RunnerLogRunawayTracker:
         self._window_s = window_s
         self._threshold_bytes = threshold_bytes
         self._samples: dict[str, deque[tuple[float, int]]] = {}
-        self._last_sizes: dict[str, int] = {}
-        self._file_ids: dict[str, tuple[int, int]] = {}
-        self._pre_rotation_sizes: dict[str, int] = {}
         self._reported: set[str] = set()
         self._windowed_bytes: dict[str, int] = {}
 
-    def observe(
-        self, runner_id: str, size_bytes: int, now: float, file_id: tuple[int, int] | None = None
-    ) -> int | None:
-        """Record one log-size sample.
+    def observe(self, runner_id: str, total_bytes: int, now: float) -> int | None:
+        """Record one cumulative warning-byte sample.
 
-        :param runner_id: Runner whose log was sampled.
-        :param size_bytes: Current log size in bytes.
+        :param runner_id: Runner whose counter was sampled.
+        :param total_bytes: Cumulative warning bytes from
+            :class:`RunnerLogWarningCounter`.
         :param now: Sample time in seconds, monotonic per caller.
         :returns: The windowed ``bytes_last_hour`` when this sample crosses
             the threshold and should be reported, else ``None``.
         """
         samples = self._samples.setdefault(runner_id, deque())
-        cumulative = samples[-1][1] if samples else 0
-        if file_id is not None:
-            if runner_id in self._file_ids and self._file_ids[runner_id] != file_id:
-                self._last_sizes.pop(runner_id, None)
-                self._pre_rotation_sizes.pop(runner_id, None)
-            self._file_ids[runner_id] = file_id
-        previous = self._last_sizes.get(runner_id)
-        if previous is None:
-            # First sighting: existing content is not this window's output.
-            delta = 0
-        elif size_bytes >= previous:
-            delta = size_bytes - previous
-        else:
-            # Copytruncate removed the file's content; those bytes are
-            # already in the counter, and the current size is output written
-            # since the truncate.
-            self._pre_rotation_sizes.setdefault(runner_id, previous)
-            delta = size_bytes
-        cumulative += delta
-        samples.append((now, cumulative))
-        self._last_sizes[runner_id] = size_bytes
+        samples.append((now, total_bytes))
         cutoff = now - self._window_s
         while len(samples) > 1 and samples[1][0] <= cutoff:
             samples.popleft()
 
-        bytes_last_hour = cumulative - samples[0][1]
+        bytes_last_hour = samples[-1][1] - samples[0][1]
         self._windowed_bytes[runner_id] = bytes_last_hour
         if bytes_last_hour > self._threshold_bytes:
             if runner_id in self._reported:
@@ -439,7 +586,7 @@ class RunnerLogRunawayTracker:
         The caller re-sends the report on every sample while this returns a
         value, always with the crossing instant.
 
-        :param runner_id: Runner whose log was sampled.
+        :param runner_id: Runner whose counter was sampled.
         :returns: The windowed ``bytes_last_hour`` from the latest
             :meth:`observe`, or ``None`` when the runner is not in a reported
             episode.
@@ -448,27 +595,6 @@ class RunnerLogRunawayTracker:
             return None
         return self._windowed_bytes.get(runner_id)
 
-    def note_rotated(
-        self,
-        runner_id: str,
-        copied_size: int,
-        now: float,
-        file_id: tuple[int, int] | None = None,
-    ) -> None:
-        """Account for bytes copied after the last sample and reset live size."""
-        if file_id is not None and self._file_ids.get(runner_id) != file_id:
-            return
-        previous = self._pre_rotation_sizes.pop(runner_id, None)
-        sampled_after_rotation = previous is not None
-        if previous is None:
-            previous = self._last_sizes.get(runner_id)
-        if previous is None:
-            return
-        samples = self._samples[runner_id]
-        samples.append((now, samples[-1][1] + max(0, copied_size - previous)))
-        if not sampled_after_rotation:
-            self._last_sizes[runner_id] = 0
-
     def retain(self, runner_ids: Collection[str]) -> None:
         """Drop state for runners this host no longer owns.
 
@@ -476,9 +602,6 @@ class RunnerLogRunawayTracker:
         """
         for runner_id in [rid for rid in self._samples if rid not in runner_ids]:
             del self._samples[runner_id]
-            self._last_sizes.pop(runner_id, None)
-            self._file_ids.pop(runner_id, None)
-            self._pre_rotation_sizes.pop(runner_id, None)
             self._reported.discard(runner_id)
             self._windowed_bytes.pop(runner_id, None)
 

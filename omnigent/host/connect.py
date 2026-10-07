@@ -132,7 +132,11 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
-from omnigent.host.maintenance import HostMaintenanceJanitor, RunnerLogRunawayTracker
+from omnigent.host.maintenance import (
+    HostMaintenanceJanitor,
+    RunnerLogRunawayTracker,
+    RunnerLogWarningCounter,
+)
 from omnigent.host.post_bind_hook import PostBindHookRunner
 from omnigent.host.pre_launch_command import run_pre_launch_command
 from omnigent.host.resource_sampler import ResourceSampler
@@ -312,10 +316,11 @@ def _connect_marker_path(log_path: Path) -> Path:
 # exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
 
-# Sample each live runner's log size on this cadence. A runner over the
-# runaway threshold is reported at the crossing and re-confirmed on every probe
-# while it stays over, with the crossing instant, so the server can tell a live
-# runaway from a stale one.
+# Sample each live runner's warning/error output on this cadence. The host
+# counts the WARN/ERROR/CRIT bytes each runner appends; a runner over the
+# runaway threshold is reported at the crossing and re-confirmed on every
+# probe while it stays over, with the crossing instant, so the server can tell
+# a live runaway from a stale one.
 _RUNNER_LOG_RUNAWAY_INTERVAL_S = 300.0
 
 # Resource-snapshot cadence: idle, and while the server holds a sampling
@@ -1253,6 +1258,7 @@ class HostProcess:
         # passes; runner startup never waits for them.
         self._maintenance_janitor: HostMaintenanceJanitor | None = None
         self._runner_log_runaway_tracker = RunnerLogRunawayTracker()
+        self._runner_log_warning_counter = RunnerLogWarningCounter()
         # runner_id → ISO instant of the current episode's crossing. Lives on
         # the host so re-confirmations survive a tunnel reconnect (the loop
         # task is restarted per connection).
@@ -1351,9 +1357,7 @@ class HostProcess:
     ) -> None:
         for runner_id, handle in self._runners.items():
             if handle.log_path == path:
-                self._runner_log_runaway_tracker.note_rotated(
-                    runner_id, copied_size, time.monotonic(), file_id
-                )
+                self._runner_log_warning_counter.note_rotated(runner_id, copied_size, file_id)
                 break
 
     def _tracked_runner_pids(self) -> set[int]:
@@ -4841,31 +4845,38 @@ class HostProcess:
         self,
         ws: websockets.asyncio.client.ClientConnection,
     ) -> None:
-        """Report live runners whose logs grow fast enough to look stuck.
+        """Report live runners whose warning/error output looks stuck.
 
         An error-looping runner can write its traceback to the log thousands
         of times an hour. The retention sweep bounds the file, not the loop,
-        so tell the server and let it warn the session's user. A runner is
-        reported at the crossing and re-confirmed on every probe while it
-        stays over, with the crossing instant, so the server can tell a live
-        runaway from a stale one.
+        so tell the server and let it warn the session's user. The counter
+        classifies the warning and error bytes each runner appends (off-loop);
+        a runner is reported at the crossing and re-confirmed on every probe
+        while it stays over, with the crossing instant, so the server can tell
+        a live runaway from a stale one.
         """
         tracker = self._runner_log_runaway_tracker
+        counter = self._runner_log_warning_counter
         since = self._runner_log_runaway_since
+
+        def _advance_all(runners: list[tuple[str, _RunnerHandle]]) -> dict[str, int | None]:
+            return {rid: counter.advance(rid, handle.log_path) for rid, handle in runners}
+
         while True:
             try:
-                tracker.retain(set(self._runners))
-                for runner_id in [rid for rid in since if rid not in self._runners]:
+                runner_ids = set(self._runners)
+                tracker.retain(runner_ids)
+                counter.retain(runner_ids)
+                for runner_id in [rid for rid in since if rid not in runner_ids]:
                     del since[runner_id]
                 now = time.monotonic()
-                for runner_id, handle in list(self._runners.items()):
-                    try:
-                        info = handle.log_path.stat()
-                    except OSError:
+                runners = list(self._runners.items())
+                totals = await asyncio.to_thread(_advance_all, runners)
+                for runner_id, handle in runners:
+                    total = totals[runner_id]
+                    if total is None:
                         continue
-                    crossing = tracker.observe(
-                        runner_id, info.st_size, now, (info.st_dev, info.st_ino)
-                    )
+                    crossing = tracker.observe(runner_id, total, now)
                     if crossing is not None:
                         since[runner_id] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                         bytes_last_hour = crossing

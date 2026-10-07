@@ -350,8 +350,8 @@ describe("useIdleNotifications runner-log runaway transitions", () => {
   const FLAG = "omnigent.runner_log_runaway";
   const MB = "omnigent.runner_log_runaway_mb";
   const BODY =
-    "This session's runner is writing logs unusually fast (7 MB in the last hour)" +
-    " — it may be stuck in an error loop.";
+    "This session's runner is writing warnings and errors to its log unusually fast" +
+    " (7 MB in the last hour) — it may be stuck in an error loop.";
 
   function runawayConv(id: string, flag?: string, mb = "7"): Conversation {
     return {

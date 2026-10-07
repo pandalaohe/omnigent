@@ -1,12 +1,12 @@
 // The session flag a host's runaway-log report becomes, and the warning copy
 // the banner and the browser notification share.
 //
-// The host samples each live runner's log size and reports a runner that
-// writes abnormally fast (a likely error loop). The server flags every
-// session bound to that runner; the flag value is the report instant, so a
-// fresh detection changes the value and the notification diff can fire once
-// per new value. The warning shows while the host keeps confirming the
-// report; dismissing it hides the band until the flag value changes.
+// The host counts each live runner's warning/error log output and reports a
+// runner that writes abnormally fast (a likely error loop). The server flags
+// every session bound to that runner; the flag value is the report instant, so
+// a fresh detection changes the value and the notification diff can fire once
+// per new value. The warning shows while the host keeps confirming the report;
+// dismissing it hides the band until the flag value changes.
 
 export const RUNNER_LOG_RUNAWAY_LABEL_KEY = "omnigent.runner_log_runaway";
 export const RUNNER_LOG_RUNAWAY_MB_LABEL_KEY = "omnigent.runner_log_runaway_mb";
@@ -45,7 +45,7 @@ export function runnerLogRunawayNotice(labels: Record<string, string> | undefine
   const mb = Number.isFinite(parsed) ? parsed : null;
   const amount = mb === null ? "" : ` (${mb} MB in the last hour)`;
   return (
-    `This session's runner is writing logs unusually fast${amount}` +
+    `This session's runner is writing warnings and errors to its log unusually fast${amount}` +
     " — it may be stuck in an error loop."
   );
 }

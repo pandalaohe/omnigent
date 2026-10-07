@@ -78,7 +78,9 @@ describe("RunnerLogRunawayBanner", () => {
     render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
     expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
     expect(
-      screen.getByText(/writing logs unusually fast \(7 MB in the last hour\)/),
+      screen.getByText(
+        /writing warnings and errors to its log unusually fast \(7 MB in the last hour\)/,
+      ),
     ).toBeInTheDocument();
     expect(screen.getByText(/may be stuck in an error loop/)).toBeInTheDocument();
   });
@@ -90,7 +92,9 @@ describe("RunnerLogRunawayBanner", () => {
 
   it("still warns without the rate when the MB label is missing", () => {
     render(<RunnerLogRunawayBanner labels={confirmedLabels()} />);
-    expect(screen.getByText(/writing logs unusually fast —/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/writing warnings and errors to its log unusually fast —/),
+    ).toBeInTheDocument();
   });
 
   it("uses the live list labels when the session snapshot has no warning", () => {

@@ -795,11 +795,11 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerLogRunawayFrame):
-            # One-way advisory: the runner's log is growing fast, which usually
-            # means an error loop. Flag every session the runner serves so the
-            # web can warn; the host re-sends this each probe while over, so the
-            # seen label stays fresh. The label is picked up by the
-            # session-updates stream like any other session change.
+            # One-way advisory: the runner is writing warnings and errors fast,
+            # which usually means an error loop. Flag every session the runner
+            # serves so the web can warn; the host re-sends this each probe
+            # while over, so the seen label stays fresh. The label is picked up
+            # by the session-updates stream like any other session change.
             _logger.warning(
                 "Host %s reported runner %s log runaway: %d bytes (observed_at=%s)",
                 host_id,

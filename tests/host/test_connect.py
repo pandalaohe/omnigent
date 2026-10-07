@@ -1748,15 +1748,9 @@ async def test_live_host_reconfirms_a_runaway_runner_log_with_its_crossing_insta
     class _SignallingTracker(_Tracker):
         """Tracker that signals the first sample so the test can grow the log."""
 
-        def observe(
-            self,
-            runner_id: str,
-            size_bytes: int,
-            now: float,
-            file_id: tuple[int, int] | None = None,
-        ) -> int | None:
+        def observe(self, runner_id: str, total_bytes: int, now: float) -> int | None:
             """Record the sample, then release the test's first-sample wait."""
-            result = super().observe(runner_id, size_bytes, now, file_id)
+            result = super().observe(runner_id, total_bytes, now)
             first_sample.set()
             return result
 
@@ -1774,7 +1768,8 @@ async def test_live_host_reconfirms_a_runaway_runner_log_with_its_crossing_insta
     task = asyncio.create_task(host._runner_log_runaway_loop(ws))
     try:
         await asyncio.wait_for(first_sample.wait(), timeout=2.0)
-        os.truncate(log_path, 6 * 1024 * 1024)
+        warn = b"WARN  10-07 14:00:00.000 runner.app run | boom\n"
+        log_path.write_bytes(warn * ((3 * 1024 * 1024) // len(warn) + 1))
         async with asyncio.timeout(2.0):
             while len(ws.sent) < 2:
                 await asyncio.sleep(0.01)
@@ -1791,7 +1786,7 @@ async def test_live_host_reconfirms_a_runaway_runner_log_with_its_crossing_insta
     assert all(isinstance(frame, HostRunnerLogRunawayFrame) for frame in frames)
     assert {frame.runner_id for frame in frames} == {"runner_runaway"}
     assert {frame.session_id for frame in frames} == {"conv_x"}
-    assert all(frame.bytes_last_hour >= 6 * 1024 * 1024 for frame in frames)
+    assert all(frame.bytes_last_hour >= 3 * 1024 * 1024 for frame in frames)
     # The crossing instant stays fixed across re-sends.
     assert len({frame.observed_at for frame in frames}) == 1
     # The payload carries no file path, which may contain user directories.
@@ -1819,13 +1814,7 @@ async def test_live_host_stops_reconfirming_a_runaway_runner_log_after_fall_back
             super().__init__()
             self.calls = 0
 
-        def observe(
-            self,
-            runner_id: str,
-            size_bytes: int,
-            now: float,
-            file_id: tuple[int, int] | None = None,
-        ) -> int | None:
+        def observe(self, runner_id: str, total_bytes: int, now: float) -> int | None:
             self.calls += 1
             return 6 * 1024 * 1024 if self.calls == 1 else None
 
@@ -1998,25 +1987,85 @@ async def test_resource_sampling_lease_expiry_returns_to_idle(
 async def test_host_rotation_accounts_for_unsampled_runner_log_bytes(
     tmp_path: Path, sample_first: bool
 ) -> None:
+    """A copytruncate neither loses nor double-counts warning bytes."""
     host = _make_host_process()
     log_path = tmp_path / "runner-conv_x-20260101-000000-000000.log"
-    log_path.touch()
-    info = log_path.stat()
-    file_id = (info.st_dev, info.st_ino)
+    log_path.write_bytes(b"")
     host._runners["runner_runaway"] = SimpleNamespace(log_path=log_path)  # type: ignore[assignment]
-    tracker = host._runner_log_runaway_tracker
+    counter = host._runner_log_warning_counter
 
-    assert tracker.observe("runner_runaway", 99 * 1024 * 1024, time.monotonic(), file_id) is None
+    assert counter.advance("runner_runaway", log_path) == 0
+    sampled = b"WARN  10-07 14:00:00.000 runner.app run | boom\n" * 2
+    log_path.write_bytes(sampled)
+    assert counter.advance("runner_runaway", log_path) == len(sampled)
+
+    # Warnings appended after the last advance and before the copy.
+    unsampled = b"ERROR 10-07 14:00:01.000 runner.app run | boom\n" * 3
+    with log_path.open("ab") as handle:
+        handle.write(unsampled)
+    info = log_path.stat()
+    copied_size = info.st_size
+    file_id = (info.st_dev, info.st_ino)
+    archive = tmp_path / f"{log_path.name}.1"
+    archive.write_bytes(log_path.read_bytes())
+    os.truncate(log_path, 0)
+
     if sample_first:
-        assert tracker.observe("runner_runaway", 0, time.monotonic(), file_id) is None
-    host._note_runner_log_rotated(log_path, 103 * 1024 * 1024, file_id)
-    if not sample_first:
-        assert tracker.observe("runner_runaway", 0, time.monotonic(), file_id) is None
-    assert (
-        tracker.observe("runner_runaway", 3 * 1024 * 1024, time.monotonic(), file_id)
-        == 7 * 1024 * 1024
-    )
+        counter.advance("runner_runaway", log_path)
+        host._note_runner_log_rotated(log_path, copied_size, file_id)
+    else:
+        host._note_runner_log_rotated(log_path, copied_size, file_id)
+        counter.advance("runner_runaway", log_path)
+
+    tail = b"CRIT  10-07 14:00:02.000 runner.app run | boom\n"
+    with log_path.open("ab") as handle:
+        handle.write(tail)
+    assert counter.advance("runner_runaway", log_path) == len(sampled) + len(unsampled) + len(tail)
+    # A quiet probe re-reads nothing and counts nothing twice.
+    assert counter.advance("runner_runaway", log_path) == len(sampled) + len(unsampled) + len(tail)
     host._runners.clear()
+    _cleanup_host(host)
+
+
+async def test_live_host_ignores_an_info_only_log_flood(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An INFO-only flood is volume, not a warning/error runaway."""
+    from omnigent.host.maintenance import RunnerLogRunawayTracker as _Tracker
+
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_LOG_RUNAWAY_INTERVAL_S", 0.01)
+    first_sample = asyncio.Event()
+
+    class _SignallingTracker(_Tracker):
+        """Tracker that signals the first sample so the test can flood the log."""
+
+        def observe(self, runner_id: str, total_bytes: int, now: float) -> int | None:
+            result = super().observe(runner_id, total_bytes, now)
+            first_sample.set()
+            return result
+
+    monkeypatch.setattr("omnigent.host.connect.RunnerLogRunawayTracker", _SignallingTracker)
+
+    host = _make_host_process()
+    log_path = tmp_path / "runner-conv_x-20260101-000000-000000.log"
+    log_path.write_bytes(b"")
+    host._runners["runner_info"] = SimpleNamespace(  # type: ignore[assignment]
+        log_path=log_path, session_id="conv_x"
+    )
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._runner_log_runaway_loop(ws))
+    try:
+        await asyncio.wait_for(first_sample.wait(), timeout=2.0)
+        info = b"INFO  10-07 14:00:00.000 runner.app run | ok\n"
+        log_path.write_bytes(info * ((3 * 1024 * 1024) // len(info) + 1))
+        await asyncio.sleep(0.1)
+    finally:
+        await _cancel(task)
+        host._runners.clear()
+
+    assert ws.sent == []
     _cleanup_host(host)
 
 
