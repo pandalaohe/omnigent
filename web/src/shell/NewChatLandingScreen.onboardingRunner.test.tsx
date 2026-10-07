@@ -49,7 +49,10 @@ vi.mock("@/lib/routing", () => ({
   useSearchParams: () => [searchParams, vi.fn()],
 }));
 
-vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
+vi.mock("@/store/chatStore", () => ({
+  setPendingInitialPrompt: vi.fn(),
+  useChatStore: () => null,
+}));
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
   getCurrentUserId: vi.fn(() => null),

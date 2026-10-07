@@ -78,10 +78,16 @@ reads a local copy outside the working checkout. See
 
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
-| `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
-| `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
-| `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
+| `attachment_max_upload_bytes` | `2147483648` (2 GiB) | Encoded bytes per upload request, any type |
+| `filesystem_attachment_max_bytes` | `0` (unlimited) | Bytes per file |
+| `filesystem_attachment_max_files` | `0` (unlimited) | Stored files of these types per session |
+| `filesystem_attachment_max_total_bytes` | `0` (unlimited) | Combined bytes of these types per session |
 | `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+
+An explicit `0` means unlimited. An invalid value (negative, non-numeric)
+falls back to the default with a server-log warning. The effective attachment
+limits are published to the web composer by `GET /v1/info` as
+`attachment_limits`.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser
@@ -89,7 +95,8 @@ reports a different MIME type. It does not identify file formats from their
 bytes, inspect archive entries, or detect renamed binary content. The denylist
 does not restrict files the agent creates or downloads through other tools.
 Images, PDFs, and text/code uploads retain their separate existing limits;
-the web composer also has a fixed 50 MiB ceiling for the formats listed above.
+the web composer validates against the limits published by `/v1/info`,
+falling back to its built-in ceilings on an older server.
 
 Request-phase policies receive the filename and content type for these files,
 with an empty `text` value. Their document, archive, and database contents are

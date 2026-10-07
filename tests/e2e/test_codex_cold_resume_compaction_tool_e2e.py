@@ -106,6 +106,8 @@ async def _write_cold_resume_rollout(codex_home: Path, workspace: Path) -> Path:
     """Rebuild a rollout through the production server-history seam."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{_SESSION_ID}/resources/files":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         assert request.url.path == f"/v1/sessions/{_SESSION_ID}/items", request.url
         return httpx.Response(200, json={"data": _stored_session_items(), "has_more": False})
 

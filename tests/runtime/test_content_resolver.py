@@ -707,6 +707,34 @@ def test_native_forward_defers_filesystem_files_and_resolves_the_rest() -> None:
     assert "file_id" not in resolved[1]
 
 
+def test_by_path_row_without_a_legacy_extension_is_deferred() -> None:
+    """The stored delivery key, not the extension, decides deferral."""
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    store = FakeFileStore(
+        files={
+            "file_video": StoredFile(
+                id="file_video",
+                created_at=1000,
+                filename="clip.mp4",
+                bytes=11,
+                content_type="video/mp4",
+                source_metadata={"delivery": "filesystem"},
+            )
+        }
+    )
+    block = {"type": "input_file", "file_id": "file_video", "filename": "renamed.txt"}
+
+    resolved = _resolve_message_content(
+        [block],
+        store,
+        FakeArtifactStore(blobs={}),  # type: ignore[arg-type]
+        defer_filesystem_files=True,
+    )
+
+    assert resolved == [block]
+
+
 # ── _resolve_content_type tests ───────────────────────────────────────
 
 

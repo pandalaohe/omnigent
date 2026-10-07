@@ -154,7 +154,6 @@ from omnigent.server.routes._sessions.helpers import (
     _codex_plan_mode_enabled,
     _discovery_key,
     _enforce_filesystem_attachment_policy,
-    _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
@@ -279,41 +278,6 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
-
-
-def _require_attachment_compatible_history(
-    session_id: str,
-    target_agent: Agent,
-    conversation_store: ConversationStore,
-    file_store: FileStore | None,
-    *,
-    up_to_response_id: str | None = None,
-) -> str | None:
-    """Reject a target that cannot replay files in the retained transcript.
-
-    :param session_id: Source session whose history will be retained.
-    :param target_agent: Agent selected for the fork or in-place switch.
-    :param conversation_store: Store containing the ordered source history.
-    :param file_store: Store containing authoritative attachment filenames.
-    :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
-    :returns: A retained filesystem attachment's name, or ``None``.
-    :raises OmnigentError: If the target cannot open a referenced attachment.
-    """
-    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
-
-    filename = _filesystem_attachment_in_history(
-        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
-    )
-    if filename is not None:
-        native = _native_coding_agent_for_agent(target_agent)
-        if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
-            raise OmnigentError(
-                f"This history includes '{filename}', which requires "
-                "Claude Code or Codex. Choose one of those harnesses, "
-                "or fork from before the attachment was sent.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-    return filename
 
 
 async def _wake_runner_for_model_change(
@@ -3990,15 +3954,6 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
-        await asyncio.to_thread(
-            _require_attachment_compatible_history,
-            source_id,
-            base_agent,
-            conversation_store,
-            file_store,
-            up_to_response_id=body.up_to_response_id,
-        )
-
         # Clone params for the fork's session-scoped agent. Created inside
         # fork_conversation's transaction (not agent_store.create): a
         # pre-created row would survive a fork failure as an orphaned
@@ -4259,10 +4214,12 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.inner.native_attachments import is_by_path
 
             filesystem_sources = [
-                stored for stored in fork_source_files if requires_filesystem(stored.filename)
+                stored
+                for stored in fork_source_files
+                if is_by_path(stored.filename, stored.source_metadata)
             ]
             if filesystem_sources:
                 await asyncio.to_thread(

@@ -79,6 +79,9 @@ vi.mock("@/store/chatStore", () => ({
   removeLocalConversation: vi.fn(),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
   hasPendingLocalMessage: () => true,
+  // The landing composer reads upload progress from the store; no test here
+  // starts an upload, so the selector stub returns its empty value.
+  useChatStore: () => null,
 }));
 
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
@@ -467,11 +470,14 @@ describe("NewChatLandingScreen MOD-s10 tokens", () => {
 
   it("T25 — a rejected file inserts no token", () => {
     renderLanding();
-    const rejected = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    // Over the 50 MB by-path cap, the only client-side rejection left.
+    const rejected = new File([new Uint8Array(50 * 1024 * 1024 + 1)], "clip.mp4", {
+      type: "video/mp4",
+    });
 
     attach([rejected]);
 
     expect(landingInput().value).toBe("");
-    expect(screen.getByText(/can't be attached/)).toBeInTheDocument();
+    expect(screen.getByText(/too large/)).toBeInTheDocument();
   });
 });

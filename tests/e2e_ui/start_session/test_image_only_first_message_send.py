@@ -168,7 +168,7 @@ def test_session_composer_image_only_draft_sends(
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
-    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(png))
+    page.get_by_test_id("composer-file-input").set_input_files(str(png))
     expect(page.get_by_role("button", name=f"Remove {_SCREENSHOT_NAME}")).to_be_visible(
         timeout=10_000
     )

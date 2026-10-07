@@ -498,6 +498,55 @@ function makeFakeSlotManager(
   };
 }
 
+/**
+ * Minimal XMLHttpRequest shim routing ``uploadFile`` through the fetch mock.
+ *
+ * ``uploadFile`` uses XHR for ``upload.onprogress``, but these store tests
+ * script every endpoint through ``fetchMock``. Delegating keeps the same mock
+ * handlers (URLs, gates, canned bodies) driving the upload path.
+ */
+class FetchBackedXHR {
+  method = "GET";
+  url = "";
+  status = 0;
+  statusText = "";
+  responseText = "";
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  private headers = new Headers();
+
+  open(method: string, url: string) {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(name: string, value: string) {
+    this.headers.set(name, value);
+  }
+
+  send(body?: BodyInit | null) {
+    void (async () => {
+      try {
+        // Halfway through, so a held upload is observably "in progress".
+        this.upload.onprogress?.({ lengthComputable: true, loaded: 1, total: 2 } as ProgressEvent);
+        const response = await fetchMock(this.url, {
+          method: this.method,
+          body,
+          headers: this.headers,
+        });
+        this.status = response.status;
+        this.statusText = response.statusText;
+        this.responseText = await response.text();
+        this.upload.onprogress?.({ lengthComputable: true, loaded: 2, total: 2 } as ProgressEvent);
+        this.onload?.();
+      } catch {
+        this.onerror?.();
+      }
+    })();
+  }
+}
+
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   sessionSnapshots = new Map();
@@ -537,6 +586,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultFetchHandler);
   vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("XMLHttpRequest", FetchBackedXHR);
 });
 
 afterEach(() => {
@@ -5655,6 +5705,48 @@ describe("chatStore — send (file attachments)", () => {
       { type: "input_image", file_id: "file_real_abc123", filename: "photo.png" },
       { type: "input_text", text: "look at this" },
     ]);
+  });
+
+  it("exposes upload progress while the upload runs, then clears it", async () => {
+    // The composer's "Uploading <name> — <n>%" row reads this field; it must
+    // be set on the sending conversation while the transfer is in flight and
+    // cleared once the upload settles.
+    useChatStore.setState({
+      conversationId: "conv_progress",
+      abortController: new AbortController(),
+    });
+
+    let releaseUpload: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_progress/resources/files")) {
+        return new Promise<Response>((resolve) => {
+          releaseUpload = () =>
+            resolve(
+              mockResponse({
+                id: "file_progress",
+                name: "clip.mp4",
+                metadata: { filename: "clip.mp4", bytes: 10, created_at: 0 },
+              }),
+            );
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const file = new File(["bytes"], "clip.mp4", { type: "video/mp4" });
+    const sendPromise = useChatStore.getState().send("watch this", "agent_xyz", [file]);
+
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().uploadProgress).toEqual({
+        filename: "clip.mp4",
+        fraction: 0.5,
+      });
+    });
+
+    releaseUpload();
+    await sendPromise;
+    expect(useChatStore.getState().uploadProgress).toBeNull();
   });
 
   it("gives same-named attachments distinct optimistic ids", async () => {

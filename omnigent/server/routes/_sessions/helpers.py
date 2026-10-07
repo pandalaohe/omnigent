@@ -8994,16 +8994,16 @@ def _filesystem_attachment_in_history(
     up_to_response_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
 ) -> str | None:
-    """Find a retained attachment requiring filesystem tools, using its stored name.
+    """Find a retained by-path attachment, using the row's stored delivery.
 
     :param session_id: Source session whose history will be retained.
     :param conversation_store: Store containing the ordered source history.
-    :param file_store: Store containing authoritative attachment filenames.
+    :param file_store: Store containing authoritative attachment metadata.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
     :param content: Additional incoming message blocks to check before stored history.
-    :returns: A referenced filesystem attachment's name, or ``None``.
+    :returns: A referenced by-path attachment's name, or ``None``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import is_by_path
 
     if file_store is None:
         return None
@@ -9012,7 +9012,7 @@ def _filesystem_attachment_in_history(
     while True:
         files_page = file_store.list(session_id, limit=1000, after=files_after, order="asc")
         for stored_file in files_page.data:
-            if requires_filesystem(stored_file.filename):
+            if is_by_path(stored_file.filename, stored_file.source_metadata):
                 filenames[stored_file.id] = stored_file.filename
         if not files_page.has_more or not files_page.data:
             break
@@ -12381,26 +12381,6 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
 _FILESYSTEM_QUOTA_PAGE_SIZE = 100
 
 
-async def _require_filesystem_attachment_harness(conv: Conversation, filename: str) -> None:
-    """Require a harness supporting delivery and restoration of filesystem attachments.
-
-    :param conv: Destination session.
-    :param filename: The attached file, named in the error.
-    :raises HTTPException: 415 when the session's harness cannot open the file.
-    """
-    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
-
-    native = await asyncio.to_thread(_native_coding_agent_for_session, conv)
-    if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
-        raise HTTPException(
-            status_code=415,
-            detail=(
-                f"'{filename}' can only be attached to a Claude Code or Codex "
-                "session, which can open this file type."
-            ),
-        )
-
-
 def require_filesystem_attachment_runtime(
     *,
     host_id: str | None,
@@ -12409,7 +12389,7 @@ def require_filesystem_attachment_runtime(
     tunnel_registry: TunnelRegistry | None,
     runner_router: RunnerRouter | None = None,
 ) -> None:
-    """Require a connected build that can deliver and restore native file attachments.
+    """Require a connected build that can deliver by-path file attachments.
 
     :param host_id: Session's assigned host, or None before host selection.
     :param runner_id: Session's current runner, when already launched.
@@ -12418,19 +12398,15 @@ def require_filesystem_attachment_runtime(
     :param runner_router: Router used to distinguish a remote host from an offline one.
     :raises OmnigentError: When the runtime needs an upgrade, connection, or reroute.
     """
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.inner.native_attachments import CAP_PATH_ATTACHMENTS
 
     host = host_registry.get(host_id) if host_id and host_registry is not None else None
     runner = tunnel_registry.get(runner_id) if runner_id and tunnel_registry is not None else None
     for connection in (host, runner):
-        if (
-            connection is not None
-            and CAP_FILESYSTEM_ATTACHMENTS not in connection.hello.capabilities
-        ):
+        if connection is not None and CAP_PATH_ATTACHMENTS not in connection.hello.capabilities:
             raise OmnigentError(
-                "Update Omnigent on this host and restart it before attaching archives, "
-                "Office documents, or databases. This host cannot restore these files "
-                "when a session resumes.",
+                "Update Omnigent on this host and restart it before attaching this file. "
+                "This host cannot deliver it when a session resumes.",
                 code=ErrorCode.CONFLICT,
             )
     if host is not None or runner is not None:
@@ -12441,8 +12417,7 @@ def require_filesystem_attachment_runtime(
             code=ErrorCode.WRONG_REPLICA,
         )
     raise OmnigentError(
-        "Connect an updated Omnigent host before attaching archives, Office documents, "
-        "or databases, then retry.",
+        "Connect an updated Omnigent host before attaching this file, then retry.",
         code=ErrorCode.CONFLICT,
     )
 
@@ -12453,27 +12428,30 @@ def _enforce_filesystem_attachment_policy(
     session_id: str | None,
     file_store: FileStore,
     sizes: Sequence[int] | None = None,
-) -> int:
+) -> int | None:
     """
     Apply deployment policy to files requiring filesystem tools entering a session.
 
     Enforces the operator denylist and the per-session file-count and total-byte
     quotas before any bytes are read, so a rejected upload or copy never
     buffers. The server accounts for all stored uploads, including files that
-    are not currently present in the runner cache.
+    are not currently present in the runner cache. ``None`` from any limit
+    reader means that dimension is unlimited and is not checked.
 
     :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
     :param session_id: Destination session, whose existing attachments are counted,
         or ``None`` for a new, empty destination.
     :param file_store: Store used to total the session's current usage.
-    :param sizes: The incoming files' byte sizes when already known (a copy),
-        checked against the per-file and remaining-session limits. ``None``
-        for an upload, whose size is enforced by the returned read cap.
-    :returns: The byte cap a single upload must stay within.
+    :param sizes: The incoming files' byte sizes when already known (a copy or a
+        spooled upload), checked against the per-file and remaining-session
+        limits. ``None`` for an as-yet-unread upload, whose size is enforced by
+        the returned read cap.
+    :returns: The byte cap a single upload must stay within, or ``None`` when
+        neither the per-file limit nor the session's remaining budget applies.
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import is_by_path
     from omnigent.server.server_config import (
         filesystem_attachment_denied_extensions,
         filesystem_attachment_file_limit,
@@ -12502,8 +12480,8 @@ def _enforce_filesystem_attachment_policy(
     # quota is already exhausted, since the answer can't change after that.
     while (
         session_id is not None
-        and used_files + len(filenames) <= max_files
-        and used_bytes < max_total_bytes
+        and (max_files is None or used_files + len(filenames) <= max_files)
+        and (max_total_bytes is None or used_bytes < max_total_bytes)
     ):
         page = file_store.list(
             session_id=session_id,
@@ -12512,15 +12490,15 @@ def _enforce_filesystem_attachment_policy(
             order="asc",
         )
         for stored in page.data:
-            # This quota covers the types that require filesystem tools.
-            if requires_filesystem(stored.filename):
+            # This quota covers the files delivered by path.
+            if is_by_path(stored.filename, stored.source_metadata):
                 used_files += 1
                 used_bytes += stored.bytes
         if not page.has_more or page.last_id is None:
             break
         after = page.last_id
 
-    if used_files + len(filenames) > max_files:
+    if max_files is not None and used_files + len(filenames) > max_files:
         raise HTTPException(
             status_code=413,
             detail=(
@@ -12528,17 +12506,19 @@ def _enforce_filesystem_attachment_policy(
                 f"(limit {max_files}). Remove one before attaching another."
             ),
         )
-    remaining = max_total_bytes - used_bytes
-    if remaining <= 0 or (sizes is not None and sum(sizes) > remaining):
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"This session's file attachments would exceed the "
-                f"{max_total_bytes // (1024 * 1024)} MB limit "
-                f"({used_bytes // (1024 * 1024)} MB already used)."
-            ),
-        )
-    if sizes is not None and any(size > per_file for size in sizes):
+    remaining: int | None = None
+    if max_total_bytes is not None:
+        remaining = max_total_bytes - used_bytes
+        if remaining <= 0 or (sizes is not None and sum(sizes) > remaining):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"This session's file attachments would exceed the "
+                    f"{max_total_bytes // (1024 * 1024)} MB limit "
+                    f"({used_bytes // (1024 * 1024)} MB already used)."
+                ),
+            )
+    if per_file is not None and sizes is not None and any(size > per_file for size in sizes):
         raise HTTPException(
             status_code=413,
             detail=(f"File attachments are limited to {per_file // (1024 * 1024)} MB each."),
@@ -12547,6 +12527,10 @@ def _enforce_filesystem_attachment_policy(
     # Cap an upload at whichever is smaller: the per-file limit, or the
     # session's remaining budget. Without the second term a single upload could
     # overshoot the session total by nearly a whole file.
+    if per_file is None:
+        return remaining
+    if remaining is None:
+        return per_file
     return min(per_file, remaining)
 
 
@@ -13043,7 +13027,6 @@ __all__ = [
     "_require_cost_control_label_authority",
     "_require_declared_subagent",
     "_require_external_status_forward",
-    "_require_filesystem_attachment_harness",
     "_require_host_conn_for_worktree",
     "_require_permission_mode_forward",
     "_resolve_harness",

@@ -1,9 +1,33 @@
-import { createRef } from "react";
+import { StrictMode, createRef } from "react";
 import { act, render } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { assignLabels } from "@/lib/composerTokens";
 import { ComposerTokenBackdrop, hasTint } from "./ComposerTokenBackdrop";
+
+/** Captures rAF callbacks so a test can flush exactly one frame, the way the
+ *  browser would after the synchronous measure cap trips. */
+function installManualRaf() {
+  const pending = new Map<number, FrameRequestCallback>();
+  let nextId = 1;
+  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+    const id = nextId++;
+    pending.set(id, cb);
+    return id;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+    pending.delete(id);
+  });
+  return {
+    flush() {
+      const callbacks = [...pending.values()];
+      pending.clear();
+      act(() => {
+        callbacks.forEach((cb) => cb(0));
+      });
+    },
+  };
+}
 
 function img(name = "a.png"): File {
   return new File([new Uint8Array(1)], name, { type: "image/png" });
@@ -47,6 +71,10 @@ describe("hasTint", () => {
 });
 
 describe("ComposerTokenBackdrop", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("tints a leading command prefix", () => {
     const node = renderBackdrop({ value: "/review please", command: "/review" });
     const span = node.querySelector(".text-brand-accent");
@@ -147,6 +175,99 @@ describe("ComposerTokenBackdrop", () => {
       </>,
     );
     expect(node().style.top).toBe("120px");
+  });
+
+  it("N4 — caps synchronous re-measures when the anchor's box oscillates between reads", () => {
+    const anchor = createRef<HTMLTextAreaElement>();
+    const widths = [300, 340];
+    let reads = 0;
+    const oscillatingRef = (el: HTMLTextAreaElement | null) => {
+      anchor.current = el;
+      if (!el) return;
+      Object.defineProperty(el, "offsetWidth", {
+        configurable: true,
+        get: () => widths[reads++ % widths.length],
+      });
+    };
+    const ui = (value: string) => (
+      <>
+        <textarea ref={oscillatingRef} />
+        <ComposerTokenBackdrop
+          value={value}
+          files={[]}
+          command={null}
+          activeIndex={null}
+          anchor={anchor}
+        />
+      </>
+    );
+    const { container, rerender } = render(ui("hello"));
+    expect(() => rerender(ui("hello [file 1]"))).not.toThrow();
+    const node = container.querySelector(
+      '[data-testid="composer-highlight-overlay"]',
+    ) as HTMLElement;
+    expect(["300px", "340px"]).toContain(node.style.width);
+  });
+
+  it("R1 — retries a capped measure after a position-only anchor move", () => {
+    const raf = installManualRaf();
+    const anchor = createRef<HTMLTextAreaElement>();
+    const ui = (value: string) => (
+      <>
+        <textarea ref={anchor} />
+        <ComposerTokenBackdrop
+          value={value}
+          files={[]}
+          command={null}
+          activeIndex={null}
+          anchor={anchor}
+        />
+      </>
+    );
+    const { container, rerender } = render(ui("a"));
+    // Each rerender is one layout-effect measure; after the cap trips, the
+    // measure is skipped until the pending frame flushes.
+    for (const value of ["b", "c", "d", "e", "f"]) rerender(ui(value));
+    // A position-only move (a reply quote above the anchor): ResizeObserver
+    // never sees it, so only the frame's retry can pick it up.
+    act(() => {
+      Object.defineProperty(anchor.current!, "offsetLeft", { value: 42, configurable: true });
+    });
+    raf.flush();
+    const node = container.querySelector(
+      '[data-testid="composer-highlight-overlay"]',
+    ) as HTMLElement;
+    expect(node.style.left).toBe("42px");
+  });
+
+  it("R2 — under StrictMode, frames still lift the cap so a later move re-aligns", () => {
+    const raf = installManualRaf();
+    const anchor = createRef<HTMLTextAreaElement>();
+    const ui = (value: string) => (
+      <StrictMode>
+        <textarea ref={anchor} />
+        <ComposerTokenBackdrop
+          value={value}
+          files={[]}
+          command={null}
+          activeIndex={null}
+          anchor={anchor}
+        />
+      </StrictMode>
+    );
+    const { container, rerender } = render(ui("a"));
+    // StrictMode replays the mount effects: its simulated unmount cancels the
+    // frame and resets the cap, so later renders must still schedule frames.
+    for (const value of ["b", "c", "d", "e", "f"]) rerender(ui(value));
+    raf.flush();
+    act(() => {
+      Object.defineProperty(anchor.current!, "offsetLeft", { value: 64, configurable: true });
+    });
+    rerender(ui("g"));
+    const node = container.querySelector(
+      '[data-testid="composer-highlight-overlay"]',
+    ) as HTMLElement;
+    expect(node.style.left).toBe("64px");
   });
 
   it("N3 — measures on mount even when rendered before its anchor (ChatComposer's real order)", () => {

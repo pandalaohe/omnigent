@@ -159,3 +159,92 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
                 assert executor._pending_framework_context == {}
     finally:
         await executor.close()
+
+
+# ── forwarded by-path delivery ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_forwarded_by_path_file_becomes_an_attached_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stored by-path row is streamed to the host and referenced by path."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    meta = {
+        "id": "file_video",
+        "name": "clip.mp4",
+        "content_type": "video/mp4",
+        "metadata": {"bytes": 11, "source_metadata": {"delivery": "filesystem"}},
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"video-bytes")
+        return httpx.Response(200, json=meta)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        content = await _resolve_forwarded_message_content(
+            [{"type": "input_file", "file_id": "file_video", "filename": "renamed.bin"}],
+            session_id="session",
+            server_client=client,
+        )
+
+    # sha256("session")[:32], pinned independently of the delivery layout.
+    path = (
+        tmp_path
+        / "data"
+        / "attachments"
+        / "s-3f3af1ecebbd1410ab417ec0d27bbfcb"
+        / "file_video"
+        / "clip.mp4"
+    )
+    assert path.read_bytes() == b"video-bytes"
+    assert content == [{"type": "input_text", "text": f"[Attached: {path}]"}]
+
+
+@pytest.mark.asyncio
+async def test_forwarded_inline_file_still_resolves_to_a_data_uri() -> None:
+    """Inline rows keep today's data-URI resolution."""
+    meta = {
+        "id": "file_notes",
+        "name": "notes.txt",
+        "content_type": "text/plain",
+        "metadata": {"bytes": 5},
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"hello")
+        return httpx.Response(200, json=meta)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        content = await _resolve_forwarded_message_content(
+            [{"type": "input_file", "file_id": "file_notes"}],
+            session_id="session",
+            server_client=client,
+        )
+
+    assert content[0]["file_data"] == "data:text/plain;base64,aGVsbG8="
+    assert "file_id" not in content[0]
+
+
+@pytest.mark.asyncio
+async def test_forwarded_file_keeps_the_block_when_metadata_fails() -> None:
+    """A failed metadata GET leaves the block for the existing marker path."""
+    block = {"type": "input_file", "file_id": "file_missing", "filename": "clip.mp4"}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        content = await _resolve_forwarded_message_content(
+            [block], session_id="session", server_client=client
+        )
+
+    assert content == [block]

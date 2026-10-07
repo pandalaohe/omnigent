@@ -200,6 +200,49 @@ describe("resolveServerInfo smart_routing_sources", () => {
   });
 });
 
+describe("resolveServerInfo attachment_limits", () => {
+  it("parses published limits, null (unlimited) included", async () => {
+    const parsed = await probe({
+      attachment_limits: {
+        upload_bytes: 2 * 1024 ** 3,
+        file_bytes: null,
+        session_files: null,
+        session_bytes: null,
+        image_bytes: 50 * 1024 * 1024,
+        uncompressed_image_bytes: 5 * 1024 * 1024,
+        pdf_bytes: 20 * 1024 * 1024,
+        text_bytes: 10 * 1024 * 1024,
+      },
+    });
+    expect(parsed.attachment_limits).toEqual({
+      upload_bytes: 2 * 1024 ** 3,
+      file_bytes: null,
+      session_files: null,
+      session_bytes: null,
+      image_bytes: 50 * 1024 * 1024,
+      uncompressed_image_bytes: 5 * 1024 * 1024,
+      pdf_bytes: 20 * 1024 * 1024,
+      text_bytes: 10 * 1024 * 1024,
+    });
+  });
+
+  it("gives undefined when the server omits the field (scenario 22)", async () => {
+    const parsed = await probe({});
+    expect(parsed.attachment_limits).toBeUndefined();
+  });
+
+  it.each([
+    ["a non-object", "huge"],
+    ["an array", [1, 2]],
+    ["an unknown string entry", { file_bytes: "huge" }],
+    ["a negative entry", { file_bytes: -1 }],
+    ["an empty object", {}],
+  ])("gives undefined for %s", async (_case, value) => {
+    const parsed = await probe({ attachment_limits: value });
+    expect(parsed.attachment_limits).toBeUndefined();
+  });
+});
+
 describe("resolveServerInfo branding", () => {
   it("preserves an explicit empty heading and disabled attribution", async () => {
     const brandingInfo = await probe({

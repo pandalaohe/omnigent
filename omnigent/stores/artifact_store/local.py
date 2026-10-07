@@ -5,8 +5,13 @@ from __future__ import annotations
 import os
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import BinaryIO
 
 from omnigent.stores.artifact_store import ArtifactStore
+
+# Copy chunk for put_stream. Bounds peak memory to one chunk regardless of the
+# blob size.
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 class LocalArtifactStore(ArtifactStore):
@@ -96,6 +101,51 @@ class LocalArtifactStore(ArtifactStore):
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
+
+    def put_stream(self, key: str, fileobj: BinaryIO, *, max_bytes: int | None) -> int:
+        """
+        Copy *fileobj* into place in 1 MiB chunks.
+
+        Writes to a sibling temp file and ``os.replace``s it in, matching
+        :meth:`put`'s atomicity: a reader never observes a partial blob.
+        Peak memory is one chunk. Over *max_bytes*, the temp file is removed
+        and ``ValueError`` is raised without touching an existing blob.
+
+        :param key: Forward-slash-separated artifact key.
+        :param fileobj: Binary file object positioned at the start.
+        :param max_bytes: Maximum allowed size in bytes, or ``None``.
+        :returns: The number of bytes written.
+        :raises ValueError: If the stream exceeds *max_bytes*.
+        """
+        path = self._resolve(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        written = 0
+        try:
+            with open(tmp_path, "wb") as handle:
+                while True:
+                    chunk = fileobj.read(_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if max_bytes is not None and written > max_bytes:
+                        raise ValueError(f"artifact {key!r} exceeds the {max_bytes}-byte limit")
+                    handle.write(chunk)
+            os.replace(tmp_path, path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        return written
+
+    def local_path(self, key: str) -> Path | None:
+        """
+        Return the on-disk file for *key*, or ``None`` when it does not exist.
+
+        :param key: Forward-slash-separated artifact key.
+        :returns: The resolved path when a regular file exists there.
+        """
+        path = self._resolve(key)
+        return path if path.is_file() else None
 
     def get(self, key: str) -> bytes:
         """

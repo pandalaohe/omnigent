@@ -284,6 +284,11 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
   );
 }
 
+/** Over the 50 MB by-path cap — the only client-side rejection left. */
+function oversizedFile(): File {
+  return new File([new Uint8Array(50 * 1024 * 1024 + 1)], "clip.mp4", { type: "video/mp4" });
+}
+
 describe("Composer Escape interrupt", () => {
   beforeEach(() => {
     clearSessionDrafts();
@@ -4349,15 +4354,14 @@ describe("Composer file-attachment focus", () => {
   });
 
   it("does not focus the textarea when the attachment is rejected", () => {
-    // An unsupported type is dropped by validateAttachments, so no file is
+    // A file over the limit is dropped by validateAttachments, so no file is
     // added — and with nothing attached there's no reason to yank focus back.
     render(<Composer {...composerProps()} />);
     const ta = textarea();
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
-    fireEvent.change(fileInput(), { target: { files: [bad] } });
+    fireEvent.change(fileInput(), { target: { files: [oversizedFile()] } });
 
     expect(document.activeElement).not.toBe(ta);
   });
@@ -4411,13 +4415,12 @@ describe("Composer file-attachment focus", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     render(<Composer {...composerProps()} />);
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
-    fireEvent.change(fileInput(), { target: { files: [bad] } });
-    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    fireEvent.change(fileInput(), { target: { files: [oversizedFile()] } });
+    expect(screen.getByText(/too large/)).toBeTruthy();
 
     fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
 
-    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(screen.queryByText(/too large/)).toBeNull();
   });
 
   it("clears the rejection notice when the accepted chip is removed", () => {
@@ -4426,14 +4429,13 @@ describe("Composer file-attachment focus", () => {
     // composer's mixed-drop behavior).
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
-    fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
+    fireEvent.change(fileInput(), { target: { files: [ok, oversizedFile()] } });
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    expect(screen.getByText(/too large/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
 
-    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(screen.queryByText(/too large/)).toBeNull();
   });
 });
 
@@ -4475,7 +4477,7 @@ describe("Composer paste", () => {
   it("leaves a text-only paste to the browser", () => {
     render(<Composer {...composerProps()} />);
     expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
-    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(screen.queryByText(/too large/)).toBeNull();
     expect(textarea().value).toBe("");
   });
 
@@ -4521,9 +4523,8 @@ describe("Composer paste", () => {
 
 // A send that fails before the server takes ownership hands its text and
 // files back to the composer for retry. The files re-enter through the same
-// up-front validation as a fresh attach — when the upload itself was what
-// failed (a 415 on an unsupported type), re-arming that file would only
-// fail again, so it is dropped with the same inline reason.
+// up-front validation as a fresh attach — a file that now exceeds a limit
+// would only fail again, so it is dropped with the same inline reason.
 describe("Composer failed-send attachment restore", () => {
   beforeEach(() => {
     setComposerState({ conversationId: "conv_test", skills: [] });
@@ -4538,7 +4539,7 @@ describe("Composer failed-send attachment restore", () => {
   it("restores the retriable files and flags the ones current limits reject", () => {
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = oversizedFile();
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
@@ -4547,7 +4548,7 @@ describe("Composer failed-send attachment restore", () => {
 
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.queryByText("clip.mp4")).toBeNull();
-    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    expect(screen.getByText(/too large/)).toBeTruthy();
     // The store entry drained on restore, so the draft can't come back twice.
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
@@ -4581,18 +4582,14 @@ describe("Composer failed-send attachment restore", () => {
     render(<Composer {...composerProps()} />);
     act(() =>
       useChatStore.setState({
-        failedSendDraft: {
-          conversationId: "conv_test",
-          text: "",
-          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
-        },
+        failedSendDraft: { conversationId: "conv_test", text: "", files: [oversizedFile()] },
       }),
     );
-    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+    expect(screen.getByText(/too large/)).toBeTruthy();
 
     fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
 
-    expect(screen.queryByText(/can't be attached/)).toBeNull();
+    expect(screen.queryByText(/too large/)).toBeNull();
   });
 });
 
@@ -6061,13 +6058,43 @@ describe("Composer attachment picker", () => {
     cleanup();
   });
 
-  it("accepts the workspace types in the file picker filter", () => {
+  it("offers every file type in the picker", () => {
     render(<Composer {...composerProps()} />);
 
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    // Without these the OS picker hides the very files the server now accepts.
-    expect(input.accept).toContain(".zip");
-    expect(input.accept).toContain(".docx");
+    // Any file is attachable, so the picker must not filter by type.
+    expect(input.accept).toBe("");
+    expect(input.getAttribute("data-testid")).toBe("composer-file-input");
+  });
+
+  it("shows the upload progress row while an upload runs and drops it after", () => {
+    render(<Composer {...composerProps()} />);
+
+    expect(screen.queryByTestId("composer-upload-progress")).toBeNull();
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: { filename: "clip.mp4", fraction: 0.42 } });
+    });
+    const row = screen.getByTestId("composer-upload-progress");
+    expect(row).toHaveTextContent("Uploading clip.mp4 — 42%");
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: null });
+    });
+    expect(screen.queryByTestId("composer-upload-progress")).toBeNull();
+  });
+
+  it("shows the upload row without a percentage when progress is unknown", () => {
+    render(<Composer {...composerProps()} />);
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: { filename: "clip.mp4", fraction: null } });
+    });
+    expect(screen.getByTestId("composer-upload-progress")).toHaveTextContent("Uploading clip.mp4…");
+
+    act(() => {
+      useChatStore.setState({ uploadProgress: null });
+    });
   });
 });
 

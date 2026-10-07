@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { validateAttachments } from "@/lib/attachments";
+import { validateAttachments, type AttachmentLimits } from "@/lib/attachments";
 
 export interface UseComposerAttachmentsOptions {
   /**
@@ -7,6 +7,12 @@ export interface UseComposerAttachmentsOptions {
    * so nothing the composer already accepted can be silently dropped.
    */
   initialFiles?: File[];
+  /**
+   * Server-published attachment limits (``/v1/info``); ``undefined`` uses the
+   * built-in client ceilings. Read through a ref so the action identities
+   * stay stable across renders.
+   */
+  limits?: AttachmentLimits;
   /**
    * Fires synchronously inside addFiles when a batch accepts at least one
    * file — before React commits the append, so readers still see the prior
@@ -53,6 +59,7 @@ export interface ComposerAttachmentsApi {
  */
 export function useComposerAttachments({
   initialFiles,
+  limits,
   onAccepted,
   onRemoved,
 }: UseComposerAttachmentsOptions = {}): ComposerAttachmentsApi {
@@ -64,9 +71,11 @@ export function useComposerAttachments({
   onAcceptedRef.current = onAccepted;
   const onRemovedRef = useRef(onRemoved);
   onRemovedRef.current = onRemoved;
+  const limitsRef = useRef(limits);
+  limitsRef.current = limits;
 
   const addFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
+    const { accepted, errors } = validateAttachments(incoming, limitsRef.current);
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       onAcceptedRef.current?.(accepted);
@@ -81,7 +90,7 @@ export function useComposerAttachments({
   }, []);
 
   const replaceFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
+    const { accepted, errors } = validateAttachments(incoming, limitsRef.current);
     setFiles(accepted);
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   }, []);

@@ -220,6 +220,10 @@ class ServerInfoResponse(BaseModel):
     dictation_available: bool
     dictation_punctuation_available: bool
     branding: BrandingInfo
+    # Attachment size limits the web client enforces before uploading (bytes;
+    # ``None`` = unlimited). Deployment settings plus the fixed inline caps;
+    # see :func:`omnigent.server.server_config.attachment_limits`.
+    attachment_limits: dict[str, int | None]
 
 
 def _resolve_extension_state(
@@ -3257,6 +3261,8 @@ def create_app(
 
         dictation_available, _ = engine_availability()
         dictation_punctuation_available, _ = punctuation_availability()
+        from omnigent.server.server_config import attachment_limits
+
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3280,6 +3286,7 @@ def create_app(
                 "dictation_available": dictation_available,
                 "dictation_punctuation_available": dictation_punctuation_available,
                 "branding": branding_snapshot.config(),
+                "attachment_limits": attachment_limits(),
             }
         )
 

@@ -93,6 +93,9 @@ vi.mock("@/lib/routing", () => ({
 
 vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
+  // The landing composer reads upload progress from the store; these tests
+  // never start an upload, so the selector stub returns its empty value.
+  useChatStore: () => null,
 }));
 
 vi.mock("@/lib/identity", () => ({

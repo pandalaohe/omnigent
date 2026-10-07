@@ -7458,6 +7458,8 @@ async def _forward_event_to_runner(
                     file_store,
                     artifact_store,
                     session_id=session_id,
+                    # The runner streams by-path files to the agent host.
+                    defer_filesystem_files=True,
                 )
                 _logger.debug(
                     "Resolved %d file_id block(s) for session=%s before forwarding",

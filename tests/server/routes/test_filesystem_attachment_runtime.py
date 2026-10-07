@@ -6,7 +6,7 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import CAP_PATH_ATTACHMENTS
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame, encode_frame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.host_registry import HostRegistry
@@ -40,7 +40,7 @@ async def test_connected_builds_must_advertise_attachment_support(
                     version="0.14.0",
                     frame_protocol_version=1,
                     name="host",
-                    capabilities=[CAP_FILESYSTEM_ATTACHMENTS] if host_capable else [],
+                    capabilities=[CAP_PATH_ATTACHMENTS] if host_capable else [],
                 )
             )
         )
@@ -52,7 +52,7 @@ async def test_connected_builds_must_advertise_attachment_support(
                 HelloFrame(
                     runner_version="0.14.0",
                     frame_protocol_version=1,
-                    capabilities=[CAP_FILESYSTEM_ATTACHMENTS] if runner_capable else [],
+                    capabilities=[CAP_PATH_ATTACHMENTS] if runner_capable else [],
                 )
             )
         )

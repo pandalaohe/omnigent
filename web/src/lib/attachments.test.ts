@@ -70,11 +70,11 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("a.zip", "text/plain"))).toBe("file");
   });
 
-  it("rejects types outside the supported allowlist", () => {
-    expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBeNull();
-    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBeNull();
-    expect(classifyAttachment(makeFile("song.mp3", "audio/mpeg"))).toBeNull();
-    expect(classifyAttachment(makeFile("noext", ""))).toBeNull();
+  it("classifies every other type as a by-path file", () => {
+    expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBe("file");
+    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBe("file");
+    expect(classifyAttachment(makeFile("song.mp3", "audio/mpeg"))).toBe("file");
+    expect(classifyAttachment(makeFile("noext", ""))).toBe("file");
   });
 
   it("recognizes a text/code extension the MIME mislabels", () => {
@@ -91,11 +91,11 @@ describe("validateAttachments", () => {
     expect(errors).toHaveLength(0);
   });
 
-  it("rejects unsupported types with a message", () => {
-    const { accepted, errors } = validateAttachments([makeFile("clip.mp4", "video/mp4")]);
-    expect(accepted).toHaveLength(0);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("clip.mp4");
+  it("accepts a video as a by-path file", () => {
+    const clip = makeFile("clip.mp4", "video/mp4");
+    const { accepted, errors } = validateAttachments([clip]);
+    expect(accepted).toEqual([clip]);
+    expect(errors).toHaveLength(0);
   });
 
   it("accepts an archive up to its larger limit", () => {
@@ -135,10 +135,55 @@ describe("validateAttachments", () => {
   it("partitions a mixed batch into accepted + errors", () => {
     const ok = makeFile("a.png", "image/png");
     const zip = makeFile("a.zip", "application/zip");
-    const badType = makeFile("a.mp4", "video/mp4");
+    const video = makeFile("a.mp4", "video/mp4");
     const tooBig = makeFile("big.pdf", "application/pdf", ATTACHMENT_SIZE_LIMITS_MB.pdf * MB + 1);
-    const { accepted, errors } = validateAttachments([ok, zip, badType, tooBig]);
-    expect(accepted).toEqual([ok, zip]);
-    expect(errors).toHaveLength(2);
+    const { accepted, errors } = validateAttachments([ok, zip, video, tooBig]);
+    expect(accepted).toEqual([ok, zip, video]);
+    expect(errors).toHaveLength(1);
+  });
+
+  it("uses the server-published limits when given", () => {
+    const oversizedClip = makeFile("clip.mp4", "video/mp4", 30 * MB);
+    const { accepted, errors } = validateAttachments([oversizedClip], { file_bytes: 10 * MB });
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("clip.mp4");
+    expect(errors[0]).toContain("10 MB");
+  });
+
+  it("treats a null limit as unlimited for that category", () => {
+    // A video far over the fixed 50 MB ceiling still passes when the server
+    // publishes no per-file cap and the upload-request cap does not bound it.
+    const clip = makeFile("clip.mp4", "video/mp4", 4 * 1024 * MB);
+    const { accepted, errors } = validateAttachments([clip], {
+      file_bytes: null,
+      upload_bytes: null,
+    });
+    expect(accepted).toEqual([clip]);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("applies whichever of the upload and category caps is smaller", () => {
+    const pdf = makeFile("report.pdf", "application/pdf", 8 * MB);
+    // pdf_bytes alone would admit it; the 5 MB request cap wins.
+    const { accepted, errors } = validateAttachments([pdf], {
+      pdf_bytes: 20 * MB,
+      upload_bytes: 5 * MB,
+    });
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("5 MB");
+  });
+
+  it("checks nothing when every published limit is null", () => {
+    const huge = makeFile("clip.mp4", "video/mp4", 900 * MB);
+    const { accepted, errors } = validateAttachments([huge], {
+      upload_bytes: null,
+      file_bytes: null,
+      image_bytes: null,
+      uncompressed_image_bytes: null,
+      pdf_bytes: null,
+      text_bytes: null,
+    });
+    expect(accepted).toEqual([huge]);
+    expect(errors).toHaveLength(0);
   });
 });

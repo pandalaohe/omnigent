@@ -134,6 +134,9 @@ export const ComposerTokenBackdrop = forwardRef<
   const innerRef = useRef<HTMLDivElement>(null);
   useImperativeHandle(ref, () => innerRef.current as HTMLDivElement);
   const [box, setBox] = useState({ top: 0, left: 0, width: 0, height: 0 });
+  const layoutMeasureCount = useRef(0);
+  const measureResetFrame = useRef<number | null>(null);
+  const measureSkipped = useRef(false);
 
   const measure = (el: HTMLTextAreaElement) => {
     setBox((prev) => {
@@ -157,8 +160,44 @@ export const ComposerTokenBackdrop = forwardRef<
   // reports, so only a render-scoped effect (no deps) sees it.
   useLayoutEffect(() => {
     const el = anchor.current;
-    if (el) measure(el);
+    if (!el) return;
+    // Without rAF there is no frame to lift the cap, so keep measuring.
+    if (typeof requestAnimationFrame !== "function") {
+      measure(el);
+      return;
+    }
+    // An oscillating layout would re-measure forever when the anchor's box
+    // flips between two values each read; cap measures until the next frame,
+    // then retry one skipped measure so a position-only move isn't lost.
+    if (layoutMeasureCount.current > 3) {
+      measureSkipped.current = true;
+      return;
+    }
+    layoutMeasureCount.current += 1;
+    if (measureResetFrame.current === null) {
+      measureResetFrame.current = requestAnimationFrame(() => {
+        measureResetFrame.current = null;
+        layoutMeasureCount.current = 0;
+        const skipped = measureSkipped.current;
+        measureSkipped.current = false;
+        const current = anchor.current;
+        if (skipped && current) measure(current);
+      });
+    }
+    measure(el);
   });
+
+  useEffect(
+    () => () => {
+      if (measureResetFrame.current !== null) cancelAnimationFrame(measureResetFrame.current);
+      // StrictMode replays effects on mount: null the ref and counters so the
+      // replay schedules a fresh frame instead of leaving measures capped.
+      measureResetFrame.current = null;
+      layoutMeasureCount.current = 0;
+      measureSkipped.current = false;
+    },
+    [],
+  );
 
   useEffect(() => {
     const el = anchor.current;

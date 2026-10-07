@@ -7,6 +7,7 @@ import contextlib
 import functools
 import mimetypes
 import ntpath
+import os
 import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -24,7 +25,9 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from fastapi.routing import APIRoute
+from starlette.datastructures import Headers
+from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.entities import (
     Conversation,
@@ -88,7 +91,6 @@ from omnigent.server.routes._sessions.helpers import (
     _raise_if_runner_session_agent_missing,
     _raise_if_session_agent_missing_payload,
     _read_upload_capped,
-    _require_filesystem_attachment_harness,
     _stored_file_to_resource,
     effective_worktree,
     require_filesystem_attachment_runtime,
@@ -136,6 +138,140 @@ class _RunnerStreamResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             await self._upstream.aclose()
+
+
+def _human_byte_size(size: int) -> str:
+    """Render a byte count in the largest exact binary unit, e.g. ``2 GiB``."""
+    for unit, factor in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
+        if size >= factor and size % factor == 0:
+            return f"{size // factor} {unit}"
+    return f"{size} bytes"
+
+
+def _upload_request_too_large(limit_bytes: int) -> HTTPException:
+    """Build the shared 413 for an oversized attachment upload request."""
+    return HTTPException(
+        status_code=413,
+        detail=f"Attachment upload request exceeds the {_human_byte_size(limit_bytes)} limit",
+    )
+
+
+class _UploadBodyLimitRoute(APIRoute):
+    """Reject an oversized attachment upload before the body is parsed.
+
+    The multipart parser spools the whole request to disk before the handler
+    runs, so the request-size limit must be enforced here: from the declared
+    ``Content-Length`` when present, and from the received byte count when
+    not (chunked). The limit is read per request so a config change applies
+    without a restart; ``None`` (unlimited) skips both checks.
+    """
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Enforce the upload request limit from headers and ASGI chunks."""
+        if scope["type"] != "http":
+            await super().handle(scope, receive, send)
+            return
+
+        from omnigent.server.server_config import attachment_upload_request_limit
+
+        limit = attachment_upload_request_limit()
+        if limit is None:
+            await super().handle(scope, receive, send)
+            return
+
+        content_length = Headers(scope=scope).get("content-length")
+        if content_length is not None:
+            try:
+                declared_bytes = int(content_length)
+            except ValueError:
+                declared_bytes = 0
+            if declared_bytes > limit:
+                raise _upload_request_too_large(limit)
+
+        received_bytes = 0
+
+        async def receive_bounded() -> Message:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > limit:
+                    raise _upload_request_too_large(limit)
+            return message
+
+        await super().handle(scope, receive_bounded, send)
+
+
+# Chunk size for streaming a local artifact to a client. Bounds peak memory to
+# one chunk; 64 KiB matches the runner's filesystem download loop.
+_FILE_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+def _stream_local_file_content(
+    path: Path,
+    *,
+    media_type: str,
+    headers: Mapping[str, str],
+) -> StreamingResponse:
+    """Stream *path* with ``Content-Length`` and the caller's headers.
+
+    Opens the file lazily on first iteration so a 304 short-circuit never
+    touches the blob. Mirrors the runner's ``_fs_download``.
+    """
+    size = path.stat().st_size
+
+    async def _chunks() -> AsyncIterator[bytes]:
+        remaining = size
+        with path.open("rb") as handle:
+            while remaining > 0:
+                chunk = await asyncio.to_thread(
+                    handle.read, min(_FILE_STREAM_CHUNK_BYTES, remaining)
+                )
+                if not chunk:
+                    # Ending short of Content-Length would hand the client a
+                    # silently incomplete file; abort the transfer instead.
+                    raise RuntimeError(f"{path.name} shrank during download")
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        _chunks(),
+        media_type=media_type,
+        headers={**headers, "Content-Length": str(size)},
+    )
+
+
+def _delete_failed_upload(
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    *,
+    session_id: str,
+    file_id: str,
+) -> None:
+    """Release a failed upload's row and any partial blob.
+
+    The row first: quota is derived from rows, so holding the session lock
+    until the row is gone keeps a failed write from reserving budget. Blob
+    cleanup is best effort — a partial write may or may not exist.
+    """
+    try:
+        file_store.delete(file_id, session_id=session_id)
+    except Exception:
+        _logger.warning(
+            "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
+            session_id,
+            file_id,
+            exc_info=True,
+        )
+    try:
+        artifact_store.delete(file_id)
+    except Exception:
+        _logger.warning(
+            "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
+            session_id,
+            file_id,
+            exc_info=True,
+        )
 
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
@@ -203,10 +339,7 @@ def register_resources_routes(
 ) -> None:
     """Register the resources routes on router."""
 
-    async def _require_filesystem_attachment_support(
-        request: Request, conv: Conversation, filename: str
-    ) -> None:
-        await _require_filesystem_attachment_harness(conv, filename)
+    async def _require_filesystem_attachment_support(request: Request, conv: Conversation) -> None:
         tracker = getattr(request.app.state, "managed_launches", None)
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and conv.host_id is None and conv.runner_id is None:
@@ -1682,7 +1815,12 @@ def register_resources_routes(
             "has_more": page.has_more,
         }
 
-    @router.post(
+    # The upload route is the only one that rejects an oversized request body
+    # before the multipart parser spools it, so it rides its own router with
+    # the body-limit route class.
+    upload_router = APIRouter(route_class=_UploadBodyLimitRoute)
+
+    @upload_router.post(
         "/sessions/{session_id}/resources/files",
         status_code=201,
         response_model=None,
@@ -1731,121 +1869,166 @@ def register_resources_routes(
             image_filename_for_content_type,
             image_needs_compression,
         )
+        from omnigent.server.server_config import filesystem_attachment_upload_limit
 
         # Validate the type and limits before buffering the file.
         content_type = _resolve_content_type(
             file.content_type,
             file.filename,
         )
-        # Check the filename first so a misleading MIME cannot skip the
-        # harness requirement or the quotas for files that need local tools.
+        # Check the filename first so a misleading MIME cannot make a legacy
+        # filesystem format look inline.
         filesystem_required = requires_filesystem(file.filename)
-        if filesystem_required:
+        type_limit = None if filesystem_required else attachment_upload_limit(content_type)
+        if type_limit is None and not filesystem_required:
+            # The browser/OS can mislabel a text/code file as binary (e.g. a
+            # .csv reported as application/vnd.ms-excel on Windows). Fall back
+            # to the extension — matching the web client's allowlist — and
+            # normalize the type so the resolver inlines it as text.
+            ext_type = attachment_text_type_for_extension(file.filename)
+            if ext_type is not None:
+                content_type = ext_type
+                type_limit = attachment_upload_limit(content_type)
+        # Everything the inline set cannot carry goes by path: persisted for
+        # the agent host and streamed there by the runner, never gated by
+        # harness.
+        if type_limit is None:
             # Drop the declared type so the file is never stored as text.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_support(request, conv, file.filename)
+            await _require_filesystem_attachment_support(request, conv)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
-            _attachment_upload_lock(session_id)
-            if filesystem_required
-            else contextlib.nullcontext()
+            _attachment_upload_lock(session_id) if type_limit is None else contextlib.nullcontext()
         )
         async with attachment_lock:
-            if filesystem_required:
-                read_limit = _enforce_filesystem_attachment_policy(
-                    [file.filename],
+            filename = file.filename
+            if type_limit is None:
+                # By-path files stream straight from the parser's spool into the
+                # artifact store: the size is already known from the spool and the
+                # bytes never materialize in memory. The route class above has
+                # already bounded the whole request, and the policy check sees the
+                # exact size.
+                file.file.seek(0, os.SEEK_END)
+                upload_size = file.file.tell()
+                file.file.seek(0)
+                _enforce_filesystem_attachment_policy(
+                    [filename],
                     session_id=session_id,
                     file_store=file_store,
+                    sizes=[upload_size],
                 )
-            else:
-                type_limit = attachment_upload_limit(content_type)
-                if type_limit is None:
-                    # The browser/OS can mislabel a text/code file as binary (e.g. a
-                    # .csv reported as application/vnd.ms-excel on Windows). Fall back
-                    # to the extension — matching the web client's allowlist — and
-                    # normalize the type so the resolver inlines it as text.
-                    ext_type = attachment_text_type_for_extension(file.filename)
-                    if ext_type is not None:
-                        content_type = ext_type
-                        type_limit = attachment_upload_limit(content_type)
-                if type_limit is None:
-                    raise HTTPException(
-                        status_code=415,
-                        detail=(
-                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
-                            "or text/code files, or use Claude Code or Codex for archives, "
-                            "Office documents, and databases."
-                        ),
+                stored = file_store.create(
+                    session_id=session_id,
+                    filename=filename,
+                    bytes=upload_size,
+                    content_type=content_type,
+                    source_metadata={"delivery": "filesystem"},
+                )
+                per_file = filesystem_attachment_upload_limit()
+                # Shield the worker so a client disconnect cannot cancel the
+                # thread mid-write while the rollback deletes the blob it is
+                # still os.replace-ing into place.
+                put_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        artifact_store.put_stream,
+                        stored.id,
+                        file.file,
+                        max_bytes=per_file,
                     )
-                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
-            filename = file.filename
-            # Persist original dimensions only after a downscale.
-            source_dims: tuple[int, int] | None = None
-            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
-                # Compressible images carry the large cap and the decode, so they are
-                # the server's peak upload memory. The body is already spooled to
-                # disk by the multipart parser, so gate the in-memory read + the
-                # decode/re-encode behind the admission semaphore: a burst of
-                # concurrent uploads waits (each holding only a disk-backed temp
-                # file), instead of every one buffering the full image in RAM and
-                # decoding at once. This bounds peak memory to the gate size × the
-                # per-upload cost, without serializing the network transfer.
-                async with _get_image_compression_gate():
-                    content = await _read_upload_capped(file, read_limit)
-                    if image_needs_compression(len(content), content_type):
+                )
+                try:
+                    await asyncio.shield(put_task)
+                except asyncio.CancelledError:
+                    # The worker thread keeps writing, so wait it out before
+                    # rolling back; deleting now would race its final os.replace.
+                    while not put_task.done():
                         try:
-                            compressed, resolved_type, source_dims = await asyncio.to_thread(
-                                compress_image_attachment, content, content_type
-                            )
-                        except ImageCompressionError as exc:
-                            raise HTTPException(status_code=413, detail=str(exc)) from exc
-                        # A re-encode (e.g. PNG → JPEG) changes the type; realign the
-                        # filename extension so name, bytes, and MIME stay consistent.
-                        if resolved_type != content_type:
-                            filename = image_filename_for_content_type(
-                                file.filename, resolved_type
-                            )
-                        content, content_type = compressed, resolved_type
+                            await asyncio.shield(put_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    _delete_failed_upload(
+                        file_store, artifact_store, session_id=session_id, file_id=stored.id
+                    )
+                    raise
+                except ValueError as exc:
+                    _delete_failed_upload(
+                        file_store, artifact_store, session_id=session_id, file_id=stored.id
+                    )
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Attachment exceeds the {per_file // (1024 * 1024)} MB "
+                            "limit for this file type."
+                            if per_file is not None
+                            else "Attachment exceeds the configured size limit."
+                        ),
+                    ) from exc
+                except Exception as exc:
+                    _delete_failed_upload(
+                        file_store, artifact_store, session_id=session_id, file_id=stored.id
+                    )
+                    raise OmnigentError(
+                        "Failed to upload file. Please try again.",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    ) from exc
             else:
-                # PDF/text/SVG and other non-compressed types use their smaller
-                # per-type caps and aren't decoded, so they read outside the gate.
-                content = await _read_upload_capped(file, read_limit)
-            stored = file_store.create(
-                session_id=session_id,
-                filename=filename,
-                bytes=len(content),
-                content_type=content_type,
-                source_metadata=(
-                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
-                ),
-            )
-            try:
-                artifact_store.put(stored.id, content)
-            except Exception as exc:
-                # Release quota before another upload can acquire the session lock.
+                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+                # Persist original dimensions only after a downscale.
+                source_dims: tuple[int, int] | None = None
+                if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+                    # Compressible images carry the large cap and the decode, so they are
+                    # the server's peak upload memory. The body is already spooled to
+                    # disk by the multipart parser, so gate the in-memory read + the
+                    # decode/re-encode behind the admission semaphore: a burst of
+                    # concurrent uploads waits (each holding only a disk-backed temp
+                    # file), instead of every one buffering the full image in RAM and
+                    # decoding at once. This bounds peak memory to the gate size × the
+                    # per-upload cost, without serializing the network transfer.
+                    async with _get_image_compression_gate():
+                        content = await _read_upload_capped(file, read_limit)
+                        if image_needs_compression(len(content), content_type):
+                            try:
+                                compressed, resolved_type, source_dims = await asyncio.to_thread(
+                                    compress_image_attachment, content, content_type
+                                )
+                            except ImageCompressionError as exc:
+                                raise HTTPException(status_code=413, detail=str(exc)) from exc
+                            # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                            # filename extension so name, bytes, and MIME stay consistent.
+                            if resolved_type != content_type:
+                                filename = image_filename_for_content_type(
+                                    file.filename, resolved_type
+                                )
+                            content, content_type = compressed, resolved_type
+                else:
+                    # PDF/text/SVG and other non-compressed types use their smaller
+                    # per-type caps and aren't decoded, so they read outside the gate.
+                    content = await _read_upload_capped(file, read_limit)
+                source_metadata: dict[str, object] | None = (
+                    {"width": source_dims[0], "height": source_dims[1]}
+                    if source_dims is not None
+                    else None
+                )
+                stored = file_store.create(
+                    session_id=session_id,
+                    filename=filename,
+                    bytes=len(content),
+                    content_type=content_type,
+                    source_metadata=source_metadata,
+                )
                 try:
-                    file_store.delete(stored.id, session_id=session_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete uploaded file row during rollback: session=%s file_id=%s",
-                        session_id,
-                        stored.id,
-                        exc_info=True,
+                    artifact_store.put(stored.id, content)
+                except Exception as exc:
+                    _delete_failed_upload(
+                        file_store, artifact_store, session_id=session_id, file_id=stored.id
                     )
-                try:
-                    artifact_store.delete(stored.id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete uploaded file blob during rollback: session=%s file_id=%s",
-                        session_id,
-                        stored.id,
-                        exc_info=True,
-                    )
-                raise OmnigentError(
-                    "Failed to upload file. Please try again.",
-                    code=ErrorCode.INTERNAL_ERROR,
-                ) from exc
+                    raise OmnigentError(
+                        "Failed to upload file. Please try again.",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    ) from exc
         resource = _stored_file_to_resource(session_id, stored)
         _publish_and_persist_resource_event(
             session_id,
@@ -1856,6 +2039,8 @@ def register_resources_routes(
             resource=resource,
         )
         return resource
+
+    router.include_router(upload_router)
 
     @router.get(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -1936,7 +2121,6 @@ def register_resources_routes(
                     "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
                 },
             )
-        content = await asyncio.to_thread(artifact_store.get, blob_key)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1946,16 +2130,20 @@ def register_resources_routes(
         # Force a download with ``Content-Disposition: attachment`` and
         # disable MIME sniffing so the response cannot be reinterpreted
         # as an active type.
-        return Response(
-            content=content,
-            media_type=media_type,
-            headers={
-                "Content-Disposition": _attachment_disposition(stored.filename),
-                "X-Content-Type-Options": "nosniff",
-                "ETag": etag,
-                "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
-            },
-        )
+        headers = {
+            "Content-Disposition": _attachment_disposition(stored.filename),
+            "X-Content-Type-Options": "nosniff",
+            "ETag": etag,
+            "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
+        }
+        # A store with a real local file streams it chunk by chunk — a big
+        # by-path attachment never lands in server memory. Other store
+        # backends keep today's whole-body response.
+        local_path = await asyncio.to_thread(artifact_store.local_path, blob_key)
+        if local_path is not None:
+            return _stream_local_file_content(local_path, media_type=media_type, headers=headers)
+        content = await asyncio.to_thread(artifact_store.get, blob_key)
+        return Response(content=content, media_type=media_type, headers=headers)
 
     @router.delete(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -2110,19 +2298,15 @@ def register_resources_routes(
                 )
             sources.append(stored)
 
-        # Files requiring filesystem tools entering a session pass the same checks as an upload,
-        # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        # By-path files entering a session pass the same checks as an upload,
+        # held under the same lock, so a copy can't skip the quotas.
+        from omnigent.inner.native_attachments import is_by_path
 
         filesystem_sources = [
-            stored
-            for stored in sources
-            if stored.filename and requires_filesystem(stored.filename)
+            stored for stored in sources if is_by_path(stored.filename, stored.source_metadata)
         ]
         if filesystem_sources:
-            await _require_filesystem_attachment_support(
-                request, conv, filesystem_sources[0].filename or ""
-            )
+            await _require_filesystem_attachment_support(request, conv)
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
         )

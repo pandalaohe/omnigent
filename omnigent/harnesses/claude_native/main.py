@@ -5486,6 +5486,7 @@ async def _ensure_local_claude_resume_transcript(
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
     from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
+    from omnigent.inner.native_attachments import restore_session_attachments
 
     current = workspace
     target_dir = _claude_project_dir_for_cwd(current)
@@ -5500,6 +5501,7 @@ async def _ensure_local_claude_resume_transcript(
             external_session_id=external_session_id,
         ):
             if candidate == target:
+                await restore_session_attachments(session_id, client)
                 return ClaudeResumeTranscriptResolution(
                     target,
                     reused_local=True,
@@ -5522,6 +5524,7 @@ async def _ensure_local_claude_resume_transcript(
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     tmp.unlink()
+            await restore_session_attachments(session_id, client)
             return ClaudeResumeTranscriptResolution(
                 target,
                 reused_local=True,
@@ -5564,6 +5567,7 @@ async def _ensure_local_claude_resume_transcript(
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
+    await restore_session_attachments(session_id, client)
     return ClaudeResumeTranscriptResolution(
         target,
         reused_local=False,

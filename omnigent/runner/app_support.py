@@ -13,9 +13,8 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner.native_attachments import (
-    framework_notice_block,
     has_unresolved_file_id,
-    resolve_file_id_block,
+    resolve_file_reference,
 )
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
@@ -162,9 +161,10 @@ async def _resolve_forwarded_message_content(
 
     Remote Omnigent servers can forward session messages with raw file IDs
     because their file store is not available to the out-of-process
-    runner. The runner can still fetch bytes through the session-scoped
-    file resource endpoint and inline them before handing content to a
-    harness. Blocks already resolved by the server pass through.
+    runner. The runner fetches the row's metadata and either inlines the
+    bytes (images, PDF, text) or streams the file to the agent host and
+    replaces the block with an ``[Attached: <path>]`` line for any harness.
+    Blocks already resolved by the server pass through.
     """
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
@@ -172,18 +172,15 @@ async def _resolve_forwarded_message_content(
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
-        result = None
+        replacement = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            result = await resolve_file_id_block(
+            replacement = await resolve_file_reference(
                 block, session_id=session_id, client=server_client
             )
-        if result is None:
+        if replacement is None:
             resolved.append(block)
         else:
-            new_block, notice = result
-            resolved.append(new_block)
-            if notice is not None:
-                resolved.append(framework_notice_block(notice))
+            resolved.extend(replacement)
             changed = True
 
     return resolved if changed else content

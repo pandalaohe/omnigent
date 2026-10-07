@@ -43,25 +43,24 @@ _COMPOSER = "Send a message…"
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
-# An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
-# error. Office documents and archives are accepted.
+# A video is not inlined: it attaches as a file the agent host receives by path.
 _MEDIA_NAME = "clip.mp4"
 
-# JSON is its own MIME (``application/json``), which is NOT covered by the
-# ``text/*`` wildcard, so it has to be listed in the ``accept`` attr explicitly
-# for the OS picker (and the drag-drop ``matchesAccept`` validator) to admit it.
+# Larger than the upload-request ceiling the server publishes to the SPA
+# (``attachment_max_upload_bytes``, default 2 GiB), so ``addFiles`` rejects it
+# client-side. The sparse file costs ~no disk: only its size matters here.
+_OVERSIZED_NAME = "recording.mov"
+_OVERSIZED_BYTES = 2 * 1024**3 + 1
+
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
 # A ZIP is a common input, such as an iCloud Photos export.
 _ZIP_NAME = "photos.zip"
 
-# The server's real 415 body for an unsupported upload, from
-# ``routes_resources.upload_session_file``. Used to drive the failed-send path.
-_SERVER_415_DETAIL = (
-    "Unsupported attachment type 'video/mp4'. Attach images, PDF, or text/code files, "
-    "or use Claude Code or Codex for archives, Office documents, and databases."
-)
+# The server's real 413 body for an oversized upload, from
+# ``helpers._read_upload_capped``. Used to drive the failed-send path.
+_SERVER_413_DETAIL = "Attachment exceeds the 10 MB limit for this file type."
 
 
 def test_attach_then_remove_file(
@@ -77,7 +76,7 @@ def test_attach_then_remove_file(
 
     # The attach affordance is a paperclip button; its click target is the
     # hidden file input. Drive the input directly (the picker can't be scripted).
-    file_input = page.locator('input[type="file"][accept*="image/"]')
+    file_input = page.get_by_test_id("composer-file-input")
     file_input.set_input_files(str(sample))
 
     # The chip renders below the textarea with a per-file remove button whose
@@ -95,14 +94,12 @@ def test_attach_then_remove_file(
 def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path: Path) -> None:
     """A ``.json`` file is admitted by the picker and attaches as a chip.
 
-    Guards the change that added ``application/json`` to the composer's
-    ``accept`` list. Two things are asserted:
+    Two things are asserted:
 
-    1. The hidden input advertises ``application/json`` in its ``accept`` attr.
-       This is the part the OS file picker and the drag-drop ``matchesAccept``
-       validator (``prompt-input.tsx``) actually read — and the part that would
-       regress if the MIME were dropped from the list. ``set_input_files`` can't
-       cover it because it bypasses the accept filter entirely.
+    1. The hidden input carries no ``accept`` filter, so the OS picker offers
+       every file type (on a phone: the photo library with videos, and the
+       camera's video mode). ``set_input_files`` bypasses the filter, so only
+       the attribute itself can pin this.
     2. Driving a real ``.json`` file through the input still yields the chip +
        remove control, i.e. ``addFiles`` accepts the JSON end-to-end.
     """
@@ -113,12 +110,9 @@ def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path:
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
-    file_input = page.locator('input[type="file"][accept*="image/"]')
-    # The accept attr is what gates the picker/drag-drop; assert JSON is listed.
+    file_input = page.get_by_test_id("composer-file-input")
     accept = file_input.get_attribute("accept")
-    assert accept is not None and "application/json" in accept, (
-        f"composer file input should accept application/json; got {accept!r}"
-    )
+    assert accept is None, f"composer file input should not filter types; got {accept!r}"
 
     file_input.set_input_files(str(sample))
 
@@ -138,13 +132,10 @@ def test_attach_zip_as_file_card(
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
-    file_input = page.locator('input[type="file"][accept*="image/"]')
-    # Without .zip in the accept attr the OS picker hides the very files the
-    # server now accepts, so the feature is unreachable from the UI.
+    file_input = page.get_by_test_id("composer-file-input")
+    # No accept filter: the picker offers every file type.
     accept = file_input.get_attribute("accept")
-    assert accept is not None and ".zip" in accept, (
-        f"composer file input should accept .zip; got {accept!r}"
-    )
+    assert accept is None, f"composer file input should not filter types; got {accept!r}"
 
     file_input.set_input_files(str(sample))
 
@@ -155,38 +146,29 @@ def test_attach_zip_as_file_card(
     expect(chip).not_to_contain_text("workspace")
 
 
-def test_reject_unsupported_type(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path
-) -> None:
-    """An unsupported type (mp4) is rejected client-side: no chip, inline error.
+def test_attach_video_as_file(page: Page, seeded_session: tuple[str, str], tmp_path: Path) -> None:
+    """A video attaches as a file chip with no rejection notice.
 
-    Covers the validation ``addFiles`` gained (``validateAttachments`` in
-    lib/attachments.ts). Office documents and archives are no longer rejected
-    here, so this pins the shape
-    that is still refused: media no harness can open from disk. Driving the
-    hidden input directly (``set_input_files`` bypasses the accept filter, so
-    the file reaches ``addFiles``) must yield NO chip and a visible error.
+    Videos are not inlined into the model context; they attach like any other
+    non-inline file and reach the agent host by path.
     """
     base_url, session_id = seeded_session
     sample = tmp_path / _MEDIA_NAME
-    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
+    sample.write_bytes(b"\x00\x00\x00 a short binary standing in for a video")
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
-    file_input = page.locator('input[type="file"][accept*="image/"]')
-    file_input.set_input_files(str(sample))
+    page.get_by_test_id("composer-file-input").set_input_files(str(sample))
 
-    # Rejected: no chip / remove control for the file.
-    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
-    # And the inline rejection error is shown.
-    expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
+    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_be_visible(timeout=10_000)
+    expect(page.get_by_text("can't be attached", exact=False)).to_have_count(0)
 
 
-def test_landing_rejects_unsupported_type_and_keeps_message(
+def test_landing_rejects_oversized_file_and_keeps_message(
     page: Page, live_server: str, tmp_path: Path
 ) -> None:
-    """The landing composer rejects an unsupported file without losing the message.
+    """The landing composer rejects an oversized file without losing the message.
 
     The landing screen is the case that actually bit users: it used to append
     incoming files unchecked, so a zip only failed after the session had been
@@ -205,8 +187,9 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
        ever clear it; left sticky it reads as a hard blocker.
     """
     base_url = live_server
-    sample = tmp_path / _MEDIA_NAME
-    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
+    sample = tmp_path / _OVERSIZED_NAME
+    with sample.open("wb") as handle:
+        handle.truncate(_OVERSIZED_BYTES)
 
     page.goto(base_url)
     composer = page.get_by_test_id("new-chat-landing-input")
@@ -216,10 +199,10 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     page.get_by_test_id("new-chat-landing-file-input").set_input_files(str(sample))
 
     # Rejected: no chip, and the reason names the file.
-    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
+    expect(page.get_by_role("button", name=f"Remove {_OVERSIZED_NAME}")).to_have_count(0)
     error = page.get_by_test_id("new-chat-landing-attachment-error")
     expect(error).to_be_visible(timeout=10_000)
-    expect(error).to_contain_text(_MEDIA_NAME)
+    expect(error).to_contain_text(_OVERSIZED_NAME)
 
     # The message the user typed is untouched, and no session was created —
     # still on the landing screen, not redirected into /c/<id>.
@@ -242,11 +225,11 @@ def test_failed_upload_restores_the_message(
     ``failedSendDraft`` and the composer restores it.
 
     The failure is injected at the network boundary (the upload route responds
-    415 with the server's real body) rather than by attaching an unsupported
+    413 with the server's real body) rather than by attaching an oversized
     file — client-side validation would reject that before any request, so it
-    would never exercise this path. The 415 body also pins the second half of
+    would never exercise this path. The 413 body also pins the second half of
     the fix: the banner must carry the server's reason, not a bare
-    ``upload failed: 415`` built from an empty HTTP/2 ``statusText``.
+    ``upload failed: 413`` built from an empty HTTP/2 ``statusText``.
     """
     base_url, session_id = seeded_session
     sample = tmp_path / _ATTACH_NAME
@@ -254,9 +237,9 @@ def test_failed_upload_restores_the_message(
 
     def _reject_upload(route: Route) -> None:
         route.fulfill(
-            status=415,
+            status=413,
             content_type="application/json",
-            body=json.dumps({"detail": _SERVER_415_DETAIL}),
+            body=json.dumps({"detail": _SERVER_413_DETAIL}),
         )
 
     page.route("**/resources/files", _reject_upload)
@@ -265,7 +248,7 @@ def test_failed_upload_restores_the_message(
     composer = page.get_by_placeholder(_COMPOSER)
     expect(composer).to_be_visible(timeout=30_000)
 
-    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(sample))
+    page.get_by_test_id("composer-file-input").set_input_files(str(sample))
     expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
 
     composer.fill("look at this file")
@@ -278,7 +261,7 @@ def test_failed_upload_restores_the_message(
     headline = pill.get_by_role("button", name="Something went wrong", exact=False)
     expect(headline).to_have_attribute("aria-expanded", "false")
     headline.click()
-    expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible()
+    expect(page.get_by_text("Attachment exceeds the", exact=False)).to_be_visible()
     # And the message is back in the composer, ready to retry.
     expect(composer).to_have_value("look at this file", timeout=10_000)
 

@@ -12,6 +12,11 @@ from typing import Any, Protocol, cast
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.inner.native_attachments import (
+    contains_attached_path,
+    restore_session_attachments,
+    rewrite_attached_paths,
+)
 from omnigent.runner.app_support import (
     _resolve_forwarded_message_content,
     _SpecEntry,
@@ -175,6 +180,38 @@ def build_session_history(
                     session_id=session_id,
                     server_client=server_client,
                 )
+        # Compaction persists "[Attached: ...]" lines that point at the host
+        # directory of whichever machine wrote them. Redirect them to this
+        # host's session dir and restore the files before any harness sees
+        # the history. A line already pointing here still needs the restore:
+        # cleanup may have deleted the file the unchanged text references.
+        restore_needed = False
+        for item in converted:
+            if item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                if not contains_attached_path(content):
+                    continue
+                restore_needed = True
+                item["content"] = rewrite_attached_paths(content, session_id)
+                continue
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") not in {"input_text", "output_text", "text"}:
+                    continue
+                text = block.get("text")
+                if not isinstance(text, str) or not contains_attached_path(text):
+                    continue
+                restore_needed = True
+                rewritten = rewrite_attached_paths(text, session_id)
+                if rewritten != text:
+                    block["text"] = rewritten
+        if restore_needed:
+            await restore_session_attachments(session_id, server_client)
         return converted
 
     def _convert_raw_items_to_input(

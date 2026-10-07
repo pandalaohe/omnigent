@@ -28,7 +28,10 @@ from typing import Any, NoReturn
 
 from omnigent.codex_rate_limits import validate_codex_rate_limits_snapshot
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_PATH_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -69,6 +72,7 @@ CAP_KEEP_WARM = "keep_warm_v1"
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_PATH_ATTACHMENTS,
     CAP_FS_READ_RAW,
     CAP_KEEP_WARM,
     CAP_MCP_INVENTORY,

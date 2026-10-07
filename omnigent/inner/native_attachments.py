@@ -28,7 +28,8 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Any, Literal
+from types import ModuleType
+from typing import IO, Any, Literal
 
 import httpx
 
@@ -88,23 +89,16 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
-# Upload limits for files that the harness opens with filesystem tools.
-# The server enforces these per session, including copies between sessions.
-MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
-MAX_SESSION_FILESYSTEM_ATTACHMENTS: int = 20
-MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
-
 # These formats require the harness's filesystem tools. Match by extension
 # because browsers can mislabel Office documents as ZIP or generic binary data.
 _FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
     {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
 )
 
-# Harnesses supporting uploads and history restoration for these file formats.
-FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
-
 # Advertised by builds that can deliver and restore these attachments.
 CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
+# Advertised by builds that stream by-path attachments to the agent host.
+CAP_PATH_ATTACHMENTS = "path_attachments"
 
 
 def requires_filesystem(filename: str | None) -> bool:
@@ -117,6 +111,24 @@ def requires_filesystem(filename: str | None) -> bool:
     return bool(
         filename and PurePath(filename).suffix.lower() in _FILESYSTEM_ATTACHMENT_EXTENSIONS
     )
+
+
+def is_by_path(filename: str | None, source_metadata: object) -> bool:
+    """
+    Whether a stored file is delivered by path instead of inlined.
+
+    The upload route persists ``source_metadata["delivery"] = "filesystem"``
+    for every file that must not enter the model context; the stored key wins
+    over the filename so a row's delivery cannot drift with a rename. Rows
+    written before that key existed fall back to the extension rule.
+
+    :param filename: The stored filename, e.g. ``"clip.mp4"``.
+    :param source_metadata: The stored row's ``source_metadata`` value.
+    :returns: True when the file is delivered by path.
+    """
+    if isinstance(source_metadata, Mapping) and "delivery" in source_metadata:
+        return source_metadata["delivery"] == "filesystem"
+    return requires_filesystem(filename)
 
 
 def inline_filesystem_attachment_name(content: object) -> str | None:
@@ -153,6 +165,60 @@ def attachment_cache_dir(bridge_dir: Path) -> Path:
     return data_dir().resolve() / "attachments" / key
 
 
+def session_attachment_dir(session_id: str) -> Path:
+    """Return the deterministic host directory for a session's by-path files.
+
+    Keyed by session id so the path survives a restart and is the same on
+    every host that runs the session; files live under ``<file_id>/<name>``.
+    """
+    digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
+    return data_dir().resolve() / "attachments" / f"s-{digest}"
+
+
+# One "[Attached: <path>]" line whose path ends in the per-session layout
+# ``...attachments<sep>s-<32 hex><sep><file_id><sep><name>``, with either
+# separator so a transcript written on another OS can still be redirected.
+_ATTACHED_PATH_RE = re.compile(
+    r"\[Attached: [^\]\r\n]*?attachments[\\/]s-[0-9a-f]{32}[\\/]([^\\/\]]+)[\\/]([^\\/\]]+)\]"
+)
+
+
+def contains_attached_path(text: str) -> bool:
+    """
+    Whether *text* carries an ``[Attached: ...]`` line in the session layout.
+
+    A line already pointing at this host's session dir is a match too, so
+    callers that restore files can trigger on the marker even when the rewrite
+    leaves the text unchanged.
+
+    :param text: Persisted text that may contain attachment reference lines.
+    :returns: ``True`` when any ``[Attached: ...]`` line matches the layout.
+    """
+    return _ATTACHED_PATH_RE.search(text) is not None
+
+
+def rewrite_attached_paths(text: str, session_id: str) -> str:
+    """
+    Redirect persisted ``[Attached: ...]`` lines to this host's session dir.
+
+    Compaction persists attachment reference lines that point at the host
+    directory of whichever machine produced them. Rewriting the session key
+    and ``file_id``/``name`` tail keeps the same file identity while moving
+    the prefix to :func:`session_attachment_dir` for *session_id*. Lines that
+    do not match the layout are left exactly as written.
+
+    :param text: Persisted text that may contain attachment reference lines.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :returns: *text* with matching paths pointing at this session's dir.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        path = session_attachment_dir(session_id) / match.group(1) / match.group(2)
+        return f"[Attached: {path}]"
+
+    return _ATTACHED_PATH_RE.sub(_replace, text)
+
+
 def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
     """
     Decode an attachment into the session's cache outside the working directory.
@@ -178,6 +244,8 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
 
     attachments_dir = attachment_cache_dir(bridge_dir)
+    if not _dir_fd_supported():
+        return _materialize_attachment_by_path(attachments_dir, filename, raw_bytes)
     try:
         attachments_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         root_fd = os.open(attachments_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -211,6 +279,465 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
     finally:
         os.close(dir_fd)
+
+
+def _materialize_attachment_by_path(
+    attachments_dir: Path, filename: str, raw_bytes: bytes
+) -> Path | None:
+    """Place decoded bytes where dir_fd-relative no-follow opens are unavailable.
+
+    Windows hosts have no ``os.O_DIRECTORY`` / ``dir_fd`` support; the same
+    traversal and symlink refusals are enforced with path-based lstat checks.
+    Writes land in a temporary sibling and are published with ``os.replace``.
+    """
+    try:
+        attachments_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
+        return None
+    for directory in (attachments_dir.parent, attachments_dir):
+        if directory.is_symlink():
+            _logger.warning("Refusing to materialize into %s", attachments_dir)
+            return None
+    stem, suffix = os.path.splitext(filename)
+    digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+    for name in (filename, f"{stem}_{digest}{suffix}"):
+        target = attachments_dir / name
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            info = None
+        except OSError:
+            _logger.warning("Refusing to write through %s", target, exc_info=True)
+            return None
+        if info is not None:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                _logger.warning("Refusing to write through %s", target)
+                return None
+            if info.st_size == len(raw_bytes):
+                try:
+                    existing = target.read_bytes()
+                except OSError:
+                    # An unreadable target is unusable; fall through to the
+                    # collision name like an unclearable execute bit.
+                    _logger.warning("Refusing to reuse unreadable %s", target, exc_info=True)
+                    continue
+                if existing == raw_bytes:
+                    try:
+                        target.chmod(stat.S_IMODE(info.st_mode) & ~0o111)
+                    except OSError:
+                        # A reused file must not stay executable; if the bits
+                        # can't be cleared, fall through to the collision name.
+                        continue
+                    return target
+            continue
+        temp_path = attachments_dir / f"{name}.{uuid.uuid4().hex}.tmp"
+        created = False
+        published = False
+        try:
+            try:
+                with open(temp_path, "xb") as handle:
+                    created = True
+                    view = memoryview(raw_bytes)
+                    while view:
+                        view = view[handle.write(view) :]
+            except FileExistsError:
+                # A colliding temp name is not ours to touch; try the
+                # other candidate name.
+                continue
+            except OSError:
+                _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
+                return None
+            try:
+                os.replace(temp_path, target)
+            except OSError:
+                _logger.warning("Failed to place attachment %s", target, exc_info=True)
+                return None
+            published = True
+            return target
+        finally:
+            if created and not published:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink()
+    _logger.warning("Attachment names for %s already hold other content", filename)
+    return None
+
+
+def _dir_fd_supported() -> bool:
+    """Whether this host exposes dir_fd-relative no-follow opens."""
+    return os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY")
+
+
+def _is_safe_path_component(part: object, pathmod: ModuleType = os.path) -> bool:
+    """Whether *part* is one safe path component: a non-empty string that is not
+    ``.``/``..``, has no NUL, no ``sep``/``altsep``, and no drive."""
+    if not isinstance(part, str) or not part or part in (".", "..") or "\x00" in part:
+        return False
+    if pathmod.sep in part:
+        return False
+    if pathmod.altsep is not None and pathmod.altsep in part:
+        return False
+    return not pathmod.splitdrive(part)[0]
+
+
+async def _stream_file_content(
+    file_id: str,
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+    handle: IO[bytes],
+) -> int:
+    """Stream one file resource's bytes into *handle* and return the count."""
+    count = 0
+    async with client.stream(
+        "GET",
+        f"{_file_resource_base(session_id, file_id)}/content",
+        timeout=httpx.Timeout(10.0, read=60.0),
+    ) as response:
+        response.raise_for_status()
+        async for chunk in response.aiter_bytes():
+            handle.write(chunk)
+            count += len(chunk)
+    return count
+
+
+async def materialize_file_reference(
+    file_id: str,
+    meta: Mapping[str, object],
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> Path | None:
+    """
+    Stream a by-path attachment to its deterministic host path.
+
+    Writes ``<data_dir>/attachments/s-<session key>/<file_id>/<name>`` so an
+    ``[Attached: ...]`` line keeps pointing at the same file across turns. An
+    existing regular file of the expected size is reused; otherwise the
+    content is streamed to a temporary sibling and atomically renamed. The
+    whole body is never buffered. Marker-breaking characters in the stored
+    name are replaced in the local name so the path cannot break the marker.
+    Hosts without dir_fd-relative opens (Windows) use path-based checks.
+
+    :param file_id: The stored file's id, e.g. ``"c531a3..."``.
+    :param meta: The file resource JSON, carrying ``name`` and
+        ``metadata.bytes``.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param client: HTTP client pointed at the Omnigent server.
+    :returns: The host path, or ``None`` when a name is unsafe, the transfer
+        failed, or the streamed size did not match the stored size.
+    """
+    name = meta.get("name")
+    if not _is_safe_path_component(name) or not _is_safe_path_component(file_id):
+        _logger.warning("Refusing unsafe attachment name for file_id=%s", file_id)
+        return None
+    assert isinstance(name, str)  # narrowed by _is_safe_path_component
+    local_name = _MARKER_UNSAFE.sub("_", name)
+    resource_metadata = meta.get("metadata")
+    expected_bytes = (
+        resource_metadata.get("bytes") if isinstance(resource_metadata, Mapping) else None
+    )
+    if _dir_fd_supported():
+        return await _materialize_file_reference_no_follow(
+            file_id,
+            local_name,
+            expected_bytes,
+            session_id=session_id,
+            client=client,
+        )
+    return await _materialize_file_reference_by_path(
+        file_id,
+        local_name,
+        expected_bytes,
+        session_id=session_id,
+        client=client,
+    )
+
+
+async def _materialize_file_reference_no_follow(
+    file_id: str,
+    local_name: str,
+    expected_bytes: object,
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> Path | None:
+    """Deliver a by-path file with dir_fd-relative no-follow opens.
+
+    :param file_id: The stored file's id.
+    :param local_name: Marker-safe base filename.
+    :param expected_bytes: Stored size, or a non-int when unknown.
+    :param session_id: Omnigent conversation id.
+    :param client: HTTP client pointed at the Omnigent server.
+    :returns: The host path, or ``None`` on a refusal or transfer failure.
+    """
+    attachments_dir = session_attachment_dir(session_id)
+    target_dir = attachments_dir / file_id
+    try:
+        attachments_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_fd = os.open(attachments_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", target_dir, exc_info=True)
+        return None
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(attachments_dir.name, mode=0o700, dir_fd=root_fd)
+        dir_fd = os.open(
+            attachments_dir.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", target_dir, exc_info=True)
+        return None
+    finally:
+        os.close(root_fd)
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(file_id, mode=0o700, dir_fd=dir_fd)
+        target_fd = os.open(file_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", target_dir, exc_info=True)
+        return None
+    finally:
+        os.close(dir_fd)
+
+    try:
+        try:
+            info = os.stat(local_name, dir_fd=target_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if not stat.S_ISREG(info.st_mode):
+                _logger.warning("Refusing to write through %s", target_dir / local_name)
+                return None
+            if info.st_size == expected_bytes:
+                return target_dir / local_name
+
+        temp_name = f"{local_name}.{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(
+                temp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=target_fd,
+            )
+        except OSError:
+            _logger.warning(
+                "Failed to create temporary attachment %s", target_dir / temp_name, exc_info=True
+            )
+            return None
+        count = 0
+        published = False
+        try:
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    fd = -1
+                    count = await _stream_file_content(
+                        file_id, session_id=session_id, client=client, handle=handle
+                    )
+            except (httpx.HTTPError, OSError):
+                _logger.warning(
+                    "failed to materialize file_id=%s for session=%s",
+                    file_id,
+                    session_id,
+                    exc_info=True,
+                )
+                return None
+            if isinstance(expected_bytes, int) and count != expected_bytes:
+                _logger.warning(
+                    "attachment file_id=%s for session=%s streamed %d bytes, expected %d",
+                    file_id,
+                    session_id,
+                    count,
+                    expected_bytes,
+                )
+                return None
+            try:
+                os.replace(temp_name, local_name, src_dir_fd=target_fd, dst_dir_fd=target_fd)
+            except OSError:
+                _logger.warning(
+                    "failed to place attachment %s", target_dir / local_name, exc_info=True
+                )
+                return None
+            published = True
+            return target_dir / local_name
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if not published:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_name, dir_fd=target_fd)
+    finally:
+        os.close(target_fd)
+
+
+async def _materialize_file_reference_by_path(
+    file_id: str,
+    local_name: str,
+    expected_bytes: object,
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> Path | None:
+    """Deliver a by-path file where dir_fd-relative opens are unavailable.
+
+    Windows hosts have no ``os.O_DIRECTORY`` / ``dir_fd`` support; the same
+    traversal and symlink refusals are enforced with path-based lstat checks.
+
+    :param file_id: The stored file's id.
+    :param local_name: Marker-safe base filename.
+    :param expected_bytes: Stored size, or a non-int when unknown.
+    :param session_id: Omnigent conversation id.
+    :param client: HTTP client pointed at the Omnigent server.
+    :returns: The host path, or ``None`` on a refusal or transfer failure.
+    """
+    attachments_dir = session_attachment_dir(session_id)
+    target_dir = attachments_dir / file_id
+    try:
+        target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", target_dir, exc_info=True)
+        return None
+    for directory in (attachments_dir.parent, attachments_dir, target_dir):
+        if directory.is_symlink():
+            _logger.warning("Refusing to materialize into %s", target_dir)
+            return None
+
+    target = target_dir / local_name
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError:
+        _logger.warning("Refusing to write through %s", target, exc_info=True)
+        return None
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            _logger.warning("Refusing to write through %s", target)
+            return None
+        if info.st_size == expected_bytes:
+            return target
+
+    temp_path = target_dir / f"{local_name}.{uuid.uuid4().hex}.tmp"
+    created = False
+    published = False
+    try:
+        try:
+            with open(temp_path, "xb") as handle:
+                created = True
+                count = await _stream_file_content(
+                    file_id, session_id=session_id, client=client, handle=handle
+                )
+        except (httpx.HTTPError, OSError):
+            _logger.warning(
+                "failed to materialize file_id=%s for session=%s",
+                file_id,
+                session_id,
+                exc_info=True,
+            )
+            return None
+        if isinstance(expected_bytes, int) and count != expected_bytes:
+            _logger.warning(
+                "attachment file_id=%s for session=%s streamed %d bytes, expected %d",
+                file_id,
+                session_id,
+                count,
+                expected_bytes,
+            )
+            return None
+        try:
+            os.replace(temp_path, target)
+        except OSError:
+            _logger.warning("failed to place attachment %s", target, exc_info=True)
+            return None
+        published = True
+        return target
+    finally:
+        if created and not published:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+
+
+async def restore_session_attachments(
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> bool:
+    """
+    Re-materialize every by-path file a session owns on this host.
+
+    The deterministic host copies can be removed by cleanup on another host
+    (or on this one after a CLI release); a transcript that still references
+    them needs the files back before the harness resumes. The session file
+    listing supplies the by-path rows; a file whose size still matches is
+    reused without fetching. Every failure is logged and skipped so a resume
+    is never blocked by one missing attachment.
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the listing succeeded and every by-path row
+        materialized; ``False`` when the listing failed or at least one
+        by-path row could not be materialized.
+    """
+    restored_all = True
+    after: str | None = None
+    while True:
+        params: dict[str, str] = {"limit": "1000", "order": "asc"}
+        if after is not None:
+            params["after"] = after
+        try:
+            response = await client.get(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/resources/files",
+                params=params,
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            _logger.warning(
+                "failed to list attachments for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            _logger.warning("unusable attachment listing for session=%s", session_id)
+            return False
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            file_id = row.get("id")
+            metadata = row.get("metadata")
+            source_metadata = (
+                metadata.get("source_metadata") if isinstance(metadata, Mapping) else None
+            )
+            name = row.get("name")
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            if not is_by_path(name if isinstance(name, str) else None, source_metadata):
+                continue
+            try:
+                path = await materialize_file_reference(
+                    file_id, row, session_id=session_id, client=client
+                )
+            except Exception:  # noqa: BLE001 — a restore failure is never fatal.
+                _logger.warning(
+                    "failed to restore file_id=%s for session=%s",
+                    file_id,
+                    session_id,
+                    exc_info=True,
+                )
+                restored_all = False
+                continue
+            if path is None:
+                restored_all = False
+        if not (isinstance(payload, dict) and payload.get("has_more")):
+            return restored_all
+        last_id = payload.get("last_id")
+        if not isinstance(last_id, str) or not last_id:
+            return restored_all
+        after = last_id
 
 
 def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] | None:
@@ -529,11 +1056,65 @@ def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:
     return alias
 
 
+def _file_resource_base(session_id: str, file_id: str) -> str:
+    """Session-scoped URL prefix for one uploaded file's resource endpoints."""
+    return (
+        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
+        f"/resources/files/{urllib.parse.quote(file_id, safe='')}"
+    )
+
+
+async def fetch_file_meta(
+    file_id: str,
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> dict[str, object] | None:
+    """
+    Fetch one uploaded file's metadata JSON.
+
+    :param file_id: The stored file's id, e.g. ``"c531a3..."``.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param client: HTTP client pointed at the Omnigent server.
+    :returns: The parsed metadata dict; ``{}`` when the body is missing or
+        unusable, so the caller falls back to the content response's
+        Content-Type, or ``None`` on an HTTP error.
+    """
+    try:
+        response = await client.get(_file_resource_base(session_id, file_id), timeout=10.0)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "failed to resolve file_id=%s for session=%s",
+            file_id,
+            session_id,
+            exc_info=True,
+        )
+        return None
+    try:
+        parsed = response.json() if response.content else {}
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        if response.content:
+            # Unusable metadata only costs the media-type hint; the content
+            # response's Content-Type header still provides it.
+            _logger.warning(
+                "unusable file metadata for file_id=%s in session=%s; "
+                "falling back to the content headers",
+                file_id,
+                session_id,
+            )
+        return {}
+    return parsed
+
+
 async def resolve_file_id_block(
     block: Mapping[str, object],
     *,
     session_id: str,
     client: httpx.AsyncClient,
+    meta: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, int] | None] | None:
     """
     Fetch a ``file_id`` attachment's bytes and inline them as a data URI.
@@ -548,20 +1129,21 @@ async def resolve_file_id_block(
         is true.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
+    :param meta: Metadata already fetched by the caller, so the call does
+        not GET it twice. Fetched here when absent.
     :returns: ``(rebuilt_block, notice)`` — the block without ``file_id``,
         and source dimensions for a sibling framework block, or ``None``.
         Returns ``None`` (not a tuple) when the fetch failed, so callers
         keep the original block and a visible marker can surface downstream.
     """
     file_id = str(block.get("file_id"))
-    base = (
-        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
-        f"/resources/files/{urllib.parse.quote(file_id, safe='')}"
-    )
+    base = _file_resource_base(session_id, file_id)
+    if meta is None:
+        meta = await fetch_file_meta(file_id, session_id=session_id, client=client)
+        if meta is None:
+            return None
     try:
-        meta_resp = await client.get(base, timeout=10.0)
         content_resp = await client.get(f"{base}/content", timeout=30.0)
-        meta_resp.raise_for_status()
         content_resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
@@ -571,21 +1153,6 @@ async def resolve_file_id_block(
             exc_info=True,
         )
         return None
-
-    try:
-        parsed = meta_resp.json() if meta_resp.content else {}
-    except ValueError:
-        parsed = None
-    meta = parsed if isinstance(parsed, dict) else {}
-    if meta_resp.content and not meta:
-        # Unusable metadata only costs the media-type hint; the content
-        # response's Content-Type header still provides it.
-        _logger.warning(
-            "unusable file metadata for file_id=%s in session=%s; "
-            "falling back to the content headers",
-            file_id,
-            session_id,
-        )
     content_type = meta.get("content_type")
     if not isinstance(content_type, str) or not content_type:
         content_type = content_resp.headers.get("content-type") or "application/octet-stream"
@@ -609,6 +1176,100 @@ async def resolve_file_id_block(
     return new_block, notice
 
 
+async def resolve_file_reference(
+    block: Mapping[str, object],
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> list[dict[str, object]] | None:
+    """
+    Resolve one unresolved ``file_id`` block to its replacement blocks.
+
+    Fetches the stored row first: a by-path row is streamed to its
+    deterministic host path and becomes a single ``[Attached: <path>]`` text
+    block; an inline row is inlined exactly as :func:`resolve_file_id_block`
+    does, followed by a framework notice block when the image was downscaled.
+
+    :param block: Content block for which :func:`has_unresolved_file_id`
+        is true.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param client: HTTP client pointed at the Omnigent server.
+    :returns: The replacement blocks, or ``None`` when resolution failed, in
+        which case the caller keeps the original block and a visible marker
+        can surface downstream.
+    """
+    file_id = str(block.get("file_id"))
+    meta = await fetch_file_meta(file_id, session_id=session_id, client=client)
+    if meta is None:
+        return None
+    resource_metadata = meta.get("metadata")
+    source_metadata = (
+        resource_metadata.get("source_metadata")
+        if isinstance(resource_metadata, Mapping)
+        else None
+    )
+    name = meta.get("name")
+    if is_by_path(name if isinstance(name, str) else None, source_metadata):
+        path = await materialize_file_reference(
+            file_id, meta, session_id=session_id, client=client
+        )
+        if path is None:
+            return None
+        return [{"type": "input_text", "text": f"[Attached: {path}]"}]
+    result = await resolve_file_id_block(block, session_id=session_id, client=client, meta=meta)
+    if result is None:
+        return None
+    new_block, notice = result
+    blocks: list[dict[str, object]] = [new_block]
+    if notice is not None:
+        blocks.append(framework_notice_block(notice))
+    return blocks
+
+
+_HISTORY_TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text"})
+
+
+def _rewrite_message_text_attachments(item: dict[str, Any], session_id: str) -> None:
+    """Redirect ``[Attached: ...]`` texts inside one message item, in place."""
+    content = item.get("content")
+    if isinstance(content, str):
+        item["content"] = rewrite_attached_paths(content, session_id)
+        return
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in _HISTORY_TEXT_BLOCK_TYPES:
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            block["text"] = rewrite_attached_paths(text, session_id)
+
+
+async def _resolve_message_item_file_references(
+    item: dict[str, Any],
+    *,
+    session_id: str,
+    client: httpx.AsyncClient,
+) -> None:
+    """Resolve one message's ``file_id`` blocks and redirect its attached paths."""
+    if item.get("type") != "message":
+        return
+    content = item.get("content")
+    if isinstance(content, list):
+        resolved_content: list[object] = []
+        for block in content:
+            if not (isinstance(block, dict) and has_unresolved_file_id(block)):
+                resolved_content.append(block)
+                continue
+            replacement = await resolve_file_reference(block, session_id=session_id, client=client)
+            if replacement is None:
+                resolved_content.append(block)
+                continue
+            resolved_content.extend(replacement)
+        item["content"] = resolved_content
+    _rewrite_message_text_attachments(item, session_id)
+
+
 async def resolve_session_item_file_references(
     client: httpx.AsyncClient,
     *,
@@ -616,35 +1277,34 @@ async def resolve_session_item_file_references(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
-    Inline ``file_id`` attachment blocks in rebuilt history as base64 data URIs.
+    Resolve ``file_id`` attachment blocks in rebuilt history.
 
     Message items come back from the server with the upload's raw ``file_id``.
     A cold-resume rebuild runs where no file/artifact stores exist, so bytes are
-    fetched back through the session file endpoints, as for a live turn. A failed
-    fetch is non-fatal: the block stays unresolved and surfaces a visible marker.
+    fetched back through the session file endpoints, as for a live turn. A
+    by-path row becomes an ``[Attached: <path>]`` text line so a rebuilt
+    transcript never carries a multi-gigabyte base64 copy; inline rows carry
+    ``image_url`` / ``file_data`` data URIs as before. A failed fetch is
+    non-fatal: the block stays unresolved and surfaces a visible marker.
+
+    Compaction items are rewritten too: both native transcript builders consume
+    their ``compacted_messages`` directly, so an ``[Attached: ...]`` line a
+    previous host persisted there must move to this host's session dir.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param items: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
-    :returns: The same items with resolvable attachment blocks rewritten
-        to carry ``image_url`` / ``file_data`` data URIs.
+    :returns: The same items with resolvable attachment blocks rewritten.
     """
     for item in items:
-        content = item.get("content")
-        if item.get("type") != "message" or not isinstance(content, list):
+        if item.get("type") == "compaction":
+            compacted = item.get("compacted_messages")
+            if isinstance(compacted, list):
+                for message in compacted:
+                    if isinstance(message, dict):
+                        await _resolve_message_item_file_references(
+                            message, session_id=session_id, client=client
+                        )
             continue
-        resolved_content: list[object] = []
-        for block in content:
-            if not (isinstance(block, dict) and has_unresolved_file_id(block)):
-                resolved_content.append(block)
-                continue
-            result = await resolve_file_id_block(block, session_id=session_id, client=client)
-            if result is None:
-                resolved_content.append(block)
-                continue
-            new_block, notice = result
-            resolved_content.append(new_block)
-            if notice is not None:
-                resolved_content.append(framework_notice_block(notice))
-        item["content"] = resolved_content
+        await _resolve_message_item_file_references(item, session_id=session_id, client=client)
     return items

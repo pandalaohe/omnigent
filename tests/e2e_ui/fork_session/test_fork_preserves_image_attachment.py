@@ -75,7 +75,7 @@ def test_fork_carries_image_reference_and_its_resource(
     expect(page.get_by_label(_COMPOSER_LABEL)).to_be_visible(timeout=30_000)
 
     # Attach + send the image in the SOURCE session; it loads fine there.
-    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(png))
+    page.get_by_test_id("composer-file-input").set_input_files(str(png))
     expect(page.get_by_role("button", name=f"Remove {_SCREENSHOT_NAME}")).to_be_visible(
         timeout=10_000
     )

@@ -4,6 +4,8 @@ import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as sessionsApi from "@/lib/sessionsApi";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -280,6 +282,54 @@ describe("side-chat interrupt", () => {
 
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+  });
+});
+
+describe("side chat composer attachments", () => {
+  const selectFiles = (files: File[]) => {
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files } });
+  };
+
+  it("rejects an oversize file against the server's limits and shows the error", () => {
+    renderPane(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, attachment_limits: { file_bytes: 10 } }}
+      >
+        <SideChatPane childId={childId} />
+      </CapabilitiesProvider>,
+    );
+
+    selectFiles([new File([new Uint8Array(11)], "clip.mp4", { type: "video/mp4" })]);
+
+    expect(screen.getByText(/"clip\.mp4" is too large/)).toHaveTextContent("10 bytes");
+    // The rejected file never reaches the attachment tray.
+    expect(screen.queryByText("clip.mp4")).toBeNull();
+  });
+
+  it("shows the child's upload progress row while it uploads", () => {
+    renderPane(<SideChatPane childId={childId} />);
+
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        uploadProgress: { filename: "clip.mp4", fraction: null },
+      }),
+    );
+    expect(screen.getByTestId("side-chat-upload-progress")).toHaveTextContent(
+      "Uploading clip.mp4…",
+    );
+
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        uploadProgress: { filename: "clip.mp4", fraction: 0.42 },
+      }),
+    );
+    expect(screen.getByTestId("side-chat-upload-progress")).toHaveTextContent(
+      "Uploading clip.mp4 — 42%",
+    );
+
+    act(() => conversationRegistry.acquire(childId).setState({ uploadProgress: null }));
+    expect(screen.queryByTestId("side-chat-upload-progress")).toBeNull();
   });
 });
 
