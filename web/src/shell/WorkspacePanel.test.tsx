@@ -110,7 +110,7 @@ function renderWorkspace(
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onBrowserTabOpened = vi.fn();
-  const onRevealRequested = vi.fn();
+  const onTabShortcut = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
@@ -136,7 +136,7 @@ function renderWorkspace(
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onBrowserTabOpened={onBrowserTabOpened}
-        onRevealRequested={onRevealRequested}
+        onTabShortcut={onTabShortcut}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -168,7 +168,7 @@ function renderWorkspace(
     onCloseFile,
     onRightRailTabChange,
     onBrowserTabOpened,
-    onRevealRequested,
+    onTabShortcut,
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
@@ -381,16 +381,16 @@ describe("WorkspacePanel surface presentation", () => {
 });
 
 describe("WorkspacePanel select-tab hotkeys", () => {
-  it("selects the numbered rail tab from its bound chord and asks to reveal the panel", () => {
+  it("routes a bound select-tab chord through onTabShortcut instead of changing the rail tab", () => {
     writeShortcutPreference("selectWorkspaceTab2", {
       common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
     });
-    const { onRightRailTabChange, onRevealRequested } = renderWorkspace();
+    const { onRightRailTabChange, onTabShortcut } = renderWorkspace();
 
     fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true, shiftKey: true });
 
-    expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
-    expect(onRevealRequested).toHaveBeenCalledOnce();
+    expect(onTabShortcut).toHaveBeenCalledWith("changes");
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
   });
 });
 

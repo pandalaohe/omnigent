@@ -3,7 +3,7 @@
 // behavior — every row here corresponds to a handler that ships today
 // (composer `handleKeyDown`, the global session-switch / message-nav hotkeys,
 // and the approve hotkey). Nothing here binds new behavior except the dialog's
-// own opener (⌘/Ctrl + /), which this component registers.
+// own opener, which follows the showShortcuts binding.
 //
 // Self-contained: it owns its open state and listens for its opener directly
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
@@ -32,7 +32,10 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   currentShortcutPlatform,
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
   isShortcutActionEnabled,
+  isShortcutRecordingActive,
   resolveShortcutBindings,
   shortcutBindingLabels,
   type ShortcutActionId,
@@ -86,13 +89,13 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "In chats",
     items: [
-      { label: "Recall previous prompt", keys: [], actionId: "recallPreviousPrompt" },
-      { label: "Recall next prompt", keys: [], actionId: "recallNextPrompt" },
+      { label: "Recall previous prompt", keys: [UP] },
+      { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [], actionId: "approvePrompt" },
       { label: "Open model picker", keys: [], actionId: "openModelPicker" },
       { label: "Focus chat input", keys: [], actionId: "focusComposer" },
       { label: "Toggle voice dictation", keys: [], actionId: "voiceDictation" },
-      { label: "Stop response", keys: [], actionId: "stopResponse" },
+      { label: "Stop response", keys: ["Esc"] },
     ],
   },
   {
@@ -121,9 +124,9 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     title: "Slash commands",
     note: "while the suggestions menu is open",
     items: [
-      { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
+      { label: "Navigate suggestions", keys: [] },
+      { label: "Apply highlighted command", keys: [], actionId: "applySuggestion" },
+      { label: "Dismiss menu", keys: [], actionId: "dismissSuggestions" },
     ],
   },
 ];
@@ -181,6 +184,19 @@ function shortcutGroupsFor(
           ...group.items,
           pinnedSessionShortcut(native),
         ],
+      };
+    }
+    if (group.title === "Slash commands") {
+      return {
+        ...group,
+        items: group.items.map((item) =>
+          item.label === "Navigate suggestions"
+            ? {
+                ...item,
+                keys: [...shortcutKeys("previousSuggestion"), ...shortcutKeys("nextSuggestion")],
+              }
+            : item,
+        ),
       };
     }
     if (group.title === "View") {
@@ -274,15 +290,25 @@ export function KeyboardShortcutsList({
   );
 }
 
+/** The dialog's own opener follows the showShortcuts binding. */
+function isShowShortcutsHotkey(event: KeyboardEvent): boolean {
+  if (event.getModifierState?.("AltGraph")) return false;
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("showShortcuts")) return false;
+  if (!hasCustomShortcutBindings("showShortcuts")) {
+    // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
+    // trigger, so require the platform command modifier and no Shift/Alt to
+    // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
+    return hasCommandModifier(event) && !event.altKey && !event.shiftKey && event.key === "/";
+  }
+  return eventMatchesShortcutAction(event, "showShortcuts");
+}
+
 export function KeyboardShortcutsDialog() {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the platform command modifier and no Shift/Alt to
-      // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
-      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+      if (isShowShortcutsHotkey(e)) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

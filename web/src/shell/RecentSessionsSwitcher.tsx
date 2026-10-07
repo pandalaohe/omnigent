@@ -5,13 +5,14 @@ import { Command, CommandGroup, CommandItem, CommandList } from "@/components/ui
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
 import {
-  eventMatchesShortcutAction,
+  eventMatchesShortcut,
   hasCustomShortcutBindings,
   isShortcutActionEnabled,
   isShortcutRecordingActive,
   resolveShortcutBindings,
   shortcutAriaKeys,
   shortcutBindingLabels,
+  type ShortcutChord,
 } from "@/lib/keyboardShortcutPreferences";
 import {
   cancelBrowserRecentSessionSwitch,
@@ -58,13 +59,16 @@ export function RecentSessionsSwitcher({
   enabled: boolean;
 }) {
   const navigate = useNavigate();
-  useKeyboardShortcutsVersion();
+  const shortcutsVersion = useKeyboardShortcutsVersion();
   const available = useMemo(() => recentSessions(conversations), [conversations]);
   const availableRef = useRef(available);
   const activeSessionIdRef = useRef(activeSessionId);
   const itemsRef = useRef<RecentSession[]>([]);
   const selectedIndexRef = useRef(0);
   const openRef = useRef(false);
+  // The chord that opened the switcher, so release commits against the modifier
+  // the user is actually holding.
+  const activeBindingRef = useRef<ShortcutChord | null>(null);
   const [items, setItems] = useState<RecentSession[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [open, setOpen] = useState(false);
@@ -107,27 +111,29 @@ export function RecentSessionsSwitcher({
 
     // Shift reverses the cycle, so it is stripped before matching a custom
     // chord; the default Ctrl+Tab test already allows it.
-    const matchesTrigger = (event: globalThis.KeyboardEvent): boolean => {
-      if (isShortcutRecordingActive() || !isShortcutActionEnabled("recentSessions")) return false;
+    const matchTrigger = (event: globalThis.KeyboardEvent): ShortcutChord | null => {
+      if (event.getModifierState?.("AltGraph")) return null;
+      if (isShortcutRecordingActive() || !isShortcutActionEnabled("recentSessions")) return null;
       if (!hasCustomShortcutBindings("recentSessions")) {
-        return (
-          event.key === "Tab" &&
-          event.ctrlKey &&
-          !event.altKey &&
-          !event.metaKey &&
-          !event.getModifierState("AltGraph")
-        );
+        if (event.key === "Tab" && event.ctrlKey && !event.altKey && !event.metaKey) {
+          return { code: "Tab", modifiers: ["control"] };
+        }
+        return null;
       }
-      return eventMatchesShortcutAction(
-        {
-          code: event.code,
-          key: event.key,
-          ctrlKey: event.ctrlKey,
-          metaKey: event.metaKey,
-          altKey: event.altKey,
-          shiftKey: false,
-        },
-        "recentSessions",
+      return (
+        resolveShortcutBindings("recentSessions").find((binding) =>
+          eventMatchesShortcut(
+            {
+              code: event.code,
+              key: event.key,
+              ctrlKey: event.ctrlKey,
+              metaKey: event.metaKey,
+              altKey: event.altKey,
+              shiftKey: false,
+            },
+            binding,
+          ),
+        ) ?? null
       );
     };
 
@@ -138,7 +144,8 @@ export function RecentSessionsSwitcher({
         cancel();
         return;
       }
-      if (!matchesTrigger(event)) return;
+      const binding = matchTrigger(event);
+      if (!binding) return;
 
       const direction = event.shiftKey ? -1 : 1;
       if (!openRef.current) {
@@ -158,6 +165,7 @@ export function RecentSessionsSwitcher({
               : nextItems.length - 1
             : (activeIndex + direction + nextItems.length) % nextItems.length;
         setSelection(initialIndex);
+        activeBindingRef.current = binding;
         openRef.current = true;
         setOpen(true);
         return;
@@ -172,11 +180,7 @@ export function RecentSessionsSwitcher({
 
     const onKeyUp = (event: globalThis.KeyboardEvent) => {
       if (!openRef.current) return;
-      if (!hasCustomShortcutBindings("recentSessions")) {
-        if (event.key === "Control") commit();
-        return;
-      }
-      const binding = resolveShortcutBindings("recentSessions")[0];
+      const binding = activeBindingRef.current;
       if (!binding) return;
       const heldModifiers = shortcutAriaKeys(binding).split("+").slice(0, -1);
       if (heldModifiers.includes(event.key)) commit();
@@ -203,7 +207,13 @@ export function RecentSessionsSwitcher({
         void cancelBrowserRecentSessionSwitch();
       }
     });
-    void setBrowserRecentSessionSwitchSupported(true);
+    // Intercept Ctrl+Tab only while the default gesture is live: a rebound or
+    // disabled switcher would otherwise swallow it inside embedded Browser pages.
+    void setBrowserRecentSessionSwitchSupported(
+      enabled &&
+        isShortcutActionEnabled("recentSessions") &&
+        !hasCustomShortcutBindings("recentSessions"),
+    );
 
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp, true);
@@ -215,10 +225,10 @@ export function RecentSessionsSwitcher({
       unsubscribeBrowserInput();
       void setBrowserRecentSessionSwitchSupported(false);
     };
-  }, [cancel, commit, enabled, setSelection]);
+  }, [cancel, commit, enabled, setSelection, shortcutsVersion]);
 
   const selectedId = items[selectedIndex]?.id ?? "";
-  const recentBinding = resolveShortcutBindings("recentSessions")[0];
+  const recentBinding = activeBindingRef.current ?? resolveShortcutBindings("recentSessions")[0];
   const recentLabels = recentBinding ? shortcutBindingLabels(recentBinding) : [];
   const cycleKey = recentLabels[recentLabels.length - 1] ?? "Tab";
   const releaseModifier = recentLabels.slice(0, -1).join(" ") || "Ctrl";

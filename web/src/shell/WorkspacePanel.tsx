@@ -680,8 +680,9 @@ interface WorkspacePanelProps {
   showBrowserTab: boolean;
   /** Reveal the workspace after a Browser tab is opened by a global shortcut. */
   onBrowserTabOpened?: () => void;
-  /** Reveal the workspace after a select-tab shortcut picks a rail tab. */
-  onRevealRequested?: () => void;
+  /** Route a select-tab shortcut to the tab's surface: the matching mobile
+   *  drawer on a phone viewport, else the rail tab itself. */
+  onTabShortcut?: (tab: RightRailTab) => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -788,7 +789,7 @@ function WorkspacePanelImpl({
   showGithubTab,
   showBrowserTab,
   onBrowserTabOpened,
-  onRevealRequested,
+  onTabShortcut,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -1004,8 +1005,8 @@ function WorkspacePanelImpl({
   useWorkspaceTabHotkeys((tabNumber) => {
     const tab = visiblePermanentTabs[tabNumber - 1];
     if (!tab) return;
-    selectPermanentTab(tab);
-    onRevealRequested?.();
+    if (onTabShortcut) onTabShortcut(tab);
+    else selectPermanentTab(tab);
   }, !pending);
   const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
     if (

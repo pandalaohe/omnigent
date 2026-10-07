@@ -215,4 +215,20 @@ describe("keyboardShortcutPreferences", () => {
       "Meta+Alt+,",
     );
   });
+
+  it("names punctuation and space keys in aria-keyshortcuts", () => {
+    expect(shortcutAriaKeys({ code: "Semicolon", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+;",
+    );
+    expect(shortcutAriaKeys({ code: "Quote", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+'",
+    );
+    expect(shortcutAriaKeys({ code: "Minus", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+-",
+    );
+    expect(shortcutAriaKeys({ code: "Equal", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+=",
+    );
+    expect(shortcutAriaKeys({ code: "Space", modifiers: [] }, "windows")).toEqual("Space");
+  });
 });

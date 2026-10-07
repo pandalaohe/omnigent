@@ -129,6 +129,42 @@ describe("KeyboardShortcutsList shortcut layer rows", () => {
     expect(keysFor("Open a new shell")).toEqual(["Ctrl", "⇧", "J"]);
     expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "⇧", "G", "1…4"]);
   });
+
+  it("keeps consumerless chat rows on their fixed keys after a rebind", () => {
+    writeShortcutPreference("recallPreviousPrompt", {
+      common: [{ code: "KeyP", modifiers: ["primary"] }],
+    });
+    writeShortcutPreference("recallNextPrompt", {
+      common: [{ code: "KeyN", modifiers: ["primary"] }],
+    });
+    writeShortcutPreference("stopResponse", {
+      common: [{ code: "KeyX", modifiers: ["primary"] }],
+    });
+    render(<KeyboardShortcutsList />);
+
+    expect(keysFor("Recall previous prompt")).toEqual(["↑"]);
+    expect(keysFor("Recall next prompt")).toEqual(["↓"]);
+    expect(keysFor("Stop response")).toEqual(["Esc"]);
+  });
+
+  it("follows rebound slash-command rows", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Navigate suggestions")).toEqual(["↑", "↓"]);
+    expect(keysFor("Apply highlighted command")).toEqual(["Tab"]);
+    expect(keysFor("Dismiss menu")).toEqual(["Esc"]);
+
+    act(() => {
+      writeShortcutPreference("previousSuggestion", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("dismissSuggestions", {
+        common: [{ code: "KeyX", modifiers: ["primary"] }],
+      });
+    });
+
+    expect(keysFor("Navigate suggestions")).toEqual(["Ctrl", "⇧", "P", "↓"]);
+    expect(keysFor("Dismiss menu")).toEqual(["Ctrl", "X"]);
+  });
 });
 
 describe("KeyboardShortcutsDialog", () => {
@@ -185,6 +221,24 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Send message")).toBeTruthy();
 
     toggleViaHotkey();
+    await waitFor(() => expect(screen.queryByText("Send message")).toBeNull());
+  });
+
+  it("opens on the rebound showShortcuts chord and no longer on the old one", async () => {
+    writeShortcutPreference("showShortcuts", {
+      common: [{ code: "KeyK", modifiers: ["primary", "shift"] }],
+    });
+    render(<KeyboardShortcutsDialog />);
+
+    // The old ⌘/Ctrl+/ no longer toggles the dialog once rebound.
+    toggleViaHotkey();
+    expect(screen.queryByText("Send message")).toBeNull();
+
+    const rebound = { key: "k", code: "KeyK", ctrlKey: true, shiftKey: true };
+    fireEvent.keyDown(window, rebound);
+    expect(screen.getByText("Send message")).toBeTruthy();
+
+    fireEvent.keyDown(window, rebound);
     await waitFor(() => expect(screen.queryByText("Send message")).toBeNull());
   });
 

@@ -169,7 +169,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "navigation",
     scope: "global",
     defaultBindings: [chord("Tab", ["control"])],
-    note: "Desktop app. Hold the modifier and press the key again to cycle (Shift goes back); release to switch.",
+    note: "Desktop app. Hold the modifier and press the key again to cycle (Shift goes back); release to switch. Inside an embedded browser page only the default Ctrl+Tab works.",
   },
   previousSession: {
     id: "previousSession",
@@ -708,6 +708,11 @@ const ARIA_KEY_CODES: Record<string, string> = {
   BracketLeft: "[",
   BracketRight: "]",
   Backquote: "`",
+  Semicolon: ";",
+  Quote: "'",
+  Minus: "-",
+  Equal: "=",
+  Space: "Space",
 };
 
 export function shortcutAriaKeys(
