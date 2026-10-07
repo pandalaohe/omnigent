@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation } from "@/hooks/useConversations";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
@@ -10,6 +11,7 @@ vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   navigate.mockReset();
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
@@ -224,6 +226,54 @@ describe("RecentSessionsSwitcher", () => {
 
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(cancelRecentSessionSwitch).toHaveBeenCalledOnce();
+  });
+
+  it("opens, cycles, and commits with a recorded chord and labels the footer from it", () => {
+    writeShortcutPreference("recentSessions", {
+      common: [{ code: "KeyJ", modifiers: ["primary"] }],
+    });
+    render(
+      <RecentSessionsSwitcher
+        conversations={[conversation("two", 2), conversation("one", 1)]}
+        activeSessionId="two"
+        enabled
+      />,
+    );
+
+    // The default Ctrl+Tab no longer opens the switcher.
+    pressTab();
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true });
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(
+      screen.getByText("Press J to cycle · Release Ctrl to switch · Esc to cancel"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Session one").closest('[role="option"]')).toHaveAttribute(
+      "data-selected",
+      "true",
+    );
+
+    // Releasing the held modifier commits the selection.
+    fireEvent.keyUp(window, { key: "Control", code: "ControlLeft" });
+
+    expect(navigate).toHaveBeenCalledWith("/c/one");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("never opens while the action is disabled", () => {
+    writeShortcutPreference("recentSessions", { enabled: false });
+    render(
+      <RecentSessionsSwitcher
+        conversations={[conversation("two", 2), conversation("one", 1)]}
+        activeSessionId="two"
+        enabled
+      />,
+    );
+
+    fireEvent.keyDown(window, { key: "Tab", code: "Tab", ctrlKey: true });
+
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("leaves Ctrl+Tab untouched outside Electron", () => {

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
+import { SELECT_WORKSPACE_TAB_ACTION_EVENT } from "@/hooks/useWorkspaceTabHotkeys";
 import {
   MOBILE_ASSISTANT_STORAGE_KEY,
   TERMINAL_SOFT_KEY_EVENT,
@@ -266,6 +267,37 @@ describe("mobileAssistantPreferences", () => {
     expect(textarea.value).toBe("hello /compact");
     expect(input).toHaveBeenCalledOnce();
     textarea.remove();
+  });
+
+  it("dispatches a workspace-tab action event for select-tab buttons", () => {
+    const listener = vi.fn();
+    window.addEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, listener);
+
+    dispatchMobileAssistantButton({
+      id: "tab-2",
+      label: "Tab 2",
+      binding: { kind: "shortcut", actionId: "selectWorkspaceTab2" },
+    });
+
+    expect(listener).toHaveBeenCalledOnce();
+    const dispatched = listener.mock.calls[0]?.[0] as
+      CustomEvent<{ tabNumber: number }> | undefined;
+    expect(dispatched?.detail).toEqual({ tabNumber: 2 });
+    window.removeEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, listener);
+  });
+
+  it("does nothing for the recent-sessions switcher (needs a held key)", () => {
+    const listener = vi.fn();
+    window.addEventListener("keydown", listener);
+
+    dispatchMobileAssistantButton({
+      id: "recents",
+      label: "Recents",
+      binding: { kind: "shortcut", actionId: "recentSessions" },
+    });
+
+    expect(listener).not.toHaveBeenCalled();
+    window.removeEventListener("keydown", listener);
   });
 
   it("dispatches a recorded in-app chord with resolved primary modifier", () => {

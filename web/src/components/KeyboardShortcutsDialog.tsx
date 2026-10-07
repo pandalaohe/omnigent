@@ -9,20 +9,15 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { Fragment, useEffect, useReducer, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 
 import {
-  ALT_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
-  CTRL_KEY,
-  ENTER_KEY,
   Kbd,
-  MOD_KEY,
-  SHIFT_KEY,
   shortcutKeys,
-  VIEW_MODE_TOGGLE_KEYS,
+  useKeyboardShortcutsVersion,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -36,7 +31,10 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import {
-  KEYBOARD_SHORTCUTS_CHANGED_EVENT,
+  currentShortcutPlatform,
+  isShortcutActionEnabled,
+  resolveShortcutBindings,
+  shortcutBindingLabels,
   type ShortcutActionId,
 } from "@/lib/keyboardShortcutPreferences";
 import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
@@ -54,8 +52,6 @@ export function openKeyboardShortcuts(): void {
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
 const UP = "↑";
 const DOWN = "↓";
-const BRACKET_LEFT = "[";
-const BRACKET_RIGHT = "]";
 
 interface Shortcut {
   label: string;
@@ -80,45 +76,45 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
-      { label: "Open command palette", keys: [MOD_KEY, "K"] },
-      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
+      { label: "Start a new session", keys: [], actionId: "newSession" },
+      { label: "Open command palette", keys: [], actionId: "commandPalette" },
+      { label: "Find a session by name", keys: [], actionId: "findSession" },
       { label: "Open Settings", keys: [], actionId: "openSettings" },
-      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
+      { label: "Show keyboard shortcuts", keys: [], actionId: "showShortcuts" },
     ],
   },
   {
     title: "In chats",
     items: [
-      { label: "Recall previous prompt", keys: [UP] },
-      { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
-      { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
-      { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
-      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
-      { label: "Stop response", keys: ["Esc"] },
+      { label: "Recall previous prompt", keys: [], actionId: "recallPreviousPrompt" },
+      { label: "Recall next prompt", keys: [], actionId: "recallNextPrompt" },
+      { label: "Accept approval prompt", keys: [], actionId: "approvePrompt" },
+      { label: "Open model picker", keys: [], actionId: "openModelPicker" },
+      { label: "Focus chat input", keys: [], actionId: "focusComposer" },
+      { label: "Toggle voice dictation", keys: [], actionId: "voiceDictation" },
+      { label: "Stop response", keys: [], actionId: "stopResponse" },
     ],
   },
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
-      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
+      { label: "Previous session", keys: [], actionId: "previousSession" },
+      { label: "Next session", keys: [], actionId: "nextSession" },
     ],
   },
   {
     title: "View",
     items: [
-      { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Toggle Chat / Terminal view", keys: [], actionId: "toggleViewMode" },
+      { label: "Toggle conversations sidebar", keys: [], actionId: "toggleConversationsSidebar" },
+      { label: "Focus or close workspace sidebar", keys: [], actionId: "toggleWorkspaceSidebar" },
       {
         label: "Select a workspace tab",
-        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
+        keys: [],
         lastKeySeparator: "+",
       },
-      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
-      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
+      { label: "Open a new browser tab", keys: [], actionId: "newBrowserTab" },
+      { label: "Open a new shell", keys: [], actionId: "newShell" },
     ],
   },
   {
@@ -137,9 +133,15 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 // Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
 // native tab-switching. Shown in both, with the matching glyphs.
 function pinnedSessionShortcut(native: boolean): Shortcut {
+  if (!isShortcutActionEnabled("pinnedSession")) {
+    return { label: "Jump to pinned session (1–10)", keys: [] };
+  }
+  const bindings = resolveShortcutBindings("pinnedSession", currentShortcutPlatform(), {
+    nativeShell: native,
+  });
   return {
     label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
+    keys: bindings.flatMap((binding) => shortcutBindingLabels(binding)),
   };
 }
 
@@ -173,16 +175,24 @@ function shortcutGroupsFor(
       return {
         ...group,
         items: [
-          ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
+          ...(electron
+            ? [{ label: "Switch recent sessions", keys: [], actionId: "recentSessions" as const }]
+            : []),
           ...group.items,
           pinnedSessionShortcut(native),
         ],
       };
     }
-    if (group.title === "View" && !browser) {
+    if (group.title === "View") {
       return {
         ...group,
-        items: group.items.filter((item) => item.label !== "Open a new browser tab"),
+        items: group.items
+          .filter((item) => browser || item.label !== "Open a new browser tab")
+          .map((item) =>
+            item.label === "Select a workspace tab"
+              ? { ...item, keys: [...shortcutKeys("toggleWorkspaceSidebar"), "1…4"] }
+              : item,
+          ),
       };
     }
     return group;
@@ -199,16 +209,7 @@ export function KeyboardShortcutsList({
 }: {
   variant?: "compact" | "settings";
 }) {
-  const [, refresh] = useReducer((version: number) => version + 1, 0);
-  useEffect(() => {
-    const onChanged = () => refresh();
-    window.addEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
-    window.addEventListener("storage", onChanged);
-    return () => {
-      window.removeEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
-      window.removeEventListener("storage", onChanged);
-    };
-  }, []);
+  useKeyboardShortcutsVersion();
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();

@@ -10,6 +10,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { copyText } from "@/lib/clipboard";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import type { ChildSessionLike } from "./subagentRailGroups";
 import { ChatHeader } from "./ChatHeader";
 import {
@@ -262,6 +263,30 @@ describe("ChatHeader — workspace pane shortcut", () => {
       expect(
         Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
       ).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("follows a rebound workspace-sidebar chord", () => {
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: true, conversationId: "conv_rebind", rightPanelOpen: false });
+      act(() => {
+        writeShortcutPreference("toggleWorkspaceSidebar", {
+          common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+        });
+      });
+
+      const trigger = screen.getByRole("button", { name: "Expand right panel" });
+      expect(trigger).toHaveAttribute("aria-keyshortcuts", "Control+Shift+J");
+      fireEvent.focus(trigger);
+      act(() => vi.advanceTimersByTime(1000));
+
+      const tooltip = screen.getByRole("tooltip");
+      expect(
+        Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+      ).toEqual(["Ctrl", "⇧", "J"]);
     } finally {
       vi.useRealTimers();
     }

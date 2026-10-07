@@ -7,6 +7,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
@@ -109,6 +110,7 @@ function renderWorkspace(
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onBrowserTabOpened = vi.fn();
+  const onRevealRequested = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
@@ -134,6 +136,7 @@ function renderWorkspace(
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onBrowserTabOpened={onBrowserTabOpened}
+        onRevealRequested={onRevealRequested}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -165,6 +168,7 @@ function renderWorkspace(
     onCloseFile,
     onRightRailTabChange,
     onBrowserTabOpened,
+    onRevealRequested,
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
@@ -359,6 +363,35 @@ describe("WorkspacePanel surface presentation", () => {
       expect(tip.textContent?.match(/\+/g)).toHaveLength(1);
     },
   );
+
+  it("shows a bound select-tab chord alone in the tab tooltip", async () => {
+    writeShortcutPreference("selectWorkspaceTab1", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+    renderWorkspace();
+
+    const tab = screen.getByRole("tab", { name: "Files" });
+    fireEvent.pointerMove(tab.parentElement!, { pointerType: "mouse" });
+    const tip = await screen.findByRole("tooltip");
+    expect(Array.from(tip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent)).toEqual(
+      ["Ctrl", "⇧", "J"],
+    );
+    expect(tip.textContent?.match(/\+/g)).toBeNull();
+  });
+});
+
+describe("WorkspacePanel select-tab hotkeys", () => {
+  it("selects the numbered rail tab from its bound chord and asks to reveal the panel", () => {
+    writeShortcutPreference("selectWorkspaceTab2", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+    const { onRightRailTabChange, onRevealRequested } = renderWorkspace();
+
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true, shiftKey: true });
+
+    expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
+    expect(onRevealRequested).toHaveBeenCalledOnce();
+  });
 });
 
 describe("WorkspacePanel open-file tabs", () => {
@@ -600,6 +633,26 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     expect(keycaps(browser)).toEqual(["Ctrl", "Alt", "B"]);
     expect(keycaps(shell)).toEqual(["Ctrl", "Alt", "T"]);
+  });
+
+  it("follows rebound new-browser and new-shell chords in the menu", async () => {
+    declaresShell();
+    writeShortcutPreference("newBrowserTab", {
+      common: [{ code: "KeyG", modifiers: ["primary", "shift"] }],
+    });
+    writeShortcutPreference("newShell", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+    renderWorkspace({ showBrowserTab: true });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const browser = await screen.findByRole("menuitem", { name: "Browser" });
+    const shell = screen.getByRole("menuitem", { name: /shell \(zsh\)/i });
+    const keycaps = (item: HTMLElement) =>
+      Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
+
+    expect(keycaps(browser)).toEqual(["Ctrl", "⇧", "G"]);
+    expect(keycaps(shell)).toEqual(["Ctrl", "⇧", "J"]);
   });
 
   it("ignores number shortcuts from the portalled menu", async () => {

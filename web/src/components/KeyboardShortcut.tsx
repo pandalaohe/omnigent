@@ -18,20 +18,31 @@ import { cn } from "@/lib/utils";
 const IS_MAC = isMacPlatform();
 
 export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
-// Literal Control on every platform (⌃ on Mac), for chords that use Ctrl rather
-// than the platform command modifier — unlike MOD_KEY, which is ⌘ on Mac.
-export const CTRL_KEY = IS_MAC ? "⌃" : "Ctrl";
 export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
-export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
 
 /** Labels for an action's first binding, or `[]` when disabled/unbound. */
 export function shortcutKeys(actionId: ShortcutActionId): string[] {
   if (!isShortcutActionEnabled(actionId)) return [];
   const binding = resolveShortcutBindings(actionId)[0];
   return binding ? shortcutBindingLabels(binding) : [];
+}
+
+/** Re-render whenever a shortcut preference changes (local write or sync). */
+export function useKeyboardShortcutsVersion(): number {
+  const [version, refresh] = useReducer((previous: number) => previous + 1, 0);
+  useEffect(() => {
+    const onChanged = () => refresh();
+    window.addEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
+    window.addEventListener("storage", onChanged);
+    return () => {
+      window.removeEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
+      window.removeEventListener("storage", onChanged);
+    };
+  }, []);
+  return version;
 }
 
 /**
@@ -42,21 +53,12 @@ export function useShortcutHint(actionId: ShortcutActionId): {
   keys: string[];
   aria: string | undefined;
 } {
-  const [, refresh] = useReducer((version: number) => version + 1, 0);
-  useEffect(() => {
-    const onChanged = () => refresh();
-    window.addEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
-    window.addEventListener("storage", onChanged);
-    return () => {
-      window.removeEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
-      window.removeEventListener("storage", onChanged);
-    };
-  }, []);
+  useKeyboardShortcutsVersion();
   const binding = isShortcutActionEnabled(actionId)
     ? resolveShortcutBindings(actionId)[0]
     : undefined;
   return {
-    keys: binding ? shortcutBindingLabels(binding) : [],
+    keys: shortcutKeys(actionId),
     aria: binding ? shortcutAriaKeys(binding) : undefined,
   };
 }

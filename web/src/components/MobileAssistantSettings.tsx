@@ -547,26 +547,33 @@ export function MobileAssistantSettings() {
               </label>
 
               {draft.kind === "shortcut" ? (
-                <label className="grid gap-1.5 text-sm">
-                  Action from keyboard shortcuts
-                  <select
-                    value={draft.actionId}
-                    onChange={(event) =>
-                      setDraft((current) =>
-                        current
-                          ? { ...current, actionId: event.target.value as ShortcutActionId }
-                          : current,
-                      )
-                    }
-                    className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
-                  >
-                    {SHORTCUT_ACTION_IDS.map((actionId) => (
-                      <option key={actionId} value={actionId}>
-                        {DEFAULT_SHORTCUT_DEFINITIONS[actionId].label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <div className="grid gap-1.5 text-sm">
+                  <label className="grid gap-1.5 text-sm">
+                    Action from keyboard shortcuts
+                    <select
+                      value={draft.actionId}
+                      onChange={(event) =>
+                        setDraft((current) =>
+                          current
+                            ? { ...current, actionId: event.target.value as ShortcutActionId }
+                            : current,
+                        )
+                      }
+                      className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
+                    >
+                      {SHORTCUT_ACTION_IDS.filter((actionId) => actionId !== "recentSessions").map(
+                        (actionId) => (
+                          <option key={actionId} value={actionId}>
+                            {DEFAULT_SHORTCUT_DEFINITIONS[actionId].label}
+                          </option>
+                        ),
+                      )}
+                    </select>
+                  </label>
+                  <span className="text-xs text-muted-foreground">
+                    Switch recent sessions is keyboard-only: it needs a held key.
+                  </span>
+                </div>
               ) : null}
 
               {draft.kind === "key" ? (

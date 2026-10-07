@@ -1,13 +1,10 @@
 import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY, useShortcutHint } from "@/components/KeyboardShortcut";
+import { useShortcutHint } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-
-const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
-const SEARCH_KEYS = [MOD_KEY, "K"] as const;
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
@@ -58,6 +55,7 @@ export function SidebarHeaderActions({
   onTogglePointerDown?: () => void;
   onTogglePointerLeave?: () => void;
 }) {
+  const toggleShortcut = useShortcutHint("toggleConversationsSidebar");
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
       <SidebarSearchButton onOpenSearch={onOpenSearch} />
@@ -69,7 +67,7 @@ export function SidebarHeaderActions({
             variant="ghost"
             size="icon-xs"
             aria-label={expanded ? "Close sidebar" : "Open sidebar"}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+[`}
+            aria-keyshortcuts={toggleShortcut.aria}
             onClick={onToggle}
             onPointerEnter={onTogglePointerEnter}
             onPointerDown={onTogglePointerDown}
@@ -90,7 +88,7 @@ export function SidebarHeaderActions({
             )}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" shortcut={SIDEBAR_TOGGLE_KEYS}>
+        <TooltipContent side="bottom" shortcut={toggleShortcut.keys}>
           <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
@@ -129,6 +127,7 @@ export function SidebarSearchButton({
   onOpenSearch?: () => void;
   className?: string;
 }) {
+  const searchShortcut = useShortcutHint("commandPalette");
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -137,7 +136,7 @@ export function SidebarSearchButton({
           variant="ghost"
           size="icon-xs"
           aria-label="Search"
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+K`}
+          aria-keyshortcuts={searchShortcut.aria}
           onClick={() => onOpenSearch?.()}
           className={cn(SIDEBAR_FLOAT_BUTTON, className)}
           data-testid="sidebar-search-button"
@@ -147,7 +146,7 @@ export function SidebarSearchButton({
       </TooltipTrigger>
       {/* Bottom placement keeps the tooltip clear of the macOS Electron
       shell's traffic lights at the window's top edge. */}
-      <TooltipContent side="bottom" shortcut={SEARCH_KEYS}>
+      <TooltipContent side="bottom" shortcut={searchShortcut.keys}>
         <span>Search</span>
       </TooltipContent>
     </Tooltip>

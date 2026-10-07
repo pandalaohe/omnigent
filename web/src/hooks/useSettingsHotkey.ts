@@ -19,14 +19,7 @@ export function isSettingsHotkey(
   }
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("openSettings")) return false;
   if (!hasCustomShortcutBindings("openSettings")) {
-    if (
-      !hasCommandModifier(event, isMac) ||
-      !event.altKey ||
-      event.shiftKey ||
-      event.getModifierState("AltGraph")
-    ) {
-      return false;
-    }
+    if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey) return false;
     return event.code === "Comma";
   }
   return eventMatchesShortcutAction(event, "openSettings");

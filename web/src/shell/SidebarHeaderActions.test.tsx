@@ -54,6 +54,35 @@ describe("SidebarHeaderActions shortcut hints", () => {
     ).toEqual(keys);
   });
 
+  it("rebinds the sidebar-toggle and search hints after a preference write", async () => {
+    render(
+      <MemoryRouter>
+        <TooltipProvider delayDuration={0}>
+          <SidebarHeaderActions expanded onToggle={vi.fn()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    const toggle = screen.getByLabelText("Close sidebar");
+    const search = screen.getByLabelText("Search");
+    act(() => {
+      writeShortcutPreference("toggleConversationsSidebar", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("commandPalette", {
+        common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(toggle).toHaveAttribute("aria-keyshortcuts", "Control+Shift+P");
+    expect(search).toHaveAttribute("aria-keyshortcuts", "Control+Shift+J");
+    fireEvent.focus(search);
+    const content = await screen.findByRole("tooltip");
+    expect(
+      Array.from(content.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual(["Ctrl", "⇧", "J"]);
+  });
+
   it("rebinds the Settings shortcut hint after a preference write", async () => {
     render(
       <MemoryRouter>

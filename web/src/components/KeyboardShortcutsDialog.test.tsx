@@ -108,6 +108,27 @@ describe("KeyboardShortcutsList shortcut layer rows", () => {
 
     expect(screen.queryByText("Open Settings")).toBeNull();
   });
+
+  it("follows rebound rows, including previous session and the workspace-tab toggle", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
+
+    act(() => {
+      writeShortcutPreference("previousSession", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("newShell", {
+        common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("toggleWorkspaceSidebar", {
+        common: [{ code: "KeyG", modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(keysFor("Previous session")).toEqual(["Ctrl", "⇧", "P"]);
+    expect(keysFor("Open a new shell")).toEqual(["Ctrl", "⇧", "J"]);
+    expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "⇧", "G", "1…4"]);
+  });
 });
 
 describe("KeyboardShortcutsDialog", () => {

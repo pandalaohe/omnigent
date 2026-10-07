@@ -61,6 +61,9 @@ const chord = (code: string, modifiers: ShortcutModifier[] = []): ShortcutChord 
   modifiers,
 });
 
+const WORKSPACE_TAB_NOTE =
+  "Not set by default. Focusing the workspace tabs and pressing the number also works.";
+
 export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefinition> = {
   newSession: {
     id: "newSession",
@@ -173,14 +176,14 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     label: "Previous session",
     group: "navigation",
     scope: "global",
-    defaultBindings: [chord("ArrowUp", ["primary"])],
+    defaultBindings: [chord("BracketLeft", ["primary"])],
   },
   nextSession: {
     id: "nextSession",
     label: "Next session",
     group: "navigation",
     scope: "global",
-    defaultBindings: [chord("ArrowDown", ["primary"])],
+    defaultBindings: [chord("BracketRight", ["primary"])],
   },
   pollSessions: {
     id: "pollSessions",
@@ -230,7 +233,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "view",
     scope: "global",
     defaultBindings: [],
-    note: "Not set by default. Focusing the workspace tabs and pressing the number also works.",
+    note: WORKSPACE_TAB_NOTE,
   },
   selectWorkspaceTab2: {
     id: "selectWorkspaceTab2",
@@ -238,7 +241,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "view",
     scope: "global",
     defaultBindings: [],
-    note: "Not set by default. Focusing the workspace tabs and pressing the number also works.",
+    note: WORKSPACE_TAB_NOTE,
   },
   selectWorkspaceTab3: {
     id: "selectWorkspaceTab3",
@@ -246,7 +249,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "view",
     scope: "global",
     defaultBindings: [],
-    note: "Not set by default. Focusing the workspace tabs and pressing the number also works.",
+    note: WORKSPACE_TAB_NOTE,
   },
   selectWorkspaceTab4: {
     id: "selectWorkspaceTab4",
@@ -254,7 +257,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "view",
     scope: "global",
     defaultBindings: [],
-    note: "Not set by default. Focusing the workspace tabs and pressing the number also works.",
+    note: WORKSPACE_TAB_NOTE,
   },
   newBrowserTab: {
     id: "newBrowserTab",

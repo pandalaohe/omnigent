@@ -1,8 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
 import { Command, CommandGroup, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+  resolveShortcutBindings,
+  shortcutAriaKeys,
+  shortcutBindingLabels,
+} from "@/lib/keyboardShortcutPreferences";
 import {
   cancelBrowserRecentSessionSwitch,
   onBrowserRecentSessionInput,
@@ -48,6 +58,7 @@ export function RecentSessionsSwitcher({
   enabled: boolean;
 }) {
   const navigate = useNavigate();
+  useKeyboardShortcutsVersion();
   const available = useMemo(() => recentSessions(conversations), [conversations]);
   const availableRef = useRef(available);
   const activeSessionIdRef = useRef(activeSessionId);
@@ -94,6 +105,32 @@ export function RecentSessionsSwitcher({
       return;
     }
 
+    // Shift reverses the cycle, so it is stripped before matching a custom
+    // chord; the default Ctrl+Tab test already allows it.
+    const matchesTrigger = (event: globalThis.KeyboardEvent): boolean => {
+      if (isShortcutRecordingActive() || !isShortcutActionEnabled("recentSessions")) return false;
+      if (!hasCustomShortcutBindings("recentSessions")) {
+        return (
+          event.key === "Tab" &&
+          event.ctrlKey &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.getModifierState("AltGraph")
+        );
+      }
+      return eventMatchesShortcutAction(
+        {
+          code: event.code,
+          key: event.key,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          altKey: event.altKey,
+          shiftKey: false,
+        },
+        "recentSessions",
+      );
+    };
+
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape" && openRef.current) {
         event.preventDefault();
@@ -101,15 +138,7 @@ export function RecentSessionsSwitcher({
         cancel();
         return;
       }
-      if (
-        event.key !== "Tab" ||
-        !event.ctrlKey ||
-        event.altKey ||
-        event.metaKey ||
-        event.getModifierState("AltGraph")
-      ) {
-        return;
-      }
+      if (!matchesTrigger(event)) return;
 
       const direction = event.shiftKey ? -1 : 1;
       if (!openRef.current) {
@@ -142,7 +171,15 @@ export function RecentSessionsSwitcher({
     };
 
     const onKeyUp = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Control" && openRef.current) commit();
+      if (!openRef.current) return;
+      if (!hasCustomShortcutBindings("recentSessions")) {
+        if (event.key === "Control") commit();
+        return;
+      }
+      const binding = resolveShortcutBindings("recentSessions")[0];
+      if (!binding) return;
+      const heldModifiers = shortcutAriaKeys(binding).split("+").slice(0, -1);
+      if (heldModifiers.includes(event.key)) commit();
     };
 
     const onBlur = () => {
@@ -181,6 +218,10 @@ export function RecentSessionsSwitcher({
   }, [cancel, commit, enabled, setSelection]);
 
   const selectedId = items[selectedIndex]?.id ?? "";
+  const recentBinding = resolveShortcutBindings("recentSessions")[0];
+  const recentLabels = recentBinding ? shortcutBindingLabels(recentBinding) : [];
+  const cycleKey = recentLabels[recentLabels.length - 1] ?? "Tab";
+  const releaseModifier = recentLabels.slice(0, -1).join(" ") || "Ctrl";
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && cancel()}>
@@ -219,7 +260,7 @@ export function RecentSessionsSwitcher({
             </CommandGroup>
           </CommandList>
           <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
-            Press Tab to cycle · Release Ctrl to switch · Esc to cancel
+            Press {cycleKey} to cycle · Release {releaseModifier} to switch · Esc to cancel
           </div>
         </Command>
       </DialogContent>

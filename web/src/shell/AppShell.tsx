@@ -2568,6 +2568,7 @@ export function AppShell() {
                     showGithubTab={railTabsAvailable.github}
                     showBrowserTab={railTabsAvailable.browser}
                     onBrowserTabOpened={revealRightPanel}
+                    onRevealRequested={revealRightPanel}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}

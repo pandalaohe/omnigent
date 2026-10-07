@@ -175,6 +175,8 @@ describe("keyboardShortcutPreferences", () => {
       ["openModelPicker", [{ code: "KeyM", modifiers: ["control", "shift"] }]],
       ["focusComposer", [{ code: "KeyL", modifiers: ["control", "shift"] }]],
       ["recentSessions", [{ code: "Tab", modifiers: ["control"] }]],
+      ["previousSession", [{ code: "BracketLeft", modifiers: ["primary"] }]],
+      ["nextSession", [{ code: "BracketRight", modifiers: ["primary"] }]],
       ["toggleViewMode", [{ code: "Backslash", modifiers: ["primary", "alt"] }]],
       ["selectWorkspaceTab1", []],
       ["selectWorkspaceTab2", []],
