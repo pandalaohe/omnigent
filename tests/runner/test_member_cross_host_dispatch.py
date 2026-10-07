@@ -19,7 +19,11 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.member_snapshot import encode_member_entry, member_label_key
+from omnigent.member_snapshot import (
+    LIBRARY_AGENT_TEMPLATE_LABEL_KEY,
+    encode_member_entry,
+    member_label_key,
+)
 
 _LEAD_HOST = "host_lead"
 _MEMBER_HOST = "host_member"
@@ -36,16 +40,24 @@ def _spec_with_worker(harness: str) -> SimpleNamespace:
 
 
 def _member_labels(**entry: object) -> dict[str, str]:
-    """One member snapshot label for ``worker`` with sensible overrides."""
+    """One member snapshot label for ``worker`` with sensible overrides.
+
+    Includes the library-agent template label: the session is a library joint
+    agent's, so the runner applies the frozen snapshot.
+    """
     payload: dict[str, object] = {
         "host": _MEMBER_HOST,
         "harness": "claude-sdk",
         "model": _MEMBER_MODEL,
         "effort": "high",
         "lead": False,
+        "locked": True,
     }
     payload.update(entry)
-    return {member_label_key("worker"): encode_member_entry(payload)}
+    return {
+        LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_cross_host_test",
+        member_label_key("worker"): encode_member_entry(payload),
+    }
 
 
 async def _dispatch(

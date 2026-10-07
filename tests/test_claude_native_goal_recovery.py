@@ -10,6 +10,12 @@ import pytest
 from omnigent.harnesses.claude_native import bridge, forwarder
 
 
+@pytest.fixture(autouse=True)
+def _isolate_auto_compact_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the host's Claude auto-compact setting out of these tests."""
+    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: None)
+
+
 def _append(path: Path, record: dict[str, object], *, complete: bool = True) -> None:
     with path.open("ab") as handle:
         payload = json.dumps(record).encode("utf-8")

@@ -237,7 +237,8 @@ def test_acp_choice_is_resolved_on_runner(
     acp_server: tuple[httpx.Client, str, Path, bool], override: str, expected: str | None
 ) -> None:
     client, runner_id, launches, has_model_policy = acp_server
-    agents = client.get("/v1/agents").json()["data"]
+    # The server seeds more builtin agents than one default page holds.
+    agents = client.get("/v1/agents", params={"limit": 1000}).json()["data"]
     agent = next(a for a in agents if a["name"] == "selection")
     before = launches.read_text() if launches.exists() else ""
     response = client.post(

@@ -82,6 +82,7 @@ from omnigent.member_snapshot import (
     MEMBER_LABEL_KEY_MAX_CHARS,
     MEMBER_LABEL_PREFIX,
     MEMBER_LABEL_VALUE_MAX_CHARS,
+    MEMBER_LOCKED_FIELD,
     MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED,
     MEMBER_UNAVAILABLE_HOST_OFFLINE,
     MEMBER_UNAVAILABLE_MODEL_MISSING,
@@ -10878,6 +10879,7 @@ async def _member_snapshot_labels(
     *,
     host_id: str | None,
     host_store: HostStore | None,
+    locked: bool = False,
     member_hosts: Mapping[str, str] | None = None,
     project_config: dict | None = None,
     master: dict | None = None,
@@ -10906,6 +10908,8 @@ async def _member_snapshot_labels(
         session (no liveness, readiness, or catalog resolution then).
     :param host_store: Host registrations, used for liveness and the reported
         per-harness readiness. ``None`` skips availability resolution.
+    :param locked: True when the session is launched from a saved library
+        agent; written into every entry so the lock is fixed at create.
     :param member_hosts: The launched library Agent's saved ``{role: host_id}``
         map. A role absent from it (or a blank value) uses the session host.
     :param project_config: The session's project config, whose per-host set
@@ -10991,6 +10995,7 @@ async def _member_snapshot_labels(
             "model": resolution.model,
             "effort": resolution.effort,
             "lead": bool(member.get("lead")),
+            MEMBER_LOCKED_FIELD: locked,
         }
         reason: str | None = None
         if host is not None and host not in lookup_failed:

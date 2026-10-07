@@ -42,7 +42,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
-from omnigent.member_snapshot import MEMBER_LABEL_PREFIX
+from omnigent.member_snapshot import MEMBER_LABEL_PREFIX, launched_from_library_agent
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -1234,6 +1234,7 @@ def register_core_routes(
             spec,
             host_id=parsed_metadata.host_id,
             host_store=getattr(request.app.state, "host_store", None),
+            locked=launched_from_library_agent(parsed_metadata.labels),
             member_hosts=await _member_hosts_from_library_agent(
                 template_id=(parsed_metadata.labels or {}).get("omnigent:agent-template-id"),
                 owner=user_id,

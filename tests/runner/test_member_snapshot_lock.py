@@ -1,11 +1,12 @@
 """Runner-side member snapshot lock for joint-agent dispatches (SCC06 F1a).
 
-A session that froze a member snapshot (``omnigent.member.<role>`` labels)
-locks the member's harness / model / effort: an explicit ``sys_session_send``
-value that differs is rejected, a member the server marked unavailable
-refuses the dispatch, and a dispatch naming none of them runs the snapshot's
-model / effort instead of parent inheritance. Sessions without member labels
-behave exactly as before.
+A session launched from a saved library joint agent (the ``ca_`` template
+label) freezes a member snapshot (``omnigent.member.<role>`` labels) and locks
+the member's harness / model / effort: an explicit ``sys_session_send`` value
+that differs is rejected, a member the server marked unavailable refuses the
+dispatch, and a dispatch naming none of them runs the snapshot's model / effort
+instead of parent inheritance. Other sessions keep per-dispatch choice and
+parent-model inheritance.
 """
 
 from __future__ import annotations
@@ -18,7 +19,17 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.member_snapshot import encode_member_entry, member_label_key
+from omnigent.member_snapshot import (
+    LIBRARY_AGENT_TEMPLATE_LABEL_KEY,
+    MEMBER_LABEL_VALUE_MAX_CHARS,
+    MEMBER_LOCKED_FIELD,
+    encode_member_entry,
+    launched_from_library_agent,
+    member_entries_from_labels,
+    member_label_key,
+    member_lock_applies,
+    unlocked_legacy_member_labels,
+)
 
 _MEMBER_MODEL = "databricks-claude-haiku-4-5"
 _PARENT_MODEL = "databricks-claude-sonnet-4-6"
@@ -59,17 +70,33 @@ def _stub_worker_launchable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(harness_install, "missing_harness_cli", lambda _harness: None)
 
 
-def _member_labels(role: str = "worker", **entry: object) -> dict[str, str]:
-    """One member snapshot label for *role* with sensible overrides."""
+def _member_labels(
+    role: str = "worker",
+    *,
+    template_id: str | None = "ca_test_agent",
+    **entry: object,
+) -> dict[str, str]:
+    """One member snapshot label for *role* with sensible overrides.
+
+    The entry defaults to ``locked: True`` (a session launched from a saved
+    library agent).
+
+    :param template_id: Value of the library-agent template label; ``None``
+        omits it (a session not started from a saved library joint agent).
+    """
     payload: dict[str, object] = {
         "host": None,
         "harness": "claude-sdk",
         "model": _MEMBER_MODEL,
         "effort": "high",
         "lead": False,
+        MEMBER_LOCKED_FIELD: True,
     }
     payload.update(entry)
-    return {member_label_key(role): encode_member_entry(payload)}
+    labels = {member_label_key(role): encode_member_entry(payload)}
+    if template_id is not None:
+        labels[LIBRARY_AGENT_TEMPLATE_LABEL_KEY] = template_id
+    return labels
 
 
 async def _dispatch(
@@ -413,6 +440,126 @@ async def test_session_without_member_labels_still_inherits_parent_model(
 
 
 @pytest.mark.asyncio
+async def test_member_labels_without_template_keep_choice_and_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unlocked entry keeps per-dispatch choice and parent inheritance."""
+    _stub_worker_launchable(monkeypatch)
+
+    _output, explicit_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_no_template_explicit",
+        labels=_member_labels(template_id=None, locked=False),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+    assert explicit_bodies[0]["model_override"] == _PARENT_MODEL
+
+    _output, inherited_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_no_template_inherit",
+        labels=_member_labels(template_id=None, locked=False),
+        parent_snapshot={
+            "id": "conv_member_no_template_inherit",
+            "agent_id": "ag_parent",
+            "harness": "claude-sdk",
+            "model_override": _PARENT_MODEL,
+            "llm_model": None,
+        },
+    )
+    assert inherited_bodies[0]["model_override"] == _PARENT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_non_library_template_label_does_not_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unlocked entry on a non-``ca_`` template keeps per-dispatch choice."""
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_builtin_template",
+        labels=_member_labels(template_id="ag_builtin", locked=False),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _PARENT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_unlocked_entry_ignores_the_ca_template_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``locked: False`` entry stays unlocked even under a ``ca_`` label.
+
+    Save-as-Agent stamps the template label onto a running session after
+    create, so the lock follows the entry's create-time provenance, not the
+    label.
+    """
+    _stub_worker_launchable(monkeypatch)
+
+    output, bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_unlocked_ca_template",
+        labels=_member_labels(locked=False),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching", output
+    assert bodies[0]["model_override"] == _PARENT_MODEL
+
+
+def _legacy_member_labels(*, template_id: str | None) -> dict[str, str]:
+    """A pre-``locked`` entry: its lock comes from the session's template label."""
+    payload: dict[str, object] = {
+        "host": None,
+        "harness": "claude-sdk",
+        "model": _MEMBER_MODEL,
+        "effort": "high",
+        "lead": False,
+    }
+    labels = {member_label_key("worker"): encode_member_entry(payload)}
+    if template_id is not None:
+        labels[LIBRARY_AGENT_TEMPLATE_LABEL_KEY] = template_id
+    return labels
+
+
+@pytest.mark.asyncio
+async def test_legacy_entry_without_the_field_follows_the_template_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-``locked`` entry is locked iff its session has a ``ca_`` label."""
+    _stub_worker_launchable(monkeypatch)
+
+    locked_output, locked_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_legacy_locked",
+        labels=_legacy_member_labels(template_id="ca_legacy_agent"),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+    assert locked_output.startswith("Error:")
+    assert "'worker' is locked to" in locked_output
+    assert locked_bodies == []
+
+    _output, unlocked_bodies = await _dispatch(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_member_legacy_unlocked",
+        labels=_legacy_member_labels(template_id="ag_builtin"),
+        dispatch_args={"model": _PARENT_MODEL},
+    )
+    assert unlocked_bodies[0]["model_override"] == _PARENT_MODEL
+
+
+@pytest.mark.asyncio
 async def test_builtin_member_takes_the_calling_defaults_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,3 +678,94 @@ async def test_malformed_member_label_is_ignored(monkeypatch: pytest.MonkeyPatch
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert bodies[0]["model_override"] == _PARENT_MODEL
+
+
+def test_launched_from_library_agent_reads_the_template_label() -> None:
+    """Only a ``ca_`` id under the create-time template label marks a launch."""
+    assert launched_from_library_agent(None) is False
+    assert launched_from_library_agent({}) is False
+    assert launched_from_library_agent({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_abc"}) is True
+    assert launched_from_library_agent({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin"}) is False
+    assert launched_from_library_agent({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "polly"}) is False
+    non_str: dict[str, Any] = {LIBRARY_AGENT_TEMPLATE_LABEL_KEY: 7}
+    assert launched_from_library_agent(non_str) is False
+
+
+def test_member_lock_applies_only_to_a_true_locked_entry() -> None:
+    """Only the boolean ``locked is True`` marks a locked entry."""
+    assert member_lock_applies({MEMBER_LOCKED_FIELD: True}) is True
+    assert member_lock_applies({MEMBER_LOCKED_FIELD: False}) is False
+    assert member_lock_applies({}) is False
+    assert member_lock_applies({MEMBER_LOCKED_FIELD: "true"}) is False
+
+
+_LEGACY_MEMBER_ENTRY: dict[str, Any] = {
+    "host": None,
+    "harness": "claude-sdk",
+    "model": _MEMBER_MODEL,
+    "effort": "medium",
+    "lead": False,
+}
+
+
+def test_unlocked_legacy_member_labels_freezes_a_pre_field_entry() -> None:
+    """A legacy entry gains ``locked: false`` without other field changes."""
+    labels = {member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY)}
+
+    rewritten = unlocked_legacy_member_labels(labels)
+
+    expected = {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}
+    assert rewritten == {member_label_key("worker"): encode_member_entry(expected)}
+    entries = member_entries_from_labels(
+        {**labels, **rewritten, LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved"}
+    )
+    assert entries == {"worker": expected}
+
+
+def test_unlocked_legacy_member_labels_skips_a_library_agent_session() -> None:
+    """A ``ca_`` launch already resolves members to locked; nothing to freeze."""
+    labels = {
+        member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY),
+        LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved",
+    }
+
+    assert unlocked_legacy_member_labels(labels) == {}
+
+
+def test_unlocked_legacy_member_labels_keeps_explicit_lock_values() -> None:
+    """Entries already carrying ``locked`` are left untouched, either value."""
+    labels = {
+        member_label_key("lead"): encode_member_entry(
+            {**_LEGACY_MEMBER_ENTRY, "lead": True, MEMBER_LOCKED_FIELD: True}
+        ),
+        member_label_key("worker"): encode_member_entry(
+            {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}
+        ),
+    }
+
+    assert unlocked_legacy_member_labels(labels) == {}
+
+
+def test_unlocked_legacy_member_labels_ignores_malformed_and_non_member_labels() -> None:
+    """Non-member keys and values that are not a JSON object yield nothing."""
+    labels = {
+        "unrelated": "1",
+        LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin",
+        member_label_key("lead"): "[]",
+        member_label_key("worker"): "{not json",
+    }
+
+    assert unlocked_legacy_member_labels(labels) == {}
+
+
+def test_unlocked_legacy_member_labels_drops_an_over_cap_rewrite() -> None:
+    """A rewrite that would overflow the 256-char label is left out."""
+    entry = {**_LEGACY_MEMBER_ENTRY, "model": "m" * 165}
+    value = encode_member_entry(entry)
+    assert len(value) <= MEMBER_LABEL_VALUE_MAX_CHARS
+    assert (
+        len(encode_member_entry({**entry, MEMBER_LOCKED_FIELD: False}))
+        > MEMBER_LABEL_VALUE_MAX_CHARS
+    )
+
+    assert unlocked_legacy_member_labels({member_label_key("worker"): value}) == {}

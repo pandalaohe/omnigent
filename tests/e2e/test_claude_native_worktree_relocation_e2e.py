@@ -651,6 +651,19 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
 
     try:
         with isolated_local_server(tmp_path, poll_interval=_POLL_S) as base_url:
+            # This test exercises the blocking approval path, which the
+            # server's deferred-approval default bypasses.
+            approval_prefs = _http.patch(
+                f"{base_url}/v1/me/preferences/approval_timeout",
+                json={
+                    "value": {
+                        "timeoutMinutes": 50,
+                        "stopTurn": True,
+                        "asyncApprovals": False,
+                    }
+                },
+            )
+            assert approval_prefs.is_success, approval_prefs.text
             session_id = str(
                 create_native_session(_http, base_url, harness="claude")["session_id"]
             )

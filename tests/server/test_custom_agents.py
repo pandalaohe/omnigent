@@ -14,6 +14,12 @@ import yaml
 from starlette.requests import HTTPConnection
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
+from omnigent.member_snapshot import (
+    MEMBER_LOCKED_FIELD,
+    encode_member_entry,
+    member_entries_from_labels,
+    member_label_key,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
@@ -1737,6 +1743,64 @@ async def test_import_requires_owner_and_retains_archive(
             content="{}",
         )
         assert bad_type.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_import_freezes_legacy_member_lock_values(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """Save as Agent on a legacy session must not flip its members to locked."""
+    app, artifacts, _agents, conversations, permissions = make_app(db_uri, tmp_path)
+    original = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, original)
+    artifacts.put(location, original)
+    snapshot = conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    session_id = snapshot.conversation.id
+    permissions.grant("alice", session_id, LEVEL_OWNER)
+    conversations.set_labels(
+        session_id,
+        {
+            member_label_key("custom-reviewer"): encode_member_entry(
+                {
+                    "host": None,
+                    "harness": "codex",
+                    "model": "lead-model",
+                    "effort": "high",
+                    "lead": True,
+                }
+            ),
+            member_label_key("researcher"): encode_member_entry(
+                {
+                    "host": None,
+                    "harness": "claude-sdk",
+                    "model": "research-model",
+                    "effort": "medium",
+                    "lead": False,
+                }
+            ),
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            json={"source_session_id": session_id},
+        )
+
+    assert created.status_code == 201, created.text
+    labels = conversations.get_conversation(session_id).labels
+    assert labels["omnigent:agent-template-id"] == created.json()["id"]
+    entries = member_entries_from_labels(labels)
+    assert set(entries) == {"custom-reviewer", "researcher"}
+    assert all(entry[MEMBER_LOCKED_FIELD] is False for entry in entries.values())
 
 
 @pytest.mark.asyncio

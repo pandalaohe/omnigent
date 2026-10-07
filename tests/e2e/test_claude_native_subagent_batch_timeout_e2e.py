@@ -161,7 +161,7 @@ def _build_subagent_items(n: int) -> list[Any]:
     return items[:n]
 
 
-async def _setup_sessions(base_url: str, parent_id: str) -> str:
+async def _setup_sessions(base_url: str, parent_id: str) -> Any:
     """Create a sub-agent child session via external_subagent_start.
 
     Uses the same POST /v1/sessions/{id}/events + external_subagent_start path
@@ -169,7 +169,8 @@ async def _setup_sessions(base_url: str, parent_id: str) -> str:
 
     :param base_url: Spawned server base URL.
     :param parent_id: Parent claude-native session id.
-    :returns: The minted child session id.
+    :returns: The registration result; its ``child_session_id`` is the minted
+        child session id.
     """
     from omnigent.harnesses.claude_native.forwarder import _post_external_subagent_start
 
@@ -181,6 +182,9 @@ async def _setup_sessions(base_url: str, parent_id: str) -> str:
             agent_type="Explore",
             description="sub-agent batch timeout regression fixture",
             tool_use_id="toolu_batch_timeout_regression_001",
+            # Durable idempotency token for this registration attempt; production
+            # forwards uuid4().hex here.
+            registration_id="b47c0e5a9d3f4a2b8c1d6e7f0a9b8c7d",
         )
 
 
@@ -258,7 +262,7 @@ def test_subagent_batch_100_items_completes_within_timeout(tmp_path: Path) -> No
 
     with isolated_local_server(tmp_path, bootstrap=_SERVER_BOOTSTRAP_SLOW_APPEND) as base_url:
         parent_id = str(create_native_session(_http, base_url, harness="claude")["session_id"])
-        child_id = asyncio.run(_setup_sessions(base_url, parent_id))
+        child_id = asyncio.run(_setup_sessions(base_url, parent_id)).child_session_id
 
         items = _build_subagent_items(_BATCH_SIZE)
         assert len(items) == _BATCH_SIZE, f"_build_subagent_items returned {len(items)}"

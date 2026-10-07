@@ -102,6 +102,7 @@ def _member_labels(
     *,
     worker_unavailable: str | None = None,
     roles: tuple[str, ...] = (LEAD_ROLE, WORKER_ROLE),
+    locked: bool = True,
 ) -> dict[str, str]:
     """Member snapshot labels: a lead plus one worker (and optional extras)."""
     entries: dict[str, dict[str, Any]] = {
@@ -126,6 +127,8 @@ def _member_labels(
     for role in roles:
         if role not in entries:
             entries[role] = dict(extra.get(role, {"lead": False}))
+    for entry in entries.values():
+        entry["locked"] = locked
     return {member_label_key(role): encode_member_entry(entry) for role, entry in entries.items()}
 
 
@@ -402,6 +405,37 @@ async def test_unavailable_named_role_gets_immediate_notice_not_note() -> None:
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_named_role_in_unlocked_session_gets_a_note() -> None:
+    """An unavailable member of an unlocked session is routed, not noticed.
+
+    The snapshot's ``unavailable`` refusal is a lock; a session launched
+    outside the library (entry ``locked: False``) keeps ordinary routing.
+    """
+    server = _MemberServerClient()
+    app, _pm, harness = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _seed_session(
+            client,
+            labels=_member_labels(worker_unavailable="host_offline", locked=False),
+        )
+        response = await _post_message(client, "[executor] build it")
+        assert response.status_code == 202
+        await _wait_until(lambda: bool(harness.posted_bodies))
+        await _wait_for_turn_end(app)
+
+    texts = _ordered_user_texts(harness.posted_bodies[0])
+    assert len(texts) == 2, texts
+    note, user_text = texts
+    assert note.startswith("[System:")
+    assert "'executor'" in note
+    assert user_text == "[executor] build it"
+    obligations = runner_app.list_member_obligations(PARENT)
+    assert [obligation.role for obligation in obligations] == ["executor"]
+    assert _notices(server) == []
 
 
 # --------------------------------------------------------------------------

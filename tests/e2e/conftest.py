@@ -60,6 +60,17 @@ from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_host_browser_auto_open() -> Iterator[None]:
+    """Keep interactive `omnigent run` in e2e subprocesses from opening the host browser.
+
+    Subprocesses inherit it even when HOME/OMNIGENT_CONFIG_HOME point at a fresh config.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("OMNIGENT_AUTO_OPEN_CONVERSATION", "false")
+        yield
+
+
 @pytest.fixture(autouse=True)
 def _skip_when_harness_cli_missing(request: pytest.FixtureRequest) -> None:
     """Skip parametrized rows whose harness CLI isn't on PATH.

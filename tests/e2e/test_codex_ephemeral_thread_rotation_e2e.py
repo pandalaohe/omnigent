@@ -86,11 +86,13 @@ class _RecordingAP:
             request=httpx.Request("GET", url),
         )
 
-    async def post(self, url: str, *, json: dict) -> httpx.Response:
+    async def post(self, url: str, *, json: dict, timeout: float | None = None) -> httpx.Response:
         """Record a POST and return 200 (a session id for a create).
 
         :param url: Request URL, e.g. ``"/v1/sessions"``.
         :param json: JSON body of the POST.
+        :param timeout: Request timeout in seconds, e.g. ``60.0``; accepted
+            but unused.
         :returns: A 200 response; ``/v1/sessions`` returns a new id.
         """
         self.posts.append((url, json))

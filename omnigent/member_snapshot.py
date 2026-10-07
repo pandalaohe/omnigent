@@ -20,6 +20,13 @@ MEMBER_LABEL_PREFIX = "omnigent.member."
 MEMBER_LABEL_KEY_MAX_CHARS = 128
 MEMBER_LABEL_VALUE_MAX_CHARS = 256
 
+# Session label recording the saved library Agent (``ca_`` id) a session was
+# created from. Only such a session locks members to the frozen snapshot.
+LIBRARY_AGENT_TEMPLATE_LABEL_KEY = "omnigent:agent-template-id"
+
+# Member entry field set at create: True when launched from a saved library agent.
+MEMBER_LOCKED_FIELD = "locked"
+
 # Reason codes stored in a member entry's ``unavailable`` field.
 MEMBER_UNAVAILABLE_HOST_OFFLINE = "host_offline"
 MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED = "harness_not_configured"
@@ -46,7 +53,12 @@ def parse_member_entry(value: str) -> dict[str, Any] | None:
 
 
 def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, dict[str, Any]]:
-    """Project ``{role: entry}`` for every well-formed member label."""
+    """Project ``{role: entry}`` for every well-formed member label.
+
+    An entry written before the field existed takes its ``locked`` value from
+    the session's template label.
+    """
+    legacy = launched_from_library_agent(labels)
     entries: dict[str, dict[str, Any]] = {}
     for key, value in (labels or {}).items():
         if not key.startswith(MEMBER_LABEL_PREFIX):
@@ -54,8 +66,49 @@ def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, di
         role = key[len(MEMBER_LABEL_PREFIX) :]
         entry = parse_member_entry(value)
         if role and entry is not None:
+            entry.setdefault(MEMBER_LOCKED_FIELD, legacy)
             entries[role] = entry
     return entries
+
+
+def launched_from_library_agent(labels: Mapping[str, str] | None) -> bool:
+    """Return whether *labels* mark a session launched from a saved library agent.
+
+    Evaluated on a session's create-time labels: only a session started from a
+    user's saved library joint agent (the template label carries its ``ca_``
+    id) locks members to the frozen snapshot; built-in and uploaded joint
+    agents keep per-dispatch choice and parent-model inheritance.
+    """
+    template_id = (labels or {}).get(LIBRARY_AGENT_TEMPLATE_LABEL_KEY)
+    return isinstance(template_id, str) and template_id.startswith("ca_")
+
+
+def member_lock_applies(entry: Mapping[str, Any]) -> bool:
+    """Return whether the member *entry* was frozen by a library-agent launch."""
+    return entry.get(MEMBER_LOCKED_FIELD) is True
+
+
+def unlocked_legacy_member_labels(labels: Mapping[str, str] | None) -> dict[str, str]:
+    """Return member labels rewritten with ``locked: false`` for legacy entries.
+
+    A session not launched from a library agent keeps unlocked members after a
+    later template-label write (Save as Agent): every entry written before the
+    ``locked`` field existed gets it fixed to false. A value that would exceed
+    the label column is left out.
+    """
+    if launched_from_library_agent(labels):
+        return {}
+    rewritten: dict[str, str] = {}
+    for key, value in (labels or {}).items():
+        if not key.startswith(MEMBER_LABEL_PREFIX):
+            continue
+        entry = parse_member_entry(value)
+        if entry is None or MEMBER_LOCKED_FIELD in entry:
+            continue
+        encoded = encode_member_entry({**entry, MEMBER_LOCKED_FIELD: False})
+        if len(encoded) <= MEMBER_LABEL_VALUE_MAX_CHARS:
+            rewritten[key] = encoded
+    return rewritten
 
 
 # The web composer's attachment preamble. Its text can carry ``@`` inside a
