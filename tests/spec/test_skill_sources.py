@@ -1485,3 +1485,27 @@ def test_session_registry_survives_a_deleted_cwd(
 
     assert roots == ()
     assert resolve_session_skill_registry(spec, roots, None) == [bundled]
+
+
+def test_session_registry_honors_the_claude_portable_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the host switch off, a claude-sdk session cannot load ``.agents`` skills."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    _write_skill(home / ".agents" / "skills", "api-design")
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".claude" / "skills", "plan")
+    spec = _agent_spec("claude-sdk")
+    off_config = tmp_path / "off-config"
+    _write_config(off_config, "skills:\n  claude_portable_skills: false\n")
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-config"))
+    on = {s.name for s in resolve_session_skill_registry(spec, (ws,), None)}
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(off_config))
+    off = {s.name for s in resolve_session_skill_registry(spec, (ws,), None)}
+
+    assert {"plan", "api-design"} <= on
+    assert "plan" in off
+    assert "api-design" not in off
