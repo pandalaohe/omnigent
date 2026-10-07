@@ -68,7 +68,11 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.member_snapshot import member_entries_from_labels, parse_role_mentions
+from omnigent.member_snapshot import (
+    member_entries_from_labels,
+    member_lock_applies,
+    parse_role_mentions,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -5395,7 +5399,8 @@ def create_runner_app(
                 if role in seen or role in lead_roles:
                     continue
                 seen.add(role)
-                unavailable = entries[role].get("unavailable")
+                entry = entries[role]
+                unavailable = entry.get("unavailable") if member_lock_applies(entry) else None
                 if isinstance(unavailable, str) and unavailable:
                     _schedule_member_notice(session_id, role, unavailable, [])
                     continue

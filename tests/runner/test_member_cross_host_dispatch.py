@@ -51,6 +51,7 @@ def _member_labels(**entry: object) -> dict[str, str]:
         "model": _MEMBER_MODEL,
         "effort": "high",
         "lead": False,
+        "locked": True,
     }
     payload.update(entry)
     return {

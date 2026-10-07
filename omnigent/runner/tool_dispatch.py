@@ -3454,15 +3454,15 @@ async def _execute_subagent_tool(
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
 
-    # Only a session launched from a user's saved library agent (``ca_``
-    # template label) locks members to their create-time snapshot; other
-    # sessions keep per-dispatch choice and parent-model inheritance.
+    # Only a member snapshot written for a session launched from a saved library agent locks;
+    # other sessions keep per-dispatch choice and parent-model inheritance.
     member_entry: _JsonObject | None = None
     session_labels = await _runner_app._fetch_current_session_labels(
         server_client, conversation_id
     )
-    if member_lock_applies(session_labels):
-        member_entry = member_entries_from_labels(session_labels).get(str(sub_agent_name))
+    entry = member_entries_from_labels(session_labels).get(str(sub_agent_name))
+    if entry is not None and member_lock_applies(entry):
+        member_entry = entry
     if member_entry is not None:
         lock_error = _member_dispatch_lock_error(
             str(sub_agent_name),

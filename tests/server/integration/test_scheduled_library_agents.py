@@ -365,6 +365,7 @@ async def test_fire_writes_member_snapshot_labels(
         "model": "lead-model",
         "effort": None,
         "lead": True,
+        "locked": True,
     }
     assert worker == {
         "host": _HOST_ID,
@@ -372,6 +373,7 @@ async def test_fire_writes_member_snapshot_labels(
         "model": "worker-model",
         "effort": None,
         "lead": False,
+        "locked": True,
     }
 
 

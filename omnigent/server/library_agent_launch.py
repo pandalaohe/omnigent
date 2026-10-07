@@ -232,6 +232,7 @@ async def launch_library_agent(
             spec,
             host_id=launch.host_id,
             host_store=host_store,
+            locked=True,
             member_hosts=await _member_hosts_from_library_agent(
                 template_id=agent_id,
                 owner=owner,

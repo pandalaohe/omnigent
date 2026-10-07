@@ -343,6 +343,7 @@ async def test_multipart_create_writes_one_label_per_member(
             "model": "lead-model",
             "effort": "high",
             "lead": True,
+            "locked": False,
         },
         "researcher": {
             "host": _HOST_ID,
@@ -350,6 +351,7 @@ async def test_multipart_create_writes_one_label_per_member(
             "model": "worker-model",
             "effort": "medium",
             "lead": False,
+            "locked": False,
         },
     }
 
@@ -490,6 +492,7 @@ async def test_host_store_failure_still_writes_labels_without_availability(
             "model": "lead-model",
             "effort": "high",
             "lead": True,
+            "locked": False,
         },
         "researcher": {
             "host": _HOST_ID,
@@ -497,6 +500,7 @@ async def test_host_store_failure_still_writes_labels_without_availability(
             "model": "worker-model",
             "effort": "medium",
             "lead": False,
+            "locked": False,
         },
     }
 
@@ -731,6 +735,7 @@ async def test_manual_launch_agent_style_metadata_writes_member_labels(
         "model": "worker-model",
         "effort": "medium",
         "lead": False,
+        "locked": False,
     }
 
 
@@ -765,6 +770,7 @@ async def test_member_host_decides_host_and_catalog_default(
         "model": "lead-model",
         "effort": "high",
         "lead": True,
+        "locked": True,
     }
     assert entries["researcher"] == {
         "host": _MEMBER_HOST,
@@ -772,6 +778,7 @@ async def test_member_host_decides_host_and_catalog_default(
         "model": "member-host-model",
         "effort": "medium",
         "lead": False,
+        "locked": True,
     }
 
 
@@ -851,6 +858,7 @@ async def test_failed_member_host_lookup_contributes_no_catalog_facts(
         "model": None,
         "effort": "medium",
         "lead": False,
+        "locked": True,
     }
 
     # An explicit model is kept as saved — never model_missing.
@@ -865,6 +873,7 @@ async def test_failed_member_host_lookup_contributes_no_catalog_facts(
         "model": "worker-model",
         "effort": "medium",
         "lead": False,
+        "locked": True,
     }
 
 
@@ -896,3 +905,8 @@ async def test_unknown_foreign_and_non_library_template_ids_keep_the_session_hos
         )
         assert entries["researcher"]["host"] == _HOST_ID, template_id
         assert entries["custom-reviewer"]["host"] == _HOST_ID, template_id
+        # The create request's template label is the launch provenance: a
+        # ``ca_`` id writes locked entries; a non-library id does not.
+        expected_locked = template_id.startswith("ca_")
+        assert entries["researcher"]["locked"] is expected_locked, template_id
+        assert entries["custom-reviewer"]["locked"] is expected_locked, template_id
