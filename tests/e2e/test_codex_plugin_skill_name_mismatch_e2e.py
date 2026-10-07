@@ -123,6 +123,10 @@ class _ExecutorStub:
     def __init__(self, harness: str) -> None:
         """:param harness: The session's harness, e.g. ``"codex-native"``."""
         self.harness_kind = harness
+        # ``_session_harness_name`` reads the executor's config/type, so a
+        # session whose spec is this stub must answer those too.
+        self.config = {"harness": harness}
+        self.type = "omnigent"
 
 
 class _SpecStub:

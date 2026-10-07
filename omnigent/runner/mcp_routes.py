@@ -39,6 +39,7 @@ from omnigent.runner.mcp_execution_registry import (
 )
 from omnigent.runner.native import (
     _forward_harness_response,
+    _resolved_spec_workdir,
     _resolved_workdir_for_spec,
     _unwrap_resolved_spec,
 )
@@ -318,11 +319,13 @@ def register_mcp_routes(
                     )
             else:
                 spec_entry = _session_spec_cache.get(session_id)
+                spec_bundle_entry = spec_entry
                 spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
                     try:
                         resolved_entry = await _resolve_session_spec_entry(session_id)
+                        spec_bundle_entry = resolved_entry
                         spec_workdir = _resolved_workdir_for_spec(resolved_entry, runner_workspace)
                         spec = _unwrap_resolved_spec(resolved_entry)
                     except (OmnigentError, httpx.HTTPError, RuntimeError):
@@ -350,6 +353,7 @@ def register_mcp_routes(
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
                         effective_harness=_session_harness_name(session_id),
+                        skill_bundle_dir=_resolved_spec_workdir(spec_bundle_entry),
                     )
                 except Exception as exc:
                     _logger.exception(

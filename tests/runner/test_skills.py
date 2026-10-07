@@ -43,6 +43,10 @@ class _ExecutorStub:
     def __init__(self, harness: str) -> None:
         """:param harness: The session's harness, e.g. ``"claude-sdk"``."""
         self.harness_kind = harness
+        # ``_session_harness_name`` reads the executor's config/type, so a
+        # session whose spec is this stub must answer those too.
+        self.config = {"harness": harness}
+        self.type = "omnigent"
 
 
 class _SpecStub:
@@ -670,3 +674,39 @@ async def test_codex_bundle_skill_not_duplicated_when_dir_differs_from_name(
     names = resp.json()["available"]
     # Exactly one entry for the skill (no phantom dir-named duplicate).
     assert names.count("triage") + names.count("sra--triage") == 1
+
+
+@pytest.mark.asyncio
+async def test_session_skills_endpoint_expands_and_strips_node_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``~``-relative or padded workspace still roots discovery at the real dir."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    # ``expanduser`` reads $HOME, so pin it too for the ``~/ws`` case.
+    monkeypatch.setenv("HOME", str(home))
+    abs_ws = home / "ws"
+    skill_dir = abs_ws / ".claude" / "skills" / "tilde-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_skill_md("tilde-skill", "Under the workspace."))
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+
+    tilde_app = _make_app(bundle, [], "all", workspace=Path("~/ws"))
+    async for c in _client(tilde_app):
+        tilde = await c.post(
+            "/v1/sessions/conv_tilde/skills/resolve", json={"name": "missing-skill"}
+        )
+
+    padded_app = _make_app(bundle, [], "all", workspace=Path(f"  {abs_ws}  "))
+    async for c in _client(padded_app):
+        padded = await c.post(
+            "/v1/sessions/conv_padded/skills/resolve", json={"name": "missing-skill"}
+        )
+
+    assert tilde.status_code == 404, tilde.text
+    assert "tilde-skill" in tilde.json()["available"]
+    assert padded.status_code == 404, padded.text
+    assert "tilde-skill" in padded.json()["available"]

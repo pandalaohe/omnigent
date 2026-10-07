@@ -16,12 +16,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from omnigent.runner.tool_dispatch import (
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _SKILL_TOOLS,
+    _execute_skill_tool,
+    _granted_tool_names,
     build_native_relay_tool_schemas,
+    session_skill_registry,
 )
-from omnigent.spec.types import AgentSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
 def test_skill_tools_are_in_the_native_relay_union() -> None:
@@ -88,3 +93,177 @@ def test_relayed_load_skill_discovers_a_host_scope_skill(tmp_path: Path) -> None
     )
 
     assert "the skill body" in loaded, loaded[:300]
+
+
+def _agent_spec(harness: str) -> AgentSpec:
+    """A skill-less spec carrying *harness* as its executor kind."""
+    return AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+
+def _write_skill(skills_dir: Path, name: str, body: str) -> None:
+    """Write ``<skills_dir>/<name>/SKILL.md`` with *body* as its content."""
+    skill_dir = skills_dir / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} desc\n---\n{body}\n"
+    )
+
+
+def _seed_split_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin a home where Claude and Codex mounts carry different skills.
+
+    ``api-design`` exists only under ``~/.agents/skills`` (Codex's mount);
+    ``plan`` exists in both mounts with distinct bodies.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_skill(home / ".agents" / "skills", "api-design", "agents api body")
+    _write_skill(home / ".claude" / "skills", "plan", "claude plan body")
+    _write_skill(home / ".agents" / "skills", "plan", "agents plan body")
+
+
+def test_execute_skill_tool_claude_registry_ignores_agents_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claude-native session's registry never lists Codex-only skills."""
+    _seed_split_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+
+    plan = _execute_skill_tool(
+        "load_skill", {"name": "plan"}, agent_spec=spec, runner_workspace=workspace
+    )
+    api = _execute_skill_tool(
+        "load_skill", {"name": "api-design"}, agent_spec=spec, runner_workspace=workspace
+    )
+
+    assert "claude plan body" in plan
+    assert "skill 'api-design' not found" in api
+
+
+def test_execute_skill_tool_codex_registry_reads_agents_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A codex-native session's registry lists ``~/.agents/skills`` and not Claude's."""
+    _seed_split_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("codex-native")
+
+    plan = _execute_skill_tool(
+        "load_skill", {"name": "plan"}, agent_spec=spec, runner_workspace=workspace
+    )
+    api = _execute_skill_tool(
+        "load_skill", {"name": "api-design"}, agent_spec=spec, runner_workspace=workspace
+    )
+
+    assert "agents plan body" in plan
+    assert "agents api body" in api
+
+
+def test_execute_skill_tool_effective_harness_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session's harness override selects the overridden family's registry."""
+    _seed_split_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+
+    plan = _execute_skill_tool(
+        "load_skill",
+        {"name": "plan"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+        effective_harness="codex-native",
+    )
+    api = _execute_skill_tool(
+        "load_skill",
+        {"name": "api-design"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+        effective_harness="codex-native",
+    )
+
+    assert "agents plan body" in plan
+    assert "agents api body" in api
+
+
+def test_relayed_load_skill_description_uses_the_given_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The advertised description lists exactly the session registry's names."""
+    _seed_split_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+    registry = session_skill_registry(spec, "claude-native", workspace, None)
+
+    schemas = build_native_relay_tool_schemas(spec, skill_registry=registry)
+    load_schema = next(schema for schema in schemas if schema["name"] == "load_skill")
+    description = load_schema["description"]
+
+    assert "plan" in description
+    assert "api-design" not in description
+
+
+def test_session_registry_injects_build_omnigent_into_the_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skill-less spec's registry and its advertised description carry build-omnigent."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+
+    registry = session_skill_registry(spec, "claude-native", workspace, None)
+    schemas = build_native_relay_tool_schemas(spec, skill_registry=registry)
+    load_schema = next(schema for schema in schemas if schema["name"] == "load_skill")
+
+    assert "build-omnigent" in [s.name for s in registry]
+    assert "build-omnigent" in load_schema["description"]
+
+
+def test_grant_pairs_read_skill_file_with_load_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec with no resource skills still grants read_skill_file with load_skill."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    spec = AgentSpec(spec_version=1, skills_filter="none")
+
+    granted = _granted_tool_names(spec, "claude-native")
+
+    assert {"load_skill", "read_skill_file"} <= granted
+
+
+def test_execute_skill_tool_loads_a_bundle_host_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host skill under the bundle workdir loads for a claude-native session."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    _write_skill(bundle / ".claude" / "skills", "bundle-host", "bundle host body")
+    spec = _agent_spec("claude-native")
+
+    loaded = _execute_skill_tool(
+        "load_skill",
+        {"name": "bundle-host"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+        bundle_workdir=bundle,
+    )
+
+    assert "bundle host body" in loaded
