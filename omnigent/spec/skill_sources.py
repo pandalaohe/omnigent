@@ -495,6 +495,11 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Codex bundle, standalone, and enabled plugin skills under the filter.
 
+    After the seeded sources, the menu also lists the two ``.agents/skills``
+    tiers the Codex CLI loads itself — ``~/.agents/skills`` and the repo tier
+    (:func:`_codex_repo_agents_skill_dirs`) — first name wins. They are not
+    seeded into the private home because the CLI reads them directly.
+
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
     selector) — so the menu draws from the same roots and selection the
@@ -525,6 +530,14 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
     host_override = ctx.codex_home if ctx.is_native else None
     sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
+    cwd = ctx.roots[0] if ctx.roots else None
+    # Tiers the Codex CLI reads itself: listed, never seeded into its private home.
+    extra = [ctx.home / ".agents" / "skills"]
+    if cwd is not None:
+        extra.extend(_codex_repo_agents_skill_dirs(cwd))
+    for tier in extra:
+        if tier not in sources and os.path.isdir(tier):
+            sources.append(tier)
     out: list[SkillSpec] = []
     for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
         try:
@@ -533,9 +546,29 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
             continue
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
-    cwd = ctx.roots[0] if ctx.roots else None
     out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
     return out
+
+
+def _codex_repo_agents_skill_dirs(cwd: Path) -> list[Path]:
+    """
+    The repo ``.agents/skills`` dirs the Codex CLI loads for *cwd*.
+
+    Walks ``cwd`` up to the nearest ``.git`` ancestor (``cwd`` alone when
+    none), closest first. ``os.path`` probes count an unreadable path as
+    absent, as Codex skips stat errors.
+
+    :param cwd: The session workspace (the Codex CLI's cwd).
+    :returns: Existing ``<d>/.agents/skills`` dirs, closest first.
+    """
+    chain: list[Path] = []
+    for directory in (cwd, *cwd.parents):
+        chain.append(directory)
+        if os.path.exists(directory / ".git"):
+            break
+    else:
+        chain = [cwd]
+    return [d / ".agents" / "skills" for d in chain if os.path.isdir(d / ".agents" / "skills")]
 
 
 def cursor_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:

@@ -5135,6 +5135,7 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
                 resolved_status = _session_status_cache.get(conv.id) or conv.live_status
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
         from omnigent.runtime._globals import _agent_store
+        from omnigent.server.child_keep_warm import cold_after_for_session
 
         agent_name, harness = _child_summary_identity(conv, _agent_store, {})
         summary = _child_session_summary_from_conversation(
@@ -5145,6 +5146,7 @@ def _publish_child_status_to_parent(session_id: str, status: str | None) -> None
             inherited=_inherited_placement(store, parent_id),
             agent_name=agent_name,
             harness=harness,
+            cold_after_s=cold_after_for_session(conv),
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -11765,6 +11767,7 @@ def _child_session_summary_from_conversation(
     inherited: Placement | None = None,
     agent_name: str | None = None,
     harness: str | None = None,
+    cold_after_s: int | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -11812,6 +11815,9 @@ def _child_session_summary_from_conversation(
         caller (memoised per list call). ``None`` when unavailable.
     :param harness: Canonical harness for this conversation, resolved by
         the caller per conversation. ``None`` when unavailable.
+    :param cold_after_s: The bound agent's idle seconds to cold
+        (``0`` = never cold), resolved by the caller through the keep-warm
+        sweeper. ``None`` keeps the per-family pill rule.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11942,7 +11948,9 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         routing_decision_id=routing_decision_id,
-        warm_state=_warm_state_from_label(conv, harness=harness, busy=busy),
+        warm_state=_warm_state_from_label(
+            conv, harness=harness, busy=busy, cold_after_s=cold_after_s
+        ),
     )
 
 
@@ -11951,6 +11959,7 @@ def _warm_state_from_label(
     *,
     harness: str | None,
     busy: bool,
+    cold_after_s: int | None = None,
 ) -> Literal["warm", "cold"] | None:
     """Derive the keep-warm pill state for a child summary (no settings read)."""
     from omnigent.db.utils import now_epoch
@@ -11964,6 +11973,7 @@ def _warm_state_from_label(
         harness=harness,
         busy=busy,
         now=now_epoch(),
+        cold_after_s=cold_after_s,
     )
 
 

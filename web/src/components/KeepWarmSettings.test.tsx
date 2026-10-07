@@ -158,6 +158,42 @@ describe("KeepWarmSettings", () => {
     expect(screen.getByLabelText("Longest keep-warm run for Claude Code in hours")).toBeEnabled();
   });
 
+  it("shows the Cold after field per agent, enabled while both switches are off", () => {
+    renderSettings();
+
+    const claude = screen.getByLabelText("Cold after for Claude Code in minutes");
+    expect(claude).toBeEnabled();
+    expect(claude).toHaveValue(null);
+    expect(claude).toHaveAttribute("placeholder", "auto");
+    expect(screen.getByLabelText("Cold after for Codex in minutes")).toBeInTheDocument();
+  });
+
+  it("writes cold-after minutes as seconds and clearing removes the field", () => {
+    renderSettings();
+    const field = screen.getByLabelText("Cold after for Claude Code in minutes");
+
+    fireEvent.change(field, { target: { value: "0" } });
+    expect(storedKeepWarm().agents["claude-native-ui"]).toEqual({
+      main: false,
+      child: false,
+      intervalSeconds: 3300,
+      maxSeconds: 14400,
+      coldAfterSeconds: 0,
+    });
+
+    fireEvent.change(field, { target: { value: "120" } });
+    expect(storedKeepWarm().agents["claude-native-ui"].coldAfterSeconds).toBe(7200);
+
+    fireEvent.change(field, { target: { value: "" } });
+    expect(storedKeepWarm().agents["claude-native-ui"]).toEqual({
+      main: false,
+      child: false,
+      intervalSeconds: 3300,
+      maxSeconds: 14400,
+    });
+    expect(field).toHaveValue(null);
+  });
+
   it("resolves a session-discovered harness and shows its row once resolved", async () => {
     const uploaded: AvailableAgent = {
       id: "ag_uploaded",

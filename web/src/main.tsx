@@ -19,6 +19,7 @@ import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
+import { installKeepWarmSessionRefresh } from "./lib/keepWarmSessionRefresh";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
@@ -56,6 +57,10 @@ const queryClient = new QueryClient({
 // invalidate cached queries (e.g. the conversations list when a new
 // conversation is created server-side).
 initChatStore(queryClient);
+
+// Keep the session lists current after a keep-warm settings save. App scope,
+// not the settings section: the acknowledgement can land while it is closed.
+installKeepWarmSessionRefresh(queryClient);
 
 // Let a host-scoped request resolve its session's routing host on demand,
 // walking a hostless sub-agent child up to its host-bound ancestor (a cold

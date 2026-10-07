@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useQueries } from "@tanstack/react-query";
 
+import { HelpTip } from "@/components/HelpTip";
 import { NumericField, SettingRow } from "@/components/SettingsFields";
 import { Switch } from "@/components/ui/switch";
 import { sessionAgentQueryOptions } from "@/hooks/useAgents";
@@ -13,6 +14,7 @@ import {
   resolveKeepWarmAgent,
   setKeepWarmAgent,
   writeKeepWarmPreferences,
+  KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS,
   KEEP_WARM_HOST_OFFLINE_ARCHIVE_BOUNDS_SECONDS,
   KEEP_WARM_MAX_BOUNDS_SECONDS,
   type AgentKeepWarmPatch,
@@ -25,7 +27,7 @@ const HINTS = {
     "Children whose host stays offline this long are archived automatically. 0 turns auto-archive off.",
 };
 
-/** One-line explanations for the four per-agent controls. */
+/** One-line explanations for the five per-agent controls. */
 function AgentHint() {
   return (
     <div className="space-y-2">
@@ -44,6 +46,11 @@ function AgentHint() {
       <p>
         <span className="font-medium text-foreground">Longest</span> stops warming that many hours
         after the session's last real turn.
+      </p>
+      <p>
+        <span className="font-medium text-foreground">Cold after</span> is how long an idle session
+        counts as warm before the blue dot appears. Empty uses the platform's own rule; 0 means
+        never cold.
       </p>
     </div>
   );
@@ -129,7 +136,13 @@ export function KeepWarmSettings() {
               data-testid="keep-warm-agent-row"
               data-agent-id={agent.id}
             >
-              <SettingRow label={agent.display_name} hint={<AgentHint />}>
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-medium text-foreground">{agent.display_name}</span>
+                <HelpTip label={`About ${agent.display_name}`}>
+                  <AgentHint />
+                </HelpTip>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-3">
                 <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
                   Main
                   <Switch
@@ -172,7 +185,21 @@ export function KeepWarmSettings() {
                   />
                   hours
                 </span>
-              </SettingRow>
+                <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                  Cold after
+                  <NumericField
+                    ariaLabel={`Cold after for ${agent.display_name} in minutes`}
+                    value={row.coldAfterSeconds === null ? null : row.coldAfterSeconds / 60}
+                    min={0}
+                    max={KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS.max / 60}
+                    disabled={false}
+                    placeholder="auto"
+                    onClear={() => patch({ coldAfterSeconds: null })}
+                    onCommit={(minutes) => patch({ coldAfterSeconds: minutes * 60 })}
+                  />
+                  min
+                </span>
+              </div>
             </div>
           );
         })}

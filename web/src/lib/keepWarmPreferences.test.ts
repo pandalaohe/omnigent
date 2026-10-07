@@ -5,6 +5,7 @@ vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatchMo
 
 import {
   clampHostOfflineArchiveSeconds,
+  clampKeepWarmColdAfterSeconds,
   clampKeepWarmIntervalSeconds,
   clampKeepWarmMaxSeconds,
   KEEP_WARM_DEFAULTS,
@@ -42,14 +43,22 @@ describe("keep-warm preferences", () => {
     expect(clampHostOfflineArchiveSeconds(999999)).toBe(172800);
   });
 
-  it("treats an absent agent row as off", () => {
+  it("treats an absent agent row as off with the platform cold rule", () => {
     expect(resolveKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude")).toEqual({
       main: false,
       child: false,
       intervalSeconds: 3300,
       maxSeconds: 14400,
+      coldAfterSeconds: null,
     });
     expect(resolveKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "codex").intervalSeconds).toBe(1500);
+  });
+
+  it("clamps cold-after bounds while 0 stays never cold", () => {
+    expect(clampKeepWarmColdAfterSeconds(0)).toBe(0);
+    expect(clampKeepWarmColdAfterSeconds(30)).toBe(60);
+    expect(clampKeepWarmColdAfterSeconds(3600)).toBe(3600);
+    expect(clampKeepWarmColdAfterSeconds(999999)).toBe(172800);
   });
 
   it("applies the family defaults when an agent row is first switched on", () => {
@@ -78,6 +87,33 @@ describe("keep-warm preferences", () => {
     expect(next.agents["agent-x"]).toMatchObject({ intervalSeconds: 300, maxSeconds: 3600 });
   });
 
+  it("sets, keeps, and clears coldAfterSeconds", () => {
+    const zero = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude", {
+      coldAfterSeconds: 0,
+    });
+    expect(zero.agents["agent-x"]).toEqual({
+      main: false,
+      child: false,
+      intervalSeconds: 3300,
+      maxSeconds: 14400,
+      coldAfterSeconds: 0,
+    });
+
+    const clamped = setKeepWarmAgent(zero, "agent-x", "claude", { coldAfterSeconds: 30 });
+    expect(clamped.agents["agent-x"].coldAfterSeconds).toBe(60);
+
+    const unrelated = setKeepWarmAgent(clamped, "agent-x", "claude", { main: true });
+    expect(unrelated.agents["agent-x"].coldAfterSeconds).toBe(60);
+
+    const cleared = setKeepWarmAgent(unrelated, "agent-x", "claude", { coldAfterSeconds: null });
+    expect(cleared.agents["agent-x"]).toEqual({
+      main: true,
+      child: false,
+      intervalSeconds: 3300,
+      maxSeconds: 14400,
+    });
+  });
+
   it("normalizes a stored namespace and clamps the archive delay", () => {
     localStorage.setItem(
       KEEP_WARM_STORAGE_KEY,
@@ -102,7 +138,45 @@ describe("keep-warm preferences", () => {
       child: false,
       intervalSeconds: 3540,
       maxSeconds: 3600,
+      coldAfterSeconds: null,
     });
+  });
+
+  it("normalizes coldAfterSeconds values from storage", () => {
+    localStorage.setItem(
+      KEEP_WARM_STORAGE_KEY,
+      JSON.stringify({
+        agents: {
+          zero: { coldAfterSeconds: 0 },
+          low: { coldAfterSeconds: 30 },
+          high: { coldAfterSeconds: 999999 },
+          negative: { coldAfterSeconds: -1 },
+          string: { coldAfterSeconds: "5" },
+          float: { coldAfterSeconds: 1.5 },
+          bool: { coldAfterSeconds: true },
+        },
+        hostOfflineArchiveSeconds: 14400,
+      }),
+    );
+
+    const stored = readKeepWarmPreferences();
+    expect(stored.agents.zero.coldAfterSeconds).toBe(0);
+    expect(stored.agents.low.coldAfterSeconds).toBe(60);
+    expect(stored.agents.high.coldAfterSeconds).toBe(172800);
+    expect(resolveKeepWarmAgent(stored, "zero", "claude").coldAfterSeconds).toBe(0);
+    for (const id of ["negative", "string", "float", "bool"]) {
+      expect(stored.agents[id]).toEqual({ main: false, child: false, maxSeconds: 14400 });
+    }
+  });
+
+  it("round-trips a cold-after value through storage", () => {
+    const written = setKeepWarmAgent(KEEP_WARM_DEFAULTS, "agent-x", "claude", {
+      coldAfterSeconds: 7200,
+    });
+    writeKeepWarmPreferences(written, NATIVE_CLAUDE);
+
+    expect(readKeepWarmPreferences()).toEqual(written);
+    expect(queuePatchMock).toHaveBeenLastCalledWith("keep_warm", written);
   });
 
   it("treats a non-object payload as defaults", () => {

@@ -18,6 +18,10 @@ export interface UserPreferencesEnvelope {
   settings: Partial<Record<UserPreferenceNamespace, unknown>>;
 }
 
+/** Window event fired after the Server acknowledges a namespace patch. */
+export const USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT =
+  "omnigent:user-preference-patch-acknowledged";
+
 type PreferenceFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eventName: string }> =
@@ -471,6 +475,11 @@ function schedulePatch(
           if (!isCurrentPreferenceGeneration(generation)) return;
           if (!response?.ok) throw new Error("preference patch failed");
           lastAcknowledged.set(namespace, serialized);
+          window.dispatchEvent(
+            new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
+              detail: { namespace },
+            }),
+          );
           const current = latestNamespaceValue(namespace);
           const currentSerialized = serializedNamespaceValue(namespace, current);
           if (currentSerialized === serialized) {

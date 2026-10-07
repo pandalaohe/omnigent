@@ -191,6 +191,66 @@ describe("keyboardShortcutPreferences", () => {
     }
   });
 
+  it("registers the question-card action defaults", () => {
+    const expected: [ShortcutActionId, ShortcutChord[]][] = [
+      ["focusQuestionCard", [{ code: "KeyF", modifiers: ["control", "shift"] }]],
+      ["questionCardPreviousOption", [{ code: "ArrowUp", modifiers: [] }]],
+      ["questionCardNextOption", [{ code: "ArrowDown", modifiers: [] }]],
+      ["questionCardSelectOption", [{ code: "Space", modifiers: [] }]],
+      ["questionCardNextOrSubmit", [{ code: "Enter", modifiers: ["primary"] }]],
+      ["questionCardPreviousQuestion", [{ code: "ArrowLeft", modifiers: [] }]],
+      ["questionCardNextQuestion", [{ code: "ArrowRight", modifiers: [] }]],
+      ["questionCardLeave", [{ code: "Escape", modifiers: [] }]],
+      ["questionCardCancel", []],
+      ["questionCardCancelAndInterrupt", []],
+    ];
+
+    for (const [actionId, bindings] of expected) {
+      expect(DEFAULT_SHORTCUT_DEFINITIONS[actionId].group).toBe("questionCard");
+      expect(DEFAULT_SHORTCUT_DEFINITIONS[actionId].scope).toBe(
+        actionId === "focusQuestionCard" ? "global" : "questionCard",
+      );
+      expect(resolveShortcutBindings(actionId, "macos")).toEqual(bindings);
+      expect(resolveShortcutBindings(actionId, "windows")).toEqual(bindings);
+    }
+  });
+
+  it("matches a key-only Space event against the Space chord", () => {
+    // Some synthetic and IME paths deliver key without code; the card's
+    // "select" binding must still match.
+    const event = new KeyboardEvent("keydown", { key: " " });
+    expect(eventMatchesShortcut(event, { code: "Space", modifiers: [] })).toBe(true);
+  });
+
+  it("lets card keys coexist with composer, suggestions and approvePrompt", () => {
+    // Card actions fire only with focus inside the card; the composer's recall
+    // keys and the approval verdict can bind the same keys without stealing
+    // each other's events.
+    expect(
+      findShortcutConflicts("questionCardPreviousOption", [{ code: "ArrowUp", modifiers: [] }]),
+    ).toEqual([]);
+    expect(
+      findShortcutConflicts("questionCardNextOrSubmit", [
+        { code: "Enter", modifiers: ["primary"] },
+      ]),
+    ).not.toContain("approvePrompt");
+  });
+
+  it("still rejects card collisions with globals and other card actions", () => {
+    expect(
+      findShortcutConflicts("questionCardSelectOption", [
+        { code: "KeyN", modifiers: ["primary", "alt"] },
+      ]),
+    ).toContain("newSession");
+    // Recording ⌘K for a card action collides with the command palette.
+    expect(
+      findShortcutConflicts("questionCardNextOrSubmit", [{ code: "KeyK", modifiers: ["primary"] }]),
+    ).toContain("commandPalette");
+    expect(
+      findShortcutConflicts("questionCardNextOption", [{ code: "ArrowUp", modifiers: [] }]),
+    ).toContain("questionCardPreviousOption");
+  });
+
   it("keeps an action with an empty default safe to resolve and conflict-check", () => {
     expect(resolveShortcutBindings("selectWorkspaceTab1", "macos")).toEqual([]);
     expect(findShortcutConflicts("selectWorkspaceTab1", [], "macos")).toEqual([]);

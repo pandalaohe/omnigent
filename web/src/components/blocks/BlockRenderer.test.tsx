@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import { CodeBlockSendContext } from "@/components/ai-elements/message";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -1765,6 +1766,36 @@ describe("BlockRenderer dispatch", () => {
     // Wait for Streamdown to finish parsing the (streamed) markdown.
     const pre = await screen.findByText(/def foo/, { selector: "pre, pre *" });
     expect(pre.closest("pre")).not.toBeNull();
+  });
+});
+
+describe("code-block send opt-in", () => {
+  const items: RenderItem[] = [
+    {
+      kind: "text",
+      itemId: "t1",
+      text: "Here is some code:\n\n```python\ndef foo():\n    return 1\n```\n",
+      final: true,
+    },
+  ];
+
+  it("offers the send button on settled text but not on the live streaming edge", async () => {
+    const sendCodeBlock = vi.fn(() => true);
+    const view = (sessionStatus: "idle" | "running") => (
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <CodeBlockSendContext.Provider value={sendCodeBlock}>
+          <BlockRenderer items={items} sessionStatus={sessionStatus} />
+        </CodeBlockSendContext.Provider>
+      </FileViewerContext.Provider>
+    );
+
+    const { unmount } = render(view("idle"));
+    await screen.findByRole("button", { name: "Send as message" });
+    unmount();
+
+    render(view("running"));
+    await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(screen.queryByRole("button", { name: "Send as message" })).toBeNull();
   });
 });
 

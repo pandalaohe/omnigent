@@ -186,7 +186,10 @@ function isAction(value: unknown): value is MobileAssistantAction {
 }
 
 function isShortcutAction(value: unknown): value is ShortcutActionId {
-  return typeof value === "string" && value in DEFAULT_SHORTCUT_DEFINITIONS;
+  if (typeof value !== "string" || !(value in DEFAULT_SHORTCUT_DEFINITIONS)) return false;
+  // Card actions only mean anything while a card has focus, which a wheel tap
+  // cannot give them; stored ones are treated as unknown ids.
+  return DEFAULT_SHORTCUT_DEFINITIONS[value as ShortcutActionId].group !== "questionCard";
 }
 
 function isIcon(value: unknown): value is MobileAssistantIcon {

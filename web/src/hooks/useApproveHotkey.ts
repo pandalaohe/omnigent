@@ -31,6 +31,7 @@ import {
   hasCustomShortcutBindings,
 } from "@/lib/keyboardShortcutPreferences";
 import { useChatStore } from "@/store/chatStore";
+import { isInsideQuestionCard } from "./useQuestionCardHotkeys";
 
 /**
  * Whether the keystroke landed in a text field that holds a draft — the
@@ -67,6 +68,11 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
         if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
         if (e.key !== "Enter") return;
       }
+
+      // A focused question card owns its keys: its binding decides whether
+      // ⌘↵ advances or submits. Accepting an approval behind it would resolve
+      // a prompt the user is not looking at.
+      if (isInsideQuestionCard(e.target)) return;
 
       // Mid-composition chord — a send intent aimed at the draft, not a
       // verdict. Leave the event for the composer's own handler (whose

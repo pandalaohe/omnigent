@@ -561,13 +561,15 @@ export function MobileAssistantSettings() {
                       }
                       className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
                     >
-                      {SHORTCUT_ACTION_IDS.filter((actionId) => actionId !== "recentSessions").map(
-                        (actionId) => (
-                          <option key={actionId} value={actionId}>
-                            {DEFAULT_SHORTCUT_DEFINITIONS[actionId].label}
-                          </option>
-                        ),
-                      )}
+                      {SHORTCUT_ACTION_IDS.filter(
+                        (actionId) =>
+                          actionId !== "recentSessions" &&
+                          DEFAULT_SHORTCUT_DEFINITIONS[actionId].group !== "questionCard",
+                      ).map((actionId) => (
+                        <option key={actionId} value={actionId}>
+                          {DEFAULT_SHORTCUT_DEFINITIONS[actionId].label}
+                        </option>
+                      ))}
                     </select>
                   </label>
                   <span className="text-xs text-muted-foreground">

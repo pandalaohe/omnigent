@@ -23,7 +23,7 @@ import {
   type McpServerSummary,
   type UpsertMcpServerInput,
 } from "@/hooks/useAgents";
-import { useConversationRow, type KeepWarmStatus } from "@/hooks/useConversations";
+import { useConversationRow, type KeepWarmStatus, type WarmState } from "@/hooks/useConversations";
 import type { ModelUsage } from "@/lib/types";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
 import {
@@ -1237,28 +1237,45 @@ function KeepWarmRow({ label, children }: { label: string; children: React.React
 }
 
 /**
- * Keep-warm counters for the described session. The sidebar only flags a
- * cold cache; warm sessions report their status here and nowhere else.
+ * Keep-warm status for the described session: the derived cache state when
+ * known, plus the counter rows when the session carries a keep-warm label.
  */
-function KeepWarmSection({ status }: { status: KeepWarmStatus }) {
-  const reason = keepWarmStopReason(status);
+function KeepWarmSection({
+  status,
+  warmState,
+}: {
+  status: KeepWarmStatus | null;
+  warmState: WarmState | null;
+}) {
+  const reason = status !== null ? keepWarmStopReason(status) : null;
   return (
     <div className="flex flex-col gap-1.5 py-3" data-testid="agent-info-keep-warm">
       <SectionLabel>Keep-warm</SectionLabel>
-      <KeepWarmRow label="State">{status.state}</KeepWarmRow>
-      {reason !== null && <KeepWarmRow label="Stop reason">{reason}</KeepWarmRow>}
-      <KeepWarmRow label="Episode">
-        {formatKeepWarmCounters(
-          status.episode.pings,
-          status.episode.cost_usd,
-          status.episode.estimated,
-        )}
-      </KeepWarmRow>
-      <KeepWarmRow label="Total">
-        {formatKeepWarmCounters(status.total.pings, status.total.cost_usd, status.total.estimated)}
-      </KeepWarmRow>
-      {status.last_return !== null && (
-        <KeepWarmRow label="Last return">{keepWarmLastReturnLabel(status.last_return)}</KeepWarmRow>
+      {warmState !== null && <KeepWarmRow label="Cache">{warmState}</KeepWarmRow>}
+      {status !== null && (
+        <>
+          <KeepWarmRow label="State">{status.state}</KeepWarmRow>
+          {reason !== null && <KeepWarmRow label="Stop reason">{reason}</KeepWarmRow>}
+          <KeepWarmRow label="Episode">
+            {formatKeepWarmCounters(
+              status.episode.pings,
+              status.episode.cost_usd,
+              status.episode.estimated,
+            )}
+          </KeepWarmRow>
+          <KeepWarmRow label="Total">
+            {formatKeepWarmCounters(
+              status.total.pings,
+              status.total.cost_usd,
+              status.total.estimated,
+            )}
+          </KeepWarmRow>
+          {status.last_return !== null && (
+            <KeepWarmRow label="Last return">
+              {keepWarmLastReturnLabel(status.last_return)}
+            </KeepWarmRow>
+          )}
+        </>
       )}
     </div>
   );
@@ -1355,6 +1372,7 @@ export function AgentInfoContent({
   // than asking the server for a second status object.
   const conversation = useConversationRow(sessionId ?? null);
   const keepWarm = conversation?.keep_warm ?? null;
+  const warmState = conversation?.warm_state ?? null;
 
   useEffect(() => {
     return () => {
@@ -1447,7 +1465,9 @@ export function AgentInfoContent({
             )}
           </div>
         )}
-      {keepWarm !== null && <KeepWarmSection status={keepWarm} />}
+      {(keepWarm !== null || warmState !== null) && (
+        <KeepWarmSection status={keepWarm} warmState={warmState} />
+      )}
       <McpServersSection
         sessionId={sessionId}
         servers={servers}

@@ -44,6 +44,7 @@ import {
 } from "./lib/host";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
+import { installKeepWarmSessionRefresh } from "./lib/keepWarmSessionRefresh";
 import {
   applyUiFontSize,
   applyUiFontFamily,
@@ -176,6 +177,10 @@ function OmnigentProviders({
     void resolveIdentity();
     return null;
   });
+
+  // A keep-warm save must refresh session lists even if the settings route is
+  // unmounted when the host acknowledges the patch.
+  useEffect(() => installKeepWarmSessionRefresh(hostQueryClient), [hostQueryClient]);
 
   // Register the theme wrapper as the Radix portal container so overlays land
   // inside the themed subtree (and clear it on unmount). It's the inner div —

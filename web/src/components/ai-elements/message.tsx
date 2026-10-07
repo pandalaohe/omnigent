@@ -308,6 +308,13 @@ export const MessageBranchPage = ({ className, ...props }: MessageBranchPageProp
   );
 };
 
+/**
+ * Sends a code block's text as a chat message, returning whether it was sent.
+ * The nearest provider supplies the implementation; a message opts in per
+ * surface via {@link MessageResponseProps.sendCodeBlocks}.
+ */
+export const CodeBlockSendContext = createContext<((text: string) => boolean) | null>(null);
+
 export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "mermaid"> & {
   /**
    * Hand file-path links to the `a` component override instead of letting the
@@ -315,6 +322,11 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
    * Opt-in: only callers that supply that override may set it.
    */
   markFileLinks?: boolean;
+  /**
+   * Opt-in: code blocks get a send button wired to the nearest
+   * {@link CodeBlockSendContext}. Without a provider, no button renders.
+   */
+  sendCodeBlocks?: boolean;
 };
 
 // Streamdown's mermaid fullscreen portals its overlay to `document.body`, which
@@ -530,8 +542,17 @@ const CodeWrapTextIcon = (props: CodeHeaderIconProps) => (
   </svg>
 );
 
+const CodeSendIcon = (props: CodeHeaderIconProps) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <g stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75}>
+      <path d="M8 13V3" />
+      <path d="M3.5 7.5 8 3l4.5 4.5" />
+    </g>
+  </svg>
+);
+
 // Shared visual style for the buttons in a chat code block header (copy, wrap
-// toggle). Keeps the frosted resting look that matches Streamdown's own button
+// toggle, send). Keeps the frosted resting look that matches Streamdown's own button
 // pill, but pins the hover background to that same frosted fill so the ghost
 // variant's grey hover box never appears — on hover only the icon brightens,
 // exactly like Streamdown's built-in buttons (e.g. download). Positioning lives
@@ -578,6 +599,51 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
       onClick={handleClick}
       size="icon-sm"
       title="Copy Code"
+      type="button"
+      variant="ghost"
+    >
+      <Icon />
+    </Button>
+  );
+}
+
+function ChatCodeBlockSendButton({
+  getCode,
+  send,
+}: {
+  getCode: () => string;
+  send: (text: string) => boolean;
+}) {
+  const [isSent, setIsSent] = useState(false);
+  const timeoutRef = useRef<number>(0);
+
+  const handleClick = useCallback(() => {
+    if (isSent) return;
+
+    const text = getCode().trim();
+    if (!text) return;
+    if (send(text)) {
+      setIsSent(true);
+      timeoutRef.current = window.setTimeout(() => setIsSent(false), 2000);
+    }
+  }, [getCode, isSent, send]);
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(timeoutRef.current);
+    },
+    [],
+  );
+
+  const Icon = isSent ? CodeCheckIcon : CodeSendIcon;
+
+  return (
+    <Button
+      aria-label="Send as message"
+      className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+      onClick={handleClick}
+      size="icon-sm"
+      title="Send as message"
       type="button"
       variant="ghost"
     >
@@ -723,6 +789,7 @@ function ChatMermaidBlock({ block }: { block: ReactNode }) {
 function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
+  const send = useContext(CodeBlockSendContext);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for when column alignment matters.
@@ -745,6 +812,7 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
+        {send && <ChatCodeBlockSendButton getCode={getCode} send={send} />}
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>
@@ -753,8 +821,16 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
 }
 
 export const MessageResponse = memo(
-  ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
+  ({
+    className,
+    components,
+    controls,
+    markFileLinks = false,
+    sendCodeBlocks = false,
+    ...props
+  }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
+    const inheritedSend = useContext(CodeBlockSendContext);
     const messageComponents = useMemo(
       () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
       [components],
@@ -764,30 +840,32 @@ export const MessageResponse = memo(
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
 
     return (
-      <MarkdownErrorBoundary source={props.children}>
-        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
-            so remount on theme change to recolor already-rendered diagrams. */}
-        <Streamdown
-          key={themeMode}
-          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-          className={cn(
-            "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-            className,
-          )}
-          plugins={STREAMDOWN_PLUGINS}
-          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-          // instead of Streamdown's default "Open external link?" modal.
-          linkSafety={CHAT_LINK_SAFETY}
-          {...props}
-          components={messageComponents}
-          controls={messageControls}
-          mermaid={mermaidOptions}
-          // Block remote image fetches that can exfiltrate data through URLs.
-          rehypePlugins={
-            markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
-          }
-        />
-      </MarkdownErrorBoundary>
+      <CodeBlockSendContext.Provider value={sendCodeBlocks ? inheritedSend : null}>
+        <MarkdownErrorBoundary source={props.children}>
+          {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+              so remount on theme change to recolor already-rendered diagrams. */}
+          <Streamdown
+            key={themeMode}
+            // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+            className={cn(
+              "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+              className,
+            )}
+            plugins={STREAMDOWN_PLUGINS}
+            // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+            // instead of Streamdown's default "Open external link?" modal.
+            linkSafety={CHAT_LINK_SAFETY}
+            {...props}
+            components={messageComponents}
+            controls={messageControls}
+            mermaid={mermaidOptions}
+            // Block remote image fetches that can exfiltrate data through URLs.
+            rehypePlugins={
+              markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
+            }
+          />
+        </MarkdownErrorBoundary>
+      </CodeBlockSendContext.Provider>
     );
   },
 );
