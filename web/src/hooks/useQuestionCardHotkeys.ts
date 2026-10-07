@@ -3,10 +3,10 @@
 // Every mounted card root registers itself here. The focus chord picks the
 // card the user is looking at — focus inside it; else the nearest set to the
 // reference node (cards tied at the deepest common ancestor), narrowed by
-// last touched, then newest; with no reference node every card is a candidate
-// — and calls that card's enter(). leaveQuestionCard() returns focus to the
-// card's own composer textarea, or to wherever focus came from when the card
-// has none (the Inbox).
+// last touched, then newest; with no usable reference every card is a
+// candidate — and calls that card's enter(). leaveQuestionCard() returns
+// focus to the card's own composer textarea, or to wherever focus came from
+// when the card has none (the Inbox).
 
 import { useEffect, useRef, type RefObject } from "react";
 
@@ -96,9 +96,9 @@ function highest(
 /**
  * The pending card the focus chord should enter: the one containing focus;
  * else among the cards nearest the reference node (all tied at the deepest
- * common ancestor) the last touched, else the newest; with no reference node
- * every card is a candidate. A touched card in another pane is never a
- * candidate, so it cannot win over cards in the focused pane.
+ * common ancestor) the last touched, else the newest; with no usable
+ * reference every card is a candidate. A touched card in another pane is
+ * never a candidate, so it cannot win over cards in the focused pane.
  */
 export function targetQuestionCard(): { element: HTMLElement; enter: () => void } | null {
   if (cardEntries.length === 0) return null;
@@ -108,15 +108,16 @@ export function targetQuestionCard(): { element: HTMLElement; enter: () => void 
   );
   if (containing) return containing;
 
-  const reference =
-    active instanceof Node && active !== document.body
-      ? active
-      : lastPointerDownTarget instanceof Node
-        ? lastPointerDownTarget
-        : null;
-  const candidates = reference
-    ? nearestSet(cardEntries, (entry) => entry.element, reference)
-    : cardEntries;
+  // The clicked control can be gone by chord time; a disconnected node
+  // positions nothing, so it is not a reference.
+  const pointerReference =
+    lastPointerDownTarget instanceof Node && lastPointerDownTarget.isConnected
+      ? lastPointerDownTarget
+      : null;
+  const reference = active instanceof Node && active !== document.body ? active : pointerReference;
+  const near = reference ? nearestSet(cardEntries, (entry) => entry.element, reference) : [];
+  // A reference that shares no ancestor leaves no candidates; use every card.
+  const candidates = near.length > 0 ? near : cardEntries;
 
   const touched = highest(
     candidates.filter((entry) => entry.touchedSeq !== null),

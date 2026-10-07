@@ -219,6 +219,34 @@ describe("targetQuestionCard order", () => {
     expect(enterA).toHaveBeenCalledTimes(1);
   });
 
+  it("ignores a pointerdown target that was removed before the chord", () => {
+    // The clicked control can vanish (its row collapsed) while focus sits on
+    // <body>; the stale target must not hide the cards that are still mounted.
+    const enter = vi.fn();
+    const layout = (showControl: boolean) => (
+      <>
+        <Pane composer="composer">
+          <QuestionCard id="card-a" enter={enter} />
+        </Pane>
+        {showControl && (
+          <button type="button" data-testid="ephemeral">
+            open
+          </button>
+        )}
+        <Host />
+      </>
+    );
+    const view = render(layout(true));
+    fireEvent.pointerDown(screen.getByTestId("ephemeral"));
+
+    view.rerender(layout(false));
+    expect(document.activeElement).toBe(document.body);
+
+    pressFocusChord();
+
+    expect(enter).toHaveBeenCalledTimes(1);
+  });
+
   it("scopes to the pane whose composer has focus", () => {
     const enterMain = vi.fn();
     const enterSide = vi.fn();

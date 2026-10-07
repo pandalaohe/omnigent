@@ -215,6 +215,19 @@ describe("KeyboardShortcutsList question-card rows", () => {
     expect(keysFor("Select option")).toEqual(["X"]);
     expect(screen.queryByText("Leave card")).toBeNull();
   });
+
+  it("shows the rebound focus chord and drops the old labels", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Focus question card")).toEqual(["Ctrl", "⇧", "F"]);
+
+    act(() => {
+      writeShortcutPreference("focusQuestionCard", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(keysFor("Focus question card")).toEqual(["Ctrl", "⇧", "P"]);
+  });
 });
 
 describe("KeyboardShortcutsDialog", () => {

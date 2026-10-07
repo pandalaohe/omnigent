@@ -2,7 +2,7 @@
 // required field is answered, and Esc to leave. Everything else stays native:
 // Tab between fields, Space on a checkbox, Enter inside a text field.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
@@ -130,6 +130,20 @@ describe("ElicitationSchemaForm — keyboard", () => {
     fireEvent.click(screen.getByTestId("elicitation-schema-submit"), { detail: 0 });
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(screen.getByTestId("composer"));
+  });
+
+  it("returns focus to the composer for a focused Reject button", () => {
+    const { onReject } = renderForm();
+    enterCard();
+
+    const reject = screen.getByRole("button", { name: "Reject" });
+    act(() => {
+      reject.focus();
+      reject.click();
+    });
+
+    expect(onReject).toHaveBeenCalledTimes(1);
     expect(document.activeElement).toBe(screen.getByTestId("composer"));
   });
 

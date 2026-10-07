@@ -647,6 +647,22 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(document.activeElement).toBe(card());
   });
 
+  it("moves focus to the card root for a focused Prev button", () => {
+    renderKeyboardForm(questionsOf(TWO_QUESTIONS));
+    focusCard();
+    pressCard({ key: "ArrowRight", code: "ArrowRight" });
+    expect(progress()).toContain("Question 2 of 2");
+
+    const prev = screen.getByTestId("ask-user-question-prev");
+    act(() => {
+      prev.focus();
+      prev.click();
+    });
+
+    expect(progress()).toContain("Question 1 of 2");
+    expect(document.activeElement).toBe(card());
+  });
+
   it("returns focus to the composer for a keyboard-activated Submit", () => {
     const { onSubmit } = renderKeyboardForm(
       questionsOf([{ id: "q1", question: "Only?", options: [{ label: "A" }] }]),
@@ -667,6 +683,22 @@ describe("AskUserQuestionForm — keyboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }), { detail: 0 });
 
     expect(onReject).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(screen.getByTestId("composer"));
+  });
+
+  it("returns focus to the composer for a focused Cancel & interrupt", () => {
+    const onAbort = vi.fn();
+    const { onReject } = renderKeyboardForm(questionsOf(TWO_QUESTIONS), { onAbort });
+    focusCard();
+
+    const abort = screen.getByTestId("ask-user-question-abort");
+    act(() => {
+      abort.focus();
+      abort.click();
+    });
+
+    expect(onAbort).toHaveBeenCalledTimes(1);
+    expect(onReject).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(screen.getByTestId("composer"));
   });
 
