@@ -9,7 +9,7 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useReducer, useState } from "react";
 
 import {
   ALT_KEY,
@@ -21,6 +21,7 @@ import {
   Kbd,
   MOD_KEY,
   SHIFT_KEY,
+  shortcutKeys,
   VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
 import {
@@ -34,6 +35,10 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import {
+  KEYBOARD_SHORTCUTS_CHANGED_EVENT,
+  type ShortcutActionId,
+} from "@/lib/keyboardShortcutPreferences";
 import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -58,6 +63,8 @@ interface Shortcut {
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
   lastKeySeparator?: string;
+  /** When set, keys come from the live shortcut layer instead of `keys`. */
+  actionId?: ShortcutActionId;
 }
 
 interface ShortcutGroup {
@@ -76,7 +83,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
-      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
+      { label: "Open Settings", keys: [], actionId: "openSettings" },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -192,6 +199,16 @@ export function KeyboardShortcutsList({
 }: {
   variant?: "compact" | "settings";
 }) {
+  const [, refresh] = useReducer((version: number) => version + 1, 0);
+  useEffect(() => {
+    const onChanged = () => refresh();
+    window.addEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
+    window.addEventListener("storage", onChanged);
+    return () => {
+      window.removeEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
+      window.removeEventListener("storage", onChanged);
+    };
+  }, []);
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -221,30 +238,34 @@ export function KeyboardShortcutsList({
             ) : null}
           </h3>
           <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
-            {group.items.map((item) => (
-              <li
-                key={item.label}
-                className={
-                  settings
-                    ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
-                    : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
-                }
-              >
-                <span className="text-ui text-foreground">{item.label}</span>
-                <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key, index) => (
-                    <Fragment key={`${item.label}-${key}`}>
-                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
-                        <span aria-hidden="true" className="text-muted-foreground/70">
-                          {item.lastKeySeparator}
-                        </span>
-                      ) : null}
-                      <Kbd>{key}</Kbd>
-                    </Fragment>
-                  ))}
-                </span>
-              </li>
-            ))}
+            {group.items.map((item) => {
+              const keys = item.actionId ? shortcutKeys(item.actionId) : item.keys;
+              if (keys.length === 0) return null;
+              return (
+                <li
+                  key={item.label}
+                  className={
+                    settings
+                      ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
+                      : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+                  }
+                >
+                  <span className="text-ui text-foreground">{item.label}</span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {keys.map((key, index) => (
+                      <Fragment key={`${item.label}-${key}`}>
+                        {index === keys.length - 1 && item.lastKeySeparator ? (
+                          <span aria-hidden="true" className="text-muted-foreground/70">
+                            {item.lastKeySeparator}
+                          </span>
+                        ) : null}
+                        <Kbd>{key}</Kbd>
+                      </Fragment>
+                    ))}
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         </section>
       ))}

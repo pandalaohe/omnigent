@@ -1,6 +1,6 @@
 import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY, useShortcutHint } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
@@ -8,7 +8,6 @@ import { cn } from "@/lib/utils";
 
 const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
 const SEARCH_KEYS = [MOD_KEY, "K"] as const;
-const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
@@ -173,6 +172,7 @@ export function SidebarSettingsButton({
   /** Distinguishes the header-row copy from the mobile floating copy. */
   testId?: string;
 }) {
+  const settingsShortcut = useShortcutHint("openSettings");
   return (
     <Tooltip delayDuration={750}>
       <TooltipTrigger asChild>
@@ -181,7 +181,7 @@ export function SidebarSettingsButton({
           variant="ghost"
           size="icon-xs"
           aria-label="Settings"
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+,`}
+          aria-keyshortcuts={settingsShortcut.aria}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
@@ -189,7 +189,7 @@ export function SidebarSettingsButton({
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" shortcut={SETTINGS_KEYS}>
+      <TooltipContent side="bottom" shortcut={settingsShortcut.keys}>
         <span>Settings</span>
       </TooltipContent>
     </Tooltip>

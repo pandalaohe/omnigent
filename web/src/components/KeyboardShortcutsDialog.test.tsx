@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -7,6 +7,7 @@ import {
   openKeyboardShortcuts,
 } from "./KeyboardShortcutsDialog";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 // The pinned-session row shows in both shells; only its chord differs (Alt in
 // the browser). Default the mock to browser (false); flip per-test for native.
@@ -82,6 +83,30 @@ describe("KeyboardShortcutsList settings layout", () => {
     const list = heading.closest("section")?.querySelector("ul");
     expect(heading).toHaveClass("text-ui", "text-foreground");
     expect(list).toHaveClass("rounded-xl", "border-border", "bg-card");
+  });
+});
+
+describe("KeyboardShortcutsList shortcut layer rows", () => {
+  it("shows the rebound keys for the Open Settings row", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
+
+    act(() => {
+      writeShortcutPreference("openSettings", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "⇧", "P"]);
+  });
+
+  it("hides the Open Settings row when the action is disabled", () => {
+    render(<KeyboardShortcutsList />);
+    act(() => {
+      writeShortcutPreference("openSettings", { enabled: false });
+    });
+
+    expect(screen.queryByText("Open Settings")).toBeNull();
   });
 });
 

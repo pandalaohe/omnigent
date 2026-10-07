@@ -2,21 +2,34 @@ import { useEffect } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 /** True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. */
 export function isSettingsHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): boolean {
-  if (
-    !hasCommandModifier(event, isMac) ||
-    !event.altKey ||
-    event.shiftKey ||
-    event.getModifierState("AltGraph")
-  ) {
+  if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
     return false;
   }
-  return event.code === "Comma";
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("openSettings")) return false;
+  if (!hasCustomShortcutBindings("openSettings")) {
+    if (
+      !hasCommandModifier(event, isMac) ||
+      !event.altKey ||
+      event.shiftKey ||
+      event.getModifierState("AltGraph")
+    ) {
+      return false;
+    }
+    return event.code === "Comma";
+  }
+  return eventMatchesShortcutAction(event, "openSettings");
 }
 
 /** Navigate to Settings from anywhere in the app. */
