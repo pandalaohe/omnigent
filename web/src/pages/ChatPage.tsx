@@ -257,6 +257,7 @@ import {
 import { ArchivedCommentsBanner } from "@/components/ArchivedCommentsBanner";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
+import { CodeBlockSendContext } from "@/components/ai-elements/message";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -1785,6 +1786,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // out of streaming-frame re-renders.
 
   const composerRef = useRef<ComposerHandle>(null);
+  const sendCodeBlock = useCallback((text: string) => {
+    const sent = composerRef.current?.sendText(text) ?? false;
+    if (!sent) toast.error("This session can't take a message right now.");
+    return sent;
+  }, []);
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
   // in side chat" action to harnesses that support side chat.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
@@ -2019,23 +2025,25 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
-          <Transcript
-            setConversationEl={setConversationEl}
-            containerEl={containerEl}
-            scroller={scroller}
-            setScroller={setScroller}
-            sendScrollNonce={sendScrollNonce}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
-            isMobileViewport={isMobileViewport}
-            showsWorking={showsWorking}
-            agentsError={agentsError}
-            sandboxLaunching={sandboxLaunching}
-            conversationId={conversationId}
-            scrollToBottomOnSessionOpen={scrollToBottomOnSessionOpen}
-            openedConversationIdRef={autoScrolledConversationIdRef}
-            spacerMeasureRef={spacerMeasureRef}
-          />
+          <CodeBlockSendContext.Provider value={sendCodeBlock}>
+            <Transcript
+              setConversationEl={setConversationEl}
+              containerEl={containerEl}
+              scroller={scroller}
+              setScroller={setScroller}
+              sendScrollNonce={sendScrollNonce}
+              hasMoreHistory={hasMoreHistory}
+              loadingMoreHistory={loadingMoreHistory}
+              isMobileViewport={isMobileViewport}
+              showsWorking={showsWorking}
+              agentsError={agentsError}
+              sandboxLaunching={sandboxLaunching}
+              conversationId={conversationId}
+              scrollToBottomOnSessionOpen={scrollToBottomOnSessionOpen}
+              openedConversationIdRef={autoScrolledConversationIdRef}
+              spacerMeasureRef={spacerMeasureRef}
+            />
+          </CodeBlockSendContext.Provider>
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
             containerRef={conversationRef}
@@ -2150,6 +2158,7 @@ function ConversationLoadError({
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
   startSideChat: (selectedText: string) => void;
+  sendText: (text: string) => boolean;
 }
 
 interface ComposerProps {
@@ -3806,6 +3815,9 @@ function ComposerImpl(
   const recallingRef = useRef(false);
 
   const replyQuoteInsertedRef = useRef(false);
+  // Set when an empty composer is stuffed with a block awaiting the same-commit
+  // submit() the layout effect below runs.
+  const pendingSendTextRef = useRef(false);
   useImperativeHandle(ref, () => ({
     appendReplyQuote(text) {
       if (disabled || isReadOnly || unreachable || composerLockedByBtw || !text.trim()) return;
@@ -3834,6 +3846,33 @@ function ComposerImpl(
       resetCursor();
       recallingRef.current = false;
     },
+    sendText(text) {
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      if (
+        disabled ||
+        isReadOnly ||
+        unreachable ||
+        composerLockedByBtw ||
+        sendDisabledReason !== null ||
+        hasPendingElicitation
+      ) {
+        return false;
+      }
+      if (!hasDraft) {
+        // Route through the composer's own submit so slash commands, prompt
+        // history, telemetry, and clearing behave exactly like an Enter send.
+        replaceText(trimmed);
+        pendingSendTextRef.current = true;
+        return true;
+      }
+      // A draft in progress stays; the block goes out on its own through the
+      // plaintext path.
+      trackClick("chat.composer.send", "button");
+      appendEntry(trimmed);
+      onSend(trimmed);
+      return true;
+    },
   }));
 
   // Apply the caret after the updated draft has rendered and auto-grown.
@@ -3847,6 +3886,14 @@ function ComposerImpl(
     if (textarea.parentElement)
       textarea.parentElement.scrollTop = textarea.parentElement.scrollHeight;
     onGrowthRef.current?.();
+  });
+
+  // Submit a block stuffed into the empty composer in the same commit, before
+  // paint, so it goes through the normal send path (see sendText).
+  useLayoutEffect(() => {
+    if (!pendingSendTextRef.current) return;
+    pendingSendTextRef.current = false;
+    submit();
   });
 
   useLayoutEffect(() => {
