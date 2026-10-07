@@ -21,11 +21,14 @@ import pytest
 
 from omnigent.member_snapshot import (
     LIBRARY_AGENT_TEMPLATE_LABEL_KEY,
+    MEMBER_LABEL_VALUE_MAX_CHARS,
     MEMBER_LOCKED_FIELD,
     encode_member_entry,
     launched_from_library_agent,
+    member_entries_from_labels,
     member_label_key,
     member_lock_applies,
+    unlocked_legacy_member_labels,
 )
 
 _MEMBER_MODEL = "databricks-claude-haiku-4-5"
@@ -694,3 +697,75 @@ def test_member_lock_applies_only_to_a_true_locked_entry() -> None:
     assert member_lock_applies({MEMBER_LOCKED_FIELD: False}) is False
     assert member_lock_applies({}) is False
     assert member_lock_applies({MEMBER_LOCKED_FIELD: "true"}) is False
+
+
+_LEGACY_MEMBER_ENTRY: dict[str, Any] = {
+    "host": None,
+    "harness": "claude-sdk",
+    "model": _MEMBER_MODEL,
+    "effort": "medium",
+    "lead": False,
+}
+
+
+def test_unlocked_legacy_member_labels_freezes_a_pre_field_entry() -> None:
+    """A legacy entry gains ``locked: false`` without other field changes."""
+    labels = {member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY)}
+
+    rewritten = unlocked_legacy_member_labels(labels)
+
+    expected = {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}
+    assert rewritten == {member_label_key("worker"): encode_member_entry(expected)}
+    entries = member_entries_from_labels(
+        {**labels, **rewritten, LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved"}
+    )
+    assert entries == {"worker": expected}
+
+
+def test_unlocked_legacy_member_labels_skips_a_library_agent_session() -> None:
+    """A ``ca_`` launch already resolves members to locked; nothing to freeze."""
+    labels = {
+        member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY),
+        LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved",
+    }
+
+    assert unlocked_legacy_member_labels(labels) == {}
+
+
+def test_unlocked_legacy_member_labels_keeps_explicit_lock_values() -> None:
+    """Entries already carrying ``locked`` are left untouched, either value."""
+    labels = {
+        member_label_key("lead"): encode_member_entry(
+            {**_LEGACY_MEMBER_ENTRY, "lead": True, MEMBER_LOCKED_FIELD: True}
+        ),
+        member_label_key("worker"): encode_member_entry(
+            {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}
+        ),
+    }
+
+    assert unlocked_legacy_member_labels(labels) == {}
+
+
+def test_unlocked_legacy_member_labels_ignores_malformed_and_non_member_labels() -> None:
+    """Non-member keys and values that are not a JSON object yield nothing."""
+    labels = {
+        "unrelated": "1",
+        LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin",
+        member_label_key("lead"): "[]",
+        member_label_key("worker"): "{not json",
+    }
+
+    assert unlocked_legacy_member_labels(labels) == {}
+
+
+def test_unlocked_legacy_member_labels_drops_an_over_cap_rewrite() -> None:
+    """A rewrite that would overflow the 256-char label is left out."""
+    entry = {**_LEGACY_MEMBER_ENTRY, "model": "m" * 165}
+    value = encode_member_entry(entry)
+    assert len(value) <= MEMBER_LABEL_VALUE_MAX_CHARS
+    assert (
+        len(encode_member_entry({**entry, MEMBER_LOCKED_FIELD: False}))
+        > MEMBER_LABEL_VALUE_MAX_CHARS
+    )
+
+    assert unlocked_legacy_member_labels({member_label_key("worker"): value}) == {}

@@ -88,6 +88,29 @@ def member_lock_applies(entry: Mapping[str, Any]) -> bool:
     return entry.get(MEMBER_LOCKED_FIELD) is True
 
 
+def unlocked_legacy_member_labels(labels: Mapping[str, str] | None) -> dict[str, str]:
+    """Return member labels rewritten with ``locked: false`` for legacy entries.
+
+    A session not launched from a library agent keeps unlocked members after a
+    later template-label write (Save as Agent): every entry written before the
+    ``locked`` field existed gets it fixed to false. A value that would exceed
+    the label column is left out.
+    """
+    if launched_from_library_agent(labels):
+        return {}
+    rewritten: dict[str, str] = {}
+    for key, value in (labels or {}).items():
+        if not key.startswith(MEMBER_LABEL_PREFIX):
+            continue
+        entry = parse_member_entry(value)
+        if entry is None or MEMBER_LOCKED_FIELD in entry:
+            continue
+        encoded = encode_member_entry({**entry, MEMBER_LOCKED_FIELD: False})
+        if len(encoded) <= MEMBER_LABEL_VALUE_MAX_CHARS:
+            rewritten[key] = encoded
+    return rewritten
+
+
 # The web composer's attachment preamble. Its text can carry ``@`` inside a
 # file path (``[Attached: /tmp/@executor.txt]``), so mentions are matched
 # against the text with every attachment span removed.

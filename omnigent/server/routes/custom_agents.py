@@ -24,6 +24,7 @@ from starlette.formparsers import MultiPartException
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.member_snapshot import unlocked_legacy_member_labels
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
@@ -336,6 +337,7 @@ def create_custom_agents_router(
     async def create_custom_agent(request: Request) -> dict[str, Any]:
         owner_id = owner(request)
         source_session_id: str | None = None
+        pre_save_labels: dict[str, str] = {}
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media_type == "multipart/form-data":
             form = await multipart_form(request)
@@ -369,6 +371,7 @@ def create_custom_agents_router(
                 conv = await asyncio.to_thread(
                     conversation_store.get_conversation, body.source_session_id
                 )
+                pre_save_labels = conv.labels if conv is not None else {}
                 agent = (
                     await asyncio.to_thread(agent_store.get, conv.agent_id)
                     if conv and conv.agent_id
@@ -396,7 +399,10 @@ def create_custom_agents_router(
                 await asyncio.to_thread(
                     conversation_store.set_labels,
                     source_session_id,
-                    {"omnigent:agent-template-id": created["id"]},
+                    {
+                        **unlocked_legacy_member_labels(pre_save_labels),
+                        "omnigent:agent-template-id": created["id"],
+                    },
                 )
             except Exception:
                 await asyncio.to_thread(store.delete, owner_id, created["id"])
