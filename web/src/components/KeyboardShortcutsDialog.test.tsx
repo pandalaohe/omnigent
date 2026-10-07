@@ -165,6 +165,22 @@ describe("KeyboardShortcutsList shortcut layer rows", () => {
     expect(keysFor("Navigate suggestions")).toEqual(["Ctrl", "⇧", "P", "↓"]);
     expect(keysFor("Dismiss menu")).toEqual(["Ctrl", "X"]);
   });
+
+  it.each([
+    ["focusComposer", "Focus chat input", "KeyL", ["Ctrl", "⇧", "L"]],
+    ["openModelPicker", "Open model picker", "KeyM", ["Ctrl", "⇧", "M"]],
+    ["findSession", "Find a session by name", "KeyS", ["Ctrl", "⇧", "S"]],
+  ] as const)("shows the rebound keys for the %s row", (actionId, label, code, expected) => {
+    render(<KeyboardShortcutsList />);
+
+    act(() => {
+      writeShortcutPreference(actionId, {
+        common: [{ code, modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(keysFor(label)).toEqual(expected);
+  });
 });
 
 describe("KeyboardShortcutsDialog", () => {

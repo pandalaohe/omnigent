@@ -25,6 +25,13 @@ function press(init: KeyboardEventInit): KeyboardEvent {
 }
 
 describe("useWorkspaceTabHotkeys", () => {
+  const tabChords = [
+    { actionId: "selectWorkspaceTab1", tabNumber: 1, key: "j", code: "KeyJ" },
+    { actionId: "selectWorkspaceTab2", tabNumber: 2, key: "k", code: "KeyK" },
+    { actionId: "selectWorkspaceTab3", tabNumber: 3, key: "l", code: "KeyL" },
+    { actionId: "selectWorkspaceTab4", tabNumber: 4, key: "m", code: "KeyM" },
+  ] as const;
+
   it("fires the bound chord with its tab number and claims the event", () => {
     const onSelect = vi.fn();
     renderHook(() => useWorkspaceTabHotkeys(onSelect, true));
@@ -37,6 +44,28 @@ describe("useWorkspaceTabHotkeys", () => {
     expect(onSelect).toHaveBeenCalledWith(2);
     expect(event.defaultPrevented).toBe(true);
   });
+
+  it.each(tabChords)(
+    "fires selectWorkspaceTab$tabNumber only from its own chord",
+    ({ tabNumber, key, code }) => {
+      const onSelect = vi.fn();
+      renderHook(() => useWorkspaceTabHotkeys(onSelect, true));
+      for (const binding of tabChords) {
+        writeShortcutPreference(binding.actionId, {
+          common: [{ code: binding.code, modifiers: ["primary", "shift"] }],
+        });
+      }
+
+      press({ key, code, ctrlKey: true, shiftKey: true });
+      expect(onSelect).toHaveBeenCalledWith(tabNumber);
+
+      onSelect.mockClear();
+      const other = tabChords[tabNumber % tabChords.length];
+      press({ key: other.key, code: other.code, ctrlKey: true, shiftKey: true });
+      expect(onSelect).toHaveBeenCalledWith(other.tabNumber);
+      expect(onSelect).not.toHaveBeenCalledWith(tabNumber);
+    },
+  );
 
   it("ignores the unbound defaults", () => {
     const onSelect = vi.fn();

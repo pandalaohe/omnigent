@@ -378,6 +378,21 @@ describe("WorkspacePanel surface presentation", () => {
     );
     expect(tip.textContent?.match(/\+/g)).toBeNull();
   });
+
+  it("follows a rebound workspace-sidebar chord in an unbound tab's fallback tooltip", async () => {
+    writeShortcutPreference("toggleWorkspaceSidebar", {
+      common: [{ code: "KeyG", modifiers: ["primary", "shift"] }],
+    });
+    renderWorkspace();
+
+    const tab = screen.getByRole("tab", { name: "Files" });
+    fireEvent.pointerMove(tab.parentElement!, { pointerType: "mouse" });
+    const tip = await screen.findByRole("tooltip");
+    expect(Array.from(tip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent)).toEqual(
+      ["Ctrl", "⇧", "G", "1"],
+    );
+    expect(tip.textContent?.match(/\+/g)).toHaveLength(1);
+  });
 });
 
 describe("WorkspacePanel select-tab hotkeys", () => {

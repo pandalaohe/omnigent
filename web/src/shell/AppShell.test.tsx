@@ -3788,10 +3788,13 @@ describe("Workspace select-tab action routing", () => {
     })) as typeof window.matchMedia;
     try {
       setupRail();
+      writeWorkspacePanelDefault("collapsed");
       renderShell("/c/conv_abc");
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
       act(() => dispatchSelectWorkspaceTab(4));
 
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
       expect(screen.getByRole("tab", { name: /^Agents/ })).toHaveAttribute("aria-selected", "true");
       expect(screen.getByTestId("subagents-panel")).toBeInTheDocument();
     } finally {
