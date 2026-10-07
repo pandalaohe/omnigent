@@ -67,7 +67,11 @@ from omnigent.harnesses.pi_native.bridge import (
 from omnigent.harnesses.qwen_native.bridge import (
     bridge_dir_for_session_id as qwen_bridge_dir,
 )
-from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
+from omnigent.inner.native_attachments import (
+    attachment_cache_dir,
+    materialize_attachment,
+    session_attachment_dir,
+)
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import _runner_client
@@ -131,6 +135,57 @@ async def test_delete_session_removes_native_bridge_dir(
 
     assert not bridge_dir.exists(), "bridge dir (with token) must be deleted"
     assert not cached.exists()
+
+
+async def test_delete_session_removes_session_attachment_dir(
+    client: httpx.AsyncClient,
+) -> None:
+    """Design scenario 8: the by-path host copies go with the session."""
+    session_id = f"conv_{uuid.uuid4().hex}"
+    attachment_dir = session_attachment_dir(session_id)
+    target = attachment_dir / "file_1" / "clip.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"hello")
+
+    resp = await client.delete(f"/v1/sessions/{session_id}")
+    assert resp.status_code == 200
+
+    assert not attachment_dir.exists(), "session attachment dir must be deleted"
+
+
+async def test_cleanup_resources_without_cached_history_leaves_no_restore_flag(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+) -> None:
+    """A session with no cached history has no ``[Attached:]`` lines to restore."""
+    from omnigent.runner.app import _session_histories_ref
+
+    session_id = f"conv_{uuid.uuid4().hex}"
+    assert session_id not in _session_histories_ref
+
+    resp = await client.delete(f"/v1/sessions/{session_id}/resources")
+
+    assert resp.status_code == 200
+    assert session_id not in app.state.attachment_restore_pending
+
+
+async def test_cleanup_resources_with_cached_history_sets_the_restore_flag(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+) -> None:
+    """Cleanup keeps the restore flag for a session whose cached history survives."""
+    from omnigent.runner.app import _session_histories_ref
+
+    session_id = f"conv_{uuid.uuid4().hex}"
+    _session_histories_ref[session_id] = []
+    try:
+        resp = await client.delete(f"/v1/sessions/{session_id}/resources")
+
+        assert resp.status_code == 200
+        assert session_id in app.state.attachment_restore_pending
+    finally:
+        _session_histories_ref.pop(session_id, None)
+        app.state.attachment_restore_pending.discard(session_id)
 
 
 @pytest.mark.parametrize("family", sorted(BRIDGE_DIR_RESOLVERS))

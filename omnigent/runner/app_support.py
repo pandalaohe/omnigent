@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias, overload
 
@@ -13,12 +13,8 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner.native_attachments import (
-    fetch_file_meta,
-    framework_notice_block,
     has_unresolved_file_id,
-    is_by_path,
-    materialize_file_reference,
-    resolve_file_id_block,
+    resolve_file_reference,
 )
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
@@ -176,40 +172,15 @@ async def _resolve_forwarded_message_content(
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
-        result = None
+        replacement = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            file_id = str(block["file_id"])
-            meta = await fetch_file_meta(file_id, session_id=session_id, client=server_client)
-            if meta is None:
-                resolved.append(block)
-                continue
-            resource_metadata = meta.get("metadata")
-            source_metadata = (
-                resource_metadata.get("source_metadata")
-                if isinstance(resource_metadata, Mapping)
-                else None
+            replacement = await resolve_file_reference(
+                block, session_id=session_id, client=server_client
             )
-            name = meta.get("name")
-            if is_by_path(name if isinstance(name, str) else None, source_metadata):
-                path = await materialize_file_reference(
-                    file_id, meta, session_id=session_id, client=server_client
-                )
-                if path is None:
-                    resolved.append(block)
-                else:
-                    resolved.append({"type": "input_text", "text": f"[Attached: {path}]"})
-                    changed = True
-                continue
-            result = await resolve_file_id_block(
-                block, session_id=session_id, client=server_client, meta=meta
-            )
-        if result is None:
+        if replacement is None:
             resolved.append(block)
         else:
-            new_block, notice = result
-            resolved.append(new_block)
-            if notice is not None:
-                resolved.append(framework_notice_block(notice))
+            resolved.extend(replacement)
             changed = True
 
     return resolved if changed else content

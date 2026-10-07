@@ -1981,6 +1981,8 @@ async def _ensure_local_codex_resume_rollout(
             f"{external_session_id!r} is not a safe Codex rollout id."
         )
     await _replay_dead_letters_before_resume(client, codex_home.parent)
+    from omnigent.inner.native_attachments import restore_session_attachments
+
     try:
         items = await _fetch_all_session_items_for_codex_resume(client, session_id)
     except _CodexResumeHistoryUnavailableError:
@@ -1994,6 +1996,7 @@ async def _ensure_local_codex_resume_rollout(
                 session_id,
                 existing,
             )
+            await restore_session_attachments(session_id, client)
             return existing
         raise
     from omnigent.inner.native_attachments import resolve_session_item_file_references
@@ -2051,6 +2054,7 @@ async def _ensure_local_codex_resume_rollout(
         len(items),
         target,
     )
+    await restore_session_attachments(session_id, client)
     return target
 
 

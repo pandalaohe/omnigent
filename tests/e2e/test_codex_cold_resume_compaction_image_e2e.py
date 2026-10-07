@@ -270,6 +270,8 @@ async def _write_cold_resume_rollout(
     """Run the production cold-resume rollout refresh against stored items."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{_SESSION_ID}/resources/files":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         assert request.url.path == f"/v1/sessions/{_SESSION_ID}/items", request.url
         return httpx.Response(200, json={"data": items, "has_more": False})
 

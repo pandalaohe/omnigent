@@ -34,7 +34,7 @@ from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.harnesses.claude_native import forwarder as claude_native_forwarder
 from omnigent.harnesses.claude_native import main as claude_native
-from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.inner.native_attachments import attachment_cache_dir, session_attachment_dir
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
@@ -3561,7 +3561,11 @@ async def test_resume_restores_attachments_using_the_launch_bridge(
     monkeypatch: pytest.MonkeyPatch,
     resume_path: str,
 ) -> None:
-    """A cold transcript rebuild downloads ZIP files into the attachment cache."""
+    """A cold transcript rebuild materializes by-path ZIP files on the host.
+
+    By-path rows land under the session attachment dir (they no longer use
+    the bridge's own cache), and the transcript references that path.
+    """
     from omnigent.harnesses.claude_native import bridge as claude_native_bridge
     from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
 
@@ -3596,6 +3600,8 @@ async def test_resume_restores_attachments_using_the_launch_bridge(
                     },
                 },
             )
+        if path == "/v1/sessions/conv_abc/resources/files":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if path.endswith("/resources/files/file_zip/content"):
             return httpx.Response(200, content=zip_bytes)
         if path.endswith("/resources/files/file_zip"):
@@ -3629,7 +3635,7 @@ async def test_resume_restores_attachments_using_the_launch_bridge(
         )
 
     transport = httpx.MockTransport(handler)
-    expected = attachment_cache_dir(bridge_dir) / "bundle.zip"
+    expected = session_attachment_dir("conv_abc") / "file_zip" / "bundle.zip"
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         for attempt in range(2):
             if resume_path == "cli":
@@ -3658,7 +3664,7 @@ async def test_resume_restores_attachments_using_the_launch_bridge(
                 written.unlink()
 
     assert not (bridge_dir / _CONFIG_FILE).exists()
-    expected = attachment_cache_dir(bridge_dir) / "bundle.zip"
+    expected = session_attachment_dir("conv_abc") / "file_zip" / "bundle.zip"
     assert expected.read_bytes() == zip_bytes
     assert written is not None
     assert f"[Attached: {expected}]" in written.read_text(encoding="utf-8")
@@ -5714,6 +5720,8 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
                     external_session_id="claude-uuid-abc",
                 ),
             )
+        if request.url.path == "/v1/sessions/conv_abc/resources/files":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.url.path == "/v1/sessions/conv_abc/items":
             after = request.url.params.get("after")
             if after is None:
@@ -5785,12 +5793,81 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
 
 
 @pytest.mark.asyncio
+async def test_cold_resume_transcript_rewrites_compacted_other_host_attached_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A compacted [Attached:] line from another host lands on this host's path."""
+    from omnigent.inner.native_attachments import session_attachment_dir
+
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.chdir(workspace)
+    other_key = "a" * 32
+    other_line = f"[Attached: /home/other/.omnigent/attachments/s-{other_key}/file_mp4/a.mp4]"
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "summary",
+            "snapshot_source": "transcript",
+            "token_count": 10,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"{other_line} inspect"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                },
+            ],
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after"}],
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        assert request.url.path == "/v1/sessions/conv_compact/items"
+        return httpx.Response(200, json=_items_response_body(items))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resolution = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_compact",
+            external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+            workspace=workspace,
+        )
+
+    assert resolution.synthesized is True
+    assert resolution.path is not None
+    transcript = resolution.path.read_text(encoding="utf-8")
+    expected = session_attachment_dir("conv_compact") / "file_mp4" / "a.mp4"
+    assert f"[Attached: {expected}] inspect" in transcript
+    assert other_key not in transcript
+
+
+@pytest.mark.asyncio
 async def test_resolve_cold_resume_args_reuses_existing_local_claude_transcript(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
     A resumable local transcript wins byte-for-byte without an items fetch.
+
+    The attachment-restore listing still runs (a missing host copy must come
+    back before the CLI starts), but the transcript itself is never rebuilt.
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -5842,6 +5919,8 @@ async def test_resolve_cold_resume_args_reuses_existing_local_claude_transcript(
                     external_session_id="claude-uuid-abc",
                 ),
             )
+        if request.url.path == "/v1/sessions/conv_abc/resources/files":
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if request.url.path == "/v1/sessions/conv_abc/items":
             item_requests += 1
             return httpx.Response(200, json=_items_response_body([item_from_ap]))
@@ -5940,7 +6019,7 @@ def test_resumable_transcript_rejects_complete_earlier_corruption(
 
 
 @pytest.mark.asyncio
-async def test_resume_searches_current_workspace_before_prior_without_server_fetch(
+async def test_resume_searches_current_workspace_before_prior_without_history_fetch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -5960,11 +6039,13 @@ async def test_resume_searches_current_workspace_before_prior_without_server_fet
     prior_raw += b'{"type":"assistant"'
     prior_path.write_bytes(prior_raw)
 
-    def no_fetch(request: httpx.Request) -> httpx.Response:
-        raise AssertionError(f"server context fetch was unexpected: {request.url}")
+    def no_history_fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        raise AssertionError(f"server history fetch was unexpected: {request.url}")
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(no_fetch), base_url="http://test"
+        transport=httpx.MockTransport(no_history_fetch), base_url="http://test"
     ) as client:
         resolved = await claude_native._ensure_local_claude_resume_transcript(
             client,
@@ -5978,7 +6059,7 @@ async def test_resume_searches_current_workspace_before_prior_without_server_fet
 
     current_path.unlink()
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(no_fetch), base_url="http://test"
+        transport=httpx.MockTransport(no_history_fetch), base_url="http://test"
     ) as client:
         resolved = await claude_native._ensure_local_claude_resume_transcript(
             client,
@@ -6020,11 +6101,13 @@ async def test_invalid_current_transcript_cannot_shadow_valid_prior(
         text="prior survives",
     )
 
-    def no_fetch(request: httpx.Request) -> httpx.Response:
-        raise AssertionError(f"server context fetch was unexpected: {request.url}")
+    def no_history_fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        raise AssertionError(f"server history fetch was unexpected: {request.url}")
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(no_fetch), base_url="http://test"
+        transport=httpx.MockTransport(no_history_fetch), base_url="http://test"
     ) as client:
         resolved = await claude_native._ensure_local_claude_resume_transcript(
             client,
@@ -6040,6 +6123,71 @@ async def test_invalid_current_transcript_cannot_shadow_valid_prior(
     backups = list(current_path.parent.glob("sid.jsonl.omnigent-backup-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == corrupt
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_restores_host_copy_on_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A valid local transcript can still be missing its by-path host copies.
+
+    Design scenario 6: the transcript survives a CLI release and is reused
+    byte-for-byte, but the session attachment dir was cleaned up. The resume
+    must restore the file before returning, or the CLI starts with a dead
+    path in its transcript.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    external_session_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    transcript_path = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace))
+        / f"{external_session_id}.jsonl"
+    )
+    _write_resumable_local_transcript(
+        transcript_path, sid=external_session_id, cwd=workspace, text="hello"
+    )
+    host_copy = session_attachment_dir("conv_restore") / "file_restore" / "clip.mp4"
+    assert not host_copy.exists()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_restore/resources/files":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "file_restore",
+                            "name": "clip.mp4",
+                            "metadata": {
+                                "bytes": 5,
+                                "source_metadata": {"delivery": "filesystem"},
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.url.path.endswith("/resources/files/file_restore/content"):
+            return httpx.Response(200, content=b"hello")
+        raise AssertionError(f"unexpected request {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resolution = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_restore",
+            external_session_id=external_session_id,
+            workspace=workspace,
+        )
+
+    assert resolution.path == transcript_path
+    assert resolution.reused_local is True
+    assert host_copy.read_bytes() == b"hello"
 
 
 @pytest.mark.asyncio
@@ -6223,6 +6371,8 @@ async def test_ensure_local_claude_resume_transcript_preserves_valid_local_image
     assert transcript_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         raise AssertionError(f"local-first resume must not fetch history: {request.url}")
 
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)

@@ -2153,11 +2153,32 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
+    # Sessions whose by-path attachment dir was removed by a cleanup that left
+    # the cached history alive. The next turn re-materializes the files before
+    # the harness reads those ``[Attached: ...]`` lines; a fresh history load
+    # resolves per block, so there the flag is simply discarded.
+    _attachment_restore_pending: set[str] = set()
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
+    app.state.attachment_restore_pending = _attachment_restore_pending
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
     _session_background_task_counts: dict[str, int] = {}
+
+    async def _restore_pending_session_attachments(session_id: str) -> None:
+        """Re-materialize by-path files a cleanup removed while history survived.
+
+        CLI release and resource cleanup delete the session attachment dir but
+        keep ``_session_histories``; the cached ``[Attached: ...]`` lines then
+        point at deleted files, so the next turn restores them before the
+        harness reads the history. Calls are idempotent and non-fatal.
+        """
+        if session_id not in _attachment_restore_pending:
+            return
+        from omnigent.inner.native_attachments import restore_session_attachments
+
+        if await restore_session_attachments(session_id, server_client):
+            _attachment_restore_pending.discard(session_id)
 
     def _session_has_cli_retention_protection(session_id: str) -> bool:
         if session_id in _active_turns:
@@ -4429,6 +4450,7 @@ def create_runner_app(
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
+        _attachment_restore_pending.discard(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -6812,6 +6834,9 @@ def create_runner_app(
             _session_histories[conv] = (
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
+            _attachment_restore_pending.discard(conv)
+        else:
+            await _restore_pending_session_attachments(conv)
         _raw_per_request_instructions = cast(str | None, msg_body.get("instructions"))
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
@@ -7665,6 +7690,7 @@ def create_runner_app(
                                             _m for _m in _buf if _m.get("injection_id") != _inj_id
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
+                                        await _restore_pending_session_attachments(conv_id)
                                         for _m in _consumed:
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
@@ -8337,8 +8363,10 @@ def create_runner_app(
                     "content": message_body.get("content", []),
                 }
                 if conversation_id in _session_histories:
+                    await _restore_pending_session_attachments(conversation_id)
                     _session_histories[conversation_id].append(new_item)
                 else:
+                    _attachment_restore_pending.discard(conversation_id)
                     persisted_item_id = message_body.get("persisted_item_id")
                     loaded = await _load_history_as_input(
                         conversation_id,
@@ -9551,6 +9579,8 @@ def create_runner_app(
             server_client=server_client,
             session_id=session_id,
         )
+        if session_id in _session_histories:
+            _attachment_restore_pending.add(session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -9699,7 +9729,7 @@ def create_runner_app(
                         break
                 if not all_new:
                     continue
-                new_items = _convert_raw_items_to_input(all_new)
+                new_items = await _load_history_as_input(session_id, items=all_new)
                 _session_histories.setdefault(session_id, []).extend(
                     new_items,
                 )
@@ -9860,6 +9890,8 @@ def create_runner_app(
             server_client=server_client,
             session_id=session_id,
         )
+        if session_id in _session_histories:
+            _attachment_restore_pending.add(session_id)
         from omnigent.runner.subagent_routing import shutdown_session_router
         from omnigent.runner.tool_dispatch import forget_spawn_family
 

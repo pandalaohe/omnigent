@@ -9438,7 +9438,7 @@ async def _delete_native_bridge_dirs(
     from omnigent.harnesses.qwen_native.bridge import (
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
-    from omnigent.inner.native_attachments import attachment_cache_dir
+    from omnigent.inner.native_attachments import attachment_cache_dir, session_attachment_dir
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -9466,6 +9466,9 @@ async def _delete_native_bridge_dirs(
     }
     # A cache can survive a missing bridge directory, including after a reboot.
     targets.update(attachment_cache_dir(target) for target in tuple(targets))
+    # By-path attachments live under a session-keyed dir shared by all
+    # harnesses, independent of any bridge directory.
+    targets.add(session_attachment_dir(session_id))
     for target in targets:
         try:
             shutil.rmtree(target, ignore_errors=False)

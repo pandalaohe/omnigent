@@ -13,7 +13,7 @@ import pytest
 
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native import main as codex_native
-from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.inner.native_attachments import session_attachment_dir
 from tests.harnesses.codex_native.session._support import (
     _write_source_rollout,
 )
@@ -260,6 +260,8 @@ async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
     server_items: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         request_order.append(request.method)
         if request.method == "POST":
             body = json.loads(request.content)
@@ -302,7 +304,11 @@ async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
 async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_workspace(
     tmp_path: Path,
 ) -> None:
-    """A cold rollout rebuild downloads ZIP files without changing the checkout."""
+    """A cold rollout rebuild materializes by-path ZIP files on the host.
+
+    By-path rows land under the session attachment dir (they no longer use
+    the bridge's own cache), and the rebuilt rollout references that path.
+    """
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -311,6 +317,8 @@ async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_work
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         if path.endswith("/resources/files/file_zip/content"):
             return httpx.Response(200, content=zip_bytes)
         if path.endswith("/resources/files/file_zip"):
@@ -331,7 +339,7 @@ async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_work
         return httpx.Response(200, json={"data": [item], "has_more": False})
 
     transport = httpx.MockTransport(handler)
-    expected = attachment_cache_dir(codex_home.parent) / "bundle.zip"
+    expected = session_attachment_dir("conv_codex") / "file_zip" / "bundle.zip"
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         for attempt in range(2):
             rollout = await codex_native._ensure_local_codex_resume_rollout(
@@ -355,6 +363,56 @@ async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_work
         {"type": "input_text", "text": f"[Attached: {expected}]"},
         {"type": "input_text", "text": "unpack this"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_rewrites_compacted_other_host_path(
+    tmp_path: Path,
+) -> None:
+    """A compacted [Attached:] line from another host lands on this host's path."""
+    codex_home = tmp_path / "codex-home"
+    workspace = (tmp_path / "workspace").resolve()
+    other_key = "a" * 32
+    other_line = f"[Attached: /home/other/.omnigent/attachments/s-{other_key}/file_mp4/a.mp4]"
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"{other_line} inspect"}],
+                }
+            ],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        assert request.url.path == "/v1/sessions/conv_compact/items"
+        return httpx.Response(200, json={"data": items, "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_compact",
+            external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+            codex_home=codex_home,
+            workspace=workspace,
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    assert rollout is not None
+    rollout_text = rollout.read_text(encoding="utf-8")
+    expected = session_attachment_dir("conv_compact") / "file_mp4" / "a.mp4"
+    assert f"[Attached: {expected}] inspect" in rollout_text
+    assert other_key not in rollout_text
 
 
 @pytest.mark.asyncio
@@ -434,6 +492,8 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
         :returns: Mock Omnigent response.
         """
         requested_urls.append(str(request.url))
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         assert request.url.path == "/v1/sessions/conv_codex/items"
         after = request.url.params.get("after")
         if after is None:
@@ -570,6 +630,8 @@ async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
         """
         nonlocal requested
         requested = True
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         assert request.url.path == "/v1/sessions/conv_codex/items"
         return httpx.Response(
             200,
@@ -624,6 +686,8 @@ async def test_ensure_local_codex_resume_rollout_empty_server_history_wins(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         assert request.url.path == "/v1/sessions/conv_codex/items"
         return httpx.Response(200, json={"data": [], "has_more": False})
 
@@ -663,6 +727,8 @@ async def test_ensure_local_codex_resume_rollout_uses_unique_atomic_temp_files(
     monkeypatch.setattr(codex_native.os, "replace", recording_replace)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
         assert request.url.path == "/v1/sessions/conv_codex/items"
         return httpx.Response(
             200,
@@ -733,6 +799,64 @@ async def test_ensure_local_codex_resume_rollout_falls_back_when_server_unavaila
 
     assert rollout == existing
     assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_restores_host_copy_on_reuse(
+    tmp_path: Path,
+) -> None:
+    """A valid local rollout still gets its by-path host copies restored.
+
+    Design scenario 6 for the Codex fallback branch: server history is
+    temporarily unavailable and the local rollout is reused, but the session
+    attachment dir was cleaned up; the file must exist again before return.
+    """
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    existing = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/local/fallback",
+    )
+    host_copy = session_attachment_dir("conv_codex") / "file_restore" / "clip.mp4"
+    assert not host_copy.exists()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_codex/resources/files":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "file_restore",
+                            "name": "clip.mp4",
+                            "metadata": {
+                                "bytes": 5,
+                                "source_metadata": {"delivery": "filesystem"},
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if request.url.path.endswith("/resources/files/file_restore/content"):
+            return httpx.Response(200, content=b"hello")
+        return httpx.Response(503, json={"error": {"code": "unavailable"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=(tmp_path / "workspace").resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    assert rollout == existing
+    assert host_copy.read_bytes() == b"hello"
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ import pytest
 
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     _is_safe_path_component,
@@ -33,6 +34,11 @@ from omnigent.inner.native_attachments import (
     requires_filesystem,
     resize_notice,
     resolve_file_id_block,
+    resolve_file_reference,
+    resolve_session_item_file_references,
+    restore_session_attachments,
+    rewrite_attached_paths,
+    session_attachment_dir,
     unresolved_attachment_marker,
 )
 
@@ -865,6 +871,395 @@ async def test_materialize_file_reference_refuses_unsafe_names(
         )
 
     assert path is None
+
+
+# ── one per-block resolver ───────────────────────────────────────────
+
+
+def _by_path_meta(name: str, *, stored_bytes: int = 5) -> dict[str, Any]:
+    """A stored by-path row as the file metadata endpoint returns it."""
+    return {
+        "id": "file_1",
+        "name": name,
+        "content_type": "video/mp4",
+        "metadata": {
+            "bytes": stored_bytes,
+            "source_metadata": {"delivery": "filesystem"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolve_file_reference_by_path_reuses_without_content_get(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A by-path row with a complete host copy becomes one [Attached:] block."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    target_dir = _session_dir(tmp_path, "file_1")
+    target_dir.mkdir(parents=True)
+    target = target_dir / "clip.mp4"
+    target.write_bytes(b"hello")
+    content_gets = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal content_gets
+        if request.url.path.endswith("/content"):
+            content_gets += 1
+            return httpx.Response(200, content=b"hello")
+        return httpx.Response(200, json=_by_path_meta("clip.mp4"))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        blocks = await resolve_file_reference(
+            {"type": "input_file", "file_id": "file_1", "filename": "clip.mp4"},
+            session_id="conv_1",
+            client=client,
+        )
+
+    assert blocks == [{"type": "input_text", "text": f"[Attached: {target}]"}]
+    assert content_gets == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_file_reference_inline_matches_resolve_file_id_block() -> None:
+    """An inline row resolves exactly as resolve_file_id_block, plus its notice."""
+    payload = {
+        "id": "file_img",
+        "filename": "shot.webp",
+        "content_type": "image/webp",
+        "metadata": {"source_metadata": {"width": 6000, "height": 4000}},
+    }
+    block = {"type": "input_image", "file_id": "file_img"}
+    client = _FakeFileClient(payload, body=b"webp-bytes")
+
+    replacement = await resolve_file_reference(
+        block,
+        session_id="conv_1",
+        client=client,  # type: ignore[arg-type]
+    )
+    expected = await resolve_file_id_block(
+        block,
+        session_id="conv_1",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert expected is not None
+    new_block, notice = expected
+    assert replacement == [
+        new_block,
+        {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "source_metadata": notice},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_file_reference_returns_none_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed metadata or by-path content fetch keeps the original block."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    block = {"type": "input_file", "file_id": "file_1"}
+
+    def metadata_404(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(metadata_404), base_url="http://test"
+    ) as client:
+        assert await resolve_file_reference(block, session_id="conv_1", client=client) is None
+
+    def content_404(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(404)
+        return httpx.Response(200, json=_by_path_meta("clip.mp4"))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(content_404), base_url="http://test"
+    ) as client:
+        assert await resolve_file_reference(block, session_id="conv_1", client=client) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_item_file_references_by_path_emits_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A by-path .mp4 row rebuilds as a path line, never base64 file_data."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"hello")
+        return httpx.Response(200, json=_by_path_meta("clip.mp4"))
+
+    items: list[dict[str, Any]] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file_1"}],
+        }
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        resolved = await resolve_session_item_file_references(
+            client, session_id="conv_1", items=items
+        )
+
+    block = resolved[0]["content"][0]
+    assert block == {
+        "type": "input_text",
+        "text": f"[Attached: {_session_target(tmp_path, 'file_1', 'clip.mp4')}]",
+    }
+    assert "file_data" not in block
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_item_file_references_rewrites_string_message_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compacted message with plain-string content gets its path rewritten.
+
+    Claude's compaction forwarder stores message content as a plain string;
+    transcript synthesis consumes it verbatim, so an other-host
+    ``[Attached: ...]`` path must still move to this host's session dir.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    items: list[dict[str, Any]] = [
+        {
+            "type": "compaction",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": (
+                        "[Attached: /home/other/.omnigent/attachments/"
+                        f"s-{'a' * 32}/file_mp4/a.mp4] inspect"
+                    ),
+                }
+            ],
+        }
+    ]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        resolved = await resolve_session_item_file_references(
+            client, session_id="conv_1", items=items
+        )
+
+    expected = session_attachment_dir("conv_1") / "file_mp4" / "a.mp4"
+    compacted = resolved[0]["compacted_messages"][0]
+    assert compacted["content"] == f"[Attached: {expected}] inspect"
+
+
+# ── restore_session_attachments ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_restore_session_attachments_pages_and_skips_present_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """By-path rows are restored across pages; inline rows are never fetched."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    present_dir = _session_dir(tmp_path, "file_present")
+    present_dir.mkdir(parents=True)
+    (present_dir / "clip.mp4").write_bytes(b"hello")
+    content_requests: list[str] = []
+    after_params: list[str | None] = []
+
+    present = {
+        "id": "file_present",
+        "name": "clip.mp4",
+        "metadata": {"bytes": 5, "source_metadata": {"delivery": "filesystem"}},
+    }
+    missing = {
+        "id": "file_missing",
+        "name": "clip.mp4",
+        "metadata": {"bytes": 5, "source_metadata": {"delivery": "filesystem"}},
+    }
+    inline = {
+        "id": "file_inline",
+        "name": "shot.png",
+        "metadata": {"bytes": 4, "source_metadata": {"delivery": "inline"}},
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files"):
+            after_params.append(request.url.params.get("after"))
+            if request.url.params.get("after") is None:
+                return httpx.Response(
+                    200,
+                    json={"data": [present, missing], "has_more": True, "last_id": "file_missing"},
+                )
+            return httpx.Response(200, json={"data": [inline], "has_more": False})
+        if path.endswith("/content"):
+            content_requests.append(path)
+            return httpx.Response(200, content=b"hello")
+        raise AssertionError(f"unexpected request {path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        restored = await restore_session_attachments("conv_1", client)
+
+    assert restored is True
+    assert after_params == [None, "file_missing"]
+    assert content_requests == ["/v1/sessions/conv_1/resources/files/file_missing/content"]
+    assert (present_dir / "clip.mp4").read_bytes() == b"hello"
+    assert (_session_dir(tmp_path, "file_missing") / "clip.mp4").read_bytes() == b"hello"
+    assert not _session_dir(tmp_path, "file_inline").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_session_attachments_logs_a_fetch_failure_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 404 on one by-path row is logged; the restore call still returns."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    row = {
+        "id": "file_missing",
+        "name": "clip.mp4",
+        "metadata": {"bytes": 5, "source_metadata": {"delivery": "filesystem"}},
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [row], "has_more": False})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.inner.native_attachments"):
+            restored = await restore_session_attachments("conv_1", client)
+
+    assert restored is False
+    assert not (_session_dir(tmp_path, "file_missing") / "clip.mp4").exists()
+    assert any(
+        "failed to materialize file_id=file_missing" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_restore_session_attachments_reports_a_listing_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 500 on the file listing reports False so callers can retry later."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        assert await restore_session_attachments("conv_1", client) is False
+
+
+# ── rewrite_attached_paths ───────────────────────────────────────────
+
+
+def test_rewrite_attached_paths_redirects_both_separator_styles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Persisted POSIX and Windows layout paths move to this session's dir."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    key = "a" * 32
+    posix = f"[Attached: /opt/work/omnigent/fork/wt/data/attachments/s-{key}/file_1/a.mp4]"
+    windows = "[Attached: C:\\Users\\other\\.omnigent\\attachments\\s-" + key + "\\file_2\\b.mp4]"
+    local = session_attachment_dir("session-a")
+
+    assert (
+        rewrite_attached_paths(posix, "session-a") == f"[Attached: {local / 'file_1' / 'a.mp4'}]"
+    )
+    assert (
+        rewrite_attached_paths(windows, "session-a") == f"[Attached: {local / 'file_2' / 'b.mp4'}]"
+    )
+    assert (
+        rewrite_attached_paths(f"see {posix} now", "session-a")
+        == f"see [Attached: {local / 'file_1' / 'a.mp4'}] now"
+    )
+
+
+def test_rewrite_attached_paths_leaves_other_text_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Text without the layout — or without a marker — stays as written."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    unchanged = [
+        "[Attached: /tmp/somewhere/a.mp4]",
+        "[Attached: /x/attachments/not-a-session-key/file_1/a.mp4]",
+        "[Attachment a.mp4 could not be loaded]",
+        "plain text without a marker",
+    ]
+
+    for text in unchanged:
+        assert rewrite_attached_paths(text, "session-a") == text
+
+
+# ── materialize_attachment without dir_fd (Windows) ──────────────────
+
+
+def test_materialize_attachment_path_fallback_matches_the_posix_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forcing the no-dir_fd branch lands the same bytes at the same name."""
+    posix_path = materialize_attachment(_zip_block(), tmp_path / "posix-bridge")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.inner.native_attachments._dir_fd_supported", lambda: False)
+        fallback_path = materialize_attachment(_zip_block(), tmp_path / "fallback-bridge")
+
+    assert posix_path is not None
+    assert fallback_path is not None
+    assert fallback_path.parent == attachment_cache_dir(tmp_path / "fallback-bridge")
+    assert fallback_path.name == posix_path.name == "archive.zip"
+    assert fallback_path.read_bytes() == posix_path.read_bytes() == _ZIP_BYTES
+    assert materialize_attachment(_zip_block(), tmp_path / "fallback-bridge") == fallback_path
+
+
+def test_materialize_attachment_path_fallback_refuses_symlinked_cache_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlinked cache dir is refused on the no-dir_fd path too."""
+    monkeypatch.setattr("omnigent.inner.native_attachments._dir_fd_supported", lambda: False)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    attachment_cache_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    (attachment_cache_dir(tmp_path)).symlink_to(elsewhere, target_is_directory=True)
+
+    assert materialize_attachment(_zip_block(), tmp_path) is None
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_materialize_attachment_path_fallback_survives_unreadable_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-size target whose bytes raise OSError falls through, not out."""
+    monkeypatch.setattr("omnigent.inner.native_attachments._dir_fd_supported", lambda: False)
+    attachments_dir = attachment_cache_dir(tmp_path)
+    attachments_dir.mkdir(parents=True)
+    target = attachments_dir / "archive.zip"
+    target.write_bytes(b"x" * len(_ZIP_BYTES))
+    original_read_bytes = Path.read_bytes
+
+    def failing_read_bytes(self: Path) -> bytes:
+        if self == target:
+            raise PermissionError("denied")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
+
+    path = materialize_attachment(_zip_block(), tmp_path)
+
+    assert path is not None
+    assert path != target
+    assert path.read_bytes() == _ZIP_BYTES
 
 
 # ── resize notice ────────────────────────────────────────────────────

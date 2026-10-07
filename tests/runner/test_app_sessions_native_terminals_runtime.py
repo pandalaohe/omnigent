@@ -507,6 +507,12 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     },
                     request=httpx.Request("GET", url),
                 )
+            if url == f"/v1/sessions/{session_id}/resources/files":
+                return httpx.Response(
+                    200,
+                    json={"object": "list", "data": [], "has_more": False, "last_id": None},
+                    request=httpx.Request("GET", url),
+                )
             assert url == f"/v1/sessions/{session_id}", kwargs
             return httpx.Response(
                 200,
@@ -1305,6 +1311,12 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                         "external_session_id": None,
                         "labels": labels,
                     },
+                    request=httpx.Request("GET", url),
+                )
+            if url == f"/v1/sessions/{session_id}/resources/files":
+                return httpx.Response(
+                    200,
+                    json={"object": "list", "data": [], "has_more": False, "last_id": None},
                     request=httpx.Request("GET", url),
                 )
             assert url == f"/v1/sessions/{session_id}/items"
