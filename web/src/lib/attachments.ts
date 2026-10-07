@@ -4,10 +4,10 @@
  *
  * This mirrors the authoritative server-side checks in
  * omnigent/runtime/content_resolver.py (`attachment_upload_limit`) and the
- * upload route (415 for unsupported types, 413 for oversized). Keeping a
- * copy here lets us reject a bad file at paste/drop/pick time — before a
- * slow upload — with a friendly message. The server still enforces; this is
- * UX only. Keep the limits in sync with the Python constants.
+ * upload route (413 for oversized). Keeping a copy here lets us reject a
+ * bad file at paste/drop/pick time — before a slow upload — with a friendly
+ * message. The server still enforces; this is UX only. Keep the limits in
+ * sync with the Python constants.
  */
 
 /**
@@ -156,11 +156,12 @@ function extensionOf(filename: string): string {
 }
 
 /**
- * Classify a file into an attachment category, or `null` if its type is not
- * supported (e.g. audio, video, unrecognised binaries). Files requiring local
- * tools are identified by extension; other types also use the browser MIME.
+ * Classify a file into an attachment category. Images, PDF and text are
+ * inlined into the model context; everything else is a `"file"` the server
+ * stores and the agent host receives by path. Files requiring local tools are
+ * identified by extension; other types also use the browser MIME.
  */
-export function classifyAttachment(file: File): AttachmentCategory | null {
+export function classifyAttachment(file: File): AttachmentCategory {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
 
@@ -175,7 +176,8 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   ) {
     return "text";
   }
-  return null;
+  // Everything else (video, audio, unrecognised binaries) is delivered by path.
+  return "file";
 }
 
 export interface AttachmentValidation {
@@ -187,8 +189,7 @@ export interface AttachmentValidation {
 
 /**
  * Split *files* into accepted attachments and rejection messages. A file is
- * rejected when its type is unsupported, or when it exceeds the per-type
- * size limit.
+ * rejected when it exceeds the per-category size limit.
  */
 export function validateAttachments(files: File[]): AttachmentValidation {
   const accepted: File[] = [];
@@ -197,13 +198,6 @@ export function validateAttachments(files: File[]): AttachmentValidation {
   for (const file of files) {
     const name = file.name || "file";
     const category = classifyAttachment(file);
-    if (category === null) {
-      errors.push(
-        `"${name}" can't be attached: only images, PDF, text/code, archives, ` +
-          `office documents, and databases are supported.`,
-      );
-      continue;
-    }
     // Non-compressible images (SVG, …) can't be shrunk server-side, so they
     // keep the smaller cap; compressible raster images get the large cap.
     const limitMb =

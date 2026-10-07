@@ -15,9 +15,9 @@ function pngFile(name = "shot.png"): File {
   return new File([new Uint8Array(10)], name, { type: "image/png" });
 }
 
-/** An unsupported file — validation rejects it before any upload exists. */
-function videoFile(name = "clip.mp4"): File {
-  return new File([new Uint8Array(10)], name, { type: "video/mp4" });
+/** A file over the 50 MB by-path cap — validation rejects it before any upload exists. */
+function oversizedFile(name = "clip.mp4"): File {
+  return new File([new Uint8Array(50 * 1024 * 1024 + 1)], name, { type: "video/mp4" });
 }
 
 /** Clipboard items as a real paste carries them: text and/or file entries. */
@@ -75,7 +75,7 @@ describe("useComposerAttachments", () => {
   it("keeps the supported files from a mixed batch and names every rejection", () => {
     const { result } = renderHook(() => useComposerAttachments());
 
-    act(() => result.current.addFiles([textFile(), videoFile(), videoFile("clip2.mp4")]));
+    act(() => result.current.addFiles([textFile(), oversizedFile(), oversizedFile("clip2.mp4")]));
 
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
     const error = result.current.attachmentError ?? "";
@@ -89,7 +89,7 @@ describe("useComposerAttachments", () => {
 
   it("clears a stale rejection when a clean batch arrives", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.addFiles([videoFile()]));
+    act(() => result.current.addFiles([oversizedFile()]));
     expect(result.current.attachmentError).not.toBeNull();
 
     act(() => result.current.addFiles([textFile()]));
@@ -100,7 +100,7 @@ describe("useComposerAttachments", () => {
 
   it("removeFile drops the indexed chip and clears the error", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.addFiles([textFile(), videoFile(), pngFile()]));
+    act(() => result.current.addFiles([textFile(), oversizedFile(), pngFile()]));
     expect(result.current.attachmentError).not.toBeNull();
 
     act(() => result.current.removeFile(0));
@@ -114,12 +114,12 @@ describe("useComposerAttachments", () => {
     const { result } = renderHook(() => useComposerAttachments({ onAccepted }));
     const ok = textFile();
 
-    act(() => result.current.addFiles([ok, videoFile()]));
+    act(() => result.current.addFiles([ok, oversizedFile()]));
     expect(onAccepted).toHaveBeenCalledTimes(1);
     expect(onAccepted).toHaveBeenCalledWith([ok]);
 
     // A fully rejected batch appends nothing, so the side effect stays silent.
-    act(() => result.current.addFiles([videoFile("nope.mp4")]));
+    act(() => result.current.addFiles([oversizedFile("nope.mp4")]));
     expect(onAccepted).toHaveBeenCalledTimes(1);
   });
 
@@ -169,7 +169,7 @@ describe("useComposerAttachments", () => {
   it("replaceFiles swaps the list wholesale and revalidates the replacement", () => {
     const { result } = renderHook(() => useComposerAttachments({ initialFiles: [textFile()] }));
 
-    act(() => result.current.replaceFiles([pngFile(), videoFile()]));
+    act(() => result.current.replaceFiles([pngFile(), oversizedFile()]));
 
     // The seeded file is gone; the rejected replacement never lands.
     expect(result.current.files.map((f) => f.name)).toEqual(["shot.png"]);
@@ -178,7 +178,7 @@ describe("useComposerAttachments", () => {
 
   it("replaceFiles with a clean batch clears a stale error", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.addFiles([videoFile()]));
+    act(() => result.current.addFiles([oversizedFile()]));
     expect(result.current.attachmentError).not.toBeNull();
 
     act(() => result.current.replaceFiles([pngFile()]));
@@ -190,7 +190,9 @@ describe("useComposerAttachments", () => {
   it("seeds initialFiles verbatim, without validating them", () => {
     // Trusted input is not re-checked on the way in — re-validating could
     // silently drop files the composer already accepted.
-    const { result } = renderHook(() => useComposerAttachments({ initialFiles: [videoFile()] }));
+    const { result } = renderHook(() =>
+      useComposerAttachments({ initialFiles: [oversizedFile()] }),
+    );
 
     expect(result.current.files.map((f) => f.name)).toEqual(["clip.mp4"]);
     expect(result.current.attachmentError).toBeNull();
@@ -198,7 +200,7 @@ describe("useComposerAttachments", () => {
 
   it("restoreFiles sets the list without validating it", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.restoreFiles([videoFile()]));
+    act(() => result.current.restoreFiles([oversizedFile()]));
 
     expect(result.current.files.map((f) => f.name)).toEqual(["clip.mp4"]);
     expect(result.current.attachmentError).toBeNull();
@@ -206,7 +208,7 @@ describe("useComposerAttachments", () => {
 
   it("restoreFiles leaves a pre-existing rejection notice untouched", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.addFiles([textFile(), videoFile()]));
+    act(() => result.current.addFiles([textFile(), oversizedFile()]));
     const notice = result.current.attachmentError;
     expect(notice).toContain("clip.mp4");
 
@@ -220,7 +222,7 @@ describe("useComposerAttachments", () => {
 
   it("clearError clears the notice without touching the files", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.addFiles([textFile(), videoFile()]));
+    act(() => result.current.addFiles([textFile(), oversizedFile()]));
 
     act(() => result.current.clearError());
 
@@ -230,7 +232,7 @@ describe("useComposerAttachments", () => {
 
   it("clear empties the files and the notice", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    act(() => result.current.addFiles([textFile(), videoFile()]));
+    act(() => result.current.addFiles([textFile(), oversizedFile()]));
 
     act(() => result.current.clear());
 
@@ -296,7 +298,7 @@ describe("useComposerAttachments", () => {
     const onAccepted = vi.fn();
     const { result } = renderHook(() => useComposerAttachments({ onAccepted }));
 
-    act(() => result.current.addFiles([videoFile(), videoFile("clip2.mp4")]));
+    act(() => result.current.addFiles([oversizedFile(), oversizedFile("clip2.mp4")]));
 
     expect(result.current.files).toEqual([]);
     expect(result.current.attachmentError).not.toBeNull();
@@ -309,7 +311,7 @@ describe("useComposerAttachments", () => {
       { initialProps: { initial: [textFile()] } },
     );
 
-    rerender({ initial: [pngFile(), videoFile()] });
+    rerender({ initial: [pngFile(), oversizedFile()] });
 
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
   });

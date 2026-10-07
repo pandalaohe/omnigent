@@ -12,7 +12,10 @@ import pytest
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_PATH_ATTACHMENTS,
+)
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     parse_runner_session_init_envelope,
@@ -396,13 +399,15 @@ def _attachment_initializer(
         ("sample.zip", [], False),
         ("sample.sqlite", [], False),
         ("sample.docx", [], False),
-        ("sample.zip", [CAP_FILESYSTEM_ATTACHMENTS], True),
+        # The old capability alone cannot deliver a by-path file on reconnect.
+        ("sample.zip", [CAP_FILESYSTEM_ATTACHMENTS], False),
+        ("sample.zip", [CAP_PATH_ATTACHMENTS], True),
     ],
 )
 async def test_initializer_checks_retained_files_before_posting_to_runner(
     db_uri: str, filename: str | None, capabilities: list[str], allowed: bool
 ) -> None:
-    """Reconnect cannot start a cold rebuild that silently loses new file formats."""
+    """Reconnect cannot start a cold rebuild that silently loses by-path files."""
     initializer, conversation, _, client = _attachment_initializer(db_uri, filename, capabilities)
     client.release.set()
     if allowed:
@@ -440,7 +445,7 @@ async def test_attachment_init_error_propagates_and_can_retry_after_upgrade(
     assert not initializer._tasks
 
     assert isinstance(registry.connection, _AdvertisedRunner)
-    registry.connection.hello.capabilities.append(CAP_FILESYSTEM_ATTACHMENTS)
+    registry.connection.hello.capabilities.append(CAP_PATH_ATTACHMENTS)
     response = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert response.status_code == 201
     assert len(client.calls) == 1
@@ -450,7 +455,7 @@ async def test_attachment_init_error_propagates_and_can_retry_after_upgrade(
 async def test_attachment_validation_preserves_single_flight(db_uri: str) -> None:
     """Concurrent reconnect and message initialization share the async validation/post."""
     initializer, conversation, _, client = _attachment_initializer(
-        db_uri, "sample.zip", [CAP_FILESYSTEM_ATTACHMENTS]
+        db_uri, "sample.zip", [CAP_PATH_ATTACHMENTS]
     )
     first = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
     await client.entered.wait()

@@ -2440,12 +2440,12 @@ def _seed_parent_zip(file_store: Any, artifact_store: _InMemoryArtifactStore, na
 
 
 @pytest.mark.asyncio
-async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
+async def test_copy_delivers_a_by_path_file_to_any_child_harness(
     file_client: httpx.AsyncClient,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
 ) -> None:
-    """A copied zip would be dropped by an SDK child, as an uploaded one would."""
+    """A copied zip is stored for by-path delivery, whatever the child harness."""
     zip_id = _seed_parent_zip(file_store, artifact_store, "bundle.zip")
 
     resp = await file_client.post(
@@ -2453,10 +2453,11 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
         json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [zip_id]},
     )
 
-    assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
-    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
-    assert listed.data == []
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][zip_id]["new_id"]
+    copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
+    assert copied is not None
+    assert copied.filename == "bundle.zip"
 
 
 @pytest.mark.asyncio
@@ -8870,6 +8871,56 @@ async def test_native_send_rechecks_runtime_after_upload(
     from omnigent.entities import MessageData
 
     session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "renamed.txt"}
+    content = [block]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached archive again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = []
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == 409, response.text
+    assert "Update Omnigent" in response.text
+    assert runner.post_json_calls == []
+    assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_history", [False, True])
+async def test_sdk_send_rechecks_runtime_after_upload(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+) -> None:
+    """Every harness rechecks by-path capability, not only native terminals."""
+    from omnigent.entities import MessageData
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    # The fixture row is a native wrapper; bind an SDK harness so this covers
+    # the non-native branch of the send-time recheck.
+    conv = file_conv_store._conversations[session_id]
+    conv.labels.pop("omnigent.wrapper", None)
+    conv.harness_override = "claude-sdk"
     runner = _FakeRunnerClient(payload={})
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     set_runner_client(runner)  # type: ignore[arg-type]

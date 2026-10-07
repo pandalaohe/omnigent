@@ -223,7 +223,6 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
-    _require_filesystem_attachment_harness,
     _resolve_harness,
     _response_agent_name_from_store,
     _RunnerForwardResult,
@@ -1525,31 +1524,15 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
         if body.type in ("message", _SLASH_COMMAND_TYPE):
-            from omnigent.inner.native_attachments import (
-                inline_filesystem_attachment_name,
-                requires_filesystem,
-            )
+            from omnigent.inner.native_attachments import inline_filesystem_attachment_name
 
-            content = body.data.get("content")
-            inline_name = inline_filesystem_attachment_name(content)
+            inline_name = inline_filesystem_attachment_name(body.data.get("content"))
             if inline_name is not None:
                 raise OmnigentError(
                     f"Attachment {inline_name!r} must be uploaded to the session's "
                     "files and referenced by file_id.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            # Unsent uploads survive a switch or fork without appearing in history.
-            if file_store is not None and isinstance(content, list):
-                for block in content:
-                    file_id = block.get("file_id") if isinstance(block, dict) else None
-                    if not isinstance(file_id, str):
-                        continue
-                    stored = await asyncio.to_thread(file_store.get, file_id)
-                    if stored is None or stored.session_id not in (None, session_id):
-                        continue
-                    if stored.filename is not None and requires_filesystem(stored.filename):
-                        await _require_filesystem_attachment_harness(conv, stored.filename)
-                        break
         # Fail fast on malformed tools at the boundary. The raw dicts
         # (not the parsed objects) are what the runner stores — the
         # parse call is purely a validator.
@@ -3480,9 +3463,11 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
-        # Recheck the bound runtime: forks and host restarts can change it
-        # after upload, while retained history still needs these files.
-        if body.type in ("message", _SLASH_COMMAND_TYPE) and _is_native_terminal_session(conv):
+        # Recheck the bound runtime for every harness: a fork, rebind or host
+        # restart can put an upload on a build without path-attachment support
+        # after its upload checks passed, while retained history still needs
+        # these files.
+        if body.type in ("message", _SLASH_COMMAND_TYPE):
             content = body.data.get("content")
             attachment = await asyncio.to_thread(
                 _filesystem_attachment_in_history,

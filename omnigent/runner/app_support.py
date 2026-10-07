@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias, overload
 
@@ -13,8 +13,11 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner.native_attachments import (
+    fetch_file_meta,
     framework_notice_block,
     has_unresolved_file_id,
+    is_by_path,
+    materialize_file_reference,
     resolve_file_id_block,
 )
 from omnigent.process_logging import process_log_reference
@@ -162,9 +165,10 @@ async def _resolve_forwarded_message_content(
 
     Remote Omnigent servers can forward session messages with raw file IDs
     because their file store is not available to the out-of-process
-    runner. The runner can still fetch bytes through the session-scoped
-    file resource endpoint and inline them before handing content to a
-    harness. Blocks already resolved by the server pass through.
+    runner. The runner fetches the row's metadata and either inlines the
+    bytes (images, PDF, text) or streams the file to the agent host and
+    replaces the block with an ``[Attached: <path>]`` line for any harness.
+    Blocks already resolved by the server pass through.
     """
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
@@ -174,8 +178,30 @@ async def _resolve_forwarded_message_content(
     for block in content:
         result = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
+            file_id = str(block["file_id"])
+            meta = await fetch_file_meta(file_id, session_id=session_id, client=server_client)
+            if meta is None:
+                resolved.append(block)
+                continue
+            resource_metadata = meta.get("metadata")
+            source_metadata = (
+                resource_metadata.get("source_metadata")
+                if isinstance(resource_metadata, Mapping)
+                else None
+            )
+            name = meta.get("name")
+            if is_by_path(name if isinstance(name, str) else None, source_metadata):
+                path = await materialize_file_reference(
+                    file_id, meta, session_id=session_id, client=server_client
+                )
+                if path is None:
+                    resolved.append(block)
+                else:
+                    resolved.append({"type": "input_text", "text": f"[Attached: {path}]"})
+                    changed = True
+                continue
             result = await resolve_file_id_block(
-                block, session_id=session_id, client=server_client
+                block, session_id=session_id, client=server_client, meta=meta
             )
         if result is None:
             resolved.append(block)

@@ -4273,7 +4273,7 @@ function ComposerImpl(
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+        data-testid="composer-file-input"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {

@@ -123,28 +123,36 @@ def test_upload_supported_types(
     assert response.json()["name"] == filename
 
 
-def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
-    """Unsupported formats are rejected with 415."""
+def test_upload_stores_unknown_type_by_path(upload_client: tuple[TestClient, str]) -> None:
+    """Formats outside the inline set are stored for by-path delivery."""
     client, session_id = upload_client
     resp = _upload(client, session_id, "clip.mp4", b"\x00\x00\x00 fake mp4 bytes", "video/mp4")
-    assert resp.status_code == 415, resp.text
-    assert "Unsupported attachment type" in resp.text
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["name"] == "clip.mp4"
+    assert body["metadata"]["source_metadata"] == {"delivery": "filesystem"}
 
 
-def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
+def test_upload_accepts_filesystem_types_for_an_sdk_harness(
     upload_client: tuple[TestClient, str], db_uri: str
 ) -> None:
-    """An SDK session refuses formats requiring native filesystem tools."""
+    """An SDK session stores by-path files like a native one; no harness gate."""
     client, _ = upload_client
-    sdk_session = SqlAlchemyConversationStore(db_uri).create_conversation(
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sdk_session = conversations.create_conversation(
         title="sdk session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
+    conversations.set_host_id(
+        sdk_session.id, "d75381f2c94b4e49a3c684946d4ddbc4", workspace="/tmp/test-upload"
     )
     resp = client.post(
         f"/v1/sessions/{sdk_session.id}/resources/files",
         files={"file": ("archive.zip", b"PK\x03\x04 fake zip", "application/zip")},
     )
-    assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
+    assert resp.status_code == 201, resp.text
+    stored = SqlAlchemyFileStore(db_uri).get(resp.json()["id"], session_id=sdk_session.id)
+    assert stored is not None
+    assert stored.source_metadata == {"delivery": "filesystem"}
 
 
 @pytest.mark.parametrize(
@@ -178,18 +186,19 @@ def test_message_cannot_inline_a_filesystem_attachment(
 
 
 @pytest.mark.parametrize(
-    "filename,target_harness,event_type,block_type,status",
+    "filename,target_harness,event_type,block_type",
     [
-        ("archive.zip", "cursor-native", "message", "input_file", 415),
-        ("archive.zip", "openai-agents", "message", "input_file", 415),
-        ("archive.zip", "openai-agents", "message", "input_image", 415),
-        ("archive.zip", "cursor-native", "slash_command", "input_file", 415),
-        ("archive.zip", "claude-native", "message", "input_file", 202),
-        ("archive.zip", "codex-native", "message", "input_file", 202),
-        ("notes.txt", "openai-agents", "message", "input_file", 202),
+        ("archive.zip", "cursor-native", "message", "input_file"),
+        ("archive.zip", "openai-agents", "message", "input_file"),
+        ("archive.zip", "openai-agents", "message", "input_image"),
+        ("archive.zip", "cursor-native", "slash_command", "input_file"),
+        ("archive.zip", "claude-native", "message", "input_file"),
+        ("archive.zip", "codex-native", "message", "input_file"),
+        ("notes.txt", "openai-agents", "message", "input_file"),
+        ("clip.mp4", "openai-agents", "message", "input_file"),
     ],
 )
-def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
+def test_send_admits_stored_upload_for_any_harness(
     upload_client: tuple[TestClient, str],
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -197,9 +206,8 @@ def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
     target_harness: str,
     event_type: str,
     block_type: str,
-    status: int,
 ) -> None:
-    """Stored filenames govern admission before policy, persistence, or runner dispatch."""
+    """Stored uploads reach policy for every target harness; no harness gate."""
     from omnigent.server.routes import sessions
     from omnigent.server.routes.sessions import routes_events
 
@@ -230,26 +238,19 @@ def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
     monkeypatch.setattr(routes_events, "_evaluate_input_policy", policy)
     monkeypatch.setattr(routes_events, "_persist_policy_deny_sentinel", AsyncMock())
     monkeypatch.setattr(routes_events, "_dispatch_session_event_to_runner", dispatch)
+    data: dict[str, object] = {
+        "role": "user",
+        "content": [{"type": block_type, "file_id": files[0].id, "filename": "renamed.txt"}],
+    }
+    if event_type == "slash_command":
+        data["name"] = "compact"
     response = client.post(
         f"/v1/sessions/{session_id}/events",
-        json={
-            "type": event_type,
-            "data": {
-                "role": "user",
-                "content": [
-                    {"type": block_type, "file_id": files[0].id, "filename": "renamed.txt"}
-                ],
-            },
-        },
+        json={"type": event_type, "data": data},
     )
-    assert response.status_code == status, response.text
-    if status == 415:
-        assert filename in response.text
-        assert "Claude Code or Codex" in response.text
-        policy.assert_not_awaited()
-    else:
-        assert response.json()["denied"] is True
-        policy.assert_awaited_once()
+    assert response.status_code == 202, response.text
+    assert response.json()["denied"] is True
+    policy.assert_awaited_once()
     dispatch.assert_not_awaited()
     assert conversations.list_items(session_id).data == before
 

@@ -8678,19 +8678,21 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  // An unsupported attachment has to be caught HERE, before the session
-  // exists. Letting it through means the upload only 415s after the session
+  // An oversized attachment has to be caught HERE, before the session
+  // exists. Letting it through means the upload only 413s after the session
   // is created and navigated into — stranding the typed message in a session
   // the user never wanted.
-  it("rejects an unsupported attachment instead of attaching it", () => {
+  it("rejects an oversized attachment instead of attaching it", () => {
     renderLanding();
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(50 * 1024 * 1024 + 1)], "clip.mp4", {
+      type: "video/mp4",
+    });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
     expect(screen.queryByText("clip.mp4")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
-      "archives, office documents, and databases are supported",
+      "too large",
     );
   });
 
@@ -8698,7 +8700,9 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(50 * 1024 * 1024 + 1)], "clip.mp4", {
+      type: "video/mp4",
+    });
     fireEvent.drop(composer, { dataTransfer: fileDrag([ok, clip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.queryByText("clip.mp4")).toBeNull();
@@ -8715,7 +8719,9 @@ describe("NewChatLandingScreen attachments", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     renderLanding();
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(50 * 1024 * 1024 + 1)], "clip.mp4", {
+      type: "video/mp4",
+    });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });
@@ -8804,7 +8810,9 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [ok] },
     });
-    const clip = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const clip = new File([new Uint8Array(50 * 1024 * 1024 + 1)], "clip.mp4", {
+      type: "video/mp4",
+    });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [clip] },
     });

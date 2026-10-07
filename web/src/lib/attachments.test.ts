@@ -70,11 +70,11 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("a.zip", "text/plain"))).toBe("file");
   });
 
-  it("rejects types outside the supported allowlist", () => {
-    expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBeNull();
-    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBeNull();
-    expect(classifyAttachment(makeFile("song.mp3", "audio/mpeg"))).toBeNull();
-    expect(classifyAttachment(makeFile("noext", ""))).toBeNull();
+  it("classifies every other type as a by-path file", () => {
+    expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBe("file");
+    expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBe("file");
+    expect(classifyAttachment(makeFile("song.mp3", "audio/mpeg"))).toBe("file");
+    expect(classifyAttachment(makeFile("noext", ""))).toBe("file");
   });
 
   it("recognizes a text/code extension the MIME mislabels", () => {
@@ -91,11 +91,11 @@ describe("validateAttachments", () => {
     expect(errors).toHaveLength(0);
   });
 
-  it("rejects unsupported types with a message", () => {
-    const { accepted, errors } = validateAttachments([makeFile("clip.mp4", "video/mp4")]);
-    expect(accepted).toHaveLength(0);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("clip.mp4");
+  it("accepts a video as a by-path file", () => {
+    const clip = makeFile("clip.mp4", "video/mp4");
+    const { accepted, errors } = validateAttachments([clip]);
+    expect(accepted).toEqual([clip]);
+    expect(errors).toHaveLength(0);
   });
 
   it("accepts an archive up to its larger limit", () => {
@@ -135,10 +135,10 @@ describe("validateAttachments", () => {
   it("partitions a mixed batch into accepted + errors", () => {
     const ok = makeFile("a.png", "image/png");
     const zip = makeFile("a.zip", "application/zip");
-    const badType = makeFile("a.mp4", "video/mp4");
+    const video = makeFile("a.mp4", "video/mp4");
     const tooBig = makeFile("big.pdf", "application/pdf", ATTACHMENT_SIZE_LIMITS_MB.pdf * MB + 1);
-    const { accepted, errors } = validateAttachments([ok, zip, badType, tooBig]);
-    expect(accepted).toEqual([ok, zip]);
-    expect(errors).toHaveLength(2);
+    const { accepted, errors } = validateAttachments([ok, zip, video, tooBig]);
+    expect(accepted).toEqual([ok, zip, video]);
+    expect(errors).toHaveLength(1);
   });
 });

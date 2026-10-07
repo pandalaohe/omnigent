@@ -88,7 +88,6 @@ from omnigent.server.routes._sessions.helpers import (
     _raise_if_runner_session_agent_missing,
     _raise_if_session_agent_missing_payload,
     _read_upload_capped,
-    _require_filesystem_attachment_harness,
     _stored_file_to_resource,
     effective_worktree,
     require_filesystem_attachment_runtime,
@@ -203,10 +202,7 @@ def register_resources_routes(
 ) -> None:
     """Register the resources routes on router."""
 
-    async def _require_filesystem_attachment_support(
-        request: Request, conv: Conversation, filename: str
-    ) -> None:
-        await _require_filesystem_attachment_harness(conv, filename)
+    async def _require_filesystem_attachment_support(request: Request, conv: Conversation) -> None:
         tracker = getattr(request.app.state, "managed_launches", None)
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and conv.host_id is None and conv.runner_id is None:
@@ -1737,47 +1733,39 @@ def register_resources_routes(
             file.content_type,
             file.filename,
         )
-        # Check the filename first so a misleading MIME cannot skip the
-        # harness requirement or the quotas for files that need local tools.
+        # Check the filename first so a misleading MIME cannot make a legacy
+        # filesystem format look inline.
         filesystem_required = requires_filesystem(file.filename)
-        if filesystem_required:
+        type_limit = None if filesystem_required else attachment_upload_limit(content_type)
+        if type_limit is None and not filesystem_required:
+            # The browser/OS can mislabel a text/code file as binary (e.g. a
+            # .csv reported as application/vnd.ms-excel on Windows). Fall back
+            # to the extension — matching the web client's allowlist — and
+            # normalize the type so the resolver inlines it as text.
+            ext_type = attachment_text_type_for_extension(file.filename)
+            if ext_type is not None:
+                content_type = ext_type
+                type_limit = attachment_upload_limit(content_type)
+        # Everything the inline set cannot carry goes by path: persisted for
+        # the agent host and streamed there by the runner, never gated by
+        # harness.
+        if type_limit is None:
             # Drop the declared type so the file is never stored as text.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_support(request, conv, file.filename)
+            await _require_filesystem_attachment_support(request, conv)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
-            _attachment_upload_lock(session_id)
-            if filesystem_required
-            else contextlib.nullcontext()
+            _attachment_upload_lock(session_id) if type_limit is None else contextlib.nullcontext()
         )
         async with attachment_lock:
-            if filesystem_required:
+            if type_limit is None:
                 read_limit = _enforce_filesystem_attachment_policy(
                     [file.filename],
                     session_id=session_id,
                     file_store=file_store,
                 )
             else:
-                type_limit = attachment_upload_limit(content_type)
-                if type_limit is None:
-                    # The browser/OS can mislabel a text/code file as binary (e.g. a
-                    # .csv reported as application/vnd.ms-excel on Windows). Fall back
-                    # to the extension — matching the web client's allowlist — and
-                    # normalize the type so the resolver inlines it as text.
-                    ext_type = attachment_text_type_for_extension(file.filename)
-                    if ext_type is not None:
-                        content_type = ext_type
-                        type_limit = attachment_upload_limit(content_type)
-                if type_limit is None:
-                    raise HTTPException(
-                        status_code=415,
-                        detail=(
-                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
-                            "or text/code files, or use Claude Code or Codex for archives, "
-                            "Office documents, and databases."
-                        ),
-                    )
                 read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
             filename = file.filename
             # Persist original dimensions only after a downscale.
@@ -1811,14 +1799,21 @@ def register_resources_routes(
                 # PDF/text/SVG and other non-compressed types use their smaller
                 # per-type caps and aren't decoded, so they read outside the gate.
                 content = await _read_upload_capped(file, read_limit)
+            if source_dims is not None:
+                source_metadata: dict[str, object] | None = {
+                    "width": source_dims[0],
+                    "height": source_dims[1],
+                }
+            elif type_limit is None:
+                source_metadata = {"delivery": "filesystem"}
+            else:
+                source_metadata = None
             stored = file_store.create(
                 session_id=session_id,
                 filename=filename,
                 bytes=len(content),
                 content_type=content_type,
-                source_metadata=(
-                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
-                ),
+                source_metadata=source_metadata,
             )
             try:
                 artifact_store.put(stored.id, content)
@@ -2110,19 +2105,15 @@ def register_resources_routes(
                 )
             sources.append(stored)
 
-        # Files requiring filesystem tools entering a session pass the same checks as an upload,
-        # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        # By-path files entering a session pass the same checks as an upload,
+        # held under the same lock, so a copy can't skip the quotas.
+        from omnigent.inner.native_attachments import is_by_path
 
         filesystem_sources = [
-            stored
-            for stored in sources
-            if stored.filename and requires_filesystem(stored.filename)
+            stored for stored in sources if is_by_path(stored.filename, stored.source_metadata)
         ]
         if filesystem_sources:
-            await _require_filesystem_attachment_support(
-                request, conv, filesystem_sources[0].filename or ""
-            )
+            await _require_filesystem_attachment_support(request, conv)
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
         )

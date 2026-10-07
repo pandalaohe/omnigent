@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
+import ntpath
+import posixpath
 import re
+import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
+    _is_safe_path_component,
     attachment_cache_dir,
     attachment_reference_line,
     codex_resize_metadata_path,
     has_unresolved_file_id,
+    is_by_path,
     materialize_attachment,
+    materialize_file_reference,
     parse_data_uri,
     requires_filesystem,
     resize_notice,
@@ -501,6 +510,361 @@ def test_client_server_filesystem_extension_parity() -> None:
 
     assert client_exts, "could not parse client FILESYSTEM_ATTACHMENT_EXTENSIONS"
     assert client_exts == set(_FILESYSTEM_ATTACHMENT_EXTENSIONS)
+
+
+# ── by-path delivery ─────────────────────────────────────────────────
+
+
+def test_is_by_path_reads_the_stored_delivery_key() -> None:
+    """The persisted delivery key decides, whatever the filename looks like."""
+    assert is_by_path("clip.mp4", {"delivery": "filesystem"})
+    assert is_by_path("photo.png", {"delivery": "filesystem"})
+    assert not is_by_path("clip.mp4", {"delivery": "inline"})
+    assert not is_by_path("archive.zip", {"delivery": "inline"})
+    assert not is_by_path("photo.png", {"width": 6000, "height": 4000})
+
+
+def test_is_by_path_falls_back_to_the_extension_for_legacy_rows() -> None:
+    """Rows written before the delivery key keep the extension rule."""
+    assert is_by_path("archive.zip", None)
+    assert is_by_path("report.docx", {})
+    assert not is_by_path("clip.mp4", None)
+    assert not is_by_path(None, None)
+
+
+def _file_meta(name: str, *, stored_bytes: int = 5) -> dict[str, Any]:
+    """Resource metadata JSON as the file endpoint returns it."""
+    return {
+        "id": "file_1",
+        "name": name,
+        "content_type": "video/mp4",
+        "metadata": {"bytes": stored_bytes},
+    }
+
+
+# sha256("conv_1")[:32], pinned so path assertions do not recompute the key.
+_CONV_1_ATTACHMENTS = "s-214d6c05cb183e28721dc2a7dc43797d"
+
+
+def _session_dir(tmp_path: Path, file_id: str) -> Path:
+    return tmp_path / "data" / "attachments" / _CONV_1_ATTACHMENTS / file_id
+
+
+def _session_target(tmp_path: Path, file_id: str, name: str) -> Path:
+    return _session_dir(tmp_path, file_id) / name
+
+
+def test_is_safe_path_component_rejects_windows_traversal() -> None:
+    """Windows separators, alternate separators, and drives are refused."""
+    for unsafe in ("../escape.mp4", "C:/outside/escape.mp4", "D:escape.mp4", "a\\b.mp4"):
+        assert not _is_safe_path_component(unsafe, ntpath), unsafe
+    assert _is_safe_path_component("clip.mp4", ntpath)
+
+
+def test_is_safe_path_component_keeps_posix_backslash_legal() -> None:
+    """POSIX has no altsep or drives, so a backslash stays a legal name."""
+    assert _is_safe_path_component("a\\b.mp4", posixpath)
+    assert not _is_safe_path_component("../x", posixpath)
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_streams_to_the_session_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content is streamed straight to the deterministic host path."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path is not None
+    assert path == _session_target(tmp_path, "file_1", "clip.mp4")
+    assert path.read_bytes() == b"hello"
+    assert [request.url.path for request in requests] == [
+        "/v1/sessions/conv_1/resources/files/file_1/content"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("clip[1].mp4", "clip_1_.mp4"), ("clip\n1.mp4", "clip_1.mp4")],
+)
+@pytest.mark.asyncio
+async def test_materialize_file_reference_sanitizes_marker_unsafe_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, expected: str
+) -> None:
+    """Brackets and newlines in the stored name cannot break the marker line."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta(name), session_id="conv_1", client=client
+        )
+
+    assert path is not None
+    assert path.name == expected
+    line = f"[Attached: {path}]"
+    assert "\n" not in line
+    assert "[" not in str(path) and "]" not in str(path)
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_reuses_a_complete_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file whose size matches the stored row is reused without a fetch."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    target_dir = _session_dir(tmp_path, "file_1")
+    target_dir.mkdir(parents=True)
+    (target_dir / "clip.mp4").write_bytes(b"hello")
+    content_gets = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal content_gets
+        content_gets += 1
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path == target_dir / "clip.mp4"
+    assert content_gets == 0
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_discards_a_size_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream shorter than the stored size leaves nothing behind."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4", stored_bytes=9), session_id="conv_1", client=client
+        )
+
+    assert path is None
+    assert list(_session_dir(tmp_path, "file_1").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_returns_none_on_fetch_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 404 leaves the caller's block unresolved and writes nothing."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path is None
+    assert list(_session_dir(tmp_path, "file_1").iterdir()) == []
+
+
+class _CancellingStreamResponse:
+    """Content response that yields one chunk and then cancels."""
+
+    def raise_for_status(self) -> None:
+        return None
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        yield b"partial"
+        raise asyncio.CancelledError
+
+
+class _CancellingStream:
+    """Async context manager yielding the cancelling response."""
+
+    async def __aenter__(self) -> _CancellingStreamResponse:
+        return _CancellingStreamResponse()
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
+
+
+class _CancellingStreamClient:
+    """Fake async client whose content stream cancels mid-body."""
+
+    def stream(self, *args: Any, **kwargs: Any) -> _CancellingStream:
+        del args, kwargs
+        return _CancellingStream()
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_cancellation_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling mid-stream leaves no temp file, final file or open fd."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await materialize_file_reference(
+            "file_1",
+            _file_meta("clip.mp4"),
+            session_id="conv_1",
+            client=_CancellingStreamClient(),  # type: ignore[arg-type]
+        )
+
+    assert list(_session_dir(tmp_path, "file_1").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_refuses_a_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink at the target name is never written through."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    target_dir = _session_dir(tmp_path, "file_1")
+    target_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"precious")
+    (target_dir / "clip.mp4").symlink_to(outside)
+    fetches = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal fetches
+        fetches += 1
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path is None
+    assert fetches == 0
+    assert outside.read_bytes() == b"precious"
+    assert [entry.name for entry in target_dir.iterdir()] == ["clip.mp4"]
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_path_fallback_writes_the_same_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forcing the no-dir_fd branch lands the same bytes at the same path."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("omnigent.inner.native_attachments._dir_fd_supported", lambda: False)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path is not None
+    assert path == _session_target(tmp_path, "file_1", "clip.mp4")
+    assert path.read_bytes() == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_path_fallback_refuses_symlinked_file_id_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlinked file_id dir is refused on the no-dir_fd path too."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("omnigent.inner.native_attachments._dir_fd_supported", lambda: False)
+    session_dir = tmp_path / "data" / "attachments" / _CONV_1_ATTACHMENTS
+    session_dir.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (session_dir / "file_1").symlink_to(outside, target_is_directory=True)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not fetch through a symlinked file_id dir")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path is None
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_materialize_file_reference_path_fallback_preserves_preexisting_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed exclusive create must not unlink a pre-existing temp file."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("omnigent.inner.native_attachments._dir_fd_supported", lambda: False)
+    monkeypatch.setattr("omnigent.inner.native_attachments.uuid.uuid4", lambda: uuid.UUID(int=0))
+    target_dir = _session_dir(tmp_path, "file_1")
+    target_dir.mkdir(parents=True)
+    temp_path = target_dir / f"clip.mp4.{uuid.UUID(int=0).hex}.tmp"
+    temp_path.write_bytes(b"precious")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not fetch when the temp path already exists")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path is None
+    assert temp_path.read_bytes() == b"precious"
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "nested/clip.mp4", "clip\x00.mp4"])
+@pytest.mark.asyncio
+async def test_materialize_file_reference_refuses_unsafe_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Names that are empty or escape the per-file directory are refused."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not fetch for an unsafe name")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta(name), session_id="conv_1", client=client
+        )
+
+    assert path is None
 
 
 # ── resize notice ────────────────────────────────────────────────────

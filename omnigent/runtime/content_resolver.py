@@ -664,7 +664,7 @@ def extract_text_attachments(
     :returns: A list of ``{"filename", "content_type", "text"}`` entries
         in order. Files requiring filesystem tools carry an empty ``text``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import is_by_path
 
     attachments: list[dict[str, str]] = []
     for block in content:
@@ -689,10 +689,10 @@ def extract_text_attachments(
         ):
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
-        # Checked before the text-like test: delivery follows the filename, so an
-        # archive stored under a text MIME still reaches the filesystem. It has no
-        # scannable text, but is announced by name so a policy can refuse it.
-        if requires_filesystem(file_meta.filename):
+        # Checked before the text-like test: delivery follows the stored row, so
+        # a by-path file under a text MIME still reaches the filesystem. It has
+        # no scannable text, but is announced by name so a policy can refuse it.
+        if is_by_path(file_meta.filename, file_meta.source_metadata):
             attachments.append(
                 {
                     "filename": file_meta.filename or "",
@@ -898,12 +898,12 @@ def _resolve_file_id_block(
             f"Referenced file '{file_id}' no longer exists — "
             f"it may have been deleted after the request was accepted"
         )
-    # Types requiring filesystem tools never reach a model as bytes (a native
-    # harness reads them off disk instead), so inlining one here would send
-    # a payload the provider can't interpret. Fail with an actionable error.
-    from omnigent.inner.native_attachments import requires_filesystem
+    # By-path files never reach a model as bytes (the runner streams them to
+    # the agent host instead), so inlining one here would send a payload the
+    # provider can't interpret. Fail with an actionable error.
+    from omnigent.inner.native_attachments import is_by_path
 
-    if requires_filesystem(file_meta.filename):
+    if is_by_path(file_meta.filename, file_meta.source_metadata):
         if defer_filesystem_files:
             return dict(block), None
         raise ValueError(

@@ -410,7 +410,6 @@ function SideChatComposer({
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,application/pdf,text/*,application/json"
           className="hidden"
           onChange={(event) => {
             if (event.target.files) {
