@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -235,7 +236,7 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 ) -> None:
     """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
 
-    The Codex provider never scans ``.agents`` and, absent a resolved
+    Both Codex harnesses include ``~/.agents/skills``. Absent a resolved
     ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
     to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
     custom codex home is in play (see the divergence test below).
@@ -250,7 +251,7 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
-    assert native == sdk == {"codex-host-skill"}
+    assert native == sdk == {"codex-host-skill", "agents-only-skill"}
 
 
 def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
@@ -267,6 +268,7 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "default-codex-skill")
+    _write_skill(home / ".agents" / "skills", "shared-skill")
     custom = tmp_path / "custom-codex-home"
     _write_skill(custom / "skills", "custom-codex-skill")
     workspace = tmp_path / "ws"
@@ -276,8 +278,8 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
     # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
-    assert native == {"custom-codex-skill"}
-    assert sdk == {"default-codex-skill"}
+    assert native == {"custom-codex-skill", "shared-skill"}
+    assert sdk == {"default-codex-skill", "shared-skill"}
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(
@@ -1100,3 +1102,175 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
     assert names == ["neutral-skill"]
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+def test_codex_menu_lists_user_agents_tier_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """Both codex harnesses list ``~/.agents/skills``; ``plan`` appears once."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".agents" / "skills", "plan")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    names = [s.name for s in resolve_harness_skills(_ctx(workspace, home), harness)]
+    assert names.count("plan") == 1
+
+
+def test_codex_repo_tier_stops_at_git_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repo tier walks cwd up to the nearest ``.git``; dirs above it are out."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    outer = tmp_path / "ws" / "outer"
+    repo = outer / "repo"
+    sub = repo / "sub"
+    (repo / ".git").mkdir(parents=True)
+    _write_skill(outer / ".agents" / "skills", "outer-skill")
+    _write_skill(repo / ".agents" / "skills", "repo-skill")
+    _write_skill(sub / ".agents" / "skills", "sub-skill")
+
+    names = {s.name for s in resolve_harness_skills(_ctx(sub, home), "codex-native")}
+    assert {"repo-skill", "sub-skill"} <= names
+    assert "outer-skill" not in names
+
+
+def test_codex_repo_tier_stops_at_git_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worktree's ``.git`` file marks the repo root, like a ``.git`` dir."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    outer = tmp_path / "ws" / "outer"
+    wt = outer / "wt"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /nonexistent\n")
+    _write_skill(wt / ".agents" / "skills", "wt-skill")
+    _write_skill(outer / ".agents" / "skills", "outer-skill")
+
+    names = {s.name for s in resolve_harness_skills(_ctx(wt, home), "codex-native")}
+    assert "wt-skill" in names
+    assert "outer-skill" not in names
+
+
+def test_codex_repo_tier_without_marker_uses_cwd_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no ``.git`` ancestor only cwd's ``.agents/skills`` counts."""
+    for parent in (tmp_path, *tmp_path.parents):
+        if (parent / ".git").exists():
+            pytest.skip("tmp_path sits inside a git checkout")
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    a = tmp_path / "ws" / "a"
+    b = a / "b"
+    _write_skill(a / ".agents" / "skills", "a-skill")
+    _write_skill(b / ".agents" / "skills", "b-skill")
+
+    names = {s.name for s in resolve_harness_skills(_ctx(b, home), "codex-native")}
+    assert "b-skill" in names
+    assert "a-skill" not in names
+
+
+def test_codex_repo_agents_tier_is_never_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding reads only bundle and Codex-home sources, never the repo tier."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    _write_skill(ws / ".agents" / "skills", "repo-skill")
+    codex_home = tmp_path / "private-home"
+    monkeypatch.chdir(ws)
+
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    populate_codex_skills_from_bundle(codex_home, None, "all")
+    seeded = codex_home / "skills" / "repo-skill"
+    assert not seeded.exists()
+    assert not seeded.is_symlink()
+
+
+def test_codex_user_agents_tier_is_not_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding takes only bundle and Codex-home sources; the user ``.agents``
+    tier is listed by the menu, not linked. Deleted once upstream seeds it.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".agents" / "skills", "plan")
+    codex_home = tmp_path / "private-home"
+
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    populate_codex_skills_from_bundle(codex_home, None, "all")
+    seeded = codex_home / "skills" / "plan"
+    assert not seeded.exists()
+    assert not seeded.is_symlink()
+
+
+def test_codex_menu_prefers_codex_home_over_agents_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First source wins: ``~/.codex/skills`` shadows the ``.agents`` tiers."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    _write_skill(home / ".codex" / "skills", "dup")
+    _write_skill(home / ".agents" / "skills", "dup")
+    _write_skill(ws / ".agents" / "skills", "dup")
+
+    out = [s for s in resolve_harness_skills(_ctx(ws, home), "codex-native") if s.name == "dup"]
+    assert len(out) == 1
+    assert out[0].skill_dir is not None
+    assert out[0].skill_dir.resolve() == (home / ".codex" / "skills" / "dup").resolve()
+
+
+def test_codex_menu_filter_selects_from_agents_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A list filter selects names from the new tiers; ``none`` is hermetic."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    _write_skill(ws / ".agents" / "skills", "repo-skill")
+    _write_skill(home / ".agents" / "skills", "plan")
+
+    names = [
+        s.name for s in resolve_harness_skills(_ctx(ws, home, ["repo-skill"]), "codex-native")
+    ]
+    assert names == ["repo-skill"]
+    none_names = [s.name for s in resolve_harness_skills(_ctx(ws, home, "none"), "codex-native")]
+    assert "repo-skill" not in none_names
+    assert "plan" not in none_names
+
+
+def test_codex_menu_tolerates_unreadable_marker_and_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable ``.git`` or skills tier counts as absent, like Codex's own stat."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    _write_skill(ws / ".agents" / "skills", "ws-skill")
+    _write_skill(home / ".agents" / "skills", "plan")
+
+    real_stat = os.stat
+    denied = {str(ws / ".git"), str(ws / ".agents" / "skills")}
+
+    def _stat(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path) in denied:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("os.stat", _stat)
+    names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "codex-native")]
+    assert "plan" in names
