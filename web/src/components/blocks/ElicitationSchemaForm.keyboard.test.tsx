@@ -121,4 +121,28 @@ describe("ElicitationSchemaForm — keyboard", () => {
     expect(fireEvent.keyDown(force, { key: " ", code: "Space" })).toBe(true);
     expect(fireEvent.keyDown(force, { key: "Tab", code: "Tab" })).toBe(true);
   });
+
+  it("returns focus to the composer for a keyboard-activated Submit", () => {
+    const { onSubmit } = renderForm();
+    enterCard();
+    answerRequiredFields();
+
+    fireEvent.click(screen.getByTestId("elicitation-schema-submit"), { detail: 0 });
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(screen.getByTestId("composer"));
+  });
+
+  it("leaves mouse-click focus alone on Submit", () => {
+    const { onSubmit } = renderForm();
+    enterCard();
+    answerRequiredFields();
+    const branch = screen.getByLabelText(/Release branch/);
+
+    fireEvent.click(screen.getByTestId("elicitation-schema-submit"), { detail: 1 });
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(branch);
+    expect(document.activeElement).not.toBe(screen.getByTestId("composer"));
+  });
 });

@@ -4,7 +4,7 @@
 // bare Enter, Alt/Shift-modified Enter, and a chord landing in a text field
 // that holds a draft (a send intent, not a verdict).
 
-import { renderHook } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitApproval = vi.fn();
@@ -13,6 +13,8 @@ vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: () => ({ blocks, submitApproval }) },
 }));
 
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
+import { castAskUserQuestionPayload } from "@/lib/askUserQuestion";
 import { useApproveHotkey } from "./useApproveHotkey";
 
 /** Dispatch a keydown that reaches window from body (default: Cmd+Enter). */
@@ -32,6 +34,7 @@ beforeEach(() => {
   blocks = [];
 });
 afterEach(() => {
+  cleanup();
   blocks = [];
 });
 
@@ -245,5 +248,43 @@ describe("useApproveHotkey", () => {
     } finally {
       ta.remove();
     }
+  });
+
+  it("yields to a question card so primary+Enter advances it instead of accepting the approval", () => {
+    // A plain approval newer than the card must not win while the user is
+    // answering: the card's own binding owns ⌘↵ there.
+    blocks = [
+      { type: "elicitation", elicitationId: "question", status: "pending", askUserQuestion: {} },
+      { type: "elicitation", elicitationId: "plain", status: "pending" },
+    ];
+    const payload = castAskUserQuestionPayload({
+      questions: [
+        { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+        { question: "Second?", options: [{ label: "C" }] },
+      ],
+    });
+    if (payload === null) throw new Error("expected a payload");
+
+    function ApproveHost() {
+      useApproveHotkey(false);
+      return null;
+    }
+    render(
+      <>
+        <AskUserQuestionForm
+          questions={payload.questions}
+          onSubmit={() => {}}
+          onReject={() => {}}
+        />
+        <ApproveHost />
+      </>,
+    );
+
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", ctrlKey: true });
+
+    expect(submitApproval).not.toHaveBeenCalled();
+    expect(screen.getByTestId("ask-user-question-progress")).toHaveTextContent("Question 2 of 2");
   });
 });

@@ -144,8 +144,9 @@ describe("useFocusQuestionCardHotkey", () => {
       common: [{ code: "KeyP", modifiers: ["control", "shift"] }],
     });
 
-    pressFocusChord();
+    const old = pressFocusChord();
     expect(enter).not.toHaveBeenCalled();
+    expect(old.defaultPrevented).toBe(false);
 
     const rebound = pressFocusChord({ code: "KeyP", key: "P" });
     expect(enter).toHaveBeenCalledTimes(1);
@@ -280,6 +281,107 @@ describe("targetQuestionCard order", () => {
 
     expect(enterB).toHaveBeenCalledTimes(1);
     expect(enterA).not.toHaveBeenCalled();
+  });
+
+  it("picks the newest card of the focused pane over a touched card in another pane", () => {
+    const enterOld = vi.fn();
+    const enterNew = vi.fn();
+    const enterSide = vi.fn();
+    render(
+      <>
+        <Pane composer="main-composer">
+          <QuestionCard id="main-old" enter={enterOld} />
+          <QuestionCard id="main-new" enter={enterNew} />
+        </Pane>
+        <Pane composer="side-composer">
+          <QuestionCard id="side-touched" enter={enterSide} />
+        </Pane>
+        <Host />
+      </>,
+    );
+    fireEvent.pointerDown(screen.getByTestId("side-touched"));
+
+    screen.getByTestId("main-composer").focus();
+    pressFocusChord();
+
+    expect(enterNew).toHaveBeenCalledTimes(1);
+    expect(enterOld).not.toHaveBeenCalled();
+    expect(enterSide).not.toHaveBeenCalled();
+  });
+
+  it("keeps the touched card when a newer one mounts in the same pane mid-answer", () => {
+    const enterA = vi.fn();
+    const enterB = vi.fn();
+    const layout = (showB: boolean) => (
+      <Pane composer="composer">
+        <QuestionCard id="card-a" enter={enterA} />
+        {showB && <QuestionCard id="card-b" enter={enterB} />}
+      </Pane>
+    );
+    const view = render(
+      <>
+        {layout(false)}
+        <Host />
+      </>,
+    );
+    fireEvent.pointerDown(screen.getByTestId("card-a"));
+
+    view.rerender(
+      <>
+        {layout(true)}
+        <Host />
+      </>,
+    );
+    screen.getByTestId("composer").focus();
+    pressFocusChord();
+
+    expect(enterA).toHaveBeenCalledTimes(1);
+    expect(enterB).not.toHaveBeenCalled();
+  });
+});
+
+describe("registry cleanup", () => {
+  it("never returns a card that has unmounted", () => {
+    const enterA = vi.fn();
+    const enterB = vi.fn();
+    const layout = (showB: boolean) => (
+      <Pane composer="composer">
+        <QuestionCard id="card-a" enter={enterA} />
+        {showB && <QuestionCard id="card-b" enter={enterB} />}
+      </Pane>
+    );
+    const view = render(
+      <>
+        {layout(true)}
+        <Host />
+      </>,
+    );
+
+    view.rerender(
+      <>
+        {layout(false)}
+        <Host />
+      </>,
+    );
+    screen.getByTestId("composer").focus();
+    pressFocusChord();
+
+    expect(enterA).toHaveBeenCalledTimes(1);
+    expect(enterB).not.toHaveBeenCalled();
+  });
+
+  it("removes the document pointerdown listener with the last card", () => {
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    const view = render(<QuestionCard id="card-a" enter={vi.fn()} />);
+
+    expect(addListener).toHaveBeenCalledWith("pointerdown", expect.any(Function), true);
+
+    view.unmount();
+
+    expect(removeListener).toHaveBeenCalledWith("pointerdown", expect.any(Function), true);
+    addListener.mockRestore();
+    removeListener.mockRestore();
   });
 });
 

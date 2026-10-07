@@ -221,7 +221,7 @@ export function AskUserQuestionForm({
     if (!keyboardActive) return;
     rootRef.current
       ?.querySelector<HTMLElement>('[data-highlighted="true"]')
-      ?.scrollIntoView?.({ block: "nearest" });
+      ?.scrollIntoView({ block: "nearest" });
   }, [keyboardActive, highlight, currentIndex]);
 
   // Re-render on preference writes, so the hint line follows live bindings.
@@ -329,6 +329,24 @@ export function AskUserQuestionForm({
     onSubmit(finalAnswers);
   };
 
+  // A keyboard-driven submit / cancel leaves the card first, so focus lands in
+  // the composer instead of falling to <body> when the card unmounts.
+  const submitAndLeave = () => {
+    leaveQuestionCard(rootRef.current);
+    handleSubmit();
+  };
+
+  const rejectAndLeave = () => {
+    leaveQuestionCard(rootRef.current);
+    onReject();
+  };
+
+  const abortAndLeave = () => {
+    if (!onAbort) return;
+    leaveQuestionCard(rootRef.current);
+    onAbort();
+  };
+
   const focusCustomInput = () => {
     rootRef.current
       ?.querySelector<HTMLTextAreaElement>('[data-testid="ask-user-question-custom-input"]')
@@ -374,10 +392,7 @@ export function AskUserQuestionForm({
       return;
     }
     if (allAnswered) {
-      // Leave before the card unmounts, so focus lands in the composer rather
-      // than falling to <body>.
-      leaveQuestionCard(rootRef.current);
-      handleSubmit();
+      submitAndLeave();
       return;
     }
     const unanswered = questions.findIndex((q) => {
@@ -477,14 +492,10 @@ export function AskUserQuestionForm({
         }
         return;
       case "questionCardCancel":
-        leaveQuestionCard(rootRef.current);
-        onReject();
+        rejectAndLeave();
         return;
       case "questionCardCancelAndInterrupt":
-        if (onAbort) {
-          leaveQuestionCard(rootRef.current);
-          onAbort();
-        }
+        abortAndLeave();
         return;
     }
   };
@@ -666,11 +677,14 @@ export function AskUserQuestionForm({
         )}
       </fieldset>
 
+      {/* Keyboard-activated buttons (click detail 0) keep focus continuity;
+          a mouse click leaves focus alone (touch devices would raise the
+          keyboard). */}
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
           variant="outline"
-          onClick={() => goToQuestion(currentIndex - 1, false)}
+          onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
           disabled={isFirst}
           data-testid="ask-user-question-prev"
           componentId="question.prev"
@@ -682,7 +696,7 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => goToQuestion(currentIndex + 1, false)}
+            onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
             data-testid="ask-user-question-next"
             componentId="question.next"
           >
@@ -693,7 +707,7 @@ export function AskUserQuestionForm({
         {isLast && (
           <Button
             size="sm"
-            onClick={handleSubmit}
+            onClick={(event) => (event.detail === 0 ? submitAndLeave() : handleSubmit())}
             disabled={!allAnswered}
             data-testid="ask-user-question-submit"
             componentId="question.submit"
@@ -705,7 +719,7 @@ export function AskUserQuestionForm({
         <Button
           size="sm"
           variant="outline"
-          onClick={onReject}
+          onClick={(event) => (event.detail === 0 ? rejectAndLeave() : onReject())}
           className="ml-auto"
           componentId="question.cancel"
         >
@@ -716,7 +730,7 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             variant="outline"
-            onClick={onAbort}
+            onClick={(event) => (event.detail === 0 ? abortAndLeave() : onAbort())}
             data-testid="ask-user-question-abort"
             componentId="question.abort"
             aria-label="Cancel & interrupt"

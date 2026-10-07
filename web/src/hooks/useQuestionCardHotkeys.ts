@@ -1,11 +1,12 @@
 // Keyboard focus for pending question cards.
 //
 // Every mounted card root registers itself here. The focus chord picks the
-// card the user is looking at — focus inside it, else the card nearest the
-// reference node in the DOM, else the last touched, else the newest — and
-// calls that card's enter(). leaveQuestionCard() returns focus to the card's
-// own composer textarea, or to wherever focus came from when the card has
-// none (the Inbox).
+// card the user is looking at — focus inside it; else the nearest set to the
+// reference node (cards tied at the deepest common ancestor), narrowed by
+// last touched, then newest; with no reference node every card is a candidate
+// — and calls that card's enter(). leaveQuestionCard() returns focus to the
+// card's own composer textarea, or to wherever focus came from when the card
+// has none (the Inbox).
 
 import { useEffect, useRef, type RefObject } from "react";
 
@@ -63,22 +64,22 @@ function commonAncestorDepth(element: HTMLElement, reference: Node): number | nu
   return null;
 }
 
-function nearest<T>(items: T[], elementOf: (item: T) => HTMLElement, reference: Node): T | null {
-  let best: T | null = null;
+/** All items whose deepest common ancestor with the reference is deepest. */
+function nearestSet<T>(items: T[], elementOf: (item: T) => HTMLElement, reference: Node): T[] {
+  const result: T[] = [];
   let bestDepth = Number.POSITIVE_INFINITY;
-  let tied = false;
   for (const item of items) {
     const depth = commonAncestorDepth(elementOf(item), reference);
     if (depth === null) continue;
     if (depth < bestDepth) {
-      best = item;
       bestDepth = depth;
-      tied = false;
+      result.length = 0;
+      result.push(item);
     } else if (depth === bestDepth) {
-      tied = true;
+      result.push(item);
     }
   }
-  return tied ? null : best;
+  return result;
 }
 
 function highest(
@@ -93,10 +94,11 @@ function highest(
 }
 
 /**
- * The pending card the focus chord should enter: the one containing focus,
- * else the unique nearest to the reference node, else the last touched, else
- * the newest. Two candidates equally near a reference tie, so a card arriving
- * mid-answer in the same pane loses to the one being touched.
+ * The pending card the focus chord should enter: the one containing focus;
+ * else among the cards nearest the reference node (all tied at the deepest
+ * common ancestor) the last touched, else the newest; with no reference node
+ * every card is a candidate. A touched card in another pane is never a
+ * candidate, so it cannot win over cards in the focused pane.
  */
 export function targetQuestionCard(): { element: HTMLElement; enter: () => void } | null {
   if (cardEntries.length === 0) return null;
@@ -112,23 +114,22 @@ export function targetQuestionCard(): { element: HTMLElement; enter: () => void 
       : lastPointerDownTarget instanceof Node
         ? lastPointerDownTarget
         : null;
-  if (reference) {
-    const nearestCard = nearest(cardEntries, (entry) => entry.element, reference);
-    if (nearestCard) return nearestCard;
-  }
+  const candidates = reference
+    ? nearestSet(cardEntries, (entry) => entry.element, reference)
+    : cardEntries;
 
   const touched = highest(
-    cardEntries.filter((entry) => entry.touchedSeq !== null),
+    candidates.filter((entry) => entry.touchedSeq !== null),
     (entry) => entry.touchedSeq ?? 0,
   );
   if (touched) return touched;
-  return highest(cardEntries, (entry) => entry.mountedSeq);
+  return highest(candidates, (entry) => entry.mountedSeq);
 }
 
-/** Nearest composer textarea to the card — its own pane's, never another's. */
+/** First of the nearest set still returns one textarea — the card's own pane's. */
 function nearestComposerTextarea(card: HTMLElement): HTMLElement | null {
   const textareas = Array.from(document.querySelectorAll<HTMLElement>(COMPOSER_TEXTAREA_SELECTOR));
-  return nearest(textareas, (textarea) => textarea, card);
+  return nearestSet(textareas, (textarea) => textarea, card)[0] ?? null;
 }
 
 /**

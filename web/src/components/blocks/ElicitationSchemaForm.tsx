@@ -254,16 +254,25 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
     hintSegment(shortcutKeys("questionCardLeave"), "leave"),
   ].filter((part): part is string => part !== null);
 
+  // A keyboard-driven submit / reject leaves the card first, so focus lands in
+  // the composer instead of falling to <body> when the card unmounts.
+  const submitAndLeave = () => {
+    leaveQuestionCard(rootRef.current);
+    onSubmit(toContent(fields, answers));
+  };
+
+  const rejectAndLeave = () => {
+    leaveQuestionCard(rootRef.current);
+    onReject();
+  };
+
   const handleKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.nativeEvent.isComposing) return;
     if (eventMatchesShortcutAction(e, "questionCardNextOrSubmit")) {
       e.preventDefault();
       e.stopPropagation();
       if (!complete) return;
-      // Leave before the card unmounts, so focus lands in the composer rather
-      // than falling to <body>.
-      leaveQuestionCard(rootRef.current);
-      onSubmit(toContent(fields, answers));
+      submitAndLeave();
       return;
     }
     if (eventMatchesShortcutAction(e, "questionCardLeave")) {
@@ -346,17 +355,26 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
           </div>
         );
       })}
+      {/* Keyboard-activated buttons (click detail 0) leave the card first; a
+          mouse click leaves focus alone (touch devices would raise the
+          keyboard). */}
       <div className="flex flex-wrap gap-2 pt-1">
         <Button
           size="sm"
           disabled={!complete}
           data-testid="elicitation-schema-submit"
-          onClick={() => onSubmit(toContent(fields, answers))}
+          onClick={(event) =>
+            event.detail === 0 ? submitAndLeave() : onSubmit(toContent(fields, answers))
+          }
         >
           <CheckIcon className="mr-1 size-3.5" />
           Submit
         </Button>
-        <Button size="sm" variant="outline" onClick={onReject}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={(event) => (event.detail === 0 ? rejectAndLeave() : onReject())}
+        >
           <XIcon className="mr-1 size-3.5" />
           Reject
         </Button>

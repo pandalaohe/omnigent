@@ -9,7 +9,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
 import { type ClaudeQuestion, castAskUserQuestionPayload } from "@/lib/askUserQuestion";
-import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { type ShortcutActionId, writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { AskUserQuestionForm } from "./AskUserQuestionForm";
 
@@ -176,6 +176,124 @@ function progress(): string {
 const TWO_QUESTIONS: QuestionSpec[] = [
   { id: "q1", question: "First?", options: [{ label: "A" }, { label: "B" }] },
   { id: "q2", question: "Second?", options: [{ label: "C" }, { label: "D" }] },
+];
+
+interface RebindHarness {
+  press: (init: KeyboardEventInit) => boolean;
+  hint: () => HTMLElement;
+  progress: () => string;
+  highlighted: () => number;
+  composer: HTMLElement;
+  onReject: ReturnType<typeof vi.fn>;
+  onAbort: ReturnType<typeof vi.fn>;
+}
+
+const REBIND_CASES: {
+  action: ShortcutActionId;
+  code: string;
+  run: (h: RebindHarness) => void;
+}[] = [
+  {
+    action: "questionCardPreviousOption",
+    code: "KeyA",
+    run: (h) => {
+      h.press({ key: "ArrowDown", code: "ArrowDown" });
+      expect(h.highlighted()).toBe(1);
+      h.press({ key: "ArrowUp", code: "ArrowUp" });
+      expect(h.highlighted()).toBe(1);
+      h.press({ key: "a", code: "KeyA" });
+      expect(h.highlighted()).toBe(0);
+      expect(h.hint()).toHaveTextContent("A ↓ move");
+    },
+  },
+  {
+    action: "questionCardNextOption",
+    code: "KeyB",
+    run: (h) => {
+      h.press({ key: "ArrowDown", code: "ArrowDown" });
+      expect(h.highlighted()).toBe(0);
+      h.press({ key: "b", code: "KeyB" });
+      expect(h.highlighted()).toBe(1);
+      expect(h.hint()).toHaveTextContent("↑ B move");
+    },
+  },
+  {
+    action: "questionCardSelectOption",
+    code: "KeyC",
+    run: (h) => {
+      h.press({ key: " ", code: "Space" });
+      expect(screen.getAllByRole("radio")[0]).not.toBeChecked();
+      h.press({ key: "c", code: "KeyC" });
+      expect(screen.getAllByRole("radio")[0]).toBeChecked();
+      expect(h.hint()).toHaveTextContent("C select");
+    },
+  },
+  {
+    action: "questionCardNextOrSubmit",
+    code: "KeyD",
+    run: (h) => {
+      h.press({ key: "Enter", code: "Enter", ctrlKey: true });
+      expect(h.progress()).toContain("Question 1 of 2");
+      h.press({ key: "d", code: "KeyD" });
+      expect(h.progress()).toContain("Question 2 of 2");
+      expect(h.hint()).toHaveTextContent("D next / submit");
+    },
+  },
+  {
+    action: "questionCardPreviousQuestion",
+    code: "KeyE",
+    run: (h) => {
+      h.press({ key: "ArrowRight", code: "ArrowRight" });
+      expect(h.progress()).toContain("Question 2 of 2");
+      h.press({ key: "ArrowLeft", code: "ArrowLeft" });
+      expect(h.progress()).toContain("Question 2 of 2");
+      h.press({ key: "e", code: "KeyE" });
+      expect(h.progress()).toContain("Question 1 of 2");
+      expect(h.hint()).toHaveTextContent("E → question");
+    },
+  },
+  {
+    action: "questionCardNextQuestion",
+    code: "KeyF",
+    run: (h) => {
+      h.press({ key: "ArrowRight", code: "ArrowRight" });
+      expect(h.progress()).toContain("Question 1 of 2");
+      h.press({ key: "f", code: "KeyF" });
+      expect(h.progress()).toContain("Question 2 of 2");
+      expect(h.hint()).toHaveTextContent("← F question");
+    },
+  },
+  {
+    action: "questionCardLeave",
+    code: "KeyG",
+    run: (h) => {
+      expect(h.hint()).toHaveTextContent("G leave");
+      expect(h.press({ key: "Escape", code: "Escape" })).toBe(true);
+      expect(document.activeElement).toBe(card());
+      h.press({ key: "g", code: "KeyG" });
+      expect(document.activeElement).toBe(h.composer);
+    },
+  },
+  {
+    action: "questionCardCancel",
+    code: "KeyH",
+    run: (h) => {
+      expect(h.hint()).toHaveTextContent("H cancel");
+      h.press({ key: "h", code: "KeyH" });
+      expect(h.onReject).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(h.composer);
+    },
+  },
+  {
+    action: "questionCardCancelAndInterrupt",
+    code: "KeyI",
+    run: (h) => {
+      expect(h.hint()).toHaveTextContent("I cancel & interrupt");
+      h.press({ key: "i", code: "KeyI" });
+      expect(h.onAbort).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(h.composer);
+    },
+  },
 ];
 
 describe("AskUserQuestionForm — keyboard", () => {
@@ -386,22 +504,23 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(progress()).toContain("Question 1 of 2");
   });
 
-  it("keeps the keys working after primary+Enter from the custom box", () => {
+  it("keeps the keys working after primary+Enter from the focused custom box", () => {
     renderKeyboardForm(questionsOf(TWO_QUESTIONS));
     focusCard();
 
     pressCard({ key: "ArrowDown", code: "ArrowDown" });
     pressCard({ key: "ArrowDown", code: "ArrowDown" });
     pressCard({ key: " ", code: "Space" });
-    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
-      target: { value: "typed" },
-    });
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    expect(document.activeElement).toBe(textarea);
+    fireEvent.change(textarea, { target: { value: "typed" } });
 
-    pressCard({ key: "Enter", code: "Enter", ctrlKey: true });
+    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", ctrlKey: true });
     expect(progress()).toContain("Question 2 of 2");
     expect(document.activeElement).toBe(card());
 
     pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    expect(highlightedIndex()).toBe(1);
     pressCard({ key: " ", code: "Space" });
     expect(screen.getAllByRole("radio")[1]).toBeChecked();
   });
@@ -496,5 +615,72 @@ describe("AskUserQuestionForm — keyboard", () => {
 
     pressCard({ key: "i", code: "KeyI" });
     expect(onAbort).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(REBIND_CASES)(
+    "rebinds $action to $code: old key inert, new key acts, hint follows",
+    ({ action, code, run }) => {
+      writeShortcutPreference(action, { common: [{ code, modifiers: [] }] });
+      const onAbort = vi.fn();
+      const { onReject } = renderKeyboardForm(questionsOf(TWO_QUESTIONS), { onAbort });
+      focusCard();
+
+      run({
+        press: pressCard,
+        hint: () => screen.getByTestId("ask-user-question-hint"),
+        progress,
+        highlighted: highlightedIndex,
+        composer: screen.getByTestId("composer"),
+        onReject,
+        onAbort,
+      });
+    },
+  );
+
+  it("keeps focus on the card root for a keyboard-activated Next", () => {
+    renderKeyboardForm(questionsOf(TWO_QUESTIONS));
+    focusCard();
+
+    fireEvent.click(screen.getByTestId("ask-user-question-next"), { detail: 0 });
+
+    expect(progress()).toContain("Question 2 of 2");
+    expect(document.activeElement).toBe(card());
+  });
+
+  it("returns focus to the composer for a keyboard-activated Submit", () => {
+    const { onSubmit } = renderKeyboardForm(
+      questionsOf([{ id: "q1", question: "Only?", options: [{ label: "A" }] }]),
+    );
+    focusCard();
+    pressCard({ key: " ", code: "Space" });
+
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"), { detail: 0 });
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(screen.getByTestId("composer"));
+  });
+
+  it("returns focus to the composer for a keyboard-activated Cancel", () => {
+    const { onReject } = renderKeyboardForm(questionsOf(TWO_QUESTIONS));
+    focusCard();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }), { detail: 0 });
+
+    expect(onReject).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(screen.getByTestId("composer"));
+  });
+
+  it("leaves focus alone for a mouse-click Submit", () => {
+    const { onSubmit } = renderKeyboardForm(
+      questionsOf([{ id: "q1", question: "Only?", options: [{ label: "A" }] }]),
+    );
+    focusCard();
+    pressCard({ key: " ", code: "Space" });
+
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"), { detail: 1 });
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(card());
+    expect(document.activeElement).not.toBe(screen.getByTestId("composer"));
   });
 });
