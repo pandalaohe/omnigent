@@ -24,6 +24,7 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.errors import OmnigentError
+from omnigent.member_snapshot import MEMBER_LOCK_LABEL_KEY
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -1316,6 +1317,7 @@ async def test_fork_switch_drops_member_snapshot_labels() -> None:
         labels={
             "omnigent.member.researcher": "{}",
             "omnigent.member.custom-reviewer": "{}",
+            MEMBER_LOCK_LABEL_KEY: "true",
             "omnigent.ui": "terminal",
         }
     )
@@ -1339,6 +1341,7 @@ async def test_fork_switch_drops_member_snapshot_labels() -> None:
     assert {
         "omnigent.member.researcher",
         "omnigent.member.custom-reviewer",
+        MEMBER_LOCK_LABEL_KEY,
     } <= set(dropped)
     assert "omnigent.ui" not in dropped
 

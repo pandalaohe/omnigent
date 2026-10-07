@@ -24,7 +24,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.member_snapshot import member_label_key, parse_member_entry
+from omnigent.member_snapshot import MEMBER_LOCK_LABEL_KEY, member_label_key, parse_member_entry
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -357,6 +357,7 @@ async def test_fire_writes_member_snapshot_labels(
     assert len(dispatched) == 1
     session = library_server.conversations.get_conversation(dispatched[0].id)
     assert session is not None
+    assert session.labels[MEMBER_LOCK_LABEL_KEY] == "true"
     lead = parse_member_entry(session.labels[member_label_key("library-runner")])
     worker = parse_member_entry(session.labels[member_label_key("researcher")])
     assert lead == {
@@ -365,7 +366,6 @@ async def test_fire_writes_member_snapshot_labels(
         "model": "lead-model",
         "effort": None,
         "lead": True,
-        "locked": True,
     }
     assert worker == {
         "host": _HOST_ID,
@@ -373,7 +373,6 @@ async def test_fire_writes_member_snapshot_labels(
         "model": "worker-model",
         "effort": None,
         "lead": False,
-        "locked": True,
     }
 
 

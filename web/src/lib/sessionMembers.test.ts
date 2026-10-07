@@ -67,6 +67,15 @@ describe("parseSessionMembers", () => {
     expect(members.map((member) => member.role)).toEqual(["ok"]);
   });
 
+  it("skips the session lock label beside the member entries", () => {
+    const members = parseSessionMembers({
+      [`${MEMBER_KEY}lead`]: snapshot({ lead: true }),
+      [`${MEMBER_KEY}reviewer`]: snapshot(),
+      [`${MEMBER_KEY}:locked`]: "true",
+    });
+    expect(members.map((member) => member.role)).toEqual(["lead", "reviewer"]);
+  });
+
   it("tolerates missing optional fields and non-string values", () => {
     const members = parseSessionMembers({
       [`${MEMBER_KEY}lead`]: JSON.stringify({ harness: "codex", lead: true, model: 7 }),

@@ -21,14 +21,15 @@ import pytest
 
 from omnigent.member_snapshot import (
     LIBRARY_AGENT_TEMPLATE_LABEL_KEY,
-    MEMBER_LABEL_VALUE_MAX_CHARS,
+    MEMBER_LOCK_LABEL_KEY,
     MEMBER_LOCKED_FIELD,
     encode_member_entry,
+    frozen_member_lock_label,
     launched_from_library_agent,
     member_entries_from_labels,
     member_label_key,
     member_lock_applies,
-    unlocked_legacy_member_labels,
+    session_member_lock,
 )
 
 _MEMBER_MODEL = "databricks-claude-haiku-4-5"
@@ -74,15 +75,17 @@ def _member_labels(
     role: str = "worker",
     *,
     template_id: str | None = "ca_test_agent",
+    locked: bool = True,
     **entry: object,
 ) -> dict[str, str]:
     """One member snapshot label for *role* with sensible overrides.
 
-    The entry defaults to ``locked: True`` (a session launched from a saved
-    library agent).
+    The session lock label fixes the lock (default: a session launched from a
+    saved library agent); the entry itself carries no ``locked`` field.
 
     :param template_id: Value of the library-agent template label; ``None``
         omits it (a session not started from a saved library joint agent).
+    :param locked: Value of the session lock label.
     """
     payload: dict[str, object] = {
         "host": None,
@@ -90,10 +93,12 @@ def _member_labels(
         "model": _MEMBER_MODEL,
         "effort": "high",
         "lead": False,
-        MEMBER_LOCKED_FIELD: True,
     }
     payload.update(entry)
-    labels = {member_label_key(role): encode_member_entry(payload)}
+    labels = {
+        member_label_key(role): encode_member_entry(payload),
+        MEMBER_LOCK_LABEL_KEY: "true" if locked else "false",
+    }
     if template_id is not None:
         labels[LIBRARY_AGENT_TEMPLATE_LABEL_KEY] = template_id
     return labels
@@ -708,64 +713,75 @@ _LEGACY_MEMBER_ENTRY: dict[str, Any] = {
 }
 
 
-def test_unlocked_legacy_member_labels_freezes_a_pre_field_entry() -> None:
-    """A legacy entry gains ``locked: false`` without other field changes."""
+def test_frozen_member_lock_label_freezes_a_pre_marker_session() -> None:
+    """A non-library legacy session gains marker ``false`` before the stamp."""
     labels = {member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY)}
 
-    rewritten = unlocked_legacy_member_labels(labels)
-
-    expected = {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}
-    assert rewritten == {member_label_key("worker"): encode_member_entry(expected)}
-    entries = member_entries_from_labels(
-        {**labels, **rewritten, LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved"}
-    )
-    assert entries == {"worker": expected}
+    assert frozen_member_lock_label(labels) == {MEMBER_LOCK_LABEL_KEY: "false"}
 
 
-def test_unlocked_legacy_member_labels_skips_a_library_agent_session() -> None:
-    """A ``ca_`` launch already resolves members to locked; nothing to freeze."""
+def test_frozen_member_lock_label_follows_a_library_template() -> None:
+    """A legacy session already launched from a ``ca_`` agent freezes ``true``."""
     labels = {
         member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY),
         LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved",
     }
 
-    assert unlocked_legacy_member_labels(labels) == {}
+    assert frozen_member_lock_label(labels) == {MEMBER_LOCK_LABEL_KEY: "true"}
 
 
-def test_unlocked_legacy_member_labels_keeps_explicit_lock_values() -> None:
-    """Entries already carrying ``locked`` are left untouched, either value."""
-    labels = {
-        member_label_key("lead"): encode_member_entry(
-            {**_LEGACY_MEMBER_ENTRY, "lead": True, MEMBER_LOCKED_FIELD: True}
-        ),
-        member_label_key("worker"): encode_member_entry(
-            {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}
-        ),
+def test_frozen_member_lock_label_is_a_noop_with_a_marker_or_no_members() -> None:
+    """An existing marker wins; a session with no member labels gets nothing."""
+    marked = {
+        MEMBER_LOCK_LABEL_KEY: "false",
+        member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY),
     }
 
-    assert unlocked_legacy_member_labels(labels) == {}
+    assert frozen_member_lock_label(marked) == {}
+    assert frozen_member_lock_label({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved"}) == {}
+    assert frozen_member_lock_label(None) == {}
 
 
-def test_unlocked_legacy_member_labels_ignores_malformed_and_non_member_labels() -> None:
-    """Non-member keys and values that are not a JSON object yield nothing."""
-    labels = {
-        "unrelated": "1",
-        LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin",
-        member_label_key("lead"): "[]",
-        member_label_key("worker"): "{not json",
-    }
-
-    assert unlocked_legacy_member_labels(labels) == {}
-
-
-def test_unlocked_legacy_member_labels_drops_an_over_cap_rewrite() -> None:
-    """A rewrite that would overflow the 256-char label is left out."""
-    entry = {**_LEGACY_MEMBER_ENTRY, "model": "m" * 165}
-    value = encode_member_entry(entry)
-    assert len(value) <= MEMBER_LABEL_VALUE_MAX_CHARS
+def test_session_member_lock_reads_the_marker_over_the_template() -> None:
+    """The marker wins either way; absent, the library-Agent template decides."""
     assert (
-        len(encode_member_entry({**entry, MEMBER_LOCKED_FIELD: False}))
-        > MEMBER_LABEL_VALUE_MAX_CHARS
+        session_member_lock(
+            {MEMBER_LOCK_LABEL_KEY: "true", LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin"}
+        )
+        is True
     )
+    assert (
+        session_member_lock(
+            {MEMBER_LOCK_LABEL_KEY: "false", LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved"}
+        )
+        is False
+    )
+    assert session_member_lock({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ca_saved"}) is True
+    assert session_member_lock({LIBRARY_AGENT_TEMPLATE_LABEL_KEY: "ag_builtin"}) is False
+    assert session_member_lock(None) is False
 
-    assert unlocked_legacy_member_labels({member_label_key("worker"): value}) == {}
+
+def test_member_entries_from_labels_projects_the_session_lock() -> None:
+    """The marker key is no role; a missing entry field takes the marker value."""
+    labels = {
+        MEMBER_LOCK_LABEL_KEY: "false",
+        member_label_key("worker"): encode_member_entry(_LEGACY_MEMBER_ENTRY),
+    }
+
+    entries = member_entries_from_labels(labels)
+
+    assert entries == {"worker": {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: False}}
+
+
+def test_member_entries_from_labels_keeps_an_entry_own_lock_field() -> None:
+    """An entry that already carries ``locked`` wins over the session marker."""
+    labels = {
+        MEMBER_LOCK_LABEL_KEY: "false",
+        member_label_key("worker"): encode_member_entry(
+            {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: True}
+        ),
+    }
+
+    entries = member_entries_from_labels(labels)
+
+    assert entries == {"worker": {**_LEGACY_MEMBER_ENTRY, MEMBER_LOCKED_FIELD: True}}

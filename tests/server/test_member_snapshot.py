@@ -25,12 +25,19 @@ import pytest_asyncio
 from fastapi import FastAPI
 from starlette.requests import HTTPConnection
 
-from omnigent.member_snapshot import MEMBER_LABEL_PREFIX, parse_member_entry
+from omnigent.member_snapshot import (
+    MEMBER_LABEL_PREFIX,
+    MEMBER_LOCK_LABEL_KEY,
+    encode_member_entry,
+    member_label_key,
+    parse_member_entry,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import AuthProvider
 from omnigent.server.custom_agents_store import CustomAgentsStore
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -197,7 +204,7 @@ async def _member_labels_after_create(
     bundle_bytes: bytes,
     *,
     metadata: dict[str, object] | None = None,
-) -> dict[str, dict[str, object]]:
+) -> tuple[dict[str, dict[str, object]], dict[str, str]]:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=member_server.app), base_url="http://test"
     ) as client:
@@ -206,12 +213,12 @@ async def _member_labels_after_create(
     assert conversation is not None
     entries: dict[str, dict[str, object]] = {}
     for key, value in conversation.labels.items():
-        if not key.startswith(MEMBER_LABEL_PREFIX):
+        if not key.startswith(MEMBER_LABEL_PREFIX) or key == MEMBER_LOCK_LABEL_KEY:
             continue
         parsed = parse_member_entry(value)
         assert parsed is not None
         entries[key[len(MEMBER_LABEL_PREFIX) :]] = parsed
-    return entries
+    return entries, dict(conversation.labels)
 
 
 _CATALOGS: dict[str, list[dict[str, object]]] = {
@@ -334,7 +341,7 @@ async def test_multipart_create_writes_one_label_per_member(
     _arm_host(member_server.hosts)
     _stub_catalog(monkeypatch)
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, labels = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries == {
         "custom-reviewer": {
@@ -343,7 +350,6 @@ async def test_multipart_create_writes_one_label_per_member(
             "model": "lead-model",
             "effort": "high",
             "lead": True,
-            "locked": False,
         },
         "researcher": {
             "host": _HOST_ID,
@@ -351,9 +357,9 @@ async def test_multipart_create_writes_one_label_per_member(
             "model": "worker-model",
             "effort": "medium",
             "lead": False,
-            "locked": False,
         },
     }
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "false"
 
 
 @pytest.mark.asyncio
@@ -363,7 +369,7 @@ async def test_one_member_bundle_writes_no_member_labels(
     """A 1-member Agent keeps its harness controls: no member snapshot at all."""
     _arm_host(member_server.hosts)
 
-    entries = await _member_labels_after_create(member_server, single_bundle())
+    entries, _ = await _member_labels_after_create(member_server, single_bundle())
 
     assert entries == {}
 
@@ -376,7 +382,7 @@ async def test_default_model_resolves_to_host_catalog_is_default(
     _arm_host(member_server.hosts)
     _stub_catalog(monkeypatch)
 
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server, joint_bundle(worker_model="default")
     )
 
@@ -397,7 +403,7 @@ async def test_missing_default_row_keeps_model_null(
         },
     )
 
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server, joint_bundle(worker_model="default")
     )
 
@@ -424,7 +430,7 @@ async def test_member_chain_keeps_saved_model_and_fills_unset_effort(
         },
     )
 
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server,
         joint_bundle(worker_effort=None),
         metadata={
@@ -457,7 +463,7 @@ async def test_chain_model_precedes_the_catalog_is_default_row(
         },
     )
 
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server,
         joint_bundle(worker_model="default"),
         metadata={
@@ -483,7 +489,7 @@ async def test_host_store_failure_still_writes_labels_without_availability(
 
     _member_snapshot_reads(monkeypatch, _BrokenHostStore())
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries == {
         "custom-reviewer": {
@@ -492,7 +498,6 @@ async def test_host_store_failure_still_writes_labels_without_availability(
             "model": "lead-model",
             "effort": "high",
             "lead": True,
-            "locked": False,
         },
         "researcher": {
             "host": _HOST_ID,
@@ -500,7 +505,6 @@ async def test_host_store_failure_still_writes_labels_without_availability(
             "model": "worker-model",
             "effort": "medium",
             "lead": False,
-            "locked": False,
         },
     }
 
@@ -519,7 +523,7 @@ async def test_catalog_lookup_failure_still_writes_declared_models(
 
     monkeypatch.setattr(helpers, "_host_model_options_via_registry", _broken_options)
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries["custom-reviewer"]["model"] == "lead-model"
     assert entries["researcher"]["model"] == "worker-model"
@@ -552,7 +556,7 @@ async def test_catalog_lookups_for_distinct_harnesses_run_concurrently(
 
     monkeypatch.setattr(helpers, "_host_model_options_via_registry", _gate)
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert sorted(started) == ["claude-sdk", "codex"]
     assert timed_out == []
@@ -562,7 +566,7 @@ async def test_catalog_lookups_for_distinct_harnesses_run_concurrently(
 @pytest.mark.asyncio
 async def test_hostless_default_model_is_null(member_server: _MemberServer) -> None:
     """A hostless create stores null, never the literal ``"default"``."""
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server, joint_bundle(worker_model="default"), metadata={}
     )
 
@@ -578,7 +582,7 @@ async def test_live_host_without_catalog_default_model_is_null(
     _arm_host(member_server.hosts)
     _stub_catalog(monkeypatch, {"codex": [{"id": "lead-model", "model": "lead-model"}]})
 
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server, joint_bundle(worker_model="default")
     )
 
@@ -594,7 +598,7 @@ async def test_offline_host_marks_every_member_host_offline(
     _arm_host(member_server.hosts)
     member_server.hosts.set_offline(_HOST_ID)
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries["custom-reviewer"]["unavailable"] == "host_offline"
     assert entries["researcher"]["unavailable"] == "host_offline"
@@ -614,7 +618,7 @@ async def test_unknown_host_marks_members_host_offline(
 
     _member_snapshot_reads(monkeypatch, _UnknownHostStore())
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries["researcher"]["unavailable"] == "host_offline"
 
@@ -640,7 +644,7 @@ async def test_unconfigured_harness_maps_false_to_reason_code(
 
     _member_snapshot_reads(monkeypatch, _ConfiguredHarnessStore())
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries["custom-reviewer"]["unavailable"] == "harness_not_configured"
     assert entries["researcher"]["unavailable"] == "binary-missing"
@@ -653,7 +657,7 @@ async def test_unreported_harness_is_not_unavailable(
     """A harness the host's readiness map omits stays unknown, not blocked."""
     _arm_host(member_server.hosts, configured_harnesses={"codex": True})
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert "unavailable" not in entries["researcher"]
 
@@ -671,7 +675,7 @@ async def test_explicit_model_missing_from_catalog_is_unavailable(
         },
     )
 
-    entries = await _member_labels_after_create(member_server, joint_bundle())
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
     assert entries["researcher"]["unavailable"] == "model_missing"
 
@@ -703,6 +707,64 @@ async def test_member_label_value_over_cap_is_a_400(
 
 
 @pytest.mark.asyncio
+async def test_member_label_value_near_cap_creates_through_http(
+    member_server: _MemberServer, client: httpx.AsyncClient
+) -> None:
+    """A member value near the 256-char cap still creates: the lock is a session label."""
+    _arm_host(member_server.hosts)
+    response = await _create(client, joint_bundle(worker_model="m" * 145))
+
+    conversation = member_server.conversations.get_conversation(response.json()["session_id"])
+    assert conversation is not None
+    labels = conversation.labels
+    assert 242 <= len(labels[member_label_key("researcher")]) <= 256
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "false"
+
+
+@pytest.mark.asyncio
+async def test_member_entry_at_the_value_cap_creates_with_the_session_lock() -> None:
+    """A member entry within 14 chars of the cap still fits: the lock is a
+    session label, not a field inside every entry."""
+    from omnigent.server.routes._sessions import helpers
+
+    model = "worker-model" + "x" * 153
+    expected_entry = {
+        "host": None,
+        "harness": "claude-sdk",
+        "model": model,
+        "effort": "medium",
+        "lead": False,
+    }
+    encoded = encode_member_entry(expected_entry)
+    assert 242 <= len(encoded) <= 256
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="lead",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="researcher",
+                executor=ExecutorSpec(
+                    type="omnigent",
+                    config={"harness": "claude-sdk"},
+                    model=model,
+                    reasoning_effort="medium",
+                ),
+            )
+        ],
+    )
+
+    for locked, marker in ((True, "true"), (False, "false")):
+        labels = await helpers._member_snapshot_labels(
+            spec, host_id=None, host_store=None, locked=locked
+        )
+        assert labels[member_label_key("researcher")] == encoded
+        assert labels[MEMBER_LOCK_LABEL_KEY] == marker
+
+
+@pytest.mark.asyncio
 async def test_client_seeded_member_label_is_rejected(
     client: httpx.AsyncClient,
 ) -> None:
@@ -727,7 +789,7 @@ async def test_manual_launch_agent_style_metadata_writes_member_labels(
 ) -> None:
     """A hostless create (the interactive shape without a host chip) stores the
     snapshot with a null host and no availability resolution."""
-    entries = await _member_labels_after_create(member_server, joint_bundle(), metadata={})
+    entries, _ = await _member_labels_after_create(member_server, joint_bundle(), metadata={})
 
     assert entries["researcher"] == {
         "host": None,
@@ -735,7 +797,6 @@ async def test_manual_launch_agent_style_metadata_writes_member_labels(
         "model": "worker-model",
         "effort": "medium",
         "lead": False,
-        "locked": False,
     }
 
 
@@ -758,7 +819,7 @@ async def test_member_host_decides_host_and_catalog_default(
     )
     _create_template(member_server.custom, "ca_joint", worker_host=_MEMBER_HOST)
 
-    entries = await _member_labels_after_create(
+    entries, labels = await _member_labels_after_create(
         member_server,
         joint_bundle(worker_model="default"),
         metadata=_template_metadata("ca_joint"),
@@ -770,7 +831,6 @@ async def test_member_host_decides_host_and_catalog_default(
         "model": "lead-model",
         "effort": "high",
         "lead": True,
-        "locked": True,
     }
     assert entries["researcher"] == {
         "host": _MEMBER_HOST,
@@ -778,8 +838,8 @@ async def test_member_host_decides_host_and_catalog_default(
         "model": "member-host-model",
         "effort": "medium",
         "lead": False,
-        "locked": True,
     }
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "true"
 
 
 @pytest.mark.asyncio
@@ -797,7 +857,7 @@ async def test_offline_member_host_marks_only_its_member(
     )
     _create_template(member_server.custom, "ca_joint", worker_host=_MEMBER_HOST)
 
-    entries = await _member_labels_after_create(
+    entries, _ = await _member_labels_after_create(
         member_server,
         joint_bundle(worker_model="default"),
         metadata=_template_metadata("ca_joint"),
@@ -846,7 +906,7 @@ async def test_failed_member_host_lookup_contributes_no_catalog_facts(
 
     # A "default" model stays null: the failed host's catalog default must not
     # leak into the snapshot.
-    default_entries = await _member_labels_after_create(
+    default_entries, default_labels = await _member_labels_after_create(
         member_server,
         joint_bundle(worker_model="default"),
         metadata=_template_metadata("ca_joint"),
@@ -858,12 +918,12 @@ async def test_failed_member_host_lookup_contributes_no_catalog_facts(
         "model": None,
         "effort": "medium",
         "lead": False,
-        "locked": True,
     }
+    assert default_labels[MEMBER_LOCK_LABEL_KEY] == "true"
 
     # An explicit model is kept as saved — never model_missing.
     calls.clear()
-    entries = await _member_labels_after_create(
+    entries, labels = await _member_labels_after_create(
         member_server, joint_bundle(), metadata=_template_metadata("ca_joint")
     )
     assert calls == [(_HOST_ID, "codex")]
@@ -873,8 +933,8 @@ async def test_failed_member_host_lookup_contributes_no_catalog_facts(
         "model": "worker-model",
         "effort": "medium",
         "lead": False,
-        "locked": True,
     }
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "true"
 
 
 @pytest.mark.asyncio
@@ -900,13 +960,12 @@ async def test_unknown_foreign_and_non_library_template_ids_keep_the_session_hos
     _create_template(member_server.custom, "ca_plain", worker_host=None)
 
     for template_id in ("ca_bob", "ca_missing", "ag_session_scoped", "ca_plain"):
-        entries = await _member_labels_after_create(
+        entries, labels = await _member_labels_after_create(
             member_server, joint_bundle(), metadata=_template_metadata(template_id)
         )
         assert entries["researcher"]["host"] == _HOST_ID, template_id
         assert entries["custom-reviewer"]["host"] == _HOST_ID, template_id
         # The create request's template label is the launch provenance: a
-        # ``ca_`` id writes locked entries; a non-library id does not.
-        expected_locked = template_id.startswith("ca_")
-        assert entries["researcher"]["locked"] is expected_locked, template_id
-        assert entries["custom-reviewer"]["locked"] is expected_locked, template_id
+        # ``ca_`` id writes the locked marker; a non-library id does not.
+        expected_marker = "true" if template_id.startswith("ca_") else "false"
+        assert labels[MEMBER_LOCK_LABEL_KEY] == expected_marker, template_id

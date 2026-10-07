@@ -27,6 +27,7 @@ import yaml
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
+from omnigent.member_snapshot import MEMBER_LOCK_LABEL_KEY
 from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import AgentSpec
@@ -897,6 +898,12 @@ async def test_json_create_rejects_member_label(
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_input"
+    locked_response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id, "labels": {MEMBER_LOCK_LABEL_KEY: "true"}},
+    )
+    assert locked_response.status_code == 400
+    assert locked_response.json()["error"]["code"] == "invalid_input"
 
 
 async def test_patch_rejects_member_label(

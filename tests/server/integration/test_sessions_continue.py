@@ -26,7 +26,7 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY,
 )
 from omnigent.db.utils import generate_agent_id
-from omnigent.member_snapshot import member_label_key
+from omnigent.member_snapshot import MEMBER_LOCK_LABEL_KEY, member_label_key
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.sdk_permission_modes import (
@@ -330,6 +330,7 @@ async def test_continue_copies_run_configuration_and_allowlisted_labels(
             AUTO_HARNESS_LABEL_KEY: "1",
             "omnigent:agent-template-id": template_id,
             member_label_key("researcher"): '{"lead": false}',
+            MEMBER_LOCK_LABEL_KEY: "true",
             CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
             pinned_label_key(None): "1730000000000",
         },
@@ -353,6 +354,7 @@ async def test_continue_copies_run_configuration_and_allowlisted_labels(
         AUTO_HARNESS_LABEL_KEY: "1",
         "omnigent:agent-template-id": template_id,
         member_label_key("researcher"): '{"lead": false}',
+        MEMBER_LOCK_LABEL_KEY: "true",
     }, "Only the allowlisted run-config labels may carry over"
 
 

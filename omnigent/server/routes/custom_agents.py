@@ -24,7 +24,7 @@ from starlette.formparsers import MultiPartException
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.member_snapshot import unlocked_legacy_member_labels
+from omnigent.member_snapshot import frozen_member_lock_label
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
@@ -400,7 +400,7 @@ def create_custom_agents_router(
                     conversation_store.set_labels,
                     source_session_id,
                     {
-                        **unlocked_legacy_member_labels(pre_save_labels),
+                        **frozen_member_lock_label(pre_save_labels),
                         "omnigent:agent-template-id": created["id"],
                     },
                 )
