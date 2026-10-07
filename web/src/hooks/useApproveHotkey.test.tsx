@@ -4,7 +4,7 @@
 // bare Enter, Alt/Shift-modified Enter, and a chord landing in a text field
 // that holds a draft (a send intent, not a verdict).
 
-import { renderHook } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitApproval = vi.fn();
@@ -13,6 +13,8 @@ vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: () => ({ blocks, submitApproval }) },
 }));
 
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
+import { castAskUserQuestionPayload } from "@/lib/askUserQuestion";
 import { useApproveHotkey } from "./useApproveHotkey";
 
 /** Dispatch a keydown that reaches window from body (default: Cmd+Enter). */
@@ -32,6 +34,7 @@ beforeEach(() => {
   blocks = [];
 });
 afterEach(() => {
+  cleanup();
   blocks = [];
 });
 
@@ -200,6 +203,31 @@ describe("useApproveHotkey", () => {
     }
   });
 
+  it("yields when the chord lands inside a question card", () => {
+    // The card owns ⌘↵ there — its binding advances or submits. Accepting the
+    // approval behind it would resolve a prompt the user is not looking at.
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    const card = document.createElement("div");
+    card.setAttribute("data-question-card", "");
+    const field = document.createElement("textarea");
+    card.appendChild(field);
+    document.body.appendChild(card);
+    try {
+      field.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      expect(submitApproval).not.toHaveBeenCalled();
+    } finally {
+      card.remove();
+    }
+  });
+
   it("still accepts from an empty text field (no draft, no send intent)", () => {
     // Post-send, focus can legitimately sit in the cleared composer; an
     // empty field carries no draft, so the chord keeps meaning "approve".
@@ -220,5 +248,43 @@ describe("useApproveHotkey", () => {
     } finally {
       ta.remove();
     }
+  });
+
+  it("yields to a question card so primary+Enter advances it instead of accepting the approval", () => {
+    // A plain approval newer than the card must not win while the user is
+    // answering: the card's own binding owns ⌘↵ there.
+    blocks = [
+      { type: "elicitation", elicitationId: "question", status: "pending", askUserQuestion: {} },
+      { type: "elicitation", elicitationId: "plain", status: "pending" },
+    ];
+    const payload = castAskUserQuestionPayload({
+      questions: [
+        { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+        { question: "Second?", options: [{ label: "C" }] },
+      ],
+    });
+    if (payload === null) throw new Error("expected a payload");
+
+    function ApproveHost() {
+      useApproveHotkey(false);
+      return null;
+    }
+    render(
+      <>
+        <AskUserQuestionForm
+          questions={payload.questions}
+          onSubmit={() => {}}
+          onReject={() => {}}
+        />
+        <ApproveHost />
+      </>,
+    );
+
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", ctrlKey: true });
+
+    expect(submitApproval).not.toHaveBeenCalled();
+    expect(screen.getByTestId("ask-user-question-progress")).toHaveTextContent("Question 2 of 2");
   });
 });
