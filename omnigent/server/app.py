@@ -45,7 +45,6 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.entities import Conversation
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -142,7 +141,7 @@ from omnigent.server.schemas import (
     UserPreferenceNamespacePatchRequest,
     UserPreferencesEnvelope,
 )
-from omnigent.server.session_collab import collab_owner_for, session_peer_enabled
+from omnigent.server.session_collab import session_peer_enabled
 from omnigent.server.user_preferences_store import (
     USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
@@ -4086,22 +4085,23 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
-    async def _keep_runner_log_dismissals(sessions: list[Conversation], observed_at: str) -> None:
+    async def _keep_runner_log_dismissals(observed_at: str) -> None:
         """Re-touch runaway dismissals while the host still confirms them.
 
-        :param sessions: Sessions the runaway report flagged.
         :param observed_at: Detection instant carried by the report.
         """
         if user_preferences_store is None:
             return
-
-        def _touch() -> None:
-            owners = [
-                collab_owner_for(conv, conversation_store, permission_store) for conv in sessions
-            ]
-            touch_runner_log_warning_dismissals(user_preferences_store, owners, observed_at)
-
-        await asyncio.to_thread(_touch)
+        # Same account-row policy as the /v1/me/preferences routes.
+        accounts_mode = (
+            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        )
+        await asyncio.to_thread(
+            touch_runner_log_warning_dismissals,
+            user_preferences_store,
+            observed_at,
+            create_if_missing=not accounts_mode,
+        )
 
     async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.

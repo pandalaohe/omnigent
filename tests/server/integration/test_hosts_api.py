@@ -1723,10 +1723,9 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     labels that the session-updates stream pushes to the web, which shows
     the warning banner. A failure here means a runaway runner stays silent
     until the user notices the disk filling. The frame also calls the
-    configured hook with exactly the flagged sessions and detection instant,
-    which the server uses to keep dismissals alive.
+    configured hook with its detection instant, which the server uses to
+    keep dismissals alive.
     """
-    from omnigent.entities import Conversation
     from omnigent.host.frames import HostRunnerLogRunawayFrame
     from omnigent.server.routes.host_tunnel import (
         RUNNER_LOG_RUNAWAY_LABEL_KEY,
@@ -1739,10 +1738,10 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     conv_store = SqlAlchemyConversationStore(db_uri)
     hot = conv_store.create_conversation(agent_id=None, runner_id="runner_hot")
     cool = conv_store.create_conversation(agent_id=None, runner_id="runner_cool")
-    received: list[tuple[list[str], str]] = []
+    received: list[str] = []
 
-    async def _record(sessions: list[Conversation], observed_at: str) -> None:
-        received.append(([session.id for session in sessions], observed_at))
+    async def _record(observed_at: str) -> None:
+        received.append(observed_at)
 
     app = FastAPI()
     app.include_router(
@@ -1787,8 +1786,8 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     seen = datetime.fromisoformat(labels[RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY])
     assert seen.tzinfo is not None
     assert abs((datetime.now(timezone.utc) - seen).total_seconds()) < 300
-    # The hook is awaited once with exactly the flagged session and instant.
-    assert received == [([hot.id], "2026-09-23T09:25:00+00:00")]
+    # The hook is awaited once with the frame's detection instant.
+    assert received == ["2026-09-23T09:25:00+00:00"]
     # A session bound to another runner keeps none of the flags.
     cool_labels = conv_store.get_conversation(cool.id).labels or {}
     assert RUNNER_LOG_RUNAWAY_LABEL_KEY not in cool_labels
@@ -1810,7 +1809,7 @@ async def test_runner_log_runaway_hook_failure_does_not_stop_later_frames(
     hot = conv_store.create_conversation(agent_id=None, runner_id="runner_hot")
     calls = 0
 
-    async def _raise(sessions: list[object], observed_at: str) -> None:
+    async def _raise(observed_at: str) -> None:
         nonlocal calls
         calls += 1
         raise RuntimeError("hook exploded")

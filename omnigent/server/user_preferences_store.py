@@ -147,50 +147,45 @@ def _prune_runner_log_warnings(value: dict[str, Any]) -> dict[str, Any]:
 
 def touch_runner_log_warning_dismissals(
     store: SqlAlchemyUserPreferencesStore,
-    owners: Iterable[str],
     flag: str,
     *,
+    create_if_missing: bool,
     now_ms: float | None = None,
 ) -> int:
-    """Refresh the owners whose dismissal of *flag* is older than a day.
+    """Refresh every user's dismissal of *flag* that is older than a day.
 
     A dismissal holds until a new detection. The host re-confirms a live
     detection every few minutes, so touching it here at most daily keeps it
     out of the 30-day prune for exactly as long as the detection is
-    confirmed. A flag that no owner dismissed is never added.
+    confirmed. Any user who dismissed it is refreshed, including viewers of
+    a shared session; a flag no user dismissed is never added.
 
     :param store: Preferences store holding the dismissals.
-    :param owners: Candidate owners; each distinct owner is visited once.
     :param flag: Detection instant whose dismissal is refreshed.
+    :param create_if_missing: The preferences routes' account-row policy:
+        ``False`` in accounts mode skips users without a live account.
     :param now_ms: Touch instant in epoch ms; defaults to now.
-    :returns: How many owners were touched.
+    :returns: How many users were touched.
     """
     if now_ms is None:
         now_ms = time.time() * 1000.0
     touched = 0
-    for owner in dict.fromkeys(owners):
+    for user_id, value in store.namespace_values(RUNNER_LOG_WARNINGS_NAMESPACE):
+        if not isinstance(value, dict):
+            continue
+        dismissed_at = value.get(flag)
+        if (
+            not isinstance(dismissed_at, (int, float))
+            or isinstance(dismissed_at, bool)
+            or dismissed_at >= now_ms - _RUNNER_LOG_WARNINGS_TOUCH_INTERVAL_MS
+        ):
+            continue
         try:
-            envelope = store.get(owner)
-            if not isinstance(envelope, dict):
-                continue
-            settings = envelope.get("settings")
-            if not isinstance(settings, dict):
-                continue
-            value = settings.get(RUNNER_LOG_WARNINGS_NAMESPACE)
-            if not isinstance(value, dict):
-                continue
-            dismissed_at = value.get(flag)
-            if (
-                not isinstance(dismissed_at, (int, float))
-                or isinstance(dismissed_at, bool)
-                or dismissed_at >= now_ms - _RUNNER_LOG_WARNINGS_TOUCH_INTERVAL_MS
-            ):
-                continue
             store.patch_namespace(
-                owner,
+                user_id,
                 RUNNER_LOG_WARNINGS_NAMESPACE,
                 {flag: now_ms},
-                create_if_missing=False,
+                create_if_missing=create_if_missing,
             )
         except (UserPreferencesValidationError, UserPreferencesUserNotFoundError):
             continue
@@ -1010,6 +1005,31 @@ class SqlAlchemyUserPreferencesStore:
             if not initialized:
                 return None
             return _assemble_envelope(settings)
+
+    def namespace_values(self, namespace: str) -> list[tuple[str, Any]]:
+        """Return ``(user_id, value)`` for every user storing *namespace* here.
+
+        Scoped to the current workspace. A row that does not decode is
+        skipped, so one corrupt user never hides the others.
+        """
+        with self._session("read_namespace_of_all_users") as session:
+            rows = session.execute(
+                select(
+                    SqlPreference.user_id,
+                    type_coerce(SqlPreference.value, LargeBinary),
+                ).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.key == _settings_key(namespace),
+                )
+            ).all()
+        values: list[tuple[str, Any]] = []
+        for user_id, raw in rows:
+            try:
+                text = decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES)
+                values.append((user_id, json.loads(text or "")))
+            except (ValueError, zstandard.ZstdError):
+                continue
+        return values
 
     def initialize(
         self,

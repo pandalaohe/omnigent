@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -15,7 +17,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
-from omnigent.db.db_models import SqlPreference, workspace_scope
+from omnigent.db.db_models import SqlPreference, current_workspace_id, workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -52,6 +54,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 
 
 class _HeaderAuthProvider(AuthProvider):
@@ -1458,7 +1461,11 @@ def test_touch_runner_log_warning_dismissals_refreshes_only_stale_dismissed_flag
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The server touch refreshes a stale dismissal and never adds a flag."""
+    """The server touch refreshes every stale dismissal and never adds a flag.
+
+    Any user holding the dismissal is refreshed, e.g. a viewer of a shared
+    session who never owned it; accounts mode skips users without an account.
+    """
     import omnigent.server.user_preferences_store as store_module
 
     clock = SimpleNamespace(now=1_800_000_000.0)
@@ -1469,60 +1476,109 @@ def test_touch_runner_log_warning_dismissals_refreshes_only_stale_dismissed_flag
     now_ms = clock.now * 1000.0
     day_ms = 24 * 60 * 60 * 1000
 
-    # The server-side touch writes fail-closed without an account row.
-    SqlAlchemyAccountStore(db_uri).create_user_with_password(
-        "stale@example.com", "test-password-hash"
-    )
+    accounts = SqlAlchemyAccountStore(db_uri)
+    for user in ("owner@example.com", "viewer@example.com"):
+        accounts.create_user_with_password(user, "test-password-hash")
     store.patch_namespace(
-        "stale@example.com",
+        "owner@example.com",
         "runner_log_warnings",
         {flag: now_ms - 2 * day_ms, other_flag: now_ms - 2 * day_ms},
     )
+    store.patch_namespace("viewer@example.com", "runner_log_warnings", {flag: now_ms - 3 * day_ms})
     store.patch_namespace("fresh@example.com", "runner_log_warnings", {flag: now_ms - day_ms / 2})
     store.patch_namespace(
         "undismissed@example.com", "runner_log_warnings", {other_flag: now_ms - 2 * day_ms}
     )
-    # An envelope without a backing account row cannot be written; the touch
-    # skips it without adding a count.
     store.patch_namespace(
         "no-account@example.com", "runner_log_warnings", {flag: now_ms - 2 * day_ms}
     )
     store.patch_namespace("garbage@example.com", "runner_log_warnings", [1, 2])
     store.initialize("empty@example.com", {"version": 1, "settings": {}})
+    with workspace_scope(101):
+        store.patch_namespace(
+            "elsewhere@example.com", "runner_log_warnings", {flag: now_ms - 2 * day_ms}
+        )
+    # A row that no longer decodes must not hide the other users.
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.add(
+            SqlPreference(
+                workspace_id=current_workspace_id(),
+                user_id="corrupt@example.com",
+                key="settings.runner_log_warnings",
+                value="{not json",
+            )
+        )
+        session.commit()
 
-    touched = touch_runner_log_warning_dismissals(
-        store,
-        [
-            "stale@example.com",
-            "fresh@example.com",
-            "undismissed@example.com",
-            "no-account@example.com",
-            "garbage@example.com",
-            "empty@example.com",
-            "missing@example.com",
-            "stale@example.com",
-        ],
-        flag,
-        now_ms=now_ms,
+    def dismissals(user: str) -> object:
+        return store.get(user)["settings"]["runner_log_warnings"]
+
+    # Accounts mode: only users with a live account row are written.
+    assert (
+        touch_runner_log_warning_dismissals(store, flag, create_if_missing=False, now_ms=now_ms)
+        == 2
     )
+    assert dismissals("owner@example.com") == {flag: now_ms, other_flag: now_ms - 2 * day_ms}
+    assert dismissals("viewer@example.com") == {flag: now_ms}
+    assert dismissals("no-account@example.com") == {flag: now_ms - 2 * day_ms}
 
-    assert touched == 1
-    assert store.get("stale@example.com")["settings"]["runner_log_warnings"] == {
-        flag: now_ms,
-        other_flag: now_ms - 2 * day_ms,
-    }
-    assert store.get("fresh@example.com")["settings"]["runner_log_warnings"] == {
-        flag: now_ms - day_ms / 2
-    }
-    assert store.get("undismissed@example.com")["settings"]["runner_log_warnings"] == {
-        other_flag: now_ms - 2 * day_ms
-    }
-    assert store.get("no-account@example.com")["settings"]["runner_log_warnings"] == {
-        flag: now_ms - 2 * day_ms
-    }
-    assert store.get("garbage@example.com")["settings"]["runner_log_warnings"] == [1, 2]
+    # Auth off: the same refresh reaches a user with no account row.
+    assert (
+        touch_runner_log_warning_dismissals(store, flag, create_if_missing=True, now_ms=now_ms)
+        == 1
+    )
+    assert dismissals("no-account@example.com") == {flag: now_ms}
+    assert dismissals("fresh@example.com") == {flag: now_ms - day_ms / 2}
+    assert dismissals("undismissed@example.com") == {other_flag: now_ms - 2 * day_ms}
+    assert dismissals("garbage@example.com") == [1, 2]
     assert store.get("empty@example.com") == {"version": 1, "settings": {}}
-    assert store.get("missing@example.com") is None
+    with workspace_scope(101):
+        assert dismissals("elsewhere@example.com") == {flag: now_ms - 2 * day_ms}
+
+
+@pytest.mark.parametrize("accounts_mode", [False, True])
+@pytest.mark.asyncio
+async def test_app_runaway_hook_follows_the_preferences_account_policy(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    accounts_mode: bool,
+) -> None:
+    """Outside accounts mode the app refreshes a header identity with no account row."""
+    import omnigent.server.routes.host_tunnel as host_tunnel
+
+    hooks: list[Any] = []
+    real_router = host_tunnel.create_host_tunnel_router
+
+    def _capture(*args: Any, **kwargs: Any) -> Any:
+        hooks.append(kwargs["on_runner_log_runaway"])
+        return real_router(*args, **kwargs)
+
+    monkeypatch.setattr(host_tunnel, "create_host_tunnel_router", _capture)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts-runaway-hook"))
+    auth_provider = _AccountsAuthProvider() if accounts_mode else _HeaderAuthProvider()
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        auth_provider=auth_provider,
+        user_preferences_store=store,
+        host_store=HostStore(db_uri),
+    )
+    if isinstance(auth_provider, _AccountsAuthProvider):
+        auth_provider._source = "accounts"
+    flag = "2026-10-07T06:22:16+00:00"
+    stale = time.time() * 1000.0 - 2 * 24 * 60 * 60 * 1000
+    user = "header-user@example.com"
+    store.patch_namespace(user, "runner_log_warnings", {flag: stale})
+
+    await hooks[0](flag)
+
+    refreshed = store.get(user)["settings"]["runner_log_warnings"][flag]
+    assert (refreshed == stale) is accounts_mode
 
 
 def test_server_touched_dismissal_survives_a_stale_device_patch(
@@ -1547,7 +1603,12 @@ def test_server_touched_dismissal_survives_a_stale_device_patch(
     # The host keeps confirming the detection, so the server touches yesterday.
     clock.now += 39 * day_s
     touched_at = clock.now * 1000.0
-    assert touch_runner_log_warning_dismissals(store, [owner], flag, now_ms=touched_at) == 1
+    assert (
+        touch_runner_log_warning_dismissals(
+            store, flag, create_if_missing=False, now_ms=touched_at
+        )
+        == 1
+    )
 
     # The stale device patches its 40-day-old touch; the per-key merge keeps
     # the newer server touch and the prune spares it.
