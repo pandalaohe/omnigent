@@ -42,6 +42,8 @@ export const KEEP_WARM_DEFAULT_HOST_OFFLINE_ARCHIVE_SECONDS = 14400;
 export const KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_SECONDS = { min: 300, max: 3540 } as const;
 export const KEEP_WARM_CODEX_INTERVAL_BOUNDS_SECONDS = { min: 300, max: 1740 } as const;
 export const KEEP_WARM_MAX_BOUNDS_SECONDS = { min: 3600, max: 172800 } as const;
+/** 0 means never cold; every other value lives between these bounds. */
+export const KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS = { min: 60, max: 172800 } as const;
 /** 0 disables auto-archive; every other value lives between these bounds. */
 export const KEEP_WARM_HOST_OFFLINE_ARCHIVE_BOUNDS_SECONDS = {
   min: 3600,
@@ -73,6 +75,12 @@ export function clampKeepWarmMaxSeconds(seconds: number): number {
   return Math.min(Math.max(seconds, min), max);
 }
 
+export function clampKeepWarmColdAfterSeconds(seconds: number): number {
+  if (seconds === 0) return 0;
+  const { min, max } = KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS;
+  return Math.min(Math.max(seconds, min), max);
+}
+
 export function clampHostOfflineArchiveSeconds(seconds: number): number {
   if (seconds <= 0) return 0;
   const { min, max } = KEEP_WARM_HOST_OFFLINE_ARCHIVE_BOUNDS_SECONDS;
@@ -85,6 +93,8 @@ export interface AgentKeepWarmPreferences {
   /** Stored ping interval in seconds; absent takes the family default. */
   intervalSeconds?: number;
   maxSeconds: number;
+  /** Idle seconds to cold; absent takes the platform rule, 0 never colds. */
+  coldAfterSeconds?: number;
 }
 
 export interface KeepWarmPreferences {
@@ -98,6 +108,8 @@ export interface ResolvedAgentKeepWarm {
   child: boolean;
   intervalSeconds: number;
   maxSeconds: number;
+  /** Effective idle seconds to cold, or null for the platform rule. */
+  coldAfterSeconds: number | null;
 }
 
 export interface AgentKeepWarmPatch {
@@ -105,6 +117,7 @@ export interface AgentKeepWarmPatch {
   child?: boolean;
   intervalSeconds?: number;
   maxSeconds?: number;
+  coldAfterSeconds?: number | null;
 }
 
 /** An absent agent row is off; the row is only written when it is first used. */
@@ -126,11 +139,17 @@ function normalizeAgentRow(value: unknown): AgentKeepWarmPreferences | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const intervalSeconds = positiveInteger(raw.intervalSeconds);
+  const rawCold = raw.coldAfterSeconds;
+  const coldAfterSeconds =
+    typeof rawCold === "number" && Number.isInteger(rawCold) && rawCold >= 0
+      ? clampKeepWarmColdAfterSeconds(rawCold)
+      : undefined;
   return {
     main: typeof raw.main === "boolean" ? raw.main : false,
     child: typeof raw.child === "boolean" ? raw.child : false,
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     maxSeconds: positiveInteger(raw.maxSeconds) ?? KEEP_WARM_DEFAULT_MAX_SECONDS,
+    ...(coldAfterSeconds !== undefined ? { coldAfterSeconds } : {}),
   };
 }
 
@@ -194,6 +213,7 @@ export function resolveKeepWarmAgent(
       row?.intervalSeconds ?? defaultKeepWarmIntervalSeconds(family),
     ),
     maxSeconds: clampKeepWarmMaxSeconds(row?.maxSeconds ?? KEEP_WARM_DEFAULT_MAX_SECONDS),
+    coldAfterSeconds: row?.coldAfterSeconds ?? null,
   };
 }
 
@@ -205,6 +225,12 @@ export function setKeepWarmAgent(
   patch: AgentKeepWarmPatch,
 ): KeepWarmPreferences {
   const current = preferences.agents[agentId];
+  const coldAfterSeconds =
+    patch.coldAfterSeconds === undefined
+      ? current?.coldAfterSeconds
+      : patch.coldAfterSeconds === null
+        ? undefined
+        : clampKeepWarmColdAfterSeconds(patch.coldAfterSeconds);
   const row: AgentKeepWarmPreferences = {
     main: patch.main ?? current?.main ?? false,
     child: patch.child ?? current?.child ?? false,
@@ -215,6 +241,7 @@ export function setKeepWarmAgent(
     maxSeconds: clampKeepWarmMaxSeconds(
       patch.maxSeconds ?? current?.maxSeconds ?? KEEP_WARM_DEFAULT_MAX_SECONDS,
     ),
+    ...(coldAfterSeconds !== undefined ? { coldAfterSeconds } : {}),
   };
   return { ...preferences, agents: { ...preferences.agents, [agentId]: row } };
 }

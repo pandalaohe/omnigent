@@ -234,6 +234,7 @@ _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
 KEEP_WARM_CLAUDE_INTERVAL_BOUNDS_S = (300, 3540)
 KEEP_WARM_CODEX_INTERVAL_BOUNDS_S = (300, 1740)
 KEEP_WARM_MAX_BOUNDS_S = (3600, 172800)
+KEEP_WARM_COLD_AFTER_BOUNDS_S = (60, 172800)
 
 
 def clamp_keep_warm(settings: CollabSettings) -> tuple[int, int, int]:
@@ -334,12 +335,15 @@ class AgentKeepWarm:
     :param interval_s: Stored ping interval in seconds, or ``None`` when the
         row takes the family default.
     :param max_s: Longest keep-warm run per session, in seconds.
+    :param cold_after_s: Idle seconds after which the agent's sessions read
+        cold, ``0`` when they never do, or ``None`` for the per-family rule.
     """
 
     main: bool
     child: bool
     interval_s: int | None
     max_s: int
+    cold_after_s: int | None = None
 
 
 @dataclass(frozen=True)
@@ -403,7 +407,10 @@ def read_keep_warm_settings(
     accept only a JSON boolean (anything else reads ``False``),
     ``intervalSeconds`` accepts only a positive int (anything else reads
     ``None`` = the family default) and ``maxSeconds`` a positive int (else the
-    default); a row that is not an object is skipped.
+    default); ``coldAfterSeconds`` accepts a non-negative int and clamps to
+    the cold-after bounds (``0`` stays ``0`` = never cold, anything else
+    invalid reads ``None`` = the per-family rule); a row that is not an
+    object is skipped.
     ``hostOfflineArchiveSeconds`` accepts a non-negative int and clamps to the
     shared keep-warm bounds (``0`` stays ``0`` = disabled). A namespace that
     exists but holds garbage still reports ``present=True``, so the legacy
@@ -442,13 +449,20 @@ def read_keep_warm_settings(
                 continue
             raw_main = row.get("main")
             raw_child = row.get("child")
+            raw_cold = row.get("coldAfterSeconds")
             interval_s = _parse_collab_value("positive_int", row.get("intervalSeconds"))
             max_s = _parse_collab_value("positive_int", row.get("maxSeconds"))
+            if isinstance(raw_cold, int) and not isinstance(raw_cold, bool) and raw_cold >= 0:
+                low, high = KEEP_WARM_COLD_AFTER_BOUNDS_S
+                cold_after_s = 0 if raw_cold == 0 else min(max(raw_cold, low), high)
+            else:
+                cold_after_s = None
             agents[agent_id] = AgentKeepWarm(
                 main=raw_main if isinstance(raw_main, bool) else False,
                 child=raw_child if isinstance(raw_child, bool) else False,
                 interval_s=interval_s,
                 max_s=max_s if max_s is not None else KEEP_WARM_DEFAULT_MAX_S,
+                cold_after_s=cold_after_s,
             )
     raw_host = value.get("hostOfflineArchiveSeconds")
     if isinstance(raw_host, int) and not isinstance(raw_host, bool) and raw_host >= 0:

@@ -899,6 +899,35 @@ def test_read_keep_warm_settings_parses_rows_and_defaults_invalid_fields(db_uri:
     assert read_keep_warm_settings(store, "clamped@example.com").host_offline_archive_s == 3600
 
 
+def test_read_keep_warm_settings_parses_cold_after_seconds(db_uri: str) -> None:
+    """coldAfterSeconds keeps 0, clamps to 60..172800, else reads as None."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "cold@example.com",
+        "keep_warm",
+        {
+            "agents": {
+                "never": {"coldAfterSeconds": 0},
+                "short": {"coldAfterSeconds": 30},
+                "exact": {"coldAfterSeconds": 600},
+                "huge": {"coldAfterSeconds": 999999},
+                "negative": {"coldAfterSeconds": -1},
+                "string": {"coldAfterSeconds": "5"},
+                "float": {"coldAfterSeconds": 1.5},
+                "bool": {"coldAfterSeconds": True},
+                "missing": {},
+            }
+        },
+    )
+    settings = read_keep_warm_settings(store, "cold@example.com")
+    assert settings.agents["never"].cold_after_s == 0
+    assert settings.agents["short"].cold_after_s == 60
+    assert settings.agents["exact"].cold_after_s == 600
+    assert settings.agents["huge"].cold_after_s == 172800
+    for agent_id in ("negative", "string", "float", "bool", "missing"):
+        assert settings.agents[agent_id].cold_after_s is None
+
+
 def test_read_keep_warm_settings_tolerates_bad_rows_and_shapes() -> None:
     """A corrupt row or malformed namespace value never fails a caller."""
     default = KeepWarmSettings(

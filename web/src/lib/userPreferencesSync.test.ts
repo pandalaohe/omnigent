@@ -6,6 +6,7 @@ import {
   queueUserPreferencePatch,
   refreshUserPreferencesFromServer,
   resetUserPreferencesSyncForTests,
+  USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT,
 } from "./userPreferencesSync";
 import {
   readApprovalTimeoutPreferences,
@@ -200,6 +201,36 @@ describe("user preference synchronization", () => {
       ...preferences,
       hostOfflineArchiveSeconds: 3600,
     });
+  });
+
+  it("announces an acknowledged patch with its namespace", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    const listener = vi.fn();
+    window.addEventListener(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, listener);
+
+    writeKeepWarmPreferences(
+      {
+        agents: {
+          "claude-native-ui": {
+            main: true,
+            child: false,
+            intervalSeconds: 3300,
+            maxSeconds: 14400,
+            coldAfterSeconds: 0,
+          },
+        },
+        hostOfflineArchiveSeconds: 14400,
+      },
+      [{ id: "claude-native-ui", harness: "claude-native" }],
+    );
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: { namespace: "keep_warm" } }),
+    );
+    window.removeEventListener(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, listener);
   });
 
   it("cancels queued sync when switching to an older Server", async () => {

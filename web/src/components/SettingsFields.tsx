@@ -4,17 +4,21 @@ import { HelpTip } from "@/components/HelpTip";
 import { Input } from "@/components/ui/input";
 
 interface NumericFieldProps {
-  value: number;
+  value: number | null;
   min: number;
   max: number;
   ariaLabel: string;
   disabled: boolean;
+  placeholder?: string;
+  onClear?: () => void;
   onCommit: (value: number) => void;
 }
 
 /**
  * Numeric input with a local draft: only a valid in-range integer is
- * committed while typing; blur restores the last committed value.
+ * committed while typing; blur restores the last committed value. With
+ * `onClear` an empty input is allowed and reports the clear; without it an
+ * empty input is ignored exactly as before.
  */
 export function NumericField({
   value,
@@ -22,18 +26,25 @@ export function NumericField({
   max,
   ariaLabel,
   disabled,
+  placeholder,
+  onClear,
   onCommit,
 }: NumericFieldProps) {
-  const [draft, setDraft] = useState(value.toString());
+  const text = value === null ? "" : value.toString();
+  const [draft, setDraft] = useState(text);
 
   useEffect(() => {
-    setDraft(value.toString());
-  }, [value]);
-
-  const update = (text: string) => {
     setDraft(text);
-    if (!/^\d+$/.test(text)) return;
-    const parsed = Number(text);
+  }, [text]);
+
+  const update = (next: string) => {
+    setDraft(next);
+    if (next === "") {
+      onClear?.();
+      return;
+    }
+    if (!/^\d+$/.test(next)) return;
+    const parsed = Number(next);
     if (parsed < min || parsed > max) return;
     onCommit(parsed);
   };
@@ -47,9 +58,10 @@ export function NumericField({
       step={1}
       aria-label={ariaLabel}
       disabled={disabled}
+      placeholder={placeholder}
       value={draft}
       onChange={(event) => update(event.target.value)}
-      onBlur={() => setDraft(value.toString())}
+      onBlur={() => setDraft(text)}
       className="h-9 w-20"
     />
   );

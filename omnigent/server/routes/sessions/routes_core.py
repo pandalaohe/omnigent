@@ -2049,6 +2049,7 @@ def register_core_routes(
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
         keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, page.data)
+        cold_after_by_session = await _cold_after_by_session_for(page.data, request.app.state)
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
@@ -2064,6 +2065,7 @@ def register_core_routes(
                 activity_unverified_child_ids=activity_unverified_child_ids,
                 last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
                 keep_warm_families=keep_warm_families,
+                cold_after_by_session=cold_after_by_session,
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -2111,6 +2113,30 @@ def register_core_routes(
             )
             for key, conv in pending.items()
         }
+
+    async def _cold_after_by_session_for(
+        convs: list[Conversation],
+        app_state: Any,
+    ) -> dict[str, int | None] | None:
+        """
+        Resolve each row's agent cold-after seconds through the sweeper.
+
+        One preferences read per distinct owner, shared across the page.
+        Blocking store reads, so they run on a worker thread. ``None`` when
+        no sweeper is wired — rows then keep the per-family pill rule.
+
+        :param convs: Session rows on the page.
+        :param app_state: The app's ``.state``.
+        :returns: Map keyed by conversation id, or ``None``.
+        """
+        sweeper = getattr(app_state, "child_keep_warm", None)
+        if sweeper is None:
+            return None
+        return await asyncio.to_thread(
+            sweeper.cold_after_for_many,
+            convs,
+            getattr(app_state, "user_preferences_store", None),
+        )
 
     async def _comments_fingerprints_for(
         conv_ids: list[str],
@@ -2205,6 +2231,7 @@ def register_core_routes(
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
+        app_state: Any,
     ) -> list[dict[str, Any]]:
         """
         Build current list-item payloads for the watched ids.
@@ -2227,6 +2254,8 @@ def register_core_routes(
             deduplicated and length-capped by the caller.
         :param user_id: The authenticated requesting user, or ``None``
             when permissions are disabled, e.g. ``"alice@example.com"``.
+        :param app_state: The websocket app's ``.state``, read for the
+            keep-warm sweeper and preferences store.
         :returns: One JSON-ready dict per accessible, existing watched
             session, in no particular order.
         """
@@ -2294,6 +2323,7 @@ def register_core_routes(
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
         keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, convs)
+        cold_after_by_session = await _cold_after_by_session_for(convs, app_state)
         items = [
             _build_session_list_item(
                 conv,
@@ -2308,6 +2338,7 @@ def register_core_routes(
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
                 keep_warm_families=keep_warm_families,
+                cold_after_by_session=cold_after_by_session,
             )
             for conv in convs
         ]
@@ -2412,7 +2443,7 @@ def register_core_routes(
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
-            items = await _fetch_watched_items(watched, user_id)
+            items = await _fetch_watched_items(watched, user_id, websocket.app.state)
             dumps = {item["id"]: item for item in items}
             last_sent.clear()
             last_sent.update(dumps)
@@ -2424,7 +2455,7 @@ def register_core_routes(
             been idle."""
             nonlocal last_send_monotonic
             if watched:
-                items = await _fetch_watched_items(watched, user_id)
+                items = await _fetch_watched_items(watched, user_id, websocket.app.state)
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost
@@ -2553,7 +2584,7 @@ def register_core_routes(
                         if sid in watched:
                             continue
                         try:
-                            items = await _fetch_watched_items([sid], user_id)
+                            items = await _fetch_watched_items([sid], user_id, websocket.app.state)
                             if items:
                                 await _send({"type": "changed", "items": items})
                         except WebSocketDisconnect:

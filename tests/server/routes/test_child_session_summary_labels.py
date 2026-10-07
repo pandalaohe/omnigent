@@ -143,6 +143,46 @@ def test_child_summary_derives_warm_state_from_the_keep_warm_label() -> None:
     assert archived_summary.warm_state is None
 
 
+def test_child_summary_cold_after_overrides_the_family_rule() -> None:
+    """cold_after_s=0 reads warm (no label or a cold one); N uses the clock."""
+    now = int(time.time())
+    keep_warm = "omnigent.keep_warm"
+    stale = json.dumps(
+        {"s": "w", "y": "claude", "t": now - 7200, "u": now - 7200, "w": now - 3600}
+    )
+    fresh = json.dumps({"s": "w", "y": "claude", "t": now - 100, "u": now - 100, "w": now + 3600})
+
+    def _summary(labels: dict[str, str], *, cold_after_s: int | None) -> ChildSessionSummary:
+        return _child_session_summary_from_conversation(
+            _child(labels), "conv_parent", None, harness="claude-native", cold_after_s=cold_after_s
+        )
+
+    # 0: warm with no label at all and with a label that reads cold today.
+    assert _summary({}, cold_after_s=0).warm_state == "warm"
+    assert _summary({keep_warm: stale}, cold_after_s=0).warm_state == "warm"
+    # N: a last touch inside the bound is warm; outside it, or with no usable
+    # label at all, it is cold — the summary still shows a pill.
+    assert _summary({keep_warm: fresh}, cold_after_s=600).warm_state == "warm"
+    assert _summary({keep_warm: stale}, cold_after_s=600).warm_state == "cold"
+    assert _summary({}, cold_after_s=600).warm_state == "cold"
+    assert _summary({keep_warm: "{not a label"}, cold_after_s=600).warm_state == "cold"
+    # The archived refusal outranks the never-cold value.
+    archived = Conversation(
+        id="conv_child",
+        created_at=100,
+        updated_at=200,
+        root_conversation_id="conv_parent",
+        title="tool:child-task",
+        agent_id="ag_test",
+        labels={keep_warm: stale},
+        archived=True,
+    )
+    archived_summary = _child_session_summary_from_conversation(
+        archived, "conv_parent", None, harness="claude-native", cold_after_s=0
+    )
+    assert archived_summary.warm_state is None
+
+
 def test_child_summary_durable_terminal_precedes_live_status_on_cache_miss() -> None:
     summary = _child_session_summary_from_conversation(
         _child(
