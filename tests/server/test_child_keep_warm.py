@@ -1600,6 +1600,61 @@ async def test_sticky_miss_pause_lifts_on_revision_and_rearms_on_real_turn(
     assert warm is not None and warm.s == "w" and warm.t == r + 2000
 
 
+async def test_sticky_miss_pause_advances_the_touch_on_a_new_real_turn(
+    harness: _Harness,
+) -> None:
+    """A new turn under the sticky pause moves ``u`` without lifting the pause.
+
+    The pinned deadline reads the last touch: leaving it at the pause's old
+    clock makes the label read cold right after the turn cached its prefix.
+    """
+    parent = _parent(harness)
+    r = harness.now - 3 * 3600
+    pause_label = _label(s="p", why="miss", t=r, c=r, u=r, w=r + 3600, v=0, m=2)
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: pause_label})
+    turn = harness.now - 60
+    _set_running_since(harness, child.id, turn)
+    before = harness.store.get_conversation(child.id)
+    assert before is not None
+    settle = before.updated_at if before.updated_at >= turn else harness.clock.now
+    assert (
+        warm_state_from_label(
+            pause_label,
+            archived=False,
+            harness="claude-native",
+            busy=False,
+            now=harness.now,
+            cold_after_s=600,
+        )
+        == "cold"
+    )
+
+    await _tick(harness)
+
+    state = _read_label(harness, child.id)
+    assert state is not None
+    assert state.s == "p" and state.why == "miss"
+    assert state.v == child.archive_revision
+    assert harness.forward.calls == []
+    assert state.t == turn
+    assert state.u == settle
+    stored = harness.store.get_conversation(child.id)
+    assert stored is not None
+    raw_after = stored.labels.get(KEEP_WARM_LABEL)
+    assert raw_after is not None
+    assert (
+        warm_state_from_label(
+            raw_after,
+            archived=False,
+            harness="claude-native",
+            busy=False,
+            now=harness.now,
+            cold_after_s=600,
+        )
+        == "warm"
+    )
+
+
 async def test_unarchive_does_not_rearm_a_stale_cache_clock(harness: _Harness) -> None:
     """Unarchive keeps ``u``; the passed window stays cold."""
     parent = _parent(harness)

@@ -1468,6 +1468,7 @@ class ChildKeepWarmSweeper:
                     and state.why == "miss"
                     and state.v == conv.archive_revision
                 )
+                settle = conv.updated_at if conv.updated_at >= running_since else now
                 if not sticky_miss:
                     prev_u = state.u if state is not None else None
                     prev_b = state.b if state is not None else None
@@ -1482,7 +1483,6 @@ class ChildKeepWarmSweeper:
                         and running_since <= state.w
                         and stats.ep_p >= 1
                     )
-                    settle = conv.updated_at if conv.updated_at >= running_since else now
                     reading = self._turn_cache_reading(conv, prev_b, running_since, family)
                     misses = prev_m
                     if reading is not None:
@@ -1529,6 +1529,12 @@ class ChildKeepWarmSweeper:
                     # The reaper-yield touch protects an episode that will be
                     # pinged; with the switch off there is nothing to protect.
                     touch = switch_on and runner_online is True and host_ok
+                else:
+                    # The pause stays sticky, but the settled turn is consumed
+                    # and its cache touch advances the clock readers use.
+                    assert state is not None
+                    state.t = running_since
+                    state.u = settle
             elif state is not None and state.r and state.s == "w":
                 # The episode opened with an unmeasurable reading; retry the
                 # same turn's classification against the stored baseline
