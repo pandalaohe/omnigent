@@ -125,8 +125,8 @@ const CARD_ACTION_IDS: ShortcutActionId[] = [
 ];
 
 /**
- * Where the highlight starts on a question: the current answer (custom row has
- * its own index at the end), else the first row.
+ * Where the highlight starts on a question: the current answer — including a
+ * selected custom row, with its own index at the end — else the first row.
  */
 function initialHighlightFor(
   question: ClaudeQuestion,
@@ -136,7 +136,8 @@ function initialHighlightFor(
   if (question.multiSelect) {
     const selected = Array.isArray(selection) ? selection : [];
     const first = question.options.findIndex((option) => selected.includes(option.label));
-    return first >= 0 ? first : 0;
+    if (first >= 0) return first;
+    return customSelected ? question.options.length : 0;
   }
   if (customSelected) return question.options.length;
   const selected = question.options.findIndex((option) => option.label === selection);

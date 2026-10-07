@@ -191,6 +191,8 @@ interface RebindHarness {
 const REBIND_CASES: {
   action: ShortcutActionId;
   code: string;
+  /** Bound first, then overwritten with `code` while the card is mounted. */
+  priorCode?: string;
   run: (h: RebindHarness) => void;
 }[] = [
   {
@@ -276,20 +278,28 @@ const REBIND_CASES: {
   },
   {
     action: "questionCardCancel",
-    code: "KeyH",
+    code: "KeyJ",
+    priorCode: "KeyH",
     run: (h) => {
-      expect(h.hint()).toHaveTextContent("H cancel");
+      expect(h.hint()).toHaveTextContent("J cancel");
+      expect(h.hint()).not.toHaveTextContent("H cancel");
       h.press({ key: "h", code: "KeyH" });
+      expect(h.onReject).not.toHaveBeenCalled();
+      h.press({ key: "j", code: "KeyJ" });
       expect(h.onReject).toHaveBeenCalledTimes(1);
       expect(document.activeElement).toBe(h.composer);
     },
   },
   {
     action: "questionCardCancelAndInterrupt",
-    code: "KeyI",
+    code: "KeyJ",
+    priorCode: "KeyH",
     run: (h) => {
-      expect(h.hint()).toHaveTextContent("I cancel & interrupt");
-      h.press({ key: "i", code: "KeyI" });
+      expect(h.hint()).toHaveTextContent("J cancel & interrupt");
+      expect(h.hint()).not.toHaveTextContent("H cancel & interrupt");
+      h.press({ key: "h", code: "KeyH" });
+      expect(h.onAbort).not.toHaveBeenCalled();
+      h.press({ key: "j", code: "KeyJ" });
       expect(h.onAbort).toHaveBeenCalledTimes(1);
       expect(document.activeElement).toBe(h.composer);
     },
@@ -315,6 +325,38 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(document.activeElement).toBe(card());
     expect(highlightedIndex()).toBe(0);
     expect(screen.getByTestId("composer")).toHaveValue("draft");
+  });
+
+  it("re-enters on the custom row when a multi-select answer is custom-only", () => {
+    renderKeyboardForm(
+      questionsOf([
+        {
+          id: "q1",
+          question: "Pick any?",
+          options: [{ label: "A" }, { label: "B" }],
+          multiSelect: true,
+        },
+      ]),
+    );
+    focusCard();
+
+    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    pressCard({ key: " ", code: "Space" });
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    const customLabel = textarea.closest("label");
+    fireEvent.change(textarea, { target: { value: "custom answer" } });
+
+    // Esc from the box returns to the options, the next Esc leaves to the composer.
+    fireEvent.keyDown(textarea, { key: "Escape", code: "Escape" });
+    pressCard({ key: "Escape", code: "Escape" });
+    expect(document.activeElement).toBe(screen.getByTestId("composer"));
+
+    fireEvent.keyDown(window, { key: "F", code: "KeyF", ctrlKey: true, shiftKey: true });
+
+    expect(document.activeElement).toBe(card());
+    expect(customLabel?.getAttribute("data-highlighted")).toBe("true");
+    expect(highlightedIndex()).toBe(2);
   });
 
   it("moves the highlight without selecting", () => {
@@ -619,10 +661,15 @@ describe("AskUserQuestionForm — keyboard", () => {
 
   it.each(REBIND_CASES)(
     "rebinds $action to $code: old key inert, new key acts, hint follows",
-    ({ action, code, run }) => {
-      writeShortcutPreference(action, { common: [{ code, modifiers: [] }] });
+    ({ action, code, priorCode, run }) => {
+      writeShortcutPreference(action, { common: [{ code: priorCode ?? code, modifiers: [] }] });
       const onAbort = vi.fn();
       const { onReject } = renderKeyboardForm(questionsOf(TWO_QUESTIONS), { onAbort });
+      if (priorCode) {
+        act(() => {
+          writeShortcutPreference(action, { common: [{ code, modifiers: [] }] });
+        });
+      }
       focusCard();
 
       run({
