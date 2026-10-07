@@ -707,6 +707,21 @@ async def test_member_label_value_over_cap_is_a_400(
 
 
 @pytest.mark.asyncio
+async def test_member_label_value_near_cap_creates_through_http(
+    member_server: _MemberServer, client: httpx.AsyncClient
+) -> None:
+    """A member value near the 256-char cap still creates: the lock is a session label."""
+    _arm_host(member_server.hosts)
+    response = await _create(client, joint_bundle(worker_model="m" * 145))
+
+    conversation = member_server.conversations.get_conversation(response.json()["session_id"])
+    assert conversation is not None
+    labels = conversation.labels
+    assert 242 <= len(labels[member_label_key("researcher")]) <= 256
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "false"
+
+
+@pytest.mark.asyncio
 async def test_member_entry_at_the_value_cap_creates_with_the_session_lock() -> None:
     """A member entry within 14 chars of the cap still fits: the lock is a
     session label, not a field inside every entry."""
