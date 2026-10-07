@@ -1,6 +1,12 @@
 import { useEffect, useRef } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 type ViewMode = "chat" | "terminal";
 
@@ -15,13 +21,16 @@ export function isViewModeToggleHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): boolean {
-  if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey || event.isComposing) {
-    return false;
-  }
+  if (event.isComposing) return false;
   if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
     return false;
   }
-  return event.code === "Backslash";
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("toggleViewMode")) return false;
+  if (!hasCustomShortcutBindings("toggleViewMode")) {
+    if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey) return false;
+    return event.code === "Backslash";
+  }
+  return eventMatchesShortcutAction(event, "toggleViewMode");
 }
 
 export function useViewModeToggleHotkey(

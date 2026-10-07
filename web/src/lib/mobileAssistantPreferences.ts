@@ -1,4 +1,5 @@
 import { dispatchArchiveSession, dispatchPollSessions } from "@/hooks/useSessionPollingHotkeys";
+import { dispatchSelectWorkspaceTab } from "@/hooks/useWorkspaceTabHotkeys";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   currentShortcutPlatform,
@@ -552,6 +553,13 @@ export function mobileAssistantBindingLabel(binding: MobileAssistantButtonBindin
   return parts.join("+");
 }
 
+const WORKSPACE_TAB_SHORTCUTS: Partial<Record<ShortcutActionId, 1 | 2 | 3 | 4>> = {
+  selectWorkspaceTab1: 1,
+  selectWorkspaceTab2: 2,
+  selectWorkspaceTab3: 3,
+  selectWorkspaceTab4: 4,
+};
+
 export function dispatchMobileAssistantButton(
   button: MobileAssistantButton,
   preferredDomTarget?: HTMLElement | null,
@@ -564,6 +572,14 @@ export function dispatchMobileAssistantButton(
     }
     if (binding.actionId === "archiveSession") {
       dispatchArchiveSession();
+      return;
+    }
+    // The switcher needs a held modifier to cycle and release to commit, which
+    // a tap can't express.
+    if (binding.actionId === "recentSessions") return;
+    const tabNumber = WORKSPACE_TAB_SHORTCUTS[binding.actionId];
+    if (tabNumber !== undefined) {
+      dispatchSelectWorkspaceTab(tabNumber);
       return;
     }
     const chord = resolveShortcutBindings(binding.actionId)[0];

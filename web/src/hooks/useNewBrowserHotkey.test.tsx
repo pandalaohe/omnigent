@@ -2,8 +2,12 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isNewBrowserHotkey, useNewBrowserHotkey } from "./useNewBrowserHotkey";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 function event(init: KeyboardEventInit): KeyboardEvent {
   return new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
@@ -83,5 +87,21 @@ describe("useNewBrowserHotkey", () => {
 
     expect(onOpen).not.toHaveBeenCalled();
     expect(keyboardEvent.defaultPrevented).toBe(false);
+  });
+
+  it("follows a recorded replacement chord instead of the default", () => {
+    const onOpen = vi.fn();
+    renderHook(() => useNewBrowserHotkey(onOpen, true, false));
+    writeShortcutPreference("newBrowserTab", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+
+    const oldChord = press({ code: "KeyB", ctrlKey: true, altKey: true });
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(oldChord.defaultPrevented).toBe(false);
+
+    const rebound = press({ code: "KeyJ", ctrlKey: true, shiftKey: true });
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(rebound.defaultPrevented).toBe(true);
   });
 });

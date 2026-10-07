@@ -1,5 +1,5 @@
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
-import { ARIA_MOD_KEY, VIEW_MODE_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
+import { useShortcutHint } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -32,6 +32,7 @@ const ignoreViewChange = () => {};
 export function ViewModeToggle() {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
+  const shortcutHint = useShortcutHint("toggleViewMode");
   useViewModeToggleHotkey({
     enabled: Boolean(ctx?.isTerminalFirst && !ctx.isShellView),
     view: ctx?.view ?? "chat",
@@ -59,6 +60,7 @@ export function ViewModeToggle() {
         onClick={() => setView("chat")}
         testId="view-mode-chat"
         componentId="chat.header.view_chat"
+        shortcutHint={shortcutHint}
       >
         <MessagesSquareIcon className="size-4" />
       </ViewModeSegment>
@@ -68,6 +70,7 @@ export function ViewModeToggle() {
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
         componentId="chat.header.view_terminal"
+        shortcutHint={shortcutHint}
       >
         {terminalStartingUp ? (
           <Loader2Icon className="size-4 animate-spin" aria-hidden />
@@ -91,6 +94,7 @@ function ViewModeSegment({
   onClick,
   testId,
   componentId,
+  shortcutHint,
   children,
 }: {
   label: string;
@@ -98,6 +102,7 @@ function ViewModeSegment({
   onClick: () => void;
   testId: string;
   componentId: string;
+  shortcutHint: { keys: string[]; aria: string | undefined };
   children: React.ReactNode;
 }) {
   return (
@@ -110,7 +115,7 @@ function ViewModeSegment({
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+\\`}
+            aria-keyshortcuts={shortcutHint.aria}
             onClick={onClick}
             data-testid={testId}
             componentId={componentId}
@@ -127,7 +132,7 @@ function ViewModeSegment({
       </TooltipTrigger>
       {/* Bottom placement: the header sits at top-0, so a top-side tooltip
           would render above the viewport edge and get clipped. */}
-      <TooltipContent side="bottom" shortcut={VIEW_MODE_TOGGLE_KEYS}>
+      <TooltipContent side="bottom" shortcut={shortcutHint.keys}>
         <span>{label}</span>
       </TooltipContent>
     </Tooltip>

@@ -3,7 +3,7 @@
 // behavior — every row here corresponds to a handler that ships today
 // (composer `handleKeyDown`, the global session-switch / message-nav hotkeys,
 // and the approve hotkey). Nothing here binds new behavior except the dialog's
-// own opener (⌘/Ctrl + /), which this component registers.
+// own opener, which follows the showShortcuts binding.
 //
 // Self-contained: it owns its open state and listens for its opener directly
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
@@ -12,16 +12,12 @@
 import { Fragment, useEffect, useState } from "react";
 
 import {
-  ALT_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
-  CTRL_KEY,
-  ENTER_KEY,
   Kbd,
-  MOD_KEY,
-  SHIFT_KEY,
-  VIEW_MODE_TOGGLE_KEYS,
+  shortcutKeys,
+  useKeyboardShortcutsVersion,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -34,6 +30,16 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import {
+  currentShortcutPlatform,
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+  resolveShortcutBindings,
+  shortcutBindingLabels,
+  type ShortcutActionId,
+} from "@/lib/keyboardShortcutPreferences";
 import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -49,8 +55,6 @@ export function openKeyboardShortcuts(): void {
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
 const UP = "↑";
 const DOWN = "↓";
-const BRACKET_LEFT = "[";
-const BRACKET_RIGHT = "]";
 
 interface Shortcut {
   label: string;
@@ -58,6 +62,8 @@ interface Shortcut {
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
   lastKeySeparator?: string;
+  /** When set, keys come from the live shortcut layer instead of `keys`. */
+  actionId?: ShortcutActionId;
 }
 
 interface ShortcutGroup {
@@ -73,11 +79,11 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
-      { label: "Open command palette", keys: [MOD_KEY, "K"] },
-      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
-      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
-      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
+      { label: "Start a new session", keys: [], actionId: "newSession" },
+      { label: "Open command palette", keys: [], actionId: "commandPalette" },
+      { label: "Find a session by name", keys: [], actionId: "findSession" },
+      { label: "Open Settings", keys: [], actionId: "openSettings" },
+      { label: "Show keyboard shortcuts", keys: [], actionId: "showShortcuts" },
     ],
   },
   {
@@ -85,42 +91,42 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
-      { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
-      { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
-      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
+      { label: "Accept approval prompt", keys: [], actionId: "approvePrompt" },
+      { label: "Open model picker", keys: [], actionId: "openModelPicker" },
+      { label: "Focus chat input", keys: [], actionId: "focusComposer" },
+      { label: "Toggle voice dictation", keys: [], actionId: "voiceDictation" },
       { label: "Stop response", keys: ["Esc"] },
     ],
   },
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
-      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
+      { label: "Previous session", keys: [], actionId: "previousSession" },
+      { label: "Next session", keys: [], actionId: "nextSession" },
     ],
   },
   {
     title: "View",
     items: [
-      { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Toggle Chat / Terminal view", keys: [], actionId: "toggleViewMode" },
+      { label: "Toggle conversations sidebar", keys: [], actionId: "toggleConversationsSidebar" },
+      { label: "Focus or close workspace sidebar", keys: [], actionId: "toggleWorkspaceSidebar" },
       {
         label: "Select a workspace tab",
-        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
+        keys: [],
         lastKeySeparator: "+",
       },
-      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
-      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
+      { label: "Open a new browser tab", keys: [], actionId: "newBrowserTab" },
+      { label: "Open a new shell", keys: [], actionId: "newShell" },
     ],
   },
   {
     title: "Slash commands",
     note: "while the suggestions menu is open",
     items: [
-      { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
+      { label: "Navigate suggestions", keys: [] },
+      { label: "Apply highlighted command", keys: [], actionId: "applySuggestion" },
+      { label: "Dismiss menu", keys: [], actionId: "dismissSuggestions" },
     ],
   },
 ];
@@ -130,9 +136,15 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 // Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
 // native tab-switching. Shown in both, with the matching glyphs.
 function pinnedSessionShortcut(native: boolean): Shortcut {
+  if (!isShortcutActionEnabled("pinnedSession")) {
+    return { label: "Jump to pinned session (1–10)", keys: [] };
+  }
+  const bindings = resolveShortcutBindings("pinnedSession", currentShortcutPlatform(), {
+    nativeShell: native,
+  });
   return {
     label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
+    keys: bindings.flatMap((binding) => shortcutBindingLabels(binding)),
   };
 }
 
@@ -166,16 +178,37 @@ function shortcutGroupsFor(
       return {
         ...group,
         items: [
-          ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
+          ...(electron
+            ? [{ label: "Switch recent sessions", keys: [], actionId: "recentSessions" as const }]
+            : []),
           ...group.items,
           pinnedSessionShortcut(native),
         ],
       };
     }
-    if (group.title === "View" && !browser) {
+    if (group.title === "Slash commands") {
       return {
         ...group,
-        items: group.items.filter((item) => item.label !== "Open a new browser tab"),
+        items: group.items.map((item) =>
+          item.label === "Navigate suggestions"
+            ? {
+                ...item,
+                keys: [...shortcutKeys("previousSuggestion"), ...shortcutKeys("nextSuggestion")],
+              }
+            : item,
+        ),
+      };
+    }
+    if (group.title === "View") {
+      return {
+        ...group,
+        items: group.items
+          .filter((item) => browser || item.label !== "Open a new browser tab")
+          .map((item) =>
+            item.label === "Select a workspace tab"
+              ? { ...item, keys: [...shortcutKeys("toggleWorkspaceSidebar"), "1…4"] }
+              : item,
+          ),
       };
     }
     return group;
@@ -192,6 +225,7 @@ export function KeyboardShortcutsList({
 }: {
   variant?: "compact" | "settings";
 }) {
+  useKeyboardShortcutsVersion();
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -221,30 +255,34 @@ export function KeyboardShortcutsList({
             ) : null}
           </h3>
           <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
-            {group.items.map((item) => (
-              <li
-                key={item.label}
-                className={
-                  settings
-                    ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
-                    : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
-                }
-              >
-                <span className="text-ui text-foreground">{item.label}</span>
-                <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key, index) => (
-                    <Fragment key={`${item.label}-${key}`}>
-                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
-                        <span aria-hidden="true" className="text-muted-foreground/70">
-                          {item.lastKeySeparator}
-                        </span>
-                      ) : null}
-                      <Kbd>{key}</Kbd>
-                    </Fragment>
-                  ))}
-                </span>
-              </li>
-            ))}
+            {group.items.map((item) => {
+              const keys = item.actionId ? shortcutKeys(item.actionId) : item.keys;
+              if (keys.length === 0) return null;
+              return (
+                <li
+                  key={item.label}
+                  className={
+                    settings
+                      ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
+                      : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+                  }
+                >
+                  <span className="text-ui text-foreground">{item.label}</span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {keys.map((key, index) => (
+                      <Fragment key={`${item.label}-${key}`}>
+                        {index === keys.length - 1 && item.lastKeySeparator ? (
+                          <span aria-hidden="true" className="text-muted-foreground/70">
+                            {item.lastKeySeparator}
+                          </span>
+                        ) : null}
+                        <Kbd>{key}</Kbd>
+                      </Fragment>
+                    ))}
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         </section>
       ))}
@@ -252,15 +290,25 @@ export function KeyboardShortcutsList({
   );
 }
 
+/** The dialog's own opener follows the showShortcuts binding. */
+function isShowShortcutsHotkey(event: KeyboardEvent): boolean {
+  if (event.getModifierState?.("AltGraph")) return false;
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("showShortcuts")) return false;
+  if (!hasCustomShortcutBindings("showShortcuts")) {
+    // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
+    // trigger, so require the platform command modifier and no Shift/Alt to
+    // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
+    return hasCommandModifier(event) && !event.altKey && !event.shiftKey && event.key === "/";
+  }
+  return eventMatchesShortcutAction(event, "showShortcuts");
+}
+
 export function KeyboardShortcutsDialog() {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the platform command modifier and no Shift/Alt to
-      // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
-      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+      if (isShowShortcutsHotkey(e)) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

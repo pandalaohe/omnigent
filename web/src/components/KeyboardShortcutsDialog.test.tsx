@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -7,6 +7,7 @@ import {
   openKeyboardShortcuts,
 } from "./KeyboardShortcutsDialog";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 // The pinned-session row shows in both shells; only its chord differs (Alt in
 // the browser). Default the mock to browser (false); flip per-test for native.
@@ -85,6 +86,107 @@ describe("KeyboardShortcutsList settings layout", () => {
   });
 });
 
+describe("KeyboardShortcutsList shortcut layer rows", () => {
+  it("shows the rebound keys for the Open Settings row", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
+
+    act(() => {
+      writeShortcutPreference("openSettings", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "⇧", "P"]);
+  });
+
+  it("hides the Open Settings row when the action is disabled", () => {
+    render(<KeyboardShortcutsList />);
+    act(() => {
+      writeShortcutPreference("openSettings", { enabled: false });
+    });
+
+    expect(screen.queryByText("Open Settings")).toBeNull();
+  });
+
+  it("follows rebound rows, including previous session and the workspace-tab toggle", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
+
+    act(() => {
+      writeShortcutPreference("previousSession", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("newShell", {
+        common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("toggleWorkspaceSidebar", {
+        common: [{ code: "KeyG", modifiers: ["primary", "shift"] }],
+      });
+    });
+
+    expect(keysFor("Previous session")).toEqual(["Ctrl", "⇧", "P"]);
+    expect(keysFor("Open a new shell")).toEqual(["Ctrl", "⇧", "J"]);
+    expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "⇧", "G", "1…4"]);
+  });
+
+  it("keeps consumerless chat rows on their fixed keys after a rebind", () => {
+    writeShortcutPreference("recallPreviousPrompt", {
+      common: [{ code: "KeyP", modifiers: ["primary"] }],
+    });
+    writeShortcutPreference("recallNextPrompt", {
+      common: [{ code: "KeyN", modifiers: ["primary"] }],
+    });
+    writeShortcutPreference("stopResponse", {
+      common: [{ code: "KeyX", modifiers: ["primary"] }],
+    });
+    render(<KeyboardShortcutsList />);
+
+    expect(keysFor("Recall previous prompt")).toEqual(["↑"]);
+    expect(keysFor("Recall next prompt")).toEqual(["↓"]);
+    expect(keysFor("Stop response")).toEqual(["Esc"]);
+  });
+
+  it("follows rebound slash-command rows", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Navigate suggestions")).toEqual(["↑", "↓"]);
+    expect(keysFor("Apply highlighted command")).toEqual(["Tab"]);
+    expect(keysFor("Dismiss menu")).toEqual(["Esc"]);
+
+    act(() => {
+      writeShortcutPreference("previousSuggestion", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+      writeShortcutPreference("dismissSuggestions", {
+        common: [{ code: "KeyX", modifiers: ["primary"] }],
+      });
+    });
+
+    expect(keysFor("Navigate suggestions")).toEqual(["Ctrl", "⇧", "P", "↓"]);
+    expect(keysFor("Dismiss menu")).toEqual(["Ctrl", "X"]);
+  });
+
+  it.each([
+    ["focusComposer", "Focus chat input", "KeyY", ["Ctrl", "⇧", "Y"], ["Ctrl", "⇧", "L"]],
+    ["openModelPicker", "Open model picker", "KeyU", ["Ctrl", "⇧", "U"], ["Ctrl", "⇧", "M"]],
+    ["findSession", "Find a session by name", "KeyO", ["Ctrl", "⇧", "O"], ["Ctrl", "Alt", "S"]],
+  ] as const)(
+    "shows the rebound keys for the %s row",
+    (actionId, label, code, expected, defaultExpected) => {
+      render(<KeyboardShortcutsList />);
+      expect(keysFor(label)).toEqual(defaultExpected);
+
+      act(() => {
+        writeShortcutPreference(actionId, {
+          common: [{ code, modifiers: ["primary", "shift"] }],
+        });
+      });
+
+      expect(keysFor(label)).toEqual(expected);
+    },
+  );
+});
+
 describe("KeyboardShortcutsDialog", () => {
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
@@ -139,6 +241,24 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Send message")).toBeTruthy();
 
     toggleViaHotkey();
+    await waitFor(() => expect(screen.queryByText("Send message")).toBeNull());
+  });
+
+  it("opens on the rebound showShortcuts chord and no longer on the old one", async () => {
+    writeShortcutPreference("showShortcuts", {
+      common: [{ code: "KeyK", modifiers: ["primary", "shift"] }],
+    });
+    render(<KeyboardShortcutsDialog />);
+
+    // The old ⌘/Ctrl+/ no longer toggles the dialog once rebound.
+    toggleViaHotkey();
+    expect(screen.queryByText("Send message")).toBeNull();
+
+    const rebound = { key: "k", code: "KeyK", ctrlKey: true, shiftKey: true };
+    fireEvent.keyDown(window, rebound);
+    expect(screen.getByText("Send message")).toBeTruthy();
+
+    fireEvent.keyDown(window, rebound);
     await waitFor(() => expect(screen.queryByText("Send message")).toBeNull());
   });
 

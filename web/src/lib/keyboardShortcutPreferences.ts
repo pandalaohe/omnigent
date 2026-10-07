@@ -14,21 +14,33 @@ export type ShortcutScope = "global" | "composer" | "suggestions";
 export type ShortcutActionId =
   | "newSession"
   | "commandPalette"
+  | "openSettings"
+  | "findSession"
   | "showShortcuts"
   | "sendMessage"
   | "newLine"
   | "recallPreviousPrompt"
   | "recallNextPrompt"
   | "approvePrompt"
+  | "openModelPicker"
+  | "focusComposer"
   | "voiceDictation"
   | "stopResponse"
+  | "recentSessions"
   | "previousSession"
   | "nextSession"
   | "pollSessions"
   | "archiveSession"
   | "pinnedSession"
+  | "toggleViewMode"
   | "toggleConversationsSidebar"
   | "toggleWorkspaceSidebar"
+  | "selectWorkspaceTab1"
+  | "selectWorkspaceTab2"
+  | "selectWorkspaceTab3"
+  | "selectWorkspaceTab4"
+  | "newBrowserTab"
+  | "newShell"
   | "previousSuggestion"
   | "nextSuggestion"
   | "applySuggestion"
@@ -49,6 +61,9 @@ const chord = (code: string, modifiers: ShortcutModifier[] = []): ShortcutChord 
   modifiers,
 });
 
+const WORKSPACE_TAB_NOTE =
+  "Not set by default. Focusing the workspace tabs and pressing the number also works.";
+
 export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefinition> = {
   newSession: {
     id: "newSession",
@@ -63,6 +78,20 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "general",
     scope: "global",
     defaultBindings: [chord("KeyK", ["primary"])],
+  },
+  openSettings: {
+    id: "openSettings",
+    label: "Open Settings",
+    group: "general",
+    scope: "global",
+    defaultBindings: [chord("Comma", ["primary", "alt"])],
+  },
+  findSession: {
+    id: "findSession",
+    label: "Find a session by name",
+    group: "general",
+    scope: "global",
+    defaultBindings: [chord("KeyS", ["primary", "alt"])],
   },
   showShortcuts: {
     id: "showShortcuts",
@@ -106,6 +135,20 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     scope: "global",
     defaultBindings: [chord("Enter", ["primary"])],
   },
+  openModelPicker: {
+    id: "openModelPicker",
+    label: "Open model picker",
+    group: "chats",
+    scope: "global",
+    defaultBindings: [chord("KeyM", ["control", "shift"])],
+  },
+  focusComposer: {
+    id: "focusComposer",
+    label: "Focus chat input",
+    group: "chats",
+    scope: "global",
+    defaultBindings: [chord("KeyL", ["control", "shift"])],
+  },
   voiceDictation: {
     id: "voiceDictation",
     label: "Toggle voice dictation",
@@ -120,19 +163,27 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     scope: "composer",
     defaultBindings: [chord("Escape")],
   },
+  recentSessions: {
+    id: "recentSessions",
+    label: "Switch recent sessions",
+    group: "navigation",
+    scope: "global",
+    defaultBindings: [chord("Tab", ["control"])],
+    note: "Desktop app. Hold the modifier and press the key again to cycle (Shift goes back); release to switch. Inside an embedded browser page only the default Ctrl+Tab works.",
+  },
   previousSession: {
     id: "previousSession",
     label: "Previous session",
     group: "navigation",
     scope: "global",
-    defaultBindings: [chord("ArrowUp", ["primary"])],
+    defaultBindings: [chord("BracketLeft", ["primary"])],
   },
   nextSession: {
     id: "nextSession",
     label: "Next session",
     group: "navigation",
     scope: "global",
-    defaultBindings: [chord("ArrowDown", ["primary"])],
+    defaultBindings: [chord("BracketRight", ["primary"])],
   },
   pollSessions: {
     id: "pollSessions",
@@ -155,6 +206,13 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     scope: "global",
     defaultBindings: [chord("Digit*", ["primary", "alt"])],
   },
+  toggleViewMode: {
+    id: "toggleViewMode",
+    label: "Toggle Chat / Terminal view",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("Backslash", ["primary", "alt"])],
+  },
   toggleConversationsSidebar: {
     id: "toggleConversationsSidebar",
     label: "Toggle conversations sidebar",
@@ -164,10 +222,56 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
   },
   toggleWorkspaceSidebar: {
     id: "toggleWorkspaceSidebar",
-    label: "Toggle workspace sidebar",
+    label: "Focus or close workspace sidebar",
     group: "view",
     scope: "global",
     defaultBindings: [chord("BracketRight", ["primary", "alt"])],
+  },
+  selectWorkspaceTab1: {
+    id: "selectWorkspaceTab1",
+    label: "Select workspace tab 1",
+    group: "view",
+    scope: "global",
+    defaultBindings: [],
+    note: WORKSPACE_TAB_NOTE,
+  },
+  selectWorkspaceTab2: {
+    id: "selectWorkspaceTab2",
+    label: "Select workspace tab 2",
+    group: "view",
+    scope: "global",
+    defaultBindings: [],
+    note: WORKSPACE_TAB_NOTE,
+  },
+  selectWorkspaceTab3: {
+    id: "selectWorkspaceTab3",
+    label: "Select workspace tab 3",
+    group: "view",
+    scope: "global",
+    defaultBindings: [],
+    note: WORKSPACE_TAB_NOTE,
+  },
+  selectWorkspaceTab4: {
+    id: "selectWorkspaceTab4",
+    label: "Select workspace tab 4",
+    group: "view",
+    scope: "global",
+    defaultBindings: [],
+    note: WORKSPACE_TAB_NOTE,
+  },
+  newBrowserTab: {
+    id: "newBrowserTab",
+    label: "Open a new browser tab",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("KeyB", ["primary", "alt"])],
+  },
+  newShell: {
+    id: "newShell",
+    label: "Open a new shell",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("KeyT", ["primary", "alt"])],
   },
   previousSuggestion: {
     id: "previousSuggestion",
@@ -449,6 +553,13 @@ function eventCode(event: Pick<KeyboardEvent, "code" | "key">): string {
     "~": "Backquote",
     "[": "BracketLeft",
     "]": "BracketRight",
+    ",": "Comma",
+    ".": "Period",
+    "\\": "Backslash",
+    ";": "Semicolon",
+    "'": "Quote",
+    "-": "Minus",
+    "=": "Equal",
   };
   return byKey[event.key] ?? event.key;
 }
@@ -559,7 +670,7 @@ export function shortcutBindingLabels(
 ): string[] {
   const flags = resolvedModifierFlags(binding, platform);
   const labels: string[] = [];
-  if (flags.ctrl) labels.push("Ctrl");
+  if (flags.ctrl) labels.push(platform === "macos" ? "⌃" : "Ctrl");
   if (flags.meta) labels.push(platform === "macos" ? "⌘" : "Meta");
   if (flags.alt) labels.push(platform === "macos" ? "⌥" : "Alt");
   if (flags.shift) labels.push("⇧");
@@ -575,8 +686,50 @@ export function shortcutBindingLabels(
     Backquote: "~",
     BracketLeft: "[",
     BracketRight: "]",
+    Comma: ",",
+    Period: ".",
+    Backslash: "\\",
+    Semicolon: ";",
+    Quote: "'",
+    Minus: "-",
+    Equal: "=",
+    Space: "Space",
     "Digit*": "1…0",
   };
   labels.push(keyLabels[binding.code] ?? binding.code.replace(/^Key/, "").replace(/^Digit/, ""));
   return labels;
+}
+
+const ARIA_KEY_CODES: Record<string, string> = {
+  Comma: ",",
+  Period: ".",
+  Backslash: "\\",
+  Slash: "/",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backquote: "`",
+  Semicolon: ";",
+  Quote: "'",
+  Minus: "-",
+  Equal: "=",
+  Space: "Space",
+};
+
+export function shortcutAriaKeys(
+  binding: ShortcutChord,
+  platform = currentShortcutPlatform(),
+): string {
+  const flags = resolvedModifierFlags(binding, platform);
+  const parts: string[] = [];
+  if (flags.ctrl) parts.push("Control");
+  if (flags.meta) parts.push("Meta");
+  if (flags.alt) parts.push("Alt");
+  if (flags.shift) parts.push("Shift");
+  const key = binding.code.startsWith("Key")
+    ? binding.code.slice(3)
+    : binding.code.startsWith("Digit")
+      ? binding.code.slice(5)
+      : (ARIA_KEY_CODES[binding.code] ?? binding.code);
+  parts.push(key);
+  return parts.join("+");
 }

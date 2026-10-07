@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useReducer, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { PlusIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 
-import { Kbd } from "@/components/KeyboardShortcut";
+import { Kbd, useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -12,7 +12,6 @@ import {
 import { Switch } from "@/components/ui/switch";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
-  KEYBOARD_SHORTCUTS_CHANGED_EVENT,
   SHORTCUT_ACTION_IDS,
   currentShortcutPlatform,
   defaultShortcutBindings,
@@ -91,6 +90,8 @@ function ShortcutBindingButton({
     >
       {recording ? (
         <span className="animate-pulse text-sm text-primary">Press shortcut…</span>
+      ) : bindings.length === 0 ? (
+        <span className="text-sm text-muted-foreground">Not set</span>
       ) : (
         bindings.flatMap((binding, bindingIndex) =>
           shortcutBindingLabels(binding, displayPlatform).map((label) => (
@@ -107,7 +108,7 @@ function platformLabel(platform: ShortcutPlatform): string {
 }
 
 export function KeyboardShortcutEditor() {
-  const [, refresh] = useReducer((version: number) => version + 1, 0);
+  useKeyboardShortcutsVersion();
   const [recording, setRecording] = useState<RecordingTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const preferences = readKeyboardShortcutPreferences();
@@ -128,16 +129,6 @@ export function KeyboardShortcutEditor() {
   };
 
   useEffect(() => {
-    const onChanged = () => refresh();
-    window.addEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
-    window.addEventListener("storage", onChanged);
-    return () => {
-      window.removeEventListener(KEYBOARD_SHORTCUTS_CHANGED_EVENT, onChanged);
-      window.removeEventListener("storage", onChanged);
-    };
-  }, []);
-
-  useEffect(() => {
     if (!recording) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.repeat || event.isComposing) return;
@@ -151,6 +142,24 @@ export function KeyboardShortcutEditor() {
         setShortcutRecordingActive(false);
         setRecording(null);
         return;
+      }
+      if (recording.actionId === "recentSessions") {
+        const holdsModifier = (["control", "meta", "alt"] as const).some((modifier) =>
+          recordedChord.modifiers.includes(modifier),
+        );
+        const refusal = recordedChord.modifiers.includes("shift")
+          ? "Switch recent sessions uses Shift to go back."
+          : !holdsModifier
+            ? "Switch recent sessions needs a modifier to hold."
+            : null;
+        if (refusal) {
+          event.preventDefault();
+          event.stopPropagation();
+          setError(refusal);
+          setShortcutRecordingActive(false);
+          setRecording(null);
+          return;
+        }
       }
       const chord =
         recording.actionId === "pinnedSession" && /^Digit[0-9]$/.test(recordedChord.code)
@@ -289,8 +298,13 @@ export function KeyboardShortcutEditor() {
                   className="border-b border-border/60 py-2 last:border-b-0"
                 >
                   <div className="flex min-h-9 items-center gap-2">
-                    <span className="min-w-0 flex-1 text-ui text-foreground">
-                      {definition.label}
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-ui text-foreground">{definition.label}</span>
+                      {definition.note ? (
+                        <span className="block text-xs text-muted-foreground">
+                          {definition.note}
+                        </span>
+                      ) : null}
                     </span>
                     <Switch
                       checked={enabled}

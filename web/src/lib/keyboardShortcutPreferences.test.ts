@@ -10,8 +10,11 @@ import {
   defaultShortcutBindings,
   readKeyboardShortcutPreferences,
   resolveShortcutBindings,
+  shortcutAriaKeys,
+  shortcutBindingLabels,
   shortcutChordFromEvent,
   writeShortcutPreference,
+  type ShortcutActionId,
   type ShortcutChord,
 } from "./keyboardShortcutPreferences";
 
@@ -163,5 +166,69 @@ describe("keyboardShortcutPreferences", () => {
 
     expect(listener).toHaveBeenCalledOnce();
     window.removeEventListener("omnigent:keyboard-shortcuts-changed", listener);
+  });
+
+  it("registers the upstream hotkey defaults", () => {
+    const expected: [ShortcutActionId, ShortcutChord[]][] = [
+      ["openSettings", [{ code: "Comma", modifiers: ["primary", "alt"] }]],
+      ["findSession", [{ code: "KeyS", modifiers: ["primary", "alt"] }]],
+      ["openModelPicker", [{ code: "KeyM", modifiers: ["control", "shift"] }]],
+      ["focusComposer", [{ code: "KeyL", modifiers: ["control", "shift"] }]],
+      ["recentSessions", [{ code: "Tab", modifiers: ["control"] }]],
+      ["previousSession", [{ code: "BracketLeft", modifiers: ["primary"] }]],
+      ["nextSession", [{ code: "BracketRight", modifiers: ["primary"] }]],
+      ["toggleViewMode", [{ code: "Backslash", modifiers: ["primary", "alt"] }]],
+      ["selectWorkspaceTab1", []],
+      ["selectWorkspaceTab2", []],
+      ["selectWorkspaceTab3", []],
+      ["selectWorkspaceTab4", []],
+      ["newBrowserTab", [{ code: "KeyB", modifiers: ["primary", "alt"] }]],
+      ["newShell", [{ code: "KeyT", modifiers: ["primary", "alt"] }]],
+    ];
+
+    for (const [actionId, bindings] of expected) {
+      expect(resolveShortcutBindings(actionId, "macos")).toEqual(bindings);
+    }
+  });
+
+  it("keeps an action with an empty default safe to resolve and conflict-check", () => {
+    expect(resolveShortcutBindings("selectWorkspaceTab1", "macos")).toEqual([]);
+    expect(findShortcutConflicts("selectWorkspaceTab1", [], "macos")).toEqual([]);
+  });
+
+  it("labels the macOS control modifier and punctuation keys", () => {
+    expect(
+      shortcutBindingLabels({ code: "KeyL", modifiers: ["control", "shift"] }, "macos"),
+    ).toEqual(["⌃", "⇧", "L"]);
+    expect(
+      shortcutBindingLabels({ code: "KeyL", modifiers: ["control", "shift"] }, "windows"),
+    ).toEqual(["Ctrl", "⇧", "L"]);
+    expect(shortcutBindingLabels({ code: "Backslash", modifiers: [] }, "macos")).toEqual(["\\"]);
+    expect(shortcutBindingLabels({ code: "Comma", modifiers: [] }, "macos")).toEqual([","]);
+  });
+
+  it("builds aria-keyshortcuts strings from the resolved modifier flags", () => {
+    const binding: ShortcutChord = { code: "KeyN", modifiers: ["primary", "alt"] };
+    expect(shortcutAriaKeys(binding, "macos")).toEqual("Meta+Alt+N");
+    expect(shortcutAriaKeys(binding, "windows")).toEqual("Control+Alt+N");
+    expect(shortcutAriaKeys({ code: "Comma", modifiers: ["primary", "alt"] }, "macos")).toEqual(
+      "Meta+Alt+,",
+    );
+  });
+
+  it("names punctuation and space keys in aria-keyshortcuts", () => {
+    expect(shortcutAriaKeys({ code: "Semicolon", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+;",
+    );
+    expect(shortcutAriaKeys({ code: "Quote", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+'",
+    );
+    expect(shortcutAriaKeys({ code: "Minus", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+-",
+    );
+    expect(shortcutAriaKeys({ code: "Equal", modifiers: ["primary"] }, "windows")).toEqual(
+      "Control+=",
+    );
+    expect(shortcutAriaKeys({ code: "Space", modifiers: [] }, "windows")).toEqual("Space");
   });
 });

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import {
   TerminalFirstContextProvider,
@@ -73,11 +74,13 @@ function renderMenuItems(ctx: TerminalFirstContextValue | null) {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   isMobileMock.mockReturnValue(false);
 });
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.clearAllMocks();
 });
 
@@ -159,6 +162,21 @@ describe("ViewModeToggle", () => {
     expect(
       Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
     ).toEqual([MOD_KEY, ALT_KEY, "\\"]);
+  });
+
+  it("follows a rebound view-mode chord in the segment hints", async () => {
+    writeShortcutPreference("toggleViewMode", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+    renderToggle(makeCtx({ view: "chat" }));
+
+    const chat = chatSegment();
+    expect(chat).toHaveAttribute("aria-keyshortcuts", "Control+Shift+J");
+    fireEvent.pointerMove(chat.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(
+      Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual(["Ctrl", "⇧", "J"]);
   });
 
   it("keeps the Terminal segment usable and shows a spinner while the terminal is coming up", () => {

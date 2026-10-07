@@ -258,7 +258,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
-import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
+import { CompactShortcutKeys, useShortcutHint } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
@@ -305,7 +305,6 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
-const NEW_SESSION_KEYS = [MOD_KEY, ALT_KEY, "N"] as const;
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -694,6 +693,7 @@ function SidebarImpl({
   peek,
 }: SidebarProps) {
   const navigate = useNavigate();
+  const newSessionShortcut = useShortcutHint("newSession");
   const sidebarData = useSidebarData();
   const branding = useBranding();
   const serverInfo = useServerInfo();
@@ -1288,7 +1288,7 @@ function SidebarImpl({
                   to={newSessionTargetRoute}
                   componentId="sidebar.new_chat"
                   aria-label={`New session in ${newSessionTargetLabel(newSessionTarget)}`}
-                  aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+N`}
+                  aria-keyshortcuts={newSessionShortcut.aria}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
@@ -1310,7 +1310,7 @@ function SidebarImpl({
                     {newSessionTargetLabel(newSessionTarget)}
                   </span>
                   <CompactShortcutKeys
-                    keys={NEW_SESSION_KEYS}
+                    keys={newSessionShortcut.keys}
                     className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
                   />
                 </Link>

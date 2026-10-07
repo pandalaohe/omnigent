@@ -2,6 +2,7 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useViewModeToggleHotkey } from "./useViewModeToggleHotkey";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 function keydown(init: KeyboardEventInit = { ctrlKey: true, altKey: true }): KeyboardEvent {
   const event = new KeyboardEvent("keydown", {
@@ -20,7 +21,10 @@ function setup(view: "chat" | "terminal" = "chat", enabled = true, isMac = false
   return { setView, ...result };
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  localStorage.clear();
+  vi.restoreAllMocks();
+});
 
 describe("useViewModeToggleHotkey", () => {
   it("switches from Chat to Terminal with Ctrl+Alt+\\", () => {
@@ -71,6 +75,23 @@ describe("useViewModeToggleHotkey", () => {
     document.body.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
     expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("follows a recorded replacement chord and keeps rejecting composing events", () => {
+    const { setView } = setup("chat");
+    writeShortcutPreference("toggleViewMode", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+
+    keydown();
+    expect(setView).not.toHaveBeenCalled();
+
+    keydown({ code: "KeyJ", ctrlKey: true, shiftKey: true, isComposing: true });
+    expect(setView).not.toHaveBeenCalled();
+
+    const rebound = keydown({ code: "KeyJ", ctrlKey: true, shiftKey: true });
+    expect(setView).toHaveBeenCalledWith("terminal");
+    expect(rebound.defaultPrevented).toBe(true);
   });
 
   it("unbinds on unmount", () => {

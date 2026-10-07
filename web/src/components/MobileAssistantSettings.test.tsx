@@ -154,6 +154,20 @@ describe("MobileAssistantSettings", () => {
     });
   });
 
+  it("omits the held-key recent-sessions switcher and explains why", () => {
+    render(<MobileAssistantSettings />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Add button" }));
+    const select = screen.getByLabelText("Action from keyboard shortcuts");
+    const values = Array.from(select.querySelectorAll("option"), (option) => option.value);
+
+    expect(values).not.toContain("recentSessions");
+    expect(values).toContain("newSession");
+    expect(
+      screen.getByText("Switch recent sessions is keyboard-only: it needs a held key."),
+    ).toBeTruthy();
+  });
+
   it("shows the real circular order preview and persists icon and repeat", () => {
     render(<MobileAssistantSettings />);
 
