@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -83,6 +84,32 @@ class UserPreferencesUserNotFoundError(LookupError):
 APPROVAL_TIMEOUT_NAMESPACE = "approval_timeout"
 APPROVAL_TIMEOUT_DEFAULT_MINUTES = 50
 APPROVAL_TIMEOUT_MAX_MINUTES = 1380
+
+RUNNER_LOG_WARNINGS_NAMESPACE = "runner_log_warnings"
+# A detection instant cannot stay confirmed for weeks, so dismissal entries
+# older than this are pruned instead of evicting recently dismissed episodes.
+_RUNNER_LOG_WARNINGS_RETENTION_S = 30 * 24 * 60 * 60
+
+
+def _prune_runner_log_warnings(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep only dismissal entries from the last retention window.
+
+    Each entry maps a detection instant to the epoch-ms time it was
+    dismissed; a value that is not a non-bool number, or is older than
+    ``_RUNNER_LOG_WARNINGS_RETENTION_S`` before now (``time.time()``), is
+    dropped.
+
+    :param value: Merged ``runner_log_warnings`` namespace value.
+    :returns: A new map holding the retained entries.
+    """
+    cutoff_ms = (time.time() - _RUNNER_LOG_WARNINGS_RETENTION_S) * 1000.0
+    return {
+        flag: dismissed_at
+        for flag, dismissed_at in value.items()
+        if isinstance(dismissed_at, (int, float))
+        and not isinstance(dismissed_at, bool)
+        and dismissed_at >= cutoff_ms
+    }
 
 
 @dataclass(frozen=True)
@@ -990,6 +1017,10 @@ class SqlAlchemyUserPreferencesStore:
                     settings[namespace] = {**existing, **deepcopy(value)}
                 else:
                     settings[namespace] = deepcopy(value)
+            if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
+                stored = settings.get(namespace)
+                if isinstance(stored, dict):
+                    settings[namespace] = _prune_runner_log_warnings(stored)
             merged = _assemble_envelope(settings)
             if namespace in merged["settings"]:
                 self._upsert_row(

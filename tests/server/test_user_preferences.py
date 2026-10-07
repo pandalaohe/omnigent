@@ -1308,24 +1308,56 @@ async def test_preferences_api_accepts_the_host_colors_namespace(
 
 
 @pytest.mark.asyncio
-async def test_preferences_api_accepts_the_runner_log_warnings_namespace(
+async def test_preferences_api_merges_stale_device_dismissals_and_prunes_old_ones(
     db_uri: str,
     runtime_init: None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The runner_log_warnings namespace is allowlisted and round-trips dismissals."""
+    """Dismissals merge per detection instant; entries older than 30 days age out."""
+    import omnigent.server.user_preferences_store as store_module
+
+    clock = SimpleNamespace(now=1_800_000_000.0)
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(time=lambda: clock.now))
+
     app = _preferences_app(db_uri, tmp_path)
     transport = httpx.ASGITransport(app=app)
+    flag_a = "2026-10-07T06:22:16+00:00"
+    flag_b = "2026-10-07T07:22:16+00:00"
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = {"x-test-user": "runaway@example.com"}
-        value = {"dismissed": ["2026-10-07T06:22:16+00:00"]}
+        # Device A dismisses one detection instant.
         patched = await client.patch(
             "/v1/me/preferences/runner_log_warnings",
             headers=headers,
-            json={"value": value},
+            json={"value": {flag_a: int(clock.now * 1000)}},
         )
         assert patched.status_code == 200, patched.text
-        assert patched.json()["settings"]["runner_log_warnings"] == value
+        assert patched.json()["settings"]["runner_log_warnings"] == {flag_a: int(clock.now * 1000)}
+
+        # Device B holds a stale snapshot with only its own instant; the
+        # per-key merge keeps A's dismissal as well.
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": {flag_b: int(clock.now * 1000) + 60_000}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["runner_log_warnings"] == {
+            flag_a: int(clock.now * 1000),
+            flag_b: int(clock.now * 1000) + 60_000,
+        }
+
+        # 31 days later the first entry is past retention: the next write
+        # drops it while the fresh dismissal stays.
+        clock.now += 31 * 24 * 60 * 60
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": {flag_b: int(clock.now * 1000)}},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["runner_log_warnings"] == {flag_b: int(clock.now * 1000)}
 
 
 @pytest.mark.asyncio

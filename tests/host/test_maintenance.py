@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1017,3 +1020,107 @@ def test_warning_counter_forgets_an_outside_truncate_before_a_rotation(tmp_path:
     counter.note_rotated("runner_1", info.st_size, (info.st_dev, info.st_ino))
 
     assert counter.advance("runner_1", path) == 6 * len(_WARN_LINE) + len(_ERROR_LINE)
+
+
+@pytest.mark.parametrize("shrink_first", [True, False])
+def test_warning_counter_rotation_counts_the_sampled_warn_records_tail(
+    tmp_path: Path, shrink_first: bool
+) -> None:
+    """A sampled WARN record's archive-tail tracebacks count in either order."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    sampled = _WARN_LINE * 2
+    _append(path, sampled)
+    assert counter.advance("runner_1", path) == len(sampled)
+
+    # Header-less lines appended after the last sample continue the sampled
+    # WARN record; only the archive holds them.
+    unsampled = _TRACEBACK_LINE * 3
+    _append(path, unsampled)
+    info = path.stat()
+    copied_size = info.st_size
+    file_id = (info.st_dev, info.st_ino)
+    (tmp_path / f"{path.name}.1").write_bytes(path.read_bytes())
+    os.truncate(path, 0)
+
+    if shrink_first:
+        assert counter.advance("runner_1", path) == len(sampled)
+        counter.note_rotated("runner_1", copied_size, file_id)
+    else:
+        counter.note_rotated("runner_1", copied_size, file_id)
+
+    assert counter.advance("runner_1", path) == len(sampled) + len(unsampled)
+
+
+def test_warning_counter_defers_a_long_unterminated_warn_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A WARN line longer than a chunk is credited only when its newline lands."""
+    monkeypatch.setattr(maintenance, "_RUNNER_LOG_WARNING_CHUNK_BYTES", 64)
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    line = b"WARN  10-07 14:00:00.000 runner.app | " + b"x" * 120
+    _append(path, line)
+    assert counter.advance("runner_1", path) == 0
+
+    _append(path, b"\n")
+    assert counter.advance("runner_1", path) == len(line) + 1
+
+
+def test_warning_counter_ignores_a_long_unterminated_info_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An INFO line longer than a chunk stays out of the count when complete."""
+    monkeypatch.setattr(maintenance, "_RUNNER_LOG_WARNING_CHUNK_BYTES", 64)
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    line = b"INFO  10-07 14:00:00.000 runner.app | " + b"x" * 120
+    _append(path, line)
+    assert counter.advance("runner_1", path) == 0
+
+    _append(path, b"\n")
+    assert counter.advance("runner_1", path) == 0
+
+
+def test_warning_counter_serializes_concurrent_advances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two racing advances classify appended bytes exactly once."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    warn = _WARN_LINE * 10
+    _append(path, warn)
+
+    original_consume = counter._consume
+    first_call = threading.Event()
+
+    def slow_consume(state: Any, data: bytes) -> None:
+        if not first_call.is_set():
+            first_call.set()
+            time.sleep(0.2)
+        original_consume(state, data)
+
+    monkeypatch.setattr(counter, "_consume", slow_consume)
+
+    results: list[int | None] = []
+
+    def advance() -> None:
+        results.append(counter.advance("runner_1", path))
+
+    first = threading.Thread(target=advance)
+    second = threading.Thread(target=advance)
+    first.start()
+    assert first_call.wait(2.0)
+    second.start()
+    first.join(5.0)
+    second.join(5.0)
+
+    assert sorted(results) == [len(warn), len(warn)]
+    assert counter.advance("runner_1", path) == len(warn)

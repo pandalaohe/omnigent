@@ -4860,13 +4860,13 @@ class HostProcess:
         since = self._runner_log_runaway_since
 
         def _advance_all(runners: list[tuple[str, _RunnerHandle]]) -> dict[str, int | None]:
+            counter.retain({rid for rid, _handle in runners})
             return {rid: counter.advance(rid, handle.log_path) for rid, handle in runners}
 
         while True:
             try:
                 runner_ids = set(self._runners)
                 tracker.retain(runner_ids)
-                counter.retain(runner_ids)
                 for runner_id in [rid for rid in since if rid not in runner_ids]:
                     del since[runner_id]
                 now = time.monotonic()

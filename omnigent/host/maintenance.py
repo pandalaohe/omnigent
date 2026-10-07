@@ -375,6 +375,20 @@ def sweep_runner_logs(
     return counts
 
 
+@dataclass(frozen=True)
+class _ShrinkSnapshot:
+    """Parsing state saved when a shrink is seen before its rotation report.
+
+    Resuming the archive tail requires the record level, the partial line,
+    and any stashed long-line length as they stood at the saved offset.
+    """
+
+    offset: int
+    record_is_warning: bool
+    carry: bytes
+    long_line_prefix: int
+
+
 @dataclass
 class _RunnerLogWarningState:
     """Warning-byte read state for one runner log."""
@@ -383,8 +397,9 @@ class _RunnerLogWarningState:
     offset: int
     warning_bytes: int = 0
     record_is_warning: bool = False
-    shrink_offset: int | None = None
+    shrink_snapshot: _ShrinkSnapshot | None = None
     carry: bytes = b""
+    long_line_prefix: int = 0
 
 
 class RunnerLogWarningCounter:
@@ -398,13 +413,15 @@ class RunnerLogWarningCounter:
     classified once, whether the shrink or the rotation report is seen first —
     and a new file identity restarts at the beginning of the new file.
 
-    :meth:`advance` runs in a worker thread and may race the event loop's
-    :meth:`note_rotated`; the pending-rotation handoff is lock-protected.
+    :meth:`advance` and :meth:`retain` serialize on a state lock and run in
+    worker threads; :meth:`note_rotated` runs on the event loop and only takes
+    the pending-rotation lock, so it never waits on a file read.
     """
 
     def __init__(self) -> None:
         self._states: dict[str, _RunnerLogWarningState] = {}
         self._pending_rotations: dict[str, tuple[int, tuple[int, int]]] = {}
+        self._state_lock = threading.Lock()
         self._lock = threading.Lock()
 
     def advance(self, runner_id: str, path: Path) -> int | None:
@@ -415,42 +432,51 @@ class RunnerLogWarningCounter:
         :returns: Cumulative warning bytes, or ``None`` when the log cannot
             be stat'ed.
         """
-        try:
-            info = path.stat()
-        except OSError:
-            return None
-        file_id = (info.st_dev, info.st_ino)
-        size = info.st_size
-        with self._lock:
-            pending = self._pending_rotations.pop(runner_id, None)
-        state = self._states.get(runner_id)
-        if state is None:
-            # First sighting: existing content is not this window's output.
-            self._states[runner_id] = _RunnerLogWarningState(file_id=file_id, offset=size)
-            return 0
-        if pending is not None and pending[1] == state.file_id:
-            self._account_rotation(state, path, pending[0])
-        else:
-            # The rotation report follows its truncate within milliseconds, so
-            # a shrink still unreported a probe later was an outside truncate.
-            state.shrink_offset = None
-        if state.file_id != file_id:
-            # A replaced file: read the new file from its start.
-            state.file_id = file_id
-            state.offset = 0
-            state.shrink_offset = None
-            state.record_is_warning = False
-            state.carry = b""
-        elif size < state.offset:
-            # An in-place truncate this probe has not seen reported yet:
-            # remember where the archived copy resumes and restart the live
-            # read at zero.
-            state.shrink_offset = state.offset
-            state.offset = 0
-            state.record_is_warning = False
-            state.carry = b""
-        state.offset = self._read_lines(state, path, state.offset, size)
-        return state.warning_bytes
+        with self._state_lock:
+            try:
+                info = path.stat()
+            except OSError:
+                return None
+            file_id = (info.st_dev, info.st_ino)
+            size = info.st_size
+            with self._lock:
+                pending = self._pending_rotations.pop(runner_id, None)
+            state = self._states.get(runner_id)
+            if state is None:
+                # First sighting: existing content is not this window's output.
+                self._states[runner_id] = _RunnerLogWarningState(file_id=file_id, offset=size)
+                return 0
+            if pending is not None and pending[1] == state.file_id:
+                self._account_rotation(state, path, pending[0])
+            else:
+                # The rotation report follows its truncate within milliseconds,
+                # so a shrink still unreported a probe later was an outside
+                # truncate.
+                state.shrink_snapshot = None
+            if state.file_id != file_id:
+                # A replaced file: read the new file from its start.
+                state.file_id = file_id
+                state.offset = 0
+                state.shrink_snapshot = None
+                state.record_is_warning = False
+                state.carry = b""
+                state.long_line_prefix = 0
+            elif size < state.offset:
+                # An in-place truncate this probe has not seen reported yet:
+                # remember where the archived copy resumes, with the parsing
+                # state to classify it, and restart the live read at zero.
+                state.shrink_snapshot = _ShrinkSnapshot(
+                    offset=state.offset,
+                    record_is_warning=state.record_is_warning,
+                    carry=state.carry,
+                    long_line_prefix=state.long_line_prefix,
+                )
+                state.offset = 0
+                state.record_is_warning = False
+                state.carry = b""
+                state.long_line_prefix = 0
+            state.offset = self._read_lines(state, path, state.offset, size)
+            return state.warning_bytes
 
     def note_rotated(self, runner_id: str, copied_size: int, file_id: tuple[int, int]) -> None:
         """Record a copytruncate for the next :meth:`advance` to classify.
@@ -471,26 +497,39 @@ class RunnerLogWarningCounter:
         :param runner_ids: Runner ids still tracked by the caller.
         """
         keep = set(runner_ids)
-        for runner_id in [rid for rid in self._states if rid not in keep]:
-            del self._states[runner_id]
-        with self._lock:
-            for runner_id in [rid for rid in self._pending_rotations if rid not in keep]:
-                del self._pending_rotations[runner_id]
+        with self._state_lock:
+            for runner_id in [rid for rid in self._states if rid not in keep]:
+                del self._states[runner_id]
+            with self._lock:
+                for runner_id in [rid for rid in self._pending_rotations if rid not in keep]:
+                    del self._pending_rotations[runner_id]
 
     def _account_rotation(
         self, state: _RunnerLogWarningState, path: Path, copied_size: int
     ) -> None:
         """Classify the archived bytes the live file no longer holds."""
-        if state.shrink_offset is not None:
+        archive = _archive_path(path, 1)
+        if state.shrink_snapshot is not None:
             # The shrink was seen first: resume the archive where the live
-            # offset stopped and keep the live offset for post-rotation bytes.
-            start = state.shrink_offset
-            state.shrink_offset = None
+            # offset stopped, using a temporary state seeded from the saved
+            # parsing state. The live state keeps its post-rotation progress.
+            snapshot = state.shrink_snapshot
+            state.shrink_snapshot = None
+            archived = _RunnerLogWarningState(
+                file_id=state.file_id,
+                offset=snapshot.offset,
+                record_is_warning=snapshot.record_is_warning,
+                carry=snapshot.carry,
+                long_line_prefix=snapshot.long_line_prefix,
+            )
+            self._read_lines(archived, archive, snapshot.offset, copied_size)
+            state.warning_bytes += archived.warning_bytes
         else:
-            # The report was seen first: the live read restarts at zero.
+            # The report was seen first: the live state is still the
+            # pre-truncate state, so it can classify the archive directly.
             start = state.offset
             state.offset = 0
-        self._read_lines(state, _archive_path(path, 1), start, copied_size)
+            self._read_lines(state, archive, start, copied_size)
 
     def _read_lines(self, state: _RunnerLogWarningState, path: Path, start: int, end: int) -> int:
         """Classify ``[start, end)`` of *path*; return the bytes consumed."""
@@ -509,18 +548,36 @@ class RunnerLogWarningCounter:
         return position
 
     def _consume(self, state: _RunnerLogWarningState, data: bytes) -> None:
-        """Classify the complete lines in *data*, keeping a partial tail."""
+        """Classify the complete lines in *data*, deferring a partial tail."""
         buffer = state.carry + data
         start = 0
         while (newline := buffer.find(b"\n", start)) >= 0:
-            self._count_line(state, buffer[start : newline + 1])
+            if state.long_line_prefix:
+                self._finish_long_line(state, newline + 1)
+            else:
+                self._count_line(state, buffer[start : newline + 1])
             start = newline + 1
         state.carry = buffer[start:]
         if len(state.carry) > _RUNNER_LOG_WARNING_CHUNK_BYTES:
-            # A record longer than a read chunk: count what is here as one
-            # line so memory stays bounded.
-            self._count_line(state, state.carry)
-            state.carry = b""
+            self._stash_long_line(state)
+
+    def _stash_long_line(self, state: _RunnerLogWarningState) -> None:
+        """Drop a pending long line's bytes, keeping its length and class."""
+        if state.long_line_prefix == 0:
+            # The first stash sees the line's header; a header line sets the
+            # record classification, a continuation keeps the previous one.
+            header = _RUNNER_LOG_HEADER_RE.match(state.carry)
+            if header is not None:
+                state.record_is_warning = header.group(1) in _RUNNER_LOG_WARNING_LEVELS
+        state.long_line_prefix += len(state.carry)
+        state.carry = b""
+
+    def _finish_long_line(self, state: _RunnerLogWarningState, continuation: int) -> None:
+        """Credit a stashed long line's full length once its newline arrives."""
+        length = state.long_line_prefix + continuation
+        state.long_line_prefix = 0
+        if state.record_is_warning:
+            state.warning_bytes += length
 
     def _count_line(self, state: _RunnerLogWarningState, line: bytes) -> None:
         header = _RUNNER_LOG_HEADER_RE.match(line)

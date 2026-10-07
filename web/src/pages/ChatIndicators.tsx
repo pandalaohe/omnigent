@@ -89,7 +89,7 @@ export function RunnerLogRunawayBanner({
   }, [leaseEnd]);
 
   if (notice === null || leaseEnd === null || !flag || leaseEnd <= now) return null;
-  if (dismissed.includes(flag)) return null;
+  if (dismissed[flag] !== undefined) return null;
   return (
     <div data-testid="runner-log-runaway-banner" role="status" className="mb-2">
       <Alert>

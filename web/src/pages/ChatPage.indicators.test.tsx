@@ -181,11 +181,13 @@ describe("RunnerLogRunawayBanner", () => {
     render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
     fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
     expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
-    expect(JSON.parse(localStorage.getItem("omnigent:runner-log-warnings") ?? "null")).toEqual({
-      dismissed: [RUNWAY_FLAG],
-    });
+    const mirrored = JSON.parse(
+      localStorage.getItem("omnigent:runner-log-warnings") ?? "null",
+    ) as Record<string, number>;
+    expect(mirrored[RUNWAY_FLAG]).toEqual(expect.any(Number));
+    expect(Object.keys(mirrored)).toEqual([RUNWAY_FLAG]);
     expect(queuePatchMock).toHaveBeenLastCalledWith("runner_log_warnings", {
-      dismissed: [RUNWAY_FLAG],
+      [RUNWAY_FLAG]: mirrored[RUNWAY_FLAG],
     });
   });
 

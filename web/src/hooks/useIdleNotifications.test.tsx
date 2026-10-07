@@ -349,14 +349,18 @@ describe("useIdleNotifications elicitation transitions", () => {
 describe("useIdleNotifications runner-log runaway transitions", () => {
   const FLAG = "omnigent.runner_log_runaway";
   const MB = "omnigent.runner_log_runaway_mb";
+  const SEEN = "omnigent.runner_log_runaway_seen";
   const BODY =
     "This session's runner is writing warnings and errors to its log unusually fast" +
     " (7 MB in the last hour) — it may be stuck in an error loop.";
 
-  function runawayConv(id: string, flag?: string, mb = "7"): Conversation {
+  function runawayConv(id: string, flag?: string, mb = "7", seen?: string): Conversation {
     return {
       ...conv(id, "running"),
-      labels: flag === undefined ? {} : { [FLAG]: flag, [MB]: mb },
+      labels:
+        flag === undefined
+          ? {}
+          : { [FLAG]: flag, [MB]: mb, ...(seen === undefined ? {} : { [SEEN]: seen }) },
     };
   }
 
@@ -383,6 +387,20 @@ describe("useIdleNotifications runner-log runaway transitions", () => {
     showMock.mockClear();
 
     // A poll refresh carrying the same value is the same detection.
+    rerender();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("does not re-notify when a re-confirmation changes the seen stamp and rate", () => {
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z")]);
+    rerender();
+    showMock.mockClear();
+
+    // The host re-confirms the same detection instant: the server receive
+    // stamp and measured rate move, but the flag value is unchanged.
+    setConversations([runawayConv("a", "2026-09-23T09:25:00Z", "12", "2026-09-23T09:30:00Z")]);
     rerender();
     expect(showMock).not.toHaveBeenCalled();
   });

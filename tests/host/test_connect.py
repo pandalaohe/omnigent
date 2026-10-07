@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -1742,6 +1743,18 @@ async def test_live_host_reconfirms_a_runaway_runner_log_with_its_crossing_insta
     """
     from omnigent.host.maintenance import RunnerLogRunawayTracker as _Tracker
 
+    class _AdvancingClock:
+        """Stand-in whose ``now`` call lands on a different whole second each time."""
+
+        def __init__(self) -> None:
+            self._base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            self._calls = 0
+
+        def now(self, _tz: object = None) -> datetime:
+            self._calls += 1
+            return self._base + timedelta(seconds=self._calls)
+
+    monkeypatch.setattr("omnigent.host.connect.datetime", _AdvancingClock())
     monkeypatch.setattr("omnigent.host.connect._RUNNER_LOG_RUNAWAY_INTERVAL_S", 0.01)
     first_sample = asyncio.Event()
 

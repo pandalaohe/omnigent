@@ -3,9 +3,10 @@ import { useEffect, useState } from "react";
 import {
   readDismissedRunnerLogWarnings,
   RUNNER_LOG_WARNINGS_CHANGED_EVENT,
+  type RunnerLogWarningDismissals,
 } from "@/lib/runnerLogWarningPreferences";
 
-export function useDismissedRunnerLogWarnings(): string[] {
+export function useDismissedRunnerLogWarnings(): RunnerLogWarningDismissals {
   const [dismissed, setDismissed] = useState(readDismissedRunnerLogWarnings);
 
   useEffect(() => {
