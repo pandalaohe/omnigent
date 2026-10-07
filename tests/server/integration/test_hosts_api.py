@@ -1844,11 +1844,13 @@ async def test_runner_log_runaway_hook_failure_does_not_stop_later_frames(
             }
         )
     # The second frame lands only if the receive loop survived the first
-    # hook's exception.
+    # hook's exception; its hook runs just after its labels are written.
     async with asyncio.timeout(2.0):
-        while (conv_store.get_conversation(hot.id).labels or {}).get(
-            RUNNER_LOG_RUNAWAY_LABEL_KEY
-        ) != second:
+        while (
+            calls < 2
+            or (conv_store.get_conversation(hot.id).labels or {}).get(RUNNER_LOG_RUNAWAY_LABEL_KEY)
+            != second
+        ):
             await asyncio.sleep(0.01)
 
     assert calls == 2
