@@ -8,8 +8,9 @@ export interface ShortcutChord {
   modifiers: ShortcutModifier[];
 }
 
-export type ShortcutGroupId = "general" | "chats" | "navigation" | "view" | "slash";
-export type ShortcutScope = "global" | "composer" | "suggestions";
+export type ShortcutGroupId =
+  "general" | "chats" | "navigation" | "view" | "slash" | "questionCard";
+export type ShortcutScope = "global" | "composer" | "suggestions" | "questionCard";
 
 export type ShortcutActionId =
   | "newSession"
@@ -44,7 +45,17 @@ export type ShortcutActionId =
   | "previousSuggestion"
   | "nextSuggestion"
   | "applySuggestion"
-  | "dismissSuggestions";
+  | "dismissSuggestions"
+  | "focusQuestionCard"
+  | "questionCardPreviousOption"
+  | "questionCardNextOption"
+  | "questionCardSelectOption"
+  | "questionCardNextOrSubmit"
+  | "questionCardPreviousQuestion"
+  | "questionCardNextQuestion"
+  | "questionCardLeave"
+  | "questionCardCancel"
+  | "questionCardCancelAndInterrupt";
 
 export interface ShortcutDefinition {
   id: ShortcutActionId;
@@ -301,6 +312,76 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     scope: "suggestions",
     defaultBindings: [chord("Escape")],
   },
+  focusQuestionCard: {
+    id: "focusQuestionCard",
+    label: "Focus question card",
+    group: "questionCard",
+    scope: "global",
+    defaultBindings: [chord("KeyF", ["control", "shift"])],
+  },
+  questionCardPreviousOption: {
+    id: "questionCardPreviousOption",
+    label: "Previous option",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("ArrowUp")],
+  },
+  questionCardNextOption: {
+    id: "questionCardNextOption",
+    label: "Next option",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("ArrowDown")],
+  },
+  questionCardSelectOption: {
+    id: "questionCardSelectOption",
+    label: "Select option",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("Space")],
+  },
+  questionCardNextOrSubmit: {
+    id: "questionCardNextOrSubmit",
+    label: "Next question, or submit on the last",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("Enter", ["primary"])],
+  },
+  questionCardPreviousQuestion: {
+    id: "questionCardPreviousQuestion",
+    label: "Previous question",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("ArrowLeft")],
+  },
+  questionCardNextQuestion: {
+    id: "questionCardNextQuestion",
+    label: "Next question",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("ArrowRight")],
+  },
+  questionCardLeave: {
+    id: "questionCardLeave",
+    label: "Leave card",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [chord("Escape")],
+  },
+  questionCardCancel: {
+    id: "questionCardCancel",
+    label: "Cancel question",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [],
+  },
+  questionCardCancelAndInterrupt: {
+    id: "questionCardCancelAndInterrupt",
+    label: "Cancel & interrupt",
+    group: "questionCard",
+    scope: "questionCard",
+    defaultBindings: [],
+  },
 };
 
 export const SHORTCUT_ACTION_IDS = Object.keys(DEFAULT_SHORTCUT_DEFINITIONS) as ShortcutActionId[];
@@ -548,6 +629,7 @@ function eventCode(event: Pick<KeyboardEvent, "code" | "key">): string {
     ArrowDown: "ArrowDown",
     ArrowLeft: "ArrowLeft",
     ArrowRight: "ArrowRight",
+    " ": "Space",
     "/": "Slash",
     "`": "Backquote",
     "~": "Backquote",
@@ -647,6 +729,21 @@ function chordIdentity(binding: ShortcutChord, platform: ShortcutPlatform): stri
   return `${flags.ctrl ? "C" : ""}${flags.meta ? "M" : ""}${flags.alt ? "A" : ""}${flags.shift ? "S" : ""}:${binding.code}`;
 }
 
+// Scopes fire under mutually exclusive focus: card actions only while focus is
+// inside a card, composer/suggestions actions only while the composer has it.
+// approvePrompt yields inside a card (its consumer checks the target), so the
+// two can share ⌘↵ by design.
+function canShareEvent(a: ShortcutActionId, b: ShortcutActionId): boolean {
+  const scopeA = DEFAULT_SHORTCUT_DEFINITIONS[a].scope;
+  const scopeB = DEFAULT_SHORTCUT_DEFINITIONS[b].scope;
+  const isCard = (scope: ShortcutScope) => scope === "questionCard";
+  if (isCard(scopeA) && (scopeB === "composer" || scopeB === "suggestions")) return false;
+  if (isCard(scopeB) && (scopeA === "composer" || scopeA === "suggestions")) return false;
+  if (isCard(scopeA) && b === "approvePrompt") return false;
+  if (isCard(scopeB) && a === "approvePrompt") return false;
+  return true;
+}
+
 export function findShortcutConflicts(
   actionId: ShortcutActionId,
   bindings: ShortcutChord[],
@@ -656,6 +753,9 @@ export function findShortcutConflicts(
   const identities = new Set(bindings.map((binding) => chordIdentity(binding, platform)));
   return SHORTCUT_ACTION_IDS.filter((candidate) => {
     if (candidate === actionId) {
+      return false;
+    }
+    if (!canShareEvent(actionId, candidate)) {
       return false;
     }
     return resolveShortcutBindings(candidate, platform, context).some((binding) =>

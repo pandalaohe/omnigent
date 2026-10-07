@@ -16,6 +16,7 @@ import { effectiveWorktree } from "@/lib/types";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
@@ -235,6 +236,8 @@ export function AppShell() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
+  // Ctrl+Shift+F moves focus into the pending question card the user is on.
+  useFocusQuestionCardHotkey();
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).

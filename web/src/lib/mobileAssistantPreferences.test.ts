@@ -130,6 +130,31 @@ describe("mobileAssistantPreferences", () => {
     expect(readMobileAssistantPreferences().enabled).toBe(true);
   });
 
+  it("drops question-card actions stored on wheel buttons", () => {
+    // Card actions need a focused card, which a wheel tap cannot give them.
+    localStorage.setItem(
+      MOBILE_ASSISTANT_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        enabled: true,
+        buttons: [
+          {
+            id: "card",
+            label: "Card",
+            binding: { kind: "shortcut", actionId: "questionCardNextOrSubmit" },
+          },
+          {
+            id: "poll",
+            label: "Poll",
+            binding: { kind: "shortcut", actionId: "pollSessions" },
+          },
+        ],
+      }),
+    );
+
+    expect(readMobileAssistantPreferences().buttons.map((button) => button.id)).toEqual(["poll"]);
+  });
+
   it("keeps repeat only for repeatable terminal keys", () => {
     writeMobileAssistantPreferences({
       version: 2,

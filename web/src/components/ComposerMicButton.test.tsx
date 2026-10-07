@@ -433,6 +433,38 @@ describe("ComposerMicButton", () => {
     expect(onTranscript).not.toHaveBeenCalled();
   });
 
+  it("yields Enter and Esc inside a question card while the take runs", () => {
+    // The card's handlers decide those keys (§2.4); the take keeps running.
+    const onVoiceDiscard = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    const card = document.createElement("div");
+    card.setAttribute("data-question-card", "");
+    const field = document.createElement("textarea");
+    card.appendChild(field);
+    document.body.appendChild(card);
+    try {
+      const esc = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+      act(() => {
+        field.dispatchEvent(esc);
+      });
+      expect(esc.defaultPrevented).toBe(false);
+      expect(onVoiceDiscard).not.toHaveBeenCalled();
+      expect(stopSpy).not.toHaveBeenCalled();
+
+      const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+      act(() => {
+        field.dispatchEvent(enter);
+      });
+      expect(enter.defaultPrevented).toBe(false);
+      expect(stopSpy).not.toHaveBeenCalled();
+    } finally {
+      card.remove();
+    }
+  });
+
   it("does not intercept Enter/Esc when not listening", () => {
     const onVoiceDiscard = vi.fn();
     render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);

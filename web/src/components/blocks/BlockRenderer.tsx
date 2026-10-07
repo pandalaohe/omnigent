@@ -787,7 +787,11 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse breaks mode={isTextStreaming ? "streaming" : "static"}>
+          <FilePathAwareMessageResponse
+            breaks
+            mode={isTextStreaming ? "streaming" : "static"}
+            sendCodeBlocks={!isTextStreaming}
+          >
             {item.text}
           </FilePathAwareMessageResponse>
           {item.previewInterrupted && item.itemId?.startsWith("live:") && (
