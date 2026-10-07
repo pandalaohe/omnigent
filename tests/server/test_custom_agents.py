@@ -15,6 +15,7 @@ from starlette.requests import HTTPConnection
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.member_snapshot import (
+    MEMBER_LOCK_LABEL_KEY,
     MEMBER_LOCKED_FIELD,
     encode_member_entry,
     member_entries_from_labels,
@@ -1798,6 +1799,130 @@ async def test_import_freezes_legacy_member_lock_values(
     assert created.status_code == 201, created.text
     labels = conversations.get_conversation(session_id).labels
     assert labels["omnigent:agent-template-id"] == created.json()["id"]
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "false"
+    entries = member_entries_from_labels(labels)
+    assert set(entries) == {"custom-reviewer", "researcher"}
+    assert all(entry[MEMBER_LOCKED_FIELD] is False for entry in entries.values())
+
+
+@pytest.mark.asyncio
+async def test_import_keeps_a_pre_save_library_session_locked(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """A legacy session already stamped with a ``ca_`` template stays locked."""
+    app, artifacts, _agents, conversations, permissions = make_app(db_uri, tmp_path)
+    original = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, original)
+    artifacts.put(location, original)
+    snapshot = conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    session_id = snapshot.conversation.id
+    permissions.grant("alice", session_id, LEVEL_OWNER)
+    conversations.set_labels(
+        session_id,
+        {
+            "omnigent:agent-template-id": "ca_previous",
+            member_label_key("custom-reviewer"): encode_member_entry(
+                {
+                    "host": None,
+                    "harness": "codex",
+                    "model": "lead-model",
+                    "effort": "high",
+                    "lead": True,
+                }
+            ),
+            member_label_key("researcher"): encode_member_entry(
+                {
+                    "host": None,
+                    "harness": "claude-sdk",
+                    "model": "research-model",
+                    "effort": "medium",
+                    "lead": False,
+                }
+            ),
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            json={"source_session_id": session_id},
+        )
+
+    assert created.status_code == 201, created.text
+    labels = conversations.get_conversation(session_id).labels
+    assert labels["omnigent:agent-template-id"] == created.json()["id"]
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "true"
+    entries = member_entries_from_labels(labels)
+    assert set(entries) == {"custom-reviewer", "researcher"}
+    assert all(entry[MEMBER_LOCKED_FIELD] is True for entry in entries.values())
+
+
+@pytest.mark.asyncio
+async def test_import_freezes_a_legacy_member_entry_at_the_value_cap(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """A legacy member entry between 242 and 256 chars still freezes unlocked.
+
+    The Save-as-Agent rewrite that used to add ``locked`` inside the entry
+    skipped an over-cap rewrite, so the ca_ stamp locked this member.
+    """
+    app, artifacts, _agents, conversations, permissions = make_app(db_uri, tmp_path)
+    original = joint_bundle()
+    runtime_id = generate_agent_id()
+    location = bundle_location(runtime_id, original)
+    artifacts.put(location, original)
+    snapshot = conversations.create_session_with_agent(
+        agent_id=runtime_id,
+        agent_name="custom-reviewer",
+        agent_bundle_location=location,
+        agent_description=None,
+    )
+    session_id = snapshot.conversation.id
+    permissions.grant("alice", session_id, LEVEL_OWNER)
+    long_entry = {
+        "host": None,
+        "harness": "claude-sdk",
+        "model": "research-model" + "x" * 153,
+        "effort": "medium",
+        "lead": False,
+    }
+    long_value = encode_member_entry(long_entry)
+    assert 242 <= len(long_value) <= 256
+    conversations.set_labels(
+        session_id,
+        {
+            member_label_key("custom-reviewer"): encode_member_entry(
+                {
+                    "host": None,
+                    "harness": "codex",
+                    "model": "lead-model",
+                    "effort": "high",
+                    "lead": True,
+                }
+            ),
+            member_label_key("researcher"): long_value,
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            json={"source_session_id": session_id},
+        )
+
+    assert created.status_code == 201, created.text
+    labels = conversations.get_conversation(session_id).labels
+    assert labels[MEMBER_LOCK_LABEL_KEY] == "false"
     entries = member_entries_from_labels(labels)
     assert set(entries) == {"custom-reviewer", "researcher"}
     assert all(entry[MEMBER_LOCKED_FIELD] is False for entry in entries.values())

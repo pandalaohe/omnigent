@@ -3,7 +3,8 @@
 A joint agent's session freezes its 2+ members at create: the server writes
 one ``omnigent.member.<role>`` label per member (the value is compact JSON),
 and the runner reads them to lock a member's harness / model / effort and to
-refuse work routed to a member that cannot run. Kept dependency-free so the
+refuse work routed to a member that cannot run. One session lock label under
+the same prefix records whether the members lock. Kept dependency-free so the
 server routes and the runner agree on the shape.
 """
 
@@ -24,7 +25,13 @@ MEMBER_LABEL_VALUE_MAX_CHARS = 256
 # created from. Only such a session locks members to the frozen snapshot.
 LIBRARY_AGENT_TEMPLATE_LABEL_KEY = "omnigent:agent-template-id"
 
-# Member entry field set at create: True when launched from a saved library agent.
+# Session label fixing at create whether the members lock ("true"/"false").
+# Under the member prefix, so reserved-label refusal, continuation copy and
+# agent-switch drop cover it; ":" is no role and the value is no JSON object.
+MEMBER_LOCK_LABEL_KEY = f"{MEMBER_LABEL_PREFIX}:locked"
+
+# In-memory entry field carrying the lock, projected from the session lock
+# label; entries written before that label existed may carry it themselves.
 MEMBER_LOCKED_FIELD = "locked"
 
 # Reason codes stored in a member entry's ``unavailable`` field.
@@ -55,10 +62,10 @@ def parse_member_entry(value: str) -> dict[str, Any] | None:
 def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, dict[str, Any]]:
     """Project ``{role: entry}`` for every well-formed member label.
 
-    An entry written before the field existed takes its ``locked`` value from
-    the session's template label.
+    An entry's own ``locked`` field wins; otherwise it is fixed from the
+    session lock label, so a pre-lock-label session still resolves its lock.
     """
-    legacy = launched_from_library_agent(labels)
+    session_lock = session_member_lock(labels)
     entries: dict[str, dict[str, Any]] = {}
     for key, value in (labels or {}).items():
         if not key.startswith(MEMBER_LABEL_PREFIX):
@@ -66,9 +73,20 @@ def member_entries_from_labels(labels: Mapping[str, str] | None) -> dict[str, di
         role = key[len(MEMBER_LABEL_PREFIX) :]
         entry = parse_member_entry(value)
         if role and entry is not None:
-            entry.setdefault(MEMBER_LOCKED_FIELD, legacy)
+            entry.setdefault(MEMBER_LOCKED_FIELD, session_lock)
             entries[role] = entry
     return entries
+
+
+def session_member_lock(labels: Mapping[str, str] | None) -> bool:
+    """Return whether *labels* freeze the members at create.
+
+    The session lock label wins; without it — a session created before the
+    label existed — the library-Agent template label decides.
+    """
+    if labels and MEMBER_LOCK_LABEL_KEY in labels:
+        return labels[MEMBER_LOCK_LABEL_KEY] == "true"
+    return launched_from_library_agent(labels)
 
 
 def launched_from_library_agent(labels: Mapping[str, str] | None) -> bool:
@@ -88,27 +106,17 @@ def member_lock_applies(entry: Mapping[str, Any]) -> bool:
     return entry.get(MEMBER_LOCKED_FIELD) is True
 
 
-def unlocked_legacy_member_labels(labels: Mapping[str, str] | None) -> dict[str, str]:
-    """Return member labels rewritten with ``locked: false`` for legacy entries.
+def frozen_member_lock_label(labels: Mapping[str, str] | None) -> dict[str, str]:
+    """Return the session lock label to fix before a template-label write.
 
-    A session not launched from a library agent keeps unlocked members after a
-    later template-label write (Save as Agent): every entry written before the
-    ``locked`` field existed gets it fixed to false. A value that would exceed
-    the label column is left out.
+    Save as Agent stamps a library id onto a running session; fixing the
+    pre-save lock first keeps a non-library session's members unlocked.
     """
-    if launched_from_library_agent(labels):
+    if not labels or MEMBER_LOCK_LABEL_KEY in labels:
         return {}
-    rewritten: dict[str, str] = {}
-    for key, value in (labels or {}).items():
-        if not key.startswith(MEMBER_LABEL_PREFIX):
-            continue
-        entry = parse_member_entry(value)
-        if entry is None or MEMBER_LOCKED_FIELD in entry:
-            continue
-        encoded = encode_member_entry({**entry, MEMBER_LOCKED_FIELD: False})
-        if len(encoded) <= MEMBER_LABEL_VALUE_MAX_CHARS:
-            rewritten[key] = encoded
-    return rewritten
+    if not any(key.startswith(MEMBER_LABEL_PREFIX) for key in labels):
+        return {}
+    return {MEMBER_LOCK_LABEL_KEY: "true" if launched_from_library_agent(labels) else "false"}
 
 
 # The web composer's attachment preamble. Its text can carry ``@`` inside a

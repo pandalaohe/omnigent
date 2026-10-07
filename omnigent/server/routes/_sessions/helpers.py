@@ -82,7 +82,7 @@ from omnigent.member_snapshot import (
     MEMBER_LABEL_KEY_MAX_CHARS,
     MEMBER_LABEL_PREFIX,
     MEMBER_LABEL_VALUE_MAX_CHARS,
-    MEMBER_LOCKED_FIELD,
+    MEMBER_LOCK_LABEL_KEY,
     MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED,
     MEMBER_UNAVAILABLE_HOST_OFFLINE,
     MEMBER_UNAVAILABLE_MODEL_MISSING,
@@ -10909,14 +10909,16 @@ async def _member_snapshot_labels(
     :param host_store: Host registrations, used for liveness and the reported
         per-harness readiness. ``None`` skips availability resolution.
     :param locked: True when the session is launched from a saved library
-        agent; written into every entry so the lock is fixed at create.
+        agent; written once as the session's lock label so the lock is fixed
+        at create.
     :param member_hosts: The launched library Agent's saved ``{role: host_id}``
         map. A role absent from it (or a blank value) uses the session host.
     :param project_config: The session's project config, whose per-host set
         supplies unset member values. ``None`` skips the project layers.
     :param master: The owner's ``calling_defaults`` master table. ``None``
         skips the master layer.
-    :returns: ``{label_key: compact_json_value}``; empty for a 1-member agent.
+    :returns: ``{label_key: value}``, including the session lock label;
+        empty for a 1-member agent.
     :raises OmnigentError: 400 when a member's label key or value would
         overflow its column.
     """
@@ -10995,7 +10997,6 @@ async def _member_snapshot_labels(
             "model": resolution.model,
             "effort": resolution.effort,
             "lead": bool(member.get("lead")),
-            MEMBER_LOCKED_FIELD: locked,
         }
         reason: str | None = None
         if host is not None and host not in lookup_failed:
@@ -11082,6 +11083,7 @@ async def _member_snapshot_labels(
                 code=ErrorCode.INVALID_INPUT,
             )
         labels[key] = value
+    labels[MEMBER_LOCK_LABEL_KEY] = "true" if locked else "false"
     return labels
 
 
