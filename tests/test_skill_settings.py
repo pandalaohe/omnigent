@@ -37,6 +37,12 @@ def _write_bytes_config(config_home: Path, content: bytes) -> None:
     (config_home / "config.yaml").write_bytes(content)
 
 
+def _write_raw_config(config_home: Path, content: str) -> None:
+    """Write raw YAML *content* to ``<config_home>/config.yaml``."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(content)
+
+
 def _linked_skill(tmp_path: Path) -> SkillSpec:
     """Build a skill whose ``BODY.md`` links outside the skill dir."""
     lib = tmp_path / "lib"
@@ -188,3 +194,96 @@ def test_host_skill_settings_relative_config_home_returns_empty(
     warnings = _warnings(caplog)
     assert len(warnings) == 1
     assert "not absolute" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("raw_config", "expected", "warns"),
+    [
+        ("skills:\n  claude_portable_skills: false\n", False, False),
+        ("skills:\n  trusted_link_roots: []\n", True, False),
+        ("skills:\n  claude_portable_skills:\n", True, True),
+        ("skills:\n  claude_portable_skills: null\n", True, True),
+        ('skills:\n  claude_portable_skills: "no"\n', True, True),
+        ("skills:\n  claude_portable_skills: 0\n", True, True),
+        ('skills:\n  claude_portable_skills: ""\n', True, True),
+    ],
+    ids=["false", "absent", "empty-value", "null", "string", "int", "empty-string"],
+)
+def test_claude_portable_skills_only_bool_is_honored(
+    raw_config: str,
+    expected: bool,
+    warns: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A bool is honored; an explicit null or any other value warns and
+    falls back to ``True``; an absent key defaults silently.
+    """
+    config_home = tmp_path / "config"
+    _write_raw_config(config_home, raw_config)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.skill_settings"):
+        settings = host_skill_settings()
+
+    assert settings.claude_portable_skills is expected
+    warnings = _warnings(caplog)
+    if warns:
+        assert len(warnings) == 1
+        assert "skills.claude_portable_skills" in warnings[0].getMessage()
+    else:
+        assert warnings == []
+
+
+def test_invalid_trusted_link_roots_keeps_valid_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A bad roots value resets only the roots, not the switch.
+    """
+    config_home = tmp_path / "config"
+    _write_config(
+        config_home,
+        {"skills": {"trusted_link_roots": "bad", "claude_portable_skills": False}},
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.skill_settings"):
+        settings = host_skill_settings()
+
+    assert settings.trusted_link_roots == ()
+    assert settings.claude_portable_skills is False
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "skills.trusted_link_roots" in warnings[0].getMessage()
+
+
+def test_invalid_switch_keeps_valid_trusted_link_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An invalid switch resets only the switch, not the roots.
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    config_home = tmp_path / "config"
+    _write_config(
+        config_home,
+        {"skills": {"trusted_link_roots": [str(lib)], "claude_portable_skills": "no"}},
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.skill_settings"):
+        settings = host_skill_settings()
+
+    assert settings.trusted_link_roots == (lib.resolve(),)
+    assert settings.claude_portable_skills is True
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "skills.claude_portable_skills" in warnings[0].getMessage()

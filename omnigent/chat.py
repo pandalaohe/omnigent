@@ -72,6 +72,7 @@ from omnigent.process_logging import (
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
+from omnigent.spec.skill_sources import generic_walk_includes_agents
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 if TYPE_CHECKING:
@@ -3477,9 +3478,10 @@ def _merge_host_skills(
     """
     Merge bundled skills with host-scope skills for the REPL.
 
-    Discovers ``.claude/skills/`` and ``.agents/skills/`` walking
-    up from the agent root, deduplicates by name (bundled wins),
-    and returns the combined list.
+    Discovers ``.claude/skills/`` and — unless the host switch is off
+    for a Claude-family harness — ``.agents/skills/``, walking up from
+    the agent root, deduplicates by name (bundled wins), and returns
+    the combined list.
 
     :param agent_spec: Parsed AgentSpec with ``.skills`` and
         ``.skills_filter``.
@@ -3489,7 +3491,12 @@ def _merge_host_skills(
     bundled: list[SkillSpec] = agent_spec.skills or []
     skills_filter = agent_spec.skills_filter
     agent_root = spec_path if spec_path.is_dir() else spec_path.parent
-    host = discover_host_skills(agent_root, skills_filter)
+    harness = canonicalize_harness(agent_spec.executor.harness_kind)
+    host = discover_host_skills(
+        agent_root,
+        skills_filter,
+        include_agents=generic_walk_includes_agents(harness),
+    )
     bundled_names = {s.name for s in bundled}
     merged = list(bundled)
     for hs in host:

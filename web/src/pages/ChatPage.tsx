@@ -2018,10 +2018,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       {terminalSurfaces}
       {!showTerminal && (
         <>
-          {/* A runner writing logs abnormally fast is a session-level
-          condition, so the warning sits above the transcript rather than in
-          the message stream. Self-gates to null for unflagged sessions. */}
-          <RunnerLogRunawayBanner labels={sessionLabels} fallbackLabels={fallbackSessionLabels} />
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
@@ -2100,6 +2096,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
             onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
+            runnerLogLabels={sessionLabels}
+            runnerLogFallbackLabels={fallbackSessionLabels}
           />
 
           {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
@@ -2283,6 +2281,10 @@ interface ComposerProps {
    * The callback itself decides whether the reader is bottom-locked.
    */
   onViewportShrinkPinScroll?: () => void;
+  /** Live list labels; a runaway-log flag shows its warning atop the composer stack. */
+  runnerLogLabels?: Record<string, string>;
+  /** Session snapshot labels, used when the list row is unavailable. */
+  runnerLogFallbackLabels?: Record<string, string>;
 }
 
 /**
@@ -2860,6 +2862,8 @@ function ComposerImpl(
     subAgentLabel = null,
     wrapperLabel = null,
     onViewportShrinkPinScroll,
+    runnerLogLabels,
+    runnerLogFallbackLabels,
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
@@ -4343,6 +4347,10 @@ function ComposerImpl(
           bottom corners when the surface below is at least as wide,
           otherwise page background shows and the tray floats detached. */}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
+        {/* Runaway-log warning tops the stack: above the transcript it would push
+            the header clearance down into a blank band, and here the overlays
+            anchored to this form (background-task pill) float above it. */}
+        <RunnerLogRunawayBanner labels={runnerLogLabels} fallbackLabels={runnerLogFallbackLabels} />
         {/* Queued messages — peeks above the workspace bar like the
             sub-agent tray. Lists follow-ups held while the agent is busy;
             drains FIFO on idle. Scope to this conversation so a queue held

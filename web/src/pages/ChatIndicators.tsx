@@ -51,8 +51,8 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 /**
  * Warning band for a session whose runner is writing logs abnormally fast
  * (the host reported a runaway; the server stamped the session label).
- * Self-gates to null when the session carries no flag. Sits at the top of
- * the chat view so the warning is visible without scrolling.
+ * Self-gates to null when the session carries no flag. Tops the composer
+ * stack so the warning is visible without scrolling.
  */
 export function RunnerLogRunawayBanner({
   labels,
@@ -64,11 +64,7 @@ export function RunnerLogRunawayBanner({
   const notice = runnerLogRunawayNotice(labels ?? fallbackLabels);
   if (notice === null) return null;
   return (
-    <div
-      data-testid="runner-log-runaway-banner"
-      role="status"
-      className={cn("mx-auto mb-4 w-full px-6", CHAT_COLUMN_WIDTH)}
-    >
+    <div data-testid="runner-log-runaway-banner" role="status" className="mb-2">
       <Alert>
         <TriangleAlertIcon aria-hidden />
         <AlertTitle>Runner log growth warning</AlertTitle>

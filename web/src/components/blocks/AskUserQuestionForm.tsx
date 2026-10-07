@@ -38,7 +38,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { shortcutKeys, useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
@@ -144,11 +143,6 @@ function initialHighlightFor(
   return selected >= 0 ? selected : 0;
 }
 
-/** "↑ ↓ move" — keys first, then what they do; empty when unbound. */
-function hintSegment(keys: string[], label: string): string | null {
-  return keys.length > 0 ? `${keys.join(" ")} ${label}` : null;
-}
-
 // A bare Enter on the navigation buttons is inert by default; if the user
 // bound plain Enter to a card action, that action handles the event instead.
 function plainEnterIsBoundToCardAction(): boolean {
@@ -205,7 +199,7 @@ export function AskUserQuestionForm({
   const rootRef = useRef<HTMLDivElement>(null);
   // Highlighted row: 0..options.length, the last index being the custom row.
   const [highlight, setHighlight] = useState(0);
-  // True while focus is inside the card — the hints show then.
+  // True while focus is inside the card — the highlighted row shows then.
   const [keyboardActive, setKeyboardActive] = useState(false);
   const current = questions[currentIndex];
 
@@ -224,26 +218,6 @@ export function AskUserQuestionForm({
       ?.querySelector<HTMLElement>('[data-highlighted="true"]')
       ?.scrollIntoView({ block: "nearest" });
   }, [keyboardActive, highlight, currentIndex]);
-
-  // Re-render on preference writes, so the hint line follows live bindings.
-  useKeyboardShortcutsVersion();
-  const movementKeys = [
-    ...shortcutKeys("questionCardPreviousOption"),
-    ...shortcutKeys("questionCardNextOption"),
-  ];
-  const questionKeys = [
-    ...shortcutKeys("questionCardPreviousQuestion"),
-    ...shortcutKeys("questionCardNextQuestion"),
-  ];
-  const hintParts = [
-    hintSegment(movementKeys, "move"),
-    hintSegment(shortcutKeys("questionCardSelectOption"), "select"),
-    hintSegment(shortcutKeys("questionCardNextOrSubmit"), "next / submit"),
-    hintSegment(questionKeys, "question"),
-    hintSegment(shortcutKeys("questionCardLeave"), "leave"),
-    hintSegment(shortcutKeys("questionCardCancel"), "cancel"),
-    hintSegment(shortcutKeys("questionCardCancelAndInterrupt"), "cancel & interrupt"),
-  ].filter((part): part is string => part !== null);
 
   if (!current) return null;
   const currentKey = questionKey(current);
@@ -745,12 +719,6 @@ export function AskUserQuestionForm({
           </Button>
         )}
       </div>
-
-      {keyboardActive && hintParts.length > 0 && (
-        <p className="text-sm text-muted-foreground" data-testid="ask-user-question-hint">
-          {hintParts.join(" · ")}
-        </p>
-      )}
     </div>
   );
 }
