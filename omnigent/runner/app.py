@@ -2883,7 +2883,8 @@ def create_runner_app(
             return await asyncio.to_thread(
                 session_skill_registry,
                 spec,
-                _session_harness_name(session_id),
+                # Without a routed override the registry falls back to this spec's harness.
+                _session_harness_overrides.get(session_id),
                 await _session_runtime_cwd(session_id),
                 _resolved_spec_workdir(entry),
             )
@@ -9285,7 +9286,8 @@ def create_runner_app(
             spec,
             roots,
             _resolved_spec_workdir(entry),
-            harness=_session_harness_name(session_id),
+            # Without a routed override the menu falls back to this spec's harness.
+            harness=_session_harness_overrides.get(session_id),
         )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
