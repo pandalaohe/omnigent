@@ -2012,10 +2012,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       {terminalSurfaces}
       {!showTerminal && (
         <>
-          {/* A runner writing logs abnormally fast is a session-level
-          condition, so the warning sits above the transcript rather than in
-          the message stream. Self-gates to null for unflagged sessions. */}
-          <RunnerLogRunawayBanner labels={sessionLabels} fallbackLabels={fallbackSessionLabels} />
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
@@ -2046,6 +2042,11 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
                 : undefined
             }
           />
+
+          {/* Session-level runaway-log warning, above the composer: the transcript
+          must start under the floating header, whose clearance would otherwise
+          turn into a dead band below this band. Null for unflagged sessions. */}
+          <RunnerLogRunawayBanner labels={sessionLabels} fallbackLabels={fallbackSessionLabels} />
 
           <Composer
             ref={composerRef}
