@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "host_colors",
         "keep_warm",
         "worktree_location",
+        "runner_log_warnings",
     }
 )
 
@@ -82,6 +84,113 @@ class UserPreferencesUserNotFoundError(LookupError):
 APPROVAL_TIMEOUT_NAMESPACE = "approval_timeout"
 APPROVAL_TIMEOUT_DEFAULT_MINUTES = 50
 APPROVAL_TIMEOUT_MAX_MINUTES = 1380
+
+RUNNER_LOG_WARNINGS_NAMESPACE = "runner_log_warnings"
+# The server re-touches a dismissal daily while the host still confirms its
+# detection, so an entry is dropped only once its detection stopped being
+# confirmed for this long.
+_RUNNER_LOG_WARNINGS_RETENTION_S = 30 * 24 * 60 * 60
+
+# How stale a still-confirmed dismissal must be before the server refreshes it.
+_RUNNER_LOG_WARNINGS_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+
+def _merge_runner_log_warnings(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge one device's dismissals, never moving a key's touch backwards.
+
+    A device holding a stale snapshot can carry an older dismissed-at for a
+    key another device already re-touched, so the larger numeric value wins.
+    Entries whose incoming value is not a number are dropped, which is what
+    pruning would do to them anyway.
+
+    :param existing: Stored ``runner_log_warnings`` map.
+    :param incoming: Incoming map for the same namespace.
+    :returns: A new merged map, ready for :func:`_prune_runner_log_warnings`.
+    """
+    merged: dict[str, Any] = dict(existing)
+    for flag, incoming_at in incoming.items():
+        if not isinstance(incoming_at, (int, float)) or isinstance(incoming_at, bool):
+            merged.pop(flag, None)
+            continue
+        stored_at = merged.get(flag)
+        if (
+            not isinstance(stored_at, (int, float))
+            or isinstance(stored_at, bool)
+            or incoming_at > stored_at
+        ):
+            merged[flag] = incoming_at
+    return merged
+
+
+def _prune_runner_log_warnings(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep only dismissal entries from the last retention window.
+
+    Each entry maps a detection instant to the epoch-ms time it was
+    dismissed; a value that is not a non-bool number, or is older than
+    ``_RUNNER_LOG_WARNINGS_RETENTION_S`` before now (``time.time()``), is
+    dropped.
+
+    :param value: Merged ``runner_log_warnings`` namespace value.
+    :returns: A new map holding the retained entries.
+    """
+    cutoff_ms = (time.time() - _RUNNER_LOG_WARNINGS_RETENTION_S) * 1000.0
+    return {
+        flag: dismissed_at
+        for flag, dismissed_at in value.items()
+        if isinstance(dismissed_at, (int, float))
+        and not isinstance(dismissed_at, bool)
+        and dismissed_at >= cutoff_ms
+    }
+
+
+def touch_runner_log_warning_dismissals(
+    store: SqlAlchemyUserPreferencesStore,
+    flag: str,
+    *,
+    create_if_missing: bool,
+    now_ms: float | None = None,
+) -> int:
+    """Refresh every user's dismissal of *flag* that is older than a day.
+
+    A dismissal holds until a new detection. The host re-confirms a live
+    detection every few minutes, so touching it here at most daily keeps it
+    out of the 30-day prune for exactly as long as the detection is
+    confirmed. Any user who dismissed it is refreshed, including viewers of
+    a shared session; a flag no user dismissed is never added.
+
+    :param store: Preferences store holding the dismissals.
+    :param flag: Detection instant whose dismissal is refreshed.
+    :param create_if_missing: The preferences routes' account-row policy:
+        ``False`` in accounts mode skips users without a live account.
+    :param now_ms: Touch instant in epoch ms; defaults to now.
+    :returns: How many users were touched.
+    """
+    if now_ms is None:
+        now_ms = time.time() * 1000.0
+    touched = 0
+    for user_id, value in store.namespace_values(RUNNER_LOG_WARNINGS_NAMESPACE):
+        if not isinstance(value, dict):
+            continue
+        dismissed_at = value.get(flag)
+        if (
+            not isinstance(dismissed_at, (int, float))
+            or isinstance(dismissed_at, bool)
+            or dismissed_at >= now_ms - _RUNNER_LOG_WARNINGS_TOUCH_INTERVAL_MS
+        ):
+            continue
+        try:
+            store.patch_namespace(
+                user_id,
+                RUNNER_LOG_WARNINGS_NAMESPACE,
+                {flag: now_ms},
+                create_if_missing=create_if_missing,
+            )
+        except (UserPreferencesValidationError, UserPreferencesUserNotFoundError):
+            continue
+        touched += 1
+    return touched
 
 
 @dataclass(frozen=True)
@@ -897,6 +1006,31 @@ class SqlAlchemyUserPreferencesStore:
                 return None
             return _assemble_envelope(settings)
 
+    def namespace_values(self, namespace: str) -> list[tuple[str, Any]]:
+        """Return ``(user_id, value)`` for every user storing *namespace* here.
+
+        Scoped to the current workspace. A row that does not decode is
+        skipped, so one corrupt user never hides the others.
+        """
+        with self._session("read_namespace_of_all_users") as session:
+            rows = session.execute(
+                select(
+                    SqlPreference.user_id,
+                    type_coerce(SqlPreference.value, LargeBinary),
+                ).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.key == _settings_key(namespace),
+                )
+            ).all()
+        values: list[tuple[str, Any]] = []
+        for user_id, raw in rows:
+            try:
+                text = decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES)
+                values.append((user_id, json.loads(text or "")))
+            except (ValueError, zstandard.ZstdError):
+                continue
+        return values
+
     def initialize(
         self,
         user_id: str,
@@ -986,9 +1120,16 @@ class SqlAlchemyUserPreferencesStore:
             else:
                 existing = settings.get(namespace)
                 if isinstance(existing, dict) and isinstance(value, dict):
-                    settings[namespace] = {**existing, **deepcopy(value)}
+                    if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
+                        settings[namespace] = _merge_runner_log_warnings(existing, value)
+                    else:
+                        settings[namespace] = {**existing, **deepcopy(value)}
                 else:
                     settings[namespace] = deepcopy(value)
+            if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
+                stored = settings.get(namespace)
+                if isinstance(stored, dict):
+                    settings[namespace] = _prune_runner_log_warnings(stored)
             merged = _assemble_envelope(settings)
             if namespace in merged["settings"]:
                 self._upsert_row(

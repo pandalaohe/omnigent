@@ -22,6 +22,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -89,12 +90,17 @@ PING_MISS_THRESHOLD = 3
 # Session labels carrying a ``host.runner_log_runaway`` report. The timestamp
 # makes the flag value change per detection, so the web's transition diff can
 # dedupe notifications by session id + value; the MB label carries the amount
-# the banner displays.
+# the banner displays; the seen label is the server's receive time of the
+# latest report, and the web shows the warning only while it is recent.
 RUNNER_LOG_RUNAWAY_LABEL_KEY = "omnigent.runner_log_runaway"
 RUNNER_LOG_RUNAWAY_MB_LABEL_KEY = "omnigent.runner_log_runaway_mb"
+RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY = "omnigent.runner_log_runaway_seen"
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
+
+RunnerLogRunawayCallback = Callable[[str], Awaitable[None]]
+"""Async ``(observed_at)`` hook for each ``host.runner_log_runaway`` report."""
 
 
 def log_runner_exited(
@@ -144,6 +150,7 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: RunnerExitedCallback | None = None,
+    on_runner_log_runaway: RunnerLogRunawayCallback | None = None,
     on_resource_snapshot: (
         Callable[[HostConnection, HostResourceSnapshotFrame], None] | None
     ) = None,
@@ -201,6 +208,10 @@ def create_host_tunnel_router(
         reported runaway log growth (``host.runner_log_runaway``); the label
         reaches the web over the session-updates stream. ``None`` (e.g.
         minimal test wiring) drops the flag.
+    :param on_runner_log_runaway: Optional async callback fired with the
+        frame's ``observed_at`` detection instant for every runaway report.
+        Used to keep a dismissal alive while the host still confirms the
+        detection.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -415,6 +426,7 @@ def create_host_tunnel_router(
                     host_registry,
                     runner_exit_reports,
                     on_runner_exited,
+                    on_runner_log_runaway,
                     on_resource_snapshot,
                     on_host_update,
                     conversation_store,
@@ -614,14 +626,17 @@ async def _mark_runner_log_runaway_sessions(
 ) -> None:
     """Flag every session bound to a runner reporting runaway log growth.
 
-    The label value is the report instant, so a fresh detection changes the
+    The label value is the crossing instant, so a fresh detection changes the
     value and the web's transition diff can fire one notification per new
-    value; the MB label carries the amount for the banner copy.
+    value; the MB label carries the amount for the banner copy, and the seen
+    label carries the server's receive time of this report, which the web
+    compares against now so the warning lapses once the host stops
+    re-confirming.
 
     :param conversation_store: Store holding the runner-bound sessions.
     :param runner_id: Runner the host reported, e.g. ``"runner_abc123..."``.
     :param bytes_last_hour: Bytes the runner wrote in the last hour.
-    :param observed_at: ISO-8601 report instant, e.g.
+    :param observed_at: ISO-8601 crossing instant, e.g.
         ``"2026-09-23T09:25:00+00:00"``.
     """
     sessions = await asyncio.to_thread(
@@ -630,6 +645,9 @@ async def _mark_runner_log_runaway_sessions(
     labels = {
         RUNNER_LOG_RUNAWAY_LABEL_KEY: observed_at,
         RUNNER_LOG_RUNAWAY_MB_LABEL_KEY: str(max(1, round(bytes_last_hour / (1024 * 1024)))),
+        RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY: datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ),
     }
     for session in sessions:
         await asyncio.to_thread(conversation_store.set_labels, session.id, labels)
@@ -643,6 +661,7 @@ async def _receive_loop(
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
+    on_runner_log_runaway: RunnerLogRunawayCallback | None,
     on_resource_snapshot: Callable[[HostConnection, HostResourceSnapshotFrame], None] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
     conversation_store: ConversationStore | None,
@@ -662,6 +681,9 @@ async def _receive_loop(
     :param on_runner_exited: Callback fired with ``(host_id, runner_id,
         error)`` when a ``host.runner_exited`` frame arrives; ``None``
         logs the session-less ``runner_exited`` event here instead.
+    :param on_runner_log_runaway: Callback fired with the frame's
+        ``observed_at`` after a ``host.runner_log_runaway`` frame is handled;
+        ``None`` skips it.
     :param on_resource_snapshot: Callback fired with the connection and
         frame for every ``host.resource_snapshot``; ``None`` drops it.
     :param on_host_update: Callback fired after readiness changes persist;
@@ -786,10 +808,11 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerLogRunawayFrame):
-            # One-way advisory: the runner's log is growing fast, which usually
-            # means an error loop. Flag every session the runner serves so the
-            # web can warn; the label is picked up by the session-updates
-            # stream like any other session change.
+            # One-way advisory: the runner is writing warnings and errors fast,
+            # which usually means an error loop. Flag every session the runner
+            # serves so the web can warn; the host re-sends this each probe
+            # while over, so the seen label stays fresh. The label is picked up
+            # by the session-updates stream like any other session change.
             _logger.warning(
                 "Host %s reported runner %s log runaway: %d bytes (observed_at=%s)",
                 host_id,
@@ -810,6 +833,16 @@ async def _receive_loop(
                     frame.bytes_last_hour,
                     frame.observed_at,
                 )
+            if on_runner_log_runaway is not None:
+                try:
+                    await on_runner_log_runaway(frame.observed_at)
+                except Exception:
+                    # One failed hook must not tear down the tunnel.
+                    _logger.exception(
+                        "on_runner_log_runaway callback failed for %s/%s",
+                        host_id,
+                        frame.runner_id,
+                    )
             continue
 
         if isinstance(frame, HostResourceSnapshotFrame):

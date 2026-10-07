@@ -389,23 +389,25 @@ class HostRunnerExitedFrame:
 
 @dataclass
 class HostRunnerLogRunawayFrame:
-    """Host → server: a live runner's log is growing abnormally fast.
+    """Host → server: a live runner is writing warnings/errors abnormally fast.
 
-    One-way advisory report (no result frame). The host daemon samples each
-    live runner's log size; when one writes more than the runaway threshold
-    within the sliding hour window, the daemon reports it once per crossing
-    so the server can warn the session's user that the runner may be stuck
-    in an error loop. Carries no file path — a log path can contain the
-    user's directories.
+    One-way advisory report (no result frame). The host daemon counts the
+    warning and error bytes each live runner's log appends; when one writes
+    more than the runaway threshold within the sliding hour window, the daemon
+    sends this frame at the crossing and re-sends it on every probe while the
+    runner stays over, so the server can warn the session's user that the
+    runner may be stuck in an error loop and tell a live runaway from a stale
+    one. Carries no file path — a log path can contain the user's directories.
 
     :param runner_id: The runner whose log is growing, e.g.
         ``"runner_abc123..."``.
     :param session_id: Session the runner serves, or ``None`` when the
         launch frame predates it.
-    :param bytes_last_hour: Bytes the runner wrote in the sliding hour
-        window, e.g. ``7340032``.
-    :param observed_at: ISO-8601 UTC instant of the report, e.g.
-        ``"2026-09-23T09:25:00+00:00"``.
+    :param bytes_last_hour: Warning/error bytes the runner appended in the
+        sliding hour window at the latest sample, e.g. ``7340032``.
+    :param observed_at: ISO-8601 UTC instant of the crossing that opened
+        the episode, e.g. ``"2026-09-23T09:25:00+00:00"``. Stays the same
+        across re-sends.
     """
 
     runner_id: str

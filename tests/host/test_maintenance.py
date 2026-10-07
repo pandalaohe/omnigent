@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,6 +16,7 @@ from omnigent.host import maintenance
 from omnigent.host.maintenance import (
     HostMaintenanceJanitor,
     RunnerLogRunawayTracker,
+    RunnerLogWarningCounter,
     sweep_runner_logs,
 )
 
@@ -771,70 +775,27 @@ def test_sweep_under_all_thresholds_changes_nothing(tmp_path: Path) -> None:
 
 
 def test_runaway_tracker_reports_once_per_crossing() -> None:
-    """Crossing 5 MB/h reports once; staying above reports nothing more."""
+    """Crossing 2 MB/h reports once; staying above reports nothing more."""
     tracker = RunnerLogRunawayTracker()
 
     assert tracker.observe("runner_1", 0, 0.0) is None
-    assert tracker.observe("runner_1", 3 * _MB, 60.0) is None
-    assert tracker.observe("runner_1", 6 * _MB, 120.0) == 6 * _MB
+    assert tracker.observe("runner_1", 1 * _MB, 60.0) is None
+    assert tracker.observe("runner_1", 3 * _MB, 120.0) == 3 * _MB
     # Already reported and still above the threshold: no second frame.
-    assert tracker.observe("runner_1", 7 * _MB, 180.0) is None
-    assert tracker.observe("runner_1", 8 * _MB, 240.0) is None
+    assert tracker.observe("runner_1", 4 * _MB, 180.0) is None
+    assert tracker.observe("runner_1", 5 * _MB, 240.0) is None
 
 
 def test_runaway_tracker_rearms_after_falling_below() -> None:
     """After a quiet hour the tracker can report the next crossing."""
     tracker = RunnerLogRunawayTracker()
     assert tracker.observe("runner_1", 0, 0.0) is None
-    assert tracker.observe("runner_1", 6 * _MB, 60.0) == 6 * _MB
-    assert tracker.observe("runner_1", 7 * _MB, 120.0) is None
+    assert tracker.observe("runner_1", 3 * _MB, 60.0) == 3 * _MB
+    assert tracker.observe("runner_1", 4 * _MB, 120.0) is None
 
     # More than a window later with no growth: the burst left the window.
-    assert tracker.observe("runner_1", 7 * _MB, 4 * 3600.0) is None
-    assert tracker.observe("runner_1", 13 * _MB, 4 * 3600.0 + 60) == 6 * _MB
-
-
-def test_runaway_tracker_copytruncate_does_not_reset_count() -> None:
-    """Bytes removed by an in-place rotation stay in the measured rate."""
-    tracker = RunnerLogRunawayTracker()
-    assert tracker.observe("runner_1", 0, 0.0) is None
-    assert tracker.observe("runner_1", 3 * _MB, 60.0) is None
-    # Copytruncate: the live file is copied to ``.1`` and truncated to zero.
-    assert tracker.observe("runner_1", 0, 120.0) is None
-    # 3 MB before the rotation + 3 MB after crosses the threshold.
-    assert tracker.observe("runner_1", 3 * _MB, 180.0) == 6 * _MB
-
-
-def test_runaway_tracker_counts_unsampled_bytes_at_rotation() -> None:
-    tracker = RunnerLogRunawayTracker()
-    assert tracker.observe("runner_1", 99 * _MB, 0.0) is None
-    tracker.note_rotated("runner_1", 103 * _MB, 60.0)
-    assert tracker.observe("runner_1", 3 * _MB, 120.0) == 7 * _MB
-
-
-@pytest.mark.parametrize("sample_first", [True, False])
-def test_runaway_tracker_rotation_counts_each_byte_once(sample_first: bool) -> None:
-    tracker = RunnerLogRunawayTracker()
-    assert tracker.observe("runner_1", 103 * _MB, 0.0) is None
-    if sample_first:
-        assert tracker.observe("runner_1", 0, 60.0) is None
-    tracker.note_rotated("runner_1", 103 * _MB, 61.0)
-    if not sample_first:
-        assert tracker.observe("runner_1", 0, 62.0) is None
-    assert tracker.observe("runner_1", 0, 63.0) is None
-    assert tracker.observe("runner_1", 6 * _MB, 64.0) == 6 * _MB
-
-
-@pytest.mark.parametrize("sample_first", [True, False])
-def test_runaway_tracker_keeps_unsampled_growth_across_rotation(sample_first: bool) -> None:
-    tracker = RunnerLogRunawayTracker()
-    assert tracker.observe("runner_1", 99 * _MB, 0.0) is None
-    if sample_first:
-        assert tracker.observe("runner_1", 0, 60.0) is None
-    tracker.note_rotated("runner_1", 103 * _MB, 61.0)
-    if not sample_first:
-        assert tracker.observe("runner_1", 0, 62.0) is None
-    assert tracker.observe("runner_1", 3 * _MB, 63.0) == 7 * _MB
+    assert tracker.observe("runner_1", 4 * _MB, 4 * 3600.0) is None
+    assert tracker.observe("runner_1", 7 * _MB, 4 * 3600.0 + 60) == 3 * _MB
 
 
 def test_runaway_tracker_keeps_cutoff_baseline() -> None:
@@ -846,24 +807,344 @@ def test_runaway_tracker_keeps_cutoff_baseline() -> None:
         if report is not None:
             reports.append(report)
     assert len(reports) == 1
-    assert reports[0] > 5 * _MB
-
-
-def test_runaway_tracker_ignores_first_sighting_of_existing_content() -> None:
-    """A runner discovered with a large log is not instantly a runaway."""
-    tracker = RunnerLogRunawayTracker()
-    assert tracker.observe("runner_1", 40 * _MB, 0.0) is None
-    assert tracker.observe("runner_1", 40 * _MB + 1, 60.0) is None
+    assert reports[0] > 2 * _MB
 
 
 def test_runaway_tracker_retain_drops_unknown_runners() -> None:
     """State for runners the host no longer owns is discarded."""
     tracker = RunnerLogRunawayTracker()
     assert tracker.observe("runner_1", 0, 0.0) is None
-    assert tracker.observe("runner_1", 6 * _MB, 60.0) == 6 * _MB
+    assert tracker.observe("runner_1", 3 * _MB, 60.0) == 3 * _MB
 
     tracker.retain({"runner_2"})
 
     assert tracker._samples == {}
-    assert tracker._last_sizes == {}
     assert tracker._reported == set()
+    assert tracker._windowed_bytes == {}
+
+
+def test_runaway_tracker_over_threshold_tracks_a_reported_episode() -> None:
+    """While over after a crossing, over_threshold follows each sample."""
+    tracker = RunnerLogRunawayTracker()
+    assert tracker.observe("runner_1", 0, 0.0) is None
+    assert tracker.over_threshold("runner_1") is None
+
+    assert tracker.observe("runner_1", 3 * _MB, 60.0) == 3 * _MB
+    assert tracker.over_threshold("runner_1") == 3 * _MB
+    # Every later sample while still over exposes its current windowed bytes.
+    assert tracker.observe("runner_1", 4 * _MB, 120.0) is None
+    assert tracker.over_threshold("runner_1") == 4 * _MB
+    assert tracker.observe("runner_1", 5 * _MB, 180.0) is None
+    assert tracker.over_threshold("runner_1") == 5 * _MB
+
+    # Once the burst leaves the window, the episode is over.
+    assert tracker.observe("runner_1", 5 * _MB, 4 * 3600.0) is None
+    assert tracker.over_threshold("runner_1") is None
+
+    # Retain drops the stored value with the rest of the runner's state.
+    assert tracker.observe("runner_1", 8 * _MB, 4 * 3600.0 + 60) == 3 * _MB
+    assert tracker.over_threshold("runner_1") == 3 * _MB
+    tracker.retain({"runner_2"})
+    assert tracker.over_threshold("runner_1") is None
+
+
+# ── Runner-log warning counter ───────────────────────────
+
+_WARN_LINE = b"WARN  10-07 14:00:00.000 runner.app run | boom\n"
+_ERROR_LINE = b"ERROR 10-07 14:00:00.000 runner.app run | boom\n"
+_CRIT_LINE = b"CRIT  10-07 14:00:00.000 runner.app run | boom\n"
+_INFO_LINE = b"INFO  10-07 14:00:00.000 runner.app run | ok\n"
+_DEBUG_LINE = b"DEBUG 10-07 14:00:00.000 runner.app run | detail\n"
+_TRACEBACK_LINE = b'  File "/tmp/x.py", line 1, in <module>\n'
+
+
+def _warning_log(tmp_path: Path) -> Path:
+    """Create an empty runner log with a real runner-log name."""
+    path = tmp_path / "runner-sess-20260101-000000-000000.log"
+    path.write_bytes(b"")
+    return path
+
+
+def _append(path: Path, data: bytes) -> None:
+    with path.open("ab") as handle:
+        handle.write(data)
+
+
+def test_warning_counter_counts_warning_records_and_their_lines(tmp_path: Path) -> None:
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    # First sighting: existing content is not this window's output.
+    assert counter.advance("runner_1", path) == 0
+
+    warn = _WARN_LINE + _TRACEBACK_LINE
+    error = _ERROR_LINE + _TRACEBACK_LINE
+    crit = _CRIT_LINE + _TRACEBACK_LINE
+    path.write_bytes(warn + error + crit)
+
+    assert counter.advance("runner_1", path) == len(warn) + len(error) + len(crit)
+
+
+def test_warning_counter_skips_info_and_debug_output(tmp_path: Path) -> None:
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    path.write_bytes(_INFO_LINE + _TRACEBACK_LINE + _DEBUG_LINE + _TRACEBACK_LINE)
+
+    assert counter.advance("runner_1", path) == 0
+    _append(path, _WARN_LINE)
+    assert counter.advance("runner_1", path) == len(_WARN_LINE)
+
+
+def test_warning_counter_waits_for_a_complete_line(tmp_path: Path) -> None:
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    partial = b"WARN  10-07 14:00:00.000 runner.app run | boom"
+    path.write_bytes(partial)
+    assert counter.advance("runner_1", path) == 0
+
+    _append(path, b"\n")
+    assert counter.advance("runner_1", path) == len(partial) + 1
+
+
+def test_warning_counter_recognises_ansi_headers(tmp_path: Path) -> None:
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    line = b"\x1b[31mERROR\x1b[0m 10-07 14:00:00.000 runner.app run | boom\n"
+    path.write_bytes(line + _TRACEBACK_LINE)
+
+    assert counter.advance("runner_1", path) == len(line) + len(_TRACEBACK_LINE)
+
+
+def test_warning_counter_first_sighting_skips_existing_content(tmp_path: Path) -> None:
+    """A runner discovered with a large warning log is not instantly a runaway."""
+    path = _warning_log(tmp_path)
+    path.write_bytes(_WARN_LINE * 4)
+
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    assert counter.advance("runner_1", path) == 0
+
+
+def test_warning_counter_new_file_identity_restarts(tmp_path: Path) -> None:
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    _append(path, _WARN_LINE)
+    assert counter.advance("runner_1", path) == len(_WARN_LINE)
+
+    # A fresh file at the same path is read from its start, with the record
+    # level state reset so a leading header-less line does not count.
+    replacement = tmp_path / "replacement.log"
+    replacement.write_bytes(_TRACEBACK_LINE + _WARN_LINE)
+    os.replace(replacement, path)
+
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE)
+
+
+def test_warning_counter_unreported_shrink_restarts_at_zero(tmp_path: Path) -> None:
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    _append(path, _WARN_LINE * 2)
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE)
+
+    os.truncate(path, 0)
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE)
+
+    _append(path, _WARN_LINE)
+    assert counter.advance("runner_1", path) == 3 * len(_WARN_LINE)
+
+
+@pytest.mark.parametrize("sample_first", [True, False])
+def test_warning_counter_rotation_counts_each_byte_once(
+    tmp_path: Path, sample_first: bool
+) -> None:
+    """A copytruncate keeps the count and every byte is classified once."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    before = _WARN_LINE * 2
+    _append(path, before)
+    assert counter.advance("runner_1", path) == len(before)
+
+    # Bytes appended after the last advance and before the copy are only in
+    # the archive until the rotation is accounted for.
+    unsampled = _ERROR_LINE * 3
+    _append(path, unsampled)
+    info = path.stat()
+    copied_size = info.st_size
+    file_id = (info.st_dev, info.st_ino)
+    archive = tmp_path / f"{path.name}.1"
+    archive.write_bytes(path.read_bytes())
+    os.truncate(path, 0)
+
+    if sample_first:
+        assert counter.advance("runner_1", path) == len(before)
+        counter.note_rotated("runner_1", copied_size, file_id)
+    else:
+        counter.note_rotated("runner_1", copied_size, file_id)
+        assert counter.advance("runner_1", path) == len(before) + len(unsampled)
+
+    after = _CRIT_LINE
+    _append(path, after)
+    total = len(before) + len(unsampled) + len(after)
+    assert counter.advance("runner_1", path) == total
+    # A quiet probe re-reads nothing and counts nothing twice.
+    assert counter.advance("runner_1", path) == total
+
+
+def test_warning_counter_forgets_an_outside_truncate_before_a_rotation(tmp_path: Path) -> None:
+    """An unreported shrink does not misplace a later rotation's archive read."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    _append(path, _WARN_LINE)
+    assert counter.advance("runner_1", path) == len(_WARN_LINE)
+
+    # Truncated by someone other than the janitor: no rotation report follows.
+    os.truncate(path, 0)
+    assert counter.advance("runner_1", path) == len(_WARN_LINE)
+    _append(path, _WARN_LINE * 5)
+    assert counter.advance("runner_1", path) == 6 * len(_WARN_LINE)
+
+    # A later janitor rotation archives only the ERROR line as unsampled.
+    _append(path, _ERROR_LINE)
+    info = path.stat()
+    (tmp_path / f"{path.name}.1").write_bytes(path.read_bytes())
+    os.truncate(path, 0)
+    counter.note_rotated("runner_1", info.st_size, (info.st_dev, info.st_ino))
+
+    assert counter.advance("runner_1", path) == 6 * len(_WARN_LINE) + len(_ERROR_LINE)
+
+
+@pytest.mark.parametrize("shrink_first", [True, False])
+def test_warning_counter_rotation_counts_the_sampled_warn_records_tail(
+    tmp_path: Path, shrink_first: bool
+) -> None:
+    """A sampled WARN record's archive-tail tracebacks count in either order."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    sampled = _WARN_LINE * 2
+    _append(path, sampled)
+    assert counter.advance("runner_1", path) == len(sampled)
+
+    # Header-less lines appended after the last sample continue the sampled
+    # WARN record; only the archive holds them.
+    unsampled = _TRACEBACK_LINE * 3
+    _append(path, unsampled)
+    info = path.stat()
+    copied_size = info.st_size
+    file_id = (info.st_dev, info.st_ino)
+    (tmp_path / f"{path.name}.1").write_bytes(path.read_bytes())
+    os.truncate(path, 0)
+
+    if shrink_first:
+        assert counter.advance("runner_1", path) == len(sampled)
+        counter.note_rotated("runner_1", copied_size, file_id)
+    else:
+        counter.note_rotated("runner_1", copied_size, file_id)
+
+    assert counter.advance("runner_1", path) == len(sampled) + len(unsampled)
+
+
+def test_warning_counter_defers_a_long_unterminated_warn_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A WARN line longer than a chunk is credited only when its newline lands."""
+    monkeypatch.setattr(maintenance, "_RUNNER_LOG_WARNING_CHUNK_BYTES", 64)
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    line = b"WARN  10-07 14:00:00.000 runner.app | " + b"x" * 120
+    _append(path, line)
+    assert counter.advance("runner_1", path) == 0
+
+    _append(path, b"\n")
+    assert counter.advance("runner_1", path) == len(line) + 1
+
+
+def test_warning_counter_ignores_a_long_unterminated_info_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An INFO line longer than a chunk stays out of the count when complete."""
+    monkeypatch.setattr(maintenance, "_RUNNER_LOG_WARNING_CHUNK_BYTES", 64)
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    line = b"INFO  10-07 14:00:00.000 runner.app | " + b"x" * 120
+    _append(path, line)
+    assert counter.advance("runner_1", path) == 0
+
+    _append(path, b"\n")
+    assert counter.advance("runner_1", path) == 0
+
+
+def test_warning_counter_serializes_concurrent_advances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two racing advances classify appended bytes exactly once."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+
+    warn = _WARN_LINE * 10
+    _append(path, warn)
+
+    original_consume = counter._consume
+    first_call = threading.Event()
+
+    def slow_consume(state: Any, data: bytes) -> None:
+        if not first_call.is_set():
+            first_call.set()
+            time.sleep(0.2)
+        original_consume(state, data)
+
+    monkeypatch.setattr(counter, "_consume", slow_consume)
+
+    results: list[int | None] = []
+
+    def advance() -> None:
+        results.append(counter.advance("runner_1", path))
+
+    first = threading.Thread(target=advance)
+    second = threading.Thread(target=advance)
+    first.start()
+    assert first_call.wait(2.0)
+    second.start()
+    first.join(5.0)
+    second.join(5.0)
+
+    assert sorted(results) == [len(warn), len(warn)]
+    assert counter.advance("runner_1", path) == len(warn)
+
+
+@pytest.mark.parametrize("shrink_first", [True, False])
+def test_warning_counter_live_continuation_after_rotation_keeps_the_record_level(
+    tmp_path: Path, shrink_first: bool
+) -> None:
+    """A traceback continuing the archived WARN record still counts after rotation."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    _append(path, _WARN_LINE)
+    assert counter.advance("runner_1", path) == len(_WARN_LINE)
+
+    _append(path, _WARN_LINE)
+    info = path.stat()
+    (tmp_path / f"{path.name}.1").write_bytes(path.read_bytes())
+    os.truncate(path, 0)
+    if shrink_first:
+        assert counter.advance("runner_1", path) == len(_WARN_LINE)
+    counter.note_rotated("runner_1", info.st_size, (info.st_dev, info.st_ino))
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE)
+
+    _append(path, _TRACEBACK_LINE)
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE) + len(_TRACEBACK_LINE)

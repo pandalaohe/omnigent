@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1721,12 +1722,15 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     The host samples log growth; the server turns a report into session
     labels that the session-updates stream pushes to the web, which shows
     the warning banner. A failure here means a runaway runner stays silent
-    until the user notices the disk filling.
+    until the user notices the disk filling. The frame also calls the
+    configured hook with its detection instant, which the server uses to
+    keep dismissals alive.
     """
     from omnigent.host.frames import HostRunnerLogRunawayFrame
     from omnigent.server.routes.host_tunnel import (
         RUNNER_LOG_RUNAWAY_LABEL_KEY,
         RUNNER_LOG_RUNAWAY_MB_LABEL_KEY,
+        RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY,
     )
 
     registry = HostRegistry()
@@ -1734,10 +1738,19 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     conv_store = SqlAlchemyConversationStore(db_uri)
     hot = conv_store.create_conversation(agent_id=None, runner_id="runner_hot")
     cool = conv_store.create_conversation(agent_id=None, runner_id="runner_cool")
+    received: list[str] = []
+
+    async def _record(observed_at: str) -> None:
+        received.append(observed_at)
 
     app = FastAPI()
     app.include_router(
-        create_host_tunnel_router(registry, host_store, conversation_store=conv_store),
+        create_host_tunnel_router(
+            registry,
+            host_store,
+            conversation_store=conv_store,
+            on_runner_log_runaway=_record,
+        ),
         prefix="/v1",
     )
 
@@ -1762,12 +1775,88 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
             conv_store.get_conversation(hot.id).labels or {}
         ):
             await asyncio.sleep(0.01)
+    async with asyncio.timeout(2.0):
+        while not received:
+            await asyncio.sleep(0.01)
 
     labels = conv_store.get_conversation(hot.id).labels
     assert labels[RUNNER_LOG_RUNAWAY_LABEL_KEY] == "2026-09-23T09:25:00+00:00"
     assert labels[RUNNER_LOG_RUNAWAY_MB_LABEL_KEY] == "7"
-    # A session bound to another runner keeps no flag.
-    assert RUNNER_LOG_RUNAWAY_LABEL_KEY not in (conv_store.get_conversation(cool.id).labels or {})
+    # The seen label is the server's receive time, which the web ages out.
+    seen = datetime.fromisoformat(labels[RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY])
+    assert seen.tzinfo is not None
+    assert abs((datetime.now(timezone.utc) - seen).total_seconds()) < 300
+    # The hook is awaited once with the frame's detection instant.
+    assert received == ["2026-09-23T09:25:00+00:00"]
+    # A session bound to another runner keeps none of the flags.
+    cool_labels = conv_store.get_conversation(cool.id).labels or {}
+    assert RUNNER_LOG_RUNAWAY_LABEL_KEY not in cool_labels
+    assert RUNNER_LOG_RUNAWAY_MB_LABEL_KEY not in cool_labels
+    assert RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY not in cool_labels
+
+
+async def test_runner_log_runaway_hook_failure_does_not_stop_later_frames(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising runaway hook is logged and the next frame still labels."""
+    from omnigent.host.frames import HostRunnerLogRunawayFrame
+    from omnigent.server.routes.host_tunnel import RUNNER_LOG_RUNAWAY_LABEL_KEY
+
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    hot = conv_store.create_conversation(agent_id=None, runner_id="runner_hot")
+    calls = 0
+
+    async def _raise(observed_at: str) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("hook exploded")
+
+    app = FastAPI()
+    caplog.set_level("ERROR", logger="omnigent.server.routes.host_tunnel")
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            host_store,
+            conversation_store=conv_store,
+            on_runner_log_runaway=_raise,
+        ),
+        prefix="/v1",
+    )
+
+    _comm = await _connect_host(app, registry)
+    first = "2026-09-23T09:25:00+00:00"
+    second = "2026-09-23T10:25:00+00:00"
+    for observed_at in (first, second):
+        await _comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostRunnerLogRunawayFrame(
+                        runner_id="runner_hot",
+                        session_id=hot.id,
+                        bytes_last_hour=7 * 1024 * 1024,
+                        observed_at=observed_at,
+                    )
+                ),
+            }
+        )
+    # The second frame lands only if the receive loop survived the first
+    # hook's exception; its hook runs just after its labels are written.
+    async with asyncio.timeout(2.0):
+        while (
+            calls < 2
+            or (conv_store.get_conversation(hot.id).labels or {}).get(RUNNER_LOG_RUNAWAY_LABEL_KEY)
+            != second
+        ):
+            await asyncio.sleep(0.01)
+
+    assert calls == 2
+    assert any(
+        "on_runner_log_runaway callback failed" in record.message for record in caplog.records
+    )
 
 
 async def test_host_cli_retention_policy_defaults_and_cas_update(
