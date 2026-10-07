@@ -34,7 +34,8 @@ def _fade_end(page: Page) -> float:
     if not mask or mask == "none":
         return 0.0
     match = _FIRST_PX_STOP.search(mask)
-    return float(match.group(1)) if match else 0.0
+    assert match, f"unrecognised transcript mask: {mask}"
+    return float(match.group(1))
 
 
 @pytest.mark.parametrize(
@@ -63,15 +64,30 @@ def test_runaway_banner_leaves_no_dead_band_under_the_header(
     banner = page.get_by_test_id("runner-log-runaway-banner")
     expect(banner).to_contain_text("5 MB in the last hour", timeout=20_000)
     expect(page.get_by_text("Explain browser fixture turn 40.")).to_be_visible()
+    # A running background task floats its pill above the composer.
+    chat.wait_for_stream()
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": chat.session_id,
+                "status": "idle",
+                "background_task_count": 1,
+            },
+        }
+    )
+    pill = page.locator('[role="status"][data-testid="background-task-pill"]')
+    expect(pill).to_be_visible(timeout=10_000)
 
     header = box(page.locator("header.chat-header"))
     transcript = box(page.get_by_role("log"))
     warning = box(banner)
     # The band is neither tucked under the status bar and floating header nor
-    # on top of the transcript.
+    # covered by the transcript or the composer's overlays.
     assert warning["y"] >= header["y"] + header["height"] - TOLERANCE, (warning, header)
     assert warning["y"] + warning["height"] <= viewport["height"] + TOLERANCE, warning
     assert_no_overlap(warning, transcript)
+    assert_no_overlap(warning, box(pill))
     # The transcript's header clearance is calibrated to a viewport that starts
     # under the header; pushed down, that clearance becomes a blank band.
     visible_from = transcript["y"] + _fade_end(page)
