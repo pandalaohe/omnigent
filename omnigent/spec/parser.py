@@ -2318,6 +2318,8 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
 def discover_host_skills(
     agent_root: Path,
     skills_filter: str | list[str],
+    *,
+    include_agents: bool = True,
 ) -> list[SkillSpec]:
     """
     Discover host-scope skills from ``.claude/skills/`` and
@@ -2334,6 +2336,8 @@ def discover_host_skills(
         agent spec. ``"none"`` suppresses all host skills;
         ``"all"`` loads everything; a list of names loads only
         those.
+    :param include_agents: When ``False``, skip every
+        ``.agents/skills/`` tier.
     :returns: Deduplicated list of :class:`SkillSpec` objects.
         Later directories (closer to /) lose on name collision
         with earlier ones (closer to agent_root).
@@ -2357,11 +2361,12 @@ def discover_host_skills(
             seen_names.add(spec.name)
             skills.append(spec)
 
+    dotdirs = (".claude", ".agents") if include_agents else (".claude",)
     # Walk from agent_root up to filesystem root, scanning
     # .claude/skills/ and .agents/skills/ at each level.
     current = agent_root.resolve()
     while True:
-        for dotdir in (".claude", ".agents"):
+        for dotdir in dotdirs:
             candidate = current / dotdir / "skills"
             if candidate.is_dir():
                 _scan_dir(candidate)
@@ -2371,7 +2376,7 @@ def discover_host_skills(
         current = parent
 
     # Also scan user-global skill directories.
-    for dotdir in (".claude", ".agents"):
+    for dotdir in dotdirs:
         home_skills = Path.home() / dotdir / "skills"
         if home_skills.is_dir():
             _scan_dir(home_skills)

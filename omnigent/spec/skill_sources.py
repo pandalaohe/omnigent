@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import cast
 
 from omnigent.errors import OmnigentError
+from omnigent.skill_settings import host_skill_settings
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 
@@ -91,6 +92,9 @@ class SkillSourceContext:
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
         terminal-matching resolution (config-home tiers, ``.agents`` exclusion)
         so it applies only to native harnesses, never the in-process SDK ones.
+    :param claude_portable_skills: Whether Claude-family discovery may include
+        ``.agents/skills`` tiers; the host's ``skills.claude_portable_skills``
+        setting.
     """
 
     roots: tuple[Path, ...]
@@ -100,6 +104,7 @@ class SkillSourceContext:
     claude_config_dir: Path | None = None
     codex_home: Path | None = None
     is_native: bool = False
+    claude_portable_skills: bool = True
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -129,6 +134,7 @@ def skill_source_context_from_env(
             Path(configured_claude_dir).expanduser() if configured_claude_dir else None
         ),
         codex_home=codex_home,
+        claude_portable_skills=host_skill_settings().claude_portable_skills,
     )
 
 
@@ -144,12 +150,23 @@ def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
     return out
 
 
-def _generic_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+def _generic_host_skills(
+    ctx: SkillSourceContext, *, include_agents: bool = True
+) -> list[SkillSpec]:
     """Today's behavior: ``discover_host_skills`` over each root."""
     out: list[SkillSpec] = []
     for root in ctx.roots:
-        out.extend(discover_host_skills(root, ctx.skills_filter))
+        out.extend(discover_host_skills(root, ctx.skills_filter, include_agents=include_agents))
     return _dedup(out)
+
+
+def generic_walk_includes_agents(harness: str | None) -> bool:
+    """Whether a generic walk for *harness* may scan ``.agents`` tiers.
+
+    :param harness: The session's harness id (canonical or alias).
+    :returns: ``False`` only for the Claude family with the host switch off.
+    """
+    return _harness_family(harness) != "claude" or host_skill_settings().claude_portable_skills
 
 
 def _claude_user_dir(ctx: SkillSourceContext) -> Path:
@@ -461,13 +478,17 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     (:func:`_claude_code_skills`: ``.claude/skills`` and the
     ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
     ``claude-sdk`` harness has no such terminal to match, so it keeps the
-    generic host walk it used before this scoping — the terminal-matching
-    behavior only affects native harnesses. Enabled plugin slash-commands are
-    added in both cases (config-dir-resolved for native, ``~/.claude`` for SDK
-    via :func:`_claude_user_dir`).
+    generic host walk it used before this scoping — except that
+    ``.agents/skills`` tiers are dropped when the host's
+    ``skills.claude_portable_skills`` switch is off. Enabled plugin
+    slash-commands are added in both cases (config-dir-resolved for native,
+    ``~/.claude`` for SDK via :func:`_claude_user_dir`).
     """
-    walk = _claude_code_skills if ctx.is_native else _generic_host_skills
-    return walk(ctx) + _claude_plugin_skills(ctx)
+    if ctx.is_native:
+        skills = _claude_code_skills(ctx)
+    else:
+        skills = _generic_host_skills(ctx, include_agents=ctx.claude_portable_skills)
+    return skills + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
