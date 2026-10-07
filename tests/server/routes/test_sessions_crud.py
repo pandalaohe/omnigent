@@ -23,13 +23,16 @@ import httpx
 import pytest
 import pytest_asyncio
 import yaml
+from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 from omnigent.member_snapshot import MEMBER_LOCK_LABEL_KEY
 from omnigent.runner import create_runner_app
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -164,6 +167,43 @@ async def test_list_sessions_keep_warm_state_uses_harness_family(
     assert rows[unsupported.id].get("warm_state") is None
 
 
+async def test_list_sessions_agent_cold_after_zero_reads_warm(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A coldAfterSeconds=0 agent row flips its session's list pill to warm."""
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    other_agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="never-cold-agent", bundle_location="test:///bundle")
+    agent_store.create(other_agent_id, name="family-rule-agent", bundle_location="test:///bundle")
+    never_cold = conv_store.create_conversation(agent_id=agent_id)
+    other = conv_store.create_conversation(agent_id=other_agent_id)
+    stale = json.dumps(
+        {"s": "w", "y": "claude", "t": now - 7200, "u": now - 7200, "w": now - 3600}
+    )
+    conv_store.set_labels(never_cold.id, {"omnigent.keep_warm": stale})
+    conv_store.set_labels(other.id, {"omnigent.keep_warm": stale})
+
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "keep_warm",
+        {"agents": {agent_id: {"coldAfterSeconds": 0}}},
+    )
+    app.state.user_preferences_store = prefs
+
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    assert rows[never_cold.id]["warm_state"] == "warm"
+    # An agent with no cold-after row keeps the per-family rule: still cold.
+    assert rows[other.id]["warm_state"] == "cold"
+
+
 async def test_list_sessions_warm_state_ignores_a_running_child(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -243,6 +283,44 @@ async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
     """Getting a nonexistent session returns 404."""
     resp = await client.get("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
     assert resp.status_code == 404
+
+
+async def test_get_session_agent_cold_after_zero_reads_warm(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A coldAfterSeconds=0 agent row flips the stale label's pill to warm."""
+    now = int(time.time())
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="never-cold-agent", bundle_location="test:///bundle")
+    conv = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(
+        conv.id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 7200, "u": now - 7200, "w": now - 3600}
+            )
+        },
+    )
+
+    before = await client.get(f"/v1/sessions/{conv.id}")
+    assert before.status_code == 200
+    assert before.json()["warm_state"] == "cold"
+
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "keep_warm",
+        {"agents": {agent_id: {"coldAfterSeconds": 0}}},
+    )
+    app.state.user_preferences_store = prefs
+
+    after = await client.get(f"/v1/sessions/{conv.id}")
+    assert after.status_code == 200
+    assert after.json()["warm_state"] == "warm"
 
 
 # ── DELETE /v1/sessions/{id} ────────────────────────────────────────

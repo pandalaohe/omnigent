@@ -477,19 +477,24 @@ def warm_state_from_label(
     now: int,
     family: Literal["claude", "codex"] | None = None,
     codex_staleness_s: int = _CODEX_DEFAULT_STALENESS_S,
+    cold_after_s: int | None = None,
 ) -> Literal["warm", "cold"] | None:
     """
     Derive the rail pill state from a session's keep-warm label.
 
-    No settings read: an archived session, an unsupported harness, or an idle
-    session with no label reads ``None``. A busy session is ``warm`` whatever
-    the label says (its running turn touches the provider cache). Otherwise
-    the rule is per family: Claude is a clock estimate (``warm`` while the
-    episode is warm and the last touch is inside the 1 h cache window); Codex
-    is observation-based (``warm`` while the latest usage observation —
-    ping receipt or real turn — is a hit younger than the staleness bound,
-    the agent's interval + 300 s; with no observation at all, a real turn
-    settled inside that bound also reads warm).
+    No settings read: an archived session or an unsupported harness reads
+    ``None``. A busy session is ``warm`` whatever the label says (its running
+    turn touches the provider cache). A positive ``cold_after_s`` replaces the
+    per-family rule with that clock alone: ``warm`` while the last cache touch
+    is inside it, ``cold`` for a missing / unparsable label or a stale touch;
+    ``0`` reads ``warm`` unconditionally. Otherwise the rule is per family:
+    Claude is a clock estimate (``warm`` while the episode is warm and the
+    last touch is inside the 1 h cache window); Codex is observation-based
+    (``warm`` while the latest usage observation — ping receipt or real turn —
+    is a hit younger than the staleness bound, the agent's interval + 300 s;
+    with no observation at all, a real turn settled inside that bound also
+    reads warm). With ``cold_after_s`` ``None`` an idle session with no usable
+    label reads ``None``.
 
     :param raw: The ``omnigent.keep_warm`` label value, or ``None``.
     :param archived: Whether the session row itself is archived.
@@ -498,6 +503,8 @@ def warm_state_from_label(
     :param now: Current epoch seconds.
     :param family: Model family; derived from *harness* when omitted.
     :param codex_staleness_s: Codex observation staleness bound in seconds.
+    :param cold_after_s: Agent's idle seconds to cold, ``0`` to never read
+        cold, or ``None`` for the per-family rule.
     :returns: ``"warm"``, ``"cold"``, or ``None``.
     """
     if archived:
@@ -506,9 +513,15 @@ def warm_state_from_label(
         if harness not in _SUPPORTED_HARNESSES:
             return None
         family = _SUPPORTED_HARNESSES[harness]
+    if cold_after_s == 0:
+        return "warm"
     if busy:
         return "warm"
     state = _WarmState.parse(raw)
+    if cold_after_s is not None and cold_after_s > 0:
+        if state is not None and state.u is not None and now - state.u < cold_after_s:
+            return "warm"
+        return "cold"
     if state is None:
         return None
     if family == "codex":
@@ -584,12 +597,14 @@ def warm_state_for_labels(
     busy: bool,
     now: int,
     family: Literal["claude", "codex"] | None = None,
+    cold_after_s: int | None = None,
 ) -> Literal["warm", "cold"] | None:
     """
     Derive the rail pill state from raw labels plus a resolved harness family.
 
     ``None`` only for an archived session, a mirrored native sub-agent row,
-    or a session whose harness has no known keep-warm family. The label's
+    or a session whose harness has no known keep-warm family. A known family
+    with ``cold_after_s == 0`` reads ``warm`` even with no label. The label's
     ``y`` stamp wins when present; otherwise the caller's ``family`` —
     resolved from the session's harness — supplies the per-family rule. A
     session outside the sweeper's scan window carries no label at all and
@@ -601,6 +616,8 @@ def warm_state_for_labels(
     :param now: Current epoch seconds.
     :param family: Model family resolved from the session's harness, used
         when the label carries no ``y`` stamp.
+    :param cold_after_s: Agent's idle seconds to cold, ``0`` to never read
+        cold, or ``None`` for the per-family rule.
     :returns: ``"warm"``, ``"cold"``, or ``None``.
     """
     if archived:
@@ -610,6 +627,8 @@ def warm_state_for_labels(
     stamped = keep_warm_family_from_labels(labels)
     if stamped is not None:
         family = stamped
+    if family is not None and cold_after_s == 0:
+        return "warm"
     raw = labels.get(KEEP_WARM_LABEL) if labels else None
     if raw is None:
         if family is None:
@@ -624,7 +643,25 @@ def warm_state_for_labels(
         busy=busy,
         now=now,
         family=family,
+        cold_after_s=cold_after_s,
     )
+
+
+def cold_after_for_agent(settings: KeepWarmSettings, agent_id: str | None) -> int | None:
+    """
+    Return the agent row's cold-after seconds, ignoring the main/child switches.
+
+    :param settings: The owner's resolved keep-warm settings.
+    :param agent_id: Agent whose row applies, or ``None``.
+    :returns: The stored ``cold_after_s`` (``0`` = never cold), or ``None``
+        when the agent id or its row is absent.
+    """
+    if agent_id is None:
+        return None
+    row = settings.agents.get(agent_id)
+    if row is None:
+        return None
+    return row.cold_after_s
 
 
 def keep_warm_status_from_labels(
@@ -772,6 +809,37 @@ def _has_sync_pending(session_id: str) -> bool:
     return False
 
 
+#: The started sweeper, for off-request publishers that carry no app handle
+#: (the live-state worker building a child summary). Set by
+#: :meth:`ChildKeepWarmSweeper.start`, cleared by :meth:`shutdown`.
+_sweeper: ChildKeepWarmSweeper | None = None
+
+
+def cold_after_for_session(conv: Conversation) -> int | None:
+    """
+    Read the session agent's cold-after seconds for an off-request publisher.
+
+    Blocking: the caller is the live-state worker thread, which already does
+    the store reads for its publish. Reads as the per-family rule (``None``)
+    when no sweeper is started, it has no app, or the lookup fails.
+
+    :param conv: The session row whose agent setting applies.
+    :returns: The agent row's ``cold_after_s`` (``0`` = never cold), or
+        ``None``.
+    """
+    sweeper = _sweeper
+    if sweeper is None or sweeper._app is None:
+        return None
+    preferences_store = getattr(
+        getattr(sweeper._app, "state", None), "user_preferences_store", None
+    )
+    try:
+        return sweeper.cold_after_for(conv, preferences_store)
+    except Exception:  # noqa: BLE001 — a summary fan-out must never fail here
+        _logger.warning("Keep-warm cold-after read failed for %s", conv.id, exc_info=True)
+        return None
+
+
 class ChildKeepWarmSweeper:
     """Forward one keep-warm control per cache window for eligible sessions."""
 
@@ -831,17 +899,26 @@ class ChildKeepWarmSweeper:
         self._scan_window_s = KEEP_WARM_DEFAULT_MAX_S + _SLACK_S
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
+        # The clock at the previous tick's start: the run loop sleeps after a
+        # sweep, so real spacing exceeds ``_interval`` and an edge between ticks
+        # needs this comparison. ``None`` until the first tick lands.
+        self._previous_tick_now: int | None = None
 
     async def start(self, app: Any) -> None:
         """Seed the tracked warm set, then start the loop."""
         if self._task is not None and not self._task.done():
             return
         self._app = app
+        global _sweeper
+        _sweeper = self
         await self._seed_tracked()
         self._task = asyncio.create_task(self._run(), name="child-keep-warm")
 
     async def shutdown(self) -> None:
         """Stop the loop and any in-flight ping forwards."""
+        global _sweeper
+        if _sweeper is self:
+            _sweeper = None
         task = self._task
         self._task = None
         if task is not None:
@@ -915,6 +992,7 @@ class ChildKeepWarmSweeper:
                 await self._archive_offline_host_children(now)
             except Exception:
                 _logger.exception("Child keep-warm host-offline archive pass failed")
+        self._previous_tick_now = now
 
     def _list_ping_candidates(self, now: int) -> set[str]:
         """Return sessions updated inside the candidate window (paged)."""
@@ -1088,8 +1166,72 @@ class ChildKeepWarmSweeper:
         for row in settings.agents.values():
             clamped = min(max(row.max_s, max_low), max_high)
             self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
+            # A session untouched for N can still need a tick when its N edge
+            # passes, so the candidate window must cover the longest N too.
+            if row.cold_after_s is not None and row.cold_after_s > 0:
+                self._scan_window_s = max(self._scan_window_s, row.cold_after_s + _SLACK_S)
         cache[owner] = settings
         return settings
+
+    def cold_after_for(self, conv: Conversation, preferences_store: Any) -> int | None:
+        """
+        Read the session agent's cold-after seconds; ``None`` on any failure.
+
+        Blocking: callers run it in a thread. The owner's main/child switches
+        never apply here. Any read failure logs and reads as the platform
+        rule, so a response is never lost to this lookup.
+
+        :param conv: The session row whose agent setting applies.
+        :param preferences_store: Preferences store, or ``None``.
+        :returns: The agent row's ``cold_after_s`` (``0`` = never cold), or
+            ``None``.
+        """
+        return self.cold_after_for_many([conv], preferences_store).get(conv.id)
+
+    def cold_after_for_many(
+        self, convs: list[Conversation], preferences_store: Any
+    ) -> dict[str, int | None]:
+        """
+        Batch :meth:`cold_after_for`: one settings read per distinct owner.
+
+        Blocking: callers run it in a thread. Never raises: one owner's read
+        failure logs and leaves that owner's rows at ``None`` (the per-family
+        rule), and an owner-resolution failure leaves only that conversation
+        at ``None``.
+
+        :param convs: Session rows whose agent settings apply.
+        :param preferences_store: Preferences store, or ``None``.
+        :returns: Map from conversation id to the agent row's ``cold_after_s``
+            (``0`` = never cold), or ``None``.
+        """
+        by_session: dict[str, int | None] = {}
+        owner_by_session: dict[str, str] = {}
+        settings_by_owner: dict[str, KeepWarmSettings | None] = {}
+        for conv in convs:
+            try:
+                owner = owner_by_session.get(conv.id)
+                if owner is None:
+                    owner = collab_owner_for(
+                        conv, self._conversation_store, self._permission_store
+                    )
+                    owner_by_session[conv.id] = owner
+            except Exception:  # noqa: BLE001 — this lookup must never fail a snapshot
+                _logger.warning("Keep-warm cold-after read failed for %s", conv.id, exc_info=True)
+                by_session[conv.id] = None
+                continue
+            if owner not in settings_by_owner:
+                try:
+                    settings_by_owner[owner] = read_keep_warm_settings(preferences_store, owner)
+                except Exception:  # noqa: BLE001 — one owner must not sink the batch
+                    _logger.warning(
+                        "Keep-warm cold-after settings read failed for %s", owner, exc_info=True
+                    )
+                    settings_by_owner[owner] = None
+            settings = settings_by_owner[owner]
+            by_session[conv.id] = (
+                None if settings is None else cold_after_for_agent(settings, conv.agent_id)
+            )
+        return by_session
 
     def _native_agents_for_migration(self) -> list[tuple[str, str]]:
         """
@@ -1206,6 +1348,7 @@ class ChildKeepWarmSweeper:
         is_child = conv.parent_conversation_id is not None
         owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
         settings = await self._settings_for(owner, now, settings_cache)
+        cold_after = cold_after_for_agent(settings, conv.agent_id)
         resolved = keep_warm_for_agent(settings, conv.agent_id, family) if family else None
         # Absent agent = off; the session's class picks the row's switch.
         switch_on = resolved is not None and (resolved.child if is_child else resolved.main)
@@ -1221,14 +1364,23 @@ class ChildKeepWarmSweeper:
             max_s = KEEP_WARM_DEFAULT_MAX_S
         staleness_s = interval + _SLACK_S if resolved is not None else _CODEX_DEFAULT_STALENESS_S
 
-        warm_before = warm_state_from_label(
+        # The pill the previous tick left behind; the first tick after a start
+        # falls back to one sweep interval. Real spacing exceeds ``_interval``,
+        # so comparing at ``now - interval`` would miss an edge in the gap.
+        previous_tick_now = (
+            self._previous_tick_now
+            if self._previous_tick_now is not None
+            else now - int(self._interval)
+        )
+        warm_at_previous_tick = warm_state_from_label(
             raw_label,
             archived=False,
             harness=harness,
             busy=busy,
-            now=now,
+            now=previous_tick_now,
             family=family,
             codex_staleness_s=staleness_s,
+            cold_after_s=cold_after,
         )
         # A label that said warm may already DERIVE cold once its window
         # passed (the rail still shows the last publish), so leaving a warm
@@ -1316,6 +1468,7 @@ class ChildKeepWarmSweeper:
                     and state.why == "miss"
                     and state.v == conv.archive_revision
                 )
+                settle = conv.updated_at if conv.updated_at >= running_since else now
                 if not sticky_miss:
                     prev_u = state.u if state is not None else None
                     prev_b = state.b if state is not None else None
@@ -1330,7 +1483,6 @@ class ChildKeepWarmSweeper:
                         and running_since <= state.w
                         and stats.ep_p >= 1
                     )
-                    settle = conv.updated_at if conv.updated_at >= running_since else now
                     reading = self._turn_cache_reading(conv, prev_b, running_since, family)
                     misses = prev_m
                     if reading is not None:
@@ -1377,6 +1529,12 @@ class ChildKeepWarmSweeper:
                     # The reaper-yield touch protects an episode that will be
                     # pinged; with the switch off there is nothing to protect.
                     touch = switch_on and runner_online is True and host_ok
+                else:
+                    # The pause stays sticky, but the settled turn is consumed
+                    # and its cache touch advances the clock readers use.
+                    assert state is not None
+                    state.t = running_since
+                    state.u = settle
             elif state is not None and state.r and state.s == "w":
                 # The episode opened with an unmeasurable reading; retry the
                 # same turn's classification against the stored baseline
@@ -1469,19 +1627,23 @@ class ChildKeepWarmSweeper:
                 updates[KEEP_WARM_STATS_LABEL] = new_stats
         if updates:
             await asyncio.to_thread(store.set_labels, session_id, updates)
-            if KEEP_WARM_LABEL in updates:
-                warm_after = warm_state_from_label(
-                    new_label,
-                    archived=False,
-                    harness=harness,
-                    busy=busy,
-                    now=now,
-                    family=family,
-                    codex_staleness_s=staleness_s,
-                )
-                state_warm_after = state is not None and state.s == "w"
-                if warm_after != warm_before or (state_warm_before and not state_warm_after):
-                    _publish_child_status_to_parent(session_id, None)
+        # One publish decision per tick: the pill at the previous tick's clock
+        # under the old label against the pill now under the label as written (or
+        # unchanged); comparing both at ``now`` would miss an edge in the gap.
+        label_now = new_label if KEEP_WARM_LABEL in updates else raw_label
+        warm_after = warm_state_from_label(
+            label_now,
+            archived=False,
+            harness=harness,
+            busy=busy,
+            now=now,
+            family=family,
+            codex_staleness_s=staleness_s,
+            cold_after_s=cold_after,
+        )
+        state_warm_after = state is not None and state.s == "w"
+        if warm_after != warm_at_previous_tick or (state_warm_before and not state_warm_after):
+            _publish_child_status_to_parent(session_id, None)
         if state is not None and state.s == "w":
             self._tracked[session_id] = state.w or 0
         else:
@@ -1545,6 +1707,7 @@ class ChildKeepWarmSweeper:
         is_child = conv.parent_conversation_id is not None
         owner = await asyncio.to_thread(collab_owner_for, conv, store, self._permission_store)
         settings = await self._settings_for(owner, now, {})
+        cold_after = cold_after_for_agent(settings, conv.agent_id)
         resolved = keep_warm_for_agent(settings, conv.agent_id, family) if family else None
         if resolved is not None:
             interval = resolved.interval_s
@@ -1565,6 +1728,7 @@ class ChildKeepWarmSweeper:
             now=now,
             family=family,
             codex_staleness_s=staleness_s,
+            cold_after_s=cold_after,
         )
         state_warm_before = state.s == "w"
 
@@ -1630,6 +1794,7 @@ class ChildKeepWarmSweeper:
             now=now,
             family=family,
             codex_staleness_s=staleness_s,
+            cold_after_s=cold_after,
         )
         if warm_after != warm_before or (state_warm_before and state.s != "w"):
             _publish_child_status_to_parent(session_id, None)
@@ -1868,6 +2033,8 @@ __all__ = [
     "KEEP_WARM_STATS_LABEL",
     "LAST_CACHE_LABEL",
     "ChildKeepWarmSweeper",
+    "cold_after_for_agent",
+    "cold_after_for_session",
     "keep_warm_episode_active",
     "keep_warm_family_for_harness",
     "keep_warm_family_from_labels",

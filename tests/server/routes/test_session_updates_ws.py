@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -25,7 +26,9 @@ from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -198,6 +201,51 @@ def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> 
         # would drop the key (stream dumps full rows, so it must be present).
         assert items[s1]["runner_online"] is True
         assert items[s1]["host_online"] is None
+
+
+def test_watched_session_cold_after_zero_reads_warm(
+    app: FastAPI,
+    stores,
+    db_uri: str,
+) -> None:
+    """A watched session whose agent never goes cold reads a warm pill."""
+    conversation_store, _agent_store, permission_store = stores
+    session_id = _seed_session(stores, owner=ALICE, title="never cold")
+    now = int(time.time())
+    conversation_store.set_labels(
+        session_id,
+        {
+            "omnigent.keep_warm": json.dumps(
+                {"s": "w", "y": "claude", "t": now - 7200, "u": now - 7200, "w": now - 3600}
+            )
+        },
+    )
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    preferences.patch_namespace(
+        ALICE,
+        "keep_warm",
+        {"agents": {"087b7cb7ac30abf4debfaa578d052ec6": {"coldAfterSeconds": 0}}},
+    )
+    app.state.user_preferences_store = preferences
+
+    async def _noop_forward(_session_id: str, _body: dict) -> bool:
+        return True
+
+    app.state.child_keep_warm = ChildKeepWarmSweeper(
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+        liveness_lookup=None,
+        forward_control=_noop_forward,
+        host_ok=lambda _conv: True,
+    )
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        assert items[session_id]["warm_state"] == "warm"
 
 
 def test_child_busy_rollup_flows_through_updates_stream(

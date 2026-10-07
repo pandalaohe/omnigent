@@ -692,13 +692,14 @@ describe("AgentInfoContent keep-warm block", () => {
     keep_warm: keepWarmStatus,
   };
   /** Seed the row into the sidebar list cache the live-updates stream patches. */
-  function seedListCache(qc: QueryClient, keepWarm: KeepWarmStatus = keepWarmStatus) {
+  function seedListCache(qc: QueryClient, row: Partial<Conversation> = {}) {
+    const conversation = { ...keepWarmConversation, keep_warm: keepWarmStatus, ...row };
     qc.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
       pages: [
         {
-          data: [{ ...keepWarmConversation, keep_warm: keepWarm }],
-          first_id: keepWarmConversation.id,
-          last_id: keepWarmConversation.id,
+          data: [conversation],
+          first_id: conversation.id,
+          last_id: conversation.id,
           has_more: false,
         },
       ],
@@ -714,11 +715,34 @@ describe("AgentInfoContent keep-warm block", () => {
     renderContent("conv_keep_warm", LEVEL_OWNER, qc);
 
     const block = screen.getByTestId("agent-info-keep-warm");
+    expect(within(block).getByText("Cache").parentElement).toHaveTextContent("warm");
     expect(block).toHaveTextContent("paused");
     expect(block).toHaveTextContent("failures (btw_unavailable)");
     expect(block).toHaveTextContent("4 pings ≈$0.04");
     expect(block).toHaveTextContent("12 pings $0.42");
     expect(block).toHaveTextContent("hit");
+  });
+
+  it("shows only the cache state when the session has no keep-warm label", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seedListCache(qc, { keep_warm: null, warm_state: "warm" });
+    renderContent("conv_keep_warm", LEVEL_OWNER, qc);
+
+    const block = screen.getByTestId("agent-info-keep-warm");
+    expect(within(block).getByText("Cache").parentElement).toHaveTextContent("warm");
+    expect(within(block).queryByText("State")).toBeNull();
+    expect(within(block).queryByText("Stop reason")).toBeNull();
+    expect(within(block).queryByText("Episode")).toBeNull();
+    expect(within(block).queryByText("Total")).toBeNull();
+    expect(within(block).queryByText("Last return")).toBeNull();
+  });
+
+  it("renders no keep-warm block without a status or warm state", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seedListCache(qc, { keep_warm: null, warm_state: null });
+    renderContent("conv_keep_warm", LEVEL_OWNER, qc);
+
+    expect(screen.queryByTestId("agent-info-keep-warm")).toBeNull();
   });
 
   it("re-renders when the stream patches the cached row's keep-warm counters", () => {
