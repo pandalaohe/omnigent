@@ -207,12 +207,17 @@ export function RecentSessionsSwitcher({
         void cancelBrowserRecentSessionSwitch();
       }
     });
-    // Intercept Ctrl+Tab only while the default gesture is live: a rebound or
-    // disabled switcher would otherwise swallow it inside embedded Browser pages.
+    // The embedded-page bridge forwards exactly Ctrl+Tab, so advertise support
+    // only while that is the current platform's resolved chord.
     void setBrowserRecentSessionSwitchSupported(
       enabled &&
         isShortcutActionEnabled("recentSessions") &&
-        !hasCustomShortcutBindings("recentSessions"),
+        resolveShortcutBindings("recentSessions").some(
+          (binding) =>
+            binding.code === "Tab" &&
+            binding.modifiers.length === 1 &&
+            binding.modifiers[0] === "control",
+        ),
     );
 
     window.addEventListener("keydown", onKeyDown, true);

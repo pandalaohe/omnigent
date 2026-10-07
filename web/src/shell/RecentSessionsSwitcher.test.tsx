@@ -223,6 +223,50 @@ describe("RecentSessionsSwitcher", () => {
     expect(setSupported).toHaveBeenLastCalledWith(false);
   });
 
+  it("keeps embedded-browser support when the override targets another platform", () => {
+    const setSupported = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      onBrowserRecentSessionInput: () => () => {},
+      browserSetRecentSessionSwitchSupported: setSupported,
+    };
+    // The test platform is not macOS, so a macOS-only recording leaves the
+    // effective chord at the default Ctrl+Tab.
+    writeShortcutPreference("recentSessions", {
+      platformOverrides: { macos: [{ code: "KeyJ", modifiers: ["primary"] }] },
+    });
+    render(
+      <RecentSessionsSwitcher
+        conversations={[conversation("two", 2), conversation("one", 1)]}
+        activeSessionId="two"
+        enabled
+      />,
+    );
+
+    expect(setSupported).toHaveBeenLastCalledWith(true);
+  });
+
+  it("keeps embedded-browser support for an explicit Ctrl+Tab recording", () => {
+    const setSupported = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      onBrowserRecentSessionInput: () => () => {},
+      browserSetRecentSessionSwitchSupported: setSupported,
+    };
+    writeShortcutPreference("recentSessions", {
+      common: [{ code: "Tab", modifiers: ["control"] }],
+    });
+    render(
+      <RecentSessionsSwitcher
+        conversations={[conversation("two", 2), conversation("one", 1)]}
+        activeSessionId="two"
+        enabled
+      />,
+    );
+
+    expect(setSupported).toHaveBeenLastCalledWith(true);
+  });
+
   it("releases native interception when a forwarded gesture has no sessions", () => {
     let forwardInput: ((input: Record<string, unknown>) => void) | undefined;
     const cancelRecentSessionSwitch = vi.fn().mockResolvedValue({ ok: true });
