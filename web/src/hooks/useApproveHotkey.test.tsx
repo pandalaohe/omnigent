@@ -200,6 +200,31 @@ describe("useApproveHotkey", () => {
     }
   });
 
+  it("yields when the chord lands inside a question card", () => {
+    // The card owns ⌘↵ there — its binding advances or submits. Accepting the
+    // approval behind it would resolve a prompt the user is not looking at.
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    const card = document.createElement("div");
+    card.setAttribute("data-question-card", "");
+    const field = document.createElement("textarea");
+    card.appendChild(field);
+    document.body.appendChild(card);
+    try {
+      field.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      expect(submitApproval).not.toHaveBeenCalled();
+    } finally {
+      card.remove();
+    }
+  });
+
   it("still accepts from an empty text field (no draft, no send intent)", () => {
     // Post-send, focus can legitimately sit in the cleared composer; an
     // empty field carries no draft, so the chord keeps meaning "approve".

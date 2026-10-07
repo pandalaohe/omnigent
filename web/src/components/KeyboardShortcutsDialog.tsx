@@ -129,6 +129,20 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Dismiss menu", keys: [], actionId: "dismissSuggestions" },
     ],
   },
+  {
+    title: "Question cards",
+    note: "while a question card has focus",
+    items: [
+      { label: "Focus question card", keys: [], actionId: "focusQuestionCard" },
+      { label: "Move between options", keys: [] },
+      { label: "Select option", keys: [], actionId: "questionCardSelectOption" },
+      { label: "Next question / submit", keys: [], actionId: "questionCardNextOrSubmit" },
+      { label: "Previous / next question", keys: [] },
+      { label: "Leave card", keys: [], actionId: "questionCardLeave" },
+      { label: "Cancel question", keys: [], actionId: "questionCardCancel" },
+      { label: "Cancel & interrupt", keys: [], actionId: "questionCardCancelAndInterrupt" },
+    ],
+  },
 ];
 
 // Numeric pinned-session jump. The chord is platform-aware (see
@@ -196,6 +210,30 @@ function shortcutGroupsFor(
                 keys: [...shortcutKeys("previousSuggestion"), ...shortcutKeys("nextSuggestion")],
               }
             : item,
+        ),
+      };
+    }
+    if (group.title === "Question cards") {
+      return {
+        ...group,
+        items: group.items.map((item) =>
+          item.label === "Move between options"
+            ? {
+                ...item,
+                keys: [
+                  ...shortcutKeys("questionCardPreviousOption"),
+                  ...shortcutKeys("questionCardNextOption"),
+                ],
+              }
+            : item.label === "Previous / next question"
+              ? {
+                  ...item,
+                  keys: [
+                    ...shortcutKeys("questionCardPreviousQuestion"),
+                    ...shortcutKeys("questionCardNextQuestion"),
+                  ],
+                }
+              : item,
         ),
       };
     }

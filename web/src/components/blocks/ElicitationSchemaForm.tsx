@@ -21,9 +21,18 @@
 // it.
 
 import { CheckIcon, XIcon } from "lucide-react";
-import { useId, useState } from "react";
+import {
+  type FocusEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useId,
+  useRef,
+  useState,
+} from "react";
+import { shortcutKeys, useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 
 /** One value MCP allows in an ``ElicitResult.content`` map. */
 export type ElicitValue = string | number | boolean;
@@ -207,6 +216,11 @@ interface ElicitationSchemaFormProps {
   onReject: () => void;
 }
 
+/** "⌘ ↵ submit" — keys first, then what they do; empty when unbound. */
+function hintSegment(keys: string[], label: string): string | null {
+  return keys.length > 0 ? `${keys.join(" ")} ${label}` : null;
+}
+
 /**
  * Render one control per schema property and gather the answers.
  *
@@ -225,8 +239,53 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
   const scope = useId();
   const complete = isComplete(fields, answers);
 
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [keyboardActive, setKeyboardActive] = useState(false);
+  // Entry lands on the first field, not the submit button: typing first is the
+  // common intent, and Tab still reaches the controls after it.
+  const enter = () => {
+    rootRef.current?.querySelector<HTMLElement>("input, select, textarea")?.focus();
+  };
+  useQuestionCardTarget(rootRef, enter);
+  // Re-render on preference writes, so the hint line follows live bindings.
+  useKeyboardShortcutsVersion();
+  const hintParts = [
+    hintSegment(shortcutKeys("questionCardNextOrSubmit"), "submit"),
+    hintSegment(shortcutKeys("questionCardLeave"), "leave"),
+  ].filter((part): part is string => part !== null);
+
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.nativeEvent.isComposing) return;
+    if (eventMatchesShortcutAction(e, "questionCardNextOrSubmit")) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!complete) return;
+      // Leave before the card unmounts, so focus lands in the composer rather
+      // than falling to <body>.
+      leaveQuestionCard(rootRef.current);
+      onSubmit(toContent(fields, answers));
+      return;
+    }
+    if (eventMatchesShortcutAction(e, "questionCardLeave")) {
+      e.preventDefault();
+      e.stopPropagation();
+      leaveQuestionCard(rootRef.current);
+    }
+  };
+
   return (
-    <div className="flex flex-col gap-3" data-testid="elicitation-schema-form">
+    <div
+      ref={rootRef}
+      tabIndex={-1}
+      data-question-card
+      className="flex flex-col gap-3"
+      data-testid="elicitation-schema-form"
+      onKeyDown={handleKeyDown}
+      onFocus={() => setKeyboardActive(true)}
+      onBlur={(e: FocusEvent<HTMLDivElement>) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboardActive(false);
+      }}
+    >
       {fields.map((field) => {
         const { name, prop, required } = field;
         const label = asText(prop.title) || name;
@@ -302,6 +361,12 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
           Reject
         </Button>
       </div>
+
+      {keyboardActive && hintParts.length > 0 && (
+        <p className="text-sm text-muted-foreground" data-testid="elicitation-schema-hint">
+          {hintParts.join(" · ")}
+        </p>
+      )}
     </div>
   );
 }

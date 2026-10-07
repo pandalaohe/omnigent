@@ -25,6 +25,32 @@ describe("KeyboardShortcutEditor", () => {
     localStorage.clear();
   });
 
+  it("lists the question-card group and records its actions", () => {
+    render(<KeyboardShortcutEditor />);
+
+    expect(actionRow("Focus question card")).toBeTruthy();
+    expect(within(actionRow("Previous option")).getByText("↑")).toBeTruthy();
+    expect(within(actionRow("Cancel question")).getByText("Not set")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record common shortcut for Select option" }),
+    );
+    fireEvent.keyDown(window, { key: "x", code: "KeyX" });
+
+    expect(resolveShortcutBindings("questionCardSelectOption", "windows")).toEqual([
+      { code: "KeyX", modifiers: [] },
+    ]);
+  });
+
+  it("rejects a card chord already used by another card action", () => {
+    render(<KeyboardShortcutEditor />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Record common shortcut for Next option" }));
+    fireEvent.keyDown(window, { key: "ArrowUp", code: "ArrowUp" });
+
+    expect(screen.getByText(/already used by Previous option/i)).toBeTruthy();
+  });
+
   it("shows the effective default in the common row", () => {
     render(<KeyboardShortcutEditor />);
 

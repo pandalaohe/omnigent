@@ -2,6 +2,7 @@
 
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
+import { isInsideQuestionCard } from "@/hooks/useQuestionCardHotkeys";
 import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession, restoreDictationPunctuation } from "@/lib/dictation";
@@ -428,85 +429,88 @@ export const ComposerMicButton = ({
 
   // Server-dictation toggle. Start resolves only once the mic + socket
   // handshake are up, so isListening flips exactly when audio flows.
-  const toggleServer = useCallback(async (continueTake = false) => {
-    if (serverBusyRef.current) return;
-    serverBusyRef.current = true;
-    const session = sessionRef.current;
-    if (session) {
-      sessionRef.current = null;
-      const orderedWithWebTake = serverContinuesWebTakeRef.current;
-      serverContinuesWebTakeRef.current = false;
-      const tail = (await session.stop()).trim();
-      if (!disabledRef.current) {
-        // A non-empty tail supersedes the pending interim via
-        // onTranscript; an empty one just clears the interim region.
-        if (tail) enqueueServerTranscriptRef.current(tail, orderedWithWebTake);
-        else onInterimRef.current?.("");
+  const toggleServer = useCallback(
+    async (continueTake = false) => {
+      if (serverBusyRef.current) return;
+      serverBusyRef.current = true;
+      const session = sessionRef.current;
+      if (session) {
+        sessionRef.current = null;
+        const orderedWithWebTake = serverContinuesWebTakeRef.current;
+        serverContinuesWebTakeRef.current = false;
+        const tail = (await session.stop()).trim();
+        if (!disabledRef.current) {
+          // A non-empty tail supersedes the pending interim via
+          // onTranscript; an empty one just clears the interim region.
+          if (tail) enqueueServerTranscriptRef.current(tail, orderedWithWebTake);
+          else onInterimRef.current?.("");
+        }
+        setIsListening(false);
+        serverBusyRef.current = false;
+        return;
       }
-      setIsListening(false);
+      try {
+        discardingRef.current = false;
+        interimRef.current = "";
+        setConnecting(true);
+        if (!continueTake) {
+          // Snapshot point: let the parent record the text so Esc can revert to it.
+          takeGenerationRef.current += 1;
+          punctuationQueueRef.current = Promise.resolve();
+          onVoiceStartRef.current?.();
+        }
+        serverContinuesWebTakeRef.current = continueTake;
+        const next = await DictationSession.start({
+          onPartial: (text) => {
+            // Drop late partials after an Esc discard — they'd repopulate the
+            // composer the parent just reverted.
+            if (!disabledRef.current && !discardingRef.current) {
+              interimRef.current = text;
+              onInterimRef.current?.(text);
+            }
+          },
+          onFinal: (text) => {
+            interimRef.current = "";
+            enqueueServerTranscriptRef.current(text, continueTake);
+          },
+          onError: () => {
+            sessionRef.current = null;
+            serverContinuesWebTakeRef.current = false;
+            // Preserve anything spoken but not yet finalized: pin the pending
+            // partial as a final rather than blanking it, so a crash mid-take
+            // doesn't discard the user's words.
+            const pending = interimRef.current.trim();
+            interimRef.current = "";
+            if (pending && !disabledRef.current && !discardingRef.current) {
+              onTranscriptRef.current(pending);
+            } else {
+              onInterimRef.current?.("");
+            }
+            reportError("Voice input failed. Please try again.");
+            setIsListening(false);
+          },
+        });
+        sessionRef.current = next;
+        setError(null);
+        setIsListening(true);
+      } catch (startError) {
+        serverContinuesWebTakeRef.current = false;
+        reportError(
+          startError instanceof DictationBusyError
+            ? "Voice input is busy. Please try again shortly."
+            : isPermissionError(startError)
+              ? "Microphone access denied. Allow access and try again."
+              : "Voice input isn't available on this device.",
+        );
+        setIsListening(false);
+      }
+      // Reached only by the start path (the stop branch returns earlier), so this
+      // clears the handshake spinner on both success and failure.
+      setConnecting(false);
       serverBusyRef.current = false;
-      return;
-    }
-    try {
-      discardingRef.current = false;
-      interimRef.current = "";
-      setConnecting(true);
-      if (!continueTake) {
-        // Snapshot point: let the parent record the text so Esc can revert to it.
-        takeGenerationRef.current += 1;
-        punctuationQueueRef.current = Promise.resolve();
-        onVoiceStartRef.current?.();
-      }
-      serverContinuesWebTakeRef.current = continueTake;
-      const next = await DictationSession.start({
-        onPartial: (text) => {
-          // Drop late partials after an Esc discard — they'd repopulate the
-          // composer the parent just reverted.
-          if (!disabledRef.current && !discardingRef.current) {
-            interimRef.current = text;
-            onInterimRef.current?.(text);
-          }
-        },
-        onFinal: (text) => {
-          interimRef.current = "";
-          enqueueServerTranscriptRef.current(text, continueTake);
-        },
-        onError: () => {
-          sessionRef.current = null;
-          serverContinuesWebTakeRef.current = false;
-          // Preserve anything spoken but not yet finalized: pin the pending
-          // partial as a final rather than blanking it, so a crash mid-take
-          // doesn't discard the user's words.
-          const pending = interimRef.current.trim();
-          interimRef.current = "";
-          if (pending && !disabledRef.current && !discardingRef.current) {
-            onTranscriptRef.current(pending);
-          } else {
-            onInterimRef.current?.("");
-          }
-          reportError("Voice input failed. Please try again.");
-          setIsListening(false);
-        },
-      });
-      sessionRef.current = next;
-      setError(null);
-      setIsListening(true);
-    } catch (startError) {
-      serverContinuesWebTakeRef.current = false;
-      reportError(
-        startError instanceof DictationBusyError
-          ? "Voice input is busy. Please try again shortly."
-          : isPermissionError(startError)
-            ? "Microphone access denied. Allow access and try again."
-            : "Voice input isn't available on this device.",
-      );
-      setIsListening(false);
-    }
-    // Reached only by the start path (the stop branch returns earlier), so this
-    // clears the handshake spinner on both success and failure.
-    setConnecting(false);
-    serverBusyRef.current = false;
-  }, [reportError]);
+    },
+    [reportError],
+  );
   toggleServerRef.current = toggleServer;
 
   const toggle = useCallback(() => {
@@ -559,6 +563,9 @@ export const ComposerMicButton = ({
   useEffect(() => {
     if (!isListening) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
+      // A focused question card owns Enter and Esc; the take keeps running in
+      // the composer while the card decides what the key means.
+      if (isInsideQuestionCard(e.target)) return;
       if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "Enter" && !e.shiftKey) {
         // Commit: end the take and keep the text. toggle() routes to the right

@@ -187,6 +187,36 @@ describe("KeyboardShortcutsList shortcut layer rows", () => {
   );
 });
 
+describe("KeyboardShortcutsList question-card rows", () => {
+  it("lists the card actions with their default keys", () => {
+    render(<KeyboardShortcutsList />);
+
+    expect(keysFor("Focus question card")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Move between options")).toEqual(["↑", "↓"]);
+    expect(keysFor("Select option")).toEqual(["Space"]);
+    expect(keysFor("Next question / submit")).toEqual(["Ctrl", "↵"]);
+    expect(keysFor("Previous / next question")).toEqual(["←", "→"]);
+    expect(keysFor("Leave card")).toEqual(["Esc"]);
+    // Unbound card actions have no keys, so their rows hide.
+    expect(screen.queryByText("Cancel question")).toBeNull();
+    expect(screen.queryByText("Cancel & interrupt")).toBeNull();
+  });
+
+  it("follows a rebound card action and hides a disabled one", () => {
+    render(<KeyboardShortcutsList />);
+
+    act(() => {
+      writeShortcutPreference("questionCardSelectOption", {
+        common: [{ code: "KeyX", modifiers: [] }],
+      });
+      writeShortcutPreference("questionCardLeave", { enabled: false });
+    });
+
+    expect(keysFor("Select option")).toEqual(["X"]);
+    expect(screen.queryByText("Leave card")).toBeNull();
+  });
+});
+
 describe("KeyboardShortcutsDialog", () => {
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
@@ -203,7 +233,8 @@ describe("KeyboardShortcutsDialog", () => {
     toggleViaHotkey();
 
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
-    // General / In chats / Navigation / View / Slash commands — one each.
+    // General / In chats / Navigation / View / Slash commands / Question cards
+    // — one each.
     expect(screen.getByText("Start a new session")).toBeTruthy();
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();

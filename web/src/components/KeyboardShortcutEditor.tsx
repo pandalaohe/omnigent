@@ -37,6 +37,7 @@ const GROUPS: { id: ShortcutGroupId; label: string; note?: string }[] = [
   { id: "navigation", label: "Navigation" },
   { id: "view", label: "View" },
   { id: "slash", label: "Slash commands", note: "suggestions open" },
+  { id: "questionCard", label: "Question cards", note: "card focused" },
 ];
 
 const PLATFORMS: { id: ShortcutPlatform; label: string }[] = [
