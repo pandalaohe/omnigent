@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import {
   ElicitationSchemaForm,
   schemaFields,
@@ -101,14 +102,28 @@ describe("ElicitationSchemaForm — keyboard", () => {
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
-  it("shows the submit and leave bindings while focus is inside", () => {
+  it("shows no keyboard-hint line in any focus state", () => {
     renderForm();
 
+    const unfocused = card().textContent ?? "";
     enterCard();
 
-    expect(screen.getByTestId("elicitation-schema-hint")).toHaveTextContent(
-      "Ctrl ↵ submit · Esc leave",
-    );
+    expect(card().textContent).toBe(unfocused);
+    const hintLiterals = ["Esc", "↵", "leave", "S submit"];
+    for (const literal of hintLiterals) {
+      expect(card().textContent).not.toContain(literal);
+    }
+
+    // A live rebind while focused must not re-introduce the hint line.
+    act(() => {
+      writeShortcutPreference("questionCardNextOrSubmit", {
+        common: [{ code: "KeyS", modifiers: [] }],
+      });
+    });
+    expect(card().textContent).toBe(unfocused);
+    for (const literal of hintLiterals) {
+      expect(card().textContent).not.toContain(literal);
+    }
   });
 
   it("leaves Tab, plain Enter in fields and Space on checkboxes native", () => {

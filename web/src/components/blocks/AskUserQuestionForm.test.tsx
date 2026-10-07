@@ -180,7 +180,6 @@ const TWO_QUESTIONS: QuestionSpec[] = [
 
 interface RebindHarness {
   press: (init: KeyboardEventInit) => boolean;
-  hint: () => HTMLElement;
   progress: () => string;
   highlighted: () => number;
   composer: HTMLElement;
@@ -205,7 +204,6 @@ const REBIND_CASES: {
       expect(h.highlighted()).toBe(1);
       h.press({ key: "a", code: "KeyA" });
       expect(h.highlighted()).toBe(0);
-      expect(h.hint()).toHaveTextContent("A ↓ move");
     },
   },
   {
@@ -216,7 +214,6 @@ const REBIND_CASES: {
       expect(h.highlighted()).toBe(0);
       h.press({ key: "b", code: "KeyB" });
       expect(h.highlighted()).toBe(1);
-      expect(h.hint()).toHaveTextContent("↑ B move");
     },
   },
   {
@@ -227,7 +224,6 @@ const REBIND_CASES: {
       expect(screen.getAllByRole("radio")[0]).not.toBeChecked();
       h.press({ key: "c", code: "KeyC" });
       expect(screen.getAllByRole("radio")[0]).toBeChecked();
-      expect(h.hint()).toHaveTextContent("C select");
     },
   },
   {
@@ -238,7 +234,6 @@ const REBIND_CASES: {
       expect(h.progress()).toContain("Question 1 of 2");
       h.press({ key: "d", code: "KeyD" });
       expect(h.progress()).toContain("Question 2 of 2");
-      expect(h.hint()).toHaveTextContent("D next / submit");
     },
   },
   {
@@ -251,7 +246,6 @@ const REBIND_CASES: {
       expect(h.progress()).toContain("Question 2 of 2");
       h.press({ key: "e", code: "KeyE" });
       expect(h.progress()).toContain("Question 1 of 2");
-      expect(h.hint()).toHaveTextContent("E → question");
     },
   },
   {
@@ -262,14 +256,12 @@ const REBIND_CASES: {
       expect(h.progress()).toContain("Question 1 of 2");
       h.press({ key: "f", code: "KeyF" });
       expect(h.progress()).toContain("Question 2 of 2");
-      expect(h.hint()).toHaveTextContent("← F question");
     },
   },
   {
     action: "questionCardLeave",
     code: "KeyG",
     run: (h) => {
-      expect(h.hint()).toHaveTextContent("G leave");
       expect(h.press({ key: "Escape", code: "Escape" })).toBe(true);
       expect(document.activeElement).toBe(card());
       h.press({ key: "g", code: "KeyG" });
@@ -281,8 +273,6 @@ const REBIND_CASES: {
     code: "KeyJ",
     priorCode: "KeyH",
     run: (h) => {
-      expect(h.hint()).toHaveTextContent("J cancel");
-      expect(h.hint()).not.toHaveTextContent("H cancel");
       h.press({ key: "h", code: "KeyH" });
       expect(h.onReject).not.toHaveBeenCalled();
       h.press({ key: "j", code: "KeyJ" });
@@ -295,8 +285,6 @@ const REBIND_CASES: {
     code: "KeyJ",
     priorCode: "KeyH",
     run: (h) => {
-      expect(h.hint()).toHaveTextContent("J cancel & interrupt");
-      expect(h.hint()).not.toHaveTextContent("H cancel & interrupt");
       h.press({ key: "h", code: "KeyH" });
       expect(h.onAbort).not.toHaveBeenCalled();
       h.press({ key: "j", code: "KeyJ" });
@@ -542,7 +530,6 @@ describe("AskUserQuestionForm — keyboard", () => {
     fireEvent.keyDown(composer, { key: "Escape", code: "Escape" });
 
     for (const radio of screen.getAllByRole("radio")) expect(radio).not.toBeChecked();
-    expect(screen.queryByTestId("ask-user-question-hint")).toBeNull();
     expect(progress()).toContain("Question 1 of 2");
   });
 
@@ -616,28 +603,17 @@ describe("AskUserQuestionForm — keyboard", () => {
 
     pressCard({ key: "x", code: "KeyX" });
     expect(screen.getAllByRole("radio")[0]).toBeChecked();
-    expect(screen.getByTestId("ask-user-question-hint")).toHaveTextContent("X select");
   });
 
-  it("drops a disabled action from the hint and stops acting on it", () => {
+  it("stops acting on a disabled action", () => {
     renderKeyboardForm(questionsOf(TWO_QUESTIONS));
     act(() => {
       writeShortcutPreference("questionCardLeave", { enabled: false });
     });
     focusCard();
 
-    expect(screen.getByTestId("ask-user-question-hint")).not.toHaveTextContent("leave");
     expect(pressCard({ key: "Escape", code: "Escape" })).toBe(true);
     expect(document.activeElement).toBe(card());
-  });
-
-  it("lists the default bindings in the hint line", () => {
-    renderKeyboardForm(questionsOf(TWO_QUESTIONS));
-    focusCard();
-
-    expect(screen.getByTestId("ask-user-question-hint")).toHaveTextContent(
-      "↑ ↓ move · Space select · Ctrl ↵ next / submit · ← → question · Esc leave",
-    );
   });
 
   it("cancels and interrupts through their bindings", () => {
@@ -660,7 +636,7 @@ describe("AskUserQuestionForm — keyboard", () => {
   });
 
   it.each(REBIND_CASES)(
-    "rebinds $action to $code: old key inert, new key acts, hint follows",
+    "rebinds $action to $code: old key inert, new key acts",
     ({ action, code, priorCode, run }) => {
       writeShortcutPreference(action, { common: [{ code: priorCode ?? code, modifiers: [] }] });
       const onAbort = vi.fn();
@@ -674,7 +650,6 @@ describe("AskUserQuestionForm — keyboard", () => {
 
       run({
         press: pressCard,
-        hint: () => screen.getByTestId("ask-user-question-hint"),
         progress,
         highlighted: highlightedIndex,
         composer: screen.getByTestId("composer"),
@@ -761,5 +736,43 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(document.activeElement).toBe(card());
     expect(document.activeElement).not.toBe(screen.getByTestId("composer"));
+  });
+
+  it("shows no keyboard-hint line in any focus state", () => {
+    // Bind the two actions whose defaults are unbound, so every card action
+    // would earn a hint segment.
+    writeShortcutPreference("questionCardCancel", { common: [{ code: "KeyJ", modifiers: [] }] });
+    writeShortcutPreference("questionCardCancelAndInterrupt", {
+      common: [{ code: "KeyK", modifiers: [] }],
+    });
+    renderKeyboardForm(questionsOf(TWO_QUESTIONS), { onAbort: vi.fn() });
+
+    // Mouse clicks (detail 1) leave focus alone, so both questions get an
+    // unfocused baseline.
+    const firstUnfocused = card().textContent ?? "";
+    fireEvent.click(screen.getByTestId("ask-user-question-next"), { detail: 1 });
+    const secondUnfocused = card().textContent ?? "";
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"), { detail: 1 });
+
+    focusCard();
+    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    expect(card().textContent).toBe(firstUnfocused);
+    pressCard({ key: "ArrowRight", code: "ArrowRight" });
+    expect(card().textContent).toBe(secondUnfocused);
+
+    const hintLiterals = ["Esc", "↵", "leave", "move", "next / submit", "cancel & interrupt"];
+    const focused = card().textContent ?? "";
+    for (const literal of hintLiterals) {
+      expect(focused).not.toContain(literal);
+    }
+
+    // A live rebind while focused must not re-introduce the hint line.
+    act(() => {
+      writeShortcutPreference("questionCardLeave", { common: [{ code: "KeyG", modifiers: [] }] });
+    });
+    expect(card().textContent).toBe(secondUnfocused);
+    for (const literal of hintLiterals) {
+      expect(card().textContent).not.toContain(literal);
+    }
   });
 });
