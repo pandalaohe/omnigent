@@ -312,8 +312,10 @@ def _connect_marker_path(log_path: Path) -> Path:
 # exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
 
-# Sample each live runner's log size on this cadence and report a runner whose
-# log grows past the runaway threshold within the sliding hour window.
+# Sample each live runner's log size on this cadence. A runner over the
+# runaway threshold is reported at the crossing and re-confirmed on every probe
+# while it stays over, with the crossing instant, so the server can tell a live
+# runaway from a stale one.
 _RUNNER_LOG_RUNAWAY_INTERVAL_S = 300.0
 
 # Resource-snapshot cadence: idle, and while the server holds a sampling
@@ -1251,6 +1253,10 @@ class HostProcess:
         # passes; runner startup never waits for them.
         self._maintenance_janitor: HostMaintenanceJanitor | None = None
         self._runner_log_runaway_tracker = RunnerLogRunawayTracker()
+        # runner_id → ISO instant of the current episode's crossing. Lives on
+        # the host so re-confirmations survive a tunnel reconnect (the loop
+        # task is restarted per connection).
+        self._runner_log_runaway_since: dict[str, str] = {}
         # Resource monitor: one sampler on one dedicated executor thread
         # (created lazily) so its CPU baselines stay comparable and its cost
         # never lands on the event loop. A server lease switches the cadence
@@ -4839,34 +4845,46 @@ class HostProcess:
 
         An error-looping runner can write its traceback to the log thousands
         of times an hour. The retention sweep bounds the file, not the loop,
-        so tell the server and let it warn the session's user. Reports are
-        one per crossing: the tracker re-arms only after the windowed rate
-        falls back to or below the threshold.
+        so tell the server and let it warn the session's user. A runner is
+        reported at the crossing and re-confirmed on every probe while it
+        stays over, with the crossing instant, so the server can tell a live
+        runaway from a stale one.
         """
         tracker = self._runner_log_runaway_tracker
+        since = self._runner_log_runaway_since
         while True:
             try:
                 tracker.retain(set(self._runners))
+                for runner_id in [rid for rid in since if rid not in self._runners]:
+                    del since[runner_id]
                 now = time.monotonic()
                 for runner_id, handle in list(self._runners.items()):
                     try:
                         info = handle.log_path.stat()
                     except OSError:
                         continue
-                    bytes_last_hour = tracker.observe(
+                    crossing = tracker.observe(
                         runner_id, info.st_size, now, (info.st_dev, info.st_ino)
                     )
-                    if bytes_last_hour is None:
-                        continue
+                    if crossing is not None:
+                        since[runner_id] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                        bytes_last_hour = crossing
+                    else:
+                        bytes_last_hour = tracker.over_threshold(runner_id)
+                        if bytes_last_hour is None:
+                            since.pop(runner_id, None)
+                            continue
+                        if runner_id not in since:
+                            since[runner_id] = datetime.now(timezone.utc).isoformat(
+                                timespec="seconds"
+                            )
                     await ws.send(
                         encode_host_frame(
                             HostRunnerLogRunawayFrame(
                                 runner_id=runner_id,
                                 session_id=handle.session_id,
                                 bytes_last_hour=bytes_last_hour,
-                                observed_at=datetime.now(timezone.utc).isoformat(
-                                    timespec="seconds"
-                                ),
+                                observed_at=since[runner_id],
                             )
                         )
                     )

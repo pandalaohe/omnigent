@@ -367,7 +367,8 @@ class RunnerLogRunawayTracker:
     file size to zero — never resets the measured rate; growth is measured
     over a sliding window. A runner is reported once per crossing: after a
     report, the tracker re-arms only when the windowed bytes fall back to or
-    below the threshold.
+    below the threshold. :meth:`over_threshold` lets the caller re-confirm
+    the report on every sample while the runner stays over.
     """
 
     def __init__(
@@ -383,6 +384,7 @@ class RunnerLogRunawayTracker:
         self._file_ids: dict[str, tuple[int, int]] = {}
         self._pre_rotation_sizes: dict[str, int] = {}
         self._reported: set[str] = set()
+        self._windowed_bytes: dict[str, int] = {}
 
     def observe(
         self, runner_id: str, size_bytes: int, now: float, file_id: tuple[int, int] | None = None
@@ -422,6 +424,7 @@ class RunnerLogRunawayTracker:
             samples.popleft()
 
         bytes_last_hour = cumulative - samples[0][1]
+        self._windowed_bytes[runner_id] = bytes_last_hour
         if bytes_last_hour > self._threshold_bytes:
             if runner_id in self._reported:
                 return None
@@ -429,6 +432,21 @@ class RunnerLogRunawayTracker:
             return bytes_last_hour
         self._reported.discard(runner_id)
         return None
+
+    def over_threshold(self, runner_id: str) -> int | None:
+        """Return the latest windowed bytes while a reported episode runs.
+
+        The caller re-sends the report on every sample while this returns a
+        value, always with the crossing instant.
+
+        :param runner_id: Runner whose log was sampled.
+        :returns: The windowed ``bytes_last_hour`` from the latest
+            :meth:`observe`, or ``None`` when the runner is not in a reported
+            episode.
+        """
+        if runner_id not in self._reported:
+            return None
+        return self._windowed_bytes.get(runner_id)
 
     def note_rotated(
         self,
@@ -462,6 +480,7 @@ class RunnerLogRunawayTracker:
             self._file_ids.pop(runner_id, None)
             self._pre_rotation_sizes.pop(runner_id, None)
             self._reported.discard(runner_id)
+            self._windowed_bytes.pop(runner_id, None)
 
 
 class HostMaintenanceJanitor:

@@ -1728,15 +1728,17 @@ async def test_live_host_keeps_quota_refresh_alive_after_unexpected_probe_error(
     _cleanup_host(host)
 
 
-async def test_live_host_reports_a_runaway_runner_log_once(
+async def test_live_host_reconfirms_a_runaway_runner_log_with_its_crossing_instant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A live runner whose log grows past the threshold is reported once.
+    """A live runner over the cap is re-reported with its crossing instant.
 
     The loop samples sizes on its own cadence; a burst over the sliding
-    hour window must send exactly one ``host.runner_log_runaway`` frame,
-    and continuing to grow above the threshold must not repeat it.
+    hour window sends one ``host.runner_log_runaway`` frame at the crossing
+    and re-sends it on later probes while the rate stays above the
+    threshold, always with the crossing instant so the server can tell a
+    live runaway from a stale one.
     """
     from omnigent.host.maintenance import RunnerLogRunawayTracker as _Tracker
 
@@ -1774,7 +1776,7 @@ async def test_live_host_reports_a_runaway_runner_log_once(
         await asyncio.wait_for(first_sample.wait(), timeout=2.0)
         os.truncate(log_path, 6 * 1024 * 1024)
         async with asyncio.timeout(2.0):
-            while not ws.sent:
+            while len(ws.sent) < 2:
                 await asyncio.sleep(0.01)
         # Several more samples with the rate still above the threshold.
         await asyncio.sleep(0.05)
@@ -1784,14 +1786,78 @@ async def test_live_host_reports_a_runaway_runner_log_once(
         proc.terminate()
         proc.wait(timeout=5.0)
 
-    assert len(ws.sent) == 1
-    frame = decode_host_frame(ws.sent[0])
-    assert isinstance(frame, HostRunnerLogRunawayFrame)
-    assert frame.runner_id == "runner_runaway"
-    assert frame.session_id == "conv_x"
-    assert frame.bytes_last_hour >= 6 * 1024 * 1024
+    assert len(ws.sent) > 1
+    frames = [decode_host_frame(text) for text in ws.sent]
+    assert all(isinstance(frame, HostRunnerLogRunawayFrame) for frame in frames)
+    assert {frame.runner_id for frame in frames} == {"runner_runaway"}
+    assert {frame.session_id for frame in frames} == {"conv_x"}
+    assert all(frame.bytes_last_hour >= 6 * 1024 * 1024 for frame in frames)
+    # The crossing instant stays fixed across re-sends.
+    assert len({frame.observed_at for frame in frames}) == 1
     # The payload carries no file path, which may contain user directories.
-    assert str(tmp_path) not in ws.sent[0]
+    assert all(str(tmp_path) not in text for text in ws.sent)
+    _cleanup_host(host)
+
+
+async def test_live_host_stops_reconfirming_a_runaway_runner_log_after_fall_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner whose rate falls back stops being re-confirmed and is dropped.
+
+    The crossing instant must be cleared once the windowed rate is back
+    under the threshold, leaving only the crossing's own frames behind.
+    """
+    from omnigent.host.maintenance import RunnerLogRunawayTracker as _Tracker
+
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_LOG_RUNAWAY_INTERVAL_S", 0.01)
+
+    class _FallingTracker(_Tracker):
+        """Crossing on the first sample, one re-confirmation, then below."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def observe(
+            self,
+            runner_id: str,
+            size_bytes: int,
+            now: float,
+            file_id: tuple[int, int] | None = None,
+        ) -> int | None:
+            self.calls += 1
+            return 6 * 1024 * 1024 if self.calls == 1 else None
+
+        def over_threshold(self, runner_id: str) -> int | None:
+            return 7 * 1024 * 1024 if self.calls == 2 else None
+
+    monkeypatch.setattr("omnigent.host.connect.RunnerLogRunawayTracker", _FallingTracker)
+
+    host = _make_host_process()
+    log_path = tmp_path / "runner-conv_x-20260101-000000-000000.log"
+    log_path.write_bytes(b"")
+    host._runners["runner_runaway"] = SimpleNamespace(  # type: ignore[assignment]
+        log_path=log_path, session_id="conv_x"
+    )
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._runner_log_runaway_loop(ws))
+    try:
+        async with asyncio.timeout(2.0):
+            while len(ws.sent) < 2:
+                await asyncio.sleep(0.01)
+        # Several samples past the fall-back must add no further frames.
+        await asyncio.sleep(0.1)
+    finally:
+        await _cancel(task)
+        host._runners.clear()
+
+    assert len(ws.sent) == 2
+    frames = [decode_host_frame(text) for text in ws.sent]
+    assert all(isinstance(frame, HostRunnerLogRunawayFrame) for frame in frames)
+    assert len({frame.observed_at for frame in frames}) == 1
+    assert "runner_runaway" not in host._runner_log_runaway_since
     _cleanup_host(host)
 
 

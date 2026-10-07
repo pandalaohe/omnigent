@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1727,6 +1728,7 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     from omnigent.server.routes.host_tunnel import (
         RUNNER_LOG_RUNAWAY_LABEL_KEY,
         RUNNER_LOG_RUNAWAY_MB_LABEL_KEY,
+        RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY,
     )
 
     registry = HostRegistry()
@@ -1766,8 +1768,15 @@ async def test_runner_log_runaway_frame_labels_bound_sessions(db_uri: str) -> No
     labels = conv_store.get_conversation(hot.id).labels
     assert labels[RUNNER_LOG_RUNAWAY_LABEL_KEY] == "2026-09-23T09:25:00+00:00"
     assert labels[RUNNER_LOG_RUNAWAY_MB_LABEL_KEY] == "7"
-    # A session bound to another runner keeps no flag.
-    assert RUNNER_LOG_RUNAWAY_LABEL_KEY not in (conv_store.get_conversation(cool.id).labels or {})
+    # The seen label is the server's receive time, which the web ages out.
+    seen = datetime.fromisoformat(labels[RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY])
+    assert seen.tzinfo is not None
+    assert abs((datetime.now(timezone.utc) - seen).total_seconds()) < 300
+    # A session bound to another runner keeps none of the flags.
+    cool_labels = conv_store.get_conversation(cool.id).labels or {}
+    assert RUNNER_LOG_RUNAWAY_LABEL_KEY not in cool_labels
+    assert RUNNER_LOG_RUNAWAY_MB_LABEL_KEY not in cool_labels
+    assert RUNNER_LOG_RUNAWAY_SEEN_LABEL_KEY not in cool_labels
 
 
 async def test_host_cli_retention_policy_defaults_and_cas_update(

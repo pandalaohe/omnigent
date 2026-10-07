@@ -867,3 +867,28 @@ def test_runaway_tracker_retain_drops_unknown_runners() -> None:
     assert tracker._samples == {}
     assert tracker._last_sizes == {}
     assert tracker._reported == set()
+
+
+def test_runaway_tracker_over_threshold_tracks_a_reported_episode() -> None:
+    """While over after a crossing, over_threshold follows each sample."""
+    tracker = RunnerLogRunawayTracker()
+    assert tracker.observe("runner_1", 0, 0.0) is None
+    assert tracker.over_threshold("runner_1") is None
+
+    assert tracker.observe("runner_1", 6 * _MB, 60.0) == 6 * _MB
+    assert tracker.over_threshold("runner_1") == 6 * _MB
+    # Every later sample while still over exposes its current windowed bytes.
+    assert tracker.observe("runner_1", 7 * _MB, 120.0) is None
+    assert tracker.over_threshold("runner_1") == 7 * _MB
+    assert tracker.observe("runner_1", 8 * _MB, 180.0) is None
+    assert tracker.over_threshold("runner_1") == 8 * _MB
+
+    # Once the burst leaves the window, the episode is over.
+    assert tracker.observe("runner_1", 8 * _MB, 4 * 3600.0) is None
+    assert tracker.over_threshold("runner_1") is None
+
+    # Retain drops the stored value with the rest of the runner's state.
+    assert tracker.observe("runner_1", 14 * _MB, 4 * 3600.0 + 60) == 6 * _MB
+    assert tracker.over_threshold("runner_1") == 6 * _MB
+    tracker.retain({"runner_2"})
+    assert tracker.over_threshold("runner_1") is None
