@@ -122,6 +122,24 @@ describe("useCommandPaletteHotkey", () => {
     expect(onSearch).not.toHaveBeenCalled();
   });
 
+  it("routes a rebound findSession chord to session search and drops the default", () => {
+    const onToggle = vi.fn();
+    const onSearch = vi.fn();
+    renderHook(() => useCommandPaletteHotkey(onToggle, true, false, onSearch));
+    writeShortcutPreference("findSession", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+
+    const oldChord = press({ code: "KeyS", ctrlKey: true, altKey: true });
+    expect(oldChord.defaultPrevented).toBe(false);
+    expect(onSearch).not.toHaveBeenCalled();
+
+    const rebound = press({ code: "KeyJ", ctrlKey: true, shiftKey: true });
+    expect(rebound.defaultPrevented).toBe(true);
+    expect(onSearch).toHaveBeenCalledOnce();
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
   it("toggles on Cmd+K and prevents the browser default", () => {
     const onToggle = vi.fn();
     renderHook(() => useCommandPaletteHotkey(onToggle, true, true));

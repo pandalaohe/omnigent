@@ -22,7 +22,8 @@ import pytest
 
 from omnigent.entities import Conversation
 from omnigent.runtime import pending_elicitations
-from omnigent.server import child_keep_warm
+from omnigent.runtime import session_stream as runtime_session_stream
+from omnigent.server import child_keep_warm, session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.child_keep_warm import (
     ARCHIVE_EXEMPT_SINCE_LABEL,
@@ -32,12 +33,15 @@ from omnigent.server.child_keep_warm import (
     KEEP_WARM_STATS_LABEL,
     LAST_CACHE_LABEL,
     ChildKeepWarmSweeper,
+    cold_after_for_agent,
     keep_warm_status_from_labels,
     warm_state_for_labels,
     warm_state_from_label,
 )
+from omnigent.server.routes._sessions import helpers as helpers_module
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
+from omnigent.server.user_preferences_store import read_keep_warm_settings
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import Host
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -1596,6 +1600,61 @@ async def test_sticky_miss_pause_lifts_on_revision_and_rearms_on_real_turn(
     assert warm is not None and warm.s == "w" and warm.t == r + 2000
 
 
+async def test_sticky_miss_pause_advances_the_touch_on_a_new_real_turn(
+    harness: _Harness,
+) -> None:
+    """A new turn under the sticky pause moves ``u`` without lifting the pause.
+
+    The pinned deadline reads the last touch: leaving it at the pause's old
+    clock makes the label read cold right after the turn cached its prefix.
+    """
+    parent = _parent(harness)
+    r = harness.now - 3 * 3600
+    pause_label = _label(s="p", why="miss", t=r, c=r, u=r, w=r + 3600, v=0, m=2)
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: pause_label})
+    turn = harness.now - 60
+    _set_running_since(harness, child.id, turn)
+    before = harness.store.get_conversation(child.id)
+    assert before is not None
+    settle = before.updated_at if before.updated_at >= turn else harness.clock.now
+    assert (
+        warm_state_from_label(
+            pause_label,
+            archived=False,
+            harness="claude-native",
+            busy=False,
+            now=harness.now,
+            cold_after_s=600,
+        )
+        == "cold"
+    )
+
+    await _tick(harness)
+
+    state = _read_label(harness, child.id)
+    assert state is not None
+    assert state.s == "p" and state.why == "miss"
+    assert state.v == child.archive_revision
+    assert harness.forward.calls == []
+    assert state.t == turn
+    assert state.u == settle
+    stored = harness.store.get_conversation(child.id)
+    assert stored is not None
+    raw_after = stored.labels.get(KEEP_WARM_LABEL)
+    assert raw_after is not None
+    assert (
+        warm_state_from_label(
+            raw_after,
+            archived=False,
+            harness="claude-native",
+            busy=False,
+            now=harness.now,
+            cold_after_s=600,
+        )
+        == "warm"
+    )
+
+
 async def test_unarchive_does_not_rearm_a_stale_cache_clock(harness: _Harness) -> None:
     """Unarchive keeps ``u``; the passed window stays cold."""
     parent = _parent(harness)
@@ -2239,6 +2298,412 @@ async def test_warm_state_for_labels_falls_back_to_the_harness_family() -> None:
         )
         is None
     )
+
+
+async def test_warm_state_from_label_cold_after_zero_never_reads_cold() -> None:
+    """cold_after_s == 0: warm for an unlabelled or cold label on both families."""
+    now = 1_000_000
+    cold_cap = _label(s="c", why="cap", y="claude", t=1, u=now - 7200)
+    for harness_id in ("claude-native", "codex-native"):
+        assert (
+            warm_state_from_label(
+                None, archived=False, harness=harness_id, busy=False, now=now, cold_after_s=0
+            )
+            == "warm"
+        )
+        assert (
+            warm_state_from_label(
+                cold_cap,
+                archived=False,
+                harness=harness_id,
+                busy=False,
+                now=now,
+                cold_after_s=0,
+            )
+            == "warm"
+        )
+    # The archived and unresolved-family refusals outrank the never-cold value.
+    assert (
+        warm_state_from_label(
+            None, archived=True, harness="claude-native", busy=False, now=now, cold_after_s=0
+        )
+        is None
+    )
+    assert (
+        warm_state_from_label(
+            None, archived=False, harness="opencode-native", busy=False, now=now, cold_after_s=0
+        )
+        is None
+    )
+
+
+async def test_warm_state_for_labels_cold_after_zero_never_reads_cold() -> None:
+    """A known family with cold_after_s == 0 reads warm even with no label."""
+    now = 1_000_000
+    assert (
+        warm_state_for_labels(
+            {}, archived=False, busy=False, now=now, family="claude", cold_after_s=0
+        )
+        == "warm"
+    )
+    assert (
+        warm_state_for_labels(
+            {KEEP_WARM_LABEL: _label(s="c", why="cap", y="codex", u=now - 7200)},
+            archived=False,
+            busy=False,
+            now=now,
+            cold_after_s=0,
+        )
+        == "warm"
+    )
+    # Archived and mirrored rows read None whatever the family says.
+    assert (
+        warm_state_for_labels(
+            {}, archived=True, busy=False, now=now, family="claude", cold_after_s=0
+        )
+        is None
+    )
+    assert (
+        warm_state_for_labels(
+            {_WRAPPER_LABEL_KEY: _MIRRORED_CLAUDE_WRAPPER},
+            archived=False,
+            busy=False,
+            now=now,
+            family="claude",
+            cold_after_s=0,
+        )
+        is None
+    )
+
+
+async def test_warm_state_cold_after_positive_uses_the_last_touch_clock() -> None:
+    """N > 0: warm iff the label's ``u`` is inside N; codex ``o`` is ignored."""
+    now = 1_000_000
+    fresh = _label(s="c", why="cap", y="claude", t=1, u=now - 599)
+    stale = _label(s="w", y="claude", t=1, u=now - 601, w=now + 3600)
+    codex_fresh_miss = _label(s="w", y="codex", t=1, u=now - 599, o=[now - 599, 0])
+
+    def state(
+        label: str | None, *, busy: bool = False, cold_after_s: int | None = 600
+    ) -> str | None:
+        return warm_state_from_label(
+            label,
+            archived=False,
+            harness="claude-native",
+            busy=busy,
+            now=now,
+            cold_after_s=cold_after_s,
+        )
+
+    assert state(fresh) == "warm"
+    assert state(stale) == "cold"
+    assert state(codex_fresh_miss) == "warm"
+    # Under N a missing or unparsable label is cold, not a pill-less None.
+    assert state(None) == "cold"
+    assert state("{not a label") == "cold"
+    # Without N the per-family rule keeps reading None for no usable label.
+    assert state(None, cold_after_s=None) is None
+    assert state(None, busy=True) == "warm"
+    # A known family and no label reads cold under N unless busy.
+    assert (
+        warm_state_for_labels(
+            {}, archived=False, busy=False, now=now, family="codex", cold_after_s=600
+        )
+        == "cold"
+    )
+    assert (
+        warm_state_for_labels(
+            {}, archived=False, busy=True, now=now, family="codex", cold_after_s=600
+        )
+        == "warm"
+    )
+    assert (
+        warm_state_for_labels(
+            {KEEP_WARM_LABEL: fresh}, archived=False, busy=False, now=now, cold_after_s=600
+        )
+        == "warm"
+    )
+
+
+async def test_cold_after_for_reads_the_agent_row(harness: _Harness) -> None:
+    """The agent row's coldAfterSeconds: 0 for the set agent, None otherwise."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": False, "child": False, "coldAfterSeconds": 0}}
+    }
+    main = _main(harness)
+    assert harness.sweeper.cold_after_for(main, harness.prefs) == 0
+    assert harness.sweeper.cold_after_for(main, None) is None
+
+    settings = read_keep_warm_settings(harness.prefs, RESERVED_USER_LOCAL)
+    assert cold_after_for_agent(settings, _CLAUDE_AGENT) == 0
+    assert cold_after_for_agent(settings, _CODEX_AGENT) is None
+    assert cold_after_for_agent(settings, None) is None
+
+    other = _main(harness, agent_id=_CODEX_AGENT)
+    assert harness.sweeper.cold_after_for(other, harness.prefs) is None
+
+    class _RaisingPrefs:
+        def get(self, _owner: str) -> None:
+            raise RuntimeError("preferences unavailable")
+
+    assert harness.sweeper.cold_after_for(main, _RaisingPrefs()) is None
+
+
+class _CountingPrefs(_Prefs):
+    """A ``_Prefs`` that counts its reads."""
+
+    def __init__(self, keep_warm: dict[str, Any] | None = None) -> None:
+        super().__init__(keep_warm)
+        self.reads = 0
+
+    def get(self, owner: str) -> dict[str, Any] | None:
+        self.reads += 1
+        return super().get(owner)
+
+
+async def test_cold_after_for_many_reads_settings_once_per_owner(harness: _Harness) -> None:
+    """One preferences read serves every row; each row still gets its own agent."""
+    prefs = _CountingPrefs(
+        {
+            "agents": {
+                _CLAUDE_AGENT: {"coldAfterSeconds": 0},
+                _CODEX_AGENT: {"coldAfterSeconds": 900},
+            }
+        }
+    )
+    parent = _parent(harness)
+    claude_child = _child(harness, parent.id, agent_id=_CLAUDE_AGENT, title="researcher:claude")
+    codex_child = _child(
+        harness,
+        parent.id,
+        agent_id=_CODEX_AGENT,
+        harness_override="codex-native",
+        title="researcher:codex",
+    )
+
+    result = harness.sweeper.cold_after_for_many([claude_child, codex_child], prefs)
+
+    assert prefs.reads == 1
+    assert result == {claude_child.id: 0, codex_child.id: 900}
+
+    unset = _child(harness, parent.id, agent_id=_CLAUDE_SDK_AGENT, title="researcher:unset")
+    assert harness.sweeper.cold_after_for_many([unset], prefs) == {unset.id: None}
+    assert prefs.reads == 2
+
+    class _RaisingPrefs:
+        def get(self, _owner: str) -> None:
+            raise RuntimeError("preferences unavailable")
+
+    assert harness.sweeper.cold_after_for_many([claude_child], _RaisingPrefs()) == {
+        claude_child.id: None
+    }
+
+
+async def test_cold_after_edge_publishes_once_without_a_label_write(harness: _Harness) -> None:
+    """The N edge passes under an unchanged label: exactly one publish, no write."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True, "coldAfterSeconds": 600}}
+    }
+    parent = _parent(harness)
+    u = harness.now - 100
+    # Pre-stamp the family so the tick's own stamp is not a label write.
+    label = _label(
+        s="w",
+        y="claude",
+        t=u,
+        c=u,
+        u=u,
+        w=u + _CLAUDE_INTERVAL_S + _SLACK_S,
+    )
+    child = _child(
+        harness,
+        parent.id,
+        labels={KEEP_WARM_LABEL: label},
+        running_since=u,
+    )
+    stored_before = harness.store.get_conversation(child.id).labels[KEEP_WARM_LABEL]
+
+    harness.clock.now = u + 100  # inside N=600
+    await _tick(harness)
+    assert harness.published == []
+    assert harness.store.get_conversation(child.id).labels[KEEP_WARM_LABEL] == stored_before
+
+    harness.clock.now = u + 620  # the edge lands inside this tick's interval
+    await _tick(harness)
+    assert harness.published == [(child.id, None)]
+    assert harness.store.get_conversation(child.id).labels[KEEP_WARM_LABEL] == stored_before
+
+    harness.clock.now = u + 620 + int(harness.sweeper._interval)
+    await _tick(harness)
+    assert harness.published == [(child.id, None)]
+
+
+async def test_cold_after_edge_between_irregular_ticks_publishes_once(harness: _Harness) -> None:
+    """An edge in the gap past a 60 s interval still flips the pill exactly once."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True, "coldAfterSeconds": 600}}
+    }
+    parent = _parent(harness)
+    u = 1000
+    # Pre-stamp the family so the tick's own stamp is not a label write.
+    label = _label(s="w", y="claude", t=u, c=u, u=u, w=u + _CLAUDE_INTERVAL_S + _SLACK_S)
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: label}, running_since=u)
+    stored_before = harness.store.get_conversation(child.id).labels[KEEP_WARM_LABEL]
+
+    harness.clock.now = 1599  # inside N=600: the quiet pre-edge tick
+    await _tick(harness)
+    assert harness.published == []
+
+    # Spacing 62 s > the 60 s interval; the edge at 1600 fell in the gap.
+    harness.clock.now = 1661
+    await _tick(harness)
+    assert harness.published == [(child.id, None)]
+    assert harness.store.get_conversation(child.id).labels[KEEP_WARM_LABEL] == stored_before
+
+    harness.clock.now = 1722
+    await _tick(harness)
+    assert harness.published == [(child.id, None)]
+
+
+async def test_cold_after_edge_with_a_stop_reason_write_publishes_once(harness: _Harness) -> None:
+    """A tick that also writes the stop reason still publishes the pill edge once."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True, "coldAfterSeconds": 600}}
+    }
+    parent = _parent(harness)
+    u = 1000
+    label = _label(s="w", y="claude", t=u, c=u, u=u, w=u + _CLAUDE_INTERVAL_S + _SLACK_S)
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: label}, running_since=u)
+
+    harness.clock.now = 1599
+    await _tick(harness)
+    assert harness.published == []
+
+    harness.liveness.runner_online = False  # this tick's only label change is k
+    harness.clock.now = 1661
+    await _tick(harness)
+    assert harness.published == [(child.id, None)]
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "w" and state.k == "runner"
+
+    harness.clock.now = 1722
+    await _tick(harness)
+    assert harness.published == [(child.id, None)]
+
+
+@pytest.mark.parametrize(
+    ("cold_after", "expected"),
+    [(0, "warm"), (None, "cold")],
+    ids=["never-cold", "platform-rule"],
+)
+async def test_expired_warm_label_publishes_the_cold_after_pill(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    cold_after: int | None,
+    expected: str,
+) -> None:
+    """The exp publish resolves the pill through the started sweeper.
+
+    A ``coldAfterSeconds: 0`` agent's expired label still publishes warm;
+    with no setting the same publish reads cold.
+    """
+    agent_row: dict[str, Any] = {"main": True, "child": True}
+    if cold_after is not None:
+        agent_row["coldAfterSeconds"] = cold_after
+    harness.prefs.keep_warm = {"agents": {_CLAUDE_AGENT: agent_row}}
+    parent = _parent(harness)
+    u = harness.now - 20 * 60
+    child = _child(
+        harness,
+        parent.id,
+        labels={KEEP_WARM_LABEL: _warm_label(t=u, w=harness.now - 60)},
+        running_since=u,
+    )
+    published_events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(session_live_state, "_store", harness.store)
+    monkeypatch.setattr(
+        session_live_state,
+        "submit",
+        lambda _description, fn, *args, **_kwargs: fn(*args),
+    )
+    monkeypatch.setattr(
+        runtime_session_stream,
+        "publish",
+        lambda session_id, payload: published_events.append((session_id, payload)),
+    )
+    monkeypatch.setattr(
+        child_keep_warm,
+        "_publish_child_status_to_parent",
+        helpers_module._publish_child_status_to_parent,
+    )
+
+    async def _idle_run() -> None:
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(harness.sweeper, "_run", _idle_run)
+    await harness.sweeper.start(harness.sweeper._app)
+    try:
+        await _tick(harness)
+    finally:
+        await harness.sweeper.shutdown()
+
+    state = _read_label(harness, child.id)
+    assert state is not None and state.s == "c" and state.why == "exp"
+    events = [payload for session_id, payload in published_events if session_id == parent.id]
+    assert len(events) == 1
+    assert events[0]["child"]["warm_state"] == expected
+
+
+async def test_cold_after_for_session_only_reads_a_started_sweeper(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No started sweeper reads None; ``start`` registers and ``shutdown`` clears."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True, "coldAfterSeconds": 0}}
+    }
+    parent = _parent(harness)
+    child = _child(harness, parent.id)
+    monkeypatch.setattr(child_keep_warm, "_sweeper", None)
+    assert child_keep_warm.cold_after_for_session(child) is None
+
+    async def _idle_run() -> None:
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(harness.sweeper, "_run", _idle_run)
+    await harness.sweeper.start(harness.sweeper._app)
+    try:
+        assert child_keep_warm.cold_after_for_session(child) == 0
+    finally:
+        await harness.sweeper.shutdown()
+    assert child_keep_warm.cold_after_for_session(child) is None
+
+
+async def test_scan_window_covers_the_cold_after_bound(harness: _Harness) -> None:
+    """Reading settings grows the candidate window past a long cold-after N."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True, "coldAfterSeconds": 172800}}
+    }
+
+    await harness.sweeper._settings_for(RESERVED_USER_LOCAL, harness.now, {})
+
+    assert harness.sweeper._scan_window_s >= 172800 + _SLACK_S
+
+
+async def test_zero_cold_after_agent_still_pings(harness: _Harness) -> None:
+    """A 0 cold-after row never reads cold; pings still fire on schedule."""
+    harness.prefs.keep_warm = {
+        "agents": {_CLAUDE_AGENT: {"main": True, "child": True, "coldAfterSeconds": 0}}
+    }
+    u = harness.now - 55 * 60
+    main = _main(harness, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+
+    await _tick(harness)
+
+    pings = harness.forward.pings()
+    assert len(pings) == 1
+    assert pings[0]["session_id"] == main.id
+    state = _read_label(harness, main.id)
+    assert state is not None and state.s == "w" and state.a is not None
 
 
 async def test_keep_warm_family_helpers_read_harness_and_label() -> None:

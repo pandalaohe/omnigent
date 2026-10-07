@@ -3753,6 +3753,7 @@ def register_events_routes(
                     page.data,
                     session_id,
                     conversation_store,
+                    request.app.state,
                 )
                 for summary in summaries:
                     events.append(

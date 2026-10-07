@@ -2,9 +2,11 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isNewShellHotkey, useNewShellHotkey } from "./useNewShellHotkey";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
@@ -152,5 +154,21 @@ describe("useNewShellHotkey", () => {
 
     expect(onLaunch).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(false);
+  });
+
+  it("follows a recorded replacement chord instead of the default", () => {
+    const onLaunch = vi.fn();
+    renderHook(() => useNewShellHotkey(onLaunch, true, false));
+    writeShortcutPreference("newShell", {
+      common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
+    });
+
+    const oldChord = press({ code: "KeyT", ctrlKey: true, altKey: true });
+    expect(onLaunch).not.toHaveBeenCalled();
+    expect(oldChord.defaultPrevented).toBe(false);
+
+    const rebound = press({ code: "KeyJ", ctrlKey: true, shiftKey: true });
+    expect(onLaunch).toHaveBeenCalledTimes(1);
+    expect(rebound.defaultPrevented).toBe(true);
   });
 });

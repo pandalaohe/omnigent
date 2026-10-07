@@ -29,7 +29,13 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
-import { ALT_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  CompactShortcutKeys,
+  shortcutKeys,
+  useKeyboardShortcutsVersion,
+  useShortcutHint,
+} from "@/components/KeyboardShortcut";
+import type { ShortcutActionId } from "@/lib/keyboardShortcutPreferences";
 import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -49,6 +55,7 @@ import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
+import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
@@ -72,10 +79,6 @@ import { Button } from "../components/ui/button";
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
-const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
-const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
-const NEW_SHELL_KEYS = [MOD_KEY, ALT_KEY, "T"] as const;
-
 function WorkspaceMenuShortcut({
   keys,
   className,
@@ -84,6 +87,12 @@ function WorkspaceMenuShortcut({
   className?: string;
 }) {
   return <CompactShortcutKeys keys={keys} className={className} />;
+}
+
+function workspaceTabActionId(tabNumber: number): ShortcutActionId | null {
+  return tabNumber >= 1 && tabNumber <= 4
+    ? (`selectWorkspaceTab${tabNumber}` as ShortcutActionId)
+    : null;
 }
 
 // Side-chat child ids opened in THIS app session. Module scope, so it resets on
@@ -104,6 +113,11 @@ function WorkspaceTabTooltip({
   className?: string;
   children: ReactElement;
 }) {
+  useKeyboardShortcutsVersion();
+  // A bound select-tab action replaces the two-step toggle+digit hint; with no
+  // binding (the default) the digit only works after focusing the tab strip.
+  const tabAction = shortcut ? workspaceTabActionId(Number(shortcut)) : null;
+  const tabKeys = tabAction ? shortcutKeys(tabAction) : [];
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -111,7 +125,13 @@ function WorkspaceTabTooltip({
       </TooltipTrigger>
       <TooltipContent
         side="bottom"
-        shortcut={shortcut ? [WORKSPACE_OPEN_KEYS, [shortcut]] : undefined}
+        shortcut={
+          shortcut
+            ? tabKeys.length > 0
+              ? [tabKeys]
+              : [shortcutKeys("toggleWorkspaceSidebar"), [shortcut]]
+            : undefined
+        }
       >
         <span>{label}</span>
       </TooltipContent>
@@ -192,6 +212,8 @@ function NewTabMenu({
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  const newShellShortcut = useShortcutHint("newShell");
+  const newBrowserShortcut = useShortcutHint("newBrowserTab");
   const connectState = shellConnectState(liveness);
   // Remembered shell type, persisted across remounts/reloads. Seeded from
   // localStorage so the "+" in either strip spot agrees on the current pick.
@@ -258,7 +280,7 @@ function NewTabMenu({
         {connectState === "offline" && (
           <span className="text-sm text-muted-foreground">Offline</span>
         )}
-        <WorkspaceMenuShortcut keys={NEW_SHELL_KEYS} />
+        <WorkspaceMenuShortcut keys={newShellShortcut.keys} />
       </span>
     </>
   );
@@ -296,7 +318,7 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
-            <WorkspaceMenuShortcut keys={NEW_BROWSER_KEYS} className="ml-auto pl-4" />
+            <WorkspaceMenuShortcut keys={newBrowserShortcut.keys} className="ml-auto pl-4" />
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -658,6 +680,9 @@ interface WorkspacePanelProps {
   showBrowserTab: boolean;
   /** Reveal the workspace after a Browser tab is opened by a global shortcut. */
   onBrowserTabOpened?: () => void;
+  /** Route a select-tab shortcut to the tab's surface: the matching mobile
+   *  drawer on a phone viewport, else the rail tab itself. */
+  onTabShortcut?: (tab: RightRailTab) => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -764,6 +789,7 @@ function WorkspacePanelImpl({
   showGithubTab,
   showBrowserTab,
   onBrowserTabOpened,
+  onTabShortcut,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -976,6 +1002,12 @@ function WorkspacePanelImpl({
   const selectPermanentTab = (tab: RightRailTab) => {
     onRightRailTabChange(tab);
   };
+  useWorkspaceTabHotkeys((tabNumber) => {
+    const tab = visiblePermanentTabs[tabNumber - 1];
+    if (!tab) return;
+    if (onTabShortcut) onTabShortcut(tab);
+    else selectPermanentTab(tab);
+  }, !pending);
   const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
     if (
       !event.currentTarget.contains(event.target as Node) ||

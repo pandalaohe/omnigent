@@ -1,8 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { useKeyboardShortcutsVersion } from "@/components/KeyboardShortcut";
 import { Command, CommandGroup, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import {
+  eventMatchesShortcut,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+  resolveShortcutBindings,
+  shortcutAriaKeys,
+  shortcutBindingLabels,
+  type ShortcutChord,
+} from "@/lib/keyboardShortcutPreferences";
 import {
   cancelBrowserRecentSessionSwitch,
   onBrowserRecentSessionInput,
@@ -48,12 +59,16 @@ export function RecentSessionsSwitcher({
   enabled: boolean;
 }) {
   const navigate = useNavigate();
+  const shortcutsVersion = useKeyboardShortcutsVersion();
   const available = useMemo(() => recentSessions(conversations), [conversations]);
   const availableRef = useRef(available);
   const activeSessionIdRef = useRef(activeSessionId);
   const itemsRef = useRef<RecentSession[]>([]);
   const selectedIndexRef = useRef(0);
   const openRef = useRef(false);
+  // The chord that opened the switcher, so release commits against the modifier
+  // the user is actually holding.
+  const activeBindingRef = useRef<ShortcutChord | null>(null);
   const [items, setItems] = useState<RecentSession[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [open, setOpen] = useState(false);
@@ -94,6 +109,34 @@ export function RecentSessionsSwitcher({
       return;
     }
 
+    // Shift reverses the cycle, so it is stripped before matching a custom
+    // chord; the default Ctrl+Tab test already allows it.
+    const matchTrigger = (event: globalThis.KeyboardEvent): ShortcutChord | null => {
+      if (event.getModifierState?.("AltGraph")) return null;
+      if (isShortcutRecordingActive() || !isShortcutActionEnabled("recentSessions")) return null;
+      if (!hasCustomShortcutBindings("recentSessions")) {
+        if (event.key === "Tab" && event.ctrlKey && !event.altKey && !event.metaKey) {
+          return { code: "Tab", modifiers: ["control"] };
+        }
+        return null;
+      }
+      return (
+        resolveShortcutBindings("recentSessions").find((binding) =>
+          eventMatchesShortcut(
+            {
+              code: event.code,
+              key: event.key,
+              ctrlKey: event.ctrlKey,
+              metaKey: event.metaKey,
+              altKey: event.altKey,
+              shiftKey: false,
+            },
+            binding,
+          ),
+        ) ?? null
+      );
+    };
+
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape" && openRef.current) {
         event.preventDefault();
@@ -101,15 +144,8 @@ export function RecentSessionsSwitcher({
         cancel();
         return;
       }
-      if (
-        event.key !== "Tab" ||
-        !event.ctrlKey ||
-        event.altKey ||
-        event.metaKey ||
-        event.getModifierState("AltGraph")
-      ) {
-        return;
-      }
+      const binding = matchTrigger(event);
+      if (!binding) return;
 
       const direction = event.shiftKey ? -1 : 1;
       if (!openRef.current) {
@@ -129,6 +165,7 @@ export function RecentSessionsSwitcher({
               : nextItems.length - 1
             : (activeIndex + direction + nextItems.length) % nextItems.length;
         setSelection(initialIndex);
+        activeBindingRef.current = binding;
         openRef.current = true;
         setOpen(true);
         return;
@@ -142,7 +179,11 @@ export function RecentSessionsSwitcher({
     };
 
     const onKeyUp = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Control" && openRef.current) commit();
+      if (!openRef.current) return;
+      const binding = activeBindingRef.current;
+      if (!binding) return;
+      const heldModifiers = shortcutAriaKeys(binding).split("+").slice(0, -1);
+      if (heldModifiers.includes(event.key)) commit();
     };
 
     const onBlur = () => {
@@ -166,7 +207,18 @@ export function RecentSessionsSwitcher({
         void cancelBrowserRecentSessionSwitch();
       }
     });
-    void setBrowserRecentSessionSwitchSupported(true);
+    // The embedded-page bridge forwards exactly Ctrl+Tab, so advertise support
+    // only while that is the current platform's resolved chord.
+    void setBrowserRecentSessionSwitchSupported(
+      enabled &&
+        isShortcutActionEnabled("recentSessions") &&
+        resolveShortcutBindings("recentSessions").some(
+          (binding) =>
+            binding.code === "Tab" &&
+            binding.modifiers.length === 1 &&
+            binding.modifiers[0] === "control",
+        ),
+    );
 
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp, true);
@@ -178,9 +230,13 @@ export function RecentSessionsSwitcher({
       unsubscribeBrowserInput();
       void setBrowserRecentSessionSwitchSupported(false);
     };
-  }, [cancel, commit, enabled, setSelection]);
+  }, [cancel, commit, enabled, setSelection, shortcutsVersion]);
 
   const selectedId = items[selectedIndex]?.id ?? "";
+  const recentBinding = activeBindingRef.current ?? resolveShortcutBindings("recentSessions")[0];
+  const recentLabels = recentBinding ? shortcutBindingLabels(recentBinding) : [];
+  const cycleKey = recentLabels[recentLabels.length - 1] ?? "Tab";
+  const releaseModifier = recentLabels.slice(0, -1).join(" ") || "Ctrl";
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && cancel()}>
@@ -219,7 +275,7 @@ export function RecentSessionsSwitcher({
             </CommandGroup>
           </CommandList>
           <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
-            Press Tab to cycle · Release Ctrl to switch · Esc to cancel
+            Press {cycleKey} to cycle · Release {releaseModifier} to switch · Esc to cancel
           </div>
         </Command>
       </DialogContent>

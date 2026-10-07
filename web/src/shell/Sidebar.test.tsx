@@ -24,6 +24,7 @@ import {
   seedReadState,
 } from "@/hooks/useUnseenConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { writeSessionNavigationPreferences } from "@/lib/sessionNavigationPreferences";
@@ -1436,6 +1437,16 @@ describe("Sidebar session list", () => {
       "group-focus-visible/new-session:opacity-100",
       "[@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
     );
+
+    act(() => {
+      writeShortcutPreference("newSession", {
+        common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+      });
+    });
+    expect(newSession).toHaveAttribute("aria-keyshortcuts", "Control+Shift+P");
+    expect(
+      Array.from(newSession.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual(["Ctrl", "⇧", "P"]);
   });
 
   it("marks the 'Automations' nav row active when on /tasks", () => {

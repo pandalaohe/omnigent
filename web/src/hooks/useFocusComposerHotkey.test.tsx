@@ -2,9 +2,11 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isFocusComposerHotkey, useFocusComposerHotkey } from "./useFocusComposerHotkey";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
@@ -117,6 +119,22 @@ describe("useFocusComposerHotkey", () => {
     press({ code: "KeyL", ctrlKey: true, shiftKey: true });
 
     expect(onFocus).not.toHaveBeenCalled();
+  });
+
+  it("follows a recorded replacement chord", () => {
+    const onFocus = vi.fn();
+    renderHook(() => useFocusComposerHotkey(onFocus));
+    writeShortcutPreference("focusComposer", {
+      common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+    });
+
+    const oldChord = press({ code: "KeyL", ctrlKey: true, shiftKey: true });
+    expect(onFocus).not.toHaveBeenCalled();
+    expect(oldChord.defaultPrevented).toBe(false);
+
+    const rebound = press({ code: "KeyP", ctrlKey: true, shiftKey: true });
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(rebound.defaultPrevented).toBe(true);
   });
 
   it("unbinds on unmount", () => {

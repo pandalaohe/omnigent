@@ -2101,6 +2101,21 @@ export function AppShell() {
     setRightPanelOpenAnimated,
   ]);
 
+  // Select-tab hotkey from the rail: the mobile drawer for that tab, else the
+  // rail tab itself plus a reveal (the rail is hidden on a phone viewport, so
+  // switching its tab there would show nothing).
+  function handleWorkspaceTabShortcut(tab: RightRailTab) {
+    if (isMobileViewport()) {
+      if (tab === "files") openFilesPanel();
+      else if (tab === "changes") openChangesPanel();
+      else if (tab === "github") openGithubPanel();
+      else if (tab === "subagents") openSubagentsPanel();
+      return;
+    }
+    handleRightRailTabChange(tab);
+    revealRightPanel();
+  }
+
   function openArchivePanel() {
     setSelectedFilePath(null);
     clearFileViewerUrl();
@@ -2568,6 +2583,7 @@ export function AppShell() {
                     showGithubTab={railTabsAvailable.github}
                     showBrowserTab={railTabsAvailable.browser}
                     onBrowserTabOpened={revealRightPanel}
+                    onTabShortcut={handleWorkspaceTabShortcut}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}

@@ -44,6 +44,22 @@ export function isCommandPaletteHotkey(
   return eventMatchesShortcutAction(e, "commandPalette");
 }
 
+/** True when the event is the session-search chord: the platform command
+ *  modifier + Alt + S, no Shift */
+export function isFindSessionHotkey(
+  e: globalThis.KeyboardEvent,
+  isMac: boolean = isMacPlatform(),
+): boolean {
+  // AltGr reports as Ctrl+Alt on some layouts; guard so intl typing never
+  // opens session search.
+  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("findSession")) return false;
+  if (!hasCustomShortcutBindings("findSession")) {
+    return hasCommandModifier(e, isMac) && e.altKey && !e.shiftKey && e.code === "KeyS";
+  }
+  return eventMatchesShortcutAction(e, "findSession");
+}
+
 /**
  * Does the focused surface consume THIS chord?
  *
@@ -83,12 +99,7 @@ export function useCommandPaletteHotkey(
       // Ignore auto-repeat: holding the chord would flap the palette.
       if (e.repeat || e.defaultPrevented) return;
       const sessionSearch =
-        latest.current.onSessionSearch &&
-        hasCommandModifier(e, isMac) &&
-        e.altKey &&
-        !e.shiftKey &&
-        !e.getModifierState("AltGraph") &&
-        e.code === "KeyS";
+        latest.current.onSessionSearch !== undefined && isFindSessionHotkey(e, isMac);
       if (!sessionSearch && !isCommandPaletteHotkey(e, isMac)) return;
       // Leave the chord to a surface that actually consumes it.
       if (focusOwnsHotkey(e)) return;

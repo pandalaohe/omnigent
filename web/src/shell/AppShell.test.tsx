@@ -278,6 +278,7 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import { dispatchSelectWorkspaceTab } from "@/hooks/useWorkspaceTabHotkeys";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -3732,6 +3733,73 @@ describe("Right-rail tab switching — file viewer close", () => {
     // Failure: closeFileViewer did not clear selectedFilePath.
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+  });
+});
+
+describe("Workspace select-tab action routing", () => {
+  function setupRail() {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+  }
+
+  it("opens the Agents drawer for the Agents tab number on mobile", () => {
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+    try {
+      setupRail();
+      renderShell("/c/conv_abc");
+
+      act(() => dispatchSelectWorkspaceTab(4));
+
+      // The rail is hidden on a phone, so the shortcut must open the drawer
+      // instead of switching the (invisible) rail tab.
+      expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute("data-state", "open");
+    } finally {
+      window.matchMedia = realMatchMedia;
+    }
+  });
+
+  it("selects the Agents rail tab and reveals the rail on desktop", () => {
+    // The default matchMedia stub reports no min-width match, which the mocked
+    // isMobileViewport() reads as a phone. Force a desktop viewport so the
+    // shortcut routes to the rail instead of the mobile drawer.
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("min-width"),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as typeof window.matchMedia;
+    try {
+      setupRail();
+      writeWorkspacePanelDefault("collapsed");
+      renderShell("/c/conv_abc");
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+      act(() => dispatchSelectWorkspaceTab(4));
+
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: /^Agents/ })).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByTestId("subagents-panel")).toBeInTheDocument();
+    } finally {
+      window.matchMedia = realMatchMedia;
+    }
   });
 });
 

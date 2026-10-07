@@ -1,10 +1,15 @@
 import { cleanup, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { isSettingsHotkey, useSettingsHotkey } from "./useSettingsHotkey";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
+
+beforeEach(() => {
+  localStorage.clear();
+});
 
 afterEach(() => {
   cleanup();
@@ -40,6 +45,19 @@ describe("isSettingsHotkey", () => {
       false,
     );
   });
+
+  it("matches a recorded replacement chord instead of the default", () => {
+    writeShortcutPreference("openSettings", {
+      common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+    });
+
+    expect(isSettingsHotkey(event({ code: "Comma", ctrlKey: true, altKey: true }), false)).toBe(
+      false,
+    );
+    expect(isSettingsHotkey(event({ code: "KeyP", ctrlKey: true, shiftKey: true }), false)).toBe(
+      true,
+    );
+  });
 });
 
 describe("useSettingsHotkey", () => {
@@ -65,5 +83,27 @@ describe("useSettingsHotkey", () => {
 
     expect(navigate).not.toHaveBeenCalled();
     expect(disabledEvent.defaultPrevented).toBe(false);
+  });
+
+  it("navigates with the rebound chord and stops when the action is disabled", () => {
+    renderHook(() => useSettingsHotkey(true, false));
+    writeShortcutPreference("openSettings", {
+      common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+    });
+
+    const oldChord = event({ code: "Comma", ctrlKey: true, altKey: true });
+    window.dispatchEvent(oldChord);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(oldChord.defaultPrevented).toBe(false);
+
+    const rebound = event({ code: "KeyP", ctrlKey: true, shiftKey: true });
+    window.dispatchEvent(rebound);
+    expect(navigate).toHaveBeenCalledWith("/settings");
+    expect(rebound.defaultPrevented).toBe(true);
+
+    navigate.mockReset();
+    writeShortcutPreference("openSettings", { enabled: false });
+    window.dispatchEvent(event({ code: "KeyP", ctrlKey: true, shiftKey: true }));
+    expect(navigate).not.toHaveBeenCalled();
   });
 });

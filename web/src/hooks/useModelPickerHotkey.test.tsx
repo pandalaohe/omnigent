@@ -2,9 +2,11 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isModelPickerHotkey, useModelPickerHotkey } from "./useModelPickerHotkey";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
@@ -136,6 +138,22 @@ describe("useModelPickerHotkey", () => {
     press({ code: "KeyM", ctrlKey: true, shiftKey: true });
 
     expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("follows a recorded replacement chord", () => {
+    const onOpen = vi.fn();
+    renderHook(() => useModelPickerHotkey(onOpen));
+    writeShortcutPreference("openModelPicker", {
+      common: [{ code: "KeyP", modifiers: ["primary", "shift"] }],
+    });
+
+    const oldChord = press({ code: "KeyM", ctrlKey: true, shiftKey: true });
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(oldChord.defaultPrevented).toBe(false);
+
+    const rebound = press({ code: "KeyP", ctrlKey: true, shiftKey: true });
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(rebound.defaultPrevented).toBe(true);
   });
 
   it("unbinds on unmount", () => {

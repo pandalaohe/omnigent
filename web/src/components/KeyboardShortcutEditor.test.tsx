@@ -130,4 +130,40 @@ describe("KeyboardShortcutEditor", () => {
     expect(screen.getByText(/must use a number key/i)).toBeTruthy();
     expect(isShortcutRecordingActive()).toBe(false);
   });
+
+  it("renders Not set and the note for an action with no default binding", () => {
+    render(<KeyboardShortcutEditor />);
+
+    const row = actionRow("Select workspace tab 1");
+    expect(within(row).getByText("Not set")).toBeTruthy();
+    expect(within(row).getByText(/Focusing the workspace tabs/)).toBeTruthy();
+  });
+
+  it("refuses a Shift chord for the recent-sessions switcher", () => {
+    render(<KeyboardShortcutEditor />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record common shortcut for Switch recent sessions" }),
+    );
+    fireEvent.keyDown(window, { key: "Tab", code: "Tab", ctrlKey: true, shiftKey: true });
+
+    expect(screen.getByText(/uses Shift to go back/)).toBeTruthy();
+    expect(isShortcutRecordingActive()).toBe(false);
+    expect(resolveShortcutBindings("recentSessions", "windows")).toEqual([
+      { code: "Tab", modifiers: ["control"] },
+    ]);
+  });
+
+  it("refuses a modifier-less chord for the recent-sessions switcher", () => {
+    render(<KeyboardShortcutEditor />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record common shortcut for Switch recent sessions" }),
+    );
+    fireEvent.keyDown(window, { key: "Tab", code: "Tab" });
+
+    expect(screen.getByText(/needs a modifier to hold/)).toBeTruthy();
+    expect(isShortcutRecordingActive()).toBe(false);
+    expect(readKeyboardShortcutPreferences().actions.recentSessions).toBeUndefined();
+  });
 });

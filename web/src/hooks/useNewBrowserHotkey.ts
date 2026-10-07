@@ -1,6 +1,12 @@
 import { useEffect, useRef } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import {
+  eventMatchesShortcutAction,
+  hasCustomShortcutBindings,
+  isShortcutActionEnabled,
+  isShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
 
 const TEXT_ENTRY_SURFACE = ".monaco-editor, .xterm";
 
@@ -9,15 +15,15 @@ export function isNewBrowserHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): boolean {
-  if (
-    !hasCommandModifier(event, isMac) ||
-    !event.altKey ||
-    event.shiftKey ||
-    event.getModifierState("AltGraph")
-  ) {
+  if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
     return false;
   }
-  return event.code === "KeyB";
+  if (isShortcutRecordingActive() || !isShortcutActionEnabled("newBrowserTab")) return false;
+  if (!hasCustomShortcutBindings("newBrowserTab")) {
+    if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey) return false;
+    return event.code === "KeyB";
+  }
+  return eventMatchesShortcutAction(event, "newBrowserTab");
 }
 
 /** Bind the new-browser-tab shortcut while the workspace supports Browser. */

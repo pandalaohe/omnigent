@@ -2119,6 +2119,7 @@ def _build_session_list_item(
         Mapping[tuple[str | None, str | None, str | None], Literal["claude", "codex"] | None]
         | None
     ) = None,
+    cold_after_by_session: Mapping[str, int | None] | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -2167,6 +2168,9 @@ def _build_session_list_item(
         harness_override, sub_agent_name)`` to the keep-warm family
         resolved from that harness, used when the keep-warm label carries
         no ``y`` stamp. ``None`` skips the fallback.
+    :param cold_after_by_session: Optional map from conversation id to the
+        agent's idle seconds to cold (``0`` = never cold); rows missing from
+        it keep the per-family rule. ``None`` skips the lookup entirely.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -2288,6 +2292,9 @@ def _build_session_list_item(
             busy=busy,
             now=now,
             family=warm_family,
+            cold_after_s=(
+                cold_after_by_session.get(conv.id) if cold_after_by_session is not None else None
+            ),
         ),
         keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
     )
@@ -2380,6 +2387,7 @@ def _build_session_response(
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
     conv_store: ConversationStore | None = None,
+    cold_after_s: int | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2451,6 +2459,8 @@ def _build_session_response(
         effective placement (nearest ancestor's host / cwd / branch). The
         caller supplies it so the ancestor walk runs on this builder's
         worker thread; ``None`` leaves the effective placement fields null.
+    :param cold_after_s: The session agent's idle seconds to cold (``0`` =
+        never cold), or ``None`` for the per-family keep-warm rule.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -2620,6 +2630,7 @@ def _build_session_response(
             busy=busy,
             now=now,
             family=keep_warm_family_for_harness(harness),
+            cold_after_s=cold_after_s,
         ),
         keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
         archive_reason=conv.labels.get(ARCHIVE_REASON_LABEL),
@@ -12433,6 +12444,7 @@ async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
     conv_store: ConversationStore,
+    app_state: Any | None = None,
 ) -> list[ChildSessionSummary]:
     """
     Build child summaries with one batched message-preview lookup.
@@ -12449,12 +12461,17 @@ async def _child_session_summaries_from_conversations(
     :param parent_session_id: Parent session id, e.g. ``"conv_parent987"``.
     :param conv_store: Conversation store used for the batched message read
         and the placement ancestor walk.
+    :param app_state: The owning app's ``.state``; when it carries a
+        keep-warm sweeper each summary's pill honours its agent's
+        cold-after setting. ``None`` keeps the per-family rule.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
     if not children:
         return []
     child_ids = [child.id for child in children]
+    sweeper = getattr(app_state, "child_keep_warm", None)
+    preferences_store = getattr(app_state, "user_preferences_store", None)
 
     def _build_summaries() -> list[ChildSessionSummary]:
         message_items_by_child = conv_store.list_latest_message_items_for_conversations(
@@ -12464,6 +12481,9 @@ async def _child_session_summaries_from_conversations(
         inherited = _inherited_placement(conv_store, parent_session_id)
         from omnigent.runtime._globals import _agent_store
 
+        cold_after_by_session: Mapping[str, int | None] = (
+            sweeper.cold_after_for_many(children, preferences_store) if sweeper is not None else {}
+        )
         memo: dict[str, Agent | None] = {}
         summaries: list[ChildSessionSummary] = []
         for child in children:
@@ -12476,6 +12496,7 @@ async def _child_session_summaries_from_conversations(
                     inherited=inherited,
                     agent_name=agent_name,
                     harness=harness,
+                    cold_after_s=cold_after_by_session.get(child.id),
                 )
             )
         return summaries
@@ -13714,6 +13735,18 @@ async def _get_session_snapshot(
         conv_store,
         conv,
     )
+    # The sweeper owns the per-agent cold-after read (owner resolution +
+    # preferences). Without one — focused tests, or a request-free caller —
+    # the response keeps the per-family rule.
+    cold_after_s: int | None = None
+    if request is not None:
+        sweeper = getattr(request.app.state, "child_keep_warm", None)
+        if sweeper is not None:
+            cold_after_s = await asyncio.to_thread(
+                sweeper.cold_after_for,
+                conv,
+                getattr(request.app.state, "user_preferences_store", None),
+            )
     response = await asyncio.to_thread(
         _build_session_response,
         conv,
@@ -13738,6 +13771,7 @@ async def _get_session_snapshot(
         agent_store=agent_store,
         agent_cache=agent_cache,
         conv_store=conv_store,
+        cold_after_s=cold_after_s,
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
