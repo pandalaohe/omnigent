@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ import pytest
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _harness_family,
+    generic_walk_includes_agents,
     resolve_harness_skills,
+    skill_source_context_from_env,
 )
 
 
@@ -43,6 +46,12 @@ def _ctx(
         claude_config_dir=claude_config_dir,
         codex_home=codex_home,
     )
+
+
+def _write_config(config_home: Path, content: str) -> None:
+    """Write raw YAML *content* to ``<config_home>/config.yaml``."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(content)
 
 
 @pytest.mark.parametrize(
@@ -1102,6 +1111,92 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
     assert names == ["neutral-skill"]
+
+
+def test_claude_sdk_switch_off_drops_agents_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The switch removes ``.agents`` from the claude-sdk generic walk.
+
+    ``api-design`` lives only in ``~/.agents/skills`` and ``plan`` in the
+    workspace's ``.claude/skills``: with the switch off the SDK list keeps
+    ``plan`` and drops ``api-design``, while the default context still
+    lists both.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".agents" / "skills", "api-design")
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".claude" / "skills", "plan")
+
+    off = replace(_ctx(ws, home), claude_portable_skills=False)
+    assert [s.name for s in resolve_harness_skills(off, "claude-sdk")] == ["plan"]
+
+    on_names = {s.name for s in resolve_harness_skills(_ctx(ws, home), "claude-sdk")}
+    assert on_names == {"plan", "api-design"}
+
+
+def test_claude_sdk_switch_off_keeps_claude_copy_on_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the switch off, a name collision falls back to the ``.claude`` copy.
+
+    ``foo`` sits in the workspace's ``.agents/skills`` (nearer, so it would
+    normally win the dedup) and in the parent's ``.claude/skills``; skipping
+    the ``.agents`` tier surfaces the ``.claude`` one.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    agents_skill = ws / ".agents" / "skills" / "foo"
+    agents_skill.mkdir(parents=True)
+    (agents_skill / "SKILL.md").write_text(
+        "---\nname: foo\ndescription: workspace agents copy\n---\nbody\n"
+    )
+    claude_skill = tmp_path / ".claude" / "skills" / "foo"
+    claude_skill.mkdir(parents=True)
+    (claude_skill / "SKILL.md").write_text(
+        "---\nname: foo\ndescription: ancestor claude copy\n---\nbody\n"
+    )
+
+    off = replace(_ctx(ws, home), claude_portable_skills=False)
+    out = resolve_harness_skills(off, "claude-sdk")
+
+    assert [s.name for s in out] == ["foo"]
+    assert out[0].skill_dir == claude_skill.resolve()
+
+
+def test_env_factory_carries_claude_portable_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``skill_source_context_from_env`` reads the host switch.
+
+    The switch-off config makes the context flag false and
+    :func:`generic_walk_includes_agents` false for the Claude family only,
+    while the generic walk for a non-Claude harness still scans
+    ``.agents``.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "agents-only")
+    off_config = tmp_path / "off-config"
+    _write_config(off_config, "skills:\n  claude_portable_skills: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(off_config))
+
+    off_ctx = skill_source_context_from_env(roots=(ws,), harness="claude-sdk")
+    assert off_ctx.claude_portable_skills is False
+    assert [s.name for s in resolve_harness_skills(off_ctx, "claude-sdk")] == []
+    assert generic_walk_includes_agents("claude-sdk") is False
+    assert generic_walk_includes_agents("codex") is True
+    assert [s.name for s in resolve_harness_skills(_ctx(ws, home), "openai-agents")] == [
+        "agents-only"
+    ]
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-config"))
+    on_ctx = skill_source_context_from_env(roots=(ws,), harness="claude-sdk")
+    assert on_ctx.claude_portable_skills is True
+    assert [s.name for s in resolve_harness_skills(on_ctx, "claude-sdk")] == ["agents-only"]
 
 
 @pytest.mark.parametrize("harness", ["codex-native", "codex"])
