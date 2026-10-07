@@ -167,20 +167,24 @@ describe("KeyboardShortcutsList shortcut layer rows", () => {
   });
 
   it.each([
-    ["focusComposer", "Focus chat input", "KeyL", ["Ctrl", "⇧", "L"]],
-    ["openModelPicker", "Open model picker", "KeyM", ["Ctrl", "⇧", "M"]],
-    ["findSession", "Find a session by name", "KeyS", ["Ctrl", "⇧", "S"]],
-  ] as const)("shows the rebound keys for the %s row", (actionId, label, code, expected) => {
-    render(<KeyboardShortcutsList />);
+    ["focusComposer", "Focus chat input", "KeyY", ["Ctrl", "⇧", "Y"], ["Ctrl", "⇧", "L"]],
+    ["openModelPicker", "Open model picker", "KeyU", ["Ctrl", "⇧", "U"], ["Ctrl", "⇧", "M"]],
+    ["findSession", "Find a session by name", "KeyO", ["Ctrl", "⇧", "O"], ["Ctrl", "Alt", "S"]],
+  ] as const)(
+    "shows the rebound keys for the %s row",
+    (actionId, label, code, expected, defaultExpected) => {
+      render(<KeyboardShortcutsList />);
+      expect(keysFor(label)).toEqual(defaultExpected);
 
-    act(() => {
-      writeShortcutPreference(actionId, {
-        common: [{ code, modifiers: ["primary", "shift"] }],
+      act(() => {
+        writeShortcutPreference(actionId, {
+          common: [{ code, modifiers: ["primary", "shift"] }],
+        });
       });
-    });
 
-    expect(keysFor(label)).toEqual(expected);
-  });
+      expect(keysFor(label)).toEqual(expected);
+    },
+  );
 });
 
 describe("KeyboardShortcutsDialog", () => {
