@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from omnigent.skill_settings import host_skill_settings
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -92,8 +93,9 @@ class ReadSkillFileTool(Tool):
         """
         Read a file from the named skill's directory.
 
-        Validates that the path is relative and contained
-        within the skill directory (no traversal).
+        Validates that the path is relative and contained within
+        the skill directory (no traversal), or under a host-trusted
+        link root when the path itself is plain.
 
         :param arguments: JSON with ``"skill_name"`` and
             ``"path"`` keys, e.g.
@@ -125,24 +127,33 @@ class ReadSkillFileTool(Tool):
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
         if skill.skill_dir is None:
             return "Error: skill has no directory on disk (loaded from in-memory config)."
-        return _read_file_safely(skill.skill_dir, rel_path)
+        return _read_file_safely(
+            skill.skill_dir,
+            rel_path,
+            host_skill_settings().trusted_link_roots,
+        )
 
 
 def _read_file_safely(
     skill_dir: Path,
     rel_path: str,
+    trusted_link_roots: tuple[Path, ...] = (),
 ) -> str:
     """
     Safely read a file relative to a skill directory.
 
     Uses ``PurePosixPath`` for parsing and
     ``Path.is_relative_to()`` for containment to prevent
-    directory traversal attacks.
+    directory traversal attacks. A path that resolves outside
+    the skill directory is still read when the request path is
+    plain and the target lies under a host-trusted link root.
 
     :param skill_dir: Absolute path to the skill directory,
         e.g. ``Path("/agents/code-review")``.
     :param rel_path: Relative path within the skill
         directory, e.g. ``"references/style-guide.md"``.
+    :param trusted_link_roots: Resolved host-configured roots
+        whose files a skill's symlinks may resolve into.
     :returns: The file contents as a string, or an error
         message if the path is invalid or the file does
         not exist.
@@ -153,8 +164,32 @@ def _read_file_safely(
 
     resolved = (skill_dir / rel_path).resolve()
     if not resolved.is_relative_to(skill_dir.resolve()):
-        return "Error: path traversal not allowed"
+        # Path text alone must not steer a read into a trusted root;
+        # only a link the skill itself contains may.
+        if not (
+            trusted_link_roots
+            and _is_plain_relative(rel_path)
+            and any(resolved.is_relative_to(root) for root in trusted_link_roots)
+        ):
+            return "Error: path traversal not allowed"
     if not resolved.is_file():
         return f"Error: file not found: {rel_path}"
 
     return resolved.read_text()
+
+
+def _is_plain_relative(rel_path: str) -> bool:
+    """
+    Return whether *rel_path* is a plain relative path.
+
+    A plain path has no anchor and no ``..`` part under both
+    POSIX and Windows parsing, so its text cannot steer a read
+    out of the skill directory on either host.
+
+    :param rel_path: The request path to inspect.
+    :returns: ``True`` when the path is plain.
+    """
+    for parsed in (PurePosixPath(rel_path), PureWindowsPath(rel_path)):
+        if parsed.anchor != "" or ".." in parsed.parts:
+            return False
+    return True
