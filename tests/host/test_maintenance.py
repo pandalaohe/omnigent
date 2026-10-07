@@ -1124,3 +1124,27 @@ def test_warning_counter_serializes_concurrent_advances(
 
     assert sorted(results) == [len(warn), len(warn)]
     assert counter.advance("runner_1", path) == len(warn)
+
+
+@pytest.mark.parametrize("shrink_first", [True, False])
+def test_warning_counter_live_continuation_after_rotation_keeps_the_record_level(
+    tmp_path: Path, shrink_first: bool
+) -> None:
+    """A traceback continuing the archived WARN record still counts after rotation."""
+    path = _warning_log(tmp_path)
+    counter = RunnerLogWarningCounter()
+    assert counter.advance("runner_1", path) == 0
+    _append(path, _WARN_LINE)
+    assert counter.advance("runner_1", path) == len(_WARN_LINE)
+
+    _append(path, _WARN_LINE)
+    info = path.stat()
+    (tmp_path / f"{path.name}.1").write_bytes(path.read_bytes())
+    os.truncate(path, 0)
+    if shrink_first:
+        assert counter.advance("runner_1", path) == len(_WARN_LINE)
+    counter.note_rotated("runner_1", info.st_size, (info.st_dev, info.st_ino))
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE)
+
+    _append(path, _TRACEBACK_LINE)
+    assert counter.advance("runner_1", path) == 2 * len(_WARN_LINE) + len(_TRACEBACK_LINE)

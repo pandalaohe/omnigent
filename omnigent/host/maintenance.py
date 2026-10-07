@@ -524,6 +524,12 @@ class RunnerLogWarningCounter:
             )
             self._read_lines(archived, archive, snapshot.offset, copied_size)
             state.warning_bytes += archived.warning_bytes
+            if state.offset == 0 and not state.carry and not state.long_line_prefix:
+                # Nothing live was parsed yet: the live file continues the
+                # archive's last record and partial line.
+                state.record_is_warning = archived.record_is_warning
+                state.carry = archived.carry
+                state.long_line_prefix = archived.long_line_prefix
         else:
             # The report was seen first: the live state is still the
             # pre-truncate state, so it can classify the archive directly.
