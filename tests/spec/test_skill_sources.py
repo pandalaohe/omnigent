@@ -1228,3 +1228,22 @@ def test_env_factory_carries_claude_portable_skills(
     on_ctx = skill_source_context_from_env(roots=(ws,), harness="claude-sdk")
     assert on_ctx.claude_portable_skills is True
     assert [s.name for s in resolve_harness_skills(on_ctx, "claude-sdk")] == ["agents-only"]
+
+
+def test_claude_native_menu_switch_off_drops_portable_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host switch off removes bridged ``.agents`` skills from the native menu."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "foo")
+    _write_skill(ws / ".claude" / "skills", "bar")
+    (home / ".claude" / "skills").mkdir(parents=True)
+
+    on = {s.name for s in resolve_harness_skills(_ctx(ws, home), "claude-native")}
+    off_ctx = replace(_ctx(ws, home), claude_portable_skills=False)
+    off = {s.name for s in resolve_harness_skills(off_ctx, "claude-native")}
+
+    assert on == {"foo", "bar"}
+    assert off == {"bar"}

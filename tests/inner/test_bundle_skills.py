@@ -332,3 +332,49 @@ def test_claude_agents_skill_args_keeps_bundle_discovery_local(
         "workspace",
         "bundled",
     }
+
+
+def _portable_workspace(tmp_path: Path) -> Path:
+    """A workspace holding one portable ``.agents`` skill named ``portable``."""
+    workspace = tmp_path / "workspace"
+    source = workspace / ".agents" / "skills" / "portable"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("---\nname: portable\ndescription: portable\n---\nBody.\n")
+    return workspace
+
+
+def test_claude_agents_skill_args_default_switch_stages_portable_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no host setting, portable skills are staged exactly as upstream does."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "no-config"))
+    workspace = _portable_workspace(tmp_path)
+    bridge = tmp_path / "bridge"
+
+    args = claude_agents_skill_args(bridge, (workspace,), "all")
+
+    assert args == ["--add-dir", str(bridge / "agent-skills")]
+    linked = bridge / "agent-skills" / ".claude" / "skills" / "portable"
+    assert (linked / "SKILL.md").is_file()
+
+
+def test_claude_agents_skill_args_switch_off_stages_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host switch off stages no portable skill and clears an earlier overlay."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "no-config"))
+    workspace = _portable_workspace(tmp_path)
+    bridge = tmp_path / "bridge"
+    assert claude_agents_skill_args(bridge, (workspace,), "all") != []
+
+    off = tmp_path / "off-config"
+    off.mkdir()
+    (off / "config.yaml").write_text("skills:\n  claude_portable_skills: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(off))
+
+    assert claude_agents_skill_args(bridge, (workspace,), "all") == []
+    assert not (bridge / "agent-skills").exists()
