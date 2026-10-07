@@ -202,11 +202,12 @@ def test_host_skill_settings_relative_config_home_returns_empty(
         ("skills:\n  claude_portable_skills: false\n", False, False),
         ("skills:\n  trusted_link_roots: []\n", True, False),
         ("skills:\n  claude_portable_skills:\n", True, True),
+        ("skills:\n  claude_portable_skills: null\n", True, True),
         ('skills:\n  claude_portable_skills: "no"\n', True, True),
         ("skills:\n  claude_portable_skills: 0\n", True, True),
         ('skills:\n  claude_portable_skills: ""\n', True, True),
     ],
-    ids=["false", "absent", "null", "string", "int", "empty-string"],
+    ids=["false", "absent", "empty-value", "null", "string", "int", "empty-string"],
 )
 def test_claude_portable_skills_only_bool_is_honored(
     raw_config: str,
