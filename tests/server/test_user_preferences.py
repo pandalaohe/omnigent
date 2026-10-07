@@ -1308,6 +1308,27 @@ async def test_preferences_api_accepts_the_host_colors_namespace(
 
 
 @pytest.mark.asyncio
+async def test_preferences_api_accepts_the_runner_log_warnings_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The runner_log_warnings namespace is allowlisted and round-trips dismissals."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "runaway@example.com"}
+        value = {"dismissed": ["2026-10-07T06:22:16+00:00"]}
+        patched = await client.patch(
+            "/v1/me/preferences/runner_log_warnings",
+            headers=headers,
+            json={"value": value},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["runner_log_warnings"] == value
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_accepts_the_keep_warm_namespace(
     db_uri: str,
     runtime_init: None,

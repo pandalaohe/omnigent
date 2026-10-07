@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -12,6 +12,13 @@ import {
   RunnerStartingIndicator,
   SandboxFailedIndicator,
 } from "./ChatIndicators";
+
+const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
+
+vi.mock("@/lib/userPreferencesSync", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, queueUserPreferencePatch: queuePatchMock };
+});
 
 // Render-level coverage for the chat surface's status bands and bubble
 // dispatcher. These exercise the branches that the pure-helper tests can't:
@@ -52,17 +59,23 @@ describe("SandboxFailedIndicator", () => {
 });
 
 describe("RunnerLogRunawayBanner", () => {
+  const RUNWAY_FLAG = "2026-09-23T09:25:00+00:00";
+
+  const confirmedLabels = (mb?: string) => ({
+    "omnigent.runner_log_runaway": RUNWAY_FLAG,
+    ...(mb === undefined ? {} : { "omnigent.runner_log_runaway_mb": mb }),
+    "omnigent.runner_log_runaway_seen": new Date().toISOString(),
+  });
+
+  beforeEach(() => {
+    localStorage.clear();
+    queuePatchMock.mockReset();
+  });
+
   it("shows the warning with the reported rate when the session is flagged", () => {
     // WHY: the user must learn WHY the session's disk is filling before the
     // runner's error loop gets out of hand, so the banner names the rate.
-    render(
-      <RunnerLogRunawayBanner
-        labels={{
-          "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
-          "omnigent.runner_log_runaway_mb": "7",
-        }}
-      />,
-    );
+    render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
     expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
     expect(
       screen.getByText(/writing logs unusually fast \(7 MB in the last hour\)/),
@@ -76,11 +89,7 @@ describe("RunnerLogRunawayBanner", () => {
   });
 
   it("still warns without the rate when the MB label is missing", () => {
-    render(
-      <RunnerLogRunawayBanner
-        labels={{ "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00" }}
-      />,
-    );
+    render(<RunnerLogRunawayBanner labels={confirmedLabels()} />);
     expect(screen.getByText(/writing logs unusually fast —/)).toBeInTheDocument();
   });
 
@@ -101,18 +110,7 @@ describe("RunnerLogRunawayBanner", () => {
     };
     const { data: updated } = mergeItemsIntoPages(
       cache,
-      new Map([
-        [
-          row.id,
-          {
-            id: row.id,
-            labels: {
-              "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
-              "omnigent.runner_log_runaway_mb": "7",
-            },
-          },
-        ],
-      ]),
+      new Map([[row.id, { id: row.id, labels: confirmedLabels("7") }]]),
       { searchQuery: "", includeArchived: false },
     );
     render(
@@ -124,10 +122,91 @@ describe("RunnerLogRunawayBanner", () => {
   });
 
   it("uses the session snapshot when the list row is unavailable", () => {
+    render(<RunnerLogRunawayBanner labels={undefined} fallbackLabels={confirmedLabels()} />);
+    expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
+  });
+
+  it("hides the warning when the host has not confirmed it within the lease", () => {
+    // WHY: the host re-sends its report every 5 minutes while the runner
+    // stays over the cap; a stale receive instant means it stopped.
     render(
       <RunnerLogRunawayBanner
-        labels={undefined}
-        fallbackLabels={{ "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00" }}
+        labels={{
+          ...confirmedLabels(),
+          "omnigent.runner_log_runaway_seen": new Date(Date.now() - 16 * 60 * 1000).toISOString(),
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+  });
+
+  it("hides the warning when the report carries no server receive instant", () => {
+    // WHY: flags written before the lease existed cannot be re-confirmed,
+    // so they must not pin a forever banner.
+    render(
+      <RunnerLogRunawayBanner
+        labels={{ "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00" }}
+      />,
+    );
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+  });
+
+  it("disappears by itself once the lease lapses without a re-confirmation", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <RunnerLogRunawayBanner
+          labels={{
+            ...confirmedLabels(),
+            "omnigent.runner_log_runaway_seen": new Date(Date.now() - 14 * 60 * 1000).toISOString(),
+          }}
+        />,
+      );
+      expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(2 * 60 * 1000);
+      });
+      expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dismisses the warning, mirrors it locally and queues the sync patch", () => {
+    render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
+    fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("omnigent:runner-log-warnings") ?? "null")).toEqual({
+      dismissed: [RUNWAY_FLAG],
+    });
+    expect(queuePatchMock).toHaveBeenLastCalledWith("runner_log_warnings", {
+      dismissed: [RUNWAY_FLAG],
+    });
+  });
+
+  it("keeps a re-reported warning hidden while the same detection instant is dismissed", () => {
+    // WHY: the host keeps reporting with the SAME detection instant; a
+    // dismissal must survive those re-reports (only a new instant re-shows).
+    const { unmount } = render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
+    fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+    unmount();
+
+    render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+  });
+
+  it("shows the warning again when a new detection instant arrives", () => {
+    const { rerender } = render(<RunnerLogRunawayBanner labels={confirmedLabels("7")} />);
+    fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+
+    rerender(
+      <RunnerLogRunawayBanner
+        labels={{
+          ...confirmedLabels("8"),
+          "omnigent.runner_log_runaway": "2026-09-23T10:25:00+00:00",
+        }}
       />,
     );
     expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
