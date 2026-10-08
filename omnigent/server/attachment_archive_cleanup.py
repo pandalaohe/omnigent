@@ -25,7 +25,6 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation, StoredFile
 from omnigent.errors import StaleCursorError
-from omnigent.inner.native_attachments import is_by_path
 from omnigent.server.admin_list import resolve_data_dir
 from omnigent.server.server_config import (
     attachment_archive_cleanup_days,
@@ -298,7 +297,10 @@ class AttachmentArchiveCleanup:
                 order="asc",
             )
             for stored in page.data:
-                if not is_by_path(stored.filename, stored.source_metadata):
+                if not (
+                    isinstance(stored.source_metadata, Mapping)
+                    and stored.source_metadata.get("delivery") == "filesystem"
+                ):
                     continue
                 if stored.bytes < min_bytes:
                     continue

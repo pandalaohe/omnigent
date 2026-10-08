@@ -213,6 +213,43 @@ async def test_large_inline_files_are_never_purged(
         assert env.artifacts.exists(row.blob_key or row.id)
 
 
+async def test_large_zip_without_delivery_marker_is_never_purged(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only attachment originals: agent-produced and legacy .zip rows are kept."""
+    _configure(monkeypatch, _DAYS_30)
+    session_id = _new_session(env)
+    agent_zip = env.files.create(
+        session_id=session_id,
+        filename="agent-output.zip",
+        bytes=_VIDEO_BYTES,
+        content_type="application/zip",
+        source_metadata={"tool": "upload_file"},
+    )
+    env.artifacts.put(agent_zip.blob_key or agent_zip.id, b"zip-bytes")
+    legacy_zip = env.files.create(
+        session_id=session_id,
+        filename="legacy.zip",
+        bytes=_VIDEO_BYTES,
+        content_type="application/zip",
+    )
+    env.artifacts.put(legacy_zip.blob_key or legacy_zip.id, b"legacy-bytes")
+    original = _by_path_row(env, session_id, filename="uploaded.zip")
+    _archive(env, session_id)
+    archived_at = env.conversations.get_conversation(session_id).archived_at
+    assert archived_at is not None
+
+    summary = await _job(env).sweep_once(now=archived_at + 31 * _DAY)
+
+    assert summary.files_purged == 1
+    assert _purge(_fresh(env, agent_zip.id)) is None
+    assert env.artifacts.exists(agent_zip.blob_key or agent_zip.id)
+    assert _purge(_fresh(env, legacy_zip.id)) is None
+    assert env.artifacts.exists(legacy_zip.blob_key or legacy_zip.id)
+    assert _purge(_fresh(env, original.id))["state"] == "done"
+    assert not env.artifacts.exists(original.blob_key or original.id)
+
+
 async def test_session_archived_inside_the_window_is_kept(
     env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

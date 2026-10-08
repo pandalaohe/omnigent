@@ -292,11 +292,15 @@ def attachment_archive_cleanup_min_bytes() -> int:
 
     Config key ``attachment_archive_cleanup_min_bytes``; defaults to
     :data:`ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT`. This defines
-    "large": smaller files are always kept.
+    "large": smaller files are always kept. ``0`` and invalid values also
+    use the default, never a smaller threshold.
     """
-    return _config_positive_int(
-        "attachment_archive_cleanup_min_bytes",
-        ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT,
+    return (
+        _config_limit(
+            "attachment_archive_cleanup_min_bytes",
+            ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT,
+        )
+        or ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT
     )
 
 
@@ -304,7 +308,7 @@ def attachment_archive_cleanup_dry_run() -> bool:
     """Whether the archive cleanup only logs what it would purge.
 
     Config key ``attachment_archive_cleanup_dry_run``; default false. A
-    non-bool value falls back to false with a warning.
+    present non-bool value falls back to true (dry-run) with a warning.
     """
     raw = load_server_config().get("attachment_archive_cleanup_dry_run")
     if raw is None:
@@ -312,10 +316,10 @@ def attachment_archive_cleanup_dry_run() -> bool:
     if isinstance(raw, bool):
         return raw
     logger.warning(
-        "server config attachment_archive_cleanup_dry_run=%r is not a bool — using false",
+        "server config attachment_archive_cleanup_dry_run=%r is not a bool — using dry-run",
         raw,
     )
-    return False
+    return True
 
 
 def attachment_limits() -> dict[str, int | None]:

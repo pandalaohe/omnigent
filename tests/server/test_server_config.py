@@ -345,16 +345,13 @@ def test_attachment_archive_cleanup_min_bytes_default_and_configured(
     assert attachment_archive_cleanup_min_bytes() == 1024
 
 
-def test_attachment_archive_cleanup_min_bytes_rejects_zero(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("bad", [True, 1.5, -1, 0, "abc"])
+def test_attachment_archive_cleanup_min_bytes_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch, bad: object
 ) -> None:
-    """Zero min-bytes would purge everything, so it falls back to the default."""
-    _pin_values(monkeypatch, {"attachment_archive_cleanup_min_bytes": 0})
-    with caplog.at_level("WARNING", logger=server_config_module.__name__):
-        assert (
-            attachment_archive_cleanup_min_bytes() == ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT
-        )
-    assert "not positive" in caplog.text
+    """A bool, float, negative, zero, or non-numeric value must not lower the bar."""
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_min_bytes": bad})
+    assert attachment_archive_cleanup_min_bytes() == ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT
 
 
 def test_attachment_archive_cleanup_dry_run_reads_booleans(
@@ -366,9 +363,14 @@ def test_attachment_archive_cleanup_dry_run_reads_booleans(
     _pin_values(monkeypatch, {"attachment_archive_cleanup_dry_run": True})
     assert attachment_archive_cleanup_dry_run() is True
 
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_dry_run": "true"})
+    with caplog.at_level("WARNING", logger=server_config_module.__name__):
+        assert attachment_archive_cleanup_dry_run() is True
+    assert "using dry-run" in caplog.text
+
     _pin_values(monkeypatch, {"attachment_archive_cleanup_dry_run": "yes"})
     with caplog.at_level("WARNING", logger=server_config_module.__name__):
-        assert attachment_archive_cleanup_dry_run() is False
+        assert attachment_archive_cleanup_dry_run() is True
     assert "is not a bool" in caplog.text
 
 

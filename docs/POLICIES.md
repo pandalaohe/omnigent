@@ -92,9 +92,11 @@ falls back to the default with a server-log warning. The effective attachment
 limits are published to the web composer by `GET /v1/info` as
 `attachment_limits`.
 
-The archive cleanup deletes only large attachment originals and keeps the
-session; it is separate from the per-browser retention period and "Delete
-expired" in Settings › Archived sessions, which delete whole sessions.
+The archive cleanup deletes only the large originals of files uploaded as
+by-path attachments (never agent-produced files, nor uploads recorded before
+by-path delivery existed) and keeps the session; it is separate
+from the per-browser retention period and "Delete expired" in Settings ›
+Archived sessions, which delete whole sessions.
 
 The archive cleanup is a server-side daily job (settings are re-read on every
 sweep, so a config edit lands without a restart). No API triggers it. It only
