@@ -255,6 +255,11 @@ function makeDesignModeInputHandler(gestureState) {
  * @param {(event: Electron.IpcMainInvokeEvent) =>
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
+ * @param {(event: Electron.IpcMainInvokeEvent, request: { url: string, grant: string }) =>
+ *          Promise<"always" | "once" | null>} deps.confirmAgentNavigation
+ *        Asks the user (native dialog) whether the agent may open a promptable
+ *        internal address; "always" persists the grant in main so a retry sees
+ *        it in the allowlist.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -262,6 +267,7 @@ function registerBrowserIpc({
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
   getAgentNavigationHintForEvent = () => null,
+  confirmAgentNavigation = async () => null,
 }) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
@@ -297,29 +303,66 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, {
-      force: !!opts?.force,
-      agent: !!opts?.agent,
-      // The first-party renderer supplies the source-session host; main owns
-      // the target and eligibility. Caller exception flags never establish identity.
-      agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
-    });
-    // On first creation, wire nav listeners here (not in the registry factory,
-    // which stays Electron-free) so the URL bar can live-track the real url.
-    if (r.ok && r.created && r.entry) {
-      attachNavListeners({
-        conversationId,
-        webContents: r.entry.view.webContents,
-        send: senderFor(event),
-      });
-    }
-    // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    const hint = !r.ok && opts?.agent ? getAgentNavigationHintForEvent(event, url) : null;
-    return {
-      ok: r.ok,
-      created: r.created ?? false,
-      error: hint ? `${r.error} ${hint}` : r.error,
+    const agent = !!opts?.agent;
+    // The first-party renderer supplies the source-session host; main owns
+    // the target and eligibility. Caller exception flags never establish identity.
+    const agentContext = agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null;
+    const options = { force: !!opts?.force, agent, agentContext };
+
+    const finish = (r) => {
+      // On first creation, wire nav listeners here (not in the registry factory,
+      // which stays Electron-free) so the URL bar can live-track the real url.
+      if (r.ok && r.created && r.entry) {
+        attachNavListeners({
+          conversationId,
+          webContents: r.entry.view.webContents,
+          send: senderFor(event),
+        });
+      }
+      // Strip the non-serializable `entry` before it crosses the IPC boundary.
+      const hint = !r.ok && agent ? getAgentNavigationHintForEvent(event, url) : null;
+      return {
+        ok: r.ok,
+        created: r.created ?? false,
+        error: hint ? `${r.error} ${hint}` : r.error,
+      };
     };
+
+    const r = g.registry.openOrNavigate(conversationId, url, bounds, options);
+    // Only an internal-class refusal on an agent call is promptable; every
+    // other outcome returns synchronously, exactly as before.
+    if (r.ok || !agent || !r.grant) return finish(r);
+    const grant = r.grant;
+    return (async () => {
+      const choice = await confirmAgentNavigation(event, { url, grant });
+      if (choice === "always" || choice === "once") {
+        // The prompt can span a server switch (same registry, new pinned
+        // origin); never retry the old server's answer under the new policy.
+        const regate = gateRegistry(event);
+        const serverOrigin = getAgentContextForEvent(event, opts?.sourceHostId)?.serverOrigin;
+        if (
+          regate.error ||
+          regate.registry !== g.registry ||
+          serverOrigin !== agentContext?.serverOrigin
+        ) {
+          return finish({
+            ok: false,
+            error: `${r.error} The window changed servers before the answer; navigation cancelled.`,
+          });
+        }
+        if (choice === "always") {
+          // Main persisted the grant, so the injected allowlist now has it.
+          return finish(regate.registry.openOrNavigate(conversationId, url, bounds, options));
+        }
+        return finish(
+          regate.registry.openOrNavigate(conversationId, url, bounds, {
+            ...options,
+            agentContext: { ...(agentContext ?? {}), allowOnce: [grant] },
+          }),
+        );
+      }
+      return finish({ ok: false, error: `${r.error} The user did not allow this address.` });
+    })();
   });
 
   // Attach the named conversation's view to the host window (detaching the

@@ -3609,6 +3609,26 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 }
 
 /**
+ * Extra internal hosts/ranges a server lets its agent browse, from the
+ * hand-edited `agent_browser_allowlist` map in settings.json (keyed by the
+ * window's pinned origin, value an array of entry strings). Re-read on every
+ * call so an edit applies from the next navigation. Malformed shapes yield no
+ * entries — the policy itself ignores malformed entries.
+ *
+ * @param {string | null | undefined} origin The window's pinned server origin.
+ * @returns {unknown[]}
+ */
+function agentBrowserAllowlist(origin) {
+  if (typeof origin !== "string" || origin === "") return [];
+  const settings = loadSettings();
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return [];
+  const byOrigin = settings.agent_browser_allowlist;
+  if (!byOrigin || typeof byOrigin !== "object" || Array.isArray(byOrigin)) return [];
+  const list = byOrigin[origin];
+  return Array.isArray(list) ? list : [];
+}
+
+/**
  * Build the per-conversation WebContentsView registry for a shell window
  * (positions child views in `win.contentView`, pings back via `win.webContents`).
  *
@@ -3645,6 +3665,7 @@ function createBrowserRegistryForWindow(win) {
         serverTarget: target,
       });
     },
+    getAgentAllowlist: (context) => agentBrowserAllowlist(context?.serverOrigin),
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
       win.contentView.addChildView(view);
@@ -3679,6 +3700,70 @@ function createBrowserRegistryForWindow(win) {
     if (isMainFrame && !isInPlace) registry.setRecentSessionSwitchSupported(false);
   });
   return registry;
+}
+
+// The server gives up on a browser action after 30 s, so an unanswered prompt
+// must close first (it then counts as Don't Allow).
+const AGENT_NAVIGATION_PROMPT_TIMEOUT_MS = 25000;
+
+/**
+ * Ask the user — through a native, main-process dialog the server page cannot
+ * draw over or answer — whether the agent may open a refused internal address.
+ * "Always Allow" remembers that exact `grant` for the window's pinned server
+ * in settings.json (`agent_browser_allowlist`), so later navigations pass
+ * without a prompt. Modelled on {@link confirmHostEnrollment}.
+ *
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @param {{ url: string, grant: string }} request
+ * @returns {Promise<"always" | "once" | null>} "once" = this navigation and
+ *   its redirects; null = refused (or unanswered).
+ */
+async function confirmAgentNavigation(event, { url, grant }) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const origin = pinnedOrigin(win);
+  if (!win || !origin) return null;
+
+  let host = origin;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    // Keep the full origin string if it somehow doesn't parse.
+  }
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(win, {
+    type: "warning",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: "Allow the agent to open " + grant + "?",
+    detail:
+      `${host} is asking to let its agent open ${url} in the embedded browser. ` +
+      `This address is on this computer or the local network, and the agent will ` +
+      `be able to read its pages. Only allow addresses you trust.`,
+    buttons: ["Don't Allow", "Allow Once", "Always Allow"],
+    defaultId: 0, // deny is the safe default (Esc / Enter both decline)
+    cancelId: 0,
+    noLink: true,
+    signal: AbortSignal.timeout(AGENT_NAVIGATION_PROMPT_TIMEOUT_MS),
+  });
+  if (response === 2) {
+    // A non-object root (null / array / number) has nothing to preserve.
+    const loaded = loadSettings();
+    const settings = loaded && typeof loaded === "object" && !Array.isArray(loaded) ? loaded : {};
+    const byOrigin =
+      settings.agent_browser_allowlist &&
+      typeof settings.agent_browser_allowlist === "object" &&
+      !Array.isArray(settings.agent_browser_allowlist)
+        ? settings.agent_browser_allowlist
+        : {};
+    const list = Array.isArray(byOrigin[origin]) ? byOrigin[origin] : [];
+    if (!list.includes(grant)) list.push(grant);
+    byOrigin[origin] = list;
+    settings.agent_browser_allowlist = byOrigin;
+    saveSettings(settings);
+    return "always";
+  }
+  if (response === 1) return "once";
+  return null;
 }
 
 /**
@@ -4657,10 +4742,15 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
-    getAgentContextForEvent: (event, sourceHostId) => ({
-      serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
-      sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
-    }),
+    getAgentContextForEvent: (event, sourceHostId) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return {
+        serverTarget: arcaTarget(windowArcaServerUrl(win)),
+        sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
+        serverOrigin: pinnedOrigin(win) ?? null,
+      };
+    },
+    confirmAgentNavigation,
     getAgentNavigationHintForEvent: (event, url) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const target = windowArcaServerUrl(win);

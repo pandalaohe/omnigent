@@ -25,6 +25,9 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
+// Private IPv4 fixtures are built from octets so no LAN address literal enters the source.
+const ip = (...octets) => octets.join(".");
+
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
@@ -133,6 +136,7 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
 
 function loadNavigationHarness({
   isPackaged = false,
+  omnigentBuild,
   platform,
   env = {},
   serverUrl = "https://host.example/ml/omnigents",
@@ -294,7 +298,8 @@ function loadNavigationHarness({
     },
   };
 
-  function createDesktopUpdater() {
+  function createDesktopUpdater(deps) {
+    calls.updaterDeps = deps;
     return {
       init() {},
       registerIpc() {},
@@ -577,6 +582,9 @@ function loadNavigationHarness({
       startLocalServer: async () => ({ ok: false }),
     },
   };
+  if (omnigentBuild !== undefined) {
+    localRequires["../package.json"] = { ...require("../package.json"), omnigentBuild };
+  }
 
   const mainPath = path.join(__dirname, "../src/main.js");
   const mainRequire = createRequire(mainPath);
@@ -1941,6 +1949,158 @@ describe("browser permission wiring", () => {
   });
 });
 
+describe("agent browser allowlist wiring", () => {
+  // main.js runs in its own VM context: compare its values structurally.
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+
+  function harness(t) {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    return h;
+  }
+
+  it("exposes the pinned server origin to the browser context", (t) => {
+    const h = harness(t);
+    const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, null);
+    assert.equal(context.serverOrigin, "https://host.example");
+  });
+
+  it("reads the per-server agent allowlist and ignores malformed values", (t) => {
+    const h = harness(t);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        agent_browser_allowlist: {
+          "https://host.example": [`${ip(192, 168, 1, 0)}/24`],
+          "https://other.example": [`${ip(10, 0, 0, 0)}/8`],
+        },
+      }),
+    );
+    h.api.createBrowserRegistryForWindow(h.win);
+    const get = h.browserRegistryDeps().getAgentAllowlist;
+    assert.deepEqual(plain(get({ serverOrigin: "https://host.example" })), [
+      `${ip(192, 168, 1, 0)}/24`,
+    ]);
+    assert.deepEqual(plain(get({ serverOrigin: "https://other.example" })), [
+      `${ip(10, 0, 0, 0)}/8`,
+    ]);
+    assert.deepEqual(plain(get(null)), []);
+    assert.deepEqual(plain(get({})), []);
+
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ agent_browser_allowlist: "x" }));
+    assert.deepEqual(plain(get({ serverOrigin: "https://host.example" })), []);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ agent_browser_allowlist: { "https://host.example": {} } }),
+    );
+    assert.deepEqual(plain(get({ serverOrigin: "https://host.example" })), []);
+
+    fs.writeFileSync(h.settingsPath, "null");
+    assert.doesNotThrow(() => get({ serverOrigin: "https://host.example" }));
+    assert.deepEqual(plain(get({ serverOrigin: "https://host.example" })), []);
+  });
+
+  it("remembers an always-allow grant without disturbing other settings", async (t) => {
+    const h = harness(t);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        server_url: "https://host.example/",
+        agent_browser_allowlist: { "https://other.example": [`${ip(10, 0, 0, 0)}/8`] },
+      }),
+    );
+    const dialogs = [];
+    h.electron.dialog.showMessageBox = async (win, options) => {
+      dialogs.push({ win, options });
+      return { response: 2 };
+    };
+    const confirm = h.browserIpcDeps().confirmAgentNavigation;
+    const event = { sender: h.webContents };
+    const grant = `${ip(192, 168, 1, 20)}:80`;
+    assert.equal(await confirm(event, { url: `http://${ip(192, 168, 1, 20)}/`, grant }), "always");
+
+    const saved = JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    assert.equal(saved.server_url, "https://host.example/");
+    assert.deepEqual(saved.agent_browser_allowlist, {
+      "https://other.example": [`${ip(10, 0, 0, 0)}/8`],
+      "https://host.example": [`${ip(192, 168, 1, 20)}:80`],
+    });
+
+    // A second Always Allow for the same grant does not duplicate it.
+    await confirm(event, { url: `http://${ip(192, 168, 1, 20)}/`, grant });
+    const again = JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    assert.deepEqual(again.agent_browser_allowlist["https://host.example"], [
+      `${ip(192, 168, 1, 20)}:80`,
+    ]);
+
+    // The prompt is modal to the shell window with the safe-default options.
+    assert.equal(dialogs.length, 2);
+    assert.equal(dialogs[0].win, h.win);
+    assert.equal(dialogs[0].options.message, `Allow the agent to open ${ip(192, 168, 1, 20)}:80?`);
+    assert.deepEqual(plain(dialogs[0].options.buttons), [
+      "Don't Allow",
+      "Allow Once",
+      "Always Allow",
+    ]);
+    assert.equal(dialogs[0].options.defaultId, 0);
+    assert.equal(dialogs[0].options.cancelId, 0);
+    assert.ok(dialogs[0].options.signal instanceof AbortSignal);
+  });
+
+  it("allows once without persisting, and treats cancel as refusal", async (t) => {
+    const h = harness(t);
+    let response = 1;
+    let dialogCount = 0;
+    h.electron.dialog.showMessageBox = async () => {
+      dialogCount++;
+      return { response };
+    };
+    const confirm = h.browserIpcDeps().confirmAgentNavigation;
+    const event = { sender: h.webContents };
+    const request = {
+      url: `http://${ip(192, 168, 1, 20)}/`,
+      grant: `${ip(192, 168, 1, 20)}:80`,
+    };
+    assert.equal(await confirm(event, request), "once");
+    assert.equal(fs.existsSync(h.settingsPath), false, "allow-once writes no settings");
+
+    response = 0;
+    assert.equal(await confirm(event, request), null);
+    assert.equal(dialogCount, 2);
+  });
+
+  it("replaces a non-object settings root when remembering an always grant", async (t) => {
+    const h = harness(t);
+    fs.writeFileSync(h.settingsPath, "null");
+    h.electron.dialog.showMessageBox = async () => ({ response: 2 });
+    const confirm = h.browserIpcDeps().confirmAgentNavigation;
+    const grant = `${ip(192, 168, 1, 20)}:80`;
+    assert.equal(
+      await confirm({ sender: h.webContents }, { url: `http://${ip(192, 168, 1, 20)}/`, grant }),
+      "always",
+    );
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")), {
+      agent_browser_allowlist: { "https://host.example": [grant] },
+    });
+  });
+
+  it("does not open a dialog without a window", async (t) => {
+    const h = harness(t);
+    let dialogCount = 0;
+    h.electron.dialog.showMessageBox = async () => {
+      dialogCount++;
+      return { response: 2 };
+    };
+    const confirm = h.browserIpcDeps().confirmAgentNavigation;
+    assert.equal(
+      await confirm({ sender: {} }, { url: `http://${ip(192, 168, 1, 20)}/`, grant: "g" }),
+      null,
+    );
+    assert.equal(dialogCount, 0);
+  });
+});
+
 describe("setup clipboard IPC wiring", () => {
   it("exposes a narrow copy action through the setup bridge", () => {
     assert.match(
@@ -2127,6 +2287,30 @@ describe("Databricks-internal local-host CLI wiring", () => {
 describe("production developer-mode wiring (src/main.js)", () => {
   it("uses the same opt-in to enable the shell window's DevTools capability", () => {
     assert.match(liveCode, /webPreferences:\s*\{[\s\S]{0,400}devTools:\s*developerModeEnabled\(\)/);
+  });
+});
+
+describe("desktop updater flavour wiring (src/main.js)", () => {
+  it("disables updates for a packaged dev build", (t) => {
+    const h = loadNavigationHarness({
+      isPackaged: true,
+      omnigentBuild: "dev",
+      registerFallbacks: false,
+    });
+    t.after(h.cleanup);
+    assert.equal(h.calls.updaterDeps.updatesEnabled, false);
+  });
+
+  it("keeps updates enabled for a packaged official release build", (t) => {
+    const h = loadNavigationHarness({ isPackaged: true, registerFallbacks: false });
+    t.after(h.cleanup);
+    assert.equal(h.calls.updaterDeps.updatesEnabled, true);
+  });
+
+  it("keeps updates enabled for an unpackaged development run", (t) => {
+    const h = loadNavigationHarness({ isPackaged: false, registerFallbacks: false });
+    t.after(h.cleanup);
+    assert.equal(h.calls.updaterDeps.updatesEnabled, true);
   });
 });
 
