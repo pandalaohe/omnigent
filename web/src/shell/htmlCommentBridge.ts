@@ -27,6 +27,7 @@
 //
 // These helpers are pure (no React) so they unit-test in isolation.
 
+import { escapeHtmlAttr } from "@/lib/html";
 import bridgeSource from "../../public/omni-html-bridge.js?raw";
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
 
@@ -300,24 +301,24 @@ export function anchorOccurrence(source: string, anchor: string, startIndex: num
 // Injected bridge script
 // ---------------------------------------------------------------------------
 
+// The shared in-frame asset: inlined for the srcdoc path, loaded by URL when an
+// embed's CSP blocks inline scripts.
+export const HTML_COMMENT_BRIDGE_RUNTIME = bridgeSource;
+
 /**
  * Wrap the shared in-frame bridge asset (web/public/omni-html-bridge.js) in the
  * same nonce-carrying `<script>` tag the server emits: the nonce reaches the
  * script as `data-omni-nonce`, and without it the script no-ops. The source is
- * escaped so a literal `</script` in it can never close the tag early.
+ * escaped so a literal `</script` in it can never close the tag early. When
+ * `runtimeUrl` is given the asset loads externally from that URL instead, for an
+ * embed whose CSP blocks inline scripts.
  *
  * Exported for unit testing.
  */
-export function buildBridgeScript(nonce: string): string {
-  // The nonce is caller-generated (a UUID); escaping is defensive only.
-  const attr = nonce.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-  return (
-    '<script data-omni-nonce="' +
-    attr +
-    '">' +
-    bridgeSource.replace(/<\/script/gi, "<\\/script") +
-    "</script>"
-  );
+export function buildBridgeScript(nonce: string, runtimeUrl?: string): string {
+  const nonceAttr = ` data-omni-nonce="${escapeHtmlAttr(nonce)}"`;
+  if (runtimeUrl) return `<script src="${escapeHtmlAttr(runtimeUrl)}"${nonceAttr}></script>`;
+  return `<script${nonceAttr}>` + bridgeSource.replace(/<\/script/gi, "<\\/script") + "</script>";
 }
 
 /**
@@ -332,10 +333,11 @@ export function buildBridgeScript(nonce: string): string {
  *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
+ * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
  */
-export function injectCommentBridge(html: string, nonce: string): string {
+export function injectCommentBridge(html: string, nonce: string, runtimeUrl?: string): string {
   const prepared = prepareHtmlPreviewDoc(html);
-  const inject = buildBridgeScript(nonce);
+  const inject = buildBridgeScript(nonce, runtimeUrl);
 
   const bodyClose = prepared.search(/<\/body\s*>/i);
   if (bodyClose !== -1) {

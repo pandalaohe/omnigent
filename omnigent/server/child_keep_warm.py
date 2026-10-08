@@ -1271,7 +1271,7 @@ class ChildKeepWarmSweeper:
             return None
         try:
             loaded = agent_cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.config.get("harness") or loaded.spec.executor.type
         except Exception:  # noqa: BLE001 — an unloadable bundle migrates nothing

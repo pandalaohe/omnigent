@@ -1,8 +1,9 @@
 import { useCallback } from "react";
 
-import { useGithubInfo } from "@/hooks/useGithub";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
+import { gitProviderCopy } from "@/lib/gitProviders";
 import { effectiveWorktree } from "@/lib/types";
 
 /** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
@@ -81,6 +82,8 @@ export interface ComposerGitStatus {
   githubState: "loading" | "ready" | "unknown";
   prCount: number;
   prNumber: number | null;
+  /** Precedes `prNumber` in the PR's provider style: "#" for GitHub, "!" for Azure DevOps. */
+  prNumberPrefix: string;
   /** Re-read live worktree + PR state from the host. */
   refresh: () => void;
   refreshing: boolean;
@@ -92,7 +95,7 @@ export interface ComposerGitStatus {
  * The branch comes from the host's `git worktree list` (via
  * {@link useSessionWorktrees}), matched to the session's effective worktree
  * (`worktree` when recorded, else `workspace`) — the real checked-out branch,
- * distinct from a PR head. {@link useGithubInfo} supplies only PR/repo
+ * distinct from a PR head. {@link usePullRequestInfo} supplies only PR/repo
  * metadata: its `branch` field can be a PR head ref, so it is not trusted for
  * the live branch. `not-git` is set only on explicit evidence; offline /
  * ambiguous / an empty list stay `unknown` rather than claiming the
@@ -121,7 +124,7 @@ export function useComposerGitStatus({
 }): ComposerGitStatus {
   const gitRoot = effectiveWorktree({ worktree, workspace });
   const worktrees = useSessionWorktrees(sessionId, hostId, gitRoot);
-  const github = useGithubInfo(sessionId ?? undefined);
+  const github = usePullRequestInfo(sessionId ?? undefined);
   const info = github.data;
   const result = worktrees.data;
 
@@ -160,6 +163,12 @@ export function useComposerGitStatus({
   const prs = info?.prs;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  // The primary PR's own provider first, then the session's.
+  const prNumberPrefix = gitProviderCopy(
+    prs?.[0]?.provider ?? info?.provider,
+    undefined,
+    prs?.[0]?.provider_display ?? info?.provider_display,
+  ).prNumberPrefix;
 
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
@@ -178,6 +187,7 @@ export function useComposerGitStatus({
     githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
     prCount,
     prNumber,
+    prNumberPrefix,
     refresh,
     refreshing: worktrees.isFetching || github.isFetching,
   };

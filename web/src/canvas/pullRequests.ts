@@ -4,8 +4,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import type { GitProviderDisplay } from "@/lib/gitProviders";
 import type { Conversation } from "@/hooks/useConversations";
-import { fetchGithubInfo } from "@/hooks/useGithub";
+import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
 import { effectiveWorktree } from "@/lib/types";
 
 export const PULL_REQUEST_REFRESH_MS = 300_000;
@@ -21,6 +22,9 @@ export interface CanvasPullRequest {
   /** "OPEN" | "MERGED" | "CLOSED" as reported by gh. */
   state: string;
   url: string;
+  /** Git provider id, which picks the number prefix: `!` for Azure DevOps, else `#`. */
+  provider?: string | null;
+  provider_display?: GitProviderDisplay | null;
 }
 
 export type CanvasPullRequests = Record<string, CanvasPullRequest | null>;
@@ -79,7 +83,11 @@ function samePullRequest(
     left.number === right.number &&
     left.title === right.title &&
     left.state === right.state &&
-    left.url === right.url
+    left.url === right.url &&
+    left.provider === right.provider &&
+    left.provider_display?.display_name === right.provider_display?.display_name &&
+    left.provider_display?.request_name === right.provider_display?.request_name &&
+    left.provider_display?.number_prefix === right.provider_display?.number_prefix
   );
 }
 
@@ -134,7 +142,7 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
           try {
             info = await queryClient.fetchQuery({
               queryKey: ["github-info", session.id],
-              queryFn: () => fetchGithubInfo(session.id),
+              queryFn: () => fetchPullRequestInfo(session.id),
               staleTime: GITHUB_INFO_STALE_MS,
             });
           } catch (error) {
@@ -146,7 +154,15 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
           const pr = info.available ? info.pr : null;
           const next: CanvasPullRequest | null =
             pr && /^https:\/\//.test(pr.url)
-              ? { number: pr.number, title: pr.title, state: pr.state, url: pr.url }
+              ? {
+                  number: pr.number,
+                  title: pr.title,
+                  state: pr.state,
+                  url: pr.url,
+                  // The PR's own provider wins over the session's, as in the composer chip.
+                  provider: info.prs?.[0]?.provider ?? info.provider,
+                  provider_display: info.prs?.[0]?.provider_display ?? info.provider_display,
+                }
               : null;
           setPullRequests((current) =>
             samePullRequest(current[session.id], next)

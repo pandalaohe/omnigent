@@ -102,6 +102,7 @@ from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_LOCK_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
@@ -120,6 +121,7 @@ from omnigent.stores.conversation_store import (
     ConversationArchiveClosingError,
     ConversationNotFoundError,
     ConversationStore,
+    ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
     DeletionClaimResult,
@@ -466,7 +468,7 @@ def _new_session_agent_row(
         name=agent_name,
         bundle_location=agent_bundle_location,
         version=1,
-        kind=encode_agent_kind("session"),
+        kind=encode_agent_kind("user"),
         description=agent_description,
         created_by=created_by,
     )
@@ -1468,6 +1470,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             ).all()
         return {row.id: row.runner_id for row in rows}
+
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Read one session's bound runner and heartbeat from the metadata DB only."""
+        with self._session("get_runner_liveness") as session:
+            row = session.execute(
+                select(
+                    SqlConversationMetadata.runner_id,
+                    SqlConversationMetadata.runner_last_seen,
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+            ).one_or_none()
+        return (row.runner_id, row.runner_last_seen) if row is not None else None
 
     def get_session_connectivity(
         self, conversation_ids: list[str]
@@ -3266,6 +3282,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
             batch_stable: dict[str, ConversationItem] = {}
+            has_new_conversation_activity = False
             for item, prepared, search in prepared_rows:
                 item_id = cast(str, prepared["id"])
                 if item.stable_id is not None and item.stable_id in batch_stable:
@@ -3384,6 +3401,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if search is not None:
                     fts_rows.append((item_id, conversation_id, search))
                 row_values.append(values)
+                if item.type != "resource_event":
+                    has_new_conversation_activity = True
                 persisted.append(
                     ConversationItem(
                         id=item_id,
@@ -3406,7 +3425,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # dominates append latency against a remote managed Postgres.
             if row_values:
                 session.execute(insert(SqlConversationItem), row_values)
-                if conv_row is not None and not items[0].native_recovery:
+                if (
+                    conv_row is not None
+                    and not items[0].native_recovery
+                    and has_new_conversation_activity
+                ):
                     conv_row.updated_at = now
             insert_fts_bulk(session, fts_rows)
 
@@ -4593,7 +4616,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         descending_scan = is_desc if forward else not is_desc
         return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
 
-    def update_conversation(
+    def update_conversation_with_changes(
         self,
         conversation_id: str,
         title: str | None = None,
@@ -4612,8 +4635,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         archived: bool | None = None,
         close_cli_on_archive: bool = False,
         archive_stop_when_idle: bool = False,
+        delete_worktree: bool = False,
         reported_model: str | None = None,
-    ) -> Conversation | None:
+    ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
 
@@ -4665,8 +4689,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             server-reserved idle-deferral label with the new archive revision
             in the same transaction. A transition without it deletes any
             prior label, as does unarchive. No effect outside a transition.
-        :returns: The updated :class:`Conversation`, or ``None``
-            if the conversation does not exist.
+        :param delete_worktree: When ``True`` alongside
+            ``close_cli_on_archive``, stamp the server-reserved
+            worktree-delete label naming the archive revision the durable
+            teardown must remove the root's recorded worktree for. On a
+            transition that is the new revision; on an already-archived
+            session it is the current revision and the same call re-opens
+            the close (clearing any completed revision) so a delete-only
+            teardown runs. A transition without it deletes any prior label,
+            as does unarchive.
+        :returns: The updated conversation and requested model-setting change
+            flags, or ``None`` if the conversation does not exist.
         """
         now = now_epoch()
         encoded_terminal_launch_args = (
@@ -4677,7 +4710,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # binding + per-session override blob) and Omnigent (metadata).
         def update_ap(
             ap_sess: Session,
-        ) -> tuple[SqlConversation, dict[str, str]] | None:
+        ) -> tuple[SqlConversation, dict[str, str], bool, bool] | None:
             row_query = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == conversation_id,
@@ -4695,16 +4728,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             # preserve keys changed by another writer. It is deterministic on replay.
             overrides = _decode_session_overrides(row.session_overrides)
             overrides_changed = False
+            reasoning_effort_changed = False
+            model_override_changed = False
             if _unset_reasoning_effort:
+                reasoning_effort_changed = overrides["reasoning_effort"] is not None
                 overrides["reasoning_effort"] = None
                 overrides_changed = True
             elif reasoning_effort is not None:
+                reasoning_effort_changed = overrides["reasoning_effort"] != reasoning_effort
                 overrides["reasoning_effort"] = reasoning_effort
                 overrides_changed = True
             if _unset_model_override:
+                model_override_changed = overrides["model_override"] is not None
                 overrides["model_override"] = None
                 overrides_changed = True
             elif model_override is not None:
+                model_override_changed = overrides["model_override"] != model_override
                 overrides["model_override"] = model_override
                 overrides_changed = True
             if reported_model is not None:
@@ -4793,11 +4832,48 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 SqlConversationLabel.key == ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
                             )
                         )
+                    if archived and close_cli_on_archive and delete_worktree:
+                        # Names this revision in the same commit as the
+                        # transition, so the durable teardown can never observe
+                        # the archive without its worktree-delete intent.
+                        _upsert_labels(
+                            ap_sess,
+                            conversation_id,
+                            {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(row.archive_revision)},
+                            now,
+                        )
+                    else:
+                        # An archive without the flag and an unarchive both void
+                        # the prior revision's delete intent; drop the stale row.
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+                            )
+                        )
+                    ap_changed = True
+                elif archived and row.archived and close_cli_on_archive and delete_worktree:
+                    # A delete on an already-archived session is a delete-only
+                    # close request for the current revision: no transition,
+                    # but the teardown must run again to remove the worktree.
+                    # Clearing the completed revision re-opens the close so the
+                    # durable coordinator picks the work up; the label names
+                    # the revision the teardown must act on.
+                    _upsert_labels(
+                        ap_sess,
+                        conversation_id,
+                        {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(row.archive_revision)},
+                        now,
+                    )
+                    row.archive_close_requested_revision = row.archive_revision
+                    row.archive_close_completed_revision = None
+                    row.archive_close_last_error = None
                     ap_changed = True
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)
-            return row, labels
+            return row, labels, reasoning_effort_changed, model_override_changed
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -4806,7 +4882,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return None
-        row, labels = ap_result
+        row, labels, reasoning_effort_changed, model_override_changed = ap_result
         if terminal_launch_args is not None:
             recreated_metadata_kind = encode_conversation_kind(
                 "sub_agent" if row.parent_conversation_id else "default"
@@ -4841,7 +4917,99 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         else:
             meta = self._get_meta(conversation_id)
-        return _to_conversation(row, meta, labels)
+        return ConversationUpdateResult(
+            conversation=_to_conversation(row, meta, labels),
+            reasoning_effort_changed=reasoning_effort_changed,
+            model_override_changed=model_override_changed,
+        )
+
+    def update_conversation(
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        reasoning_effort: str | None = None,
+        _unset_reasoning_effort: bool = False,
+        model_override: str | None = None,
+        _unset_model_override: bool = False,
+        cost_control_mode_override: str | None = None,
+        _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
+        harness_override: str | None = None,
+        _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
+        terminal_launch_args: list[str] | None = None,
+        archived: bool | None = None,
+        close_cli_on_archive: bool = False,
+        archive_stop_when_idle: bool = False,
+        delete_worktree: bool = False,
+        reported_model: str | None = None,
+    ) -> Conversation | None:
+        """Update a conversation, preserving the legacy return contract."""
+        result = self.update_conversation_with_changes(
+            conversation_id=conversation_id,
+            title=title,
+            reasoning_effort=reasoning_effort,
+            _unset_reasoning_effort=_unset_reasoning_effort,
+            model_override=model_override,
+            _unset_model_override=_unset_model_override,
+            cost_control_mode_override=cost_control_mode_override,
+            _unset_cost_control_mode_override=_unset_cost_control_mode_override,
+            subagent_routing_override=subagent_routing_override,
+            _unset_subagent_routing_override=_unset_subagent_routing_override,
+            harness_override=harness_override,
+            _unset_harness_override=_unset_harness_override,
+            share_workspace_files=share_workspace_files,
+            terminal_launch_args=terminal_launch_args,
+            archived=archived,
+            close_cli_on_archive=close_cli_on_archive,
+            archive_stop_when_idle=archive_stop_when_idle,
+            delete_worktree=delete_worktree,
+            reported_model=reported_model,
+        )
+        return result.conversation if result is not None else None
+
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Roll back refused settings under the row lock, retaining newer field values."""
+        settings: dict[str, tuple[str | None, str | None]] = {}
+        if restore_effort:
+            settings["reasoning_effort"] = (attempted.reasoning_effort, previous.reasoning_effort)
+        if restore_model:
+            settings["model_override"] = (attempted.model_override, previous.model_override)
+        if not settings:
+            return
+
+        def restore(session: Session) -> None:
+            query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                query = query.with_for_update()
+            row = session.scalar(query)
+            if row is None:
+                return
+            overrides = _decode_session_overrides(row.session_overrides)
+            changed = False
+            for key, (expected, original) in settings.items():
+                if overrides.get(key) == expected and expected != original:
+                    overrides[key] = original
+                    changed = True
+            if changed:
+                row.session_overrides = _encode_session_overrides(overrides)
+                row.updated_at = now_epoch()
+
+        run_write_transaction(
+            self._conv_session_immediate, "restore_session_settings_if_matches", restore
+        )
 
     def reassign_live_children(
         self,
@@ -5308,6 +5476,38 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_session_live_status", write)
 
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Settle stop intent without overwriting a replacement runner or failure."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == runner_id,
+                        or_(
+                            SqlConversationMetadata.live_status.is_(None),
+                            SqlConversationMetadata.live_status.in_(
+                                [
+                                    encode_session_live_status("idle"),
+                                    encode_session_live_status("running"),
+                                    encode_session_live_status("waiting"),
+                                ]
+                            ),
+                        ),
+                    )
+                    .values(live_status=encode_session_live_status("idle"))
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(
+            self._session_immediate, "settle_intentionally_stopped_session", write
+        )
+
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Settle a stale running row with one conditional update."""
 
@@ -5688,6 +5888,36 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
+
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Page teardown candidates through the workspace/runner/session-ID index."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        statement = select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.runner_id == runner_id,
+        )
+        if after is not None:
+            statement = statement.where(SqlConversationMetadata.id > after)
+        statement = statement.order_by(SqlConversationMetadata.id).limit(limit)
+        with self._session("list_runner_session_statuses") as session:
+            rows = session.execute(statement).all()
+        statuses: list[tuple[str, str | None]] = []
+        for session_id, status in rows:
+            try:
+                decoded = decode_session_live_status(status) if status is not None else None
+            except ValueError:
+                # A newer replica's status must not discard the rest of this page.
+                _logger.debug(
+                    "Unknown live status %r for session %s during runner teardown",
+                    status,
+                    session_id,
+                )
+                decoded = None
+            statuses.append((session_id, decoded))
+        return statuses
 
     def list_conversations_by_runner_id(
         self,
@@ -6371,7 +6601,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         new_conv_id = conversation_id
         creating_clone = cloned_agent_bundle_location is not None
         encoded_default_kind = encode_conversation_kind("default")
-        encoded_session_agent_kind = encode_agent_kind("session")
+        encoded_session_agent_kind = encode_agent_kind("user")
 
         # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
         # from the Omnigent DB before opening the AP session.
@@ -6773,6 +7003,51 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return _to_conversation(new_conv, fork_meta, fork_labels)
 
+    def list_session_roots_for_agent(self, agent_id: str, limit: int) -> list[str]:
+        """
+        Up to *limit* distinct roots of sessions using *agent_id* (see the protocol docstring).
+
+        Pages ``ix_conversations_agent_id`` in id order and dedupes as it goes, so
+        one tree's children never crowd out other roots.
+        """
+        # ponytail: reads at most 1,000 rows, so an agent used by more sessions can
+        # hide later roots; an index on (agent_id, root_conversation_id) lifts that.
+        page_size, max_pages = 200, 5
+        roots: dict[str, None] = {}
+        after: str | None = None
+        with self._conv_session("list_session_roots_for_agent") as session:
+            for _ in range(max_pages):
+                stmt = select(SqlConversation.id, SqlConversation.root_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id == agent_id,
+                )
+                if after is not None:
+                    stmt = stmt.where(SqlConversation.id > after)
+                rows = session.execute(stmt.order_by(SqlConversation.id).limit(page_size)).all()
+                roots.update(
+                    dict.fromkeys(
+                        row.root_conversation_id for row in rows if row.root_conversation_id
+                    )
+                )
+                if len(rows) < page_size or len(roots) >= limit:
+                    break
+                after = rows[-1].id
+        return list(roots)[:limit]
+
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """Unordered ``LIMIT`` over ``ix_conversations_agent_id``; reads at most *cap* rows."""
+        with self._conv_session("count_sessions_for_agent") as session:
+            rows = (
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id == agent_id,
+                )
+                .limit(cap)
+                .subquery()
+            )
+            return session.execute(select(func.count()).select_from(rows)).scalar_one()
+
     def has_other_live_session_in_workspace(
         self,
         *,
@@ -6879,9 +7154,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Omnigent-side rows (metadata/comments/policies/permissions) are cleaned up
         # second. A failure of the second transaction leaves orphaned Omnigent rows
         # for a conversation that no longer exists — an acceptable best-effort tradeoff.
-        encoded_session_agent_kind = encode_agent_kind("session")
+        # Agent rows are never deleted here: agents outlive the sessions using them
+        # and only an explicit agent removal deletes one.
 
-        def delete_ap(ap_sess: Session) -> tuple[list[str], set[str]] | None:
+        def delete_ap(ap_sess: Session) -> list[str] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
@@ -6902,40 +7178,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             subtree_ids = [
                 cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
             ]
-            # Collect the subtree's agent bindings before their rows go, so
-            # the Omnigent transaction below can delete the session-scoped
-            # agent rows that backed these conversations. Only include agents
-            # with NO surviving reference outside the deleted subtree: a
-            # session-scoped agent may be referenced by multiple conversations
-            # (e.g. when POST /v1/sessions reuses an existing agent_id), and
-            # should only be removed when ALL its referrers are deleted.
-            candidate_agent_ids = {
-                cast(str, candidate_agent_id)
-                for candidate_agent_id in ap_sess.execute(
-                    select(SqlConversation.agent_id).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id.in_(subtree_ids),
-                        SqlConversation.agent_id.is_not(None),
-                    )
-                )
-                .scalars()
-                .all()
-                if candidate_agent_id is not None
-            }
-            # Keep only agents that have no remaining reference outside the
-            # subtree being deleted.
-            surviving_refs = set(
-                ap_sess.execute(
-                    select(SqlConversation.agent_id).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.agent_id.in_(candidate_agent_ids),
-                        SqlConversation.id.not_in(subtree_ids),
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            bound_agent_ids = candidate_agent_ids - surviving_refs
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -6966,7 +7208,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             ap_sess.delete(row)
-            return subtree_ids, bound_agent_ids
+            return subtree_ids
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -6975,7 +7217,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return False
-        subtree_ids, bound_agent_ids = ap_result
+        subtree_ids = ap_result
 
         def delete_metadata(session: Session) -> None:
             session.execute(
@@ -7002,18 +7244,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(subtree_ids),
                 )
             )
-            if bound_agent_ids:
-                # Session-scoped agents are 1:1 with their conversation
-                # (forks always clone a fresh agent), so every binding
-                # collected from the deleted subtree is dead. Template
-                # agents are shared and survive via the kind guard.
-                session.execute(
-                    delete(SqlAgent).where(
-                        SqlAgent.workspace_id == current_workspace_id(),
-                        SqlAgent.id.in_(bound_agent_ids),
-                        SqlAgent.kind == encoded_session_agent_kind,
-                    )
-                )
 
         run_write_transaction(
             self._session_immediate,

@@ -19,7 +19,6 @@ import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
-import { effectiveWorktree } from "./types";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -348,7 +347,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
   setSessionHost(wire.id, wire.host_id);
-  setSessionParent(wire.id, wire.parent_session_id);
+  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
     agentId: wire.agent_id,
@@ -980,15 +979,12 @@ export async function forkSession(
 
 /**
  * Fork a generic side chat in the parent's current working directory.
- * Hosted sessions launch a separate runner; CLI sessions use their existing
- * runner, and in-process sessions use normal server dispatch. Codex uses its
+ * Reuse the parent's live runner, relaunching the parent first if it has
+ * stopped. In-process sessions use normal server dispatch. Codex uses its
  * native `/side` fork instead.
  *
- * Like native Codex side chats, these share the parent's working tree: the
- * fork launches in the source's effective worktree (its recorded worktree,
- * else its launch directory — MOD-xho04), so a project-entry session's side
- * chat reads git state from the parent's worktree. A saved branch may belong
- * to a previous host and must not be required to send.
+ * Like native Codex side chats, these share the parent's workspace. A saved
+ * branch may belong to a previous host and must not be required to send.
  *
  * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
  * @returns The new side-chat session id.
@@ -996,22 +992,22 @@ export async function forkSession(
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
   let source = await getSession(sourceId);
-  if (source.hostResumable && source.hostOnline === false && source.runnerOnline !== true) {
+  if (
+    source.runnerOnline === false &&
+    source.hostId != null &&
+    (source.hostOnline !== false || source.hostResumable)
+  ) {
     await retrySession(sourceId);
     source = await getSession(sourceId);
   }
-  const { hostId, runnerId } = source;
-  const repoPath = effectiveWorktree(source);
-  const canLaunchOnHost = hostId && repoPath && source.hostOnline !== false;
+  const { runnerId } = source;
   const canUseRunner =
     source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
-  if (!canLaunchOnHost && !canUseRunner) {
+  if (!canUseRunner) {
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  if (canLaunchOnHost) {
-    await launchRunner(hostId, fork.id, repoPath);
-  } else if (runnerId) {
+  if (runnerId) {
     await updateSession(fork.id, { runnerId });
   }
   return { childSessionId: fork.id };

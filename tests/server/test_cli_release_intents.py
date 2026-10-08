@@ -23,6 +23,7 @@ from omnigent.server.cli_retention import (
     CliRetentionHostLeaseLost,
 )
 from omnigent.stores.conversation_store import (
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     ConversationArchiveClosingError,
 )
@@ -85,6 +86,22 @@ class _RunnerRouter:
         if not self.online:
             raise RuntimeError("runner offline")
         return SimpleNamespace(runner_id=conversation.runner_id, client=self.client)
+
+
+class _GatedRunnerClient(_RunnerClient):
+    """Runner client whose one gated session release parks until released."""
+
+    def __init__(self, gate_url: str) -> None:
+        super().__init__()
+        self._gate_url = gate_url
+        self.entered = asyncio.Event()
+        self.released = asyncio.Event()
+
+    async def post(self, url: str, *, json: dict[str, object], timeout: float):
+        if url == self._gate_url:
+            self.entered.set()
+            await self.released.wait()
+        return await super().post(url, json=json, timeout=timeout)
 
 
 class _UnconnectedRunnerRouter:
@@ -476,9 +493,9 @@ async def test_child_archive_keeps_runner_shared_with_live_parent_and_sibling(
             coordinator.trigger(parent.id)
             await coordinator.wait_for_idle()
     finally:
-        _sessions_common._intentional_stop_sessions.discard(parent.id)
-        _sessions_common._intentional_stop_sessions.discard(child_a.id)
-        _sessions_common._intentional_stop_sessions.discard(child_b.id)
+        _sessions_common._intentional_stop_sessions.pop(parent.id, None)
+        _sessions_common._intentional_stop_sessions.pop(child_a.id, None)
+        _sessions_common._intentional_stop_sessions.pop(child_b.id, None)
 
     stop_runner.assert_awaited_once()
 
@@ -564,6 +581,80 @@ async def test_fallback_archive_stop_keeps_runner_shared_with_live_parent(
         )
 
     stop_host_runner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_deletes_worktree_once_after_every_target_completes(
+    db_uri: str,
+) -> None:
+    """The delete waits for the whole tree and runs exactly once."""
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions import common as _sessions_common
+
+    host_id = "a4b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b4b2c3d4e5f61234567890abcdef0123"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation()
+    child = conversations.create_conversation(parent_conversation_id=root.id)
+    conversations.set_host_id(
+        root.id,
+        host_id,
+        workspace="/opt/work/omnigent/fork/root",
+        git_branch="feature/root",
+    )
+    conversations.set_runner_id(root.id, runner_id)
+    conversations.set_host_id(
+        child.id, host_id, workspace="/opt/work/omnigent/fork/child", git_branch="feature/child"
+    )
+    conversations.set_runner_id(child.id, runner_id)
+    archived = conversations.update_conversation(
+        root.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+    )
+    assert archived is not None
+    assert archived.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(archived.archive_revision)
+    intents = CliReleaseIntentStore(db_uri)
+    client = _GatedRunnerClient(f"/v1/sessions/{child.id}/cli-retention/release")
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=_RunnerRouter(client, online=True),
+        intent_store=intents,
+        scan_interval_seconds=3600,
+    )
+    remove = AsyncMock()
+    stop_runner = AsyncMock(return_value="acked")
+    try:
+        with (
+            patch.object(sessions_facade, "_remove_session_worktree_best_effort", remove),
+            patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_runner),
+        ):
+            coordinator.trigger(root.id)
+            await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+            # Another target on the shared runner is still mid-teardown.
+            remove.assert_not_awaited()
+
+            client.released.set()
+            await coordinator.wait_for_idle()
+            # A later scan of the completed root must not repeat the delete.
+            coordinator.trigger(root.id)
+            await coordinator.wait_for_idle()
+    finally:
+        for conversation in (root, child):
+            _sessions_common._intentional_stop_sessions.pop(conversation.id, None)
+
+    remove.assert_awaited_once()
+    kwargs = remove.await_args.kwargs
+    assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/root"
+    assert kwargs["branch"] == "feature/root"
+    assert kwargs["delete_branch"] is False
+    assert kwargs["exclude_conversation_id"] == root.id
+    settled = conversations.get_conversation(root.id)
+    assert settled is not None
+    assert settled.archive_close_completed_revision == settled.archive_revision
 
 
 def test_host_pool_selection_lease_is_single_owner_without_touching_liveness(
@@ -1091,7 +1182,7 @@ async def test_archive_intent_completes_when_host_reports_unknown_runner(
             coordinator.trigger(root.id)
             await coordinator.wait_for_idle()
     finally:
-        _sessions_common._intentional_stop_sessions.discard(root.id)
+        _sessions_common._intentional_stop_sessions.pop(root.id, None)
 
     stop_outcome.assert_awaited_once()
     assert root.id not in _sessions_common._intentional_stop_sessions
@@ -1146,7 +1237,7 @@ async def test_archive_execute_intent_completes_when_host_row_deleted(
         with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_unavailable):
             assert await coordinator_no_tunnel._execute_intent(intent) == "completed"
     finally:
-        _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
+        _sessions_common._intentional_stop_sessions.pop(intent.target_session_id, None)
     stop_unavailable.assert_awaited_once()
     assert len(client.posts) == 1
 
@@ -1159,7 +1250,7 @@ async def test_archive_execute_intent_completes_when_host_row_deleted(
         ):
             assert await coordinator_live._execute_intent(intent) == "runner_or_host_unavailable"
     finally:
-        _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
+        _sessions_common._intentional_stop_sessions.pop(intent.target_session_id, None)
     stop_unavailable_live.assert_awaited_once()
     assert len(client.posts) == 2
 
@@ -1169,7 +1260,7 @@ async def test_archive_execute_intent_completes_when_host_row_deleted(
         with patch.object(sessions_facade, "_stop_session_host_runner_outcome", stop_acked):
             assert await coordinator_live._execute_intent(intent) == "completed"
     finally:
-        _sessions_common._intentional_stop_sessions.discard(intent.target_session_id)
+        _sessions_common._intentional_stop_sessions.pop(intent.target_session_id, None)
     stop_acked.assert_awaited_once()
     assert len(client.posts) == 3
 
@@ -1208,8 +1299,8 @@ async def test_shared_gone_runner_completes_non_owner_without_host_stop(
             coordinator.trigger(root.id)
             await coordinator.wait_for_idle()
     finally:
-        _sessions_common._intentional_stop_sessions.discard(root.id)
-        _sessions_common._intentional_stop_sessions.discard(child.id)
+        _sessions_common._intentional_stop_sessions.pop(root.id, None)
+        _sessions_common._intentional_stop_sessions.pop(child.id, None)
 
     stop_outcome.assert_awaited_once()
     assert intents.archive_targets_complete(root.id, archived.archive_revision)
@@ -1413,7 +1504,7 @@ async def test_archive_intent_completes_when_runner_acks_stop(db_uri: str) -> No
             coordinator.trigger(root.id)
             await coordinator.wait_for_idle()
     finally:
-        _sessions_common._intentional_stop_sessions.discard(root.id)
+        _sessions_common._intentional_stop_sessions.pop(root.id, None)
 
     stop_outcome.assert_awaited_once()
     settled = conversations.get_conversation(root.id)

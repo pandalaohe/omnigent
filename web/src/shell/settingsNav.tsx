@@ -116,7 +116,6 @@ export function settingsNavGroups(
   isAdmin = false,
   isSingleUser = false,
   integrationsEnabled = false,
-  harnessesEnabled = false,
   sessionCollabEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
@@ -125,6 +124,7 @@ export function settingsNavGroups(
     { id: "keep-warm", label: "Keep-warm", icon: FlameIcon },
     { id: "calling-defaults", label: "Calling defaults", icon: SlidersHorizontalIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
+    { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
     { id: "context-usage", label: "Context & usage", icon: GaugeIcon },
@@ -140,10 +140,6 @@ export function settingsNavGroups(
       label: "Session collaboration",
       icon: UsersIcon,
     });
-  }
-  // WIP: gated behind the `harness_settings_ui` release feature. Slots after Appearance.
-  if (harnessesEnabled) {
-    general.splice(2, 0, { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon });
   }
   // Sandbox Integrations appears once any connection provider is wired
   // (enabled_connections non-empty). Slots right after Git.
@@ -235,12 +231,8 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    // Harnesses is WIP behind the `harness_settings_ui` release feature; a deep link to
-    // it while disabled falls back to the default section rather than an empty
-    // page. Session collaboration is gated the same way on
-    // `session_peer_messaging`. Keeps content, nav, and header in agreement on
-    // availability.
-    !(next === "harnesses" && !isFeatureEnabled(info, "harness_settings_ui")) &&
+    // Session collaboration is gated on `session_peer_messaging`: a deep link to it while disabled
+    // falls back to the default section rather than an empty page, keeping content, nav and header in agreement.
     !(next === "session-collab" && !isFeatureEnabled(info, "session_peer_messaging"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
@@ -285,7 +277,6 @@ export function SettingsSidebarBody({
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
   const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
-  const harnessesEnabled = isFeatureEnabled(info, "harness_settings_ui");
   const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
@@ -294,7 +285,6 @@ export function SettingsSidebarBody({
     isAdmin,
     isSingleUserMode(info),
     integrationsEnabled,
-    harnessesEnabled,
     sessionCollabEnabled,
   );
 

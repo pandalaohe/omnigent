@@ -270,7 +270,7 @@ async def test_late_codex_forwarder_closes_only_its_app_server(
             bridge_dir=tmp_path,
             codex_ws_url="ws://127.0.0.1:1",
             thread_id="thread-old",
-            owned_app_server=old,  # type: ignore[arg-type]
+            app_server=old,  # type: ignore[arg-type]
         )
         assert native_runtime._AUTO_CODEX_APP_SERVERS[session_id] is new
         assert old.closed is True

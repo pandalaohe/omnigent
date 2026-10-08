@@ -8,6 +8,7 @@ import {
   BRIDGE_SOURCE,
   buildBridgeScript,
   findAnchorInSource,
+  HTML_COMMENT_BRIDGE_RUNTIME,
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
@@ -19,7 +20,10 @@ import {
 describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
   const SCRIPT_OPEN = `<script data-omni-nonce="${NONCE}">`;
+  const LOADER_URL = "https://app.example/assets/html-comment-bridge.js";
 
+  // The prepared head carries its own <script> (same-page anchors), so the
+  // bridge script is located by its nonce.
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
     const out = injectCommentBridge(html, NONCE);
@@ -36,16 +40,17 @@ describe("injectCommentBridge", () => {
   });
 
   it("appends to a bare fragment with no body/html", () => {
-    const out = injectCommentBridge("<p>just a fragment</p>", NONCE);
-    // prepareHtmlPreviewDoc prepends <base> for a bare fragment; the bridge is
-    // then appended at the end since there's no </body>/</html> to inject before.
+    const out = injectCommentBridge("<p>just a fragment</p>", NONCE, LOADER_URL);
+    // prepareHtmlPreviewDoc prepends its head markup for a bare fragment; the
+    // bridge is then appended at the end since there's no </body>/</html> to
+    // inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf(SCRIPT_OPEN)).toBeGreaterThan(fragAt);
+    expect(out.indexOf(`data-omni-nonce="${NONCE}"`)).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {
-    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE);
+    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE, LOADER_URL);
     expect(out).toContain('<base target="_blank">');
   });
 
@@ -56,6 +61,19 @@ describe("injectCommentBridge", () => {
     expect(script).toContain(bridgeSource.replace(/<\/script/gi, "<\\/script"));
   });
 
+  it("includes the highlight style for the Custom Highlight ranges", () => {
+    const out = injectCommentBridge("<body></body>", NONCE);
+    expect(out).toContain("::highlight(omni-comment)");
+    expect(out).toContain("::highlight(omni-comment-active)");
+  });
+
+  it("loads the static runtime externally for a no-inline CSP", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
+    expect(out).toContain(`src="${LOADER_URL}"`);
+    expect(out).toContain(`data-omni-nonce="${NONCE}"`);
+    expect(out).not.toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+  });
+
   it("escapes an HTML-special nonce in the attribute", () => {
     expect(buildBridgeScript('a"b&c<d')).toContain('data-omni-nonce="a&quot;b&amp;c&lt;d"');
   });
@@ -64,6 +82,27 @@ describe("injectCommentBridge", () => {
     // The asset runs verbatim in the frame; an escaping typo would only surface
     // at runtime. new Function throws on a syntax error.
     expect(() => new Function(bridgeSource)).not.toThrow();
+  });
+
+  it("injects the same runtime inline without a network dependency", () => {
+    const out = injectCommentBridge("<body></body>", NONCE);
+    expect(out).toContain(`<script data-omni-nonce="${NONCE}">`);
+    expect(out).toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+    expect(out).not.toContain("<script src=");
+  });
+
+  it("keeps the inline runtime body free of closing script tags", () => {
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/<\/script/i);
+  });
+
+  it("escapes runtime URLs and nonces as HTML attributes", () => {
+    const out = injectCommentBridge(
+      "<body></body>",
+      "nonce&\"'<>value",
+      'https://app.example/a?x=1&y="2"\'<>',
+    );
+    expect(out).toContain('src="https://app.example/a?x=1&amp;y=&quot;2&quot;&#39;&lt;&gt;"');
+    expect(out).toContain('data-omni-nonce="nonce&amp;&quot;&#39;&lt;&gt;value"');
   });
 });
 
@@ -81,6 +120,11 @@ describe("omni-html-bridge.js constants", () => {
     for (const [key, value] of Object.entries(BRIDGE_MSG)) {
       expect(t.get(key), `T.${key}`).toBe(value);
     }
+  });
+
+  it("keeps the asset loadable under the embed's strict script-src", () => {
+    // No unsafe-eval in the frame's CSP, so the runtime must not eval.
+    expect(bridgeSource).not.toMatch(/\b(?:eval|Function)\s*\(/);
   });
 });
 

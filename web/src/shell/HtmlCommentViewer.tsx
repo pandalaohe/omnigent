@@ -27,6 +27,7 @@ import {
   useArtifactEntry,
 } from "@/hooks/useArtifactLink";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot, hasOmnigentHostFetcher } from "@/lib/host";
 import { withBasePath } from "@/lib/basePath";
 import { randomUUID } from "@/lib/randomUUID";
@@ -46,6 +47,13 @@ import {
   parseBridgeMessage,
 } from "./htmlCommentBridge";
 import { TruncatedBanner } from "./TruncatedBanner";
+
+// Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
+const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
+  "../../public/omni-html-bridge.js?no-inline",
+  import.meta.url,
+).href;
+const BRIDGE_READY_TIMEOUT_MS = 5_000;
 
 interface HtmlCommentViewerProps {
   conversationId: string;
@@ -99,9 +107,6 @@ function activePayload(source: string, sel: ActiveSelection | null) {
 // The bridge reports its `location.pathname`; this pulls out the path inside
 // the bundle (the last segment of the route is the token).
 const ARTIFACT_TAIL_RE = /\/v1\/artifacts\/[^/]+\/(.*)$/;
-
-/** How long after an iframe load we wait for the bridge's `ready`. */
-const BRIDGE_READY_TIMEOUT_MS = 4000;
 
 /** Re-mint a panel token this long before its expiry. */
 const PANEL_REFRESH_LEAD_MS = 5 * 60 * 1000;
@@ -302,6 +307,7 @@ export function HtmlCommentViewer({
   const isEmbed = hasOmnigentHostFetcher();
   const openFile = useFileViewer();
   const { root: workspaceRoot, home: workspaceHome } = useWorkspacePaths();
+  const loadBridgeExternally = useIsEmbedded();
 
   // Embed mode cannot carry an iframe `src` through the host fetcher: it keeps
   // the client-injected srcdoc (bridge + fresh nonce per content load, which
@@ -309,8 +315,15 @@ export function HtmlCommentViewer({
   const embedDoc = useMemo(() => {
     if (!isEmbed) return null;
     const n = genNonce();
-    return { nonce: n, srcDoc: injectCommentBridge(content, n) };
-  }, [isEmbed, content]);
+    return {
+      nonce: n,
+      srcDoc: injectCommentBridge(
+        content,
+        n,
+        loadBridgeExternally ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+      ),
+    };
+  }, [isEmbed, content, loadBridgeExternally]);
 
   const load = useArtifactEntry(conversationId, path, !isEmbed);
   // A re-minted entry for the same file, swapped in when the panel token nears
@@ -347,7 +360,6 @@ export function HtmlCommentViewer({
   // A mount's first frame document is the entry; a later `load` replaces it.
   const entryDocumentLoadedRef = useRef(false);
   const [bridgeMissing, setBridgeMissing] = useState(false);
-
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
@@ -625,7 +637,10 @@ export function HtmlCommentViewer({
       // The bridge is inlined by the server; when the asset is missing from the
       // deployment, nothing answers and comments are impossible on this page.
       clearReadyTimer();
-      readyTimer = window.setTimeout(() => setBridgeMissing(true), BRIDGE_READY_TIMEOUT_MS);
+      readyTimer = window.setTimeout(() => {
+        console.warn("HTML comment bridge did not become ready; comments are unavailable.");
+        setBridgeMissing(true);
+      }, BRIDGE_READY_TIMEOUT_MS);
     };
 
     iframe.addEventListener("load", onLoad);

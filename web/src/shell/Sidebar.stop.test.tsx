@@ -127,6 +127,9 @@ describe("sidebar Stop session item", () => {
     openKebab();
     fireEvent.click(screen.getByTestId("stop-conversation"));
 
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "stops its runner, including side chats running on it",
+    );
     // The confirm dialog gates the mutation — nothing fires on item click.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
 
@@ -169,6 +172,11 @@ describe("sidebar Stop session item", () => {
     renderSidebar();
     openKebab();
     expect(screen.getByTestId("stop-conversation")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("stop-conversation"));
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "This terminates the running session for My Session. Conversation histories are kept.",
+    );
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("stops its runner");
   });
 
   it("is hidden for a local in-process runner (runner_id, no host_id)", () => {

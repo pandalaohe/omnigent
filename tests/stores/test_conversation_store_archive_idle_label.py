@@ -9,7 +9,10 @@ void it.
 
 from __future__ import annotations
 
-from omnigent.stores.conversation_store import ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -122,3 +125,110 @@ def test_flag_without_a_close_request_writes_no_label(
     assert archived is not None
     assert archived.archive_close_requested_revision is None
     assert ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY not in archived.labels
+
+
+def test_archive_transition_writes_the_worktree_delete_label_in_the_same_call(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``delete_worktree`` stamps the new revision and close request atomically."""
+    conv = conversation_store.create_conversation()
+
+    archived = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+    )
+
+    assert archived is not None
+    assert archived.archive_revision == 1
+    assert archived.archive_close_requested_revision == 1
+    assert archived.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == "1"
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert stored.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == "1"
+
+
+def test_unarchive_deletes_the_worktree_delete_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The unarchive transition voids and removes the delete intent."""
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+    )
+
+    unarchived = conversation_store.update_conversation(conv.id, archived=False)
+
+    assert unarchived is not None
+    assert unarchived.archive_revision == 2
+    assert ARCHIVE_DELETE_WORKTREE_LABEL_KEY not in unarchived.labels
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert ARCHIVE_DELETE_WORKTREE_LABEL_KEY not in stored.labels
+
+
+def test_archive_without_delete_removes_a_stale_worktree_delete_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A plain re-archive drops a delete intent left by an earlier revision."""
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+    )
+    conversation_store.update_conversation(conv.id, archived=False)
+    conversation_store.set_labels(conv.id, {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: "1"})
+
+    archived = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+    )
+
+    assert archived is not None
+    assert archived.archive_revision == 3
+    assert ARCHIVE_DELETE_WORKTREE_LABEL_KEY not in archived.labels
+
+
+def test_delete_worktree_on_an_archived_session_reopens_the_close(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A delete-only request keeps the revision and re-arms the close."""
+    conv = conversation_store.create_conversation()
+    archived = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+    )
+    assert archived is not None
+    revision = archived.archive_revision
+    assert (
+        conversation_store.claim_archive_close(
+            conv.id,
+            revision,
+            "worker",
+            claimed_at=100,
+            stale_before=0,
+        )
+        == "claimed"
+    )
+    assert conversation_store.complete_archive_close(conv.id, revision, "worker")
+
+    re_requested = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+    )
+
+    assert re_requested is not None
+    assert re_requested.archive_revision == revision
+    assert re_requested.archive_close_requested_revision == revision
+    assert re_requested.archive_close_completed_revision is None
+    assert re_requested.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(revision)

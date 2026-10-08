@@ -225,16 +225,19 @@ class SkillSummary(BaseModel):
     is intentionally omitted — it's only loaded server-side when
     the harness invokes the skill, and it can be large.
 
-    :param name: Skill identifier as parsed from the SKILL.md
-        frontmatter, e.g. ``"triage-issues"``. Lowercase
-        kebab-case.
+    :param name: Invocation identifier (the skill's directory name),
+        e.g. ``"triage-issues"``, typed as ``/triage-issues``.
     :param description: One-line summary from the SKILL.md
         frontmatter, e.g. ``"Triage open GitHub issues in the
         repo."``.
+    :param display_name: Human-facing label from the SKILL.md
+        frontmatter ``name``, e.g. ``"Triage Issues"``. ``None`` when
+        it equals ``name`` or the source has no label.
     """
 
     name: str
     description: str
+    display_name: str | None = None
 
 
 class NativeReasoningEffortOption(BaseModel):
@@ -2628,6 +2631,14 @@ class UpdateSessionRequest(BaseModel):
     :param archive_locked: Protect an archived session from bulk deletion.
         ``True`` locks it, ``False`` unlocks it, and ``None`` leaves the
         current lock unchanged. Owner-only.
+    :param delete_worktree: With ``archived=True``, also remove the
+        session's server-created git worktree directory once the archive
+        teardown runs (after the Undo grace; on an already-archived session
+        a delete-only teardown of its current archive revision runs the
+        same way). The branch is kept. It forces the CLI teardown for that
+        archive even on a host policy that keeps CLIs on archive, so the
+        worktree is never removed under a running CLI. Ignored for sessions
+        with no worktree; rejected (400) without ``archived=True``.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2661,6 +2672,7 @@ class UpdateSessionRequest(BaseModel):
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     archive_locked: bool | None = None
+    delete_worktree: bool = False
     project_id: str | None = None
     silent: bool = False
     stop_when_idle: bool = False
@@ -2929,7 +2941,7 @@ class SessionForkRequest(BaseModel):
     workspace: str | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
-    # side-chat tab). The fork otherwise behaves normally (its own runner).
+    # side-chat tab). It may share its parent's runner.
     side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")

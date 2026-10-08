@@ -41,6 +41,7 @@ const pickerAgentSchema = agentSchema.extend({
   // cold render de-duplicates template rows against the catalog the same way
   // a warm one does, instead of briefly showing each agent twice.
   templateId: z.string().optional(),
+  mine: z.literal(true).optional(),
 });
 const modelOptionSchema = z.object({
   id: z.string(),

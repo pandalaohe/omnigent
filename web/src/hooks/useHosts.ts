@@ -8,6 +8,7 @@ import {
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { isSandboxHostChoice, readLastHostChoice } from "@/lib/hostPreferences";
+import { ApiError } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -715,6 +716,37 @@ export function useDetectedCredentials(hostId: string | null | undefined, enable
       return Array.isArray(body.credentials) ? body.credentials : [];
     },
     enabled: enabled && !!hostId,
+    staleTime: 30_000,
+  });
+}
+
+export interface HarnessStartup {
+  command: string;
+  resolved_path: string | null;
+  command_source: "env" | "config" | "default";
+  arg_count: number;
+  /** Null when an older host reports only the count. */
+  args?: string[] | null;
+  configured_command?: string | null;
+  configured_args?: string[] | null;
+  environment?: {
+    inherit: boolean;
+    variables: Record<string, string>;
+    unset: string[];
+  } | null;
+}
+
+export function useHarnessStartup(hostId: string, harness: string) {
+  return useQuery({
+    queryKey: ["harness-startup", hostId, harness],
+    queryFn: async (): Promise<HarnessStartup> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/startup`,
+      );
+      if (!res.ok) throw new ApiError("Couldn't load launch settings", res.status, null);
+      return (await res.json()) as HarnessStartup;
+    },
+    retry: false,
     staleTime: 30_000,
   });
 }

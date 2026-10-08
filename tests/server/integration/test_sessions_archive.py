@@ -13,6 +13,7 @@ pipeline without subprocesses.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gzip
 import io
 import tarfile
@@ -27,7 +28,10 @@ from omnigent.server.cli_release_store import CliReleaseIntentStore
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
-from omnigent.stores.conversation_store import ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -358,7 +362,7 @@ async def test_archive_tears_down_host_spawned_runner(
         )
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
-        _sessions_common._intentional_stop_sessions.discard(session_id)
+        _sessions_common._intentional_stop_sessions.pop(session_id, None)
 
 
 async def test_failed_archive_leaves_session_running(
@@ -756,6 +760,176 @@ async def test_cancel_cannot_interrupt_teardown_in_flight(
             assert not registered.cancelled()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_worktree_requires_archive(
+    client: httpx.AsyncClient,
+) -> None:
+    """``delete_worktree`` without ``archived=true`` is rejected."""
+    session = await create_test_session(client, name="archive-worktree-invalid")
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "x", "delete_worktree": True},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("delete_worktree", [True, False])
+async def test_archive_stop_removes_worktree_when_requested(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    delete_worktree: bool,
+) -> None:
+    """The archive teardown removes the worktree (keeping the branch) only on opt-in."""
+    session = await create_test_session(client, name=f"archive-worktree-{delete_worktree}")
+    session_id = session["id"]
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    real_conv = conv_store.get_conversation(session_id)
+    assert real_conv is not None
+    worktree_conv = dataclasses.replace(
+        real_conv,
+        git_branch="feature/x",
+        workspace="/repo-worktrees/feature-x",
+        host_id="host_1",
+        runner_id=None,
+    )
+    mock_remove = AsyncMock()
+    with (
+        patch.object(conv_store, "get_conversation", return_value=worktree_conv),
+        patch.object(_sessions_facade, "_best_effort_stop", AsyncMock()),
+        patch.object(_sessions_facade, "_remove_session_worktree_best_effort", mock_remove),
+    ):
+        await _sessions_orchestration._archive_stop(
+            session_id,
+            conv_store,
+            runner_router=None,
+            host_registry=None,
+            delete_worktree=delete_worktree,
+        )
+    if not delete_worktree:
+        mock_remove.assert_not_awaited()
+        return
+    mock_remove.assert_awaited_once()
+    kwargs = mock_remove.await_args.kwargs
+    assert kwargs["worktree_path"] == "/repo-worktrees/feature-x"
+    assert kwargs["branch"] == "feature/x"
+    assert kwargs["delete_branch"] is False
+    assert kwargs["exclude_conversation_id"] == session_id
+
+
+def _keep_cli_host(app, db_uri: str, host_id: str) -> HostStore:
+    """A host whose policy keeps CLIs running on archive."""
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.upsert_on_connect(host_id, "archive-delete-host", "local")
+    host_store.replace_cli_retention_policy(
+        host_id,
+        CliRetentionPolicy(
+            idle_threshold_minutes=60,
+            max_idle_clis=10,
+            close_on_archive=False,
+        ),
+        expected_revision=0,
+    )
+    return host_store
+
+
+async def test_delete_worktree_forces_the_teardown_on_a_keep_cli_host(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A-X1: the explicit delete overrides ``close_on_archive=false``."""
+    session = await create_test_session(client, name="archive-delete-forces-close")
+    session_id = session["id"]
+    host_id = "8a2b3c4d5e6f1234567890abcdef0123"
+    _keep_cli_host(app, db_uri, host_id)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(
+        session_id,
+        host_id,
+        workspace="/opt/work/omnigent/fork/archive-delete-forces-close",
+        git_branch="feature/forced",
+    )
+    conv_store.set_runner_id(session_id, "b8b2c3d4e5f61234567890abcdef0123")
+
+    teardown = AsyncMock(return_value="acked")
+    remove = AsyncMock()
+    with (
+        patch.object(_sessions_facade, "_stop_session_host_runner_outcome", teardown),
+        patch.object(_sessions_facade, "_remove_session_worktree_best_effort", remove),
+    ):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"archived": True, "delete_worktree": True},
+        )
+        await _drain_detached_stops()
+
+    assert resp.status_code == 200
+    row = conv_store.get_conversation(session_id)
+    assert row is not None
+    assert row.archive_revision == 1
+    assert row.archive_close_requested_revision == 1
+    assert row.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == "1"
+    assert row.archive_close_completed_revision == 1
+    teardown.assert_awaited_once()
+    remove.assert_awaited_once()
+
+
+async def test_delete_worktree_on_an_already_archived_session_requests_the_teardown(
+    app,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """W2: a delete on an archived session is not a silent no-op."""
+    session = await create_test_session(client, name="archive-delete-again")
+    session_id = session["id"]
+    host_id = "9a2b3c4d5e6f1234567890abcdef0123"
+    _keep_cli_host(app, db_uri, host_id)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(
+        session_id,
+        host_id,
+        workspace="/opt/work/omnigent/fork/archive-delete-again",
+        git_branch="feature/again",
+    )
+    conv_store.set_runner_id(session_id, "c8b2c3d4e5f61234567890abcdef0123")
+
+    teardown = AsyncMock(return_value="acked")
+    remove = AsyncMock()
+    with (
+        patch.object(_sessions_facade, "_stop_session_host_runner_outcome", teardown),
+        patch.object(_sessions_facade, "_remove_session_worktree_best_effort", remove),
+    ):
+        first = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+        await _drain_detached_stops()
+        assert first.status_code == 200
+        row = conv_store.get_conversation(session_id)
+        assert row is not None
+        # The keep-CLI policy left the first archive with no teardown at all.
+        assert row.archive_close_requested_revision is None
+        teardown.assert_not_awaited()
+
+        second = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"archived": True, "delete_worktree": True},
+        )
+        await _drain_detached_stops()
+
+    assert second.status_code == 200
+    row = conv_store.get_conversation(session_id)
+    assert row is not None
+    assert row.archive_revision == 1  # no transition, no revision bump
+    assert row.archive_close_requested_revision == 1
+    assert row.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == "1"
+    assert row.archive_close_completed_revision == 1
+    teardown.assert_awaited_once()
+    remove.assert_awaited_once()
+    kwargs = remove.await_args.kwargs
+    assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/archive-delete-again"
+    assert kwargs["branch"] == "feature/again"
 
 
 # ── Agent contents download ──────────────────────────────
@@ -1466,6 +1640,27 @@ async def test_client_cannot_seed_the_archive_deferral_label(
         json={
             "archived": True,
             "labels": {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: "1"},
+        },
+    )
+    assert resp.status_code == 400
+
+    listed = await client.get(f"/v1/sessions/{session_id}")
+    assert listed.status_code == 200
+    assert listed.json()["archived"] is False
+
+
+async def test_client_cannot_seed_the_archive_worktree_delete_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """A client-supplied worktree-delete label is rejected like other reserved keys."""
+    session = await create_test_session(client, name="archive-forged-delete-label")
+    session_id = session["id"]
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "archived": True,
+            "labels": {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: "1"},
         },
     )
     assert resp.status_code == 400

@@ -8,7 +8,7 @@
 //     first handshake keeps a parent-applied selection.
 //   • embed mode (host fetcher installed): keeps the client-injected srcdoc and
 //     never mints.
-//   • no `ready` within 4 s → an "unavailable" notice.
+//   • no `ready` within 5 s → an "unavailable" notice.
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { type ReactNode, useMemo, useState } from "react";
@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
 import * as host from "@/lib/host";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { FileViewerContext } from "./FileViewerContext";
 import { HtmlCommentViewer, resolveFrameLinkPath } from "./HtmlCommentViewer";
 import {
@@ -102,6 +103,7 @@ function renderViewer(
     path?: string;
     content?: string;
     truncated?: boolean;
+    embedded?: boolean;
     onFrameChange?: (frame: { path: string; source: string } | null) => void;
     onSetActiveSelection?: (
       sel: { start_index: number; end_index: number; anchor_content: string } | null,
@@ -112,7 +114,7 @@ function renderViewer(
   const onFrameChange = props.onFrameChange ?? vi.fn();
   const onSetActiveSelection = props.onSetActiveSelection ?? vi.fn();
   const openFile = props.openFile ?? vi.fn();
-  const utils = render(
+  const viewer = (
     <ViewerContext openFile={openFile}>
       <HtmlCommentViewer
         conversationId="conv_1"
@@ -124,8 +126,9 @@ function renderViewer(
         onSetActiveSelection={onSetActiveSelection}
         onFrameChange={onFrameChange}
       />
-    </ViewerContext>,
+    </ViewerContext>
   );
+  const utils = render(props.embedded ? <EmbeddedProvider>{viewer}</EmbeddedProvider> : viewer);
   return { ...utils, onFrameChange, onSetActiveSelection, openFile };
 }
 
@@ -716,7 +719,7 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     });
     fireEvent.load(iframe);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(4000);
+      await vi.advanceTimersByTimeAsync(5000);
     });
     expect(screen.getByText("Comments are unavailable for this preview")).toBeTruthy();
     vi.useRealTimers();
@@ -876,6 +879,57 @@ describe("HtmlCommentViewer embed mode", () => {
 
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("injects the bridge inline in embed mode without an external script", () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+    renderViewer({ content: "<html><head></head><body><p>doc</p></body></html>" });
+
+    const iframe = screen.getByTitle("HTML preview");
+    const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("<script data-omni-nonce=");
+    expect(srcDoc).not.toContain("<script src=");
+  });
+
+  it("loads the static bridge runtime externally when embedded", () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+    renderViewer({
+      content: "<html><head></head><body><p>doc</p></body></html>",
+      embedded: true,
+    });
+
+    const iframe = screen.getByTitle("HTML preview");
+    const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("<script src=");
+    expect(srcDoc).toContain("omni-html-bridge");
+    expect(srcDoc).toContain("data-omni-nonce=");
+  });
+
+  it("starts the diagnostic timer only after the iframe loads", () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    renderViewer({ content: "<body><p>doc</p></body>" });
+
+    const iframe = screen.getByTitle("HTML preview") as HTMLIFrameElement;
+    const postMessage = vi.fn();
+    Object.defineProperty(iframe, "contentWindow", {
+      configurable: true,
+      value: { postMessage },
+    });
+
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersByTime(5_000));
+    expect(warn).not.toHaveBeenCalled();
+
+    act(() => fireEvent.load(iframe));
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(warn).toHaveBeenCalledWith(
+      "HTML comment bridge did not become ready; comments are unavailable.",
+    );
+    warn.mockRestore();
   });
 
   it("shows the truncated banner in embed mode", () => {

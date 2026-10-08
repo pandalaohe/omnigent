@@ -1,10 +1,10 @@
-// Persisted, device-local preferences for the UI font — size and family.
+// Persisted, app-global preferences for the UI font — size and family.
 //
 // The preference is stored as a discrete px choice and exposed to CSS through
-// `--desktop-ui-font-size`. index.css maps that value into Tailwind's typography
-// tokens at desktop widths while keeping the root rem grid fixed at 16px, so
-// text changes without resizing icons, controls, or spacing. The same local
-// choice feeds the active device's desktop or mobile typography ramp.
+// `--desktop-ui-font-size`. index.css maps that value directly into Tailwind's
+// typography tokens while keeping the root rem grid fixed at 16px, so text
+// changes without resizing icons, controls, or spacing. With no saved choice,
+// CSS supplies a 13px desktop default and a 14px mobile default.
 //
 // Font family works the analogous way with `--ui-font-family`. Note it can't
 // reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
@@ -28,6 +28,7 @@ export const UI_FONT_SIZE_MOBILE_DEFAULT = 14;
 export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
+export const UI_FONT_SIZE_MOBILE_QUERY = "(max-width: 767.98px)";
 
 /** Clamp an arbitrary number into the supported px range. */
 export function clampUiFontSizePx(px: number): number {
@@ -38,31 +39,38 @@ function isValidPx(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-/** Default for the active responsive device class when no local choice exists. */
-export function defaultUiFontSizePx(): number {
-  return typeof window !== "undefined" && window.innerWidth < 768
-    ? UI_FONT_SIZE_MOBILE_DEFAULT
-    : UI_FONT_SIZE_DEFAULT;
+function defaultUiFontSizePx(): number {
+  if (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY).matches
+  ) {
+    return UI_FONT_SIZE_MOBILE_DEFAULT;
+  }
+  return UI_FONT_SIZE_DEFAULT;
+}
+
+function readStoredUiFontSizePx(): number | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isValidPx(parsed)) return null;
+    return clampUiFontSizePx(parsed);
+  } catch {
+    return null;
+  }
 }
 
 /**
  * Read the persisted UI font size in px.
  *
- * Returns the default when nothing is stored, on a server render (no `window`),
- * or when the stored value is missing/malformed — never throws, so a corrupt
- * entry can't break app boot. A stored value outside the range is clamped.
+ * Returns the viewport default when nothing valid is stored: 13px on desktop
+ * and 14px on mobile. A stored value applies directly on either viewport.
  */
 export function readUiFontSizePx(): number {
-  if (typeof window === "undefined") return UI_FONT_SIZE_DEFAULT;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultUiFontSizePx();
-    const parsed: unknown = JSON.parse(raw);
-    if (!isValidPx(parsed)) return defaultUiFontSizePx();
-    return clampUiFontSizePx(parsed);
-  } catch {
-    return defaultUiFontSizePx();
-  }
+  return readStoredUiFontSizePx() ?? defaultUiFontSizePx();
 }
 
 /**
@@ -80,21 +88,25 @@ export function writeUiFontSizePx(px: number): void {
 }
 
 /**
- * Apply the given discrete px size to both responsive ramps on this device.
- * Keeping both variables aligned makes the choice survive rotation or window
- * resizing, while local persistence still lets a phone and desktop keep
- * different values even when they use the same account.
+ * Apply an explicit user-selected size to the typography tokens.
  */
-export function applyUiFontSize(px: number): void {
+export function applyDesktopUiFontSize(px: number): void {
   const root = getStyleRoot();
   if (!root) return;
-  const value = `${clampUiFontSizePx(px)}px`;
-  root.style.setProperty("--desktop-ui-font-size", value);
-  root.style.setProperty("--mobile-ui-font-size", value);
+  root.style.setProperty("--desktop-ui-font-size", `${clampUiFontSizePx(px)}px`);
 }
 
-/** Backward-compatible name used by the upstream desktop bootstrap. */
-export const applyDesktopUiFontSize = applyUiFontSize;
+/** Apply a saved choice, or let CSS choose the viewport-specific default. */
+export function applyStoredUiFontSize(): void {
+  const root = getStyleRoot();
+  if (!root) return;
+  const stored = readStoredUiFontSizePx();
+  if (stored === null) {
+    root.style.removeProperty("--desktop-ui-font-size");
+  } else {
+    root.style.setProperty("--desktop-ui-font-size", `${stored}px`);
+  }
+}
 
 // ---- Font family ---------------------------------------------------------
 

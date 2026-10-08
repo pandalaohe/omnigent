@@ -37,6 +37,7 @@ from omnigent.native._native_forwarder_health import (
 from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
+from omnigent.native.failure_telemetry import normalize_failure_context
 
 _logger = logging.getLogger(__name__)
 
@@ -183,6 +184,7 @@ async def post_external_session_status(
     response_id: str | None = None,
     replayed: bool = False,
     failure_detail: str | None = None,
+    failure_context: object = None,
     turn_completed: bool | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
@@ -225,6 +227,8 @@ async def post_external_session_status(
         on an interrupt). ``True`` lets the runner deliver a sub-agent
         ``completed`` as fact; ``None`` (the default) marks a quiescence-derived
         edge that cannot distinguish "finished" from "stopped early".
+    :param failure_context: Optional bounded native error evidence, independent
+        of display text. Older servers ignore this additive field.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -232,6 +236,8 @@ async def post_external_session_status(
         data["output"] = output
     if failure_detail:
         data["failure_detail"] = failure_detail
+    if status == "failed" and (context := normalize_failure_context(failure_context)):
+        data["failure_context"] = context
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
     if background_tasks is not None:

@@ -6,6 +6,7 @@
 // field for future compatibility, plus one entry per localStorage key that
 // holds a non-default value.
 
+import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "./contextIndicatorPreferences";
 import { AGENT_BADGE_STORAGE_KEY } from "./agentBadgePreferences";
@@ -30,6 +31,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
+  DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   CONTEXT_INDICATOR_STORAGE_KEY,
   KEYBOARD_SHORTCUTS_STORAGE_KEY,

@@ -12,7 +12,10 @@ from typing import Any
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.cli_release_store import CliReleaseIntent, CliReleaseIntentStore
-from omnigent.stores.conversation_store import ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S
+from omnigent.stores.conversation_store import (
+    ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S,
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+)
 from omnigent.stores.host_store import host_is_live
 
 _logger = logging.getLogger(__name__)
@@ -51,10 +54,15 @@ class ArchiveCloseCoordinator:
         self._intent_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._scan_task: asyncio.Task[None] | None = None
         self._host_lock_provider: Any = None
+        self._project_host_binding_store: Any = None
 
     def set_host_lock_provider(self, provider: Any) -> None:
         """Share the online Host policy/release linearization lock."""
         self._host_lock_provider = provider
+
+    def set_project_host_binding_store(self, store: Any) -> None:
+        """Share the project-to-host binding store for archive worktree guards."""
+        self._project_host_binding_store = store
 
     async def start(self) -> None:
         """Start restart recovery for the current workspace."""
@@ -305,9 +313,7 @@ class ArchiveCloseCoordinator:
         if initial_tasks:
             await asyncio.gather(*initial_tasks)
         if await asyncio.to_thread(self._intent_store.archive_targets_complete, root_id, revision):
-            await asyncio.to_thread(
-                self._conversation_store.finalize_archive_close, root_id, revision
-            )
+            await self._complete_archive_close(root_id, revision)
 
     async def _intent_routable_here(self, intent: CliReleaseIntent) -> bool:
         if intent.host_id is not None:
@@ -509,10 +515,10 @@ class ArchiveCloseCoordinator:
                     intent.archive_revision,
                 ):
                     await self._ensure_root_lease(intent.root_session_id, root_token)
-                    await asyncio.to_thread(
-                        self._conversation_store.finalize_archive_close,
+                    await self._complete_archive_close(
                         intent.root_session_id,
                         intent.archive_revision,
+                        claim_token=root_token,
                     )
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -597,6 +603,7 @@ class ArchiveCloseCoordinator:
                 target,
                 self._runner_router,
                 self._host_registry,
+                conversation_store=self._conversation_store,
                 archive_scope_id=intent.root_session_id,
                 archive_revision=intent.archive_revision,
                 stop_host_runner=stop_host_runner,
@@ -627,6 +634,80 @@ class ArchiveCloseCoordinator:
             async with self._host_lock_provider(intent.host_id) as lease:
                 return await self._execute_idle_intent_locked(intent, target, lease=lease)
         return await self._execute_idle_intent_locked(intent, target)
+
+    async def _complete_archive_close(
+        self,
+        root_id: str,
+        revision: int,
+        *,
+        claim_token: str | None = None,
+    ) -> None:
+        """Remove the root's worktree, then finalize its close, exactly once.
+
+        Called after every archive target's teardown has completed. The delete
+        precedes the finalize, so a crash between the two is retried from the
+        still-pending request rather than losing the delete. Without
+        *claim_token* the caller must win the root lease here, which keeps a
+        concurrent completion (another replica, the intent path) from
+        repeating the delete; with one, the caller's own live lease fences it.
+        """
+        if claim_token is None:
+            claim_token = secrets.token_hex(16)
+            now = int(time.time())
+            claimed = await asyncio.to_thread(
+                self._conversation_store.claim_archive_close,
+                root_id,
+                revision,
+                claim_token,
+                claimed_at=now,
+                stale_before=now - ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S,
+            )
+            if claimed != "claimed":
+                return
+            release_claim = True
+        else:
+            release_claim = False
+        try:
+            await self._remove_archived_worktree(root_id, revision)
+            await asyncio.to_thread(
+                self._conversation_store.finalize_archive_close, root_id, revision
+            )
+        finally:
+            if release_claim:
+                await asyncio.to_thread(
+                    self._conversation_store.release_archive_close_claim,
+                    root_id,
+                    revision,
+                    claim_token,
+                )
+
+    async def _remove_archived_worktree(self, root_id: str, revision: int) -> None:
+        """Remove an archived root's worktree once the tree's teardown ran.
+
+        The delete is recorded as a revision-keyed label by the archive PATCH,
+        so it survives a restart or another replica executing the intent. Runs
+        after every target's stop, through MOD-xho04's ``cleanup_worktree`` so
+        a project entry is never removed; best-effort, like the direct path.
+        """
+        from omnigent.server.routes._sessions.helpers import (
+            remove_archived_worktree_best_effort,
+        )
+
+        root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
+        if (
+            root is None
+            or not root.archived
+            or root.archive_revision != revision
+            or root.labels.get(ARCHIVE_DELETE_WORKTREE_LABEL_KEY) != str(revision)
+        ):
+            return
+        await remove_archived_worktree_best_effort(
+            root,
+            host_registry=self._host_registry,
+            project_host_binding_store=self._project_host_binding_store,
+            conversation_store=self._conversation_store,
+            exclude_conversation_id=root_id,
+        )
 
     async def _execute_idle_intent_locked(
         self,

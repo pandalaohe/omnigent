@@ -3,6 +3,7 @@ import {
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   DEFAULT_SUBMIT_WITH_MOD_ENTER,
   composerNewLineDisposition,
+  isComposerAltNewlineKey,
   isComposerSendKey,
   isComposerSteerAllKey,
   parseSubmitWithModEnter,
@@ -97,6 +98,22 @@ describe("composerNewLineDisposition", () => {
     expect(composerNewLineDisposition({ key: "l", code: "KeyL", altKey: true }, false, false)).toBe(
       "block",
     );
+  });
+});
+
+describe("isComposerAltNewlineKey", () => {
+  it("is Alt/Option+Enter, with or without Shift", () => {
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true })).toBe(true);
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, shiftKey: true })).toBe(true);
+    expect(isComposerAltNewlineKey({ key: "Enter" })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "Enter", shiftKey: true })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "a", altKey: true })).toBe(false);
+  });
+
+  it("leaves Ctrl/Cmd chords (including AltGr) and composition alone", () => {
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, ctrlKey: true })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, metaKey: true })).toBe(false);
+    expect(isComposerAltNewlineKey({ key: "Enter", altKey: true, isComposing: true })).toBe(false);
   });
 });
 

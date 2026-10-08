@@ -46,7 +46,8 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { unhandledCommentsDeleteLine } from "@/lib/comments";
 import { useComments } from "@/hooks/useComments";
@@ -68,6 +69,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { unpinWithUndo } from "./unpinUndoToast";
+import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -122,9 +125,12 @@ export function HeaderConversationMenu({
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
+  // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
+  const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
@@ -226,7 +232,7 @@ export function HeaderConversationMenu({
     }
   };
 
-  const archiveConversation = async () => {
+  const archiveConversation = () => {
     // The local ref closes the same-tick gap before React Query's isPending
     // state reaches the menu, while the disabled state communicates progress
     // and blocks later duplicate selections.
@@ -238,13 +244,20 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
+    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) => {
+      void archiveNow(deleteWorktreeIds.has(conversation.id));
+    });
+  };
+
+  const archiveNow = async (deleteWorktree: boolean) => {
+    if (archiveRequestRef.current || archive.isPending) return;
     archiveRequestRef.current = true;
     setArchivePending(true);
     const requestedConversationId = conversation.id;
     const requestedLocation = location;
 
     try {
-      await archive.mutateAsync({ id: requestedConversationId, archived: true });
+      await archive.mutateAsync({ id: requestedConversationId, archived: true, deleteWorktree });
     } catch {
       // useArchiveConversation owns the error toast and optimistic-cache
       // rollback. Staying on this route makes the restored session usable.
@@ -283,7 +296,12 @@ export function HeaderConversationMenu({
       <DropdownMenuItem
         data-testid="header-pin-conversation"
         className={itemClass}
-        onSelect={() => togglePinned.mutate({ id: conversation.id, pinned: !isPinned })}
+        disabled={pinSaving}
+        onSelect={() =>
+          isPinned
+            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+            : togglePinned.mutate({ id: conversation.id, pinned: true })
+        }
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
         {isPinned ? "Unpin" : "Pin"}
@@ -455,7 +473,7 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
@@ -499,6 +517,7 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
+      {archiveWorktreePrompt.dialog}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form onSubmit={submitRename}>

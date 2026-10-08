@@ -156,8 +156,11 @@ PINNED_LABEL_KEY = "omnigent.pinned"
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
-# otherwise behaves like any other session (its own runner, transcript).
+# keeps its own transcript and may share its parent's runner.
 SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
+
+# Server-owned routing ancestry; it does not require a workspace or own a runner.
+SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
@@ -206,6 +209,11 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # waits for the whole session tree to go idle before it is torn down. It
 # matches only its own revision, so unarchive or re-archive voids it.
 ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY = "omnigent.archive_stop_when_idle"
+
+# Server-reserved label whose value is the archive revision whose teardown
+# should also remove the root's server-created worktree. Keyed to the
+# revision so unarchive or re-archive voids it.
+ARCHIVE_DELETE_WORKTREE_LABEL_KEY = "omnigent.archive_delete_worktree"
 
 # New-session id an archived session was continued into (``POST
 # /v1/sessions/{sid}/continue``). The archived row keeps the pointer so a
@@ -323,6 +331,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
 }
 
@@ -339,6 +349,22 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class ConversationUpdateResult:
+    """Result of updating a conversation and its requested model settings.
+
+    :param conversation: The conversation after the update has been persisted.
+    :param reasoning_effort_changed: Whether a requested reasoning-effort
+        value changed from the value on the locked AP row.
+    :param model_override_changed: Whether a requested model override changed
+        from the value on the locked AP row.
+    """
+
+    conversation: Conversation
+    reasoning_effort_changed: bool
+    model_override_changed: bool
 
 
 @dataclass(frozen=True)
@@ -711,6 +737,19 @@ class ConversationStore(ABC):
 
         Bulk variant for the sidebar runner-online dot path. Missing
         ids are omitted; ids without a bound runner map to ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+        """Return the bound runner ID and heartbeat from the metadata database.
+
+        Reads neither conversation data nor labels, so an unrelated
+        conversation backend outage cannot hide a healthy runner.
+
+        :param conversation_id: Session/conversation ID to look up.
+        :returns: ``(runner_id, runner_last_seen)``, or ``None`` if the
+            metadata row is missing. Either field may be ``None``.
         """
         ...
 
@@ -1119,6 +1158,7 @@ class ConversationStore(ABC):
         archived: bool | None = None,
         close_cli_on_archive: bool = False,
         archive_stop_when_idle: bool = False,
+        delete_worktree: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -1183,6 +1223,15 @@ class ConversationStore(ABC):
             archive revision, so the teardown waits for the tree to settle.
             Deletes any prior label on a transition without it (including
             unarchive). No effect outside a transition.
+        :param delete_worktree: When ``True`` alongside
+            ``close_cli_on_archive``, atomically stamp the server-reserved
+            worktree-delete label naming the archive revision the durable
+            teardown must remove the root's recorded worktree for. On a
+            transition that is the new revision; on an already-archived
+            session it is the current revision and the same call re-opens
+            the close (clearing any completed revision) so a delete-only
+            teardown runs. Deletes any prior label on a transition without
+            it (including unarchive).
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -1258,6 +1307,81 @@ class ConversationStore(ABC):
         :param fields: Column updates, e.g. ``phase="rekeyed"``.
         :returns: ``True`` when the row was updated, ``False`` when the
             phase no longer matched or the receipt is missing.
+        """
+        ...
+
+    @abstractmethod
+    def update_conversation_with_changes(
+        self,
+        conversation_id: str,
+        title: str | None = None,
+        reasoning_effort: str | None = None,
+        _unset_reasoning_effort: bool = False,
+        model_override: str | None = None,
+        _unset_model_override: bool = False,
+        cost_control_mode_override: str | None = None,
+        _unset_cost_control_mode_override: bool = False,
+        subagent_routing_override: str | None = None,
+        _unset_subagent_routing_override: bool = False,
+        harness_override: str | None = None,
+        _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
+        terminal_launch_args: list[str] | None = None,
+        archived: bool | None = None,
+        close_cli_on_archive: bool = False,
+        archive_stop_when_idle: bool = False,
+        delete_worktree: bool = False,
+        reported_model: str | None = None,
+    ) -> ConversationUpdateResult | None:
+        """Update a conversation and report requested model-setting changes.
+
+        The returned change flags describe only the explicitly requested
+        ``reasoning_effort`` and ``model_override`` updates. A request that
+        writes the value already stored, including an explicit clear of an
+        already-``None`` value, reports ``False``.
+
+        :param close_cli_on_archive: Atomically create a durable teardown
+            request when this call transitions ``archived`` to ``True``.
+        :param archive_stop_when_idle: When ``True`` alongside
+            ``close_cli_on_archive`` on an archive transition, atomically
+            stamp the server-reserved idle-deferral label naming the new
+            archive revision, so the teardown waits for the tree to settle.
+            Deletes any prior label on a transition without it (including
+            unarchive). No effect outside a transition.
+        :param delete_worktree: When ``True`` alongside
+            ``close_cli_on_archive``, atomically stamp the server-reserved
+            worktree-delete label naming the archive revision the durable
+            teardown must remove the root's recorded worktree for. On a
+            transition that is the new revision; on an already-archived
+            session it is the current revision and the same call re-opens
+            the close (clearing any completed revision) so a delete-only
+            teardown runs. Deletes any prior label on a transition without
+            it (including unarchive).
+        """
+        ...
+
+    @abstractmethod
+    def restore_session_settings_if_matches(
+        self,
+        conversation_id: str,
+        *,
+        previous: Conversation,
+        attempted: Conversation,
+        restore_effort: bool = True,
+        restore_model: bool = False,
+    ) -> None:
+        """Restore a refused effort update without overwriting a newer selection.
+
+        Each setting is compared and restored atomically. When ``restore_model``
+        is true, also undo the model selection from a combined PATCH that was
+        aborted before forwarding its model change. Preserve other overrides.
+
+        :param conversation_id: Conversation whose settings were refused.
+        :param previous: Snapshot before persisting the requested settings.
+        :param attempted: Snapshot returned by that persistence operation.
+        :param restore_effort: Whether the refused effort needs rollback; false when
+            a newer write already replaced it.
+        :param restore_model: Whether the unforwarded model change also needs rollback.
         """
         ...
 
@@ -1928,6 +2052,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Set idle only while this runner still owns a non-failed session.
+
+        Match the current runner binding in the update, without changing labels
+        or ``updated_at``. A failed status must survive teardown reconciliation.
+
+        :param conversation_id: Session whose runner was intentionally stopped.
+        :param runner_id: The stopped runner, which may have been replaced.
+        :returns: Whether the conditional update matched the session.
+        """
+        ...
+
+    @abstractmethod
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Atomically settle a stale running session to idle.
 
@@ -2067,6 +2204,23 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        """
+        ...
+
+    @abstractmethod
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Read a bounded page of session IDs and live statuses for runner teardown.
+
+        Include archived sessions. Read bindings consistently with runner writes,
+        in ascending session-ID order; use the last ID as the next page's cursor.
+        A short page ends iteration. Do not hydrate conversation content or labels.
+
+        :param runner_id: The runner being stopped.
+        :param after: Exclusive session-ID cursor, or ``None`` for the first page.
+        :param limit: Maximum number of rows, between 1 and 1000.
+        :returns: ``(session_id, live_status)`` pairs; status can be unknown (``None``).
         """
         ...
 
@@ -2421,6 +2575,37 @@ class ConversationStore(ABC):
             the source conversation has that ``response_id``.
         """
         ...
+
+    def list_session_roots_for_agent(self, agent_id: str, limit: int) -> list[str]:
+        """
+        Up to *limit* distinct spawn-tree roots of sessions that use *agent_id*.
+
+        Forks of one user's sessions share an agent row, so several roots can
+        use it. Lets a caller be authorized by READ on any of them. Reads a
+        bounded number of rows, so an agent used very widely may return fewer.
+        Default: none (stores without the lookup authorize against one root only).
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param limit: Most roots to return, e.g. ``50``.
+        :returns: Distinct root conversation ids, at most *limit*.
+        """
+        del agent_id, limit
+        return []
+
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """
+        Count sessions that use *agent_id*, reading at most *cap* of them.
+
+        Any kind, archived included. Default: one bounded conversation page.
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param cap: Most sessions to count, e.g. ``101``.
+        :returns: The count, at most *cap*.
+        """
+        page = self.list_conversations(
+            limit=cap, kind=None, agent_id=agent_id, include_archived=True
+        )
+        return len(page.data)
 
     @abstractmethod
     def has_other_live_session_in_workspace(

@@ -22,7 +22,6 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
-  harnessesEnabled: true,
   sessionCollabEnabled: false,
 }));
 
@@ -31,10 +30,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: {
-      harness_settings_ui: mocks.harnessesEnabled,
-      session_peer_messaging: mocks.sessionCollabEnabled,
-    },
+    features: { session_peer_messaging: mocks.sessionCollabEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -68,7 +64,6 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
-  mocks.harnessesEnabled = true;
   mocks.sessionCollabEnabled = false;
 });
 afterEach(cleanup);
@@ -81,6 +76,8 @@ describe("settingsNavGroups", () => {
       label: "General",
       icon: SettingsIcon,
     });
+    const ids = general?.items.map((item) => item.id) ?? [];
+    expect(ids.indexOf("harnesses")).toBe(ids.indexOf("appearance") + 1);
   });
 
   it("keeps Keyboard shortcuts reachable on mobile for floating-assistant setup", () => {
@@ -192,10 +189,10 @@ describe("settingsNavGroups", () => {
   });
 
   it("includes Session collaboration right after Calling defaults only when peer messaging is on", () => {
-    // 7th arg is sessionCollabEnabled (the `session_peer_messaging` feature).
+    // 6th arg is sessionCollabEnabled (the `session_peer_messaging` feature).
     const generalIds = (sessionCollabEnabled: boolean) =>
       (
-        settingsNavGroups(false, false, false, false, false, false, sessionCollabEnabled).find(
+        settingsNavGroups(false, false, false, false, false, sessionCollabEnabled).find(
           (group) => group.title === "General",
         )?.items ?? []
       ).map((item) => item.id);
@@ -498,17 +495,6 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: "harnesses",
       harness: "claude-native",
-    });
-  });
-
-  it("falls back to General for a harnesses deep link when the feature is disabled", () => {
-    mocks.harnessesEnabled = false;
-    // Disabled (the default deploy) → the section resolves to General instead
-    // of an empty harnesses page, and no harness is set.
-    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "general" });
-    expect(routeHook("/settings/harnesses/claude-native")).toEqual({
-      inSettings: true,
-      section: "general",
     });
   });
 

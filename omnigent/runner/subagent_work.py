@@ -154,6 +154,10 @@ class _SubagentWorkEntry:
         was registered, used by the remote-member liveness interval.
     :param last_remote_check_monotonic: Runner-local monotonic instant of the
         last remote-member liveness check, or ``None`` until first checked.
+    :param launch_timed_out: Whether the recorded ``failed`` came from the
+        launch-liveness reaper rather than from the child itself. Such a
+        failure is a guess ("no start acknowledgment"), so a genuine
+        terminal edge from the child afterwards must replace it.
     """
 
     parent_session_id: str
@@ -176,6 +180,7 @@ class _SubagentWorkEntry:
     registered_by: str | None = None
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
+    launch_timed_out: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -864,7 +869,15 @@ def mark_subagent_work_terminal(
             entry.completed_at = time.time()
             entry.delivered = False
             return _deliver_subagent_completion(entry, result_key)
-        if status == entry.status and output is not None and output != entry.output:
+        # A child-reported terminal state supersedes the reaper's provisional failure.
+        if entry.launch_timed_out and status in ("completed", "failed"):
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.launch_timed_out = False
+            return _deliver_subagent_completion(entry, result_key)
+        if status == entry.status and output and output != entry.output:
             entry.output = output
             entry.completed_at = time.time()
             entry.delivered = False
@@ -1031,6 +1044,7 @@ def reap_stalled_subagent_launches(
             entry.parent_session_id,
             entry.child_session_id,
         )
+        entry.launch_timed_out = True
         deliver(
             entry.child_session_id,
             status="failed",

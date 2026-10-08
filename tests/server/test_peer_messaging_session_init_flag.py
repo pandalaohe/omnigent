@@ -9,6 +9,7 @@ and the session-create route passes the app's resolved flags.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -69,9 +70,9 @@ def test_builder_defaults_flag_off() -> None:
 
 class _Registry:
     def __init__(self) -> None:
-        self.connection: object | None = object()
+        self.connection: Any = SimpleNamespace(generation=1)
 
-    def get(self, _runner_id: str) -> object | None:
+    def get(self, _runner_id: str) -> Any:
         return self.connection
 
 

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { setOmnigentHostConfig } from "@/lib/host";
 
-function renderDialog() {
+function renderDialog(props: Partial<Parameters<typeof CreateAgentDialog>[0]> = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onCreate = vi.fn();
   render(
@@ -16,6 +16,7 @@ function renderDialog() {
         onOpenChange={vi.fn()}
         onCreate={onCreate}
         extraFields={<div data-testid="badge-fields">Badge settings</div>}
+        {...props}
       />
     </QueryClientProvider>,
   );
@@ -34,6 +35,10 @@ async function choose(sectionTestId: string, optionTestId: string) {
   fireEvent.click(screen.getByTestId(sectionTestId));
   fireEvent.click(await screen.findByTestId(optionTestId));
 }
+
+const bundle = new File([new Uint8Array([0x1f, 0x8b])], "orion.tar.gz", {
+  type: "application/gzip",
+});
 
 afterEach(() => {
   cleanup();
@@ -185,5 +190,76 @@ describe("CreateAgentDialog", () => {
 
     expect(screen.getByTestId("create-agent-submit")).toBeEnabled();
     expect(screen.queryByText(/Pick a model/)).toBeNull();
+  });
+
+  it("accepts only names the server accepts", async () => {
+    const onCreate = vi.fn();
+    renderDialog({ onCreate });
+    await choose("agent-member-model", "agent-member-model-opus");
+
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "Agent 1" } });
+    expect(screen.getByTestId("create-agent-name-error")).toHaveTextContent(
+      "Use only letters, numbers, hyphens, and underscores.",
+    );
+    expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "agent-1" } });
+    expect(screen.queryByTestId("create-agent-name-error")).toBeNull();
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ name: "agent-1" }));
+  });
+
+  it("hides Import bundle without an import handler", () => {
+    renderDialog();
+    expect(screen.queryByTestId("create-agent-import")).toBeNull();
+  });
+
+  it("imports a picked bundle and closes", async () => {
+    const onImport = vi.fn().mockResolvedValue(undefined);
+    const onOpenChange = vi.fn();
+    renderDialog({ onImport, onOpenChange });
+
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [bundle] },
+    });
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(onImport).toHaveBeenCalledWith(bundle);
+  });
+
+  it("keeps the dialog open and shows the server's reason on failure", async () => {
+    const onImport = vi.fn().mockRejectedValue(new Error("'polly' is a built-in agent"));
+    const onOpenChange = vi.fn();
+    renderDialog({ onImport, onOpenChange });
+
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [bundle] },
+    });
+
+    expect(await screen.findByTestId("create-agent-import-error")).toHaveTextContent(
+      "'polly' is a built-in agent",
+    );
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("create-agent-import")).not.toBeDisabled();
+  });
+
+  it("locks Cancel and Create while an import is in flight", async () => {
+    let finish: () => void = () => {};
+    const onImport = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderDialog({ onImport });
+
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [bundle] },
+    });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled());
+    expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+    finish();
+    await waitFor(() => expect(screen.getByTestId("create-agent-import")).not.toBeDisabled());
   });
 });

@@ -9,6 +9,7 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -31,8 +32,12 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => usePullRequestInfoMock(),
+}));
+vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileViewerContextModule>()),
+  useOpenGithubTab: () => openGithubTabMock,
 }));
 
 // The archived-comments banner reads session comments via a TanStack query
@@ -75,13 +80,21 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useCodexRateLimitsMock, useSessionHostOnlineMock } =
-  vi.hoisted(() => ({
-    useSessionMock: vi.fn(),
-    useHostsMock: vi.fn(),
-    useCodexRateLimitsMock: vi.fn(),
-    useSessionHostOnlineMock: vi.fn(),
-  }));
+const {
+  useSessionMock,
+  useHostsMock,
+  useCodexRateLimitsMock,
+  useSessionHostOnlineMock,
+  usePullRequestInfoMock,
+  openGithubTabMock,
+} = vi.hoisted(() => ({
+  useSessionMock: vi.fn(),
+  useHostsMock: vi.fn(),
+  useCodexRateLimitsMock: vi.fn(),
+  useSessionHostOnlineMock: vi.fn(),
+  usePullRequestInfoMock: vi.fn(),
+  openGithubTabMock: vi.fn(),
+}));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: (id: string | null | undefined) => useSessionMock(id),
@@ -190,6 +203,9 @@ describe("Composer status line (branch + context ring)", () => {
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useCodexRateLimitsMock.mockReset().mockReturnValue({ data: null });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
+    usePullRequestInfoMock.mockReset().mockReturnValue({ data: undefined });
+    useComposerGitStatusMock.mockReset().mockReturnValue(composerGitStatus());
+    openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
       contextWindow: null,

@@ -31,8 +31,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   useWorkspaceAllFiles: () => ({ data: undefined }),
   useWorkspaceDirectory: () => ({ data: undefined }),
 }));
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
 }));
 
 // The archived-comments banner reads session comments via a TanStack query

@@ -12,9 +12,11 @@
 import { Fragment, useEffect, useState } from "react";
 
 import {
+  ALT_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
+  ENTER_KEY,
   Kbd,
   shortcutKeys,
   useKeyboardShortcutsVersion,
@@ -60,6 +62,8 @@ interface Shortcut {
   lastKeySeparator?: string;
   /** When set, keys come from the live shortcut layer instead of `keys`. */
   actionId?: ShortcutActionId;
+  /** Another chord for the same action, shown after "or". */
+  alternateKeys?: string[];
 }
 
 interface ShortcutGroup {
@@ -179,6 +183,8 @@ function shortcutGroupsFor(
           {
             label: "New line in message",
             keys: composerNewLineShortcutKeys(submitWithModEnter),
+            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
+            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
           },
           ...group.items,
         ],
@@ -313,6 +319,14 @@ export function KeyboardShortcutsList({
                         <Kbd>{key}</Kbd>
                       </Fragment>
                     ))}
+                    {item.alternateKeys ? (
+                      <>
+                        <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
+                        {item.alternateKeys.map((key) => (
+                          <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
+                        ))}
+                      </>
+                    ) : null}
                   </span>
                 </li>
               );

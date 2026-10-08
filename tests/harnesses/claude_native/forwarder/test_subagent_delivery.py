@@ -906,11 +906,14 @@ async def test_subagent_batch_backoff_survives_new_tail_items(
         items=[first],
         record_items=(TranscriptRecordItems(next_byte_offset=10, items=(first,)),),
     )
-    monkeypatch.setattr(
-        forwarder,
-        "read_transcript_items_from_offset",
-        lambda *args, **kwargs: current_result,
-    )
+    read_calls = 0
+
+    def read_items(*args: object, **kwargs: object) -> TranscriptReadResult:
+        nonlocal read_calls
+        read_calls += 1
+        return current_result
+
+    monkeypatch.setattr(forwarder, "read_transcript_items_from_offset", read_items)
     entry = forwarder.SubagentEntry(
         subagent_id="backoff",
         child_conversation_id="conv_child_backoff",
@@ -968,6 +971,7 @@ async def test_subagent_batch_backoff_survives_new_tail_items(
         )
 
     assert requests == 1
+    assert read_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1115,10 +1119,7 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
             statuses.append((child_id, body))
         return httpx.Response(202, json={})
 
-    tracker = forwarder._PostRetryTracker(
-        base_delay_s=0.0,
-        max_transient_attempts=3,
-    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     state = forwarder.SubagentForwardState(subagents=entries)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
@@ -1378,10 +1379,8 @@ async def test_timed_out_batch_is_split_not_dropped(
             individual_source_ids.append(body["data"]["source_id"])
         return httpx.Response(204)
 
-    retry_tracker = forwarder._PostRetryTracker(
-        base_delay_s=0.0,
-        max_transient_attempts=2,
-    )
+    retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    monkeypatch.setattr(forwarder, "_SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS", 2)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
@@ -2036,10 +2035,7 @@ async def test_subagent_history_transient_exhaustion_is_never_parked(
         posts += 1
         return httpx.Response(status_code, json=response_body)
 
-    tracker = forwarder._PostRetryTracker(
-        base_delay_s=0.0,
-        max_transient_attempts=forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS,
-    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
     items = forwarder.read_transcript_items_from_offset(
         child_path,
         0,
@@ -2065,10 +2061,10 @@ async def test_subagent_history_transient_exhaustion_is_never_parked(
                 tracker=tracker,
             )
 
-        for _ in range(forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS + 8):
+        for _ in range(forwarder._SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS + 8):
             assert await poll() is None
 
-    assert posts == forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS + 8
+    assert posts == forwarder._SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS + 8
     retry_delay_s = tracker.retry_delay_s(retry_key)
     assert retry_delay_s is None or retry_delay_s < forwarder._SUBAGENT_RECOVERY_PARK_S
     assert entry.recovery_watermark == child_path.stat().st_size

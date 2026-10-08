@@ -602,6 +602,53 @@ describe("authenticatedFetch", () => {
     }
   });
 
+  it("does not retry a hostless wrong-replica request on a Server selected after dispatch", async () => {
+    let releaseEvents!: (res: Response) => void;
+    const eventsPending = new Promise<Response>((resolve) => {
+      releaseEvents = resolve;
+    });
+    const serverA = vi.fn((path: string) => {
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      if (path === "/v1/sessions/sess-hostless/events") return eventsPending;
+      return Promise.resolve(mockJsonResponse({}));
+    });
+    const serverB = vi.fn((path: string) =>
+      Promise.resolve(mockJsonResponse(path === "/v1/me" ? { user_id: "bob" } : {})),
+    );
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const { resolveIdentity, authenticatedFetch, setSessionHostResolver } =
+      await import("./identity");
+    const { getSessionHost, setSessionHost } = await import("./sessionHost");
+    const resolver = vi.fn(async (sessionId: string, options?: { force?: boolean }) => {
+      if (options?.force) setSessionHost(sessionId, "host-new");
+    });
+    setSessionHostResolver(resolver);
+
+    expect(await resolveIdentity()).toBe("alice");
+    const pending = authenticatedFetch("/v1/sessions/sess-hostless/events", { method: "POST" });
+    await vi.waitFor(() =>
+      expect(serverA).toHaveBeenCalledWith("/v1/sessions/sess-hostless/events", expect.anything()),
+    );
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    expect(await resolveIdentity()).toBe("bob");
+    const original = {
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      json: async () => ({ error: { code: "wrong_replica" } }),
+      clone: function () {
+        return this;
+      },
+    } as unknown as Response;
+    releaseEvents(original);
+
+    expect(await pending).toBe(original);
+    expect(serverB.mock.calls.map((call) => call[0])).toEqual(["/v1/me"]);
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(getSessionHost("sess-hostless")).toBeNull();
+  });
+
   it("keeps the header decision from the start of a request that waits for its session host", async () => {
     const { setOmnigentHostConfig } = await import("./host");
     const { setSessionHostResolver, resolveIdentity, authenticatedFetch } =

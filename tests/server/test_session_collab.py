@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -328,9 +329,9 @@ async def test_message_forward_reinits_when_peer_flag_is_stale(
 
 class _Registry:
     def __init__(self) -> None:
-        self.connection: object | None = object()
+        self.connection: Any = SimpleNamespace(generation=1)
 
-    def get(self, _runner_id: str) -> object | None:
+    def get(self, _runner_id: str) -> Any:
         return self.connection
 
 
@@ -515,7 +516,7 @@ async def test_initialize_retries_when_a_joined_post_carries_a_stale_value(
     # latest resolved value and the applied snapshot follows it.
     assert len(client.calls) == 3
     assert _peer_flag(client.calls[-1]) is True
-    pkey = (conversation.runner_id or "", id(registry.connection), conversation.id)
+    pkey = (conversation.runner_id or "", registry.connection.generation, conversation.id)
     assert initializer._applied_peer[pkey] is True
     assert not initializer._pending_peer
     assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]
@@ -572,7 +573,7 @@ async def test_initialize_retry_is_single_flight_across_joined_callers(
     await asyncio.gather(off, on_first, on_second)
 
     assert [_peer_flag(body) for body in client.calls] == [True, False, True]
-    pkey = (conversation.runner_id or "", id(registry.connection), conversation.id)
+    pkey = (conversation.runner_id or "", registry.connection.generation, conversation.id)
     assert initializer._applied_peer[pkey] is True
     assert not initializer._pending_peer
     assert await initializer.peer_flag_stale(conversation, client) is False  # type: ignore[arg-type]

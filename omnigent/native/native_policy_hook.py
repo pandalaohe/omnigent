@@ -32,10 +32,12 @@ from typing import NotRequired, TypedDict
 
 import httpx
 
+from omnigent.util.http_retry import bounded_retry_after_seconds
+
 _logger = logging.getLogger(__name__)
 
 # How long every non-tool-call phase (request / result) keeps retrying
-# transient 5xx / connect errors on the policy evaluate POST before
+# transient 429 / 5xx / connect errors on the policy evaluate POST before
 # failing closed. Keeps those gates from blocking long on a sick server
 # while still absorbing brief DB hiccups on a hosted deployment. The
 # budget must also land the fail-closed block inside the tightest
@@ -59,6 +61,7 @@ _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # retry loop, shares the budget.
 TOOL_CALL_POLICY_RETRY_BUDGET_S = 300.0
 _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S = 20.0
+_EVALUATE_POLICY_MAX_RETRY_AFTER_S = 10.0
 # Fast connect budget so an unreachable server fails into the retry
 # loop quickly rather than blocking on the day-long read timeout.
 _EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
@@ -638,7 +641,7 @@ def post_evaluate_with_retry(
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
-    Retries on 5xx HTTP responses and connection-level errors
+    Retries on explicit 429 and 5xx HTTP responses and connection-level errors
     (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within a
     phase-dependent budget: the tool-call phase (``PHASE_TOOL_CALL``) gets
     :data:`TOOL_CALL_POLICY_RETRY_BUDGET_S` with a
@@ -646,6 +649,8 @@ def post_evaluate_with_retry(
     out a multi-minute server outage; every other phase keeps
     :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
+    A 429 ``Retry-After`` hint takes precedence over exponential backoff but
+    is capped by :data:`_EVALUATE_POLICY_MAX_RETRY_AFTER_S`.
 
     A 5xx or torn connection that arrives only after the POST was held at
     least :data:`_EVALUATE_POLICY_HELD_POLL_FLOOR_S` is not a fault but a
@@ -657,14 +662,15 @@ def post_evaluate_with_retry(
 
     A stable ``_omnigent_elicitation_id`` is minted once and stamped on
     every attempt. When the server parks an ASK gate and the connection
-    drops (5xx or :class:`httpx.ConnectError`), the retry re-POSTs the
-    same id so the server re-attaches to the existing elicitation rather
-    than minting a new one — mirroring the ``_post_hook_with_reattach``
+    drops or rejects the request (429, 5xx, or :class:`httpx.ConnectError`),
+    each retry re-POSTs the same id so the server re-attaches to the existing
+    elicitation rather than minting a new one — mirroring the
+    ``_post_hook_with_reattach``
     idiom used by the ``PermissionRequest`` hook. This prevents a
     second approval card from appearing when the first was already
     published before the error.
 
-    4xx responses are final — a bad request won't succeed on retry. A
+    Other 4xx responses are final — a bad request won't succeed on retry. A
     :class:`httpx.ReadTimeout` is final too: it fires only after the server
     held the poll for the whole read budget, i.e. the ask itself timed out.
     The caller is responsible for fail-closed handling on ``None``.
@@ -704,6 +710,7 @@ def post_evaluate_with_retry(
     reauthed = False
     last_error: str = "unknown error"
     while True:
+        retry_delay_s = backoff_s
         attempt_started = time.monotonic()
         held_poll_severed = False
         try:
@@ -757,25 +764,36 @@ def post_evaluate_with_retry(
             last_error = f"server returned {status}" + (
                 f": {body_preview}" if body_preview else ""
             )
-            if status < 500:
+            if status == 429:
+                retry_delay_s = bounded_retry_after_seconds(
+                    exc.response,
+                    fallback=backoff_s,
+                    max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                )
+                print(
+                    f"omnigent {hook_label}: Omnigent returned 429; retrying",
+                    file=sys.stderr,
+                )
+            elif status < 500:
                 print(
                     f"omnigent {hook_label}: Omnigent returned {status}"
                     + (f": {body_preview}" if body_preview else ""),
                     file=sys.stderr,
                 )
                 return None, last_error
-            held_poll_severed = (
-                time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
-            )
-            print(
-                f"omnigent {hook_label}: Omnigent returned {status}"
-                + (
-                    " after a held poll (gateway sever); re-parking"
-                    if held_poll_severed
-                    else "; retrying"
-                ),
-                file=sys.stderr,
-            )
+            else:
+                held_poll_severed = (
+                    time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                )
+                print(
+                    f"omnigent {hook_label}: Omnigent returned {status}"
+                    + (
+                        " after a held poll (gateway sever); re-parking"
+                        if held_poll_severed
+                        else "; retrying"
+                    ),
+                    file=sys.stderr,
+                )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_error = f"connection error: {exc}"
             print(
@@ -814,14 +832,14 @@ def post_evaluate_with_retry(
         # budget iff its start is; an attempt that starts inside the budget
         # runs to completion, landing the fallback at most one attempt past
         # it (each attempt's connect timeout is bounded).
-        if time.monotonic() + backoff_s > deadline:
+        if time.monotonic() + retry_delay_s > deadline:
             print(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
             )
             return None, f"retry budget exhausted (last error: {last_error})"
         # Two-step backoff; not worth a retry library in this dependency-light hook.
-        time.sleep(backoff_s)
+        time.sleep(retry_delay_s)
         backoff_s = min(backoff_s * 2, max_backoff_s)
 
 
