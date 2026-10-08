@@ -135,6 +135,7 @@ import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -4235,7 +4236,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (eventMatchesShortcutAction(e.nativeEvent, "stopResponse") && isWorking && !isReadOnly) {
       e.preventDefault();
       onStop();
       return;
@@ -4248,19 +4249,13 @@ function ComposerImpl(
     // within the wrapped line.  Gating on position 0 / length ensures the
     // browser gets to move the caret through wrapped lines first; only the
     // final ArrowUp-at-start / ArrowDown-at-end triggers recall.
-    // Recall is for UNmodified arrows only. Cmd/Ctrl+↑/↓ (switch session) and
-    // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
-    // fire even mid-compose; without this guard the recall below intercepts
-    // them (replacing the draft) and the hotkeys appear broken in the composer.
-    if (
-      (draft.quotes.length === 0 || recallingRef.current) &&
-      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
-      !e.metaKey &&
-      !e.ctrlKey &&
-      !e.altKey
-    ) {
+    // The default bindings are unmodified arrows; Cmd/Ctrl/Alt+↑/↓ global
+    // hotkeys therefore never match them and still fire mid-compose.
+    const recallsPrevious = eventMatchesShortcutAction(e.nativeEvent, "recallPreviousPrompt");
+    const recallsNext = eventMatchesShortcutAction(e.nativeEvent, "recallNextPrompt");
+    if ((draft.quotes.length === 0 || recallingRef.current) && (recallsPrevious || recallsNext)) {
       const ta = e.currentTarget;
-      if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+      if (recallsPrevious && ta.selectionStart === 0) {
         // Empty-composer recall takes the last queued row before browsing history.
         if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
@@ -4278,7 +4273,7 @@ function ComposerImpl(
           e.preventDefault();
           applyRecall(ta, recalled);
         }
-      } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
+      } else if (recallsNext && ta.selectionEnd === ta.value.length) {
         const recalled = recallNext();
         if (recalled !== null) {
           e.preventDefault();
