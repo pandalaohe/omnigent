@@ -25,7 +25,7 @@ import shutil
 import stat
 import urllib.parse
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import ModuleType
@@ -131,6 +131,23 @@ def is_by_path(filename: str | None, source_metadata: object) -> bool:
     return requires_filesystem(filename)
 
 
+def is_purged(source_metadata: object) -> bool:
+    """
+    Whether the archive cleanup deleted the stored bytes of this row.
+
+    Only ``done`` means gone: a ``claimed`` row behaves like a live one (its
+    content is served and quota-counted) until the artifact-store delete
+    completes. Old rows without a purge record read as live.
+
+    :param source_metadata: The stored row's ``source_metadata`` value.
+    :returns: True when the row's purge state is ``done``.
+    """
+    if not isinstance(source_metadata, Mapping):
+        return False
+    purge = source_metadata.get("purge")
+    return isinstance(purge, Mapping) and purge.get("state") == "done"
+
+
 def inline_filesystem_attachment_name(content: object) -> str | None:
     """
     Filename of the first attachment requiring filesystem tools with inline bytes.
@@ -215,6 +232,37 @@ def rewrite_attached_paths(text: str, session_id: str) -> str:
     def _replace(match: re.Match[str]) -> str:
         path = session_attachment_dir(session_id) / match.group(1) / match.group(2)
         return f"[Attached: {path}]"
+
+    return _ATTACHED_PATH_RE.sub(_replace, text)
+
+
+def mark_purged_attachments(text: str, session_id: str, purged: Mapping[str, str]) -> str:
+    """
+    Replace purged attachment lines with the visible could-not-load marker.
+
+    The archive cleanup deletes a purged row's bytes, so a persisted
+    ``[Attached: ...]`` line for that row would hand the harness a dead path
+    and the model a hallucinated file. A line whose ``file_id`` is purged
+    becomes the :func:`unresolved_attachment_marker` for the row's stored
+    name, unless the host file at the rewritten path still exists — per
+    design, a surviving copy keeps working. Lines of live rows and lines that
+    do not match the layout are left exactly as written.
+
+    :param text: Persisted text that may contain attachment reference lines.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param purged: This session's purged rows, ``file_id`` -> stored name.
+    :returns: *text* with purged rows' lines replaced by the marker.
+    """
+    if not purged:
+        return text
+
+    def _replace(match: re.Match[str]) -> str:
+        file_id, path_name = match.group(1), match.group(2)
+        if file_id not in purged:
+            return match.group(0)
+        if (session_attachment_dir(session_id) / file_id / path_name).exists():
+            return match.group(0)
+        return unresolved_attachment_marker({"filename": purged[file_id]})
 
     return _ATTACHED_PATH_RE.sub(_replace, text)
 
@@ -662,6 +710,8 @@ async def _materialize_file_reference_by_path(
 async def restore_session_attachments(
     session_id: str,
     client: httpx.AsyncClient,
+    *,
+    purged: MutableMapping[str, str] | None = None,
 ) -> bool:
     """
     Re-materialize every by-path file a session owns on this host.
@@ -670,11 +720,16 @@ async def restore_session_attachments(
     (or on this one after a CLI release); a transcript that still references
     them needs the files back before the harness resumes. The session file
     listing supplies the by-path rows; a file whose size still matches is
-    reused without fetching. Every failure is logged and skipped so a resume
-    is never blocked by one missing attachment.
+    reused without fetching. Rows the archive cleanup purged (``done``) are
+    skipped — their bytes are gone by design. Every failure is logged and
+    skipped so a resume is never blocked by one missing attachment.
 
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
+    :param purged: When given, filled with this session's purged by-path
+        rows (``file_id`` -> stored name) from the same listing, so a caller
+        can pass them to :func:`mark_purged_attachments` without a second
+        listing request.
     :returns: ``True`` when the listing succeeded and every by-path row
         materialized; ``False`` when the listing failed or at least one
         by-path row could not be materialized.
@@ -716,6 +771,13 @@ async def restore_session_attachments(
             if not isinstance(file_id, str) or not file_id:
                 continue
             if not is_by_path(name if isinstance(name, str) else None, source_metadata):
+                continue
+            if is_purged(source_metadata):
+                # The archive cleanup deleted the bytes; a 410 would fail the
+                # whole restore and every later turn would retry it. Report the
+                # row so the caller can mark its transcript line as lost.
+                if purged is not None:
+                    purged[file_id] = name if isinstance(name, str) and name else file_id
                 continue
             try:
                 path = await materialize_file_reference(
@@ -1229,11 +1291,11 @@ async def resolve_file_reference(
 _HISTORY_TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text"})
 
 
-def _rewrite_message_text_attachments(item: dict[str, Any], session_id: str) -> None:
-    """Redirect ``[Attached: ...]`` texts inside one message item, in place."""
+def _map_message_text_attachments(item: dict[str, Any], transform: Callable[[str], str]) -> None:
+    """Apply *transform* to every attachment-bearing text inside one message item."""
     content = item.get("content")
     if isinstance(content, str):
-        item["content"] = rewrite_attached_paths(content, session_id)
+        item["content"] = transform(content)
         return
     if not isinstance(content, list):
         return
@@ -1242,7 +1304,22 @@ def _rewrite_message_text_attachments(item: dict[str, Any], session_id: str) -> 
             continue
         text = block.get("text")
         if isinstance(text, str):
-            block["text"] = rewrite_attached_paths(text, session_id)
+            block["text"] = transform(text)
+
+
+def _rewrite_message_text_attachments(item: dict[str, Any], session_id: str) -> None:
+    """Redirect ``[Attached: ...]`` texts inside one message item, in place."""
+    _map_message_text_attachments(item, lambda text: rewrite_attached_paths(text, session_id))
+
+
+def mark_purged_message_attachments(
+    item: dict[str, Any], session_id: str, purged: Mapping[str, str]
+) -> None:
+    """Replace purged ``[Attached: ...]`` texts inside one message item, in place."""
+    if purged:
+        _map_message_text_attachments(
+            item, lambda text: mark_purged_attachments(text, session_id, purged)
+        )
 
 
 async def _resolve_message_item_file_references(

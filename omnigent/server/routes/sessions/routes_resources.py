@@ -11,6 +11,7 @@ import os
 import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -2103,6 +2104,27 @@ def register_resources_routes(
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
+            )
+        # The archive cleanup deleted the original; the row stays for its chip
+        # and metadata, but the bytes are gone for good. Checked before the
+        # ETag so a cached 304 can never resurrect them.
+        from omnigent.inner.native_attachments import is_purged
+
+        if is_purged(stored.source_metadata):
+            purge = (
+                stored.source_metadata.get("purge")
+                if isinstance(stored.source_metadata, Mapping)
+                else None
+            )
+            at = purge.get("at") if isinstance(purge, Mapping) else None
+            when = (
+                datetime.fromtimestamp(at, tz=timezone.utc).date().isoformat()
+                if isinstance(at, int) and not isinstance(at, bool)
+                else "an unknown date"
+            )
+            raise HTTPException(
+                status_code=410,
+                detail=f"File was removed by the archive cleanup on {when}",
             )
         # The bytes live under blob_key (== id for own uploads; the source's
         # blob for a fork copy that shares it). Content is immutable per blob,

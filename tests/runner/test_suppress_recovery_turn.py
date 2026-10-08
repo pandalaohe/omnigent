@@ -705,6 +705,104 @@ async def test_cleanup_restores_cached_history_attachments_on_the_next_message(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_marks_purged_cached_history_attachment_for_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A purged cached-history line must read as lost before the next harness call.
+
+    Cleanup deletes the host copy and the archive cleanup later purges the
+    stored bytes. The cached ``[Attached: ...]`` line must be rewritten in
+    place to the could-not-load marker so the next turn's harness never sees
+    a dead path, and no content GET may be attempted for the purged row.
+    """
+    from omnigent.inner.native_attachments import session_attachment_dir
+    from omnigent.runner.app import _session_histories_ref
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    host_copy = session_attachment_dir(SESSION_ID) / "file_1" / "clip.mp4"
+    host_copy.parent.mkdir(parents=True)
+    host_copy.write_bytes(b"hello")
+    state = {"content_gets": 0}
+    file_row = {
+        "id": "file_1",
+        "name": "clip.mp4",
+        "metadata": {
+            "bytes": 5,
+            "source_metadata": {
+                "delivery": "filesystem",
+                "purge": {"state": "done", "revision": 1, "at": 1_700_000_000},
+            },
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(f"/sessions/{SESSION_ID}/items"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        if path.endswith(f"/sessions/{SESSION_ID}/resources/files"):
+            return httpx.Response(200, json={"data": [file_row], "has_more": False})
+        if path.endswith("/resources/files/file_1/content"):
+            state["content_gets"] += 1
+            return httpx.Response(200, content=b"hello")
+        if path.endswith("/resources/files/file_1"):
+            return httpx.Response(200, json=file_row)
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    )
+    app, _pm, harness = _build_sdk_app(server_client)
+    async with server_client:
+        async with _runner_client(app) as client:
+            init_resp = await client.post(
+                "/v1/sessions",
+                json=_session_init_payload(suppress_recovery_turn=True),
+            )
+            assert init_resp.status_code == 201, init_resp.text
+
+            _session_histories_ref[SESSION_ID] = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"[Attached: {host_copy}]"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                },
+            ]
+            pending = app.state.attachment_restore_pending
+            try:
+                cleanup_resp = await client.delete(f"/v1/sessions/{SESSION_ID}/resources")
+                assert cleanup_resp.status_code == 200, cleanup_resp.text
+                assert not host_copy.exists(), "cleanup must delete the host copy"
+
+                forward_resp = await client.post(
+                    f"/v1/sessions/{SESSION_ID}/events",
+                    json={
+                        "type": "message",
+                        "agent_id": AGENT_ID,
+                        "content": [{"type": "input_text", "text": "another look"}],
+                    },
+                )
+                assert forward_resp.status_code == 202, forward_resp.text
+                turn = app.state.active_turns.get(SESSION_ID)
+                assert turn is not None
+                await asyncio.wait_for(turn, timeout=5)
+                assert SESSION_ID not in pending
+            finally:
+                _session_histories_ref.pop(SESSION_ID, None)
+                pending.discard(SESSION_ID)
+
+    assert state["content_gets"] == 0
+    harness_content = str(harness.posted_bodies[0]["content"])
+    assert "[Attachment clip.mp4 could not be loaded]" in harness_content
+    assert "[Attached:" not in harness_content
+
+
+@pytest.mark.asyncio
 async def test_failed_restore_keeps_the_flag_for_the_next_message(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -272,3 +272,66 @@ async def test_load_history_restores_a_plain_string_message_content(
     assert converted[0]["content"] == f"[Attached: {local_path}] inspect"
     assert local_path.read_bytes() == file_bytes
     assert content_gets == 1
+
+
+@pytest.mark.asyncio
+async def test_load_history_marks_a_purged_attachment_without_fetching_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A purged row's line becomes the marker and its content is never fetched."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    session_id = "conv_hist_purged"
+    content_requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "file_mp4",
+                            "name": "a.mp4",
+                            "metadata": {
+                                "bytes": 5,
+                                "source_metadata": {
+                                    "delivery": "filesystem",
+                                    "purge": {
+                                        "state": "done",
+                                        "revision": 1,
+                                        "at": 1_700_000_000,
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if path.endswith("/content"):
+            content_requests.append(path)
+            return httpx.Response(200, content=b"hello")
+        if path.endswith(f"/sessions/{session_id}/items"):
+            return httpx.Response(200, json={"data": _compacted_items(), "has_more": False})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        history = build_session_history(
+            _background_tasks=set(),
+            _last_server_item_id={},
+            _persist_cancellation_items=_noop_persist_cancellation_items,
+            _session_histories={},
+            _session_spec_cache={},
+            server_client=client,
+        )
+        converted = await history.load_history_as_input(session_id)
+
+    expected = session_attachment_dir(session_id) / "file_mp4" / "a.mp4"
+    assert converted[0]["content"][0]["text"] == (
+        "[Attachment a.mp4 could not be loaded] please inspect"
+    )
+    assert not expected.exists()
+    assert content_requests == []

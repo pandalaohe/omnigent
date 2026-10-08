@@ -14,6 +14,7 @@ import httpx
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.inner.native_attachments import (
     contains_attached_path,
+    mark_purged_message_attachments,
     restore_session_attachments,
     rewrite_attached_paths,
 )
@@ -211,7 +212,14 @@ def build_session_history(
                 if rewritten != text:
                     block["text"] = rewritten
         if restore_needed:
-            await restore_session_attachments(session_id, server_client)
+            purged: dict[str, str] = {}
+            await restore_session_attachments(session_id, server_client, purged=purged)
+            # A purged row's bytes are gone, so its rewritten line would point
+            # at a dead path; mark it as lost before the harness sees history.
+            if purged:
+                for item in converted:
+                    if item.get("type") == "message":
+                        mark_purged_message_attachments(item, session_id, purged)
         return converted
 
     def _convert_raw_items_to_input(

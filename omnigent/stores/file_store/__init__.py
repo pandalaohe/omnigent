@@ -87,6 +87,72 @@ class FileStore(ABC):
         ...
 
     @abstractmethod
+    def list_blob_referrers(self, blob_key: str) -> builtins.list[StoredFile]:
+        """
+        Return every file row whose bytes live under *blob_key*.
+
+        A fork copy shares the source's blob, so one artifact-store key can
+        back rows in several sessions. The archive cleanup re-checks this set
+        after claiming so it never deletes bytes a later fork still needs.
+
+        :param blob_key: The artifact-store key to resolve.
+        :returns: The referencing rows (possibly empty).
+        """
+        ...
+
+    @abstractmethod
+    def claim_purge(
+        self,
+        blob_key: str,
+        *,
+        session_id: str,
+        revision: int,
+        now: int,
+    ) -> builtins.list[StoredFile] | None:
+        """
+        Mark every referrer of *blob_key* as claimed for deletion.
+
+        Runs in one transaction that locks the referrer rows. Refuses when any
+        referrer belongs to another session (a shared blob) or already holds a
+        ``done`` purge state, so a caller that receives rows may delete the
+        blob once it re-checks the session revision.
+
+        :param blob_key: The artifact-store key to claim.
+        :param session_id: Session whose archive cleanup owns the claim.
+        :param revision: The session's ``archive_revision`` at claim time.
+        :param now: Unix epoch seconds of the claim.
+        :returns: The claimed rows, or ``None`` when the blob is shared or
+            already purged.
+        """
+        ...
+
+    @abstractmethod
+    def release_purge(self, blob_key: str) -> None:
+        """
+        Drop a ``claimed`` purge state from every referrer of *blob_key*.
+
+        Used when the archive changed between claim and delete (unarchive,
+        re-archive, or a fork copying the row). ``done`` rows are left alone:
+        their bytes are gone, so they must never read as live again.
+
+        :param blob_key: The artifact-store key whose claim to release.
+        """
+        ...
+
+    @abstractmethod
+    def finish_purge(self, blob_key: str, *, now: int) -> None:
+        """
+        Mark every referrer of *blob_key* as ``done``.
+
+        Called after the artifact-store blob is deleted: ``done`` is the only
+        state that means the bytes are gone.
+
+        :param blob_key: The artifact-store key whose bytes were deleted.
+        :param now: Unix epoch seconds the deletion finished.
+        """
+        ...
+
+    @abstractmethod
     def get(
         self,
         file_id: str,

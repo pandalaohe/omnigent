@@ -12435,8 +12435,9 @@ def _enforce_filesystem_attachment_policy(
     Enforces the operator denylist and the per-session file-count and total-byte
     quotas before any bytes are read, so a rejected upload or copy never
     buffers. The server accounts for all stored uploads, including files that
-    are not currently present in the runner cache. ``None`` from any limit
-    reader means that dimension is unlimited and is not checked.
+    are not currently present in the runner cache; purged-by-cleanup rows do
+    not count. ``None`` from any limit reader means that dimension is unlimited
+    and is not checked.
 
     :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
     :param session_id: Destination session, whose existing attachments are counted,
@@ -12451,7 +12452,7 @@ def _enforce_filesystem_attachment_policy(
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
     """
-    from omnigent.inner.native_attachments import is_by_path
+    from omnigent.inner.native_attachments import is_by_path, is_purged
     from omnigent.server.server_config import (
         filesystem_attachment_denied_extensions,
         filesystem_attachment_file_limit,
@@ -12490,8 +12491,11 @@ def _enforce_filesystem_attachment_policy(
             order="asc",
         )
         for stored in page.data:
-            # This quota covers the files delivered by path.
-            if is_by_path(stored.filename, stored.source_metadata):
+            # This quota covers the files delivered by path. Purged originals
+            # no longer occupy storage, so they do not count against it.
+            if is_by_path(stored.filename, stored.source_metadata) and not is_purged(
+                stored.source_metadata
+            ):
                 used_files += 1
                 used_bytes += stored.bytes
         if not page.has_more or page.last_id is None:

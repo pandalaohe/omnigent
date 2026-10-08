@@ -1838,6 +1838,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
 
+    def list_workspace_ids_with_archived_before(self, *, archived_before: int) -> list[int]:
+        """Find every tenant partition holding a conversation archived before a cutoff.
+
+        Privileged cross-workspace scan for the archive cleanup job, which runs
+        in the lifespan's default workspace. Ordered by workspace id so a sweep
+        is deterministic.
+
+        :param archived_before: Exclusive epoch-seconds cutoff on ``archived_at``.
+        :returns: Workspace ids in ascending order.
+        """
+        with self._conv_session("list_archived_workspace_ids") as session:
+            return list(
+                session.scalars(
+                    select(SqlConversation.workspace_id)
+                    .where(
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archived_at.is_not(None),
+                        SqlConversation.archived_at < archived_before,
+                    )
+                    .distinct()
+                    .order_by(SqlConversation.workspace_id)
+                )
+            )
+
     def claim_archive_close(
         self,
         conversation_id: str,

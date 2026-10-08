@@ -12,6 +12,8 @@ host routes themselves.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -21,12 +23,28 @@ from fastapi import APIRouter, Body, Request
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.attachment_archive_cleanup import SUMMARY_FILENAME
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.system_status import DEFAULT_HEALTH_CHECK_PROMPT, SystemStatusHub
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.version import VERSION
+
+_logger = logging.getLogger(__name__)
+
+
+def _attachment_archive_cleanup_summary(hub: SystemStatusHub) -> dict[str, Any] | None:
+    """Last archive-cleanup sweep summary, or ``None`` when never run."""
+    path = hub.history_path.parent / SUMMARY_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        _logger.warning("ignoring corrupt attachment archive cleanup summary %s", path)
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def create_system_status_router(
@@ -157,6 +175,7 @@ def create_system_status_router(
         return {
             "text": text,
             "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            "attachment_archive_cleanup": _attachment_archive_cleanup_summary(hub),
         }
 
     @router.get("/system/settings")

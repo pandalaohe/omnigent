@@ -6,7 +6,7 @@ import builtins
 import json
 from typing import Any
 
-from sqlalchemy import and_, asc, desc, func, or_, select
+from sqlalchemy import ColumnElement, and_, asc, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlFile, Uuid16, current_workspace_id, normalize_uuid
@@ -48,6 +48,29 @@ def _effective_blob_key(row: SqlFile) -> str:
     return row.blob_key if row.blob_key is not None else row.id
 
 
+def _blob_referrers_filter(
+    blob_key: str,
+) -> ColumnElement[bool]:
+    """Predicate matching every row that references *blob_key*.
+
+    ``id``/``blob_key`` are Uuid16 (binary); the COALESCE is typed so the
+    bound value is encoded the same way, not compared as text. Shared by the
+    orphan check and the purge operations so they always agree on referrers.
+    """
+    return func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16()) == normalize_uuid(blob_key)
+
+
+def _decode_source_metadata(row: SqlFile) -> dict[str, Any]:
+    """Decode a row's opaque JSON metadata, tolerating absent/corrupt values."""
+    if row.source_metadata is None:
+        return {}
+    try:
+        decoded = json.loads(row.source_metadata)
+    except ValueError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 class SqlAlchemyFileStore(FileStore):
     """
     SQLAlchemy-backed implementation of :class:`FileStore`.
@@ -74,6 +97,9 @@ class SqlAlchemyFileStore(FileStore):
             query_name_prefix="omnigent.file_store",
             immediate=True,
         )
+        # SQLite's immediate sessions take the write lock before the first
+        # read; other dialects lock the referrer rows explicitly.
+        self._supports_for_update = self._engine.dialect.name != "sqlite"
 
     def create(
         self,
@@ -146,10 +172,7 @@ class SqlAlchemyFileStore(FileStore):
                 select(SqlFile.id)
                 .where(
                     SqlFile.workspace_id == current_workspace_id(),
-                    # id/blob_key are Uuid16 (binary); type the COALESCE so the
-                    # bound value is encoded the same way, not compared as text.
-                    func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16())
-                    == normalize_uuid(blob_key),
+                    _blob_referrers_filter(blob_key),
                 )
                 .limit(1)
             ).first()
@@ -315,8 +338,7 @@ class SqlAlchemyFileStore(FileStore):
                         select(SqlFile.id)
                         .where(
                             SqlFile.workspace_id == current_workspace_id(),
-                            func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16())
-                            == normalize_uuid(blob_key),
+                            _blob_referrers_filter(blob_key),
                         )
                         .limit(1)
                     ).first()
@@ -325,3 +347,128 @@ class SqlAlchemyFileStore(FileStore):
             return orphaned
 
         return run_write_transaction(self._session_immediate, "delete_session_files", write)
+
+    def _referrer_rows(
+        self,
+        session: Session,
+        blob_key: str,
+        *,
+        lock: bool,
+    ) -> builtins.list[SqlFile]:
+        """Every row referencing *blob_key*, optionally locked for update."""
+        stmt = select(SqlFile).where(
+            SqlFile.workspace_id == current_workspace_id(),
+            _blob_referrers_filter(blob_key),
+        )
+        if lock and self._supports_for_update:
+            stmt = stmt.with_for_update()
+        return list(session.execute(stmt).scalars().all())
+
+    @staticmethod
+    def _purge_state(metadata: dict[str, Any]) -> dict[str, Any] | None:
+        """The row's ``source_metadata["purge"]`` mapping, or ``None``."""
+        purge = metadata.get("purge")
+        return purge if isinstance(purge, dict) else None
+
+    def list_blob_referrers(self, blob_key: str) -> builtins.list[StoredFile]:
+        """
+        Return every file row whose bytes live under *blob_key*.
+
+        A fork copy shares the source's blob, so one artifact-store key can
+        back rows in several sessions. The archive cleanup re-checks this set
+        after claiming so it never deletes bytes a later fork still needs.
+
+        :param blob_key: The artifact-store key to resolve.
+        :returns: The referencing rows (possibly empty).
+        """
+        with self._session("list_blob_referrers") as session:
+            return [_to_entity(row) for row in self._referrer_rows(session, blob_key, lock=False)]
+
+    def claim_purge(
+        self,
+        blob_key: str,
+        *,
+        session_id: str,
+        revision: int,
+        now: int,
+    ) -> builtins.list[StoredFile] | None:
+        """
+        Mark every referrer of *blob_key* as claimed for deletion.
+
+        Runs in one transaction that locks the referrer rows. Refuses when any
+        referrer belongs to another session (a shared blob) or already holds a
+        ``done`` purge state, so a caller that receives rows may delete the
+        blob once it re-checks the session revision.
+
+        :param blob_key: The artifact-store key to claim.
+        :param session_id: Session whose archive cleanup owns the claim.
+        :param revision: The session's ``archive_revision`` at claim time.
+        :param now: Unix epoch seconds of the claim.
+        :returns: The claimed rows, or ``None`` when the blob is shared or
+            already purged.
+        """
+        normalized_session = normalize_uuid(session_id)
+
+        def write(session: Session) -> builtins.list[StoredFile] | None:
+            rows = self._referrer_rows(session, blob_key, lock=True)
+            if not rows:
+                return None
+            for row in rows:
+                if row.session_id != normalized_session:
+                    return None
+                purge = self._purge_state(_decode_source_metadata(row))
+                if purge is not None and purge.get("state") == "done":
+                    return None
+            for row in rows:
+                metadata = _decode_source_metadata(row)
+                metadata["purge"] = {"state": "claimed", "revision": revision, "at": now}
+                row.source_metadata = json.dumps(metadata)
+            session.flush()
+            return [_to_entity(row) for row in rows]
+
+        return run_write_transaction(self._session_immediate, "claim_blob_purge", write)
+
+    def release_purge(self, blob_key: str) -> None:
+        """
+        Drop a ``claimed`` purge state from every referrer of *blob_key*.
+
+        Used when the archive changed between claim and delete (unarchive,
+        re-archive, or a fork copying the row). ``done`` rows are left alone:
+        their bytes are gone, so they must never read as live again.
+
+        :param blob_key: The artifact-store key whose claim to release.
+        """
+
+        def write(session: Session) -> None:
+            for row in self._referrer_rows(session, blob_key, lock=True):
+                metadata = _decode_source_metadata(row)
+                purge = self._purge_state(metadata)
+                if purge is None or purge.get("state") != "claimed":
+                    continue
+                del metadata["purge"]
+                row.source_metadata = json.dumps(metadata) if metadata else None
+            session.flush()
+
+        run_write_transaction(self._session_immediate, "release_blob_purge", write)
+
+    def finish_purge(self, blob_key: str, *, now: int) -> None:
+        """
+        Mark every referrer of *blob_key* as ``done``.
+
+        Called after the artifact-store blob is deleted: ``done`` is the only
+        state that means the bytes are gone.
+
+        :param blob_key: The artifact-store key whose bytes were deleted.
+        :param now: Unix epoch seconds the deletion finished.
+        """
+
+        def write(session: Session) -> None:
+            for row in self._referrer_rows(session, blob_key, lock=True):
+                metadata = _decode_source_metadata(row)
+                purge = self._purge_state(metadata)
+                revision = purge.get("revision", 0) if purge is not None else 0
+                metadata["purge"] = {"state": "done", "revision": revision, "at": now}
+                row.source_metadata = json.dumps(metadata)
+            session.flush()
+
+        run_write_transaction(self._session_immediate, "finish_blob_purge", write)
