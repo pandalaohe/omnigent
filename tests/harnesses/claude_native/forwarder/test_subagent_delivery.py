@@ -22,6 +22,10 @@ from omnigent.harnesses.claude_native.bridge import (
     TranscriptRecordItems,
     record_hook_event,
 )
+from omnigent.runner.transports.ws_tunnel.event_delivery import (
+    RunnerEventDispatcher,
+    TunnelEventClient,
+)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _legacy_event_transport,
@@ -1708,7 +1712,7 @@ async def test_subagent_history_recovery_rejects_malformed_skipped_ack(
     """Only the exact skipped acknowledgement can suppress a historical item."""
 
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=response_body)
+        return httpx.Response(200, json=[response_body])
 
     item = ClaudeTranscriptItem(
         source_id=f"historical-item:0:{item_type}",
@@ -1809,6 +1813,311 @@ async def test_subagent_history_recovery_409_keeps_cursor_for_retry(tmp_path: Pa
     assert recovery_attempts == 2
     assert second.subagents["mismatch1"].byte_offset == child_path.stat().st_size
     assert second.subagents["mismatch1"].recovery_watermark is None
+
+
+def _seed_recovery_child(
+    tmp_path: Path,
+    *,
+    subagent_id: str,
+    child_id: str,
+) -> tuple[Path, Path, forwarder.SubagentEntry]:
+    """Create one existing child frozen at a recovery watermark."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    child_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id=subagent_id,
+        agent_type="Explore",
+        description="history recovery",
+        tool_use_id=f"toolu_{subagent_id}",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": f"historical-{subagent_id}",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "old answer"}],
+                },
+            }
+        ],
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id=subagent_id,
+        child_conversation_id=child_id,
+        recovery_watermark=child_path.stat().st_size,
+    )
+    return bridge_dir, child_path, entry
+
+
+async def _recover_once(
+    client: httpx.AsyncClient,
+    *,
+    bridge_dir: Path,
+    entry: forwarder.SubagentEntry,
+    child_path: Path,
+    tracker: forwarder._PostRetryTracker,
+) -> forwarder.SubagentEntry | None:
+    """Run one frozen-history reconciliation pass over ``entry``."""
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={entry.subagent_id: entry}),
+    )
+    return await forwarder._recover_subagent_history(
+        client=client,
+        entry=entry,
+        jsonl_path=child_path,
+        agent_name="claude-native-ui",
+        checkpoint=checkpoint,
+        item_retry_tracker=tracker,
+    )
+
+
+async def test_subagent_recovery_post_is_http_array_with_item_id_ack() -> None:
+    """Recovery posts a one-element array over HTTP; the tunnel ack has no item id."""
+    bodies: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            202,
+            json=[
+                {
+                    "queued": False,
+                    "item_id": "server-recovered",
+                    "replayed": True,
+                    "recovery": True,
+                }
+            ],
+        )
+
+    frames: list[str] = []
+
+    async def send(frame: str) -> None:
+        frames.append(frame)
+
+    dispatcher = RunnerEventDispatcher()
+    dispatcher.ready(send)
+    item = ClaudeTranscriptItem(
+        source_id="historical-item:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "text", "text": "old"}]},
+        response_id="resp_history",
+    )
+    async with TunnelEventClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+        event_dispatcher=dispatcher,
+    ) as client:
+        item_id = await forwarder._post_external_recovery_item(
+            client,
+            session_id="conv_child",
+            item=item,
+            recovery_after="server-prior",
+        )
+
+    assert item_id == "server-recovered"
+    assert len(bodies) == 1
+    assert isinstance(bodies[0], list)
+    assert len(bodies[0]) == 1
+    assert bodies[0][0]["type"] == "external_conversation_item"
+    assert bodies[0][0]["data"]["recovery_after"] == "server-prior"
+    assert frames == []
+
+
+async def test_subagent_history_recovery_parks_after_permanent_rejections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permanently rejected history item is parked, never retried per poll."""
+    bridge_dir, child_path, entry = _seed_recovery_child(
+        tmp_path, subagent_id="park1", child_id="conv_child_park"
+    )
+    posts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        posts += 1
+        return httpx.Response(403, json={"detail": "forbidden"})
+
+    real_monotonic = time.monotonic
+    clock_offset = [0.0]
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: real_monotonic() + clock_offset[0])
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def poll() -> forwarder.SubagentEntry | None:
+            return await _recover_once(
+                client,
+                bridge_dir=bridge_dir,
+                entry=entry,
+                child_path=child_path,
+                tracker=tracker,
+            )
+
+        for _ in range(20):
+            assert await poll() is None
+        assert posts == 3
+        assert entry.recovery_watermark == child_path.stat().st_size
+        assert entry.byte_offset == 0
+        assert not (bridge_dir / "dead_letter.jsonl").exists()
+
+        clock_offset[0] += forwarder._SUBAGENT_RECOVERY_PARK_S + 1.0
+        assert await poll() is None
+        assert posts == 4
+        assert await poll() is None
+        assert posts == 4
+
+
+async def test_subagent_history_recovery_parks_unconfirmed_ack(tmp_path: Path) -> None:
+    """An unconfirmed 202 chain is bounded like a permanent rejection."""
+    bridge_dir, child_path, entry = _seed_recovery_child(
+        tmp_path, subagent_id="unconfirmed1", child_id="conv_child_unconfirmed"
+    )
+    posts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        posts += 1
+        return httpx.Response(202, json=[{"queued": False}])
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def poll() -> forwarder.SubagentEntry | None:
+            return await _recover_once(
+                client,
+                bridge_dir=bridge_dir,
+                entry=entry,
+                child_path=child_path,
+                tracker=tracker,
+            )
+
+        for _ in range(5):
+            assert await poll() is None
+        assert posts == 3
+        assert await poll() is None
+
+    assert posts == 3
+    assert entry.recovery_watermark == child_path.stat().st_size
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "response_body"),
+    [
+        (503, {"detail": "unavailable"}),
+        (503, {"error": "subagent_delivery_not_confirmed"}),
+        (409, {"detail": "conflict"}),
+    ],
+)
+async def test_subagent_history_transient_exhaustion_is_never_parked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+    response_body: dict[str, str],
+) -> None:
+    """An exhausted transient failure keeps the backoff ceiling, never the long park."""
+    bridge_dir, child_path, entry = _seed_recovery_child(
+        tmp_path, subagent_id="transient1", child_id="conv_child_transient"
+    )
+    monkeypatch.setattr(forwarder, "_HTTP_POST_RETRY_MAX_DELAY_S", 0.0)
+    posts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        posts += 1
+        return httpx.Response(status_code, json=response_body)
+
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS,
+    )
+    items = forwarder.read_transcript_items_from_offset(
+        child_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id=None,
+        include_sidechains=True,
+        end_offset=entry.recovery_watermark,
+    ).items
+    assert len(items) == 1
+    retry_key = f"subagent_recovery:{entry.child_conversation_id}:{items[0].source_id}"
+    caplog.set_level(logging.DEBUG, logger=forwarder._logger.name)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def poll() -> forwarder.SubagentEntry | None:
+            return await _recover_once(
+                client,
+                bridge_dir=bridge_dir,
+                entry=entry,
+                child_path=child_path,
+                tracker=tracker,
+            )
+
+        for _ in range(forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS + 8):
+            assert await poll() is None
+
+    assert posts == forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS + 8
+    retry_delay_s = tracker.retry_delay_s(retry_key)
+    assert retry_delay_s is None or retry_delay_s < forwarder._SUBAGENT_RECOVERY_PARK_S
+    assert entry.recovery_watermark == child_path.stat().st_size
+    assert entry.byte_offset == 0
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+    records = [record for record in caplog.records if record.name == forwarder._logger.name]
+    assert len([record for record in records if record.exc_info]) == 1
+    assert not [record for record in records if "reconciliation parked" in record.getMessage()]
+
+
+async def test_subagent_history_recovery_logs_one_traceback_before_parking(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only the first blocked attempt logs a traceback; parking logs one WARN."""
+    bridge_dir, child_path, entry = _seed_recovery_child(
+        tmp_path, subagent_id="log1", child_id="conv_child_log"
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": "forbidden"})
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    caplog.set_level(logging.DEBUG, logger=forwarder._logger.name)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def poll() -> forwarder.SubagentEntry | None:
+            return await _recover_once(
+                client,
+                bridge_dir=bridge_dir,
+                entry=entry,
+                child_path=child_path,
+                tracker=tracker,
+            )
+
+        for _ in range(20):
+            assert await poll() is None
+
+    records = [record for record in caplog.records if record.name == forwarder._logger.name]
+    traced = [record for record in records if record.exc_info]
+    assert len(traced) == 1
+    assert traced[0].levelno == logging.WARNING
+    assert "reconciliation held" in traced[0].getMessage()
+    parked = [record for record in records if "reconciliation parked" in record.getMessage()]
+    assert len(parked) == 1
+    assert parked[0].levelno == logging.WARNING
+    assert parked[0].exc_info is None
 
 
 async def test_subagent_history_partial_eof_becomes_live_only_after_newline(
