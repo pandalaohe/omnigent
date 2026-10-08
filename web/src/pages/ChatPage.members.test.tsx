@@ -258,7 +258,7 @@ describe("2+ member session composer", () => {
 
   it("shows the routing hint in the placeholder", () => {
     renderComposer();
-    expect(textarea().placeholder).toContain("@role hands a part to a member");
+    expect(textarea().placeholder).toBe("Send a message… — @role hands a part to a member");
   });
 
   it("offers the Members section to `@` on a non-native harness", () => {
