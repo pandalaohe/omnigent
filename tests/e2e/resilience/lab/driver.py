@@ -135,6 +135,10 @@ class SessionDriver:
             timeout=_TURN_TIMEOUT_S,
             what=f"the approval prompt for {turn.marker}",
         )
+        if self.deferred and self.harness == "codex":
+            # Settle the pending notice first: arriving together with the approval
+            # message it would take that message's reply.
+            self.lab.wait_for_text(self.session_id, _noted(turn), timeout=_TURN_TIMEOUT_S)
         return turn, str(approval["elicitation_id"])
 
     def start_streaming_turn(self, seconds: float, *, retries: int = 3) -> Turn:
@@ -280,7 +284,7 @@ class SessionDriver:
         """
         assert turn.gate is not None
         self._script(turn, [{"tool_calls": [call]}, {"text": f"Waiting for {turn.marker}."}])
-        after_notice = [{"text": "Noted."}] if self.harness == "codex" else []
+        after_notice = [{"text": _noted(turn)}] if self.harness == "codex" else []
         self.lab.script_turn(
             turn.gate,
             [*after_notice, {"tool_calls": [retry]}, {"text": turn.reply}],
@@ -320,3 +324,7 @@ class SessionDriver:
 
 def _reply(marker: str) -> str:
     return f"Finished {marker}."
+
+
+def _noted(turn: Turn) -> str:
+    return f"Noted {turn.marker}."
