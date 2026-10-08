@@ -1,4 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { type ReactNode, useMemo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
@@ -89,6 +91,18 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
+/** The HTML preview's annotation hook saves through React Query. */
+function Providers({ children }: { children: ReactNode }) {
+  const queryClient = useMemo(
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      }),
+    [],
+  );
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+
 interface RenderViewerOpts {
   viewMode?: "editor" | "preview" | "source" | "diff";
   truncated?: boolean;
@@ -113,22 +127,24 @@ function viewerElement(
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
   return (
-    <CodeViewer
-      position={opts.position}
-      conversationId="conv_1"
-      path={path}
-      fileQuery={makeFileQuery(content, opts.truncated)}
-      comments={[]}
-      activeSelection={null}
-      onSetActiveSelection={() => {}}
-      panelOpen={panelOpen}
-      searchOpen={false}
-      setSearchOpen={() => {}}
-      searchInputRef={noopRef}
-      viewMode={opts.viewMode ?? "source"}
-      onRequestEditMode={opts.onRequestEditMode}
-      previewKey={opts.previewKey}
-    />
+    <Providers>
+      <CodeViewer
+        position={opts.position}
+        conversationId="conv_1"
+        path={path}
+        fileQuery={makeFileQuery(content, opts.truncated)}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen={panelOpen}
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={opts.viewMode ?? "source"}
+        onRequestEditMode={opts.onRequestEditMode}
+        previewKey={opts.previewKey}
+      />
+    </Providers>
   );
 }
 
