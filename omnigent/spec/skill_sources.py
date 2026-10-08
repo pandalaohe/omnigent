@@ -208,6 +208,9 @@ def _claude_code_skills(
     """
     if ctx.skills_filter == "none":
         return []
+    # A host may publish .agents/skills for another agent; its switch keeps Claude off them.
+    if dotdir == ".agents" and not ctx.claude_portable_skills:
+        return []
     filter_names: set[str] | None = (
         set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
     )
