@@ -6572,6 +6572,20 @@ describe("NewChatLandingScreen", () => {
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 
+  it("blocks the newline keys in the landing composer when the newline is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "firstsecond" } });
+    input.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(false);
+    expect(input).toHaveValue("firstsecond");
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+    expect(input).toHaveValue("firstsecond");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
   it("leaves plain Enter as a newline on a phone viewport", async () => {
     // Touch keyboards own the create action (the on-screen button), so plain
     // Enter never creates — same rule as the in-session composer on a coarse

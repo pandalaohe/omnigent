@@ -296,6 +296,24 @@ describe("ChatComposer", () => {
     expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
     expect(input).toHaveValue("firstsecond");
   });
+
+  it("leaves touch Enter and Shift+Enter native even when the newline is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+    const onKeyDown = vi.fn();
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: true }}
+        input={{ "aria-label": "Draft", defaultValue: "firstsecond", onKeyDown }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(true);
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(true);
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+    expect(input).toHaveValue("firstsecond");
+  });
 });
 
 describe("ChatComposer label collapse", () => {

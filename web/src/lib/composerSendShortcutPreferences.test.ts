@@ -127,6 +127,13 @@ describe("composerNewLineDisposition", () => {
 
     expect(composerNewLineDisposition({ key: "Enter", altKey: true }, false, false)).toBe("block");
   });
+
+  it("keeps touch Enter and Shift+Enter native even when the newline is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+
+    expect(composerNewLineDisposition({ key: "Enter", shiftKey: true }, false, true)).toBe("none");
+    expect(composerNewLineDisposition({ key: "Enter" }, true, true)).toBe("none");
+  });
 });
 
 describe("isComposerAltNewlineKey", () => {
