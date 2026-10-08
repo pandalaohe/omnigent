@@ -168,6 +168,18 @@ describe("MobileAssistantSettings", () => {
     ).toBeTruthy();
   });
 
+  it("does not offer question-card actions in the picker", () => {
+    render(<MobileAssistantSettings />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Add button" }));
+    const select = screen.getByLabelText("Action from keyboard shortcuts");
+    const values = Array.from(select.querySelectorAll("option"), (option) => option.value);
+
+    expect(values).not.toContain("focusQuestionCard");
+    expect(values).not.toContain("questionCardNextOrSubmit");
+    expect(values).toContain("newSession");
+  });
+
   it("shows the real circular order preview and persists icon and repeat", () => {
     render(<MobileAssistantSettings />);
 

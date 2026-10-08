@@ -1,10 +1,18 @@
-import { Loader2Icon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Loader2Icon, TriangleAlertIcon, WifiOffIcon, XIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { useDismissedRunnerLogWarnings } from "@/hooks/useDismissedRunnerLogWarnings";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import { runnerLogRunawayNotice } from "@/lib/runnerLogRunaway";
+import {
+  RUNNER_LOG_RUNAWAY_LABEL_KEY,
+  runnerLogRunawayLeaseEnd,
+  runnerLogRunawayNotice,
+} from "@/lib/runnerLogRunaway";
+import { dismissRunnerLogWarning } from "@/lib/runnerLogWarningPreferences";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -51,8 +59,9 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 /**
  * Warning band for a session whose runner is writing logs abnormally fast
  * (the host reported a runaway; the server stamped the session label).
- * Self-gates to null when the session carries no flag. Sits at the top of
- * the chat view so the warning is visible without scrolling.
+ * Shows while the host keeps confirming the runner is over the cap;
+ * dismissing hides the band until a new detection instant arrives. Tops the
+ * composer stack so the warning is visible without scrolling.
  */
 export function RunnerLogRunawayBanner({
   labels,
@@ -61,18 +70,44 @@ export function RunnerLogRunawayBanner({
   labels: Record<string, string> | undefined;
   fallbackLabels?: Record<string, string> | undefined;
 }) {
-  const notice = runnerLogRunawayNotice(labels ?? fallbackLabels);
-  if (notice === null) return null;
+  const effectiveLabels = labels ?? fallbackLabels;
+  const notice = runnerLogRunawayNotice(effectiveLabels);
+  const flag = effectiveLabels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY];
+  const leaseEnd = runnerLogRunawayLeaseEnd(effectiveLabels);
+  const dismissed = useDismissedRunnerLogWarnings();
+  const [now, setNow] = useState(() => Date.now());
+
+  // One timer just past the lease end flips `now`, so the band disappears on
+  // its own when the host stops re-confirming the runaway report.
+  useEffect(() => {
+    if (leaseEnd === null) return;
+    const timer = window.setTimeout(
+      () => setNow(Date.now()),
+      Math.max(0, leaseEnd - Date.now()) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [leaseEnd]);
+
+  if (notice === null || leaseEnd === null || !flag || leaseEnd <= now) return null;
+  if (dismissed[flag] !== undefined) return null;
   return (
-    <div
-      data-testid="runner-log-runaway-banner"
-      role="status"
-      className={cn("mx-auto mb-4 w-full px-6", CHAT_COLUMN_WIDTH)}
-    >
+    <div data-testid="runner-log-runaway-banner" role="status" className="mb-2">
       <Alert>
         <TriangleAlertIcon aria-hidden />
         <AlertTitle>Runner log growth warning</AlertTitle>
         <AlertDescription>{notice}</AlertDescription>
+        <AlertAction>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Dismiss runner log warning"
+            data-testid="runner-log-runaway-dismiss"
+            onClick={() => dismissRunnerLogWarning(flag)}
+          >
+            <XIcon className="size-3.5" aria-hidden="true" />
+          </Button>
+        </AlertAction>
       </Alert>
     </div>
   );

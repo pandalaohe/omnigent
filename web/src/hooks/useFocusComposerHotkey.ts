@@ -37,7 +37,7 @@ export function isFocusComposerHotkey(e: globalThis.KeyboardEvent): boolean {
 }
 
 /** Does focus sit inside a surface that owns its keystrokes (xterm / Monaco)? */
-function focusOwnsHotkey(): boolean {
+export function focusOwnsHotkey(): boolean {
   const el = document.activeElement;
   return el instanceof Element && el.closest(HOTKEY_OWNING_SURFACES) !== null;
 }

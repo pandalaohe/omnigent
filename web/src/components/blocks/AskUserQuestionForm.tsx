@@ -30,9 +30,21 @@
 // passed to ``onSubmit``.
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, SquareIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useState } from "react";
+import {
+  type ChangeEvent,
+  type FocusEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
+import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import {
+  eventMatchesShortcutAction,
+  type ShortcutActionId,
+} from "@/lib/keyboardShortcutPreferences";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 /**
@@ -98,6 +110,57 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
+/** In-card actions in the order a key event resolves against them. */
+const CARD_ACTION_IDS: ShortcutActionId[] = [
+  "questionCardPreviousOption",
+  "questionCardNextOption",
+  "questionCardSelectOption",
+  "questionCardNextOrSubmit",
+  "questionCardPreviousQuestion",
+  "questionCardNextQuestion",
+  "questionCardLeave",
+  "questionCardCancel",
+  "questionCardCancelAndInterrupt",
+];
+
+/**
+ * Where the highlight starts on a question: the current answer — including a
+ * selected custom row, with its own index at the end — else the first row.
+ */
+function initialHighlightFor(
+  question: ClaudeQuestion,
+  selection: string | string[],
+  customSelected: boolean,
+): number {
+  if (question.multiSelect) {
+    const selected = Array.isArray(selection) ? selection : [];
+    const first = question.options.findIndex((option) => selected.includes(option.label));
+    if (first >= 0) return first;
+    return customSelected ? question.options.length : 0;
+  }
+  if (customSelected) return question.options.length;
+  const selected = question.options.findIndex((option) => option.label === selection);
+  return selected >= 0 ? selected : 0;
+}
+
+// A bare Enter on the navigation buttons is inert by default; if the user
+// bound plain Enter to a card action, that action handles the event instead.
+function plainEnterIsBoundToCardAction(): boolean {
+  return CARD_ACTION_IDS.some((actionId) =>
+    eventMatchesShortcutAction(
+      {
+        code: "Enter",
+        key: "Enter",
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+        shiftKey: false,
+      },
+      actionId,
+    ),
+  );
+}
+
 export function AskUserQuestionForm({
   questions,
   onSubmit,
@@ -133,6 +196,34 @@ export function AskUserQuestionForm({
     return initial;
   });
 
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Highlighted row: 0..options.length, the last index being the custom row.
+  const [highlight, setHighlight] = useState(0);
+  // True while focus is inside the card — the highlighted row shows then.
+  const [keyboardActive, setKeyboardActive] = useState(false);
+  const current = questions[currentIndex];
+
+  const enterCard = () => {
+    if (!current) return;
+    const key = questionKey(current);
+    setHighlight(initialHighlightFor(current, selections[key] ?? "", customSelected[key] ?? false));
+    rootRef.current?.focus();
+  };
+  useQuestionCardTarget(rootRef, enterCard);
+
+  // Keep the highlighted row visible when entry or an arrow key moves it.
+  useEffect(() => {
+    if (!keyboardActive) return;
+    rootRef.current
+      ?.querySelector<HTMLElement>('[data-highlighted="true"]')
+      ?.scrollIntoView({ block: "nearest" });
+  }, [keyboardActive, highlight, currentIndex]);
+
+  if (!current) return null;
+  const currentKey = questionKey(current);
+  const isFirst = currentIndex === 0;
+  const isLast = currentIndex === questions.length - 1;
+
   const handleSingleSelect = (key: string, label: string) => {
     // Single-select mutex: clicking a real option clears the
     // custom row selection so the radio group exposes exactly one
@@ -150,8 +241,8 @@ export function AskUserQuestionForm({
 
   const handleMultiToggle = (key: string, label: string) => {
     setSelections((prev) => {
-      const current = prev[key];
-      const set = new Set(Array.isArray(current) ? current : []);
+      const selected = prev[key];
+      const set = new Set(Array.isArray(selected) ? selected : []);
       if (set.has(label)) {
         set.delete(label);
       } else {
@@ -213,11 +304,176 @@ export function AskUserQuestionForm({
     onSubmit(finalAnswers);
   };
 
-  const current = questions[currentIndex];
-  if (!current) return null;
-  const currentKey = questionKey(current);
-  const isFirst = currentIndex === 0;
-  const isLast = currentIndex === questions.length - 1;
+  // A keyboard-driven submit / cancel leaves the card first, so focus lands in
+  // the composer instead of falling to <body> when the card unmounts.
+  const submitAndLeave = () => {
+    leaveQuestionCard(rootRef.current);
+    handleSubmit();
+  };
+
+  const rejectAndLeave = () => {
+    leaveQuestionCard(rootRef.current);
+    onReject();
+  };
+
+  const abortAndLeave = () => {
+    if (!onAbort) return;
+    leaveQuestionCard(rootRef.current);
+    onAbort();
+  };
+
+  const focusCustomInput = () => {
+    rootRef.current
+      ?.querySelector<HTMLTextAreaElement>('[data-testid="ask-user-question-custom-input"]')
+      ?.focus();
+  };
+
+  const goToQuestion = (index: number, focusRoot: boolean) => {
+    const question = questions[index];
+    if (!question) return;
+    // The fieldset is keyed by question, so the focused control unmounts with
+    // it: move focus to the root, then seed the new question's highlight.
+    if (focusRoot) rootRef.current?.focus();
+    setCurrentIndex(index);
+    const key = questionKey(question);
+    setHighlight(
+      initialHighlightFor(question, selections[key] ?? "", customSelected[key] ?? false),
+    );
+  };
+
+  const selectHighlighted = () => {
+    if (!current) return;
+    const key = questionKey(current);
+    if (highlight >= current.options.length) {
+      const wasSelected = customSelected[key] ?? false;
+      if (current.multiSelect) {
+        handleCustomToggleMulti(key);
+        if (!wasSelected) focusCustomInput();
+      } else {
+        handleCustomToggleSingle(key);
+        focusCustomInput();
+      }
+      return;
+    }
+    const option = current.options[highlight];
+    if (!option) return;
+    if (current.multiSelect) handleMultiToggle(key, option.label);
+    else handleSingleSelect(key, option.label);
+  };
+
+  const nextOrSubmit = () => {
+    if (!isLast) {
+      goToQuestion(currentIndex + 1, true);
+      return;
+    }
+    if (allAnswered) {
+      submitAndLeave();
+      return;
+    }
+    const unanswered = questions.findIndex((q) => {
+      const key = questionKey(q);
+      return (
+        answerForQuestion(
+          q,
+          selections[key] ?? "",
+          customSelected[key] ?? false,
+          customInputs[key] ?? "",
+        ) === null
+      );
+    });
+    if (unanswered >= 0) goToQuestion(unanswered, true);
+  };
+
+  const handleCardKeyUp = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== " " || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+    // Native Space activation on a focused checkbox can fire on keyup; the
+    // card owns that key whether or not "select" is bound.
+    const target = e.target;
+    if (
+      target instanceof HTMLInputElement &&
+      (target.type === "radio" || target.type === "checkbox")
+    ) {
+      e.preventDefault();
+    }
+  };
+
+  const handleCardKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.nativeEvent.isComposing) return;
+    const isCustomTextarea = e.target instanceof HTMLTextAreaElement;
+    const isButtonLike = e.target instanceof Element && e.target.closest("button, a") !== null;
+    const isOptionInput =
+      e.target instanceof HTMLInputElement &&
+      (e.target.type === "radio" || e.target.type === "checkbox");
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+
+    // Native defaults on option inputs belong to the card, independent of
+    // bindings: arrows must not move a radio, and Space must not toggle one.
+    if (isOptionInput && plain && (e.key === " " || e.key.startsWith("Arrow"))) {
+      e.preventDefault();
+    }
+    // Plain Enter neither advances nor submits from the navigation buttons
+    // unless the user bound plain Enter to a card action.
+    const onAdvanceButton =
+      e.target instanceof Element &&
+      e.target.closest(
+        '[data-testid="ask-user-question-prev"], [data-testid="ask-user-question-next"], [data-testid="ask-user-question-submit"]',
+      ) !== null;
+    if (onAdvanceButton && plain && e.key === "Enter" && !plainEnterIsBoundToCardAction()) {
+      e.preventDefault();
+    }
+
+    const actionId = CARD_ACTION_IDS.find((id) => eventMatchesShortcutAction(e, id));
+    if (!actionId) return;
+    // The custom text box keeps its own keys: Enter is a newline unless the
+    // next/submit action claims it; Esc returns to the options.
+    if (
+      isCustomTextarea &&
+      actionId !== "questionCardNextOrSubmit" &&
+      actionId !== "questionCardLeave"
+    ) {
+      return;
+    }
+    // Space on a button stays native activation.
+    if (isButtonLike && actionId === "questionCardSelectOption") return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    switch (actionId) {
+      case "questionCardPreviousOption":
+        setHighlight((previous) => Math.max(0, previous - 1));
+        return;
+      case "questionCardNextOption":
+        setHighlight((previous) => Math.min(current.options.length, previous + 1));
+        return;
+      case "questionCardSelectOption":
+        selectHighlighted();
+        return;
+      case "questionCardNextOrSubmit":
+        nextOrSubmit();
+        return;
+      case "questionCardPreviousQuestion":
+        goToQuestion(currentIndex - 1, true);
+        return;
+      case "questionCardNextQuestion":
+        goToQuestion(currentIndex + 1, true);
+        return;
+      case "questionCardLeave":
+        if (isCustomTextarea) {
+          setHighlight(current.options.length);
+          rootRef.current?.focus();
+        } else {
+          leaveQuestionCard(rootRef.current);
+        }
+        return;
+      case "questionCardCancel":
+        rejectAndLeave();
+        return;
+      case "questionCardCancelAndInterrupt":
+        abortAndLeave();
+        return;
+    }
+  };
 
   // Selected labels drive the preview render. Only PREDEFINED
   // options contribute previews — the custom row has no preview
@@ -241,7 +497,19 @@ export function AskUserQuestionForm({
   const customRowValue = customInputs[currentKey] ?? "";
 
   return (
-    <div className="flex flex-col gap-2 text-foreground" data-testid="ask-user-question-form">
+    <div
+      ref={rootRef}
+      tabIndex={-1}
+      data-question-card
+      className="flex flex-col gap-2 text-foreground"
+      data-testid="ask-user-question-form"
+      onKeyDown={handleCardKeyDown}
+      onKeyUp={handleCardKeyUp}
+      onFocus={() => setKeyboardActive(true)}
+      onBlur={(e: FocusEvent<HTMLDivElement>) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboardActive(false);
+      }}
+    >
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <span data-testid="ask-user-question-progress">
           Question {currentIndex + 1} of {questions.length}:
@@ -271,8 +539,11 @@ export function AskUserQuestionForm({
           {current.question}
         </legend>
         <div className="flex flex-col gap-2">
-          {current.options.map((opt) => {
+          {current.options.map((opt, index) => {
             const inputId = `${currentKey}-${opt.label}`;
+            const rowClassName =
+              "flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60";
+            const rowHighlighted = keyboardActive && highlight === index ? true : undefined;
             if (current.multiSelect) {
               const sel = selections[currentKey];
               const checked = Array.isArray(sel) && sel.includes(opt.label);
@@ -280,13 +551,15 @@ export function AskUserQuestionForm({
                 <label
                   key={opt.label}
                   htmlFor={inputId}
-                  className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
+                  data-highlighted={rowHighlighted}
+                  className={rowClassName}
                 >
                   <input
                     type="checkbox"
                     id={inputId}
                     checked={checked}
                     onChange={() => handleMultiToggle(currentKey, opt.label)}
+                    onFocus={() => setHighlight(index)}
                     className="mt-1"
                   />
                   <span className="flex flex-col">
@@ -304,7 +577,8 @@ export function AskUserQuestionForm({
               <label
                 key={opt.label}
                 htmlFor={inputId}
-                className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
+                data-highlighted={rowHighlighted}
+                className={rowClassName}
               >
                 <input
                   type="radio"
@@ -312,6 +586,7 @@ export function AskUserQuestionForm({
                   name={currentKey}
                   checked={checked}
                   onChange={() => handleSingleSelect(currentKey, opt.label)}
+                  onFocus={() => setHighlight(index)}
                   className="mt-1"
                 />
                 <span className="flex flex-col">
@@ -329,7 +604,10 @@ export function AskUserQuestionForm({
               same way. */}
           <label
             htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
+            data-highlighted={
+              keyboardActive && highlight === current.options.length ? true : undefined
+            }
+            className="flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
           >
             <input
               type={current.multiSelect ? "checkbox" : "radio"}
@@ -341,6 +619,7 @@ export function AskUserQuestionForm({
                   ? handleCustomToggleMulti(currentKey)
                   : handleCustomToggleSingle(currentKey)
               }
+              onFocus={() => setHighlight(current.options.length)}
               className="mt-1"
               data-testid="ask-user-question-custom-toggle"
             />
@@ -353,6 +632,7 @@ export function AskUserQuestionForm({
               placeholder="Type something"
               value={customRowValue}
               onChange={(e) => handleCustomInput(currentKey, e)}
+              onFocus={() => setHighlight(current.options.length)}
               data-testid="ask-user-question-custom-input"
               className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
             />
@@ -372,11 +652,14 @@ export function AskUserQuestionForm({
         )}
       </fieldset>
 
+      {/* Keyboard-activated buttons (click detail 0) keep focus continuity;
+          a mouse click leaves focus alone (touch devices would raise the
+          keyboard). */}
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
           variant="outline"
-          onClick={() => setCurrentIndex((i) => i - 1)}
+          onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
           disabled={isFirst}
           data-testid="ask-user-question-prev"
           componentId="question.prev"
@@ -388,7 +671,7 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => setCurrentIndex((i) => i + 1)}
+            onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
             data-testid="ask-user-question-next"
             componentId="question.next"
           >
@@ -399,7 +682,7 @@ export function AskUserQuestionForm({
         {isLast && (
           <Button
             size="sm"
-            onClick={handleSubmit}
+            onClick={(event) => (event.detail === 0 ? submitAndLeave() : handleSubmit())}
             disabled={!allAnswered}
             data-testid="ask-user-question-submit"
             componentId="question.submit"
@@ -411,7 +694,7 @@ export function AskUserQuestionForm({
         <Button
           size="sm"
           variant="outline"
-          onClick={onReject}
+          onClick={(event) => (event.detail === 0 ? rejectAndLeave() : onReject())}
           className="ml-auto"
           componentId="question.cancel"
         >
@@ -422,7 +705,7 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             variant="outline"
-            onClick={onAbort}
+            onClick={(event) => (event.detail === 0 ? abortAndLeave() : onAbort())}
             data-testid="ask-user-question-abort"
             componentId="question.abort"
             aria-label="Cancel & interrupt"

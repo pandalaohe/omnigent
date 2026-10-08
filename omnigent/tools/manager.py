@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
@@ -55,6 +55,9 @@ from omnigent.tools.builtins import (
 from omnigent.tools.builtins.flow import SysFlowCancelTool, SysFlowListTool, SysFlowStartTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
+
+if TYPE_CHECKING:
+    from omnigent.spec.types import SkillSpec
 
 # MCP lifecycle moved to runner; see designs/RUNNER_MCP.md.
 
@@ -121,6 +124,7 @@ class ToolManager:
         session_open_enabled: bool = False,
         *,
         os_env_schema_only: bool = False,
+        skill_registry: list[SkillSpec] | None = None,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -160,11 +164,14 @@ class ToolManager:
         :param os_env_schema_only: Register static OS tool schemas without
             creating an environment. For metadata callers only; OS tool
             execution remains runner-owned. Preserves the ``os_env`` gate.
+        :param skill_registry: A precomputed session skill registry for
+            ``load_skill``; ``None`` keeps the manager's own discovery.
         """
         self._spec = spec
         self._peer_messaging_enabled = peer_messaging_enabled
         self._session_open_enabled = session_open_enabled
         self._workdir = workdir
+        self._skill_registry = skill_registry
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
         self._started = False
@@ -343,11 +350,14 @@ class ToolManager:
         Registers ``read_skill_file`` only when at least one skill
         has bundled resource files.
         """
-        load_tool = LoadSkillTool(
-            self._spec.skills,
-            agent_root=self._workdir,
-            skills_filter=self._spec.skills_filter,
-        )
+        if self._skill_registry is not None:
+            load_tool = LoadSkillTool(self._skill_registry, discover_host=False)
+        else:
+            load_tool = LoadSkillTool(
+                self._spec.skills,
+                agent_root=self._workdir,
+                skills_filter=self._spec.skills_filter,
+            )
         self._tools[load_tool.name()] = load_tool
         # Combine bundled + discovered skills for resource check.
         all_skills = load_tool.skills

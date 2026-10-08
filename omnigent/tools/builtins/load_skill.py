@@ -33,6 +33,8 @@ class LoadSkillTool(Tool):
         skills: list[SkillSpec],
         agent_root: Path | None = None,
         skills_filter: str | list[str] = "all",
+        *,
+        discover_host: bool = True,
     ) -> None:
         """
         Initialize with bundled + host-scope skills.
@@ -42,7 +44,13 @@ class LoadSkillTool(Tool):
             skill discovery.
         :param skills_filter: Host-scope skill filter from
             the agent spec.
+        :param discover_host: ``False``: *skills* is the complete
+            registry; no host discovery.
         """
+        if not discover_host:
+            self._skills = list(skills)
+            self._skills_by_name = {s.name: s for s in self._skills}
+            return
         all_skills = list(skills)
         from omnigent.spec.parser import discover_host_skills
 

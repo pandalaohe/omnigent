@@ -70,7 +70,10 @@ def test_metadata_survives_deleted_cwd(
         for harness in ("claude-sdk", "claude-native", "codex-native", "pi-native"):
             native = harness.endswith("-native")
             granted = tool_dispatch._granted_tool_names(spec, harness)
-            assert granted == registered | (tool_dispatch._OS_ENV_TOOLS if native else set())
+            # read_skill_file is granted with load_skill, whatever discovery finds.
+            assert granted == registered | {"read_skill_file"} | (
+                tool_dispatch._OS_ENV_TOOLS if native else set()
+            )
             for tool_name in ("sys_call_async", "sys_timer_set", "sys_session_create"):
                 assert (tool_name in granted) is enabled
             for tool_name in tool_dispatch._OS_ENV_TOOLS:

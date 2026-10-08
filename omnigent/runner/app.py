@@ -227,7 +227,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import resolve_session_skills
+from omnigent.spec.skill_sources import resolve_session_skills, session_skill_roots
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -2892,6 +2892,32 @@ def create_runner_app(
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
         return runner_workspace.resolve() if runner_workspace is not None else None
+
+    async def _session_skill_registry(session_id: str, entry: object) -> list[SkillSpec] | None:
+        """The session's skill registry, or ``None`` to keep load_skill's own discovery."""
+        from omnigent.runner.tool_dispatch import session_skill_registry
+
+        spec = _unwrap_resolved_spec(entry)
+        if not isinstance(spec, AgentSpec):
+            return None
+        try:
+            return await asyncio.to_thread(
+                session_skill_registry,
+                spec,
+                # Without a routed override the registry falls back to this spec's harness.
+                _session_harness_overrides.get(session_id),
+                await _session_runtime_cwd(session_id),
+                _resolved_spec_workdir(entry),
+            )
+        except (OSError, OmnigentError, ValueError, RuntimeError):
+            # A discovery failure must not cost the session its whole tool surface.
+            _logger.warning(
+                "Skill registry failed for session=%s; load_skill keeps its own discovery",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return None
 
     async def _load_legacy_session_init_context(session_id: str) -> _SessionInitContext:
         await _get_server_version(server_client)
@@ -6482,6 +6508,7 @@ def create_runner_app(
                 )
                 or session_id
             )
+        skill_registry = await _session_skill_registry(session_id, spec_entry)
 
         # Re-read after the awaits above: a concurrent caller may have
         # installed a relay that already matches the current agent.
@@ -6501,6 +6528,7 @@ def create_runner_app(
             _unwrap_spec_entry(spec_entry),
             peer_messaging_enabled=peer_for_relay,
             session_open_enabled=open_for_relay,
+            skill_registry=skill_registry,
         )
         if _session_harness_name(session_id) == _CODEX_NATIVE_HARNESS:
             # Codex has its own async question tool; the Omnigent card would
@@ -6992,6 +7020,7 @@ def create_runner_app(
         if conv not in _session_tool_schemas:
             all_tools: list[_JsonObject] = []
             if cached_spec is not None:
+                _tmgr_registry = await _session_skill_registry(conv, cached_spec_entry)
                 try:
                     from omnigent.tools.manager import (
                         ToolManager,
@@ -7003,6 +7032,7 @@ def create_runner_app(
                         peer_messaging_enabled=_session_peer_messaging_enabled.get(conv, False),
                         session_open_enabled=_session_open_enabled.get(conv, False),
                         os_env_schema_only=True,
+                        skill_registry=_tmgr_registry,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -7874,6 +7904,9 @@ def create_runner_app(
                                                     filesystem_registry=filesystem_registry,
                                                     effective_harness=_session_harness_name(
                                                         conv_id
+                                                    ),
+                                                    skill_bundle_dir=_resolved_spec_workdir(
+                                                        _spec_for_dispatch_entry
                                                     ),
                                                 )
                                             )
@@ -9273,25 +9306,16 @@ def create_runner_app(
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
         if spec is None:
             return []
-        workspace = await _session_workspace_value(session_id)
-        candidate_roots = [
-            Path(workspace).resolve()
-            if workspace is not None
-            else (runner_workspace.resolve() if runner_workspace is not None else None),
-            _resolved_spec_workdir(entry),
-        ]
-        roots: list[Path] = []
-        for candidate in candidate_roots:
-            if candidate is None:
-                continue
-            resolved = candidate.resolve()
-            if resolved not in roots:
-                roots.append(resolved)
-        if not roots:
-            roots.append(Path.cwd())
-
+        roots = session_skill_roots(
+            await _session_runtime_cwd(session_id), _resolved_spec_workdir(entry)
+        )
         skills = await asyncio.to_thread(
-            resolve_session_skills, spec, tuple(roots), _resolved_spec_workdir(entry)
+            resolve_session_skills,
+            spec,
+            roots,
+            _resolved_spec_workdir(entry),
+            # Without a routed override the menu falls back to this spec's harness.
+            harness=_session_harness_overrides.get(session_id),
         )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,

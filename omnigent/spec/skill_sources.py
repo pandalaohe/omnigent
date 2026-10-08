@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import cast
 
 from omnigent.errors import OmnigentError
+from omnigent.skill_settings import host_skill_settings
 from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 
@@ -91,6 +92,9 @@ class SkillSourceContext:
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
         terminal-matching resolution (config-home tiers, ``.agents`` exclusion)
         so it applies only to native harnesses, never the in-process SDK ones.
+    :param claude_portable_skills: Whether Claude-family discovery may include
+        ``.agents/skills`` tiers; the host's ``skills.claude_portable_skills``
+        setting.
     """
 
     roots: tuple[Path, ...]
@@ -100,6 +104,7 @@ class SkillSourceContext:
     claude_config_dir: Path | None = None
     codex_home: Path | None = None
     is_native: bool = False
+    claude_portable_skills: bool = True
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -129,6 +134,7 @@ def skill_source_context_from_env(
             Path(configured_claude_dir).expanduser() if configured_claude_dir else None
         ),
         codex_home=codex_home,
+        claude_portable_skills=host_skill_settings().claude_portable_skills,
     )
 
 
@@ -144,12 +150,23 @@ def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
     return out
 
 
-def _generic_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+def _generic_host_skills(
+    ctx: SkillSourceContext, *, include_agents: bool = True
+) -> list[SkillSpec]:
     """Today's behavior: ``discover_host_skills`` over each root."""
     out: list[SkillSpec] = []
     for root in ctx.roots:
-        out.extend(discover_host_skills(root, ctx.skills_filter))
+        out.extend(discover_host_skills(root, ctx.skills_filter, include_agents=include_agents))
     return _dedup(out)
+
+
+def generic_walk_includes_agents(harness: str | None) -> bool:
+    """Whether a generic walk for *harness* may scan ``.agents`` tiers.
+
+    :param harness: The session's harness id (canonical or alias).
+    :returns: ``False`` only for the Claude family with the host switch off.
+    """
+    return _harness_family(harness) != "claude" or host_skill_settings().claude_portable_skills
 
 
 def _claude_user_dir(ctx: SkillSourceContext) -> Path:
@@ -218,6 +235,20 @@ def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return _dedup(out)
 
 
+def _harness_skills(ctx: SkillSourceContext, harness: str | None) -> list[SkillSpec]:
+    """The selected harness's own skills, before the invocability filter."""
+    from omnigent.harness_aliases import is_native_harness
+
+    family = _harness_family(harness)
+    provider = _SKILL_SOURCES.get(family, _generic_host_skills)
+    # The terminal-matching resolution — a native session types ``/name`` into
+    # the vendor CLI as plaintext, so its menu must mirror what that CLI loads —
+    # is native-only. Tag the context so providers keep the in-process SDK
+    # harnesses on their pre-scoping behavior (see ``claude_host_skills``).
+    native_ctx = replace(ctx, is_native=is_native_harness(harness))
+    return _dedup(provider(native_ctx))
+
+
 def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list[SkillSpec]:
     """
     Return the extra (non-bundled) skills the selected harness exposes.
@@ -233,32 +264,63 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
         internal orchestration skills, not user-typeable slash commands
         (applied uniformly across every harness).
     """
-    from omnigent.harness_aliases import is_native_harness
-
-    family = _harness_family(harness)
-    provider = _SKILL_SOURCES.get(family, _generic_host_skills)
-    # The terminal-matching resolution — a native session types ``/name`` into
-    # the vendor CLI as plaintext, so its menu must mirror what that CLI loads —
-    # is native-only. Tag the context so providers keep the in-process SDK
-    # harnesses on their pre-scoping behavior (see ``claude_host_skills``).
-    native_ctx = replace(ctx, is_native=is_native_harness(harness))
-    return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
+    return [s for s in _harness_skills(ctx, harness) if s.user_invocable]
 
 
-def resolve_session_skills(
-    spec: AgentSpec, roots: tuple[Path, ...], bundle_dir: Path | None
+def session_skill_roots(cwd: Path | None, bundle_workdir: Path | None) -> tuple[Path, ...]:
+    """
+    The session's skill-discovery roots, in priority order.
+
+    :param cwd: The session's runtime cwd, or ``None`` when unknown.
+    :param bundle_workdir: The materialized bundle workdir, or ``None``.
+    :returns: Resolved, deduplicated roots; ``(Path.cwd(),)`` when both are
+        absent, or ``()`` when that cwd no longer exists.
+    """
+    roots: list[Path] = []
+    for candidate in (cwd, bundle_workdir):
+        if candidate is None:
+            continue
+        resolved = candidate.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    if not roots:
+        try:
+            roots.append(Path.cwd())
+        except OSError:
+            # A runner can outlive its working directory; bundled skills still work.
+            return ()
+    return tuple(roots)
+
+
+def _session_skills(
+    spec: AgentSpec,
+    roots: tuple[Path, ...],
+    bundle_dir: Path | None,
+    harness: str | None,
+    *,
+    invocable_only: bool,
 ) -> list[SkillSpec]:
-    """Use identical precedence and filters for menu discovery and invocation."""
+    """One assembly shared by the menu and the loadable registry."""
     from omnigent.harness_aliases import canonicalize_harness
 
-    merged = [s for s in spec.skills if s.user_invocable]
+    harness = canonicalize_harness(harness or spec.executor.harness_kind)
+    merged = [s for s in spec.skills if s.user_invocable or not invocable_only]
     seen = {s.name for s in spec.skills}
     seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
-    harness = canonicalize_harness(spec.executor.harness_kind)
     ctx = skill_source_context_from_env(
         roots=roots, harness=harness, skills_filter=spec.skills_filter, bundle_dir=bundle_dir
     )
-    for skill in resolve_harness_skills(ctx, harness):
+    if not roots:
+        host_skills: list[SkillSpec] = []
+    elif invocable_only:
+        host_skills = resolve_harness_skills(ctx, harness)
+    elif _harness_family(harness) in ("claude", "codex"):
+        host_skills = _harness_skills(ctx, harness)
+    else:
+        # Every other harness keeps today's load_skill behavior: the generic
+        # walk at the session cwd, never its own (possibly empty) provider.
+        host_skills = discover_host_skills(roots[0], spec.skills_filter)
+    for skill in host_skills:
         if skill.name in seen:
             continue
         if skill.skill_dir is not None and skill.skill_dir.resolve() in seen_dirs:
@@ -268,6 +330,40 @@ def resolve_session_skills(
             seen_dirs.add(skill.skill_dir.resolve())
         merged.append(skill)
     return merged
+
+
+def resolve_session_skills(
+    spec: AgentSpec,
+    roots: tuple[Path, ...],
+    bundle_dir: Path | None,
+    *,
+    harness: str | None = None,
+) -> list[SkillSpec]:
+    """Use identical precedence and filters for menu discovery and invocation.
+
+    :param harness: The harness whose sources to use; ``None`` means the
+        spec's declared harness.
+    """
+    return _session_skills(spec, roots, bundle_dir, harness, invocable_only=True)
+
+
+def resolve_session_skill_registry(
+    spec: AgentSpec,
+    roots: tuple[Path, ...],
+    bundle_dir: Path | None,
+    *,
+    harness: str | None = None,
+) -> list[SkillSpec]:
+    """What ``load_skill`` / ``read_skill_file`` may load for a session.
+
+    Claude and Codex families: the menu's sources without the
+    user-invocable filter. Any other harness: bundled + the generic walk at
+    the first root.
+
+    :param harness: The harness whose sources to use; ``None`` means the
+        spec's declared harness.
+    """
+    return _session_skills(spec, roots, bundle_dir, harness, invocable_only=False)
 
 
 def _read_json(path: Path) -> dict[str, object] | None:
@@ -461,13 +557,17 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     (:func:`_claude_code_skills`: ``.claude/skills`` and the
     ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
     ``claude-sdk`` harness has no such terminal to match, so it keeps the
-    generic host walk it used before this scoping — the terminal-matching
-    behavior only affects native harnesses. Enabled plugin slash-commands are
-    added in both cases (config-dir-resolved for native, ``~/.claude`` for SDK
-    via :func:`_claude_user_dir`).
+    generic host walk it used before this scoping — except that
+    ``.agents/skills`` tiers are dropped when the host's
+    ``skills.claude_portable_skills`` switch is off. Enabled plugin
+    slash-commands are added in both cases (config-dir-resolved for native,
+    ``~/.claude`` for SDK via :func:`_claude_user_dir`).
     """
-    walk = _claude_code_skills if ctx.is_native else _generic_host_skills
-    return walk(ctx) + _claude_plugin_skills(ctx)
+    if ctx.is_native:
+        skills = _claude_code_skills(ctx)
+    else:
+        skills = _generic_host_skills(ctx, include_agents=ctx.claude_portable_skills)
+    return skills + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:

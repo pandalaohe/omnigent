@@ -10915,7 +10915,8 @@
                 "session_collab",
                 "host_colors",
                 "keep_warm",
-                "worktree_location"
+                "worktree_location",
+                "runner_log_warnings"
               ]
             },
             "title": "Settings",
@@ -13212,6 +13213,7 @@
                         "keep_warm",
                         "keyboard_shortcuts",
                         "mobile_assistant",
+                        "runner_log_warnings",
                         "session_collab",
                         "session_navigation",
                         "usage_context",
@@ -13295,7 +13297,8 @@
                 "session_collab",
                 "host_colors",
                 "keep_warm",
-                "worktree_location"
+                "worktree_location",
+                "runner_log_warnings"
               ],
               "title": "Namespace",
               "type": "string"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,14 @@ import pytest
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _harness_family,
+    generic_walk_includes_agents,
     resolve_harness_skills,
+    resolve_session_skill_registry,
+    resolve_session_skills,
+    session_skill_roots,
+    skill_source_context_from_env,
 )
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
 
 
 def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = None) -> None:
@@ -43,6 +50,12 @@ def _ctx(
         claude_config_dir=claude_config_dir,
         codex_home=codex_home,
     )
+
+
+def _write_config(config_home: Path, content: str) -> None:
+    """Write raw YAML *content* to ``<config_home>/config.yaml``."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(content)
 
 
 @pytest.mark.parametrize(
@@ -1104,6 +1117,92 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
     assert names == ["neutral-skill"]
 
 
+def test_claude_sdk_switch_off_drops_agents_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The switch removes ``.agents`` from the claude-sdk generic walk.
+
+    ``api-design`` lives only in ``~/.agents/skills`` and ``plan`` in the
+    workspace's ``.claude/skills``: with the switch off the SDK list keeps
+    ``plan`` and drops ``api-design``, while the default context still
+    lists both.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".agents" / "skills", "api-design")
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".claude" / "skills", "plan")
+
+    off = replace(_ctx(ws, home), claude_portable_skills=False)
+    assert [s.name for s in resolve_harness_skills(off, "claude-sdk")] == ["plan"]
+
+    on_names = {s.name for s in resolve_harness_skills(_ctx(ws, home), "claude-sdk")}
+    assert on_names == {"plan", "api-design"}
+
+
+def test_claude_sdk_switch_off_keeps_claude_copy_on_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the switch off, a name collision falls back to the ``.claude`` copy.
+
+    ``foo`` sits in the workspace's ``.agents/skills`` (nearer, so it would
+    normally win the dedup) and in the parent's ``.claude/skills``; skipping
+    the ``.agents`` tier surfaces the ``.claude`` one.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    agents_skill = ws / ".agents" / "skills" / "foo"
+    agents_skill.mkdir(parents=True)
+    (agents_skill / "SKILL.md").write_text(
+        "---\nname: foo\ndescription: workspace agents copy\n---\nbody\n"
+    )
+    claude_skill = tmp_path / ".claude" / "skills" / "foo"
+    claude_skill.mkdir(parents=True)
+    (claude_skill / "SKILL.md").write_text(
+        "---\nname: foo\ndescription: ancestor claude copy\n---\nbody\n"
+    )
+
+    off = replace(_ctx(ws, home), claude_portable_skills=False)
+    out = resolve_harness_skills(off, "claude-sdk")
+
+    assert [s.name for s in out] == ["foo"]
+    assert out[0].skill_dir == claude_skill.resolve()
+
+
+def test_env_factory_carries_claude_portable_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``skill_source_context_from_env`` reads the host switch.
+
+    The switch-off config makes the context flag false and
+    :func:`generic_walk_includes_agents` false for the Claude family only,
+    while the generic walk for a non-Claude harness still scans
+    ``.agents``.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".agents" / "skills", "agents-only")
+    off_config = tmp_path / "off-config"
+    _write_config(off_config, "skills:\n  claude_portable_skills: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(off_config))
+
+    off_ctx = skill_source_context_from_env(roots=(ws,), harness="claude-sdk")
+    assert off_ctx.claude_portable_skills is False
+    assert [s.name for s in resolve_harness_skills(off_ctx, "claude-sdk")] == []
+    assert generic_walk_includes_agents("claude-sdk") is False
+    assert generic_walk_includes_agents("codex") is True
+    assert [s.name for s in resolve_harness_skills(_ctx(ws, home), "openai-agents")] == [
+        "agents-only"
+    ]
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-config"))
+    on_ctx = skill_source_context_from_env(roots=(ws,), harness="claude-sdk")
+    assert on_ctx.claude_portable_skills is True
+    assert [s.name for s in resolve_harness_skills(on_ctx, "claude-sdk")] == ["agents-only"]
+
+
 @pytest.mark.parametrize("harness", ["codex-native", "codex"])
 def test_codex_menu_lists_user_agents_tier_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
@@ -1274,3 +1373,139 @@ def test_codex_menu_tolerates_unreadable_marker_and_tier(
     monkeypatch.setattr("os.stat", _stat)
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "codex-native")]
     assert "plan" in names
+
+
+# ---------------------------------------------------------------------------
+# session registry and roots
+# ---------------------------------------------------------------------------
+
+
+def _agent_spec(harness: str) -> AgentSpec:
+    """A skill-less spec carrying *harness* as its executor kind."""
+    return AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+    )
+
+
+def test_session_registry_keeps_a_non_invocable_claude_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry drops only the menu's invocability filter, nothing else."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    _write_skill(home / ".claude" / "skills", "helper", user_invocable=False)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+    roots = (workspace,)
+
+    registry = [s.name for s in resolve_session_skill_registry(spec, roots, None)]
+    menu = [s.name for s in resolve_session_skills(spec, roots, None)]
+
+    assert "helper" in registry
+    assert menu == []
+
+
+def test_pi_session_registry_keeps_the_generic_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi's registry is bundled + the generic walk; its empty provider never runs."""
+    from omnigent.spec.parser import discover_host_skills
+
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".claude" / "skills", "ws-skill")
+    _write_skill(home / ".claude" / "skills", "claude-skill")
+    _write_skill(home / ".agents" / "skills", "agents-skill")
+    spec = _agent_spec("pi-native")
+
+    registry = resolve_session_skill_registry(spec, (workspace,), None)
+
+    assert [s.name for s in registry] == [s.name for s in discover_host_skills(workspace, "all")]
+    assert {s.name for s in registry} == {"ws-skill", "claude-skill", "agents-skill"}
+
+
+def test_session_skill_roots_dedup_and_fallback(tmp_path: Path) -> None:
+    """Roots are resolved, deduped, and fall back to the process cwd."""
+    cwd = tmp_path / "cwd"
+    bundle = tmp_path / "bundle"
+    cwd.mkdir()
+    bundle.mkdir()
+
+    assert session_skill_roots(None, None) == (Path.cwd(),)
+    assert session_skill_roots(cwd, cwd) == (cwd.resolve(),)
+    assert session_skill_roots(cwd, bundle) == (cwd.resolve(), bundle.resolve())
+
+
+def test_session_registry_harness_keyword_overrides_the_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner-side harness override picks the overridden family's sources."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_skill(home / ".agents" / "skills", "agents-only")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    spec = _agent_spec("claude-native")
+
+    declared = [s.name for s in resolve_session_skill_registry(spec, (workspace,), None)]
+    overridden = [
+        s.name
+        for s in resolve_session_skill_registry(spec, (workspace,), None, harness="codex-native")
+    ]
+
+    assert "agents-only" not in declared
+    assert "agents-only" in overridden
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi-native"])
+def test_session_registry_survives_a_deleted_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """With no session root and an unlinked process cwd, bundled skills still load."""
+    bundled = SkillSpec(name="bundled", description="Bundled.", content="Do it.")
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        skills=[bundled],
+    )
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    roots = session_skill_roots(None, None)
+
+    assert roots == ()
+    assert resolve_session_skill_registry(spec, roots, None) == [bundled]
+
+
+def test_session_registry_honors_the_claude_portable_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the host switch off, a claude-sdk session cannot load ``.agents`` skills."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    _write_skill(home / ".agents" / "skills", "api-design")
+    ws = tmp_path / "ws"
+    _write_skill(ws / ".claude" / "skills", "plan")
+    spec = _agent_spec("claude-sdk")
+    off_config = tmp_path / "off-config"
+    _write_config(off_config, "skills:\n  claude_portable_skills: false\n")
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-config"))
+    on = {s.name for s in resolve_session_skill_registry(spec, (ws,), None)}
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(off_config))
+    off = {s.name for s in resolve_session_skill_registry(spec, (ws,), None)}
+
+    assert {"plan", "api-design"} <= on
+    assert "plan" in off
+    assert "api-design" not in off

@@ -19,17 +19,53 @@ class HostSkillSettings:
 
     :param trusted_link_roots: Resolved absolute directories under which
         a skill's symlink target may be read.
+    :param claude_portable_skills: Whether Claude-family discovery may
+        include ``.agents/skills`` tiers.
     """
 
     trusted_link_roots: tuple[Path, ...] = ()
+    claude_portable_skills: bool = True
+
+
+def _trusted_link_roots(raw: object) -> tuple[Path, ...]:
+    """Parse ``skills.trusted_link_roots``, failing closed to ``()``.
+
+    :param raw: The raw ``skills.trusted_link_roots`` value.
+    :returns: The resolved roots, or ``()`` with one warning when any
+        entry is not an absolute path that can be expanded and resolved.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
+        _logger.warning("Ignoring skills.trusted_link_roots: expected a list of non-empty strings")
+        return ()
+
+    roots: list[Path] = []
+    for item in raw:
+        try:
+            root = Path(item).expanduser()
+        except (OSError, RuntimeError, ValueError) as err:
+            _logger.warning("Ignoring skills.trusted_link_roots: cannot expand %r: %s", item, err)
+            return ()
+        if not root.is_absolute():
+            _logger.warning("Ignoring skills.trusted_link_roots: %r is not absolute", item)
+            return ()
+        try:
+            roots.append(root.resolve())
+        except (OSError, RuntimeError, ValueError) as err:
+            _logger.warning("Ignoring skills.trusted_link_roots: cannot resolve %r: %s", item, err)
+            return ()
+
+    return tuple(roots)
 
 
 def host_skill_settings() -> HostSkillSettings:
     """Read the host skill settings from the user config.
 
     Never raises: an unusable config location, an unreadable or
-    undecodable file, or an invalid value logs one warning and yields
-    that field's default.
+    undecodable file, or a non-mapping config logs one warning and
+    yields all defaults; an invalid individual value logs one warning
+    and yields only that field's default.
 
     :returns: The validated host skill settings.
     """
@@ -57,27 +93,22 @@ def host_skill_settings() -> HostSkillSettings:
     if not isinstance(block, dict):
         _logger.warning("Ignoring skills.trusted_link_roots: 'skills' is not a mapping")
         return HostSkillSettings()
-    raw = block.get("trusted_link_roots")
-    if raw is None:
-        return HostSkillSettings()
-    if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
-        _logger.warning("Ignoring skills.trusted_link_roots: expected a list of non-empty strings")
-        return HostSkillSettings()
 
-    roots: list[Path] = []
-    for item in raw:
-        try:
-            root = Path(item).expanduser()
-        except (OSError, RuntimeError, ValueError) as err:
-            _logger.warning("Ignoring skills.trusted_link_roots: cannot expand %r: %s", item, err)
-            return HostSkillSettings()
-        if not root.is_absolute():
-            _logger.warning("Ignoring skills.trusted_link_roots: %r is not absolute", item)
-            return HostSkillSettings()
-        try:
-            roots.append(root.resolve())
-        except (OSError, RuntimeError, ValueError) as err:
-            _logger.warning("Ignoring skills.trusted_link_roots: cannot resolve %r: %s", item, err)
-            return HostSkillSettings()
+    trusted_link_roots = _trusted_link_roots(block.get("trusted_link_roots"))
+    if "claude_portable_skills" not in block:
+        claude_portable_skills = True
+    else:
+        raw_portable = block["claude_portable_skills"]
+        if isinstance(raw_portable, bool):
+            claude_portable_skills = raw_portable
+        else:
+            _logger.warning(
+                "Ignoring skills.claude_portable_skills: expected a boolean, got %s",
+                type(raw_portable).__name__,
+            )
+            claude_portable_skills = True
 
-    return HostSkillSettings(trusted_link_roots=tuple(roots))
+    return HostSkillSettings(
+        trusted_link_roots=trusted_link_roots,
+        claude_portable_skills=claude_portable_skills,
+    )

@@ -90,6 +90,7 @@ UserPreferenceNamespace = Literal[
     "host_colors",
     "keep_warm",
     "worktree_location",
+    "runner_log_warnings",
 ]
 
 

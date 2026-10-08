@@ -148,6 +148,7 @@ from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
+    touch_runner_log_warning_dismissals,
 )
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -4091,6 +4092,24 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
+    async def _keep_runner_log_dismissals(observed_at: str) -> None:
+        """Re-touch runaway dismissals while the host still confirms them.
+
+        :param observed_at: Detection instant carried by the report.
+        """
+        if user_preferences_store is None:
+            return
+        # Same account-row policy as the /v1/me/preferences routes.
+        accounts_mode = (
+            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        )
+        await asyncio.to_thread(
+            touch_runner_log_warning_dismissals,
+            user_preferences_store,
+            observed_at,
+            create_if_missing=not accounts_mode,
+        )
+
     async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
@@ -4436,6 +4455,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_runner_log_runaway=_keep_runner_log_dismissals,
                 on_resource_snapshot=lambda conn, frame: system_status.ingest(
                     host_id=conn.host_id,
                     workspace_id=conn.workspace_id,
