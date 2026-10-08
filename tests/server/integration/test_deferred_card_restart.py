@@ -266,3 +266,25 @@ async def test_question_card_is_answerable_after_restart(
                 f"[System: answers to your question card #{asked['qid']}]\nWhich DB? → SQLite",
             )
         ]
+
+
+async def test_grant_is_refused_when_its_record_cannot_be_dropped(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allowance fails closed: an undroppable grant record means asking again."""
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-restart-fail-closed")
+        assert await _request_bash(client, session_id, "pnpm lint") == "deny"
+        (card,) = await _pending(client, session_id)
+        await _answer(client, session_id, card["elicitation_id"], "accept")
+        await _wait_for(lambda: bool(deliveries.calls))
+
+        def _store_down(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "delete_detached_grants", _store_down)
+        assert await _request_bash(client, session_id, "pnpm lint") == "deny"

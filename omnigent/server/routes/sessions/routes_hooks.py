@@ -386,6 +386,9 @@ def _approval_feedback_clause(result: ElicitationResult) -> str:
 #: Lifetime of an unanswered detached card (the park's own wait budget).
 _DETACHED_CARD_TTL_S = 86400.0
 
+#: Bound on waiting for restored cards to publish at server start.
+_RESTORE_PUBLISH_TIMEOUT_S = 30.0
+
 
 def _render_card_verdict(kind: str, payload: dict[str, Any], result: ElicitationResult) -> str:
     """
@@ -494,11 +497,6 @@ def _detached_card_callback(
             return
         text = _render_card_verdict(card.kind, card.payload, result)
         granted = card.grant_key is not None and result.action == "accept"
-        if granted:
-            assert card.grant_key is not None
-            approval_grants.put(
-                card.session_id, tuple(card.grant_key), result, _APPROVAL_GRANT_TTL_S
-            )
         await _write_card_record(
             conversation_store.update_detached_card,
             card.elicitation_id,
@@ -507,6 +505,13 @@ def _detached_card_callback(
             delivery_text=text,
             expires_at=int(time.time() + _APPROVAL_GRANT_TTL_S),
         )
+        # Armed only once its record is answered: a consume racing the write
+        # would otherwise find no record to drop, and a restart would re-arm it.
+        if granted:
+            assert card.grant_key is not None
+            approval_grants.put(
+                card.session_id, tuple(card.grant_key), result, _APPROVAL_GRANT_TTL_S
+            )
         await _deliver_card_verdict(
             card,
             text,
@@ -524,6 +529,7 @@ def _park_detached_card(
     timeout_s: float,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    published: asyncio.Event | None = None,
 ) -> None:
     """
     Park one recorded card under its own id.
@@ -532,6 +538,7 @@ def _park_detached_card(
     :param timeout_s: Seconds left before the card expires.
     :param conversation_store: Store for the ancestor mirror and record.
     :param runner_router: Router used to deliver the verdict.
+    :param published: Set once the card is published, mirrors included.
     :returns: None.
     """
     start_detached_elicitation(
@@ -543,6 +550,7 @@ def _park_detached_card(
         ),
         timeout_s=timeout_s,
         elicitation_id=card.elicitation_id,
+        published=published,
     )
 
 
@@ -608,7 +616,8 @@ async def _consume_grant(
     Consume a live grant for a re-issued call, durably.
 
     The record is dropped before the allow is returned, so a restart can
-    never re-arm a grant that was already used.
+    never re-arm a grant that was already used; when that fails the call is
+    asked again (the record keeps its single use for after a restart).
 
     :param session_id: Session the incoming call belongs to.
     :param grant_key: Match key of the incoming call.
@@ -616,10 +625,16 @@ async def _consume_grant(
     :returns: The stored verdict, or ``None`` when no grant matches.
     """
     granted = approval_grants.consume(session_id, grant_key)
-    if granted is not None:
-        await _write_card_record(
+    if granted is None:
+        return None
+    try:
+        await asyncio.to_thread(
             conversation_store.delete_detached_grants, session_id, list(grant_key)
         )
+    except Exception:
+        # An allowance fails closed: the call is asked again instead.
+        _logger.warning("Could not drop a consumed grant's record", exc_info=True)
+        return None
     return granted
 
 
@@ -633,13 +648,16 @@ async def restore_detached_cards(
     Server start: a pending card is parked again under its own id for its
     remaining lifetime, an answered verdict is delivered again, and an
     accepted grant is re-armed; expired records and records whose session
-    is gone are dropped. Covers the active workspace.
+    is gone are dropped. Covers the active workspace. Returns once every
+    re-parked card is published, so observers installed afterwards never
+    see a restored card as new.
 
     :param conversation_store: Store holding the records.
     :param runner_router: Router used to deliver verdicts.
     :returns: None.
     """
     cards = await asyncio.to_thread(conversation_store.list_detached_cards)
+    published: list[asyncio.Event] = []
     for card in cards:
         remaining = card.expires_at - time.time()
         alive = remaining > 0 and (
@@ -654,11 +672,13 @@ async def restore_detached_cards(
             await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
             continue
         if card.state == "pending":
+            published.append(asyncio.Event())
             _park_detached_card(
                 card,
                 timeout_s=remaining,
                 conversation_store=conversation_store,
                 runner_router=runner_router,
+                published=published[-1],
             )
             continue
         if granted:
@@ -676,6 +696,11 @@ async def restore_detached_cards(
             )
             _detached_elicitation_tasks.add(task)
             task.add_done_callback(_detached_elicitation_tasks.discard)
+    if published:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in published)),
+            timeout=_RESTORE_PUBLISH_TIMEOUT_S,
+        )
 
 
 def _start_background_delivery(

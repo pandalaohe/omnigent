@@ -5356,14 +5356,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         workspace_id = current_workspace_id()
 
         def write(session: Session) -> None:
-            session.execute(
-                delete(SqlDetachedCard).where(
+            rows = session.scalars(
+                select(SqlDetachedCard).where(
                     SqlDetachedCard.workspace_id == workspace_id,
                     SqlDetachedCard.session_id == session_id,
                     SqlDetachedCard.state != "pending",
-                    SqlDetachedCard.grant_key == json.dumps(grant_key),
+                    SqlDetachedCard.grant_key.is_not(None),
                 )
             )
+            # Matched here, not in SQL: a case-insensitive collation must not
+            # drop a grant for a command that differs only in case.
+            for row in rows:
+                if row.grant_key is not None and json.loads(row.grant_key) == grant_key:
+                    session.delete(row)
 
         run_write_transaction(self._conv_session_immediate, "delete_detached_grants", write)
 
