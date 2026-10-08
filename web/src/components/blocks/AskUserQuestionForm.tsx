@@ -207,7 +207,7 @@ export function AskUserQuestionForm({
     if (!current) return;
     const key = questionKey(current);
     setHighlight(initialHighlightFor(current, selections[key] ?? "", customSelected[key] ?? false));
-    rootRef.current?.focus();
+    rootRef.current?.focus({ preventScroll: true });
   };
   useQuestionCardTarget(rootRef, enterCard);
 
