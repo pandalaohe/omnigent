@@ -31,6 +31,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pexpect
+
 from tests.e2e.omnigent._pexpect_harness import (
     await_turn_complete,
     clean_exit,
@@ -50,6 +52,11 @@ _HARNESS = "openai-agents"
 # startup banners or prompt-toolkit chrome.
 _NEEDLE = "zxqw-unique-history-token"
 _PROMPT = f"please just say ok ({_NEEDLE})"
+
+# Distinct mock replies mark each turn's completion. The ``❯`` prompt
+# marker cannot: it repaints with the spinner while a turn is running.
+_FIRST_REPLY = "first-ctrl-r-reply"
+_SECOND_REPLY = "second-ctrl-r-reply"
 
 # prompt-toolkit's default reverse-search toolbar prompt. This
 # is the literal text the SearchToolbar widget paints when
@@ -95,8 +102,8 @@ def test_repl_ctrl_r_reverse_search(
     configure_mock_llm(
         mock_llm_server_url,
         [
-            {"text": "ok"},
-            {"text": "ok again"},
+            {"text": _FIRST_REPLY},
+            {"text": _SECOND_REPLY},
         ],
         key=_MODEL,
     )
@@ -123,7 +130,7 @@ def test_repl_ctrl_r_reverse_search(
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
             running_marker=r"working",
-            completion_pattern=r"❯ ",
+            completion_pattern=_FIRST_REPLY,
         )
         # Enter reverse-search mode. prompt-toolkit swaps the
         # input area focus to the search toolbar and redraws
@@ -155,18 +162,15 @@ def test_repl_ctrl_r_reverse_search(
         child.sendcontrol("g")
         drain_for(child, _ACCEPT_DRAIN_TIMEOUT)
         child.send("\r")
-        submit_drain = drain_for(child, _ACCEPT_DRAIN_TIMEOUT)
+        # Wait for the second reply itself, with no drain in between: a fast
+        # second turn can start and finish inside a drain, leaving no later
+        # ``working`` frame to match.
         try:
-            await_turn_complete(
-                child,
-                running_timeout=_RUNNING_TIMEOUT,
-                completion_timeout=_COMPLETION_TIMEOUT,
-                running_marker=r"working",
-                completion_pattern=r"❯ ",
-            )
+            child.expect(_SECOND_REPLY, timeout=_COMPLETION_TIMEOUT)
             accepted_search_submits = True
-        except Exception:
+        except (pexpect.TIMEOUT, pexpect.EOF):
             accepted_search_submits = False
+        submit_output = child.before or ""
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
     finally:
@@ -176,7 +180,7 @@ def test_repl_ctrl_r_reverse_search(
     search_stripped = strip_ansi(search_drain)
     accept_stripped = strip_ansi(accept_drain)
     tail_stripped = strip_ansi(child.before or "")
-    submit_stripped = strip_ansi(submit_drain)
+    submit_stripped = strip_ansi(submit_output)
     combined_stripped = (
         search_stripped + "\n" + accept_stripped + "\n" + submit_stripped + "\n" + tail_stripped
     )
