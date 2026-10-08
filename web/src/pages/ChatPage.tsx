@@ -4489,9 +4489,7 @@ function ComposerImpl(
                       : isStreaming
                         ? "Send a follow-up (queued) — Esc to stop"
                         : multiMemberSession
-                          ? composerAgentName === null
-                            ? "@role hands a part to a member"
-                            : `Message ${composerAgentName} — @role hands a part to a member`
+                          ? "Send a message… — @role hands a part to a member"
                           : "Send a message…",
           rows: 1,
           disabled:

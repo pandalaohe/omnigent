@@ -37,6 +37,9 @@ const ACTION_EDGE_MARGIN = 6;
 const HANDLE_THICKNESS = 18;
 const HANDLE_LENGTH = 48;
 const DOCK_THRESHOLD = 38;
+// On portrait phones this clears the composer band (input, action row, queued
+// messages), keyboard-shortened viewport included; a stored or docked spot wins.
+const FIRST_USE_POINT = { x: 0.86, y: 0.2 };
 
 interface ViewportSize {
   width: number;
@@ -328,7 +331,7 @@ export function MobileFloatingAssistant() {
     };
   }, []);
 
-  const point = preferences.position ?? { x: 0.86, y: 0.78 };
+  const point = preferences.position ?? FIRST_USE_POINT;
   const center = {
     x: clamp(point.x * viewport.width, MAIN_SIZE / 2, viewport.width - MAIN_SIZE / 2),
     y: clamp(point.y * viewport.height, MAIN_SIZE / 2, viewport.height - MAIN_SIZE / 2),

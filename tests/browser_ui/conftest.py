@@ -222,6 +222,23 @@ def browser_contract(
     # so tests can add concise explicit mocks on top of these catch-alls.
     context.route("**/*", deny_http)
     context.route_web_socket("**/*", deny_websocket)
+    # Routes the SPA shell calls on every page that per-test contracts do not
+    # model; tests override them by registering their own mocks later.
+    for path, body in (
+        ("/v1/system/status", {"revision": 0, "level": "ok", "findings": []}),
+        ("/v1/custom-agents", {"object": "list", "data": [], "has_more": False}),
+        (
+            "/v1/artifact-sharing",
+            {"external": False, "share_code_set": False, "allow_comments": True},
+        ),
+        (
+            re.compile(
+                rf"^{re.escape(browser_base_url)}/v1/hosts/[^/]+/codex-rate-limits(?:\?.*)?$"
+            ),
+            {"rate_limits": None},
+        ),
+    ):
+        contract.json(path, body)
     try:
         yield contract
     finally:

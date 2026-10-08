@@ -1,5 +1,6 @@
 """Browser-only contracts for native slash-menu interaction."""
 
+import re
 import time
 
 import pytest
@@ -183,4 +184,4 @@ def test_native_file_paste_closes_the_slash_menu(page: Page, chat_session_contra
 
     expect(page.get_by_text("notes.txt")).to_be_visible()
     expect(page.locator(_ROWS)).to_have_count(0)
-    expect(composer).to_have_value("/")
+    expect(composer).to_have_value(re.compile(r"^/ \[file 1\]\s*$"))
