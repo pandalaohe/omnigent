@@ -42,6 +42,7 @@ from omnigent.inner.codex_goal_command import (
     GOAL_OBJECTIVE_MAX_CHARS,
     goal_objective_length_error,
 )
+from omnigent.inner.codex_worker import CodexWorkerLaunch
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -5465,6 +5466,268 @@ def test_app_server_negotiates_direct_tools_from_server_version(
                 assert config["features.unified_exec"] is False
                 key = "features.code_mode.direct_only_tool_namespaces"
                 assert config.get(key) == (["functions"] if direct_tools else None)
+            finally:
+                await session.close()
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("with_tools", [True, False])
+def test_app_server_thread_start_config_carries_native_server_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_tools: bool
+) -> None:
+    """The native app-server pid reaches shell tools via thread config."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+    native_pid_calls: list[tuple[object, object]] = []
+
+    def _fake_native_server_pid(root_pid, subcommand):
+        native_pid_calls.append((root_pid, subcommand))
+        return 4242
+
+    monkeypatch.setattr("omnigent.inner._proc.native_server_pid", _fake_native_server_pid)
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+        )
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"userAgent": "omnigent/0.154.0"}},
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        fake_process = _FakeProcess()
+        fake_process.stdout = _ScriptedStdoutPipe(
+            [
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turnId": "turn-1", "turn": {"id": "turn-1"}},
+                    }
+                ).encode()
+                + b"\n"
+            ]
+        )
+        tools = (
+            [{"name": "snapshot", "description": "Screenshot", "parameters": {}}]
+            if with_tools
+            else []
+        )
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=AsyncMock(return_value=fake_process),
+        ):
+            try:
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=tools,
+                    system_prompt="",
+                    model="fixture-model",
+                    cwd=str(tmp_path),
+                    sandbox="workspace-write",
+                ):
+                    pass
+                params = session._request.await_args_list[1].args[1]
+                assert params["config"]["shell_environment_policy.set.COLLAB_AGENT_PID"] == (
+                    "4242"
+                )
+                assert session._agent_pid == 4242
+                assert native_pid_calls == [(fake_process.pid, "app-server")]
+            finally:
+                await session.close()
+            assert session._agent_pid is None
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("with_tools", [True, False])
+def test_app_server_thread_start_config_omits_absent_native_server_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_tools: bool
+) -> None:
+    """Without a native server the config keeps its tool keys only."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("omnigent.inner._proc.native_server_pid", lambda *_args: None)
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+        )
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"userAgent": "omnigent/0.154.0"}},
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        fake_process = _FakeProcess()
+        fake_process.stdout = _ScriptedStdoutPipe(
+            [
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turnId": "turn-1", "turn": {"id": "turn-1"}},
+                    }
+                ).encode()
+                + b"\n"
+            ]
+        )
+        tools = (
+            [{"name": "snapshot", "description": "Screenshot", "parameters": {}}]
+            if with_tools
+            else []
+        )
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=AsyncMock(return_value=fake_process),
+        ):
+            try:
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=tools,
+                    system_prompt="",
+                    model="fixture-model",
+                    cwd=str(tmp_path),
+                    sandbox="workspace-write",
+                ):
+                    pass
+                params = session._request.await_args_list[1].args[1]
+                if with_tools:
+                    assert "shell_environment_policy.set.COLLAB_AGENT_PID" not in params["config"]
+                else:
+                    assert "config" not in params
+                assert session._agent_pid is None
+            finally:
+                await session.close()
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("env_key", ["COLLAB_AGENT_PID", "collab_agent_pid"])
+def test_app_server_spawn_env_drops_inherited_agent_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_key: str
+) -> None:
+    """An inherited PID would name the parent's server, so it is stripped."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("omnigent.inner._proc.native_server_pid", lambda *_args: None)
+
+    async def _t() -> None:
+        recorded_env: dict[str, str] | None = None
+        fake_process = _FakeProcess()
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            nonlocal recorded_env
+            recorded_env = kwargs.get("env")
+            return fake_process
+
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex",
+            cwd=str(tmp_path),
+            env={env_key: "1", "KEEP_ME": "ok"},
+            tool_executor=None,
+        )
+        session._request = AsyncMock(return_value={"result": {}})
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=_fake_create_subprocess_exec,
+        ):
+            await session.start()
+            await session.close()
+
+        assert recorded_env is not None
+        assert env_key not in recorded_env
+        assert recorded_env["KEEP_ME"] == "ok"
+
+    _run(_t())
+
+
+def test_app_server_skips_native_pid_lookup_for_linux_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bwrap --unshare-pid sandbox cannot see the host app-server pid."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor.IS_LINUX", True)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        lambda **_kwargs: CodexWorkerLaunch(launch_path="/fixture/codex", sandboxed=True),
+    )
+    native_pid_calls: list[tuple[object, ...]] = []
+
+    def _fake_native_server_pid(*args):
+        native_pid_calls.append(args)
+        return 4242
+
+    monkeypatch.setattr("omnigent.inner._proc.native_server_pid", _fake_native_server_pid)
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+        )
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"userAgent": "omnigent/0.154.0"}},
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        fake_process = _FakeProcess()
+        fake_process.stdout = _ScriptedStdoutPipe(
+            [
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turnId": "turn-1", "turn": {"id": "turn-1"}},
+                    }
+                ).encode()
+                + b"\n"
+            ]
+        )
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=AsyncMock(return_value=fake_process),
+        ):
+            try:
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[{"name": "snapshot", "description": "Screenshot", "parameters": {}}],
+                    system_prompt="",
+                    model="fixture-model",
+                    cwd=str(tmp_path),
+                    sandbox="workspace-write",
+                ):
+                    pass
+                params = session._request.await_args_list[1].args[1]
+                assert "shell_environment_policy.set.COLLAB_AGENT_PID" not in params["config"]
+                assert session._agent_pid is None
+                assert native_pid_calls == []
             finally:
                 await session.close()
 

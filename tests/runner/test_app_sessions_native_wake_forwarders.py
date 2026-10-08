@@ -914,6 +914,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -969,6 +970,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -1247,6 +1249,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1298,6 +1301,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1429,6 +1433,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1482,6 +1487,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.

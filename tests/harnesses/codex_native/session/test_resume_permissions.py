@@ -112,6 +112,79 @@ def test_preload_codex_thread_for_resume_manages_subscription(
     assert retained is (fake_client if retain_client else None)
 
 
+@pytest.mark.parametrize(
+    ("agent_pid", "expected_config"),
+    [
+        (4242, {"shell_environment_policy.set.COLLAB_AGENT_PID": "4242"}),
+        (None, None),
+    ],
+)
+def test_preload_codex_thread_for_resume_carries_agent_pid(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_pid: int | None,
+    expected_config: dict[str, str] | None,
+) -> None:
+    """
+    The first thread loader carries the app-server pid for tool processes.
+
+    A resume of an already-loaded thread ignores ``config``, so the
+    loader that runs first must place the key.
+    """
+    fake_client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876", "thread_test", agent_pid=agent_pid
+        )
+    )
+
+    expected_params: dict[str, Any] = {
+        "threadId": "thread_test",
+        "excludeTurns": True,
+        "approvalsReviewer": "auto_review",
+    }
+    if expected_config is not None:
+        expected_params["config"] = expected_config
+    assert fake_client.requests == [("thread/resume", expected_params)]
+
+
+def test_preload_codex_thread_agent_pid_beats_terminal_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner's agent pid overrides one persisted in terminal args."""
+    fake_client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876",
+            "thread_test",
+            terminal_launch_args=(
+                "-c",
+                'shell_environment_policy.set.COLLAB_AGENT_PID="999"',
+            ),
+            agent_pid=4242,
+        )
+    )
+
+    assert fake_client.requests == [
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_test",
+                "excludeTurns": True,
+                "approvalsReviewer": "auto_review",
+                "config": {"shell_environment_policy.set.COLLAB_AGENT_PID": "4242"},
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize("retain_client", [False, True])
 @pytest.mark.parametrize("stage", ["connect", "request"])
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])

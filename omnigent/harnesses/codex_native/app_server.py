@@ -72,6 +72,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
+    CODEX_AGENT_PID_CONFIG_KEY,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -89,6 +90,7 @@ from omnigent.inner.codex_executor import (
     codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
     read_codex_model_catalog,
+    strip_codex_agent_pid_env,
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import (
@@ -1955,6 +1957,11 @@ class CodexNativeAppServer:
         :meth:`start` in ws mode on POSIX only; ``None`` in unix mode (the
         socket is the app-server's own) or when relay setup failed. Not a
         constructor input.
+    :param agent_pid: Innermost native app-server pid resolved by
+        :meth:`start` (see :func:`omnigent.inner._proc.native_server_pid`),
+        or ``None`` when startup has not resolved it. Passed to codex-native
+        thread config so tool processes can report session liveness. Not a
+        constructor input.
     """
 
     codex_path: str
@@ -1992,6 +1999,7 @@ class CodexNativeAppServer:
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
     auto_title_relay: asyncio.Server | None = field(default=None, init=False)
     _auto_title_relay_identity: tuple[int, int] | None = field(default=None, init=False)
+    agent_pid: int | None = field(default=None, init=False)
 
     async def start(self) -> None:
         """
@@ -2162,6 +2170,9 @@ class CodexNativeAppServer:
             config_overrides=self.config_overrides,
         )
         app_server_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        # An inherited value would name the parent's app-server, not this one.
+        strip_codex_agent_pid_env(app_server_env)
+        self.agent_pid = None
         if os.name == "posix":
             # An inherited value would point at a different app-server.
             app_server_env[CODEX_AUTO_TITLE_SOCKET_ENV] = str(self.socket_path)
@@ -2211,6 +2222,13 @@ class CodexNativeAppServer:
         # outer guard so a cancellation mid-trust still tears down.
         try:
             startup_client = await self._wait_until_ready()
+            # The spawned CLI can be a wrapper that exits while the native
+            # server lives on; the innermost process is the stable identity.
+            proc = self.proc
+            assert proc is not None
+            self.agent_pid = await asyncio.to_thread(
+                _proc.native_server_pid, proc.pid, "app-server"
+            )
             try:
                 if self.policy_hook_disabled_reason is None:
                     try:
@@ -2450,6 +2468,7 @@ class CodexNativeAppServer:
                     self.process_registry_tag = None
                     self.process_owner_lock = None
                     self.process_group_id = None
+                    self.agent_pid = None
                     if diagnostics is not None:
                         diagnostics.finish()
                         with contextlib.suppress(Exception):
@@ -4384,6 +4403,7 @@ async def preload_codex_thread_for_resume(
     terminal_launch_args: Sequence[str] | None = None,
     retain_client: bool = False,
     cwd: Path | None = None,
+    agent_pid: int | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -4402,6 +4422,9 @@ async def preload_codex_thread_for_resume(
     :param retain_client: Keep the thread subscribed through terminal attachment.
         The caller must pass the returned client to the forwarder and close it.
     :param cwd: Session working directory for resolving additional writable roots.
+    :param agent_pid: Native app-server pid to expose to the thread's shell
+        tools, or ``None``. A resume of an already-loaded thread ignores
+        params, so the loader must carry it.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -4413,6 +4436,9 @@ async def preload_codex_thread_for_resume(
     try:
         await client.connect()
         params = _codex_resume_permission_params(terminal_launch_args)
+        if agent_pid is not None:
+            config = cast(CodexParams, params.setdefault("config", {}))
+            config[CODEX_AGENT_PID_CONFIG_KEY] = str(agent_pid)
         args = canonical_codex_launch_args(terminal_launch_args or ())
         additional_roots: list[str] = []
         effective_cwd = cwd or Path.cwd()
@@ -4684,6 +4710,7 @@ def build_codex_remote_args(
     codex_cli_version: tuple[int, int, int] | None = None,
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
+    agent_pid: int | None = None,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -4747,6 +4774,9 @@ def build_codex_remote_args(
         user to answer the prompt. Default ``False`` for interactive
         ``omnigent codex`` sessions where the user faces the terminal and
         can accept hooks normally.
+    :param agent_pid: Native app-server pid to expose to the TUI's shell
+        tools, or ``None``. The TUI forwards its own ``-c`` overrides in
+        the thread calls it sends, so the key travels with the attach.
     :returns: Codex argv tail after the executable.
     """
     # The runner owns the app-server and the TUI ``--remote`` attach it appends
@@ -4760,6 +4790,12 @@ def build_codex_remote_args(
                 "Codex remote provider definitions must be materialized in CODEX_HOME"
             )
         override_args.extend(["-c", override])
+    agent_pid_args: list[str] = []
+    if agent_pid is not None:
+        agent_pid_args = [
+            "-c",
+            f"{CODEX_AGENT_PID_CONFIG_KEY}={json.dumps(str(agent_pid))}",
+        ]
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
         # bypass flag (a global flag, so it precedes any ``resume``).
@@ -4769,14 +4805,26 @@ def build_codex_remote_args(
     passthrough = without_codex_config_profile(passthrough)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
+    # Emitted after pass-through: Codex applies ordered ``-c`` flags
+    # last-wins, and the runner's pid must beat any caller-supplied value.
     if thread_id is None:
-        return [*override_args, *passthrough, "--remote", remote_url]
+        return [*override_args, *passthrough, *agent_pid_args, "--remote", remote_url]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
-        return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+        return [
+            *override_args,
+            *passthrough,
+            *agent_pid_args,
+            "resume",
+            "--remote",
+            remote_url,
+            thread_id,
+        ]
     # Codex rejects explicit permission overrides on remote resume, even
     # when they match the app-server policy. config_overrides went to server
     # startup; codex_args went to preload's thread/resume call.
-    resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
+    resume_args = _strip_codex_resume_permission_args(
+        (*override_args, *passthrough, *agent_pid_args)
+    )
     return [*resume_args, "resume", "--remote", remote_url, thread_id]
 
 

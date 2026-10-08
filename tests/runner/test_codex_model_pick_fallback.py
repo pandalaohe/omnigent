@@ -154,6 +154,7 @@ async def codex_launch_harness(
         env={"OPENAI_API_KEY": "test-key"},
         config_overrides=[],
         listen_url=None,
+        agent_pid=None,
         start=AsyncMock(side_effect=lambda: events.append("app-server-start")),
         close=AsyncMock(),
     )

@@ -222,6 +222,40 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def native_server_pid(root_pid: int | None, subcommand: str) -> int | None:
+    """Return the innermost native server pid under ``root_pid``, else None.
+
+    Only ``argv[1] == subcommand`` matches; an incomplete view returns None.
+    """
+    if root_pid is None or root_pid <= 1:
+        return None
+    try:
+        root = psutil.Process(root_pid)
+        procs = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return None
+    matches: list[psutil.Process] = []
+    for proc in procs:
+        try:
+            cmdline = proc.cmdline()
+        except psutil.Error:
+            # An unreadable candidate could hide the real inner server.
+            return None
+        if len(cmdline) >= 2 and cmdline[1] == subcommand:
+            matches.append(proc)
+    match_pids = {proc.pid for proc in matches}
+    ancestor_pids: set[int] = set()
+    for proc in matches:
+        try:
+            ancestor_pids.update(parent.pid for parent in proc.parents())
+        except psutil.Error:
+            return None
+    innermost_pids = match_pids - ancestor_pids
+    if len(innermost_pids) != 1:
+        return None
+    return innermost_pids.pop()
+
+
 def _snapshot_identities(pid: int) -> dict[int, float]:
     """Snapshot a process tree using PID plus creation time identity."""
     identities: dict[int, float] = {}
