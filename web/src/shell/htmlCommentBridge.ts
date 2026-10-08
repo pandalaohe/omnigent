@@ -21,13 +21,17 @@
 //   origin still applies), which is exactly the property the sandbox guarantees.
 //   We still gate on a per-mount nonce + a source tag to reject stray messages.
 //
-// The script body itself is the shared asset web/public/omni-html-bridge.js:
-// the server inlines the same bytes into panel-view pages, and this module
-// imports them ?raw for the srcdoc (embed) path and the unit tests.
+// The script bodies themselves are the shared assets web/public/omni-html-bridge.js
+// (text-selection comments) and web/public/omni-html-annotate.js (element
+// annotation stub): the server inlines the same bytes into panel-view pages,
+// and this module imports them ?raw for the srcdoc (embed) path and the unit
+// tests.
 //
 // These helpers are pure (no React) so they unit-test in isolation.
 
+import annotateSource from "../../public/omni-html-annotate.js?raw";
 import bridgeSource from "../../public/omni-html-bridge.js?raw";
+import captureSource from "../../public/omni-html-capture.js?raw";
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
@@ -301,49 +305,95 @@ export function anchorOccurrence(source: string, anchor: string, startIndex: num
 // ---------------------------------------------------------------------------
 
 /**
- * Wrap the shared in-frame bridge asset (web/public/omni-html-bridge.js) in the
- * same nonce-carrying `<script>` tag the server emits: the nonce reaches the
- * script as `data-omni-nonce`, and without it the script no-ops. The source is
- * escaped so a literal `</script` in it can never close the tag early.
- *
- * Exported for unit testing.
+ * Wrap a shared in-frame asset in the nonce-carrying `<script>` tag the server
+ * emits: the nonce reaches the script as `data-omni-nonce`, and without it the
+ * script no-ops. The source is escaped so a literal `</script` in it can never
+ * close the tag early.
  */
-export function buildBridgeScript(nonce: string): string {
+function buildAssetScript(source: string, nonce: string): string {
   // The nonce is caller-generated (a UUID); escaping is defensive only.
   const attr = nonce.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
   return (
     '<script data-omni-nonce="' +
     attr +
     '">' +
-    bridgeSource.replace(/<\/script/gi, "<\\/script") +
+    source.replace(/<\/script/gi, "<\\/script") +
     "</script>"
   );
 }
 
 /**
+ * Wrap the shared in-frame bridge asset (web/public/omni-html-bridge.js).
+ *
+ * Exported for unit testing.
+ */
+export function buildBridgeScript(nonce: string): string {
+  return buildAssetScript(bridgeSource, nonce);
+}
+
+/**
+ * Wrap the shared in-frame annotate stub (web/public/omni-html-annotate.js),
+ * which the srcdoc path places right after the bridge script.
+ *
+ * Exported for unit testing.
+ */
+export function buildAnnotateScript(nonce: string): string {
+  return buildAssetScript(annotateSource, nonce);
+}
+
+/**
+ * Wrap the shared early-capture asset (web/public/omni-html-capture.js), which
+ * the srcdoc path places at the top of `<head>`.
+ *
+ * Exported for unit testing.
+ */
+export function buildCaptureScript(nonce: string): string {
+  return buildAssetScript(captureSource, nonce);
+}
+
+/**
+ * Where the capture script goes: right after the opening `<head>` tag, else
+ * after `<html>`, else after a leading doctype, else the very start (a bare
+ * fragment has no doctype to displace). Mirrors the server's ladder.
+ */
+function headInjectIndex(html: string): number {
+  const head = /<head[^>]*>/i.exec(html);
+  if (head) return head.index + head[0].length;
+  const htmlOpen = /<html[^>]*>/i.exec(html);
+  if (htmlOpen) return htmlOpen.index + htmlOpen[0].length;
+  const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
+  if (doctype) return doctype.index + doctype[0].length;
+  return 0;
+}
+
+/**
  * Prepare HTML artifact content for the comment-enabled preview iframe: first
  * run {@link prepareHtmlPreviewDoc} (so links still open in a new tab), then
- * inject the bridge `<script>` (it installs the highlight styles itself) so it
- * runs after the document body has been parsed.
+ * inject the capture script at the top of `<head>` (so it runs before any page
+ * script) and the bridge + annotate stub before `</body>`.
  *
  * Placement mirrors prepareHtmlPreviewDoc's deliberately-simple regex approach
  * (NOT a full HTML parse, which could subtly change how the artifact renders):
- * inject before `</body>` when present, else before `</html>`, else append.
+ * the body scripts go before `</body>` when present, else before `</html>`,
+ * else append.
  *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
  */
 export function injectCommentBridge(html: string, nonce: string): string {
   const prepared = prepareHtmlPreviewDoc(html);
-  const inject = buildBridgeScript(nonce);
+  const headAt = headInjectIndex(prepared);
+  const withCapture =
+    prepared.slice(0, headAt) + buildCaptureScript(nonce) + prepared.slice(headAt);
 
-  const bodyClose = prepared.search(/<\/body\s*>/i);
+  const inject = buildBridgeScript(nonce) + buildAnnotateScript(nonce);
+  const bodyClose = withCapture.search(/<\/body\s*>/i);
   if (bodyClose !== -1) {
-    return prepared.slice(0, bodyClose) + inject + prepared.slice(bodyClose);
+    return withCapture.slice(0, bodyClose) + inject + withCapture.slice(bodyClose);
   }
-  const htmlClose = prepared.search(/<\/html\s*>/i);
+  const htmlClose = withCapture.search(/<\/html\s*>/i);
   if (htmlClose !== -1) {
-    return prepared.slice(0, htmlClose) + inject + prepared.slice(htmlClose);
+    return withCapture.slice(0, htmlClose) + inject + withCapture.slice(htmlClose);
   }
-  return prepared + inject;
+  return withCapture + inject;
 }
