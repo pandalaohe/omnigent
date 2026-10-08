@@ -314,7 +314,7 @@ async def test_runner_request_is_recorded_before_native_control_dispatch(
 ) -> None:
     caplog.set_level(logging.INFO)
 
-    async def dispatch(_self, _harness, session_id):
+    async def dispatch(_self, _harness, session_id, **_kwargs):
         assert session_id == _SESSION
         assert (
             launch.instance.lifecycle_trace.snapshot()["terminal_control_request_action"] == action

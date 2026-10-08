@@ -1003,6 +1003,8 @@ async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
 
     Tasks get the copy when created; this covers ones saved before that.
     """
+    if _is_library_agent_task(deps, task):
+        return task
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
     if agent is None:
         return task

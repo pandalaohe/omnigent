@@ -1371,12 +1371,20 @@ async def _fetch_assistant_item_with_text(
         params["after"] = page["last_id"]
 
 
+# A status reader's child may run on another host, so it keeps the live-status probe.
+_SESSION_STATUS_PARAMS: dict[str, str] = {
+    "include_items": "false",
+    "include_liveness": "false",
+    "include_usage": "false",
+}
+
+
 async def _fetch_session_status(server_client: httpx.AsyncClient, session_id: str) -> str | None:
     """Read a session's current status, or ``None`` when unreadable."""
     try:
         resp = await server_client.get(
             f"/v1/sessions/{session_id}",
-            params=_SESSION_METADATA_PARAMS,
+            params=_SESSION_STATUS_PARAMS,
             timeout=10.0,
         )
     except (httpx.HTTPError, RuntimeError):
@@ -1539,7 +1547,7 @@ async def check_remote_member_liveness(
         try:
             resp = await server_client.get(
                 f"/v1/sessions/{entry.child_session_id}",
-                params=_SESSION_METADATA_PARAMS,
+                params=_SESSION_STATUS_PARAMS,
                 timeout=10.0,
             )
         except (httpx.HTTPError, asyncio.TimeoutError, RuntimeError):

@@ -310,17 +310,18 @@ async def test_claude_native_retried_shell_command_mirror_leaves_the_queue_alone
     event = _shell_mirror("input", "claude:ls:0", input="ls")
 
     try:
-        first_id = await _persist_external_conversation_item(
+        first_id, first_replayed = await _persist_external_conversation_item(
             sid,
             conv,
             event,
             store,  # type: ignore[arg-type]
         )
+        assert first_replayed is False
         assert pending_inputs.snapshot_for(sid) == []
         # The person runs the same command again before the retry arrives.
         again = pending_inputs.record(sid, [{"type": "input_text", "text": "!ls"}])
 
-        retried_id = await _persist_external_conversation_item(
+        retried_id, retried_replayed = await _persist_external_conversation_item(
             sid,
             conv,
             event,
@@ -328,6 +329,7 @@ async def test_claude_native_retried_shell_command_mirror_leaves_the_queue_alone
         )
 
         assert retried_id == first_id
+        assert retried_replayed is True
         assert [item.type for item in store.appended_items] == ["terminal_command"]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [again]
     finally:

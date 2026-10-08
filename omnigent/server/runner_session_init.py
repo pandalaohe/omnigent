@@ -188,7 +188,8 @@ class RunnerSessionInitializer:
         if generation is None:
             generation = self.generation_for(runner_id, runner_client)
         self.require_generation(runner_id, runner_client, generation)
-        peer = await self.resolve_peer_messaging(conversation)
+        async with store_slots or nullcontext():
+            peer = await self.resolve_peer_messaging(conversation)
         pkey = (runner_id, generation, conversation.id)
         effective_archive_states = archive_states or [runner_archive_state(conversation)]
         archive_key = tuple(
@@ -331,13 +332,15 @@ class RunnerSessionInitializer:
             # Built here, not before create_task: the store read blocks,
             # and awaiting between the single-flight lookup and the task
             # registration would let a second caller start its own init.
+            async with store_slots or nullcontext():
+                global_instructions = await asyncio.to_thread(current_global_instructions_text)
             payload = build_runner_session_init_payload(
                 conversation,
                 server_version=self._server_version,
                 suppress_recovery_turn=suppress_recovery_turn,
                 archive_states=archive_states,
                 peer_messaging_enabled=peer,
-                global_instructions=await asyncio.to_thread(current_global_instructions_text),
+                global_instructions=global_instructions,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
             )

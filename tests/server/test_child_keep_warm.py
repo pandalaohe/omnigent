@@ -2036,7 +2036,12 @@ async def test_migration_defers_when_agent_enumeration_fails(
     owner must stay un-migrated until a listing succeeds.
     """
     monkeypatch.setattr("omnigent.runtime.get_agent_cache", lambda: _FakeAgentCache())
-    agent = SimpleNamespace(id=_CLAUDE_AGENT, bundle_location="/fake/claude.zip", session_id=None)
+    agent = SimpleNamespace(
+        id=_CLAUDE_AGENT,
+        bundle_location="/fake/claude.zip",
+        session_id=None,
+        operator_authored=True,
+    )
     agent_store = _AgentListStore([agent], failures=1)
     harness.sweeper._app.state.agent_store = agent_store
     harness.prefs.keep_warm = None
@@ -2072,12 +2077,23 @@ async def test_migration_ignores_sdk_agents(
             }
         ),
     )
-    native = SimpleNamespace(id=_CLAUDE_AGENT, bundle_location="/fake/claude.zip", session_id=None)
+    native = SimpleNamespace(
+        id=_CLAUDE_AGENT,
+        bundle_location="/fake/claude.zip",
+        session_id=None,
+        operator_authored=True,
+    )
     sdk_codex = SimpleNamespace(
-        id=_CODEX_AGENT, bundle_location="/fake/codex.zip", session_id=None
+        id=_CODEX_AGENT,
+        bundle_location="/fake/codex.zip",
+        session_id=None,
+        operator_authored=True,
     )
     sdk_claude = SimpleNamespace(
-        id=_CLAUDE_SDK_AGENT, bundle_location="/fake/claude-sdk.zip", session_id=None
+        id=_CLAUDE_SDK_AGENT,
+        bundle_location="/fake/claude-sdk.zip",
+        session_id=None,
+        operator_authored=True,
     )
     harness.sweeper._app.state.agent_store = _AgentListStore([native, sdk_codex, sdk_claude])
     harness.prefs.keep_warm = None

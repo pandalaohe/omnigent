@@ -420,7 +420,7 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
         nonlocal pending_reads, peak_reads
         pending_reads += 1
         peak_reads = max(peak_reads, pending_reads)
-        if call.__name__ == "_filesystem_attachment_in_history":
+        if getattr(call, "__name__", None) == "_filesystem_attachment_in_history":
             attachment_sessions.add(args[0])
         try:
             return await asyncio.to_thread(call, *args, **kwargs)

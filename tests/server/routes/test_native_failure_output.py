@@ -151,7 +151,7 @@ async def test_failure_without_output_marks_missing_detail_and_keeps_category() 
     result = await _enrich(
         {"status": "failed", "failure_context": {"native_error_category": "server_error"}}, []
     )
-    assert "output" not in result
+    assert result["output"] == _FAILED_FALLBACK
     assert result["failure_context"]["native_error_category"] == "server_error"
     assert result["failure_context"]["detail_source"] == "missing"
 

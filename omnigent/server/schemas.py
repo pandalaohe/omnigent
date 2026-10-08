@@ -2633,9 +2633,10 @@ class UpdateSessionRequest(BaseModel):
         current lock unchanged. Owner-only.
     :param delete_worktree: With ``archived=True``, also remove the
         session's server-created git worktree directory once the archive
-        teardown runs (after the Undo grace; on an already-archived session
-        a delete-only teardown of its current archive revision runs the
-        same way). The branch is kept. It forces the CLI teardown for that
+        teardown runs (after the Undo grace). On an already-archived session
+        it requests a delete-only teardown of the current archive revision,
+        whose Undo grace counts from that archive, not from this request.
+        The branch is kept. It forces the CLI teardown for that
         archive even on a host policy that keeps CLIs on archive, so the
         worktree is never removed under a running CLI. Ignored for sessions
         with no worktree; rejected (400) without ``archived=True``.

@@ -127,11 +127,21 @@ def _seed_split_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_skill(home / ".agents" / "skills", "plan", "agents plan body")
 
 
+def _claude_portable_skills_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the host config to ``skills.claude_portable_skills: false``."""
+    config_home = tmp_path / "off-config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("skills:\n  claude_portable_skills: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+
 def test_execute_skill_tool_claude_registry_ignores_agents_skills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A claude-native session's registry never lists Codex-only skills."""
+    """With the host's Claude portable-skills switch off, a claude-native
+    registry never lists Codex-only skills."""
     _seed_split_home(tmp_path, monkeypatch)
+    _claude_portable_skills_off(tmp_path, monkeypatch)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     spec = _agent_spec("claude-native")
@@ -200,6 +210,7 @@ def test_relayed_load_skill_description_uses_the_given_registry(
 ) -> None:
     """The advertised description lists exactly the session registry's names."""
     _seed_split_home(tmp_path, monkeypatch)
+    _claude_portable_skills_off(tmp_path, monkeypatch)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     spec = _agent_spec("claude-native")
@@ -248,14 +259,15 @@ def test_grant_pairs_read_skill_file_with_load_skill(
 def test_execute_skill_tool_loads_a_bundle_host_skill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A host skill under the bundle workdir loads for a claude-native session."""
+    """A portable host skill under the bundle workdir loads for a claude-native session."""
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "empty-config"))
     workspace = tmp_path / "ws"
     workspace.mkdir()
     bundle = tmp_path / "bundle"
-    _write_skill(bundle / ".claude" / "skills", "bundle-host", "bundle host body")
+    _write_skill(bundle / ".agents" / "skills", "bundle-host", "bundle host body")
     spec = _agent_spec("claude-native")
 
     loaded = _execute_skill_tool(
