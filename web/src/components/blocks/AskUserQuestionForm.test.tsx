@@ -220,10 +220,15 @@ const REBIND_CASES: {
     action: "questionCardSelectOption",
     code: "KeyC",
     run: (h) => {
+      // Row 0 already starts selected; move the highlight to row 1
+      // without selecting it so the rebound key has a row to confirm.
+      const option = screen.getAllByRole("radio")[1] as HTMLInputElement;
+      act(() => option.focus());
+      expect(h.highlighted()).toBe(1);
       h.press({ key: " ", code: "Space" });
-      expect(screen.getAllByRole("radio")[0]).not.toBeChecked();
+      expect(option).not.toBeChecked();
       h.press({ key: "c", code: "KeyC" });
-      expect(screen.getAllByRole("radio")[0]).toBeChecked();
+      expect(option).toBeChecked();
     },
   },
   {
@@ -313,6 +318,57 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(document.activeElement).toBe(card());
     expect(highlightedIndex()).toBe(0);
     expect(screen.getByTestId("composer")).toHaveValue("draft");
+  });
+
+  it("preselects option one on single-select questions and leaves the rest empty", () => {
+    // Every single-select question opens with its first option checked,
+    // so the user only adjusts what they disagree with; multi-select and
+    // free-text questions stay unanswered until the user acts.
+    const { onSubmit } = renderKeyboardForm(
+      questionsOf([
+        { id: "s1", question: "First pick?", options: [{ label: "A" }, { label: "B" }] },
+        { id: "s2", question: "Second pick?", options: [{ label: "C" }, { label: "D" }] },
+        {
+          id: "m1",
+          question: "Pick any?",
+          options: [{ label: "E" }, { label: "F" }],
+          multiSelect: true,
+        },
+        { id: "free", question: "Anything else?" },
+      ]),
+    );
+
+    const firstRadios = screen.getAllByRole("radio");
+    expect(firstRadios[0]).toBeChecked();
+    expect(firstRadios[1]).not.toBeChecked();
+    expect(screen.getByTestId("ask-user-question-custom-toggle")).not.toBeChecked();
+
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    const secondRadios = screen.getAllByRole("radio");
+    expect(secondRadios[0]).toBeChecked();
+    expect(secondRadios[1]).not.toBeChecked();
+
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    const checkboxes = screen.getAllByRole("checkbox");
+    expect(checkboxes).toHaveLength(3);
+    for (const checkbox of checkboxes) expect(checkbox).not.toBeChecked();
+    fireEvent.click(screen.getByLabelText("E"));
+
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByTestId("ask-user-question-custom-input")).toHaveValue("");
+    expect(screen.getByTestId("ask-user-question-submit").hasAttribute("disabled")).toBe(true);
+
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "custom note" },
+    });
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+
+    expect(onSubmit).toHaveBeenCalledWith({
+      s1: "A",
+      s2: "C",
+      m1: ["E"],
+      free: "custom note",
+    });
   });
 
   it("re-enters on the custom row when a multi-select answer is custom-only", () => {
@@ -473,7 +529,20 @@ describe("AskUserQuestionForm — keyboard", () => {
   });
 
   it("jumps to the first unanswered question instead of submitting", () => {
-    const { onSubmit } = renderKeyboardForm(questionsOf(TWO_QUESTIONS));
+    // The single-select questions are answered by their default first
+    // option, so the multi-select one is the unanswered question to jump
+    // back to.
+    const { onSubmit } = renderKeyboardForm(
+      questionsOf([
+        {
+          id: "q1",
+          question: "First?",
+          options: [{ label: "A" }, { label: "B" }],
+          multiSelect: true,
+        },
+        { id: "q2", question: "Second?", options: [{ label: "C" }] },
+      ]),
+    );
     focusCard();
 
     pressCard({ key: "ArrowRight", code: "ArrowRight" });
@@ -640,7 +709,12 @@ describe("AskUserQuestionForm — keyboard", () => {
     fireEvent.keyDown(composer, { key: " ", code: "Space" });
     fireEvent.keyDown(composer, { key: "Escape", code: "Escape" });
 
-    for (const radio of screen.getAllByRole("radio")) expect(radio).not.toBeChecked();
+    // The card keeps its seeded first-option selection; ArrowDown would
+    // have moved it to B had the card acted on the composer's keys.
+    const radios = screen.getAllByRole("radio");
+    expect(radios[0]).toBeChecked();
+    expect(radios[1]).not.toBeChecked();
+    expect(screen.getByTestId("ask-user-question-custom-toggle")).not.toBeChecked();
     expect(progress()).toContain("Question 1 of 2");
   });
 
@@ -718,11 +792,17 @@ describe("AskUserQuestionForm — keyboard", () => {
     });
     focusCard();
 
+    // Row 0 already starts selected; highlight row 1 without selecting
+    // it so the old key would have something to select and the new key
+    // has a row to confirm.
+    const option = screen.getAllByRole("radio")[1] as HTMLInputElement;
+    act(() => option.focus());
+
     pressCard({ key: " ", code: "Space" });
-    expect(screen.getAllByRole("radio")[0]).not.toBeChecked();
+    expect(option).not.toBeChecked();
 
     pressCard({ key: "x", code: "KeyX" });
-    expect(screen.getAllByRole("radio")[0]).toBeChecked();
+    expect(option).toBeChecked();
   });
 
   it("selects through a rebound next-option key and drops the old arrow", () => {
@@ -736,7 +816,8 @@ describe("AskUserQuestionForm — keyboard", () => {
 
     pressCard({ key: "ArrowDown", code: "ArrowDown" });
     expect(highlightedIndex()).toBe(0);
-    for (const radio of screen.getAllByRole("radio")) expect(radio).not.toBeChecked();
+    expect(screen.getAllByRole("radio")[0]).toBeChecked();
+    expect(screen.getAllByRole("radio")[1]).not.toBeChecked();
 
     pressCard({ key: "b", code: "KeyB" });
     expect(highlightedIndex()).toBe(1);
