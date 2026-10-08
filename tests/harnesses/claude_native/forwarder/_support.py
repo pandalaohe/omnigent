@@ -424,11 +424,27 @@ def _task_notification_record(
 def _legacy_event_transport(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> httpx.MockTransport:
-    """Exercise old single-event Servers with their real array rejection."""
+    """Exercise old single-event Servers with their real array rejection.
+
+    A one-element recovery array passes through because recovery needs an
+    array-capable server for its per-event acknowledgement.
+    """
 
     def dispatch(request: httpx.Request) -> httpx.Response:
-        if request.content and isinstance(json.loads(request.content), list):
-            return httpx.Response(422, json={"detail": "single event required"})
+        if request.content:
+            body = json.loads(request.content)
+            if isinstance(body, list):
+                event = body[0] if len(body) == 1 else None
+                if (
+                    isinstance(event, dict)
+                    and isinstance(event.get("data"), dict)
+                    and "recovery_after" in event["data"]
+                ):
+                    response = handler(httpx.Request(request.method, request.url, json=event))
+                    if 200 <= response.status_code < 300:
+                        return httpx.Response(response.status_code, json=[response.json()])
+                    return response
+                return httpx.Response(422, json={"detail": "single event required"})
         return handler(request)
 
     return httpx.MockTransport(dispatch)

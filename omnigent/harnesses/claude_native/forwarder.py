@@ -110,6 +110,8 @@ _COMPACTION_HOOK_FALLBACK_WAIT_S = 2.0
 _COMPACTION_BOUNDARY_CHAIN_MAX_HOPS = 10_000
 _compaction_locks: dict[str, asyncio.Lock] = {}
 _SUBAGENT_RECOVERY_BATCH_ITEMS = 64
+# Rejected history items retry this rarely, never dropped, so recovery never skips history.
+_SUBAGENT_RECOVERY_PARK_S = 600.0
 
 # Cap on the in-memory ``(message_id, index)`` dedupe ring for streamed
 # deltas. The byte offset already prevents re-reading on the normal
@@ -1155,6 +1157,20 @@ class _PostRetryTracker:
         # A cleared key means the post got through (or was ambiguously
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
+
+    def park(self, key: str, *, attempts: int, delay_s: float) -> None:
+        """
+        Hold ``key`` until a later retry without dropping or restarting it.
+
+        :param key: Stable retry key, e.g. ``"subagent_recovery:..."``.
+        :param attempts: Failed-attempt count to keep for diagnostics.
+        :param delay_s: Minimum seconds before the next retry is allowed.
+        :returns: None.
+        """
+        self._entries[key] = _PostRetryEntry(
+            attempts=attempts,
+            next_attempt_at=time.monotonic() + max(0.0, delay_s),
+        )
 
     def record_failure(self, key: str, exc: Exception, *, session_id: str) -> _PostRetryDecision:
         """
@@ -2928,21 +2944,33 @@ async def _post_external_recovery_item(
     recovery_after: str | None,
 ) -> str | None:
     """Reconcile one frozen item; ``None`` means the Server safely skipped it."""
+    # A one-element array is always delivered over HTTP with its per-event ack,
+    # and the tunnel's ack carries no item id.
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": item.item_type,
-                "item_data": item.data,
-                "response_id": item.response_id,
-                "source_id": item.source_id,
-                "recovery_after": recovery_after,
-            },
-        },
+        json=[
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": item.item_type,
+                    "item_data": item.data,
+                    "response_id": item.response_id,
+                    "source_id": item.source_id,
+                    "recovery_after": recovery_after,
+                },
+            }
+        ],
     )
     resp.raise_for_status()
-    body = _parse_json_response(resp, context="sub-agent history recovery")
+    try:
+        payload: object = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "sub-agent history recovery response did not confirm the chain"
+        ) from exc
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise RuntimeError("sub-agent history recovery response did not confirm the chain")
+    body = payload[0]
     item_id = body.get("item_id")
     if body.get("replayed") is not True or body.get("recovery") is not True:
         raise RuntimeError("sub-agent history recovery response did not confirm the chain")
@@ -3378,29 +3406,58 @@ async def _recover_subagent_history(
                     item=item,
                     recovery_after=entry.recovery_after,
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, RuntimeError) as exc:
                 decision = item_retry_tracker.record_failure(
                     retry_key, exc, session_id=entry.child_conversation_id
                 )
-                _logger.warning(
-                    "Claude sub-agent history reconciliation held; child=%s "
-                    "source_id=%s attempt=%s http_status=%s",
-                    entry.child_conversation_id,
-                    item.source_id,
-                    decision.attempts,
-                    _http_status_for_log(exc),
-                    exc_info=True,
-                )
-                recovery_blocked = True
-                break
-            except RuntimeError:
-                _logger.warning(
-                    "Claude sub-agent history reconciliation was not confirmed; "
-                    "child=%s source_id=%s",
-                    entry.child_conversation_id,
-                    item.source_id,
-                    exc_info=True,
-                )
+                if isinstance(exc, httpx.HTTPError):
+                    give_up = decision.exhausted
+                    http_status = _http_status_for_log(exc)
+                    detail = _http_detail_for_log(exc)
+                    held_message = (
+                        "Claude sub-agent history reconciliation held; child=%s "
+                        "source_id=%s attempt=%s http_status=%s detail=%s"
+                    )
+                    held_args = (
+                        entry.child_conversation_id,
+                        item.source_id,
+                        decision.attempts,
+                        http_status,
+                        detail,
+                    )
+                else:
+                    # A structural failure has no HTTP permanence verdict, so
+                    # this caller's budget decides when to park it.
+                    give_up = decision.attempts >= _HTTP_POST_MAX_PERMANENT_FAILURES
+                    http_status = None
+                    detail = None
+                    held_message = (
+                        "Claude sub-agent history reconciliation was not confirmed; "
+                        "child=%s source_id=%s"
+                    )
+                    held_args = (entry.child_conversation_id, item.source_id)
+                if give_up:
+                    # Park, never drop: the item must still be reconciled later.
+                    item_retry_tracker.park(
+                        retry_key,
+                        attempts=decision.attempts,
+                        delay_s=_SUBAGENT_RECOVERY_PARK_S,
+                    )
+                    _logger.warning(
+                        "Claude sub-agent history reconciliation parked; child=%s "
+                        "source_id=%s attempts=%s http_status=%s detail=%s "
+                        "next_retry_s=%.0f",
+                        entry.child_conversation_id,
+                        item.source_id,
+                        decision.attempts,
+                        http_status,
+                        detail,
+                        _SUBAGENT_RECOVERY_PARK_S,
+                    )
+                elif decision.attempts == 1:
+                    _logger.warning(held_message, *held_args, exc_info=True)
+                else:
+                    _logger.debug(held_message, *held_args)
                 recovery_blocked = True
                 break
             item_retry_tracker.clear(retry_key)
@@ -8342,6 +8399,22 @@ def _http_status_for_log(exc: Exception) -> int | None:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return None
+
+
+def _http_detail_for_log(exc: Exception) -> str | None:
+    """
+    Extract a bounded response-body detail from ``exc`` when it was read.
+
+    :param exc: Exception raised while posting an Omnigent event.
+    :returns: First 200 characters of the response text, or ``None``
+        for non-status failures and unread streaming bodies.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    try:
+        return exc.response.text[:200]
+    except httpx.ResponseNotRead:
+        return None
 
 
 def _batch_response_never_received(exc: httpx.HTTPError) -> bool:

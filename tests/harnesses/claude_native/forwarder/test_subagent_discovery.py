@@ -326,6 +326,8 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{}])
         if body.get("type") != "external_subagent_start":
             return httpx.Response(202, json={})
         subagent_id = body["data"]["subagent_id"]
