@@ -3411,7 +3411,7 @@ async def _recover_subagent_history(
                     retry_key, exc, session_id=entry.child_conversation_id
                 )
                 if isinstance(exc, httpx.HTTPError):
-                    give_up = decision.exhausted
+                    give_up = decision.exhausted and decision.permanent
                     http_status = _http_status_for_log(exc)
                     detail = _http_detail_for_log(exc)
                     held_message = (
@@ -3454,6 +3454,15 @@ async def _recover_subagent_history(
                         detail,
                         _SUBAGENT_RECOVERY_PARK_S,
                     )
+                elif decision.exhausted:
+                    # The shared transient budget belongs to the live lane; recovery
+                    # keeps retrying at the backoff ceiling instead of restarting.
+                    item_retry_tracker.park(
+                        retry_key,
+                        attempts=decision.attempts,
+                        delay_s=_HTTP_POST_RETRY_MAX_DELAY_S,
+                    )
+                    _logger.debug(held_message, *held_args)
                 elif decision.attempts == 1:
                     _logger.warning(held_message, *held_args, exc_info=True)
                 else:

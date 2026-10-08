@@ -2009,19 +2009,49 @@ async def test_subagent_history_recovery_parks_unconfirmed_ack(tmp_path: Path) -
     assert not (bridge_dir / "dead_letter.jsonl").exists()
 
 
-async def test_subagent_history_generic_503_is_never_parked(tmp_path: Path) -> None:
-    """A generic transient 5xx keeps posting on the tracker's normal backoff."""
+@pytest.mark.parametrize(
+    ("status_code", "response_body"),
+    [
+        (503, {"detail": "unavailable"}),
+        (503, {"error": "subagent_delivery_not_confirmed"}),
+        (409, {"detail": "conflict"}),
+    ],
+)
+async def test_subagent_history_transient_exhaustion_is_never_parked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+    response_body: dict[str, str],
+) -> None:
+    """An exhausted transient failure keeps the backoff ceiling, never the long park."""
     bridge_dir, child_path, entry = _seed_recovery_child(
         tmp_path, subagent_id="transient1", child_id="conv_child_transient"
     )
+    monkeypatch.setattr(forwarder, "_HTTP_POST_RETRY_MAX_DELAY_S", 0.0)
     posts = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal posts
         posts += 1
-        return httpx.Response(503, json={"error": "try again"})
+        return httpx.Response(status_code, json=response_body)
 
-    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS,
+    )
+    items = forwarder.read_transcript_items_from_offset(
+        child_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id=None,
+        include_sidechains=True,
+        end_offset=entry.recovery_watermark,
+    ).items
+    assert len(items) == 1
+    retry_key = f"subagent_recovery:{entry.child_conversation_id}:{items[0].source_id}"
+    caplog.set_level(logging.DEBUG, logger=forwarder._logger.name)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
@@ -2035,12 +2065,18 @@ async def test_subagent_history_generic_503_is_never_parked(tmp_path: Path) -> N
                 tracker=tracker,
             )
 
-        for _ in range(10):
+        for _ in range(forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS + 8):
             assert await poll() is None
 
-    assert posts == 10
+    assert posts == forwarder._SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS + 8
+    retry_delay_s = tracker.retry_delay_s(retry_key)
+    assert retry_delay_s is None or retry_delay_s < forwarder._SUBAGENT_RECOVERY_PARK_S
     assert entry.recovery_watermark == child_path.stat().st_size
+    assert entry.byte_offset == 0
     assert not (bridge_dir / "dead_letter.jsonl").exists()
+    records = [record for record in caplog.records if record.name == forwarder._logger.name]
+    assert len([record for record in records if record.exc_info]) == 1
+    assert not [record for record in records if "reconciliation parked" in record.getMessage()]
 
 
 async def test_subagent_history_recovery_logs_one_traceback_before_parking(
