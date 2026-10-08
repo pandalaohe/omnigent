@@ -12,10 +12,14 @@ without needing a running HTTP server.
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 
 from omnigent.entities import Comment
-from omnigent.server.routes.comments import _format_message
+from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX
+from omnigent.server.routes.comments import _annotation_attachments, _format_message
 from omnigent.stores.comment_store.visitor_comments import VISITOR_FEEDBACK_HEADER
 
 
@@ -24,6 +28,7 @@ def _make_comment(
     start_index: int,
     body: str,
     *,
+    comment_id: str = "test-id",
     end_index: int = 0,
     anchor_content: str | None = None,
     conversation_id: str = "conv_test",
@@ -32,12 +37,13 @@ def _make_comment(
 ) -> Comment:
     """Build a :class:`Comment` for use in formatting tests.
 
-    All fields other than ``path``, ``start_index``, and ``body`` default to
-    sensible test values.
+    All fields other than ``path``, ``start_index``, ``body``, and
+    ``comment_id`` default to sensible test values.
 
     :param path: File path for the comment.
     :param start_index: 0-based absolute character offset where the anchor begins.
     :param body: Comment text.
+    :param comment_id: Comment id (default ``"test-id"``).
     :param end_index: 0-based absolute character offset where the anchor ends
         (default ``0``).
     :param anchor_content: Plain-text snapshot of the selected range (default
@@ -45,10 +51,10 @@ def _make_comment(
     :param conversation_id: Owning conversation (default ``"conv_test"``).
     :param status: Comment status (default ``"draft"``).
     :param created_by: Comment author marker (default ``None``).
-    :returns: A :class:`Comment` with a fixed id and created_at.
+    :returns: A :class:`Comment` with a fixed created_at.
     """
     return Comment(
-        id="test-id",
+        id=comment_id,
         conversation_id=conversation_id,
         path=path,
         start_index=start_index,
@@ -60,6 +66,41 @@ def _make_comment(
         anchor_content=anchor_content,
         created_by=created_by,
     )
+
+
+def _element_anchor(
+    *,
+    label: str = "div.filter-menu > button.option",
+    text: str = "Option 2",
+    screenshot: dict[str, Any] | None = None,
+) -> str:
+    """Encode a minimal valid element anchor.
+
+    :param label: One-line element path for ``target.label``.
+    :param text: Visible element text for ``target.text``.
+    :param screenshot: Screenshot descriptor, or ``None``.
+    :returns: ``__element__`` plus JSON.
+    """
+    return ELEMENT_ANCHOR_PREFIX + json.dumps(
+        {
+            "v": 1,
+            "kind": "element",
+            "page": {"url": "http://localhost:6767/v1/artifacts/tok/reports/q3.html"},
+            "target": {"label": label, "css": "button.option", "text": text},
+            "rect": {"x": 0, "y": 0, "w": 10, "h": 10},
+            "screenshot": screenshot,
+        }
+    )
+
+
+def _screenshot(file_id: str, filename: str) -> dict[str, Any]:
+    """Build a valid screenshot descriptor.
+
+    :param file_id: Session file id.
+    :param filename: Original file name.
+    :returns: The descriptor dict.
+    """
+    return {"file_id": file_id, "filename": filename, "width": 640, "height": 480}
 
 
 # ── header ────────────────────────────────────────────────────────────────────
@@ -364,3 +405,211 @@ def test_format_message_windows_paths_keep_their_backslashes() -> None:
 
     assert "File: C:\\work\\a.py" in result
     assert "\\u005c" not in result
+
+
+# ── element annotations ──────────────────────────────────────────────────────
+
+
+def test_format_message_element_heading_carries_numbers_only() -> None:
+    """The heading is server-generated; the page label lives in the wrapper."""
+    comment = _make_comment(
+        path="reports/q3.html",
+        start_index=0,
+        end_index=0,
+        body="Fix the filter",
+        anchor_content=_element_anchor(label="div.filter-menu > button.option"),
+    )
+
+    result = _format_message([comment])
+    lines = result.splitlines()
+    heading = lines[lines.index('User comment: "Fix the filter"') - 1]
+
+    assert heading == "Element annotation 1"
+    assert "div.filter-menu" not in heading
+    assert result.count("<untrusted_page_evidence>") == 1
+    assert result.count("</untrusted_page_evidence>") == 1
+    open_index = lines.index("<untrusted_page_evidence>")
+    assert "div.filter-menu > button.option" in lines[open_index + 1]
+    assert lines[open_index + 2] == "</untrusted_page_evidence>"
+
+
+def test_format_message_image_number_marks_only_screenshot_rows() -> None:
+    """``(image k)`` counts screenshots in message order, only on their rows."""
+    first = _make_comment(
+        path="reports/q3.html",
+        start_index=0,
+        end_index=0,
+        body="no image",
+        comment_id="c1",
+        anchor_content=_element_anchor(),
+    )
+    second = _make_comment(
+        path="reports/q3.html",
+        start_index=10,
+        end_index=10,
+        body="has image",
+        comment_id="c2",
+        anchor_content=_element_anchor(screenshot=_screenshot("file_one", "one.png")),
+    )
+
+    result = _format_message([first, second])
+    lines = result.splitlines()
+
+    assert "Element annotation 1" in lines
+    assert not any(line.startswith("Element annotation 1 (") for line in lines)
+    assert lines[lines.index('User comment: "has image"') - 1] == "Element annotation 2 (image 1)"
+
+
+def test_format_message_numbers_annotations_across_files() -> None:
+    """``n`` runs over all files in output order; ``k`` follows screenshots."""
+    b_image = _make_comment(
+        path="b.html",
+        start_index=0,
+        end_index=0,
+        body="b image",
+        comment_id="b1",
+        anchor_content=_element_anchor(screenshot=_screenshot("file_b", "b.png")),
+    )
+    a_second = _make_comment(
+        path="a.html",
+        start_index=50,
+        end_index=50,
+        body="a second",
+        comment_id="a2",
+        anchor_content=_element_anchor(),
+    )
+    a_first = _make_comment(
+        path="a.html",
+        start_index=10,
+        end_index=10,
+        body="a first",
+        comment_id="a1",
+        anchor_content=_element_anchor(),
+    )
+
+    result = _format_message([b_image, a_second, a_first])
+    lines = result.splitlines()
+
+    assert lines[lines.index('User comment: "a first"') - 1] == "Element annotation 1"
+    assert lines[lines.index('User comment: "a second"') - 1] == "Element annotation 2"
+    assert lines[lines.index('User comment: "b image"') - 1] == "Element annotation 3 (image 1)"
+
+
+def test_format_message_mixes_text_and_element_rows_in_one_file() -> None:
+    """Text rows keep the Location/Excerpt form beside element rows."""
+    text = _make_comment(
+        path="reports/q3.html",
+        start_index=0,
+        end_index=5,
+        body="text note",
+        comment_id="t1",
+        anchor_content="<div>",
+    )
+    element = _make_comment(
+        path="reports/q3.html",
+        start_index=10,
+        end_index=10,
+        body="element note",
+        comment_id="e1",
+        anchor_content=_element_anchor(),
+    )
+
+    result = _format_message([element, text])
+    lines = result.splitlines()
+
+    assert lines.index("Location: characters 0–5") < lines.index("Element annotation 1")
+    assert "Excerpt:\n> <div>" in result
+    assert result.count("Location: characters") == 1
+
+
+def test_format_message_unparsable_owner_anchor_renders_as_text() -> None:
+    """A stored element anchor that fails to parse is a text comment."""
+    comment = _make_comment(
+        path="reports/q3.html",
+        start_index=0,
+        end_index=0,
+        body="broken anchor",
+        anchor_content=ELEMENT_ANCHOR_PREFIX + '{"v":2}',
+    )
+
+    result = _format_message([comment])
+
+    assert "Element annotation" not in result
+    assert "Excerpt:" in result
+
+
+def test_format_message_visitor_element_anchor_renders_as_text() -> None:
+    """A visitor row carrying an element anchor stays a visitor text comment."""
+    visitor = _make_comment(
+        path="reports/q3.html",
+        start_index=0,
+        end_index=0,
+        body="visitor note",
+        anchor_content=_element_anchor(),
+        created_by="visitor:Alice",
+    )
+
+    result = _format_message([visitor])
+
+    assert "Element annotation" not in result
+    assert "<untrusted_page_evidence>" not in result
+    assert "Excerpt:" in result
+    assert 'Visitor comment (Visitor · Alice): "visitor note"' in result
+
+
+def test_annotation_attachments_follow_message_order() -> None:
+    """Attachment order is the screenshot rows' message order."""
+    b_image = _make_comment(
+        path="b.html",
+        start_index=0,
+        end_index=0,
+        body="b image",
+        comment_id="b1",
+        anchor_content=_element_anchor(screenshot=_screenshot("file_b", "b.png")),
+    )
+    visitor_image = _make_comment(
+        path="a.html",
+        start_index=0,
+        end_index=0,
+        body="visitor image",
+        comment_id="v1",
+        anchor_content=_element_anchor(screenshot=_screenshot("file_v", "v.png")),
+        created_by="visitor:Alice",
+    )
+    a_text = _make_comment(
+        path="a.html",
+        start_index=5,
+        end_index=5,
+        body="text",
+        comment_id="t1",
+        anchor_content="plain",
+    )
+    a_image = _make_comment(
+        path="a.html",
+        start_index=10,
+        end_index=10,
+        body="a image",
+        comment_id="a1",
+        anchor_content=_element_anchor(screenshot=_screenshot("file_a", "a.png")),
+    )
+
+    attachments = _annotation_attachments([b_image, visitor_image, a_text, a_image])
+
+    assert attachments == [
+        {"comment_id": "a1", "file_id": "file_a", "filename": "a.png"},
+        {"comment_id": "b1", "file_id": "file_b", "filename": "b.png"},
+    ]
+
+
+def test_annotation_attachments_empty_without_screenshots() -> None:
+    """No screenshot rows yields no attachments."""
+    text = _make_comment(path="a.py", start_index=0, end_index=1, body="note")
+    element = _make_comment(
+        path="a.html",
+        start_index=0,
+        end_index=0,
+        body="element",
+        anchor_content=_element_anchor(),
+    )
+
+    assert _annotation_attachments([text, element]) == []

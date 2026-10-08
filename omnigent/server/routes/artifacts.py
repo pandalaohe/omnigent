@@ -155,9 +155,14 @@ _FORBIDDEN_PAGE_TEMPLATE = (
     '<body><h1>403 Forbidden</h1><p><a href="{root}/">Home</a></p></body></html>\n'
 )
 
-# In-frame scripts injected into panel-view HTML, in order. RPB03 appends
-# its annotation asset here; an asset missing from disk is skipped.
-_IN_FRAME_ASSETS: tuple[str, ...] = ("omni-html-bridge.js",)
+# In-frame scripts injected into panel-view HTML. The capture script goes right
+# after the opening <head> so it runs before any page script; the body scripts
+# share its nonce, with the comment bridge first and the annotate stub (idle
+# until the parent opens the annotate channel) after it. An asset missing from
+# disk is skipped; when every asset in both lists is missing, the body is
+# served unmodified.
+_HEAD_FRAME_ASSETS: tuple[str, ...] = ("omni-html-capture.js",)
+_IN_FRAME_ASSETS: tuple[str, ...] = ("omni-html-bridge.js", "omni-html-annotate.js")
 
 # Served web-ui directory, resolved the same way as ``omnigent.server.app``
 # does (that module imports this one transitively, so the path is rebuilt
@@ -212,6 +217,9 @@ _HTML_CLOSE_RE = re.compile(r"</html\s*>", re.IGNORECASE)
 _HEAD_CLOSE_RE = re.compile(r"</head\s*>", re.IGNORECASE)
 _SCRIPT_CLOSE_RE = re.compile(r"</script", re.IGNORECASE)
 _SCRIPT_OPEN_RE = re.compile(r"<script\b", re.IGNORECASE)
+_HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
+_HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
+_DOCTYPE_RE = re.compile(r"\s*<!doctype\b[^>]*>", re.IGNORECASE)
 _MODULEPRELOAD_LINK_RE = re.compile(
     r"<link\b(?=[^>]*\brel\s*=\s*[\"']modulepreload[\"'])", re.IGNORECASE
 )
@@ -410,23 +418,16 @@ def _last_match_start(pattern: re.Pattern[str], text: str) -> int:
     return start
 
 
-def _inject_in_frame_assets(body: bytes, nonce: str) -> bytes | None:
-    """Inline the panel assets as ``<script data-omni-nonce=…>`` blocks.
+def _read_in_frame_scripts(names: tuple[str, ...], nonce: str) -> str:
+    """Inline every readable asset in *names* as a nonce-carrying script block.
 
-    Placement mirrors the viewer's own regex approach: before the last
-    ``</body>``, else the last ``</html>``, else appended.
-
-    :param body: The raw HTML bytes.
+    :param names: Asset file names, in injection order.
     :param nonce: The bridge nonce for the served token.
-    :returns: The injected bytes, or ``None`` when the body is not UTF-8 or
-        no asset could be read (the caller then serves the body unmodified).
+    :returns: The concatenated ``<script>`` tags, or ``""`` when no asset in
+        *names* could be read.
     """
-    try:
-        text = body.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
     scripts: list[str] = []
-    for name in _IN_FRAME_ASSETS:
+    for name in names:
         asset = _read_in_frame_asset(name)
         if asset is None:
             continue
@@ -435,14 +436,58 @@ def _inject_in_frame_assets(body: bytes, nonce: str) -> bytes | None:
         # still sees no closing tag.
         escaped = _SCRIPT_CLOSE_RE.sub(lambda _match: r"<\/script", asset)
         scripts.append(f'<script data-omni-nonce="{nonce}">{escaped}</script>')
-    if not scripts:
+    return "".join(scripts)
+
+
+def _head_asset_index(text: str) -> int:
+    """The insertion point for the head assets.
+
+    Right after the opening ``<head>`` tag; without one, right after
+    ``<html>``; without either, after a leading doctype; otherwise at the very
+    start (a bare fragment has no doctype or html element to displace).
+    """
+    for pattern in (_HEAD_OPEN_RE, _HTML_OPEN_RE):
+        match = pattern.search(text)
+        if match is not None:
+            return match.end()
+    match = _DOCTYPE_RE.match(text)
+    if match is not None:
+        return match.end()
+    return 0
+
+
+def _inject_in_frame_assets(body: bytes, nonce: str) -> bytes | None:
+    """Inline the panel assets as ``<script data-omni-nonce=…>`` blocks.
+
+    The capture script is placed ahead of page scripts by ``_head_asset_index``;
+    the body assets mirror the viewer's own regex approach: before the last
+    ``</body>``, else the last ``</html>``, else appended.
+
+    :param body: The raw HTML bytes.
+    :param nonce: The bridge nonce for the served token.
+    :returns: The injected bytes, or ``None`` when the body is not UTF-8 or
+        no asset could be read from either list (the caller then serves the
+        body unmodified).
+    """
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
         return None
-    index = _last_match_start(_BODY_CLOSE_RE, text)
-    if index == -1:
-        index = _last_match_start(_HTML_CLOSE_RE, text)
-    if index == -1:
-        index = len(text)
-    return (text[:index] + "".join(scripts) + text[index:]).encode("utf-8")
+    head_scripts = _read_in_frame_scripts(_HEAD_FRAME_ASSETS, nonce)
+    body_scripts = _read_in_frame_scripts(_IN_FRAME_ASSETS, nonce)
+    if not head_scripts and not body_scripts:
+        return None
+    if head_scripts:
+        index = _head_asset_index(text)
+        text = text[:index] + head_scripts + text[index:]
+    if body_scripts:
+        index = _last_match_start(_BODY_CLOSE_RE, text)
+        if index == -1:
+            index = _last_match_start(_HTML_CLOSE_RE, text)
+        if index == -1:
+            index = len(text)
+        text = text[:index] + body_scripts + text[index:]
+    return text.encode("utf-8")
 
 
 def _stamp_script_nonce(html: str, nonce: str) -> str:

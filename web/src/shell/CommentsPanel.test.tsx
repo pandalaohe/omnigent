@@ -51,6 +51,7 @@ function renderPanel(
   comments: Comment[],
   addressedComments: Comment[],
   onCopyCommentLink?: (id: string) => void,
+  orphanIds?: ReadonlySet<string>,
 ) {
   return render(
     <CommentsPanel
@@ -65,6 +66,7 @@ function renderPanel(
       canAddress={false}
       addressPending={false}
       onCopyCommentLink={onCopyCommentLink}
+      orphanIds={orphanIds}
     />,
   );
 }
@@ -758,5 +760,21 @@ describe("CommentsPanel unsent drafts", () => {
       body: "newer draft",
     });
     clearCommentDraft("conv_1", "a.html");
+  });
+});
+
+describe("CommentsPanel orphan annotations", () => {
+  it("shows the orphan line for a comment whose id is in orphanIds", () => {
+    renderPanel([makeComment("c1")], [], undefined, new Set(["c1"]));
+
+    expect(screen.getByTestId("comment-orphan")).toBeTruthy();
+    expect(screen.getByText("Element not found on this page")).toBeTruthy();
+  });
+
+  it("shows no orphan line when the comment id is not orphaned", () => {
+    renderPanel([makeComment("c1")], [], undefined, new Set(["other"]));
+
+    expect(screen.queryByTestId("comment-orphan")).toBeNull();
+    expect(screen.queryByText("Element not found on this page")).toBeNull();
   });
 });

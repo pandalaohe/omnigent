@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 // @ts-expect-error jsdom ships no declarations and @types/jsdom is not a dependency
 import { JSDOM } from "jsdom";
+import annotateSource from "../../public/omni-html-annotate.js?raw";
 import bridgeSource from "../../public/omni-html-bridge.js?raw";
+import captureSource from "../../public/omni-html-capture.js?raw";
 import {
   anchorOccurrence,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
+  buildAnnotateScript,
   buildBridgeScript,
+  buildCaptureScript,
   findAnchorInSource,
   HTML_COMMENT_BRIDGE_RUNTIME,
   injectCommentBridge,
@@ -27,7 +31,7 @@ describe("injectCommentBridge", () => {
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
     const out = injectCommentBridge(html, NONCE);
-    const scriptAt = out.indexOf(SCRIPT_OPEN);
+    const scriptAt = out.indexOf(buildBridgeScript(NONCE));
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
@@ -36,7 +40,7 @@ describe("injectCommentBridge", () => {
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE);
-    expect(out.indexOf(SCRIPT_OPEN)).toBeLessThan(out.indexOf("</html>"));
+    expect(out.indexOf(buildBridgeScript(NONCE))).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
@@ -47,6 +51,53 @@ describe("injectCommentBridge", () => {
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
     expect(out.indexOf(`data-omni-nonce="${NONCE}"`)).toBeGreaterThan(fragAt);
+  });
+
+  it("puts the capture script first and appends the bridge in a bare fragment", () => {
+    const out = injectCommentBridge("<p>just a fragment</p>", NONCE);
+    // The capture script goes at the very start (nothing to displace) and the
+    // bridge is appended at the end since there's no </body>/</html>.
+    const fragAt = out.indexOf("<p>just a fragment</p>");
+    expect(out.indexOf(buildCaptureScript(NONCE))).toBe(0);
+    expect(out.indexOf(buildBridgeScript(NONCE))).toBeGreaterThan(fragAt);
+  });
+
+  it("injects the capture script inside <head> before page scripts", () => {
+    const html = '<html><head><script src="page.js"></script></head><body>hi</body></html>';
+    const out = injectCommentBridge(html, NONCE);
+    const captureAt = out.indexOf(buildCaptureScript(NONCE));
+    const pageScriptAt = out.indexOf('<script src="page.js">');
+    expect(out.indexOf("<head>")).toBeLessThan(captureAt);
+    expect(captureAt).toBeLessThan(out.indexOf('<base target="_blank">'));
+    expect(captureAt).toBeLessThan(pageScriptAt);
+    expect(out.indexOf(buildBridgeScript(NONCE))).toBeLessThan(out.indexOf("</body>"));
+    expect(out.indexOf(buildAnnotateScript(NONCE))).toBeLessThan(out.indexOf("</body>"));
+    expect(buildCaptureScript(NONCE)).toContain(`data-omni-nonce="${NONCE}"`);
+  });
+
+  it("falls back to right after <html> when there is no head", () => {
+    const out = injectCommentBridge("<html><body><p>hi</p></body></html>", NONCE);
+    const captureAt = out.indexOf(buildCaptureScript(NONCE));
+    // prepareHtmlPreviewDoc inserts <head><base> after <html>; the capture
+    // script still lands before the body and after the html element.
+    expect(out.indexOf("<html>")).toBeLessThan(captureAt);
+    expect(captureAt).toBeLessThan(out.indexOf("<body>"));
+    expect(out.indexOf(buildBridgeScript(NONCE))).toBeLessThan(out.indexOf("</body>"));
+  });
+
+  it.each([
+    ["<header>", "<html><body><header>top</header></body></html>"],
+    ["a commented <head>", "<html><!-- <head> --><body><p>hi</p></body></html>"],
+  ])("does not mistake %s for the head", (_label, html) => {
+    const out = injectCommentBridge(html, NONCE);
+    const captureAt = out.indexOf(buildCaptureScript(NONCE));
+    // prepareHtmlPreviewDoc creates <head> right after <html>; capture leads it.
+    expect(out.indexOf("<html><head>")).toBe(captureAt - "<html><head>".length);
+  });
+
+  it("gives all three injected scripts the same nonce", () => {
+    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE);
+    expect(out.split(`data-omni-nonce="${NONCE}"`).length - 1).toBe(3);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {
@@ -72,16 +123,32 @@ describe("injectCommentBridge", () => {
     expect(out).toContain(`src="${LOADER_URL}"`);
     expect(out).toContain(`data-omni-nonce="${NONCE}"`);
     expect(out).not.toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+    // The annotation runtime is evaluated inline, so that mode carries the bridge only.
+    expect(out).not.toContain(buildCaptureScript(NONCE));
+    expect(out).not.toContain(buildAnnotateScript(NONCE));
+    expect(out.split(`data-omni-nonce="${NONCE}"`).length - 1).toBe(1);
+  });
+
+  it("injects the annotate stub right after the bridge with the same nonce", () => {
+    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE);
+    const bridgeAt = out.indexOf(buildBridgeScript(NONCE));
+    const annotateAt = out.indexOf(buildAnnotateScript(NONCE));
+    expect(bridgeAt).toBeGreaterThan(-1);
+    expect(annotateAt).toBeGreaterThan(bridgeAt);
+    expect(out.indexOf("</body>")).toBeGreaterThan(annotateAt);
+    expect(buildAnnotateScript(NONCE)).toContain(`data-omni-nonce="${NONCE}"`);
   });
 
   it("escapes an HTML-special nonce in the attribute", () => {
     expect(buildBridgeScript('a"b&c<d')).toContain('data-omni-nonce="a&quot;b&amp;c&lt;d"');
   });
 
-  it("produces a syntactically valid script (guards escaping in the asset)", () => {
-    // The asset runs verbatim in the frame; an escaping typo would only surface
+  it("produces syntactically valid scripts (guards escaping in the assets)", () => {
+    // The assets run verbatim in the frame; an escaping typo would only surface
     // at runtime. new Function throws on a syntax error.
     expect(() => new Function(bridgeSource)).not.toThrow();
+    expect(() => new Function(annotateSource)).not.toThrow();
+    expect(() => new Function(captureSource)).not.toThrow();
   });
 
   it("injects the same runtime inline without a network dependency", () => {

@@ -52,6 +52,8 @@ import { PeerMessageView } from "@/components/blocks/PeerMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { parsePeerMessage } from "@/lib/peerMessage";
+import { parseAnnotationMessage } from "@/lib/annotationMessage";
+import { AnnotationCards } from "@/components/chat/AnnotationCards";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
@@ -728,6 +730,7 @@ function UserBubble({
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
   const text = extractUserText(bubble.content);
+  const annotation = parseAnnotationMessage(text);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
@@ -757,7 +760,14 @@ function UserBubble({
   const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
+  // A review-comments message is a real turn even without images, so it skips
+  // the peer/system sniffing and renders as cards below.
+  if (
+    annotation === null &&
+    images.length === 0 &&
+    fileChips.length === 0 &&
+    mentionedChips.length === 0
+  ) {
     // Checked before parseSystemMessage: a peer envelope is a real turn
     // input (the receiving agent replies to it), never a `[System: ...]`
     // marker, even though both ride in on role=user.
@@ -844,6 +854,17 @@ function UserBubble({
                 first COLLAPSE_THRESHOLD characters of text reach the Markdown
                 renderer and the box clips at max-h-64. */}
             {(() => {
+              if (annotation)
+                return (
+                  <AnnotationCards
+                    items={annotation.items}
+                    images={images}
+                    sessionId={sessionId ?? undefined}
+                    pending={bubble.pending === true}
+                    fullText={annotation.text}
+                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                  />
+                );
               let budget = isCollapsed ? COLLAPSE_THRESHOLD : Number.POSITIVE_INFINITY;
               const blocks = keyedContent.map(({ block, key }) => {
                 if (isTextBlock(block)) {
