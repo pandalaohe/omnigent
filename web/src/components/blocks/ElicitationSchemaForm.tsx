@@ -231,7 +231,9 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
   // Entry lands on the first field, not the submit button: typing first is the
   // common intent, and Tab still reaches the controls after it.
   const enter = () => {
-    rootRef.current?.querySelector<HTMLElement>("input, select, textarea")?.focus();
+    rootRef.current
+      ?.querySelector<HTMLElement>("input, select, textarea")
+      ?.focus({ preventScroll: true });
   };
   useQuestionCardTarget(rootRef, enter);
 

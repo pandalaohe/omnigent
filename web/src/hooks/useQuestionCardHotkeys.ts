@@ -4,11 +4,18 @@
 // card the user is looking at — focus inside it; else the nearest set to the
 // reference node (cards tied at the deepest common ancestor), narrowed by
 // last touched, then newest; with no usable reference every card is a
-// candidate — and calls that card's enter(). leaveQuestionCard() returns
+// candidate — and calls that card's enter(). Pressing again while focus is
+// inside a card steps to the next card of that pane, newest first, wrapping.
+// The reveal that follows keeps the entered card in view, releasing the
+// conversation bottom-lock when it scrolls up. leaveQuestionCard() returns
 // focus to the card's own composer textarea, or to wherever focus came from
 // when the card has none (the Inbox).
 
-import { useEffect, useRef, type RefObject } from "react";
+import {
+  ConversationScrollLockContext,
+  type ConversationScrollLock,
+} from "@/components/ai-elements/conversation";
+import { useContext, useEffect, useRef, type RefObject } from "react";
 
 import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { focusOwnsHotkey } from "./useFocusComposerHotkey";
@@ -16,6 +23,7 @@ import { focusOwnsHotkey } from "./useFocusComposerHotkey";
 interface QuestionCardEntry {
   element: HTMLElement;
   enter: () => void;
+  lock: () => ConversationScrollLock | null;
   mountedSeq: number;
   touchedSeq: number | null;
 }
@@ -94,19 +102,28 @@ function highest(
 }
 
 /**
- * The pending card the focus chord should enter: the one containing focus;
- * else among the cards nearest the reference node (all tied at the deepest
- * common ancestor) the last touched, else the newest; with no usable
+ * The pending card the focus chord should enter: the one containing focus,
+ * advanced to the next of its pane's cards (newest first, wrapping to the
+ * newest); else among the cards nearest the reference node (all tied at the
+ * deepest common ancestor) the last touched, else the newest; with no usable
  * reference every card is a candidate. A touched card in another pane is
  * never a candidate, so it cannot win over cards in the focused pane.
  */
-export function targetQuestionCard(): { element: HTMLElement; enter: () => void } | null {
+export function targetQuestionCard(): QuestionCardEntry | null {
   if (cardEntries.length === 0) return null;
   const active = document.activeElement;
   const containing = cardEntries.find(
     (entry) => active instanceof Node && entry.element.contains(active),
   );
-  if (containing) return containing;
+  if (containing) {
+    // Peers are the cards sharing the containing card's scroll container, so
+    // the cycle cannot leave the focused pane; no container means no cycling.
+    const scope = scrollContainerFor(containing.element);
+    const peers = (
+      scope ? cardEntries.filter((entry) => scope.contains(entry.element)) : [containing]
+    ).sort((a, b) => b.mountedSeq - a.mountedSeq);
+    return peers[(peers.indexOf(containing) + 1) % peers.length];
+  }
 
   // The clicked control can be gone by chord time; a disconnected node
   // positions nothing, so it is not a reference.
@@ -158,13 +175,63 @@ export function isInsideQuestionCard(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest(QUESTION_CARD_SELECTOR) !== null;
 }
 
+const REVEAL_MARGIN_PX = 12;
+
+/** The nearest ancestor that scrolls vertically, or null outside one. */
+function scrollContainerFor(element: HTMLElement): HTMLElement | null {
+  for (let node = element.parentElement; node; node = node.parentElement) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") return node;
+  }
+  return null;
+}
+
+/**
+ * Put the entered card in view. Scrolling up first releases the conversation
+ * bottom-lock, or the next content resize scrolls the transcript back down.
+ */
+function revealQuestionCard(entry: QuestionCardEntry): void {
+  const { element } = entry;
+  const container = scrollContainerFor(element);
+  if (!container) {
+    element.scrollIntoView?.({ block: "nearest" });
+    return;
+  }
+  const view = container.getBoundingClientRect();
+  const card = element.getBoundingClientRect();
+  if (card.top >= view.top && card.bottom <= view.bottom) return;
+  // A card no taller than the view keeps half the slack as its margin, so it
+  // always lands fully inside; an oversized card is pinned with the margin.
+  const margin =
+    card.height > view.height
+      ? REVEAL_MARGIN_PX
+      : Math.min(REVEAL_MARGIN_PX, (view.height - card.height) / 2);
+  const delta =
+    card.height > view.height || card.top < view.top
+      ? card.top - view.top - margin
+      : card.bottom - view.bottom + margin;
+  if (delta < 0) {
+    const lock = entry.lock();
+    if (lock) {
+      lock.stopScroll();
+      lock.state.isAtBottom = false;
+      lock.state.escapedFromLock = true;
+    }
+  }
+  container.scrollTop += delta;
+}
+
 /**
  * Register a mounted, pending card root. `enter` focuses the card and seeds
- * its highlight; it is held in a ref so the latest closure runs.
+ * its highlight; it is held in a ref so the latest closure runs. The card's
+ * conversation bottom-lock (null outside a conversation) is tracked the same
+ * way, so the reveal reads the latest lock at chord time.
  */
 export function useQuestionCardTarget(ref: RefObject<HTMLElement | null>, enter: () => void): void {
   const enterRef = useRef(enter);
   enterRef.current = enter;
+  const lockRef = useRef<ConversationScrollLock | null>(null);
+  lockRef.current = useContext(ConversationScrollLockContext);
 
   useEffect(() => {
     const element = ref.current;
@@ -173,6 +240,7 @@ export function useQuestionCardTarget(ref: RefObject<HTMLElement | null>, enter:
     const entry: QuestionCardEntry = {
       element,
       enter: () => enterRef.current(),
+      lock: () => lockRef.current,
       mountedSeq: mountedCounter,
       touchedSeq: null,
     };
@@ -196,8 +264,9 @@ export function useQuestionCardTarget(ref: RefObject<HTMLElement | null>, enter:
 }
 
 /**
- * Bind the focus chord once in the app shell: remember where focus was, then
- * hand it to the chosen card. No card means the event is left untouched.
+ * Bind the focus chord once in the app shell: remember where focus was, hand
+ * it to the chosen card, then reveal the card. No card means the event is
+ * left untouched.
  */
 export function useFocusQuestionCardHotkey(): void {
   useEffect(() => {
@@ -221,6 +290,7 @@ export function useFocusQuestionCardHotkey(): void {
       e.preventDefault();
       e.stopPropagation();
       target.enter();
+      revealQuestionCard(target);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
