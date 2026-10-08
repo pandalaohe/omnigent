@@ -28,9 +28,9 @@
   // One capture-phase listener per interactive type, all registered here before
   // any page script, so a runtime handler installed through setSlot wins over
   // page listeners registered later. The annotate stub takes `keydown`; the
-  // picker and the freeze take the rest while the mode is on. The focus types
-  // are here because a page blur handler registered before mode entry would
-  // otherwise see the window blur when focus moves to the parent composer.
+  // picker and the freeze take the rest while the mode is on. The hover and
+  // focus types are here because a page handler registered before mode entry
+  // would otherwise see the pointer or focus leaving the menu and close it.
   var SLOT_TYPES = [
     "pointermove",
     "pointerdown",
@@ -41,10 +41,14 @@
     "contextmenu",
     "dblclick",
     "keydown",
-    "keyup",
-    "keypress",
-    "beforeinput",
-    "input",
+    "pointerover",
+    "pointerout",
+    "pointerenter",
+    "pointerleave",
+    "mouseover",
+    "mouseout",
+    "mouseenter",
+    "mouseleave",
     "focus",
     "blur",
     "focusin",
@@ -151,6 +155,32 @@
   wrapConsole("error");
   wrapConsole("warn");
 
+  // Native URL and Request accessors, captured while the globals are still the
+  // originals. Metadata reads use these instead of ordinary property lookups,
+  // so an accessor a page defines on the object itself never runs; a brand
+  // mismatch throws and reads as "not that type".
+  function nativeAccessor(owner, property) {
+    if (!owner || !owner.prototype) return null;
+    var descriptor = Object.getOwnPropertyDescriptor(owner.prototype, property);
+    return descriptor && typeof descriptor.get === "function" ? descriptor.get : null;
+  }
+
+  var NativeURL = typeof URL !== "undefined" ? URL : null;
+  var NativeRequest = typeof Request !== "undefined" ? Request : null;
+  var urlHrefGetter = nativeAccessor(NativeURL, "href");
+  var requestUrlGetter = nativeAccessor(NativeRequest, "url");
+  var requestMethodGetter = nativeAccessor(NativeRequest, "method");
+
+  function nativeString(getter, value) {
+    if (typeof getter !== "function") return null;
+    try {
+      var result = getter.call(value);
+      return typeof result === "string" ? result : null;
+    } catch {
+      return null;
+    }
+  }
+
   // The url as recorded: credentials, query and hash dropped, only http(s)
   // kept (design §2.6 — anything else, including unparseable input, is "").
   // Reads only strings, URLs and Requests: a page-passed object's getters (or
@@ -158,12 +188,14 @@
   function recordableUrl(input) {
     var raw = null;
     if (typeof input === "string") raw = input;
-    else if (typeof URL !== "undefined" && input instanceof URL) raw = input.href;
-    else if (typeof Request !== "undefined" && input instanceof Request) raw = input.url;
+    else if (typeof input === "object" && input !== null) {
+      raw = nativeString(urlHrefGetter, input);
+      if (raw === null) raw = nativeString(requestUrlGetter, input);
+    }
     if (raw === null) return "";
     var parsed;
     try {
-      parsed = new URL(raw, location.href);
+      parsed = new NativeURL(raw, location.href);
     } catch {
       return "";
     }
@@ -222,7 +254,7 @@
       try {
         url = recordableUrl(input);
         // Only an own data `method` is safe to read: a page-defined getter must
-        // never run here. A real Request's native method getter is allowed.
+        // never run here. A Request's method comes from the captured accessor.
         var descriptor =
           init && typeof init === "object"
             ? Object.getOwnPropertyDescriptor(init, "method")
@@ -230,13 +262,9 @@
         var initMethod = descriptor && "value" in descriptor ? descriptor.value : undefined;
         if (typeof initMethod === "string" && initMethod) {
           method = initMethod.toUpperCase();
-        } else if (
-          initMethod === undefined &&
-          typeof Request !== "undefined" &&
-          input instanceof Request &&
-          input.method
-        ) {
-          method = input.method.toUpperCase();
+        } else if (initMethod === undefined) {
+          var requestMethod = nativeString(requestMethodGetter, input);
+          if (requestMethod) method = requestMethod.toUpperCase();
         }
       } catch {
         // Metadata is best-effort; the native call below is authoritative and

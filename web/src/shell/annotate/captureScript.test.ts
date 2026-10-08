@@ -274,6 +274,75 @@ describe("omni-html-capture.js", () => {
     ]);
   });
 
+  it("calls the captured native accessors instead of own accessors on the objects", async () => {
+    const win = spawnWindow();
+    let urlReads = 0;
+    let methodReads = 0;
+    // Native accessors brand-check their receiver; the captured getters must
+    // be called directly, or a page-defined own accessor would run instead.
+    class FakeRequest {
+      get url(): string {
+        if (!(this instanceof FakeRequest)) throw new win.TypeError("illegal receiver");
+        return "http://localhost:6767/from-request";
+      }
+
+      get method(): string {
+        if (!(this instanceof FakeRequest)) throw new win.TypeError("illegal receiver");
+        return "post";
+      }
+    }
+    win.Request = FakeRequest as unknown as typeof Request;
+    const response = { ok: false, status: 500 };
+    const fetchStub = stubFetch(win, async () => response);
+
+    const request = new (win.Request as unknown as new () => object)();
+    Object.defineProperty(request, "url", {
+      configurable: true,
+      get: () => {
+        urlReads++;
+        return "http://evil.test/own-url";
+      },
+    });
+    Object.defineProperty(request, "method", {
+      configurable: true,
+      get: () => {
+        methodReads++;
+        return "PUT";
+      },
+    });
+    const url = new win.URL("http://user:pass@localhost:6767/path?q=1#h");
+    Object.defineProperty(url, "href", {
+      configurable: true,
+      get: () => {
+        urlReads++;
+        return "http://evil.test/own-href";
+      },
+    });
+
+    const ns = capture(win);
+    await win.fetch(request as unknown as RequestInfo);
+    await win.fetch(url as unknown as RequestInfo);
+
+    expect(urlReads).toBe(0);
+    expect(methodReads).toBe(0);
+    expect(fetchStub.mock.calls[0]![0]).toBe(request);
+    expect(fetchStub.mock.calls[1]![0]).toBe(url);
+    expect(ns.snapshot().network).toEqual([
+      {
+        method: "POST",
+        url: "http://localhost:6767/from-request",
+        status: 500,
+        ts: expect.any(Number),
+      },
+      {
+        method: "GET",
+        url: "http://localhost:6767/path",
+        status: 500,
+        ts: expect.any(Number),
+      },
+    ]);
+  });
+
   it("never inspects an arbitrary fetch input object", async () => {
     const win = spawnWindow();
     const input = {
@@ -464,6 +533,20 @@ describe("omni-html-capture.js", () => {
     ns.setSlot("click", null);
     win.document.body.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
     expect(slot).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not route the interactive types the in-frame composer no longer uses", () => {
+    const win = spawnWindow();
+    const ns = capture(win);
+    const slot = vi.fn();
+    const deadTypes = ["keyup", "keypress", "beforeinput", "input"];
+    for (const type of deadTypes) ns.setSlot(type, slot);
+    for (const type of deadTypes) {
+      win.document.body.dispatchEvent(
+        new win.Event(type, { bubbles: true, cancelable: true, composed: true }),
+      );
+    }
+    expect(slot).not.toHaveBeenCalled();
   });
 });
 

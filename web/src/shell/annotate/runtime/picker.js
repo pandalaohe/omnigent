@@ -526,6 +526,9 @@ function teardown() {
   lastPoint = null;
   capturePending = false;
   modeGeneration++;
+  // A capture still in flight must not keep our chrome hidden or come back to
+  // hide the next mode's chrome.
+  if (typeof ns.captureRelease === "function") ns.captureRelease();
   ns.freeze.off();
 }
 

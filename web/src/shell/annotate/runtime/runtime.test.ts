@@ -1050,6 +1050,64 @@ describe("picker", () => {
     ).toBe("block");
   });
 
+  it("restores capture-hidden chrome on exit and keeps a stale capture out of the next mode", async () => {
+    const win = startFrame('<button id="target">Pick me</button>');
+    const frame = await loadPick(win, [freezeSource, pickerSource, SNAPDOM_DEFERRED, cropSource]);
+    const ns = win.__omniAnnotate;
+    const button = win.document.getElementById("target")!;
+    const canvas = {
+      width: 10,
+      height: 10,
+      toDataURL: () => "data:image/jpeg;base64,/9j/",
+    };
+    stubRect(button, 10, 20, 100, 30);
+    stubElementFromPoint(win, button);
+
+    await setMode(frame, true);
+    const host = win.document.getElementById("__omni-annotate-host")!;
+    clickAt(win, button, 50, 30);
+    await settle();
+    expect(ns.__captureCalls).toBe(1);
+    const shield = win.document.getElementById("__omni-annotate-shield")!;
+    expect(host.style.visibility).toBe("hidden");
+    expect(shield.style.visibility).toBe("hidden");
+
+    // Leaving the mode releases the hidden chrome at once, not when the
+    // in-flight capture settles.
+    await setMode(frame, false);
+    expect(host.style.visibility).toBe("");
+    expect(win.document.getElementById("__omni-annotate-shield")).toBeNull();
+
+    // The stale capture settles only after a fresh mode and capture exist: it
+    // must not touch the new mode's nodes or depth.
+    await setMode(frame, true);
+    // The freeze may have pinned the host (it sits in the body's hover
+    // subtree in this harness), so "restored" is the value right before the
+    // capture hid it.
+    const hostBeforeCapture = host.style.visibility;
+    clickAt(win, button, 50, 30);
+    await settle();
+    expect(ns.__captureCalls).toBe(2);
+    const newShield = win.document.getElementById("__omni-annotate-shield")!;
+    expect(host.style.visibility).toBe("hidden");
+    expect(newShield.style.visibility).toBe("hidden");
+
+    ns.__captureResolvers![0]!(canvas);
+    await settle();
+    expect(lastOf(frame.messages, "annotate:picked")).toBeUndefined();
+    expect(host.style.visibility).toBe("hidden");
+    expect(newShield.style.visibility).toBe("hidden");
+
+    ns.__captureResolvers![1]!(canvas);
+    await settle();
+    expect(host.style.visibility).toBe(hostBeforeCapture);
+    expect(newShield.style.visibility).toBe("");
+    expect(lastOf(frame.messages, "annotate:picked")).toBeDefined();
+    expect(
+      (ns.overlayRoot().querySelector('[data-omni-pick="selected"]') as HTMLElement).style.display,
+    ).toBe("block");
+  });
+
   it("ignores untrusted picker and mode-leave events", async () => {
     const win = startFrame('<button id="target">Pick me</button>');
     const frame = await loadPick(win);
@@ -1306,7 +1364,7 @@ describe("freeze", () => {
     expect(paused.animationsPaused()).toBe(true);
   });
 
-  it("holds every callback scheduled while frozen and restores the rAF globals", async () => {
+  it("flushes held rAF callbacks at off and leaves no held handle behind", async () => {
     const win = startFrame('<button id="target">Pick me</button>');
     await loadPick(win);
     const ns = win.__omniAnnotate;
@@ -1320,7 +1378,11 @@ describe("freeze", () => {
 
     ns.freeze.on(50, 30);
     expect(win.requestAnimationFrame).not.toBe(originalRequest);
-    win.requestAnimationFrame(() => ran.push("held"));
+    const held = win.requestAnimationFrame(() => {
+      ran.push("held");
+      // A held loop's re-schedule must land on the restored native pair.
+      win.requestAnimationFrame(() => ran.push("next"));
+    });
     const cancelled = win.requestAnimationFrame(() => ran.push("cancelled"));
     win.cancelAnimationFrame(cancelled);
     await sleep(10);
@@ -1328,11 +1390,85 @@ describe("freeze", () => {
     expect(frames()).toBe(0);
 
     ns.freeze.off();
+    // The flush is synchronous at off; the callback cancelled while frozen is
+    // skipped and the natives are already back.
+    expect(ran).toEqual(["held"]);
     expect(win.requestAnimationFrame).toBe(originalRequest);
     expect(win.cancelAnimationFrame).toBe(originalCancel);
+
+    // The held id was never a native one: cancelling it after off is a no-op.
+    expect(() => win.cancelAnimationFrame(held)).not.toThrow();
     await sleep(10);
-    expect(ran).toEqual(["held"]);
+    expect(ran).toEqual(["held", "next"]);
     expect(frames()).toBe(1);
+  });
+
+  it("stops a not-yet-run held rAF callback cancelled during the flush", async () => {
+    const win = startFrame('<button id="target">Pick me</button>');
+    await loadPick(win);
+    const ns = win.__omniAnnotate;
+    const button = win.document.getElementById("target")!;
+    stubRect(button, 10, 20, 100, 30);
+    stubElementFromPoint(win, button);
+    installRaf(win);
+    const ran: string[] = [];
+
+    ns.freeze.on(50, 30);
+    let second = 0;
+    win.requestAnimationFrame(() => {
+      ran.push("first");
+      // Native rAF would drop the not-yet-run second callback.
+      win.cancelAnimationFrame(second);
+    });
+    second = win.requestAnimationFrame(() => ran.push("second"));
+
+    ns.freeze.off();
+    expect(ran).toEqual(["first"]);
+    await sleep(10);
+    expect(ran).toEqual(["first"]);
+  });
+
+  it("invokes held rAF callbacks with window as this", async () => {
+    const win = startFrame('<button id="target">Pick me</button>');
+    await loadPick(win);
+    const ns = win.__omniAnnotate;
+    const button = win.document.getElementById("target")!;
+    stubRect(button, 10, 20, 100, 30);
+    stubElementFromPoint(win, button);
+    installRaf(win);
+    const receivers: unknown[] = [];
+
+    ns.freeze.on(50, 30);
+    win.requestAnimationFrame(function (this: unknown) {
+      receivers.push(this);
+    });
+
+    ns.freeze.off();
+    expect(receivers).toEqual([win]);
+  });
+
+  it("rethrows a held callback error asynchronously so window.onerror still sees it", async () => {
+    const win = startFrame('<button id="target">Pick me</button>');
+    await loadPick(win);
+    const ns = win.__omniAnnotate;
+    const button = win.document.getElementById("target")!;
+    stubRect(button, 10, 20, 100, 30);
+    stubElementFromPoint(win, button);
+    const errors: string[] = [];
+    win.addEventListener("error", (event) => errors.push((event as ErrorEvent).message));
+    const later = vi.fn();
+
+    ns.freeze.on(50, 30);
+    win.requestAnimationFrame(() => {
+      throw new win.Error("held boom");
+    });
+    win.requestAnimationFrame(later);
+    expect(() => ns.freeze.off()).not.toThrow();
+    expect(later).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual([]);
+
+    await sleep(20);
+    expect(errors.join(" ")).toContain("held boom");
   });
 
   it("pins hover-revealed descendants before installing the shield", async () => {
@@ -1418,6 +1554,31 @@ describe("freeze", () => {
     win.dispatchEvent(new win.Event("blur"));
     expect(pageBlur).toHaveBeenCalledTimes(1);
   });
+
+  it("blocks a page window pointerout listener through the early slot while frozen", async () => {
+    const win = startFrame('<button id="target">Pick me</button>', NONCE, true);
+    const frame = await loadPick(win);
+    const button = win.document.getElementById("target")!;
+    const menu = win.document.createElement("div");
+    menu.id = "menu";
+    win.document.body.appendChild(menu);
+    const pageOut = vi.fn(() => menu.remove());
+    win.addEventListener("pointerout", pageOut, true);
+
+    await setMode(frame, true);
+    button.dispatchEvent(
+      new win.MouseEvent("pointerout", { bubbles: true, cancelable: true, composed: true }),
+    );
+    expect(pageOut).not.toHaveBeenCalled();
+    expect(win.document.getElementById("menu")).not.toBeNull();
+
+    await setMode(frame, false);
+    button.dispatchEvent(
+      new win.MouseEvent("pointerout", { bubbles: true, cancelable: true, composed: true }),
+    );
+    expect(pageOut).toHaveBeenCalledTimes(1);
+    expect(win.document.getElementById("menu")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1435,10 +1596,14 @@ describe("capture-slot interception", () => {
     "contextmenu",
     "dblclick",
     "keydown",
-    "keyup",
-    "keypress",
-    "beforeinput",
-    "input",
+    "pointerover",
+    "pointerout",
+    "pointerenter",
+    "pointerleave",
+    "mouseover",
+    "mouseout",
+    "mouseenter",
+    "mouseleave",
     "focus",
     "blur",
     "focusin",

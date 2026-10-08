@@ -30,36 +30,49 @@ function timeoutAfter(promise, ms) {
 }
 
 // Overlapping captures nest: only the outermost hides the chrome and only the
-// outermost restore puts the original visibility back.
+// outermost restore puts the original visibility back. A mode exit releases
+// the hiding at once; the per-capture epoch keeps a capture that settles later
+// from touching the next mode's nodes or depth.
 var chromeHideDepth = 0;
-var restoreChrome = null;
+var hiddenChrome = null; // [[node, visibility], ...] while chromeHideDepth > 0
+
+function restoreHiddenChrome(hidden) {
+  for (var i = 0; i < hidden.length; i++) {
+    hidden[i][0].style.visibility = hidden[i][1];
+  }
+}
 
 /** Hide our chrome for the capture; the returned callback joins the depth. */
 function hideOwnChrome() {
   if (chromeHideDepth === 0) {
-    var hidden = [];
+    hiddenChrome = [];
     var ids = [OVERLAY_HOST_ID, SHIELD_ID];
     for (var i = 0; i < ids.length; i++) {
       var node = document.getElementById(ids[i]);
       if (!node) continue;
-      hidden.push([node, node.style.visibility]);
+      hiddenChrome.push([node, node.style.visibility]);
       node.style.visibility = "hidden";
     }
-    restoreChrome = function () {
-      for (var j = 0; j < hidden.length; j++) {
-        hidden[j][0].style.visibility = hidden[j][1];
-      }
-    };
   }
   chromeHideDepth++;
+  var epoch = hiddenChrome;
   return function () {
-    if (chromeHideDepth === 0) return;
+    if (epoch !== hiddenChrome || chromeHideDepth === 0) return;
     chromeHideDepth--;
     if (chromeHideDepth === 0) {
-      restoreChrome();
-      restoreChrome = null;
+      restoreHiddenChrome(epoch);
+      hiddenChrome = null;
     }
   };
+}
+
+/** Mode teardown: put capture-hidden chrome back and forget the depth. */
+function releaseCaptureChrome() {
+  if (hiddenChrome) {
+    restoreHiddenChrome(hiddenChrome);
+    hiddenChrome = null;
+  }
+  chromeHideDepth = 0;
 }
 
 /** The picked rect in page coordinates, clipped to the document's scroll box. */
@@ -135,6 +148,8 @@ async function captureRegion(rect) {
   if (!dataUrl) return null;
   return { dataUrl: dataUrl, width: fitted.width, height: fitted.height };
 }
+
+ns.captureRelease = releaseCaptureChrome;
 
 ns.capture = async function (rect) {
   var restore = hideOwnChrome();

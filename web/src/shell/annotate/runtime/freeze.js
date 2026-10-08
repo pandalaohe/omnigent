@@ -311,47 +311,43 @@ function captureSlotRegistry() {
   return capture && typeof capture.setSlot === "function" ? capture : null;
 }
 
-// Focus blockers installed through the head script's early slots; without the
+// Event blockers installed through the head script's early slots; without the
 // registry they fall back to capture-phase listeners on `document`.
-var slotBlockerTypes = [];
+var slotBlockers = []; // [type, handler, viaCaptureSlot]
 
-function addFocusBlocker(type) {
+function addEventBlocker(type, handler) {
   var capture = captureSlotRegistry();
   if (capture) {
-    capture.setSlot(type, preventFocusChange);
-    slotBlockerTypes.push(type);
+    capture.setSlot(type, handler);
+    slotBlockers.push([type, handler, true]);
     return;
   }
-  document.addEventListener(type, preventFocusChange, true);
-}
-
-function removeFocusBlockers() {
-  var capture = captureSlotRegistry();
-  for (var i = 0; i < slotBlockerTypes.length; i++) {
-    if (capture) capture.setSlot(slotBlockerTypes[i], null);
-  }
-  slotBlockerTypes = [];
-  for (var j = 0; j < FOCUS_EVENTS_TO_BLOCK.length; j++) {
-    document.removeEventListener(FOCUS_EVENTS_TO_BLOCK[j], preventFocusChange, true);
-  }
-}
-
-function addEventBlockers() {
-  for (var i = 0; i < MOUSE_EVENTS_TO_BLOCK.length; i++) {
-    document.addEventListener(MOUSE_EVENTS_TO_BLOCK[i], stopEvent, true);
-  }
-  // The early slot runs before page listeners registered before mode entry, so
-  // a page blur/focus handler cannot close a menu when focus leaves the frame.
-  for (var j = 0; j < FOCUS_EVENTS_TO_BLOCK.length; j++) {
-    addFocusBlocker(FOCUS_EVENTS_TO_BLOCK[j]);
-  }
+  document.addEventListener(type, handler, true);
+  slotBlockers.push([type, handler, false]);
 }
 
 function removeEventBlockers() {
-  for (var i = 0; i < MOUSE_EVENTS_TO_BLOCK.length; i++) {
-    document.removeEventListener(MOUSE_EVENTS_TO_BLOCK[i], stopEvent, true);
+  var capture = captureSlotRegistry();
+  for (var i = 0; i < slotBlockers.length; i++) {
+    if (slotBlockers[i][2]) {
+      if (capture) capture.setSlot(slotBlockers[i][0], null);
+    } else {
+      document.removeEventListener(slotBlockers[i][0], slotBlockers[i][1], true);
+    }
   }
-  removeFocusBlockers();
+  slotBlockers = [];
+}
+
+// The early slots run before page listeners registered before mode entry, so a
+// page hover or focus handler cannot close a menu that is open when the mode
+// starts.
+function addEventBlockers() {
+  for (var i = 0; i < MOUSE_EVENTS_TO_BLOCK.length; i++) {
+    addEventBlocker(MOUSE_EVENTS_TO_BLOCK[i], stopEvent);
+  }
+  for (var j = 0; j < FOCUS_EVENTS_TO_BLOCK.length; j++) {
+    addEventBlocker(FOCUS_EVENTS_TO_BLOCK[j], preventFocusChange);
+  }
 }
 
 function applyPseudoStates(snapshot) {
@@ -658,10 +654,12 @@ function unfreezeGlobalAnimations(cleanupErrors) {
 }
 
 // While frozen every page-scheduled requestAnimationFrame callback is held,
-// whatever its shape; `off` replays the held callbacks through the exact rAF
-// pair the freeze replaced. Held callbacks get negative ids so a
-// cancelAnimationFrame reaches them while the hold is installed.
+// whatever its shape; `off` flushes the held callbacks synchronously before it
+// restores the replaced rAF pair. Held callbacks get negative ids so a
+// cancelAnimationFrame reaches them while the hold is installed, and the ids
+// stay live through the flush so one held callback can cancel another.
 var isRafFrozen = false;
+var isRafDraining = false;
 var pendingRafCallbacks = new Map();
 var nextFakeRafId = -1;
 var frozenRafRequest = null;
@@ -677,32 +675,55 @@ function installRafHold() {
   frozenRafRequest = window.requestAnimationFrame;
   frozenRafCancel = window.cancelAnimationFrame;
 
+  // A page can keep a reference to these wrappers past `off`; outside the hold
+  // they delegate to the native pair they closed over.
+  var nativeRequest = frozenRafRequest;
+  var nativeCancel = frozenRafCancel;
   window.requestAnimationFrame = function (callback) {
+    if (!isRafFrozen || isRafDraining) {
+      return typeof nativeRequest === "function" ? nativeRequest.call(window, callback) : undefined;
+    }
     var identifier = nextFakeRafId--;
     pendingRafCallbacks.set(identifier, callback);
     return identifier;
   };
   window.cancelAnimationFrame = function (identifier) {
-    if (pendingRafCallbacks.has(identifier)) {
+    if (isRafFrozen && pendingRafCallbacks.has(identifier)) {
       pendingRafCallbacks.delete(identifier);
       return;
     }
-    if (typeof frozenRafCancel === "function") frozenRafCancel.call(window, identifier);
+    if (typeof nativeCancel === "function") nativeCancel.call(window, identifier);
   };
 }
 
 function uninstallRafHold() {
   if (!isRafFrozen) return;
-  isRafFrozen = false;
 
-  var replayRequest = frozenRafRequest;
-  pendingRafCallbacks.forEach(function (callback) {
-    if (typeof replayRequest !== "function") return;
-    replayRequest.call(window, function (timestamp) {
-      callback(timestamp);
-    });
+  var heldCallbacks = [];
+  pendingRafCallbacks.forEach(function (callback, identifier) {
+    heldCallbacks.push({ identifier: identifier, callback: callback });
   });
+
+  // The held ids stay live through the drain, so a callback can cancel a later
+  // one; a re-schedule routes straight to the native pair and the wrappers are
+  // uninstalled only once every held callback has run.
+  isRafDraining = true;
+  for (var i = 0; i < heldCallbacks.length; i++) {
+    var held = heldCallbacks[i];
+    if (!pendingRafCallbacks.has(held.identifier)) continue;
+    pendingRafCallbacks.delete(held.identifier);
+    try {
+      held.callback.call(window, performance.now());
+    } catch (error) {
+      // A callback failure must reach window.onerror, not break the unfreeze.
+      setTimeout(function () {
+        throw error;
+      }, 0);
+    }
+  }
   pendingRafCallbacks.clear();
+  isRafDraining = false;
+  isRafFrozen = false;
 
   if (didOwnRafRequest) window.requestAnimationFrame = frozenRafRequest;
   else delete window.requestAnimationFrame;
