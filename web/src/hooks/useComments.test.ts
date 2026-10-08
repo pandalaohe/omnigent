@@ -25,25 +25,44 @@ vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: vi.fn() },
 }));
 
-function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
+function mockResponse(
+  body: unknown,
+  init?: { ok?: boolean; status?: number; headers?: Record<string, string> },
+): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
     statusText: "OK",
+    headers: new Headers(init?.headers),
     json: async () => body,
+    blob: async () => body,
   } as unknown as Response;
 }
 
 const fetchMock = vi.fn();
 const sendMock = vi.fn();
+const enqueueMock = vi.fn();
+const chatState = {
+  conversationId: "conv_1" as string | null,
+  status: "idle" as "idle" | "streaming",
+  sessionStatus: "idle",
+  queuedMessages: [] as { conversationId: string }[],
+  send: sendMock,
+  enqueueMessage: enqueueMock,
+};
 
 beforeEach(() => {
   fetchMock.mockReset();
   sendMock.mockReset();
   sendMock.mockResolvedValue(true);
-  vi.mocked(useChatStore.getState).mockReturnValue({
-    send: sendMock,
-  } as unknown as ReturnType<typeof useChatStore.getState>);
+  enqueueMock.mockReset();
+  chatState.conversationId = "conv_1";
+  chatState.status = "idle";
+  chatState.sessionStatus = "idle";
+  chatState.queuedMessages = [];
+  vi.mocked(useChatStore.getState).mockReturnValue(
+    chatState as unknown as ReturnType<typeof useChatStore.getState>,
+  );
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -268,6 +287,22 @@ describe("useSendCommentsToAgent", () => {
     sent_comment_ids: ["c1", "c2"],
   };
 
+  const attachedResponse = {
+    ...sendResponse,
+    attachments: [
+      { comment_id: "c1", file_id: "f1", filename: "shot-1.jpg" },
+      { comment_id: "c2", file_id: "f2", filename: "shot-2.png" },
+    ],
+  };
+
+  function fileResponse(type: string): Response {
+    return mockResponse(new Blob(["image-bytes"]), { headers: { "Content-Type": type } });
+  }
+
+  function addressedPatchCalls() {
+    return fetchMock.mock.calls.filter(([, init]) => (init as RequestInit).method === "PATCH");
+  }
+
   it("POSTs the comment ids with mark_addressed: false", async () => {
     fetchMock.mockResolvedValue(mockResponse(sendResponse));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -312,6 +347,71 @@ describe("useSendCommentsToAgent", () => {
       expect(JSON.parse((init as RequestInit).body as string)).toEqual({ status: "addressed" });
     }
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
+  });
+
+  it("fetches attachments in order and passes them as Files", async () => {
+    fetchMock.mockResolvedValue(mockResponse(sendResponse));
+    fetchMock
+      .mockResolvedValueOnce(mockResponse(attachedResponse))
+      .mockResolvedValueOnce(fileResponse("image/jpeg"))
+      .mockResolvedValueOnce(fileResponse("image/png"));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1", "c2"] });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/v1/sessions/conv_1/resources/files/f1/content");
+    expect(fetchMock.mock.calls[2]?.[0]).toBe("/v1/sessions/conv_1/resources/files/f2/content");
+    const files = sendMock.mock.calls[0][2] as File[];
+    expect(files.map((file) => file.name)).toEqual(["shot-1.jpg", "shot-2.png"]);
+    expect(files.map((file) => file.type)).toEqual(["image/jpeg", "image/png"]);
+  });
+
+  it("aborts with nothing sent when an attachment fetch fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse(attachedResponse))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1", "c2"], respectQueue: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect((result.current.error as Error).message).toBe(
+      "Couldn't attach screenshot 1; nothing was sent",
+    );
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueMock).not.toHaveBeenCalled();
+    expect(addressedPatchCalls()).toEqual([]);
+  });
+
+  it("queues the batch when the agent is busy, then patches the sent ids", async () => {
+    chatState.status = "streaming";
+    fetchMock.mockResolvedValue(mockResponse(sendResponse));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1", "c2"], respectQueue: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(enqueueMock).toHaveBeenCalledWith("please address these", []);
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(addressedPatchCalls().map(([url]) => String(url))).toEqual([
+      "/v1/sessions/conv_1/comments/c1",
+      "/v1/sessions/conv_1/comments/c2",
+    ]);
+  });
+
+  it("refuses to send when the active session changed", async () => {
+    chatState.conversationId = "conv_other";
+    fetchMock.mockResolvedValueOnce(mockResponse(sendResponse));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1"], respectQueue: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect((result.current.error as Error).message).toBe("Return to this session before sending.");
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueMock).not.toHaveBeenCalled();
+    expect(addressedPatchCalls()).toEqual([]);
   });
 
   it("marks nothing when the message was not delivered", async () => {

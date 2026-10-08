@@ -4,6 +4,7 @@
 // viewer needs to repaint them after reload.
 
 import type { Comment } from "@/hooks/useComments";
+import { decodeElementAnchor, elementAnchorLabel, isElementAnchor } from "./annotationAnchor";
 import type { ActiveSelection } from "./codeViewerHelpers";
 
 /** Prefix that marks anchor_content as a PDF geometry payload, not raw text. */
@@ -40,6 +41,10 @@ export function decodePdfAnchor(anchorContent: string | null | undefined): PdfAn
 export function displayAnchorContent(anchorContent: string | null | undefined): string {
   const decoded = decodePdfAnchor(anchorContent);
   if (decoded) return decoded.text;
+  if (isElementAnchor(anchorContent)) {
+    const anchor = decodeElementAnchor(anchorContent);
+    return anchor ? elementAnchorLabel(anchor) : "Element annotation";
+  }
   return anchorContent?.trim() ?? "";
 }
 

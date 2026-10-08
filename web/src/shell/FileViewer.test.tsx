@@ -254,6 +254,7 @@ import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
+import { type ElementAnchorV1, encodeElementAnchor } from "./annotationAnchor";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
@@ -991,7 +992,11 @@ describe("FileViewer URL sync — comment param (write)", () => {
 describe("FileViewer addressed selection", () => {
   it("keeps the selected comment active while Address All moves it", () => {
     const mutate = vi.fn();
-    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
     const comment = makeComment("c1");
     useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
 
@@ -1472,6 +1477,46 @@ describe("classifyAndRemapComments", () => {
     });
 
     const result = classifyAndRemapComments([c], "%PDF-1.4 binary bytes");
+
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0]).toEqual(c);
+  });
+
+  it("keeps an element anchor at its stored offsets", () => {
+    const anchor: ElementAnchorV1 = {
+      v: 1,
+      kind: "element",
+      page: { url: "", title: "", vw: 800, vh: 600, sx: 0, sy: 0, dpr: 1 },
+      target: {
+        label: "button.option",
+        css: "button.option",
+        xpath: "//button",
+        quote: { exact: "Alpha", prefix: "", suffix: "" },
+        fingerprint: "1:1:abcd",
+        neighborText: "",
+        tag: "BUTTON",
+        id: "",
+        role: "",
+        ariaLabel: "",
+        text: "Alpha",
+      },
+      rect: { x: 10, y: 20, w: 120, h: 32 },
+      region: null,
+      selectedText: "",
+      console: [],
+      network: [],
+      screenshot: null,
+    };
+    const c = makeAnchoredComment({
+      id: "c_element",
+      start_index: 456,
+      end_index: 456,
+      anchor_content: encodeElementAnchor(anchor),
+    });
+
+    // The stored offsets do not appear in the content at all; the branch must
+    // still keep the comment rather than searching for the encoded JSON.
+    const result = classifyAndRemapComments([c], "completely different content");
 
     expect(result.open).toHaveLength(1);
     expect(result.open[0]).toEqual(c);

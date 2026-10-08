@@ -445,6 +445,11 @@ export interface CodeViewerProps {
    */
   onFrameChange?: (frame: { path: string; source: string } | null) => void;
   /**
+   * Lifts the ids of the HTML preview's element annotations that no longer
+   * resolve on the page it shows.
+   */
+  onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
+  /**
    * Remounts the HTML preview when bumped, so it mints a fresh artifact link
    * (e.g. after the user revokes links).
    */
@@ -472,6 +477,7 @@ export function CodeViewer({
   onTocToggle,
   onRequestEditMode,
   onFrameChange,
+  onAnnotationOrphansChange,
   previewKey,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
@@ -880,6 +886,7 @@ export function CodeViewer({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         onFrameChange={onFrameChange}
+        onAnnotationOrphansChange={onAnnotationOrphansChange}
       />
     );
   }

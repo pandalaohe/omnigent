@@ -1379,9 +1379,46 @@ async def test_panel_html_injects_script_with_nonce(
     client: httpx.AsyncClient,
     asset_dir: Path,
 ) -> None:
-    """Panel-view HTML gets the inline bridge with the mint's nonce."""
+    """Panel HTML gets the head capture script, then the bridge and stub in order."""
+    capture_asset = "window.__omniCapture = 1;\n"
     asset = "window.__omniBridge = 1;\n"
+    annotate_asset = "window.__omniAnnotateStub = 1;\n"
+    (asset_dir / "omni-html-capture.js").write_text(capture_asset, encoding="utf-8")
     (asset_dir / "omni-html-bridge.js").write_text(asset, encoding="utf-8")
+    (asset_dir / "omni-html-annotate.js").write_text(annotate_asset, encoding="utf-8")
+    body = b'<html><head><script src="app.js"></script></head><body><h1>hi</h1></body></html>'
+    runner = _stub_runner_app(body, content_type="text/html")
+    minted = await _mint(client)
+
+    async with _use_runner(runner):
+        resp = await client.get(minted["url"])
+
+    expected_capture = f'<script data-omni-nonce="{minted["nonce"]}">{capture_asset}</script>'
+    expected = f'<script data-omni-nonce="{minted["nonce"]}">{asset}</script>'
+    expected_annotate = f'<script data-omni-nonce="{minted["nonce"]}">{annotate_asset}</script>'
+    assert resp.status_code == 200
+    assert expected_capture in resp.text
+    assert expected in resp.text
+    assert expected_annotate in resp.text
+    # The capture script beats the page's own head script.
+    assert (
+        resp.text.index("<head>")
+        < resp.text.index(expected_capture)
+        < resp.text.index('<script src="app.js">')
+    )
+    assert (
+        resp.text.index(expected) < resp.text.index(expected_annotate) < resp.text.index("</body>")
+    )
+    assert int(resp.headers["content-length"]) == len(resp.content)
+
+
+async def test_panel_html_without_head_places_capture_after_html(
+    client: httpx.AsyncClient,
+    asset_dir: Path,
+) -> None:
+    """Without a <head> the capture script lands right after the <html> tag."""
+    capture_asset = "window.__omniCapture = 1;\n"
+    (asset_dir / "omni-html-capture.js").write_text(capture_asset, encoding="utf-8")
     body = b"<html><body><h1>hi</h1></body></html>"
     runner = _stub_runner_app(body, content_type="text/html")
     minted = await _mint(client)
@@ -1389,11 +1426,31 @@ async def test_panel_html_injects_script_with_nonce(
     async with _use_runner(runner):
         resp = await client.get(minted["url"])
 
-    expected = f'<script data-omni-nonce="{minted["nonce"]}">{asset}</script>'
+    expected_capture = f'<script data-omni-nonce="{minted["nonce"]}">{capture_asset}</script>'
     assert resp.status_code == 200
-    assert expected in resp.text
-    assert resp.text.index(expected) < resp.text.index("</body>")
-    assert int(resp.headers["content-length"]) == len(resp.content)
+    assert (
+        resp.text.index("<html>") < resp.text.index(expected_capture) < resp.text.index("<body>")
+    )
+
+
+async def test_panel_html_injects_capture_when_body_assets_are_missing(
+    client: httpx.AsyncClient,
+    asset_dir: Path,
+) -> None:
+    """The head list degrades independently: capture still lands without a bridge."""
+    capture_asset = "window.__omniCapture = 1;\n"
+    (asset_dir / "omni-html-capture.js").write_text(capture_asset, encoding="utf-8")
+    body = b"<html><head></head><body>x</body></html>"
+    runner = _stub_runner_app(body, content_type="text/html")
+    minted = await _mint(client)
+
+    async with _use_runner(runner):
+        resp = await client.get(minted["url"])
+
+    expected_capture = f'<script data-omni-nonce="{minted["nonce"]}">{capture_asset}</script>'
+    assert resp.status_code == 200
+    assert resp.text.count("data-omni-nonce") == 1
+    assert expected_capture in resp.text
 
 
 async def test_raw_view_html_is_byte_identical(
@@ -1418,7 +1475,7 @@ async def test_panel_html_without_asset_is_served_unmodified(
     client: httpx.AsyncClient,
     asset_dir: Path,
 ) -> None:
-    """A missing bridge asset degrades to no injection, never an error."""
+    """With every asset missing, the page degrades to no injection, never an error."""
     body = b"<html><body>plain</body></html>"
     runner = _stub_runner_app(body, content_type="text/html")
     minted = await _mint(client)

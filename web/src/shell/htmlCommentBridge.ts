@@ -21,15 +21,19 @@
 //   origin still applies), which is exactly the property the sandbox guarantees.
 //   We still gate on a per-mount nonce + a source tag to reject stray messages.
 //
-// The script body itself is the shared asset web/public/omni-html-bridge.js:
-// the server inlines the same bytes into panel-view pages, and this module
-// imports them ?raw for the srcdoc (embed) path and the unit tests.
+// The script bodies themselves are the shared assets web/public/omni-html-bridge.js
+// (text-selection comments) and web/public/omni-html-annotate.js (element
+// annotation stub): the server inlines the same bytes into panel-view pages,
+// and this module imports them ?raw for the srcdoc (embed) path and the unit
+// tests.
 //
 // These helpers are pure (no React) so they unit-test in isolation.
 
 import { escapeHtmlAttr } from "@/lib/html";
+import annotateSource from "../../public/omni-html-annotate.js?raw";
 import bridgeSource from "../../public/omni-html-bridge.js?raw";
-import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
+import captureSource from "../../public/omni-html-capture.js?raw";
+import { prepareHtmlPreviewDoc, startTagEnd } from "./codeViewerHelpers";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -306,46 +310,83 @@ export function anchorOccurrence(source: string, anchor: string, startIndex: num
 export const HTML_COMMENT_BRIDGE_RUNTIME = bridgeSource;
 
 /**
- * Wrap the shared in-frame bridge asset (web/public/omni-html-bridge.js) in the
- * same nonce-carrying `<script>` tag the server emits: the nonce reaches the
- * script as `data-omni-nonce`, and without it the script no-ops. The source is
- * escaped so a literal `</script` in it can never close the tag early. When
+ * Wrap a shared in-frame asset in the nonce-carrying `<script>` tag the server
+ * emits: the nonce reaches the script as `data-omni-nonce`, and without it the
+ * script no-ops. The source is escaped so a literal `</script` in it can never
+ * close the tag early.
+ */
+function buildAssetScript(source: string, nonce: string): string {
+  const nonceAttr = ` data-omni-nonce="${escapeHtmlAttr(nonce)}"`;
+  return `<script${nonceAttr}>` + source.replace(/<\/script/gi, "<\\/script") + "</script>";
+}
+
+/**
+ * Wrap the shared in-frame bridge asset (web/public/omni-html-bridge.js). When
  * `runtimeUrl` is given the asset loads externally from that URL instead, for an
  * embed whose CSP blocks inline scripts.
  *
  * Exported for unit testing.
  */
 export function buildBridgeScript(nonce: string, runtimeUrl?: string): string {
+  if (!runtimeUrl) return buildAssetScript(bridgeSource, nonce);
   const nonceAttr = ` data-omni-nonce="${escapeHtmlAttr(nonce)}"`;
-  if (runtimeUrl) return `<script src="${escapeHtmlAttr(runtimeUrl)}"${nonceAttr}></script>`;
-  return `<script${nonceAttr}>` + bridgeSource.replace(/<\/script/gi, "<\\/script") + "</script>";
+  return `<script src="${escapeHtmlAttr(runtimeUrl)}"${nonceAttr}></script>`;
+}
+
+/**
+ * Wrap the shared in-frame annotate stub (web/public/omni-html-annotate.js),
+ * which the srcdoc path places right after the bridge script.
+ *
+ * Exported for unit testing.
+ */
+export function buildAnnotateScript(nonce: string): string {
+  return buildAssetScript(annotateSource, nonce);
+}
+
+/**
+ * Wrap the shared early-capture asset (web/public/omni-html-capture.js), which
+ * the srcdoc path places at the top of `<head>`.
+ *
+ * Exported for unit testing.
+ */
+export function buildCaptureScript(nonce: string): string {
+  return buildAssetScript(captureSource, nonce);
 }
 
 /**
  * Prepare HTML artifact content for the comment-enabled preview iframe: first
  * run {@link prepareHtmlPreviewDoc} (so links still open in a new tab), then
- * inject the bridge `<script>` (it installs the highlight styles itself) so it
- * runs after the document body has been parsed.
+ * inject the capture script at the top of `<head>` (so it runs before the
+ * preview head markup and any page script) and the bridge + annotate stub
+ * before `</body>`.
  *
- * Placement mirrors prepareHtmlPreviewDoc's deliberately-simple regex approach
- * (NOT a full HTML parse, which could subtly change how the artifact renders):
- * inject before `</body>` when present, else before `</html>`, else append.
+ * Placement mirrors prepareHtmlPreviewDoc's deliberately-simple approach (NOT a
+ * full HTML parse, which could subtly change how the artifact renders): the
+ * body scripts go before `</body>` when present, else before `</html>`, else
+ * append.
  *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
- * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
+ * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline
+ *   scripts. The annotation runtime is evaluated inline, so that mode carries
+ *   the bridge only.
  */
 export function injectCommentBridge(html: string, nonce: string, runtimeUrl?: string): string {
   const prepared = prepareHtmlPreviewDoc(html);
-  const inject = buildBridgeScript(nonce, runtimeUrl);
+  if (runtimeUrl) return injectBeforeClose(prepared, buildBridgeScript(nonce, runtimeUrl));
 
-  const bodyClose = prepared.search(/<\/body\s*>/i);
-  if (bodyClose !== -1) {
-    return prepared.slice(0, bodyClose) + inject + prepared.slice(bodyClose);
-  }
-  const htmlClose = prepared.search(/<\/html\s*>/i);
-  if (htmlClose !== -1) {
-    return prepared.slice(0, htmlClose) + inject + prepared.slice(htmlClose);
-  }
-  return prepared + inject;
+  // prepareHtmlPreviewDoc leaves a real <head> unless the input is a bare
+  // fragment, whose implicit head starts at offset 0.
+  const headAt = Math.max(startTagEnd(prepared, "head"), 0);
+  const withCapture =
+    prepared.slice(0, headAt) + buildCaptureScript(nonce) + prepared.slice(headAt);
+  return injectBeforeClose(withCapture, buildBridgeScript(nonce) + buildAnnotateScript(nonce));
+}
+
+function injectBeforeClose(doc: string, inject: string): string {
+  const bodyClose = doc.search(/<\/body\s*>/i);
+  if (bodyClose !== -1) return doc.slice(0, bodyClose) + inject + doc.slice(bodyClose);
+  const htmlClose = doc.search(/<\/html\s*>/i);
+  if (htmlClose !== -1) return doc.slice(0, htmlClose) + inject + doc.slice(htmlClose);
+  return doc + inject;
 }

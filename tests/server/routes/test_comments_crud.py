@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.comment_store.visitor_comments import (
@@ -41,6 +44,24 @@ def _comment_payload(**overrides: object) -> dict:
     return base
 
 
+def _element_anchor(screenshot: dict | None = None) -> str:
+    """Encode a minimal valid element anchor.
+
+    :param screenshot: Optional screenshot descriptor.
+    :returns: ``__element__`` plus JSON.
+    """
+    return ELEMENT_ANCHOR_PREFIX + json.dumps(
+        {
+            "v": 1,
+            "kind": "element",
+            "page": {"url": "http://localhost:6767/v1/artifacts/tok/reports/q3.html"},
+            "target": {"label": "div.filter-menu > button.option"},
+            "rect": {"x": 0, "y": 0, "w": 10, "h": 10},
+            "screenshot": screenshot,
+        }
+    )
+
+
 # ── POST /sessions/{id}/comments ─────────────────────────────────────
 
 
@@ -72,6 +93,49 @@ async def test_add_comment_end_before_start(client: httpx.AsyncClient, session_i
         json=_comment_payload(start_index=10, end_index=5),
     )
     assert resp.status_code == 422
+
+
+async def test_add_comment_accepts_large_synthetic_element_range(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """A 32-bit-safe synthetic range from a low element position is accepted."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(
+            path="reports/q3.html",
+            start_index=300_000_000,
+            end_index=300_000_000,
+            anchor_content=_element_anchor(),
+        ),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["start_index"] == 300_000_000
+
+
+async def test_add_comment_stores_canonical_element_anchor(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """An owner element anchor is stored clamped and stripped of unknown fields."""
+    anchor = json.loads(_element_anchor()[len(ELEMENT_ANCHOR_PREFIX) :])
+    anchor["target"]["label"] = "x" * 10_000
+    anchor["unknown"] = "drop me"
+    anchor["page"]["url"] = "https://user:pw@localhost:6767/reports/q3.html?token=s#top"
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(anchor_content=ELEMENT_ANCHOR_PREFIX + json.dumps(anchor)),
+    )
+
+    assert resp.status_code == 200
+    stored_content = resp.json()["anchor_content"]
+    stored = json.loads(stored_content[len(ELEMENT_ANCHOR_PREFIX) :])
+    assert stored["target"]["label"] == "x" * 199 + "…"
+    assert "unknown" not in stored
+    assert stored["page"]["url"] == "https://localhost:6767/reports/q3.html"
+    assert stored_content == ELEMENT_ANCHOR_PREFIX + json.dumps(
+        stored, ensure_ascii=False, separators=(",", ":")
+    )
 
 
 async def test_add_comment_nonexistent_session_returns_404_without_persisting(
@@ -258,6 +322,55 @@ async def test_send_comments(client: httpx.AsyncClient, session_id: str) -> None
     assert cid in body["sent_comment_ids"]
     assert "formatted_message" in body
     assert "review comments" in body["formatted_message"].lower()
+
+
+async def test_send_comments_returns_attachments_in_message_order(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """Screenshot rows yield attachments in the message's element order."""
+    q3_low = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(
+            path="reports/q3.html",
+            start_index=0,
+            end_index=0,
+            anchor_content=_element_anchor(
+                {"file_id": "file_q3", "filename": "q3.png", "width": 640, "height": 480}
+            ),
+        ),
+    )
+    a_html = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(
+            path="reports/a.html",
+            start_index=10,
+            end_index=10,
+            anchor_content=_element_anchor(
+                {"file_id": "file_a", "filename": "a.png", "width": 320, "height": 200}
+            ),
+        ),
+    )
+    q3_high = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(
+            path="reports/q3.html",
+            start_index=50,
+            end_index=50,
+            anchor_content=_element_anchor(),
+        ),
+    )
+    ids = [q3_low.json()["id"], a_html.json()["id"], q3_high.json()["id"]]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/comments/send",
+        json={"comment_ids": ids},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["attachments"] == [
+        {"comment_id": a_html.json()["id"], "file_id": "file_a", "filename": "a.png"},
+        {"comment_id": q3_low.json()["id"], "file_id": "file_q3", "filename": "q3.png"},
+    ]
 
 
 async def test_send_comments_mark_addressed_false_leaves_status(

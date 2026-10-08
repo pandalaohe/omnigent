@@ -91,7 +91,9 @@ class ListCommentsTool(Tool):
             ``start_index``, ``end_index``, ``body``, ``status``,
             and ``created_by``. Visitor comments still in draft are
             omitted (the owner has not sent them); listed visitor rows
-            additionally carry ``source`` and an untrusted-data ``note``.
+            additionally carry ``source`` and an untrusted-data ``note``,
+            while an owner row whose ``anchor_content`` is a valid element
+            anchor additionally carries the parsed ``annotation`` payload.
         """
         if ctx.conversation_id is None:
             return json.dumps({"error": "no conversation context — cannot scope comment query"})

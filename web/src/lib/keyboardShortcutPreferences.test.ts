@@ -10,6 +10,7 @@ import {
   defaultShortcutBindings,
   readKeyboardShortcutPreferences,
   resolveShortcutBindings,
+  resolvedShortcutChords,
   shortcutAriaKeys,
   shortcutBindingLabels,
   shortcutChordFromEvent,
@@ -184,11 +185,24 @@ describe("keyboardShortcutPreferences", () => {
       ["selectWorkspaceTab4", []],
       ["newBrowserTab", [{ code: "KeyB", modifiers: ["primary", "alt"] }]],
       ["newShell", [{ code: "KeyT", modifiers: ["primary", "alt"] }]],
+      ["toggleAnnotationMode", [{ code: "Period", modifiers: ["primary", "shift"] }]],
     ];
 
     for (const [actionId, bindings] of expected) {
       expect(resolveShortcutBindings(actionId, "macos")).toEqual(bindings);
     }
+  });
+
+  it("resolves action chords to concrete platform modifier flags", () => {
+    expect(resolvedShortcutChords("toggleAnnotationMode", "macos")).toEqual([
+      { code: "Period", ctrl: false, meta: true, alt: false, shift: true },
+    ]);
+    expect(resolvedShortcutChords("toggleAnnotationMode", "windows")).toEqual([
+      { code: "Period", ctrl: true, meta: false, alt: false, shift: true },
+    ]);
+
+    writeShortcutPreference("toggleAnnotationMode", { enabled: false });
+    expect(resolvedShortcutChords("toggleAnnotationMode", "windows")).toEqual([]);
   });
 
   it("registers the question-card action defaults", () => {

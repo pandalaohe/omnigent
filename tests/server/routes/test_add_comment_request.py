@@ -8,10 +8,31 @@ that any relaxation or tightening of the validator surfaces immediately.
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
+import pytest_asyncio
 from pydantic import ValidationError
 
+from omnigent.db.utils import generate_agent_id
+from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX
 from omnigent.server.routes.comments import AddCommentRequest
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+
+
+@pytest_asyncio.fixture()
+async def session_id(db_uri: str) -> str:
+    """Seed a test agent and conversation, return the session ID."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="comment-test-agent", bundle_location="test:///bundle")
+    conv = conv_store.create_conversation(agent_id=agent_id)
+    return conv.id
 
 
 def _valid_kwargs(**overrides: object) -> dict:
@@ -78,3 +99,62 @@ def test_add_comment_request_rejects_end_index_before_start_index() -> None:
     """end_index must be >= start_index; a smaller end_index is rejected."""
     with pytest.raises(ValidationError, match="end_index must be >= start_index"):
         AddCommentRequest(**_valid_kwargs(start_index=10, end_index=5))
+
+
+# ── element anchor validation ─────────────────────────────────────────────────
+
+
+def test_add_comment_request_rejects_invalid_element_anchor() -> None:
+    """A prefixed anchor that does not parse is rejected with 422."""
+    with pytest.raises(ValidationError, match="invalid element anchor"):
+        AddCommentRequest(
+            **_valid_kwargs(anchor_content=ELEMENT_ANCHOR_PREFIX + '{"v":2,"kind":"element"}')
+        )
+
+
+def test_add_comment_request_rejects_unparsable_prefixed_anchor() -> None:
+    """The prefix without JSON is also rejected."""
+    with pytest.raises(ValidationError, match="invalid element anchor"):
+        AddCommentRequest(**_valid_kwargs(anchor_content=ELEMENT_ANCHOR_PREFIX + "{oops"))
+
+
+def test_add_comment_request_accepts_valid_element_anchor() -> None:
+    """A well-formed element anchor is stored as its canonical form."""
+    anchor_content = (
+        ELEMENT_ANCHOR_PREFIX + '{"v":1,"kind":"element","rect":{"x":0,"y":0,"w":1,"h":1}}'
+    )
+
+    req = AddCommentRequest(**_valid_kwargs(anchor_content=anchor_content))
+
+    assert req.anchor_content == (
+        ELEMENT_ANCHOR_PREFIX
+        + '{"v":1,"kind":"element","rect":{"x":0,"y":0,"w":1,"h":1},"screenshot":null}'
+    )
+
+
+def test_add_comment_request_rejects_missing_rect() -> None:
+    """``rect`` is required, matching the parent codec."""
+    with pytest.raises(ValidationError, match="invalid element anchor"):
+        AddCommentRequest(
+            **_valid_kwargs(anchor_content=ELEMENT_ANCHOR_PREFIX + '{"v":1,"kind":"element"}')
+        )
+
+
+async def test_add_comment_route_oversized_int_rect_is_422_not_500(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """A JSON integer too large for a float is rejected at the boundary."""
+    anchor = {
+        "v": 1,
+        "kind": "element",
+        "rect": {"x": 10**400, "y": 0, "w": 1, "h": 1},
+    }
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_valid_kwargs(
+            anchor_content=ELEMENT_ANCHOR_PREFIX + json.dumps(anchor, separators=(",", ":"))
+        ),
+    )
+
+    assert resp.status_code == 422
