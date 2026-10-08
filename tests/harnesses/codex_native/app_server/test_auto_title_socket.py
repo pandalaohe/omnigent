@@ -138,6 +138,42 @@ async def test_unix_mode_passes_auto_title_socket_env_and_starts_no_relay(
 
 
 @pytest.mark.usefixtures("neutral_codex_source", "stubbed_startup")
+async def test_start_drops_inherited_agent_pid_and_resolves_native_pid(
+    short_socket_dir: Path,
+    tmp_path: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inherited pid is dropped; the resolved native pid names this server."""
+    captured: dict[str, Any] = {}
+    _capture_spawn_env(monkeypatch, captured)
+    native_pid_calls: list[tuple[object, ...]] = []
+
+    def _fake_native_server_pid(*args: object) -> int:
+        native_pid_calls.append(args)
+        return 4242
+
+    monkeypatch.setattr("omnigent.inner._proc.native_server_pid", _fake_native_server_pid)
+    server = _test_app_server(
+        short_socket_dir,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+        env={"COLLAB_AGENT_PID": "999", "KEEP_ME": "ok"},
+    )
+
+    await server.start()
+    try:
+        assert "COLLAB_AGENT_PID" not in captured["env"]
+        assert captured["env"]["KEEP_ME"] == "ok"
+        assert server.agent_pid == 4242
+        assert native_pid_calls == [(_FAKE_PID, "app-server")]
+    finally:
+        await server.close()
+    assert server.agent_pid is None
+
+
+@pytest.mark.usefixtures("neutral_codex_source", "stubbed_startup")
 async def test_ws_mode_relays_bytes_over_the_auto_title_socket(
     short_socket_dir: Path,
     tmp_path: Path,

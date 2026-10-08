@@ -1310,6 +1310,7 @@ async def _prepare_codex_terminal(
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
+                    agent_pid=app_server.agent_pid,
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -1337,6 +1338,7 @@ async def _prepare_codex_terminal(
                 # and skips the OpenAI-login onboarding screen.
                 config_overrides=tuple(app_server.config_overrides),
                 codex_cli_version=app_server.codex_cli_version,
+                agent_pid=app_server.agent_pid,
             )
             terminal_id = launched_terminal.terminal_id
             _update_startup_progress(startup_progress, "Codex terminal ready.")
@@ -2868,6 +2870,7 @@ async def _launch_codex_terminal(
     env: dict[str, str],
     config_overrides: tuple[str, ...] = (),
     codex_cli_version: tuple[int, int, int] | None = None,
+    agent_pid: int | None = None,
 ) -> LaunchedCodexTerminal:
     """
     Launch the server-backed Codex terminal resource.
@@ -2888,6 +2891,8 @@ async def _launch_codex_terminal(
         Codex-login launch. E.g.
         ``('model_provider="omnigent_databricks"',)``.
     :param codex_cli_version: Probed CLI version used to preserve older resume behavior.
+    :param agent_pid: Native app-server pid for the TUI's shell tools, or
+        ``None``. See :func:`build_codex_remote_args`.
     :returns: Launched terminal resource details.
     """
     terminal_args = build_codex_remote_args(
@@ -2896,6 +2901,7 @@ async def _launch_codex_terminal(
         remote_url=remote_url,
         config_overrides=config_overrides,
         codex_cli_version=codex_cli_version,
+        agent_pid=agent_pid,
     )
     body = {
         "terminal": _TERMINAL_NAME,

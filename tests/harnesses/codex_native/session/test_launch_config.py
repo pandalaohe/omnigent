@@ -246,6 +246,92 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
 
 
 @pytest.mark.parametrize(
+    ("thread_id", "codex_cli_version"),
+    [
+        (None, None),
+        ("thread_host", (0, 153, 1)),
+        ("thread_host", (0, 154, 0)),
+    ],
+)
+def test_build_codex_remote_args_forwards_agent_pid_override(
+    thread_id: str | None,
+    codex_cli_version: tuple[int, int, int] | None,
+) -> None:
+    """
+    ``build_codex_remote_args`` forwards the native app-server pid as a
+    global ``-c`` override in every attach form.
+
+    Codex shell tools read the pid from the thread's
+    ``shell_environment_policy.set`` config, and the remote TUI forwards
+    its own ``-c`` overrides into the thread calls it sends. The override
+    must stay a global flag ahead of ``resume`` / ``--remote``, and the
+    0.154+ resume path strips permission configs only — a regression that
+    dropped this key would leave tool processes with no session pid.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=thread_id,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=codex_cli_version,
+        agent_pid=4242,
+    )
+    key = 'shell_environment_policy.set.COLLAB_AGENT_PID="4242"'
+    assert args[args.index(key) - 1] == "-c"
+    boundary = min(
+        (index for index, arg in enumerate(args) if arg in {"--remote", "resume"}),
+        default=len(args),
+    )
+    assert args.index(key) < boundary
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "codex_cli_version"),
+    [
+        (None, None),
+        ("thread_host", (0, 153, 1)),
+        ("thread_host", (0, 154, 0)),
+    ],
+)
+def test_build_codex_remote_args_agent_pid_beats_caller_config(
+    thread_id: str | None,
+    codex_cli_version: tuple[int, int, int] | None,
+) -> None:
+    """
+    The runner's pid override wins over a caller-supplied ``-c`` pair.
+
+    Codex applies ordered ``-c`` flags last-wins, so the runner must emit
+    its ``shell_environment_policy.set.COLLAB_AGENT_PID`` pair after any
+    caller pass-through args; otherwise a stale caller value would name
+    the wrong app-server in tool processes.
+    """
+    caller = ("-c", 'shell_environment_policy.set.COLLAB_AGENT_PID="999"')
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=caller,
+        thread_id=thread_id,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=codex_cli_version,
+        agent_pid=4242,
+    )
+    pid_values = [
+        arg for arg in args if arg.startswith("shell_environment_policy.set.COLLAB_AGENT_PID=")
+    ]
+    assert pid_values
+    assert pid_values[-1] == 'shell_environment_policy.set.COLLAB_AGENT_PID="4242"'
+
+
+def test_build_codex_remote_args_omits_absent_agent_pid() -> None:
+    """Without an app-server pid no ``-c`` override is emitted."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        agent_pid=None,
+    )
+
+    assert not any("COLLAB_AGENT_PID" in arg for arg in args)
+
+
+@pytest.mark.parametrize(
     ("codex_args", "expected"),
     [
         # ``--flag value`` pair: both dropped.

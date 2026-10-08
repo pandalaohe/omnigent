@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 from packaging.version import InvalidVersion, Version
 
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_LINUX, resolve_cli_binary
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_native.keep_warm import (
     KeepWarmPingResult,
@@ -232,6 +232,18 @@ _CODEX_ROLE_DEFAULT_KEYS = ("default_subagent_model", "default_subagent_reasonin
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
+# Env var naming the native app-server PID for tool processes (read by liveness tooling).
+CODEX_AGENT_PID_ENV = "COLLAB_AGENT_PID"
+# Dotted Codex config key placing the app-server pid in a thread's shell env.
+CODEX_AGENT_PID_CONFIG_KEY = f"shell_environment_policy.set.{CODEX_AGENT_PID_ENV}"
+
+
+def strip_codex_agent_pid_env(env: MutableMapping[str, str]) -> None:
+    """Drop any inherited agent-pid variable (any case) from ``env``."""
+    for key in tuple(env):
+        if key.upper() == CODEX_AGENT_PID_ENV:
+            del env[key]
+
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -2941,6 +2953,7 @@ class _CodexAppServerSession:
         self._cleaned = True
         self._cleanup_task: asyncio.Task[None] | None = None
         self._proc: asyncio.subprocess.Process | None = None
+        self._agent_pid: int | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._worker_census_task: asyncio.Task[None] | None = None
@@ -3166,6 +3179,8 @@ class _CodexAppServerSession:
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        # An inherited value names the parent's server, not this session's.
+        strip_codex_agent_pid_env(proc_env)
         if self._signer is not None:
             # Newer Codex builds keep some SQLite stores relative to HOME even
             # when CODEX_HOME is set. Keep those stores inside the same private,
@@ -3258,6 +3273,12 @@ class _CodexAppServerSession:
                     },
                 },
             )
+            # Tool processes report session liveness with the native server's
+            # pid: the spawned shim can exit while the server lives on.
+            if not (self._worker_launch.sandboxed and IS_LINUX):
+                self._agent_pid = await asyncio.to_thread(
+                    _proc.native_server_pid, proc.pid, "app-server"
+                )
             user_agent = initialized.get("result", {}).get("userAgent")
             version = (
                 re.match(r"^[^/\s]+/(\d+)\.(\d+)\.(\d+)", user_agent)
@@ -3465,6 +3486,7 @@ class _CodexAppServerSession:
                 close_subprocess_transport(proc)
             self._started = False
             self.thread_id = None
+            self._agent_pid = None
             self.active_turn_id = None
             self._recent_events.clear()
             if worker_reaped:
@@ -3513,6 +3535,7 @@ class _CodexAppServerSession:
         self._pending_requests.clear()
         self._started = False
         self.thread_id = None
+        self._agent_pid = None
         self.active_turn_id = None
         self._recent_events.clear()
         self._cleanup_worker_launch()
@@ -3902,17 +3925,19 @@ class _CodexAppServerSession:
                 params["modelProvider"] = self._thread_model_provider
             if system_prompt:
                 params["developerInstructions"] = system_prompt
+            config: CodexParams = {}
             if tools:
                 params["dynamicTools"] = _dynamic_tool_specs(tools)
-                tool_config: CodexParams = {
-                    "features.unified_exec": False,
-                }
+                config["features.unified_exec"] = False
                 if self._supports_direct_tool_namespaces:
                     # Code Mode flattens dynamic image results into strings.
-                    tool_config["features.code_mode.direct_only_tool_namespaces"] = ["functions"]
+                    config["features.code_mode.direct_only_tool_namespaces"] = ["functions"]
                 if self._disable_native_tools:
-                    tool_config["features.shell_tool"] = False
-                params["config"] = tool_config
+                    config["features.shell_tool"] = False
+            if self._agent_pid is not None:
+                config[CODEX_AGENT_PID_CONFIG_KEY] = str(self._agent_pid)
+            if config:
+                params["config"] = config
             response = await self._request("thread/start", params)
             thread = response.get("result", {}).get("thread", {})
             raw_thread_id = thread.get("id")

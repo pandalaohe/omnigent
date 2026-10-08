@@ -532,6 +532,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version = version
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -668,6 +669,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -1058,6 +1060,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1149,6 +1152,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1364,6 +1368,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1446,6 +1451,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -1608,6 +1614,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -1891,6 +1898,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = None
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """:returns: None."""
@@ -4296,6 +4304,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
@@ -4351,6 +4360,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -4535,6 +4545,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
 
         codex_path = "/opt/codex/bin/codex"
         codex_cli_version: tuple[int, int, int] | None = (0, 145, 0)
+        agent_pid: int | None = None
 
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
@@ -4590,6 +4601,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        agent_pid: int | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args
