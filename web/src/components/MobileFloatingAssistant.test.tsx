@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
 import {
+  MOBILE_ASSISTANT_DEVICE_STORAGE_KEY,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
@@ -47,7 +48,7 @@ describe("MobileFloatingAssistant", () => {
     render(<MobileFloatingAssistant />);
     const button = screen.getByRole("button", { name: "Open floating assistant" });
 
-    fireEvent.pointerDown(button, { pointerId: 1, clientX: 330, clientY: 660 });
+    fireEvent.pointerDown(button, { pointerId: 1, clientX: 335, clientY: 169 });
     fireEvent.pointerMove(button, { pointerId: 1, clientX: 150, clientY: 250 });
     fireEvent.pointerUp(button, { pointerId: 1, clientX: 150, clientY: 250 });
 
@@ -55,6 +56,15 @@ describe("MobileFloatingAssistant", () => {
       x: 150 / 390,
       y: 250 / 844,
     });
+  });
+
+  it("keeps a stored device position instead of the first-use spot", () => {
+    localStorage.setItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY, '{"position":{"x":0.2,"y":0.9}}');
+    render(<MobileFloatingAssistant />);
+
+    const button = screen.getByRole("button", { name: "Open floating assistant" });
+    expect(button.style.left).toBe(`${0.2 * 390}px`);
+    expect(button.style.top).toBe(`${0.9 * 844}px`);
   });
 
   it("keeps all nine controls visible and separated at each viewport corner", () => {
