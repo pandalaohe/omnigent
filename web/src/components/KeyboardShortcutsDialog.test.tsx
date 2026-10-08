@@ -130,21 +130,27 @@ describe("KeyboardShortcutsList shortcut layer rows", () => {
     expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "⇧", "G", "1…4"]);
   });
 
-  it("keeps consumerless chat rows on their fixed keys after a rebind", () => {
-    writeShortcutPreference("recallPreviousPrompt", {
-      common: [{ code: "KeyP", modifiers: ["primary"] }],
-    });
-    writeShortcutPreference("recallNextPrompt", {
-      common: [{ code: "KeyN", modifiers: ["primary"] }],
-    });
-    writeShortcutPreference("stopResponse", {
-      common: [{ code: "KeyX", modifiers: ["primary"] }],
-    });
+  it("follows rebound recall and stop rows", () => {
     render(<KeyboardShortcutsList />);
-
     expect(keysFor("Recall previous prompt")).toEqual(["↑"]);
     expect(keysFor("Recall next prompt")).toEqual(["↓"]);
     expect(keysFor("Stop response")).toEqual(["Esc"]);
+
+    act(() => {
+      writeShortcutPreference("recallPreviousPrompt", {
+        common: [{ code: "KeyP", modifiers: ["primary"] }],
+      });
+      writeShortcutPreference("recallNextPrompt", {
+        common: [{ code: "KeyN", modifiers: ["primary"] }],
+      });
+      writeShortcutPreference("stopResponse", {
+        common: [{ code: "KeyX", modifiers: ["primary"] }],
+      });
+    });
+
+    expect(keysFor("Recall previous prompt")).toEqual(["Ctrl", "P"]);
+    expect(keysFor("Recall next prompt")).toEqual(["Ctrl", "N"]);
+    expect(keysFor("Stop response")).toEqual(["Ctrl", "X"]);
   });
 
   it("follows rebound slash-command rows", () => {

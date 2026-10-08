@@ -171,6 +171,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -362,6 +363,79 @@ describe("Composer Escape interrupt", () => {
     fireEvent.compositionEnd(textarea());
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Composer rebound recall and stop shortcuts", () => {
+  const CONV = "conv_rebound_shortcuts";
+
+  beforeEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: CONV, blocks: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    window.localStorage.removeItem("omnigent:keyboard-shortcut-preferences");
+    for (let i = window.localStorage.length - 1; i >= 0; i--) {
+      const key = window.localStorage.key(i);
+      if (key?.startsWith("omnigent:prompt-history")) window.localStorage.removeItem(key);
+    }
+  });
+
+  it("stops on the rebound key and ignores the default Escape", () => {
+    writeShortcutPreference("stopResponse", {
+      common: [{ code: "KeyX", modifiers: ["alt"] }],
+    });
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea(), { key: "x", code: "KeyX", altKey: true });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("recalls the previous prompt only on the rebound key", () => {
+    appendPromptHistoryEntry("earlier prompt", CONV);
+    writeShortcutPreference("recallPreviousPrompt", {
+      common: [{ code: "KeyP", modifiers: ["alt"] }],
+    });
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue("");
+
+    fireEvent.keyDown(textarea(), { key: "p", code: "KeyP", altKey: true });
+    expect(textarea()).toHaveValue("earlier prompt");
+  });
+
+  it("recalls the next prompt only on the rebound key", () => {
+    appendPromptHistoryEntry("older prompt", CONV);
+    appendPromptHistoryEntry("newer prompt", CONV);
+    writeShortcutPreference("recallNextPrompt", {
+      common: [{ code: "KeyN", modifiers: ["alt"] }],
+    });
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue("newer prompt");
+
+    // Recall starts only at the caret's start; a real ArrowUp moves it there
+    // first, so mirror that before the second press.
+    textarea().setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue("older prompt");
+
+    textarea().setSelectionRange(textarea().value.length, textarea().value.length);
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(textarea()).toHaveValue("older prompt");
+
+    fireEvent.keyDown(textarea(), { key: "n", code: "KeyN", altKey: true });
+    expect(textarea()).toHaveValue("newer prompt");
   });
 });
 

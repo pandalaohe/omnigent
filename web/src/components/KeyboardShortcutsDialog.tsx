@@ -52,10 +52,6 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const UP = "↑";
-const DOWN = "↓";
-
 interface Shortcut {
   label: string;
   /** Keys rendered left→right as chips. A chord (held together) or, for the
@@ -89,13 +85,13 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "In chats",
     items: [
-      { label: "Recall previous prompt", keys: [UP] },
-      { label: "Recall next prompt", keys: [DOWN] },
+      { label: "Recall previous prompt", keys: [], actionId: "recallPreviousPrompt" },
+      { label: "Recall next prompt", keys: [], actionId: "recallNextPrompt" },
       { label: "Accept approval prompt", keys: [], actionId: "approvePrompt" },
       { label: "Open model picker", keys: [], actionId: "openModelPicker" },
       { label: "Focus chat input", keys: [], actionId: "focusComposer" },
       { label: "Toggle voice dictation", keys: [], actionId: "voiceDictation" },
-      { label: "Stop response", keys: ["Esc"] },
+      { label: "Stop response", keys: [], actionId: "stopResponse" },
     ],
   },
   {
