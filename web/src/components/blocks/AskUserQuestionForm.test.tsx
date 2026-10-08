@@ -439,7 +439,13 @@ describe("AskUserQuestionForm — keyboard", () => {
     );
     focusCard();
 
-    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    // Focusing the option input highlights its row without selecting it, so
+    // the Space below is what must select.
+    const option = screen.getAllByRole("radio")[1] as HTMLInputElement;
+    act(() => option.focus());
+    expect(highlightedIndex()).toBe(1);
+    expect(option).not.toBeChecked();
+
     pressCard({ key: " ", code: "Space" });
 
     expect(screen.getAllByRole("radio")[1]).toBeChecked();
@@ -497,11 +503,15 @@ describe("AskUserQuestionForm — keyboard", () => {
     );
     focusCard();
 
-    pressCard({ key: "ArrowDown", code: "ArrowDown" });
-    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    // Focusing the custom toggle highlights its row without selecting it, so
+    // the Space below is what must select.
+    const toggle = screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement;
+    act(() => toggle.focus());
+    expect(highlightedIndex()).toBe(2);
+    expect(toggle).not.toBeChecked();
+
     pressCard({ key: " ", code: "Space" });
 
-    const toggle = screen.getByTestId("ask-user-question-custom-toggle");
     const textarea = screen.getByTestId("ask-user-question-custom-input");
     expect(document.activeElement).toBe(textarea);
     expect(toggle).toBeChecked();
@@ -517,6 +527,39 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(highlightedIndex()).toBe(2);
     expect(textarea).toHaveValue("a\n");
     expect(toggle).toBeChecked();
+  });
+
+  it("keeps typed custom text when the arrows leave and re-select the custom row", () => {
+    renderKeyboardForm(
+      questionsOf([{ id: "q1", question: "Name it?", options: [{ label: "A" }, { label: "B" }] }]),
+    );
+    focusCard();
+
+    const toggle = screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement;
+    act(() => toggle.focus());
+    expect(highlightedIndex()).toBe(2);
+    expect(toggle).not.toBeChecked();
+    pressCard({ key: " ", code: "Space" });
+
+    const textarea = screen.getByTestId("ask-user-question-custom-input");
+    expect(document.activeElement).toBe(textarea);
+    expect(toggle).toBeChecked();
+    fireEvent.change(textarea, { target: { value: "abc" } });
+
+    fireEvent.keyDown(textarea, { key: "Escape", code: "Escape" });
+    expect(document.activeElement).toBe(card());
+
+    // Up selects the option above and drops the custom row.
+    pressCard({ key: "ArrowUp", code: "ArrowUp" });
+    expect(highlightedIndex()).toBe(1);
+    expect(screen.getAllByRole("radio")[1]).toBeChecked();
+    expect(toggle).not.toBeChecked();
+
+    // Back down re-selects the custom row with the text intact.
+    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    expect(highlightedIndex()).toBe(2);
+    expect(toggle).toBeChecked();
+    expect(textarea).toHaveValue("abc");
   });
 
   it("toggles a multi option once per Space press", () => {
@@ -616,8 +659,12 @@ describe("AskUserQuestionForm — keyboard", () => {
     expect(progress()).toContain("Question 2 of 2");
     expect(document.activeElement).toBe(card());
 
-    pressCard({ key: "ArrowDown", code: "ArrowDown" });
+    // Space still confirms the next question's highlighted row: focus it
+    // without selecting first.
+    const option = screen.getAllByRole("radio")[1] as HTMLInputElement;
+    act(() => option.focus());
     expect(highlightedIndex()).toBe(1);
+    expect(option).not.toBeChecked();
     pressCard({ key: " ", code: "Space" });
     expect(screen.getAllByRole("radio")[1]).toBeChecked();
   });
