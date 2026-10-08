@@ -406,6 +406,39 @@ def test_parity_untrimmed_oversized_stored_anchor_is_rejected_not_trimmed() -> N
     assert parse_element_anchor(content) is None
 
 
+def test_parity_stored_canonical_anchor_boundary_is_32768_bytes_after_the_prefix() -> None:
+    """A stored canonical anchor exactly at the 32 KiB cap parses; one byte
+    more does not.
+
+    The parent decoder measures the stored payload without the prefix; the
+    server measures its canonical re-encoding. A compact stored form makes the
+    two measures equal, pinning the same boundary on both sides.
+    """
+    console = [{"level": "warn", "message": "c" * 500, "ts": i} for i in range(50)]
+    network = [
+        {"method": "GET", "url": "https://example.com/" + "a" * 1980, "status": 500, "ts": i}
+        for i in range(20)
+    ]
+    anchor = _anchor(console=console, network=network)
+
+    def payload() -> str:
+        return json.dumps(anchor, separators=(",", ":"))
+
+    excess = len(payload().encode("utf-8")) - 32 * 1024
+    per, remainder = divmod(excess, len(anchor["network"]))
+    for index, entry in enumerate(anchor["network"]):
+        trim = per + (1 if index < remainder else 0)
+        entry["url"] = entry["url"][: len(entry["url"]) - trim]
+    assert len(payload().encode("utf-8")) == 32 * 1024
+
+    assert parse_element_anchor(ELEMENT_ANCHOR_PREFIX + payload()) is not None
+
+    anchor["network"][0]["url"] += "a"
+    over = ELEMENT_ANCHOR_PREFIX + payload()
+    assert len(over[len(ELEMENT_ANCHOR_PREFIX) :].encode("utf-8")) == 32 * 1024 + 1
+    assert parse_element_anchor(over) is None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 

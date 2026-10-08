@@ -235,6 +235,48 @@ describe("design §2.6 parity cases", () => {
     expect(encodedBytes(trimmed!)).toBeLessThanOrEqual(32 * 1024);
   });
 
+  /** A canonical stored anchor whose payload (without the prefix) is exactly
+   * `target` UTF-8 bytes: the padded urls stay inside the codec's caps. */
+  function storedAnchorOfExactPayloadBytes(target: number): ElementAnchorV1 {
+    const anchor = makeAnchor({
+      console: Array.from({ length: 50 }, (_, i) => ({
+        level: "warn" as const,
+        message: "c".repeat(500),
+        ts: i,
+      })),
+      network: Array.from({ length: 20 }, (_, i) => ({
+        method: "GET",
+        url: `https://example.com/${"a".repeat(1980)}`,
+        status: 500,
+        ts: i,
+      })),
+    });
+    const excess = JSON.stringify(anchor).length - target;
+    const per = Math.floor(excess / anchor.network.length);
+    const remainder = excess % anchor.network.length;
+    anchor.network.forEach((entry, index) => {
+      entry.url = entry.url.slice(0, entry.url.length - (per + (index < remainder ? 1 : 0)));
+    });
+    expect(JSON.stringify(anchor).length).toBe(target);
+    return anchor;
+  }
+
+  it("decodes a stored payload of exactly 32 KiB and rejects one byte more", () => {
+    const atCap = storedAnchorOfExactPayloadBytes(32 * 1024);
+    const stored = ELEMENT_ANCHOR_PREFIX + JSON.stringify(atCap);
+    expect(new TextEncoder().encode(stored.slice(ELEMENT_ANCHOR_PREFIX.length)).length).toBe(
+      32 * 1024,
+    );
+    expect(decodeElementAnchor(stored)).toEqual(atCap);
+
+    atCap.network[0]!.url += "a";
+    const overCap = ELEMENT_ANCHOR_PREFIX + JSON.stringify(atCap);
+    expect(new TextEncoder().encode(overCap.slice(ELEMENT_ANCHOR_PREFIX.length)).length).toBe(
+      32 * 1024 + 1,
+    );
+    expect(decodeElementAnchor(overCap)).toBeNull();
+  });
+
   it("decodes the server's canonical form with omitted fields as defaults", () => {
     const canonical = `${ELEMENT_ANCHOR_PREFIX}{"v":1,"kind":"element","rect":{"x":1,"y":2,"w":3,"h":4},"screenshot":null}`;
     const decoded = decodeElementAnchor(canonical);

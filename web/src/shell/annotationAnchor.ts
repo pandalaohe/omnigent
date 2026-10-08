@@ -320,14 +320,16 @@ export function encodeElementAnchor(anchor: ElementAnchorV1): string {
 /**
  * Decode a stored anchor. Unlike the producer-side clamp, an oversized
  * anchor is rejected rather than trimmed, matching the server's
- * `parse_element_anchor` accept/reject decision (design §2.6).
+ * `parse_element_anchor` accept/reject decision (design §2.6). The size is
+ * that of the stored payload without the prefix — the server's canonical
+ * JSON — not a re-encode, which would add fields Python omits.
  */
 export function decodeElementAnchor(anchor: string | null | undefined): ElementAnchorV1 | null {
   if (!isElementAnchor(anchor)) return null;
+  const payload = anchor!.slice(ELEMENT_ANCHOR_PREFIX.length);
+  if (new TextEncoder().encode(payload).length > MAX_ANCHOR_BYTES) return null;
   try {
-    const decoded = clampAnchorFields(JSON.parse(anchor!.slice(ELEMENT_ANCHOR_PREFIX.length)));
-    if (!decoded || anchorByteLength(decoded) > MAX_ANCHOR_BYTES) return null;
-    return decoded;
+    return clampAnchorFields(JSON.parse(payload));
   } catch {
     return null;
   }
