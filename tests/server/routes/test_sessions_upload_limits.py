@@ -960,3 +960,110 @@ def test_content_route_streamed_path_keeps_etag_and_304(
     assert cached.status_code == 304
     assert cached.content == b""
     assert cached.headers["etag"] == etag
+
+
+# ── archive cleanup: 410 on a purged row (scenario 16) ─────────────
+
+
+def test_content_route_returns_410_for_a_purged_file(
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+) -> None:
+    """A ``done`` row's content is gone: 410 with the cleanup date, even cached."""
+    client, session_id = upload_client
+    uploaded = _upload(client, session_id, "clip.mp4", b"\x00\x00\x00 fake mp4", "video/mp4")
+    assert uploaded.status_code == 201, uploaded.text
+    file_id = uploaded.json()["id"]
+    url = f"/v1/sessions/{session_id}/resources/files/{file_id}/content"
+    assert client.get(url).status_code == 200
+    etag = client.get(url).headers["etag"]
+
+    files = SqlAlchemyFileStore(db_uri)
+    stored = files.get(file_id, session_id=session_id)
+    assert stored is not None
+    blob_key = stored.blob_key or stored.id
+    assert (
+        files.claim_purge(blob_key, session_id=session_id, revision=1, now=1_700_000_000)
+        is not None
+    )
+    files.finish_purge(blob_key, now=1_700_000_000)
+
+    response = client.get(url)
+    assert response.status_code == 410
+    assert "removed by the archive cleanup on 2023-11-14" in response.text
+
+    # A cached ETag must not resurrect the deleted bytes via a 304.
+    cached = client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 410
+
+
+# ── archive cleanup: quota ignores purged rows ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("state", "rejected"),
+    [("done", False), ("claimed", True), (None, True)],
+)
+def test_quota_ignores_only_purged_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str | None,
+    rejected: bool,
+) -> None:
+    """Only ``done`` rows free their quota share; claimed rows still count."""
+    from fastapi import HTTPException
+
+    from omnigent.entities import StoredFile
+    from omnigent.entities.pagination import PagedList
+    from omnigent.server.routes._sessions.helpers import (
+        _enforce_filesystem_attachment_policy,
+    )
+
+    metadata: dict[str, Any] = {"delivery": "filesystem"}
+    if state is not None:
+        metadata["purge"] = {"state": state, "revision": 1, "at": 1700000000}
+    existing = StoredFile(
+        id="f" * 32,
+        created_at=1,
+        filename="clip.mp4",
+        bytes=1_000_000,
+        session_id="conv_1",
+        source_metadata=metadata,
+    )
+
+    class _Store:
+        def list(self, session_id: str, limit: int, after: str | None, order: str):
+            del session_id, limit, after, order
+            return PagedList(
+                data=[existing],
+                first_id=existing.id,
+                last_id=existing.id,
+                has_more=False,
+            )
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_total_bytes_limit",
+        lambda: 1_000_000,
+    )
+
+    if rejected:
+        with pytest.raises(HTTPException) as error:
+            _enforce_filesystem_attachment_policy(
+                ["new.mp4"],
+                session_id="conv_1",
+                file_store=_Store(),  # type: ignore[arg-type]
+                sizes=[1_000_000],
+            )
+        assert error.value.status_code == 413
+    else:
+        cap = _enforce_filesystem_attachment_policy(
+            ["new.mp4"],
+            session_id="conv_1",
+            file_store=_Store(),  # type: ignore[arg-type]
+            sizes=[1_000_000],
+        )
+        # The purged row freed the whole session budget for the new upload.
+        assert cap == 1_000_000

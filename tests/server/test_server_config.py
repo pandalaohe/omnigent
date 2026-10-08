@@ -17,11 +17,15 @@ from PIL import Image
 
 from omnigent.server import server_config as server_config_module
 from omnigent.server.server_config import (
+    ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT,
     BRANDING_ASSET_MAX_BYTES,
     BRANDING_ASSET_MAX_DECODED_PIXELS,
     BRANDING_ASSET_MAX_DIMENSION,
     BRANDING_ASSET_MAX_FRAMES,
     BRANDING_ASSETS_DIRNAME,
+    attachment_archive_cleanup_days,
+    attachment_archive_cleanup_dry_run,
+    attachment_archive_cleanup_min_bytes,
     branding_config,
     branding_logo_asset,
     config_str_list,
@@ -297,6 +301,77 @@ def test_attachment_limits_reflect_configuration(monkeypatch: pytest.MonkeyPatch
     assert limits["file_bytes"] is None
     assert limits["session_files"] == 3
     assert limits["session_bytes"] == 4096
+
+
+# ── archive cleanup settings ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ({}, 0),  # absent → off
+        ({"attachment_archive_cleanup_days": 0}, 0),  # explicit off
+        ({"attachment_archive_cleanup_days": 30}, 30),
+    ],
+)
+def test_attachment_archive_cleanup_days_reads_zero_as_off(
+    monkeypatch: pytest.MonkeyPatch, values: dict[str, object], expected: int
+) -> None:
+    _pin_values(monkeypatch, values)
+    assert attachment_archive_cleanup_days() == expected
+
+
+@pytest.mark.parametrize("bad", [-1, "many", [30], 1.5, True])
+def test_attachment_archive_cleanup_days_invalid_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    bad: object,
+) -> None:
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_days": bad})
+    with caplog.at_level("WARNING", logger=server_config_module.__name__):
+        assert attachment_archive_cleanup_days() == 0
+    assert "using default" in caplog.text
+
+
+def test_attachment_archive_cleanup_min_bytes_default_and_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default defines "large" as 10 MiB; a configured value wins."""
+    _pin_values(monkeypatch, {})
+    assert ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT == 10 * 1024**2
+    assert attachment_archive_cleanup_min_bytes() == ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT
+
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_min_bytes": 1024})
+    assert attachment_archive_cleanup_min_bytes() == 1024
+
+
+@pytest.mark.parametrize("bad", [True, 1.5, -1, 0, "abc"])
+def test_attachment_archive_cleanup_min_bytes_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """A bool, float, negative, zero, or non-numeric value must not lower the bar."""
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_min_bytes": bad})
+    assert attachment_archive_cleanup_min_bytes() == ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT
+
+
+def test_attachment_archive_cleanup_dry_run_reads_booleans(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _pin_values(monkeypatch, {})
+    assert attachment_archive_cleanup_dry_run() is False
+
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_dry_run": True})
+    assert attachment_archive_cleanup_dry_run() is True
+
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_dry_run": "true"})
+    with caplog.at_level("WARNING", logger=server_config_module.__name__):
+        assert attachment_archive_cleanup_dry_run() is True
+    assert "using dry-run" in caplog.text
+
+    _pin_values(monkeypatch, {"attachment_archive_cleanup_dry_run": "yes"})
+    with caplog.at_level("WARNING", logger=server_config_module.__name__):
+        assert attachment_archive_cleanup_dry_run() is True
+    assert "is not a bool" in caplog.text
 
 
 def test_session_title_instructions_accepts_trimmed_string() -> None:

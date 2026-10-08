@@ -76,6 +76,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server.attachment_archive_cleanup import AttachmentArchiveCleanup
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -2024,6 +2025,17 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        # Settings-only job: always started, because the config file is
+        # re-read on every sweep (days == 0 keeps it a no-op). It never
+        # touches a session by request.
+        attachment_archive_cleanup = AttachmentArchiveCleanup(
+            conversation_store=conversation_store,
+            file_store=file_store,
+            artifact_store=artifact_store,
+        )
+        app_inst.state.attachment_archive_cleanup = attachment_archive_cleanup
+        await attachment_archive_cleanup.start()
+
         peer_sweeper = getattr(app_inst.state, "peer_sweeper", None)
         if peer_sweeper is not None:
             await peer_sweeper.start(app_inst)
@@ -2043,6 +2055,7 @@ def create_app(
                 await peer_sweeper.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
+            await attachment_archive_cleanup.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.

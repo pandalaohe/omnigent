@@ -310,6 +310,145 @@ def test_is_blob_key_orphaned_true_for_unreferenced_blob(
     assert file_store.is_blob_key_orphaned("deadbeefdeadbeefdeadbeefdeadbeef") is True
 
 
+# ── archive-cleanup purge state ───────────────────────────────────
+
+
+def test_list_blob_referrers_returns_shared_rows(file_store: SqlAlchemyFileStore) -> None:
+    """Every row sharing a blob is returned, across sessions."""
+    source = file_store.create("clip.mp4", 8, session_id=_SID)
+    fork = file_store.create(
+        "clip.mp4",
+        8,
+        session_id="9999999999999999e9ed9298fd5a3e29",
+        blob_key=source.blob_key,
+    )
+    other = file_store.create("notes.zip", 4, session_id=_SID)
+
+    referrers = file_store.list_blob_referrers(source.blob_key or source.id)
+    assert {row.id for row in referrers} == {source.id, fork.id}
+    assert file_store.list_blob_referrers(other.blob_key or other.id) == [file_store.get(other.id)]
+
+
+def test_claim_purge_marks_every_referrer_and_round_trips(
+    file_store: SqlAlchemyFileStore,
+) -> None:
+    """A claim stamps every same-session referrer and reads back."""
+    source = file_store.create(
+        "clip.mp4",
+        8,
+        session_id=_SID,
+        source_metadata={"delivery": "filesystem"},
+    )
+    # A second row in the same session can share the blob (e.g. a copied row).
+    sibling = file_store.create(
+        "clip.mp4",
+        8,
+        session_id=_SID,
+        blob_key=source.blob_key,
+        source_metadata={"delivery": "filesystem"},
+    )
+
+    claimed = file_store.claim_purge(
+        source.blob_key or source.id, session_id=_SID, revision=7, now=1000
+    )
+
+    assert claimed is not None
+    assert {row.id for row in claimed} == {source.id, sibling.id}
+    for file_id in (source.id, sibling.id):
+        row = file_store.get(file_id)
+        assert row is not None
+        assert row.source_metadata == {
+            "delivery": "filesystem",
+            "purge": {"state": "claimed", "revision": 7, "at": 1000},
+        }
+
+
+def test_claim_purge_refuses_a_foreign_session(file_store: SqlAlchemyFileStore) -> None:
+    """A blob a live fork still references is never claimed."""
+    source = file_store.create("clip.mp4", 8, session_id=_SID)
+    fork_session = "9999999999999999e9ed9298fd5a3e29"
+    file_store.create(
+        "clip.mp4",
+        8,
+        session_id=fork_session,
+        blob_key=source.blob_key,
+    )
+
+    assert (
+        file_store.claim_purge(source.blob_key or source.id, session_id=_SID, revision=1, now=5)
+        is None
+    )
+    row = file_store.get(source.id)
+    assert row is not None
+    assert row.source_metadata is None
+
+
+def test_claim_purge_refuses_an_already_done_blob(file_store: SqlAlchemyFileStore) -> None:
+    """A done row stays done; a second claim is refused."""
+    source = file_store.create("clip.mp4", 8, session_id=_SID)
+    blob_key = source.blob_key or source.id
+    assert file_store.claim_purge(blob_key, session_id=_SID, revision=1, now=5) is not None
+    file_store.finish_purge(blob_key, now=6)
+
+    assert file_store.claim_purge(blob_key, session_id=_SID, revision=2, now=7) is None
+
+
+def test_release_purge_clears_only_claimed_state(file_store: SqlAlchemyFileStore) -> None:
+    """Release restores the pre-claim metadata shape and never touches done."""
+    bare = file_store.create("clip.mp4", 8, session_id=_SID)
+    tagged = file_store.create(
+        "clip.mp4",
+        8,
+        session_id=_SID,
+        source_metadata={"delivery": "filesystem"},
+    )
+    done = file_store.create("other.mp4", 8, session_id=_SID)
+    for row, revision in ((bare, 1), (tagged, 2), (done, 3)):
+        assert (
+            file_store.claim_purge(
+                row.blob_key or row.id, session_id=_SID, revision=revision, now=10
+            )
+            is not None
+        )
+    file_store.finish_purge(done.blob_key or done.id, now=11)
+
+    file_store.release_purge(bare.blob_key or bare.id)
+    file_store.release_purge(tagged.blob_key or tagged.id)
+    file_store.release_purge(done.blob_key or done.id)
+
+    bare_row = file_store.get(bare.id)
+    tagged_row = file_store.get(tagged.id)
+    done_row = file_store.get(done.id)
+    assert bare_row is not None and bare_row.source_metadata is None
+    assert tagged_row is not None
+    assert tagged_row.source_metadata == {"delivery": "filesystem"}
+    assert done_row is not None
+    assert done_row.source_metadata == {"purge": {"state": "done", "revision": 3, "at": 11}}
+
+
+def test_finish_purge_keeps_the_claim_revision(file_store: SqlAlchemyFileStore) -> None:
+    """Done rows carry the revision the claim was authorized under."""
+    source = file_store.create("clip.mp4", 8, session_id=_SID)
+    blob_key = source.blob_key or source.id
+    assert file_store.claim_purge(blob_key, session_id=_SID, revision=42, now=5) is not None
+
+    file_store.finish_purge(blob_key, now=99)
+
+    row = file_store.get(source.id)
+    assert row is not None
+    assert row.source_metadata == {"purge": {"state": "done", "revision": 42, "at": 99}}
+
+
+def test_claim_purge_refuses_an_unreferenced_blob(file_store: SqlAlchemyFileStore) -> None:
+    """Nothing to claim is not a claim."""
+    assert (
+        file_store.claim_purge(
+            "deadbeefdeadbeefdeadbeefdeadbeef", session_id=_SID, revision=1, now=5
+        )
+        is None
+    )
+
+
 def test_delete_all_for_session_returns_only_orphaned_blobs(
     file_store: SqlAlchemyFileStore,
 ) -> None:

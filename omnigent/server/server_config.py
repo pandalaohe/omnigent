@@ -272,6 +272,56 @@ def attachment_upload_request_limit() -> int | None:
     return _config_limit("attachment_max_upload_bytes", ATTACHMENT_UPLOAD_REQUEST_DEFAULT_BYTES)
 
 
+# Default "large" threshold for the archive cleanup: originals at or above
+# this size are eligible for purge.
+ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT = 10 * 1024**2
+
+
+def attachment_archive_cleanup_days() -> int:
+    """Days an archived session must stay archived before big originals go.
+
+    Config key ``attachment_archive_cleanup_days``; ``0`` (default) disables
+    the cleanup. Re-read on every sweep, so a config edit lands without a
+    server restart.
+    """
+    return _config_limit("attachment_archive_cleanup_days", 0) or 0
+
+
+def attachment_archive_cleanup_min_bytes() -> int:
+    """Smallest by-path file the archive cleanup may purge.
+
+    Config key ``attachment_archive_cleanup_min_bytes``; defaults to
+    :data:`ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT`. This defines
+    "large": smaller files are always kept. ``0`` and invalid values also
+    use the default, never a smaller threshold.
+    """
+    return (
+        _config_limit(
+            "attachment_archive_cleanup_min_bytes",
+            ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT,
+        )
+        or ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT
+    )
+
+
+def attachment_archive_cleanup_dry_run() -> bool:
+    """Whether the archive cleanup only logs what it would purge.
+
+    Config key ``attachment_archive_cleanup_dry_run``; default false. A
+    present non-bool value falls back to true (dry-run) with a warning.
+    """
+    raw = load_server_config().get("attachment_archive_cleanup_dry_run")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    logger.warning(
+        "server config attachment_archive_cleanup_dry_run=%r is not a bool — using dry-run",
+        raw,
+    )
+    return True
+
+
 def attachment_limits() -> dict[str, int | None]:
     """Every attachment size limit the web client should enforce.
 

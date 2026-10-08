@@ -28,6 +28,8 @@ from omnigent.inner.native_attachments import (
     codex_resize_metadata_path,
     has_unresolved_file_id,
     is_by_path,
+    is_purged,
+    mark_purged_attachments,
     materialize_attachment,
     materialize_file_reference,
     parse_data_uri,
@@ -528,6 +530,15 @@ def test_is_by_path_reads_the_stored_delivery_key() -> None:
     assert not is_by_path("clip.mp4", {"delivery": "inline"})
     assert not is_by_path("archive.zip", {"delivery": "inline"})
     assert not is_by_path("photo.png", {"width": 6000, "height": 4000})
+
+
+def test_is_purged_only_for_done_state() -> None:
+    """Only ``done`` means the bytes are gone; claimed rows read live."""
+    assert is_purged({"purge": {"state": "done", "revision": 1, "at": 2}})
+    assert not is_purged({"purge": {"state": "claimed", "revision": 1, "at": 2}})
+    assert not is_purged({"delivery": "filesystem"})
+    assert not is_purged({"purge": "done"})  # malformed record
+    assert not is_purged(None)
 
 
 def test_is_by_path_falls_back_to_the_extension_for_legacy_rows() -> None:
@@ -1115,6 +1126,52 @@ async def test_restore_session_attachments_pages_and_skips_present_files(
 
 
 @pytest.mark.asyncio
+async def test_restore_session_attachments_skips_purged_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``done`` row is never fetched and does not fail the restore."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    content_requests: list[str] = []
+    purged_rows: dict[str, str] = {}
+    purged = {
+        "id": "file_purged",
+        "name": "clip.mp4",
+        "metadata": {
+            "bytes": 5,
+            "source_metadata": {
+                "delivery": "filesystem",
+                "purge": {"state": "done", "revision": 1, "at": 1700000000},
+            },
+        },
+    }
+    live = {
+        "id": "file_live",
+        "name": "clip.mp4",
+        "metadata": {"bytes": 5, "source_metadata": {"delivery": "filesystem"}},
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [purged, live], "has_more": False})
+        if path.endswith("/content"):
+            content_requests.append(path)
+            return httpx.Response(200, content=b"hello")
+        raise AssertionError(f"unexpected request {path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        restored = await restore_session_attachments("conv_1", client, purged=purged_rows)
+
+    assert restored is True
+    assert purged_rows == {"file_purged": "clip.mp4"}
+    assert content_requests == ["/v1/sessions/conv_1/resources/files/file_live/content"]
+    assert not _session_dir(tmp_path, "file_purged").exists()
+    assert (_session_dir(tmp_path, "file_live") / "clip.mp4").read_bytes() == b"hello"
+
+
+@pytest.mark.asyncio
 async def test_restore_session_attachments_logs_a_fetch_failure_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1200,6 +1257,39 @@ def test_rewrite_attached_paths_leaves_other_text_unchanged(
 
     for text in unchanged:
         assert rewrite_attached_paths(text, "session-a") == text
+
+
+# ── mark_purged_attachments ──────────────────────────────────────────
+
+
+def test_mark_purged_attachments_marks_only_the_purged_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A purged row's line becomes the marker; a live row's line is untouched."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    key = "b" * 32
+    purged_line = f"[Attached: /home/other/.omnigent/attachments/s-{key}/file_gone/trip.mp4]"
+    live_line = f"[Attached: /home/other/.omnigent/attachments/s-{key}/file_live/clip.mp4]"
+
+    marked = mark_purged_attachments(
+        f"{purged_line} then {live_line}", "session-a", {"file_gone": "trip.mp4"}
+    )
+
+    assert marked == f"[Attachment trip.mp4 could not be loaded] then {live_line}"
+
+
+def test_mark_purged_attachments_keeps_a_surviving_host_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A purged row whose host copy still exists keeps the working path."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    session_id = "session-a"
+    target = session_attachment_dir(session_id) / "file_gone" / "trip.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"data")
+    line = f"[Attached: {target}]"
+
+    assert mark_purged_attachments(line, session_id, {"file_gone": "trip.mp4"}) == line
 
 
 # ── materialize_attachment without dir_fd (Windows) ──────────────────

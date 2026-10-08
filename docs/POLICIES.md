@@ -83,11 +83,29 @@ reads a local copy outside the working checkout. See
 | `filesystem_attachment_max_files` | `0` (unlimited) | Stored files of these types per session |
 | `filesystem_attachment_max_total_bytes` | `0` (unlimited) | Combined bytes of these types per session |
 | `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+| `attachment_archive_cleanup_days` | `0` (off) | Delete large by-path originals from sessions archived this many days |
+| `attachment_archive_cleanup_min_bytes` | `10485760` (10 MiB) | "Large": files below this size are never purged |
+| `attachment_archive_cleanup_dry_run` | `false` | Log rows that would be purged without deleting them |
 
 An explicit `0` means unlimited. An invalid value (negative, non-numeric)
 falls back to the default with a server-log warning. The effective attachment
 limits are published to the web composer by `GET /v1/info` as
 `attachment_limits`.
+
+The archive cleanup deletes only the large originals of files uploaded as
+by-path attachments (never agent-produced files, nor uploads recorded before
+by-path delivery existed) and keeps the session; it is separate
+from the per-browser retention period and "Delete expired" in Settings ›
+Archived sessions, which delete whole sessions.
+
+The archive cleanup is a server-side daily job (settings are re-read on every
+sweep, so a config edit lands without a restart). No API triggers it. It only
+purges by-path originals whose session is still archived under the same
+revision; images, PDFs, and text are never touched. A purged file's download
+and fetch return HTTP 410, its quota share is released, and its row remains as
+a name-only chip. The last sweep's summary is written to
+`<data_dir>/system-status/attachment-archive-cleanup.json` and returned under
+`attachment_archive_cleanup` by the admin-only `GET /v1/system/brief`.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser

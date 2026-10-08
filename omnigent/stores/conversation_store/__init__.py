@@ -1288,6 +1288,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_workspace_ids_with_archived_before(self, *, archived_before: int) -> list[int]:
+        """Return every workspace id holding a conversation archived before a cutoff.
+
+        Privileged cross-workspace scan for the archive cleanup job, which runs
+        in the lifespan's default workspace and must reach every tenant
+        partition. Ids are ordered so a sweep is deterministic.
+
+        :param archived_before: Exclusive epoch-seconds cutoff on ``archived_at``.
+        :returns: Workspace ids in ascending order.
+        """
+        ...
+
+    @abstractmethod
     def claim_archive_close(
         self,
         conversation_id: str,

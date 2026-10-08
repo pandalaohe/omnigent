@@ -2171,14 +2171,24 @@ def create_runner_app(
         CLI release and resource cleanup delete the session attachment dir but
         keep ``_session_histories``; the cached ``[Attached: ...]`` lines then
         point at deleted files, so the next turn restores them before the
-        harness reads the history. Calls are idempotent and non-fatal.
+        harness reads the history. A purged row has no bytes to restore, so
+        its cached lines are replaced in place with the could-not-load marker.
+        Calls are idempotent and non-fatal.
         """
         if session_id not in _attachment_restore_pending:
             return
-        from omnigent.inner.native_attachments import restore_session_attachments
+        from omnigent.inner.native_attachments import (
+            mark_purged_message_attachments,
+            restore_session_attachments,
+        )
 
-        if await restore_session_attachments(session_id, server_client):
+        purged: dict[str, str] = {}
+        if await restore_session_attachments(session_id, server_client, purged=purged):
             _attachment_restore_pending.discard(session_id)
+        if purged:
+            for item in _session_histories.get(session_id, []):
+                if item.get("type") == "message":
+                    mark_purged_message_attachments(item, session_id, purged)
 
     def _session_has_cli_retention_protection(session_id: str) -> bool:
         if session_id in _active_turns:
