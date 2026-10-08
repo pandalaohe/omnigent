@@ -1,10 +1,9 @@
 // Target selection for the question-card focus chord: focus advances to the
 // next card of the focused pane; without focus in a card, DOM proximity to
 // the reference node (focused element, or the last pointerdown when focus is
-// on <body>), then the last touched card, then the newest. Pane scoping comes
-// from proximity alone, so no session id is needed. The reveal after entry
-// scrolls the card into view and releases the conversation bottom-lock when
-// it scrolls up.
+// on <body>), then the last touched card, then the newest. A card's scroll
+// container scopes the cycle to its pane. The reveal after entry scrolls the
+// card into view and releases the conversation bottom-lock when it scrolls up.
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef, type ReactNode } from "react";
@@ -48,13 +47,21 @@ function Host() {
   return null;
 }
 
-function Pane({ composer, children }: { composer: string; children: ReactNode }) {
+function Pane({
+  composer,
+  children,
+  scroll = false,
+}: {
+  composer: string;
+  children: ReactNode;
+  scroll?: boolean;
+}) {
   return (
     <div>
       <div data-composer-card>
         <textarea data-testid={composer} />
       </div>
-      {children}
+      {scroll ? <div style={{ overflowY: "auto" }}>{children}</div> : children}
     </div>
   );
 }
@@ -441,7 +448,7 @@ describe("targetQuestionCard cycle", () => {
     const { entered, enter } = recordingEnter();
     render(
       <>
-        <Pane composer="composer">
+        <Pane composer="composer" scroll>
           <FocusCard id="card-a" onEnter={enter} />
           <FocusCard id="card-b" onEnter={enter} />
           <FocusCard id="card-c" onEnter={enter} />
@@ -463,7 +470,7 @@ describe("targetQuestionCard cycle", () => {
     const { entered, enter } = recordingEnter();
     render(
       <>
-        <Pane composer="composer">
+        <Pane composer="composer" scroll>
           <FocusCard id="card-a" onEnter={enter} />
           <FocusCard id="card-b" onEnter={enter} />
         </Pane>
@@ -483,7 +490,7 @@ describe("targetQuestionCard cycle", () => {
     const { entered, enter } = recordingEnter();
     render(
       <>
-        <Pane composer="composer">
+        <Pane composer="composer" scroll>
           <FocusCard id="card-a" onEnter={enter} />
         </Pane>
         <Host />
@@ -501,12 +508,12 @@ describe("targetQuestionCard cycle", () => {
     const { entered, enter } = recordingEnter();
     render(
       <>
-        <Pane composer="main-composer">
+        <Pane composer="main-composer" scroll>
           <FocusCard id="main-a" onEnter={enter} />
           <FocusCard id="main-b" onEnter={enter} />
           <FocusCard id="main-c" onEnter={enter} />
         </Pane>
-        <Pane composer="side-composer">
+        <Pane composer="side-composer" scroll>
           <FocusCard id="side-card" onEnter={enter} />
         </Pane>
         <Host />
@@ -525,7 +532,7 @@ describe("targetQuestionCard cycle", () => {
     const { entered, enter } = recordingEnter();
     render(
       <>
-        <Pane composer="composer">
+        <Pane composer="composer" scroll>
           <FocusCard id="card-a" onEnter={enter} />
           <FocusCard id="card-b" onEnter={enter} />
           <FocusCard id="card-c" onEnter={enter} />
@@ -541,6 +548,75 @@ describe("targetQuestionCard cycle", () => {
     pressFocusChord();
 
     expect(entered).toEqual(["card-a", "card-c", "card-b"]);
+  });
+
+  it("keeps the cycle in a one-card pane beside another pane's card", () => {
+    const { entered, enter } = recordingEnter();
+    render(
+      <>
+        <Pane composer="pane-1-composer" scroll>
+          <FocusCard id="pane-1-card" onEnter={enter} />
+        </Pane>
+        <Pane composer="pane-2-composer" scroll>
+          <FocusCard id="pane-2-card" onEnter={enter} />
+        </Pane>
+        <Host />
+      </>,
+    );
+
+    screen.getByTestId("pane-1-card-button").focus();
+    pressFocusChord();
+    pressFocusChord();
+    pressFocusChord();
+
+    expect(entered).toEqual(["pane-1-card", "pane-1-card", "pane-1-card"]);
+  });
+
+  it("cycles a card nested deeper than its siblings in the same pane", () => {
+    const { entered, enter } = recordingEnter();
+    render(
+      <>
+        <Pane composer="composer" scroll>
+          <FocusCard id="card-a" onEnter={enter} />
+          <div>
+            <div>
+              <FocusCard id="card-b" onEnter={enter} />
+            </div>
+          </div>
+          <FocusCard id="card-c" onEnter={enter} />
+        </Pane>
+        <Host />
+      </>,
+    );
+
+    screen.getByTestId("composer").focus();
+    pressFocusChord();
+    pressFocusChord();
+    pressFocusChord();
+    pressFocusChord();
+
+    expect(entered).toEqual(["card-c", "card-b", "card-a", "card-c"]);
+  });
+
+  it("re-enters a card whose pane has no scroll container", () => {
+    const { entered, enter } = recordingEnter();
+    render(
+      <>
+        <Pane composer="plain-composer">
+          <FocusCard id="plain-card" onEnter={enter} />
+        </Pane>
+        <Pane composer="scrolled-composer" scroll>
+          <FocusCard id="scrolled-card" onEnter={enter} />
+        </Pane>
+        <Host />
+      </>,
+    );
+
+    screen.getByTestId("plain-card-button").focus();
+    pressFocusChord();
+    pressFocusChord();
+
+    expect(entered).toEqual(["plain-card", "plain-card"]);
   });
 });
 
@@ -585,6 +661,24 @@ describe("question card reveal", () => {
     expect(lock.stopScroll).not.toHaveBeenCalled();
     expect(lock.state.isAtBottom).toBe(true);
     expect(lock.state.escapedFromLock).toBe(false);
+  });
+
+  it("fits a card no taller than the view fully inside it", () => {
+    const lock: ConversationScrollLock = {
+      stopScroll: vi.fn(),
+      state: { isAtBottom: true, escapedFromLock: false },
+    };
+    renderRevealCard({ scroller: true, lock });
+    const scroller = screen.getByTestId("scroller");
+    const card = screen.getByTestId("card-a");
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue(rect(100, 300));
+    vi.spyOn(card, "getBoundingClientRect").mockReturnValue(rect(310, 505));
+    scroller.scrollTop = 500;
+
+    screen.getByTestId("composer").focus();
+    pressFocusChord();
+
+    expect(scroller.scrollTop).toBe(500 + (505 - 300 + 2.5));
   });
 
   it("leaves the scroll alone when the card is already fully visible", () => {

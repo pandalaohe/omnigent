@@ -116,16 +116,12 @@ export function targetQuestionCard(): QuestionCardEntry | null {
     (entry) => active instanceof Node && entry.element.contains(active),
   );
   if (containing) {
-    // Pane scoping by proximity: a sibling card shares a deeper ancestor than
-    // any card in another pane. One card (or none) leaves the card itself.
-    const peers = [
-      containing,
-      ...nearestSet(
-        cardEntries.filter((entry) => entry !== containing),
-        (entry) => entry.element,
-        containing.element,
-      ),
-    ].sort((a, b) => b.mountedSeq - a.mountedSeq);
+    // Peers are the cards sharing the containing card's scroll container, so
+    // the cycle cannot leave the focused pane; no container means no cycling.
+    const scope = scrollContainerFor(containing.element);
+    const peers = (
+      scope ? cardEntries.filter((entry) => scope.contains(entry.element)) : [containing]
+    ).sort((a, b) => b.mountedSeq - a.mountedSeq);
     return peers[(peers.indexOf(containing) + 1) % peers.length];
   }
 
@@ -204,10 +200,16 @@ function revealQuestionCard(entry: QuestionCardEntry): void {
   const view = container.getBoundingClientRect();
   const card = element.getBoundingClientRect();
   if (card.top >= view.top && card.bottom <= view.bottom) return;
+  // A card no taller than the view keeps half the slack as its margin, so it
+  // always lands fully inside; an oversized card is pinned with the margin.
+  const margin =
+    card.height > view.height
+      ? REVEAL_MARGIN_PX
+      : Math.min(REVEAL_MARGIN_PX, (view.height - card.height) / 2);
   const delta =
-    card.height > view.height - 2 * REVEAL_MARGIN_PX || card.top < view.top
-      ? card.top - view.top - REVEAL_MARGIN_PX
-      : card.bottom - view.bottom + REVEAL_MARGIN_PX;
+    card.height > view.height || card.top < view.top
+      ? card.top - view.top - margin
+      : card.bottom - view.bottom + margin;
   if (delta < 0) {
     const lock = entry.lock();
     if (lock) {
