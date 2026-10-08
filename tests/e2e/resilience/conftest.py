@@ -14,6 +14,16 @@ from tests.e2e.resilience.lab.lab import Lab, LabConfig, LabMode
 KEEP_ENV = "OMNIGENT_RESILIENCE_KEEP"
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """``--resilience-approvals=deferred`` runs every scenario with deferred approvals."""
+    parser.addoption(
+        "--resilience-approvals",
+        choices=("blocking", "deferred"),
+        default="blocking",
+        help="Approval mode for labs whose scenario does not pick one.",
+    )
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Generator[None]:
     """Expose each phase's report on the item so fixtures can keep failed labs."""
@@ -42,6 +52,9 @@ def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
 
     def _start(mode: LabMode = "host", **options: object) -> Lab:
         require_tmux()
+        # The option exists only when this conftest loaded at startup.
+        approvals = request.config.getoption("--resilience-approvals", default="blocking")
+        options.setdefault("approvals", approvals)
         lab = Lab(LabConfig(mode=mode, **options))  # type: ignore[arg-type]
         labs.append(lab)
         return lab.start()

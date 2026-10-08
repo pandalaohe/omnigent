@@ -447,6 +447,36 @@ class SessionSuccession:
     updated_at: int
 
 
+@dataclass(frozen=True)
+class DetachedCard:
+    """One detached card's durable record with its JSON payloads decoded.
+
+    :param kind: ``"approval"`` or ``"question"``.
+    :param state: ``"pending"``, ``"answered"`` or ``"settled"``.
+    :param mirror: Whether the card is mirrored into ancestor streams.
+    :param params: The published ``ElicitationRequestParams`` dump.
+    :param payload: What rebuilds the card's verdict text, e.g.
+        ``{"aid": "a1b2c3", "action": "Bash(...)"}``.
+    :param grant_key: Match key of the re-issued call (approvals only).
+    :param verdict: The ``ElicitationResult`` dump once answered.
+    :param delivery_text: The ``[System: …]`` message owed to the agent.
+    :param expires_at: Epoch seconds the card (or its grant) lapses.
+    """
+
+    elicitation_id: str
+    session_id: str
+    kind: str
+    state: str
+    mirror: bool
+    params: dict[str, Any]
+    payload: dict[str, Any]
+    grant_key: list[str] | None
+    verdict: dict[str, Any] | None
+    delivery_text: str | None
+    created_at: int
+    expires_at: int
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -1308,6 +1338,32 @@ class ConversationStore(ABC):
         :returns: ``True`` when the row was updated, ``False`` when the
             phase no longer matched or the receipt is missing.
         """
+        ...
+
+    @abstractmethod
+    def add_detached_card(self, card: DetachedCard) -> None:
+        """Insert one detached card record; expired records are dropped first."""
+        ...
+
+    @abstractmethod
+    def list_detached_cards(self) -> list[DetachedCard]:
+        """Return every detached card record in the workspace, oldest first."""
+        ...
+
+    @abstractmethod
+    def update_detached_card(self, elicitation_id: str, **fields: Any) -> None:
+        """Patch one record: ``state`` and ``delivery_text`` verbatim,
+        ``verdict`` as a dict, ``expires_at`` in epoch seconds."""
+        ...
+
+    @abstractmethod
+    def delete_detached_card(self, elicitation_id: str) -> None:
+        """Delete one record; a missing record is a no-op."""
+        ...
+
+    @abstractmethod
+    def delete_detached_grants(self, session_id: str, grant_key: list[str]) -> None:
+        """Delete the session's answered or settled records carrying *grant_key*."""
         ...
 
     @abstractmethod

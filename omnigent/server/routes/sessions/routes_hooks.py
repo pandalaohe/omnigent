@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
@@ -124,6 +125,7 @@ from omnigent.spec.types import (
     PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import DetachedCard
 from omnigent.stores.permission_store import PermissionStore
 
 #: Policy-name vendor for a native agent key, where the two differ. Mirrors
@@ -381,29 +383,105 @@ def _approval_feedback_clause(result: ElicitationResult) -> str:
     return ""
 
 
-def _deferred_approval_callback(
+#: Lifetime of an unanswered detached card (the park's own wait budget).
+_DETACHED_CARD_TTL_S = 86400.0
+
+#: Bound on waiting for restored cards to publish at server start.
+_RESTORE_PUBLISH_TIMEOUT_S = 30.0
+
+
+def _render_card_verdict(kind: str, payload: dict[str, Any], result: ElicitationResult) -> str:
+    """
+    Render the ``[System: …]`` message one detached card's verdict owes.
+
+    :param kind: ``"approval"`` or ``"question"``.
+    :param payload: The card's record payload: ``{aid, action}`` for an
+        approval, ``{questions, qid}`` for a question card.
+    :param result: The web verdict.
+    :returns: The message for the asking session.
+    """
+    if kind == "question":
+        qid = payload["qid"]
+        if result.action == "accept":
+            return _format_async_question_answers(payload["questions"], result.content, qid)
+        return f"[System: the user dismissed question card #{qid} without answering.]"
+    if result.action == "accept":
+        return _APPROVAL_GRANTED_TEXT.format(aid=payload["aid"], action=payload["action"])
+    return _APPROVAL_DENIED_TEXT.format(
+        aid=payload["aid"],
+        action=payload["action"],
+        feedback=_approval_feedback_clause(result),
+    )
+
+
+async def _write_card_record(write: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+    """
+    Run one detached-card record write off the loop.
+
+    The record only carries the card across a restart; a failed write is
+    logged and never fails the hook or the verdict it belongs to.
+
+    :param write: Bound store method, e.g. ``store.delete_detached_card``.
+    :returns: None.
+    """
+    try:
+        await asyncio.to_thread(write, *args, **kwargs)
+    except Exception:
+        _logger.warning("Detached card record write failed (%s)", write.__name__, exc_info=True)
+
+
+async def _deliver_card_verdict(
+    card: DetachedCard,
+    text: str,
     *,
-    session_id: str,
-    grant_key: tuple[str, ...],
-    aid: str,
-    action: str,
+    granted: bool,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """
+    Deliver an answered card's message, then drop what is no longer owed.
+
+    The record stays only while an accepted grant waits for its re-issued
+    call; a delivery that gave up has already left its visible notice.
+
+    :param card: The answered card's record.
+    :param text: The ``[System: …]`` message.
+    :param granted: Whether the verdict armed a grant.
+    :param conversation_store: Store for the delivery and the record.
+    :param runner_router: Router used to reach the runner.
+    :returns: None.
+    """
+    await _deliver_with_retry(
+        card.session_id,
+        text,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+    )
+    if granted:
+        await _write_card_record(
+            conversation_store.update_detached_card, card.elicitation_id, state="settled"
+        )
+    else:
+        await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
+
+
+def _detached_card_callback(
+    card: DetachedCard,
+    *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
 ) -> Callable[[ElicitationResult | None], Awaitable[None]]:
     """
-    Build the verdict handler for one deferred approval card.
+    Build the verdict handler for one detached card.
 
-    An accept stores the one-shot grant BEFORE the message is delivered,
-    so a lost or retried delivery never loses the approval itself. A
-    decline or cancel posts the denial text; ``None`` (expiry / restart)
-    posts nothing.
+    An accept on an approval stores the one-shot grant BEFORE the message
+    is delivered, so a lost or retried delivery never loses the approval;
+    the verdict and its message are recorded before delivery starts, so a
+    restart mid-delivery delivers it again. ``None`` (expiry) owes nothing.
 
-    :param session_id: Session that owns the deferred card.
-    :param grant_key: Match key a re-issued call must carry.
-    :param aid: Card's short correlation id, e.g. ``"a1a2b3c"``.
-    :param action: Preformatted ``<tool>(<preview>)`` action clause.
-    :param conversation_store: Store used to reach the runner.
-    :param runner_router: Router used to resolve the runner.
+    :param card: The card's record.
+    :param conversation_store: Store for the delivery and the record.
+    :param runner_router: Router used to reach the runner.
     :returns: The ``on_result`` coroutine for the detached park.
     """
 
@@ -411,28 +489,218 @@ def _deferred_approval_callback(
         """
         Deliver the card's verdict to the session.
 
-        :param result: Web verdict, or ``None`` on expiry / restart.
+        :param result: Web verdict, or ``None`` on expiry.
         :returns: None.
         """
         if result is None:
+            await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
             return
-        if result.action == "accept":
-            approval_grants.put(session_id, grant_key, result, _APPROVAL_GRANT_TTL_S)
-            text = _APPROVAL_GRANTED_TEXT.format(aid=aid, action=action)
-        else:
-            text = _APPROVAL_DENIED_TEXT.format(
-                aid=aid,
-                action=action,
-                feedback=_approval_feedback_clause(result),
+        text = _render_card_verdict(card.kind, card.payload, result)
+        granted = card.grant_key is not None and result.action == "accept"
+        await _write_card_record(
+            conversation_store.update_detached_card,
+            card.elicitation_id,
+            state="answered",
+            verdict=result.model_dump(mode="json"),
+            delivery_text=text,
+            expires_at=int(time.time() + _APPROVAL_GRANT_TTL_S),
+        )
+        # Armed only once its record is answered: a consume racing the write
+        # would otherwise find no record to drop, and a restart would re-arm it.
+        if granted:
+            assert card.grant_key is not None
+            approval_grants.put(
+                card.session_id, tuple(card.grant_key), result, _APPROVAL_GRANT_TTL_S
             )
-        await _deliver_with_retry(
-            session_id,
+        await _deliver_card_verdict(
+            card,
             text,
+            granted=granted,
             conversation_store=conversation_store,
             runner_router=runner_router,
         )
 
     return _on_result
+
+
+def _park_detached_card(
+    card: DetachedCard,
+    *,
+    timeout_s: float,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    published: asyncio.Event | None = None,
+) -> None:
+    """
+    Park one recorded card under its own id.
+
+    :param card: The card's record.
+    :param timeout_s: Seconds left before the card expires.
+    :param conversation_store: Store for the ancestor mirror and record.
+    :param runner_router: Router used to deliver the verdict.
+    :param published: Set once the card is published, mirrors included.
+    :returns: None.
+    """
+    start_detached_elicitation(
+        card.session_id,
+        ElicitationRequestParams.model_validate(card.params),
+        conversation_store=conversation_store if card.mirror else None,
+        on_result=_detached_card_callback(
+            card, conversation_store=conversation_store, runner_router=runner_router
+        ),
+        timeout_s=timeout_s,
+        elicitation_id=card.elicitation_id,
+        published=published,
+    )
+
+
+async def _open_detached_card(
+    session_id: str,
+    params: ElicitationRequestParams,
+    *,
+    elicitation_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    grant_key: tuple[str, ...] | None,
+    mirror: bool,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """
+    Record a new detached card durably, then park it.
+
+    The record is written before the park starts so the park's own result
+    can never race ahead of it.
+
+    :param session_id: Session the card belongs to.
+    :param params: Params to publish.
+    :param elicitation_id: The card's id, already stamped into ``params``.
+    :param kind: ``"approval"`` or ``"question"``.
+    :param payload: What renders the verdict text later.
+    :param grant_key: Re-issued call's match key (approvals), else ``None``.
+    :param mirror: Whether ancestors mirror the card.
+    :param conversation_store: Store for the record and the mirror.
+    :param runner_router: Router used to deliver the verdict.
+    :returns: None.
+    """
+    now = int(time.time())
+    card = DetachedCard(
+        elicitation_id=elicitation_id,
+        session_id=session_id,
+        kind=kind,
+        state="pending",
+        mirror=mirror,
+        params=params.model_dump(mode="json"),
+        payload=payload,
+        grant_key=list(grant_key) if grant_key is not None else None,
+        verdict=None,
+        delivery_text=None,
+        created_at=now,
+        expires_at=now + int(_DETACHED_CARD_TTL_S),
+    )
+    await _write_card_record(conversation_store.add_detached_card, card)
+    _park_detached_card(
+        card,
+        timeout_s=_DETACHED_CARD_TTL_S,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+    )
+
+
+async def _consume_grant(
+    session_id: str,
+    grant_key: tuple[str, ...],
+    conversation_store: ConversationStore,
+) -> ElicitationResult | None:
+    """
+    Consume a live grant for a re-issued call, durably.
+
+    The record is dropped before the allow is returned, so a restart can
+    never re-arm a grant that was already used; when that fails the call is
+    asked again (the record keeps its single use for after a restart).
+
+    :param session_id: Session the incoming call belongs to.
+    :param grant_key: Match key of the incoming call.
+    :param conversation_store: Store holding the grant's record.
+    :returns: The stored verdict, or ``None`` when no grant matches.
+    """
+    granted = approval_grants.consume(session_id, grant_key)
+    if granted is None:
+        return None
+    try:
+        await asyncio.to_thread(
+            conversation_store.delete_detached_grants, session_id, list(grant_key)
+        )
+    except Exception:
+        # An allowance fails closed: the call is asked again instead.
+        _logger.warning("Could not drop a consumed grant's record", exc_info=True)
+        return None
+    return granted
+
+
+async def restore_detached_cards(
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """
+    Reopen what the previous server process owed for its detached cards.
+
+    Server start: a pending card is parked again under its own id for its
+    remaining lifetime, an answered verdict is delivered again, and an
+    accepted grant is re-armed; expired records and records whose session
+    is gone are dropped. Covers the active workspace. Returns once every
+    re-parked card is published, so observers installed afterwards never
+    see a restored card as new.
+
+    :param conversation_store: Store holding the records.
+    :param runner_router: Router used to deliver verdicts.
+    :returns: None.
+    """
+    cards = await asyncio.to_thread(conversation_store.list_detached_cards)
+    published: list[asyncio.Event] = []
+    for card in cards:
+        remaining = card.expires_at - time.time()
+        alive = remaining > 0 and (
+            await asyncio.to_thread(conversation_store.get_conversation, card.session_id)
+            is not None
+        )
+        verdict = (
+            ElicitationResult.model_validate(card.verdict) if card.verdict is not None else None
+        )
+        granted = card.grant_key is not None and verdict is not None and verdict.action == "accept"
+        if not alive or (card.state == "settled" and not granted):
+            await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
+            continue
+        if card.state == "pending":
+            published.append(asyncio.Event())
+            _park_detached_card(
+                card,
+                timeout_s=remaining,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                published=published[-1],
+            )
+            continue
+        if granted:
+            assert card.grant_key is not None and verdict is not None
+            approval_grants.put(card.session_id, tuple(card.grant_key), verdict, remaining)
+        if card.state == "answered" and card.delivery_text is not None:
+            task = asyncio.create_task(
+                _deliver_card_verdict(
+                    card,
+                    card.delivery_text,
+                    granted=granted,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                )
+            )
+            _detached_elicitation_tasks.add(task)
+            task.add_done_callback(_detached_elicitation_tasks.discard)
+    if published:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in published)),
+            timeout=_RESTORE_PUBLISH_TIMEOUT_S,
+        )
 
 
 def _start_background_delivery(
@@ -653,7 +921,7 @@ def _permission_hook_response(decision: dict[str, Any], *, is_claude: bool) -> R
     )
 
 
-def _defer_codex_command_approval(
+async def _defer_codex_command_approval(
     codex_request: CodexElicitationRequest,
     *,
     session_id: str,
@@ -691,20 +959,16 @@ def _defer_codex_command_approval(
             "approval_ref": aid,
         }
     )
-    grant_key = codex_command_grant_key(codex_request.codex_params.get("command"), cwd)
-    start_detached_elicitation(
+    await _open_detached_card(
         session_id,
         params,
-        conversation_store=conversation_store,
-        on_result=_deferred_approval_callback(
-            session_id=session_id,
-            grant_key=grant_key,
-            aid=aid,
-            action=action,
-            conversation_store=conversation_store,
-            runner_router=runner_router,
-        ),
         elicitation_id=elicitation_id,
+        kind="approval",
+        payload={"aid": aid, "action": action},
+        grant_key=codex_command_grant_key(codex_request.codex_params.get("command"), cwd),
+        mirror=True,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
     )
     _start_background_delivery(
         session_id,
@@ -876,36 +1140,20 @@ def register_hooks_routes(
             policy_name=f"{vendor}_async_question",
             **extras,
         )
-        qid = ""
-
-        async def _on_result(result: ElicitationResult | None) -> None:
-            """
-            Deliver the card's verdict to the asking session.
-
-            :param result: Web verdict, or ``None`` when the park expired
-                or was severed; ``None`` posts nothing.
-            :returns: None.
-            """
-            if result is None:
-                return
-            if result.action == "accept":
-                text = _format_async_question_answers(questions, result.content, qid)
-            else:
-                text = f"[System: the user dismissed question card #{qid} without answering.]"
-            await _deliver_with_retry(
-                session_id,
-                text,
-                conversation_store=conversation_store,
-                runner_router=runner_router,
-            )
-
-        elicitation_id = start_detached_elicitation(
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        qid = "q" + elicitation_id.removeprefix("elicit_")[:6]
+        # Question cards stay in their own session: no ancestor mirror.
+        await _open_detached_card(
             session_id,
             params,
-            conversation_store=None,
-            on_result=_on_result,
+            elicitation_id=elicitation_id,
+            kind="question",
+            payload={"questions": questions, "qid": qid},
+            grant_key=None,
+            mirror=False,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
         )
-        qid = "q" + elicitation_id.removeprefix("elicit_")[:6]
         return Response(
             content=json.dumps({"elicitation_id": elicitation_id, "qid": qid}),
             media_type="application/json",
@@ -1063,7 +1311,8 @@ def register_hooks_routes(
         # comes from the stored verdict, so remember / allow-all-edits /
         # auto-mode chosen on the deferred card still apply.
         grant_key = claude_grant_key(tool_name, tool_input, cwd)
-        granted = approval_grants.consume(session_id, grant_key)
+        # No await before registration unless a grant hits (then nothing registers).
+        granted = await _consume_grant(session_id, grant_key, conversation_store)
         if granted is not None:
             decision = _permission_decision(
                 granted,
@@ -1197,19 +1446,16 @@ def register_hooks_routes(
             # Mirrored to ancestors so a parent page can answer the child's
             # approval; ``tool_name`` / ``tool_input`` stay unset because the
             # tool never ran, so no terminal result can resolve the park.
-            start_detached_elicitation(
+            await _open_detached_card(
                 session_id,
                 params,
-                conversation_store=conversation_store,
-                on_result=_deferred_approval_callback(
-                    session_id=session_id,
-                    grant_key=grant_key,
-                    aid=deferred_aid,
-                    action=deferred_action,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router,
-                ),
                 elicitation_id=deferred_elicitation_id,
+                kind="approval",
+                payload={"aid": deferred_aid, "action": deferred_action},
+                grant_key=grant_key,
+                mirror=True,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
             )
             return _permission_hook_response(
                 {
@@ -1889,9 +2135,10 @@ def register_hooks_routes(
         # second card. The key keeps the raw protocol command (argv
         # boundaries included), never the space-joined display preview.
         if is_command_approval:
-            granted = approval_grants.consume(
+            granted = await _consume_grant(
                 session_id,
                 codex_command_grant_key(codex_request.codex_params.get("command"), cwd),
+                conversation_store,
             )
             if granted is not None:
                 try:
@@ -1920,7 +2167,7 @@ def register_hooks_routes(
             timeout_s = timeout_policy.timeout_s
             async_approvals = timeout_setting.async_approvals
         if is_command_approval and async_approvals:
-            return _defer_codex_command_approval(
+            return await _defer_codex_command_approval(
                 codex_request,
                 session_id=session_id,
                 cwd=cwd,

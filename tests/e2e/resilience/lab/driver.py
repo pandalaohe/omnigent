@@ -13,6 +13,11 @@ Harness differences stay here:
   chain of shorter calls. Workspace commands run without approval in the
   "Ask for approval" mode the lab launches Codex in. An approval prompt comes
   from an escalated (``require_escalated``) command.
+- With deferred approvals the gated call is denied at once and the turn ends;
+  the user's Approve arrives as a message quoting the command, and the model
+  re-issues the call. The gated command carries its own gate token instead of
+  the marker, so those messages neither claim the turn's first replies nor
+  count as the user's message (Codex also gets the pending notice first).
 """
 
 from __future__ import annotations
@@ -50,6 +55,8 @@ class Turn:
     :param done: Workspace file the turn's tool creates when it finishes, if any.
     :param call_ids: Scripted tool-call ids, in order.
     :param tool_s: How long the turn's tools run in total, e.g. ``140``.
+    :param gate: Token of a deferred-approval call, if any; the pending notice
+        and the approval message quote it instead of the marker.
     """
 
     marker: str
@@ -58,6 +65,7 @@ class Turn:
     done: Path | None = None
     call_ids: tuple[str, ...] = field(default_factory=tuple)
     tool_s: float = 0.0
+    gate: str | None = None
 
 
 class SessionDriver:
@@ -110,16 +118,27 @@ class SessionDriver:
         :returns: The waiting turn and the pending approval's id.
         """
         marker = self._marker()
-        done = self.lab.workspace / f"done-{marker}"
-        call = self._shell_call(marker, 0, f"touch {done.name}", escalate=True)
-        turn = Turn(marker, _reply(marker), None, done, (call["call_id"],))
-        self._script(turn, [{"tool_calls": [call]}, {"text": turn.reply}])
+        gate = self._marker() if self.deferred else marker
+        done = self.lab.workspace / f"done-{gate}"
+        call = self._shell_call(gate, 0, f"touch {done.name}", escalate=True)
+        if self.deferred:
+            retry = self._shell_call(gate, 1, f"touch {done.name}", escalate=True)
+            call_ids = (call["call_id"], retry["call_id"])
+            turn = Turn(marker, _reply(marker), None, done, call_ids, gate=gate)
+            self._script_deferred(turn, call, retry)
+        else:
+            turn = Turn(marker, _reply(marker), None, done, (call["call_id"],))
+            self._script(turn, [{"tool_calls": [call]}, {"text": turn.reply}])
         self.send(turn)
         approval = wait_for(
             lambda: self.pending_approval(turn),
             timeout=_TURN_TIMEOUT_S,
             what=f"the approval prompt for {turn.marker}",
         )
+        if self.deferred and self.harness == "codex":
+            # Settle the pending notice first: arriving together with the approval
+            # message it would take that message's reply.
+            self.lab.wait_for_text(self.session_id, _noted(turn), timeout=_TURN_TIMEOUT_S)
         return turn, str(approval["elicitation_id"])
 
     def start_streaming_turn(self, seconds: float, *, retries: int = 3) -> Turn:
@@ -160,7 +179,7 @@ class SessionDriver:
         """The pending approval prompt for *turn*, read directly from the server."""
         snapshot = self.lab.snapshot(self.session_id)
         for pending in snapshot.get("pending_elicitations") or []:
-            if turn.marker in json.dumps(pending.get("params", {})):
+            if (turn.gate or turn.marker) in json.dumps(pending.get("params", {})):
                 return dict(pending)
         return None
 
@@ -225,8 +244,11 @@ class SessionDriver:
 
     def _tool_turn(self, seconds: float) -> Turn:
         marker = self._marker()
-        started = self.lab.workspace / f"started-{marker}"
-        done = self.lab.workspace / f"done-{marker}"
+        # Every Claude Bash call asks; Codex workspace commands never do.
+        gated = self.deferred and self.harness == "claude"
+        gate = self._marker() if gated else marker
+        started = self.lab.workspace / f"started-{gate}"
+        done = self.lab.workspace / f"done-{gate}"
         if self.harness == "claude":
             commands = [f"touch {started.name} && sleep {seconds:g} && touch {done.name}"]
         else:
@@ -235,12 +257,39 @@ class SessionDriver:
             commands = [f"sleep {step_s:g}" for _ in range(steps)]
             commands[0] = f"touch {started.name} && {commands[0]}"
             commands[-1] = f"{commands[-1]} && touch {done.name}"
-        calls = [self._shell_call(marker, index, cmd) for index, cmd in enumerate(commands)]
+        calls = [self._shell_call(gate, index, cmd) for index, cmd in enumerate(commands)]
+        if gated:
+            retry = self._shell_call(gate, 1, commands[0])
+            call_ids = (calls[0]["call_id"], retry["call_id"])
+            turn = Turn(marker, _reply(marker), started, done, call_ids, seconds, gate=gate)
+            self._script_deferred(turn, calls[0], retry)
+            return turn
         turn = Turn(
             marker, _reply(marker), started, done, tuple(c["call_id"] for c in calls), seconds
         )
         self._script(turn, [*({"tool_calls": [call]} for call in calls), {"text": turn.reply}])
         return turn
+
+    @property
+    def deferred(self) -> bool:
+        """Whether the lab's server defers tool approvals."""
+        return self.lab.config.approvals == "deferred"
+
+    def _script_deferred(self, turn: Turn, call: dict[str, str], retry: dict[str, str]) -> None:
+        """Script a gated call that is denied, approved later and re-issued.
+
+        Replies after the pending notice or the approval message are queued
+        under the gate token they quote: it has the marker's length and comes
+        later, so it wins until the next turn's message.
+        """
+        assert turn.gate is not None
+        self._script(turn, [{"tool_calls": [call]}, {"text": f"Waiting for {turn.marker}."}])
+        after_notice = [{"text": _noted(turn)}] if self.harness == "codex" else []
+        self.lab.script_turn(
+            turn.gate,
+            [*after_notice, {"tool_calls": [retry]}, {"text": turn.reply}],
+            harness=self.harness,
+        )
 
     def _shell_call(
         self, marker: str, index: int, command: str, *, escalate: bool = False
@@ -275,3 +324,7 @@ class SessionDriver:
 
 def _reply(marker: str) -> str:
     return f"Finished {marker}."
+
+
+def _noted(turn: Turn) -> str:
+    return f"Noted {turn.marker}."

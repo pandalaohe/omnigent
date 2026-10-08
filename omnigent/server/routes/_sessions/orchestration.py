@@ -826,6 +826,7 @@ async def _publish_and_wait_for_harness_elicitation(
     tool_name: str | None = None,
     tool_input: dict[str, Any] | None = None,
     timeout_policy: HarnessTimeoutPolicy | None = None,
+    published: asyncio.Event | None = None,
 ) -> ElicitationResult | None:
     """
     Publish one harness-originated elicitation and wait for web verdict.
@@ -881,6 +882,8 @@ async def _publish_and_wait_for_harness_elicitation(
         same-named prompts are parked at once.
     :param timeout_policy: Optional configured-timeout behaviour; see
         :class:`HarnessTimeoutPolicy`. ``None`` = historical behaviour.
+    :param published: Set once the request is published (ancestor mirrors
+        included) or the wait ends without publishing.
     :returns: Web verdict, or the stop verdict on a timed-out wait that
         stopped the turn; ``None`` on terminal-side resolution, native
         timeout, or disconnect.
@@ -944,6 +947,8 @@ async def _publish_and_wait_for_harness_elicitation(
                 session_id,
                 event_payload,
             )
+        if published is not None:
+            published.set()
         disconnect_task: asyncio.Task[Any] | None = None
         if request is not None:
             disconnect_task = asyncio.create_task(
@@ -1065,6 +1070,8 @@ async def _publish_and_wait_for_harness_elicitation(
             _drop_harness_elicitation_timeout(elicitation_id)
         return None
     finally:
+        if published is not None:
+            published.set()
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:
@@ -1117,6 +1124,7 @@ def start_detached_elicitation(
     on_result: Callable[[ElicitationResult | None], Awaitable[None]],
     timeout_s: float = 86400.0,
     elicitation_id: str | None = None,
+    published: asyncio.Event | None = None,
 ) -> str:
     """
     Park an elicitation with no HTTP request attached and return immediately.
@@ -1139,6 +1147,8 @@ def start_detached_elicitation(
     :param elicitation_id: Server-minted correlation id the caller
         already stamped into ``params`` (a card that must name its own
         reference). ``None`` mints one.
+    :param published: Set once the card is published, ancestor mirrors
+        included; see :func:`_publish_and_wait_for_harness_elicitation`.
     :returns: The elicitation id, e.g. ``"elicit_abc123"``.
     """
     if elicitation_id is None:
@@ -1152,6 +1162,7 @@ def start_detached_elicitation(
             timeout_s=timeout_s,
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
+            published=published,
         )
         await on_result(result)
 

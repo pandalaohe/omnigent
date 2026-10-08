@@ -113,6 +113,10 @@ MAIN_LOOP_TOOL: dict[str, str] = {"claude": "Bash", "codex": "exec_command"}
 #: How a stopped server looks to clients: ``ingress`` answers 502 like a load
 #: balancer (Databricks Apps); ``direct`` refuses connections like a bare port.
 LabFront = Literal["ingress", "direct"]
+#: How the server answers a tool approval: ``blocking`` holds the hook until the
+#: user decides; ``deferred`` (the server default) denies at once, parks a card
+#: and lets the model re-issue the call once the user approves.
+ApprovalMode = Literal["blocking", "deferred"]
 
 
 @dataclass(frozen=True)
@@ -124,11 +128,13 @@ class LabConfig:
     :param front: How the server looks while it is down; see :data:`LabFront`.
     :param root: Directory for logs, databases and workspaces. Defaults to a new
         short directory under ``/tmp`` (tmux socket paths must stay short).
+    :param approvals: How tool approvals behave; see :data:`ApprovalMode`.
     """
 
     mode: LabMode = "host"
     front: LabFront = "ingress"
     root: Path | None = None
+    approvals: ApprovalMode = "blocking"
 
 
 @dataclass(frozen=True)
@@ -539,11 +545,12 @@ class Lab:
         self.observer = self._client(self.server_url)
         self._start_model()
         self._start_server()
-        # The scenarios drive a blocking approval; deferred approvals answer at once.
+        # The lab user picks the approval mode the scenario's turns are scripted for.
         assert self.observer is not None
+        deferred = self.config.approvals == "deferred"
         approval_prefs = self.observer.patch(
             "/v1/me/preferences/approval_timeout",
-            json={"value": {"timeoutMinutes": 50, "stopTurn": True, "asyncApprovals": False}},
+            json={"value": {"timeoutMinutes": 50, "stopTurn": True, "asyncApprovals": deferred}},
         )
         assert approval_prefs.is_success, approval_prefs.text
         if self.config.mode == "host":

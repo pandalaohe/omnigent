@@ -1011,6 +1011,45 @@ class SqlSessionSuccession(ConversationBase):
     )
 
 
+class SqlDetachedCard(ConversationBase):
+    """Durable mirror of one detached card (deferred approval or async question).
+
+    The live card is an in-memory park; this row lets the next server process
+    re-park it, re-deliver a verdict still owed to the agent, and re-arm an
+    accepted approval's one-shot grant. JSON columns are opaque to SQL.
+
+    :param state: ``pending`` (card open), ``answered`` (verdict stored, its
+        message still owed) or ``settled`` (message done; kept only while an
+        accepted grant is live).
+    :param grant_key: JSON list matching the re-issued call, or ``None`` for
+        a question card.
+    """
+
+    __tablename__ = "detached_cards"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    elicitation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    mirror: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    params: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    grant_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verdict: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (Index("ix_detached_cards_session", "workspace_id", "session_id"),)
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.
