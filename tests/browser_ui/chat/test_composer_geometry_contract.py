@@ -82,12 +82,8 @@ def _attach(page: Page, names: list[str]) -> None:
         [
             {
                 "name": name,
-                # An .mp4 over the 50 MB cap is the rejection case the geometry
-                # contract needs above the chip row.
                 "mimeType": "video/mp4" if name.endswith(".mp4") else "text/plain",
-                "buffer": (
-                    b"x" * (50 * 1024 * 1024 + 1) if name.endswith(".mp4") else b"geometry"
-                ),
+                "buffer": b"geometry",
             }
             for name in names
         ]
@@ -182,6 +178,18 @@ def test_content_and_action_controls_follow_shared_inset_lines(
     chat = chat_session_contract
     if surface == "landing":
         chat.harness = "claude-native"
+    # The 4-byte file cap is what rejects clip.mp4 into the error above the chips.
+    chat.contract.json(
+        "/v1/info",
+        {
+            "accounts_enabled": False,
+            "single_user": True,
+            "needs_setup": False,
+            "sharing_mode": "off",
+            "public_sharing_enabled": False,
+            "attachment_limits": {"file_bytes": 4},
+        },
+    )
     _surface(page, chat, surface, DESKTOP)
     _attach(page, ["alpha.txt", "clip.mp4"])
     card = box(page.locator("[data-composer-card]"))

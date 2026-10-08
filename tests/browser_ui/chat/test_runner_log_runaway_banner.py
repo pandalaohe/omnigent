@@ -19,11 +19,19 @@ from tests.browser_ui.chat.session_contract import (
 
 TOLERANCE = 1.0
 PHONE = {"width": 402, "height": 874}
-RUNAWAY_LABELS = {
-    "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
-    "omnigent.runner_log_runaway_mb": "5",
-    "omnigent.runner_log_runaway_seen": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-}
+
+
+def _runaway_labels() -> dict[str, str]:
+    """Fresh ``seen`` because the web banner lapses 15 minutes after that stamp."""
+    return {
+        "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
+        "omnigent.runner_log_runaway_mb": "5",
+        "omnigent.runner_log_runaway_seen": datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
 # The iOS shell renders under the status bar. Headless Chromium reports a zero
 # env(safe-area-inset-top), so feed the inset through the shell's override var.
 IOS_SHELL_SCRIPT = """
@@ -45,9 +53,8 @@ def _open(
     shell: str,
     banner: bool,
 ) -> None:
-    chat.contract.json("/v1/system/status", {"revision": 0, "level": "ok", "findings": []})
     if banner:
-        chat.update_session(labels=RUNAWAY_LABELS)
+        chat.update_session(labels=_runaway_labels())
     if shell == "ios":
         page.add_init_script(IOS_SHELL_SCRIPT)
     page.set_viewport_size(viewport)
