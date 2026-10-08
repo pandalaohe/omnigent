@@ -13,9 +13,10 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
-  isComposerAltNewlineKey,
+  composerNewLineDisposition,
   isComposerSendKey,
   isComposerSteerAllKey,
+  isTextareaNewlineKey,
 } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
@@ -252,20 +253,27 @@ export function ComposerTextInput({
     <ComposerTextarea
       {...input}
       onKeyDown={(event) => {
-        // A newline in every mode and on touch devices; completion menus never see it.
-        if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+        const keyEvent = { ...event, isComposing: event.nativeEvent.isComposing };
+        const newLine = composerNewLineDisposition(
+          keyEvent,
+          keyboard.submitWithModEnter,
+          keyboard.preventsKeyboardSubmit,
+        );
+        // A bound newline chord the textarea ignores (Alt+Enter by default) works in every mode and on
+        // touch devices; completion menus never see it.
+        if (newLine !== "none" && !isTextareaNewlineKey(keyEvent)) {
           event.preventDefault();
-          insertLineBreak(event.currentTarget);
+          if (newLine === "insert") insertLineBreak(event.currentTarget);
           return;
         }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
         const shouldSubmitFromKeyboard = isComposerSendKey(
-          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyEvent,
           keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
         );
         const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
-          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyEvent,
           keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
         );
@@ -274,6 +282,8 @@ export function ComposerTextInput({
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
+        // Enter / Shift+Enter reach menus and send first, then stay native unless the newline is disabled.
+        if (newLine === "block" && !event.defaultPrevented) event.preventDefault();
       }}
     />
   );

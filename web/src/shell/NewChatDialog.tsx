@@ -99,10 +99,7 @@ import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTi
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
-import {
-  composerNewLineDisposition,
-  readSubmitWithModEnter,
-} from "@/lib/composerSendShortcutPreferences";
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerPartsFromProjection,
   composerPartsToText,
@@ -7174,28 +7171,6 @@ export function NewChatLandingScreen() {
                   // submission (same UX as the in-session composer).
                   if (slashCompletion.handleKey(e, { shouldPreferSendOverCompletion })) return;
 
-                  const newLineDisposition = composerNewLineDisposition(
-                    {
-                      key: e.key,
-                      code: e.code,
-                      shiftKey: e.shiftKey,
-                      metaKey: e.metaKey,
-                      ctrlKey: e.ctrlKey,
-                      altKey: e.altKey,
-                      isComposing: e.nativeEvent.isComposing,
-                    },
-                    submitWithModEnter,
-                    preventsKeyboardSubmit,
-                  );
-                  if (newLineDisposition !== "none") {
-                    e.preventDefault();
-                    if (newLineDisposition === "block") return;
-                    const start = e.currentTarget.selectionStart ?? message.length;
-                    const end = e.currentTarget.selectionEnd ?? start;
-                    setMessage(message.slice(0, start) + "\n" + message.slice(end));
-                    pendingCaretRef.current = { caret: start + 1 };
-                    return;
-                  }
                   if (shouldSubmitFromKeyboard) {
                     e.preventDefault();
                     // The mention menu is briefly closed while its listing loads;

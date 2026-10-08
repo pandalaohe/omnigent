@@ -7,6 +7,14 @@ import {
   ComposerSendButton,
   COMPOSER_LABELS_MIN_GAP_PX,
 } from "./ChatComposer";
+import {
+  KEYBOARD_SHORTCUTS_STORAGE_KEY,
+  writeShortcutPreference,
+} from "@/lib/keyboardShortcutPreferences";
+
+afterEach(() => {
+  localStorage.removeItem(KEYBOARD_SHORTCUTS_STORAGE_KEY);
+});
 
 describe("ChatComposer", () => {
   it("keeps route-owned input and submit handlers on the shared surface", () => {
@@ -234,6 +242,59 @@ describe("ChatComposer", () => {
     fireEvent.compositionStart(input);
     expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(true);
     expect(input).toHaveValue("draft");
+  });
+
+  it("inserts a newline on a rebound newline chord without notifying the route", () => {
+    writeShortcutPreference("newLine", { common: [{ code: "KeyJ", modifiers: ["control"] }] });
+    const onKeyDown = vi.fn();
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft", defaultValue: "firstsecond", onKeyDown }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+    input.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true })).toBe(false);
+    expect(input).toHaveValue("first\nsecond");
+    expect(input.selectionStart).toBe(6);
+    expect(onKeyDown).not.toHaveBeenCalled();
+  });
+
+  it("leaves Alt+Enter to the browser once the newline is rebound away from it", () => {
+    writeShortcutPreference("newLine", { common: [{ code: "KeyJ", modifiers: ["control"] }] });
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft", defaultValue: "firstsecond" }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+    input.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(true);
+    expect(input).toHaveValue("firstsecond");
+  });
+
+  it("blocks the native newline keys when the newline action is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft", defaultValue: "firstsecond" }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+    input.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(false);
+    expect(input).toHaveValue("firstsecond");
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+    expect(input).toHaveValue("firstsecond");
   });
 });
 

@@ -93,6 +93,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import {
   connectArcaHost,
@@ -6542,6 +6543,32 @@ describe("NewChatLandingScreen", () => {
     const user = userEvent.setup();
     await user.type(input, "first" + keys + "second");
     expect((input as HTMLTextAreaElement).value).toBe("first\nsecond");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("inserts a newline only on the rebound newline key in the landing composer", () => {
+    writeShortcutPreference("newLine", { common: [{ code: "KeyJ", modifiers: ["control"] }] });
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "firstsecond" } });
+    input.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(true);
+    expect(input).toHaveValue("firstsecond");
+
+    expect(fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true })).toBe(false);
+    expect(input).toHaveValue("first\nsecond");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("inserts the default Alt+Enter newline without starting a session", () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "firstsecond" } });
+    input.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+    expect(input).toHaveValue("first\nsecond");
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 

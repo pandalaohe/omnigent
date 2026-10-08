@@ -78,17 +78,25 @@ export function isComposerSendKey(
 
 export type ComposerNewLineDisposition = "none" | "insert" | "block";
 
+/** Enter or Shift+Enter with no Ctrl/Meta/Alt: the chords a textarea itself turns into a newline. */
+export function isTextareaNewlineKey(event: ComposerSendKeyEvent): boolean {
+  return event.key === "Enter" && !event.altKey && !event.metaKey && !event.ctrlKey;
+}
+
 /**
  * Resolve both the legacy textarea-owned newline and a recorded replacement.
- * Returning `block` lets callers suppress the browser's native Shift+Enter
- * insertion when the action is disabled.
+ * Defaults are Shift+Enter (Enter in alternate mode) plus Alt/Option+Enter; a
+ * recorded replacement replaces them; `block` lets callers suppress the
+ * browser's native newline when the action is disabled.
  */
 export function composerNewLineDisposition(
   event: ComposerSendKeyEvent,
   submitWithModEnter: boolean,
   isMobile: boolean,
 ): ComposerNewLineDisposition {
-  if (isMobile || event.isComposing) return "none";
+  if (event.isComposing) return "none";
+  // Touch keyboards already turn Enter and Shift+Enter into a newline; never intercept them there.
+  if (isMobile && isTextareaNewlineKey(event)) return "none";
 
   const normalized = {
     code: event.code ?? "",
@@ -102,11 +110,8 @@ export function composerNewLineDisposition(
     ? resolveShortcutBindings("newLine").some((binding) =>
         eventMatchesShortcut(normalized, binding),
       )
-    : event.key === "Enter" &&
-      !event.altKey &&
-      !event.metaKey &&
-      !event.ctrlKey &&
-      Boolean(event.shiftKey) !== submitWithModEnter;
+    : isComposerAltNewlineKey(event) ||
+      (isTextareaNewlineKey(event) && Boolean(event.shiftKey) !== submitWithModEnter);
   if (!matches) return "none";
   return isShortcutActionEnabled("newLine") ? "insert" : "block";
 }

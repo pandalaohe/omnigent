@@ -152,10 +152,28 @@ describe("keyboardShortcutPreferences", () => {
     ]);
     expect(defaultShortcutBindings("newLine", { submitWithModEnter: true })).toEqual([
       { code: "Enter", modifiers: [] },
+      { code: "Enter", modifiers: ["alt"] },
     ]);
     expect(defaultShortcutBindings("pinnedSession", { nativeShell: true })).toEqual([
       { code: "Digit*", modifiers: ["primary"] },
     ]);
+  });
+
+  it("defaults the composer newline to Shift+Enter and Alt+Enter", () => {
+    expect(DEFAULT_SHORTCUT_DEFINITIONS.newLine.defaultBindings).toEqual([
+      { code: "Enter", modifiers: ["shift"] },
+      { code: "Enter", modifiers: ["alt"] },
+    ]);
+    expect(resolveShortcutBindings("newLine", "windows")).toEqual([
+      { code: "Enter", modifiers: ["shift"] },
+      { code: "Enter", modifiers: ["alt"] },
+    ]);
+  });
+
+  it("flags the default Alt+Enter newline as a conflict on other composer actions", () => {
+    expect(
+      findShortcutConflicts("sendMessage", [{ code: "Enter", modifiers: ["alt"] }], "windows"),
+    ).toContain("newLine");
   });
 
   it("notifies live consumers after a preference write", async () => {

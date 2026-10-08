@@ -77,10 +77,21 @@ export function composerSteerAllShortcutKeys(submitWithModEnter: boolean): strin
 }
 
 export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {
+  if (!isShortcutActionEnabled("newLine")) return [];
   if (hasCustomShortcutBindings("newLine")) {
-    return resolveShortcutBindings("newLine").flatMap((binding) => shortcutBindingLabels(binding));
+    const binding = resolveShortcutBindings("newLine")[0];
+    return binding ? shortcutBindingLabels(binding) : [];
   }
   return submitWithModEnter ? [ENTER_KEY] : [SHIFT_KEY, ENTER_KEY];
+}
+
+export function composerNewLineAlternateKeys(submitWithModEnter: boolean): string[] | undefined {
+  if (hasCustomShortcutBindings("newLine")) {
+    const binding = resolveShortcutBindings("newLine")[1];
+    return binding ? shortcutBindingLabels(binding) : undefined;
+  }
+  // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
+  return submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY];
 }
 
 export function Kbd({

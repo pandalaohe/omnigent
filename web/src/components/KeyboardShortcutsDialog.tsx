@@ -12,11 +12,10 @@
 import { Fragment, useEffect, useState } from "react";
 
 import {
-  ALT_KEY,
+  composerNewLineAlternateKeys,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
-  ENTER_KEY,
   Kbd,
   shortcutKeys,
   useKeyboardShortcutsVersion,
@@ -183,8 +182,7 @@ function shortcutGroupsFor(
           {
             label: "New line in message",
             keys: composerNewLineShortcutKeys(submitWithModEnter),
-            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
-            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
+            alternateKeys: composerNewLineAlternateKeys(submitWithModEnter),
           },
           ...group.items,
         ],

@@ -99,6 +99,34 @@ describe("composerNewLineDisposition", () => {
       "block",
     );
   });
+
+  it("matches the default Alt+Enter newline in both modes and on touch", () => {
+    for (const submitWithModEnter of [false, true]) {
+      expect(
+        composerNewLineDisposition({ key: "Enter", altKey: true }, submitWithModEnter, false),
+      ).toBe("insert");
+      expect(
+        composerNewLineDisposition({ key: "Enter", altKey: true }, submitWithModEnter, true),
+      ).toBe("insert");
+    }
+    expect(composerNewLineDisposition({ key: "Enter", shiftKey: true }, false, true)).toBe("none");
+    expect(composerNewLineDisposition({ key: "Enter" }, false, true)).toBe("none");
+  });
+
+  it("replaces the default newline chords with a recorded binding", () => {
+    writeShortcutPreference("newLine", { common: [{ code: "KeyJ", modifiers: ["control"] }] });
+
+    expect(
+      composerNewLineDisposition({ key: "j", code: "KeyJ", ctrlKey: true }, false, false),
+    ).toBe("insert");
+    expect(composerNewLineDisposition({ key: "Enter", altKey: true }, false, false)).toBe("none");
+  });
+
+  it("blocks the default Alt+Enter newline when the action is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+
+    expect(composerNewLineDisposition({ key: "Enter", altKey: true }, false, false)).toBe("block");
+  });
 });
 
 describe("isComposerAltNewlineKey", () => {
