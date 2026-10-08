@@ -150,6 +150,75 @@ def test_runaway_banner_leaves_no_dead_band_under_the_header(
     assert_no_overlap(warning, box(pill))
 
 
+@pytest.mark.parametrize(
+    ("viewport", "shell"),
+    [
+        pytest.param(PHONE, "web", id="phone-web"),
+        pytest.param(PHONE, "ios", id="phone-ios-shell"),
+        pytest.param({"width": 1280, "height": 852}, "web", id="desktop"),
+    ],
+)
+def test_dismissed_warning_collapses_into_the_workspace_bar(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    viewport: dict[str, int],
+    shell: str,
+) -> None:
+    """Dismissing shrinks the warning into the workspace bar without moving it."""
+    chat = chat_session_contract
+    chat.seed_transcript(40)
+    _open(page, chat, viewport, shell=shell, banner=True)
+    # A running background task floats its pill above the composer.
+    chat.wait_for_stream()
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": chat.session_id,
+                "status": "idle",
+                "background_task_count": 1,
+            },
+        }
+    )
+    pill = page.locator('[role="status"][data-testid="background-task-pill"]')
+    expect(pill).to_be_visible(timeout=10_000)
+
+    bar = page.get_by_test_id("composer-workspace-controls")
+    before = box(bar)
+    page.get_by_test_id("runner-log-runaway-dismiss").click()
+    expect(page.get_by_test_id("runner-log-runaway-banner")).to_have_count(0)
+
+    indicator = page.get_by_test_id("runner-log-runaway-indicator")
+    expect(indicator).to_be_visible()
+    after = box(bar)
+    assert after["height"] == pytest.approx(before["height"], abs=TOLERANCE), (before, after)
+    assert after["y"] == pytest.approx(before["y"], abs=TOLERANCE), (before, after)
+    indicator_box = box(indicator)
+    indicator_right = indicator_box["x"] + indicator_box["width"]
+    indicator_bottom = indicator_box["y"] + indicator_box["height"]
+    bar_right = after["x"] + after["width"]
+    bar_bottom = after["y"] + after["height"]
+    assert (
+        indicator_box["x"] >= after["x"] - TOLERANCE
+        and indicator_box["y"] >= after["y"] - TOLERANCE
+        and indicator_right <= bar_right + TOLERANCE
+        and indicator_bottom <= bar_bottom + TOLERANCE
+    ), (indicator_box, after)
+
+    for index in range(bar.locator("button:visible").count()):
+        button = bar.locator("button:visible").nth(index)
+        if button.get_attribute("data-testid") == "runner-log-runaway-indicator":
+            continue
+        assert_no_overlap(indicator_box, box(button))
+
+    _assert_transcript_starts_under_header(page)
+
+    indicator.click()
+    expect(page.get_by_test_id("runner-log-runaway-details")).to_contain_text(
+        "5 MB in the last hour"
+    )
+
+
 @pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
 def test_runaway_banner_transcript_scrolls_by_touch_while_older_history_loads(
     page: Page,

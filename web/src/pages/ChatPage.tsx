@@ -324,7 +324,11 @@ import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { ConnectionIndicator, RunnerLogRunawayBanner } from "./ChatIndicators";
+import {
+  ConnectionIndicator,
+  RunnerLogRunawayBanner,
+  RunnerLogRunawayIndicator,
+} from "./ChatIndicators";
 import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
@@ -4429,6 +4433,11 @@ function ComposerImpl(
               <BackgroundTaskIndicator />
               <SubagentTaskIndicator conversationId={conversationId} />
               {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
+              <RunnerLogRunawayIndicator
+                key={conversationId}
+                labels={runnerLogLabels}
+                fallbackLabels={runnerLogFallbackLabels}
+              />
             </div>
           </div>
         </ComposerWorkspaceBar>
