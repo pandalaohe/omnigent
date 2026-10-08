@@ -119,6 +119,7 @@ import {
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 import { draftSelection, getCommentDraft } from "./commentDrafts";
 import { useScrollRestore } from "./useScrollRestore";
+import { isElementAnchor } from "./annotationAnchor";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
@@ -130,6 +131,8 @@ const MonacoDiffViewer = lazy(() =>
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+const EMPTY_ORPHANS: ReadonlySet<string> = new Set();
 
 /**
  * Classify comments into open/addressed and remap open draft comments to
@@ -160,6 +163,12 @@ export function classifyAndRemapComments(
     // PDF anchors store geometry in anchor_content; byte-offset remapping does
     // not apply to binary PDF content.
     if (isPdfAnchor(c.anchor_content)) {
+      open.push(c);
+      continue;
+    }
+    // Element anchors carry page geometry instead of a source range; the frame
+    // resolves them, so stored offsets stand as-is.
+    if (isElementAnchor(c.anchor_content)) {
       open.push(c);
       continue;
     }
@@ -444,6 +453,8 @@ function FileViewerBody({
   // comment thread — and fall back to the opened file when no frame is up.
   const [frame, setFrame] = useState<{ path: string; source: string } | null>(null);
   const commentPath = frame?.path ?? path;
+  // Ids of this page's element annotations the frame could not re-find.
+  const [orphanIds, setOrphanIds] = useState<ReadonlySet<string>>(EMPTY_ORPHANS);
   // Latest page for post settlement: by the time a request lands, an in-frame
   // navigation may already have pointed the viewer at another page.
   const commentPathRef = useRef(commentPath);
@@ -510,6 +521,7 @@ function FileViewerBody({
   useEffect(() => {
     setActiveSelection(null);
     setFrame(null);
+    setOrphanIds(EMPTY_ORPHANS);
     handleDirtyChange(false);
     setSaveStatus("idle");
     setTocOpen(false);
@@ -1876,6 +1888,7 @@ function FileViewerBody({
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
               onFrameChange={setFrame}
+              onAnnotationOrphansChange={setOrphanIds}
               previewKey={previewKey}
             />
           )}
@@ -1885,6 +1898,7 @@ function FileViewerBody({
             comments={openComments}
             addressedComments={addressedComments}
             activeSelection={activeSelection}
+            orphanIds={orphanIds}
             pendingBodyRef={pendingBodyRef}
             conversationId={conversationId}
             commentPath={commentPath}

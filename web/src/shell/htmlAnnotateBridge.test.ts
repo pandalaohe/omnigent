@@ -14,14 +14,15 @@ const ANCHOR = {
 
 const JPEG_PREFIX = "data:image/jpeg;base64,";
 
+const VIEWPORT_RECT = { x: 10, y: 20, w: 120, h: 32 };
+
 function picked(overrides: Record<string, unknown> = {}) {
   return {
     ...base,
     type: ANNOTATE_MSG.picked,
     anchor: ANCHOR,
     screenshot: null,
-    note: "note",
-    action: "stack",
+    viewportRect: VIEWPORT_RECT,
     ...overrides,
   };
 }
@@ -46,6 +47,7 @@ describe("parseAnnotateMessage — gate", () => {
       parseAnnotateMessage({ ...base, type: ANNOTATE_MSG.setMode, on: true }, NONCE),
     ).toBeNull();
     expect(parseAnnotateMessage({ ...base, type: ANNOTATE_MSG.init }, NONCE)).toBeNull();
+    expect(parseAnnotateMessage({ ...base, type: ANNOTATE_MSG.pickDone }, NONCE)).toBeNull();
   });
 
   it("parses the other frame→parent types", () => {
@@ -93,12 +95,11 @@ describe("parseAnnotateMessage — gate", () => {
 });
 
 describe("parseAnnotateMessage — picked", () => {
-  it("clamps the anchor and keeps a valid note and action", () => {
+  it("clamps the anchor and keeps a valid viewport rect", () => {
     const msg = parsePicked(picked());
     expect(msg.anchor.target.label).toBe("div.filter-menu > button.option");
     expect(msg.anchor.v).toBe(1);
-    expect(msg.note).toBe("note");
-    expect(msg.action).toBe("stack");
+    expect(msg.viewportRect).toEqual(VIEWPORT_RECT);
     expect(msg.screenshot).toBeNull();
   });
 
@@ -116,9 +117,35 @@ describe("parseAnnotateMessage — picked", () => {
     ).toBeNull();
   });
 
-  it("rejects an unknown action", () => {
-    expect(parseAnnotateMessage(picked({ action: "blast" }), NONCE)).toBeNull();
-    expect(parseAnnotateMessage(picked({ action: undefined }), NONCE)).toBeNull();
+  it("drops a pick whose viewport rect is missing or not four finite numbers", () => {
+    expect(parseAnnotateMessage(picked({ viewportRect: undefined }), NONCE)).toBeNull();
+    expect(parseAnnotateMessage(picked({ viewportRect: null }), NONCE)).toBeNull();
+    expect(parseAnnotateMessage(picked({ viewportRect: "10,20" }), NONCE)).toBeNull();
+    for (const key of ["x", "y", "w", "h"]) {
+      expect(
+        parseAnnotateMessage(picked({ viewportRect: { ...VIEWPORT_RECT, [key]: "10" } }), NONCE),
+      ).toBeNull();
+      expect(
+        parseAnnotateMessage(
+          picked({ viewportRect: { ...VIEWPORT_RECT, [key]: Number.NaN } }),
+          NONCE,
+        ),
+      ).toBeNull();
+      expect(
+        parseAnnotateMessage(
+          picked({ viewportRect: { ...VIEWPORT_RECT, [key]: Number.POSITIVE_INFINITY } }),
+          NONCE,
+        ),
+      ).toBeNull();
+      expect(
+        parseAnnotateMessage(picked({ viewportRect: { ...VIEWPORT_RECT, [key]: 1e6 + 1 } }), NONCE),
+      ).toBeNull();
+    }
+  });
+
+  it("keeps a viewport rect at the 1e6 geometry boundary", () => {
+    const atLimit = { x: -1e6, y: 1e6, w: 0, h: 1e6 };
+    expect(parsePicked(picked({ viewportRect: atLimit })).viewportRect).toEqual(atLimit);
   });
 
   it("drops an oversized screenshot but keeps the annotation", () => {
@@ -157,12 +184,6 @@ describe("parseAnnotateMessage — picked", () => {
     for (const screenshot of bad) {
       expect(parsePicked(picked({ screenshot })).screenshot).toBeNull();
     }
-  });
-
-  it("trims the note and clamps it to 4000 chars", () => {
-    expect(parsePicked(picked({ note: "  hi  " })).note).toBe("hi");
-    expect(parsePicked(picked({ note: "" })).note).toBe("");
-    expect(parsePicked(picked({ note: "n".repeat(5000) })).note).toHaveLength(4000);
   });
 });
 

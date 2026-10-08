@@ -34,8 +34,10 @@ export const ANNOTATE_MSG = {
   setAnnotations: "annotate:setAnnotations",
   /** iframe → parent: per-annotation resolve result. */
   resolved: "annotate:resolved",
-  /** iframe → parent: the composer submitted an annotation. */
+  /** iframe → parent: an element or region was picked; the note stays owner UI. */
   picked: "annotate:picked",
+  /** parent → iframe: the pick is closed (saved, cancelled or mode off). */
+  pickDone: "annotate:pickDone",
   /** iframe → parent: a marker was clicked. */
   markerClick: "annotate:markerClick",
 } as const;
@@ -78,13 +80,20 @@ export interface AnnotatePickedScreenshot {
   height: number;
 }
 
+/** The picked rect (or region box) in the frame's viewport CSS px at pick time. */
+export interface AnnotateViewportRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface AnnotatePicked {
   type: typeof ANNOTATE_MSG.picked;
   anchor: ElementAnchorV1;
   /** `null` when the frame's capture failed or was rejected by the caps. */
   screenshot: AnnotatePickedScreenshot | null;
-  note: string;
-  action: "stack" | "send";
+  viewportRect: AnnotateViewportRect;
 }
 
 export interface AnnotateMarkerClick {
@@ -102,11 +111,11 @@ export type InboundAnnotateMessage =
   | AnnotatePicked
   | AnnotateMarkerClick;
 
-const MAX_NOTE_CHARS = 4000;
 const MAX_RESOLVED_ITEMS = 200;
 const MAX_ID_CHARS = 64;
 const MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_SCREENSHOT_DIM = 4096;
+const MAX_GEOMETRY = 1e6;
 
 const JPEG_DATA_URL = "data:image/jpeg;base64,";
 const PNG_DATA_URL = "data:image/png;base64,";
@@ -131,6 +140,18 @@ function parsePickedScreenshot(raw: unknown): AnnotatePickedScreenshot | null {
   if (Math.floor((base64.length * 3) / 4) > MAX_SCREENSHOT_BYTES) return null;
   if (!isScreenshotDim(width) || !isScreenshotDim(height)) return null;
   return { dataUrl, width, height };
+}
+
+/** Four finite numbers within the geometry cap, or null (the pick is dropped). */
+function parseViewportRect(raw: unknown): AnnotateViewportRect | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const { x, y, w, h } = raw as Record<string, unknown>;
+  for (const value of [x, y, w, h]) {
+    if (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > MAX_GEOMETRY) {
+      return null;
+    }
+  }
+  return { x: x as number, y: y as number, w: w as number, h: h as number };
 }
 
 /**
@@ -181,14 +202,13 @@ export function parseAnnotateMessage(data: unknown, nonce: string): InboundAnnot
     case ANNOTATE_MSG.picked: {
       const anchor = clampElementAnchor(d.anchor);
       if (!anchor) return null;
-      if (d.action !== "stack" && d.action !== "send") return null;
-      const note = typeof d.note === "string" ? d.note.trim().slice(0, MAX_NOTE_CHARS) : "";
+      const viewportRect = parseViewportRect(d.viewportRect);
+      if (!viewportRect) return null;
       return {
         type: ANNOTATE_MSG.picked,
         anchor,
         screenshot: parsePickedScreenshot(d.screenshot),
-        note,
-        action: d.action,
+        viewportRect,
       };
     }
     case ANNOTATE_MSG.markerClick:

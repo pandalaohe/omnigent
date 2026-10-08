@@ -71,6 +71,8 @@ export interface CommentsPanelProps {
   conversationId?: string;
   /** Page the comments (and any unsent draft) belong to. */
   commentPath?: string;
+  /** Ids of element-anchored comments the frame could not re-find on the page. */
+  orphanIds?: ReadonlySet<string>;
   /** Fixed wall clock for deterministic embeds and tests. Defaults to now. */
   now?: Date;
 }
@@ -103,6 +105,7 @@ export function CommentsPanel({
   pendingBodyRef,
   conversationId,
   commentPath,
+  orphanIds,
   onCopyCommentLink,
   now,
 }: CommentsPanelProps) {
@@ -411,6 +414,7 @@ export function CommentsPanel({
                     key={c.id}
                     comment={c}
                     isSelected={isSelected}
+                    isOrphan={orphanIds?.has(c.id)}
                     cardRef={isSelected ? selectedCardRef : undefined}
                     onClick={() => onClickComment(c)}
                     onDelete={canDelete(c) ? () => onDeleteComment(c.id) : undefined}
@@ -435,6 +439,7 @@ export function CommentsPanel({
                   key={c.id}
                   comment={c}
                   isSelected={isSelected}
+                  isOrphan={orphanIds?.has(c.id)}
                   cardRef={isSelected ? selectedCardRef : undefined}
                   onClick={() => onClickComment(c)}
                   onDelete={canDelete(c) ? () => onDeleteComment(c.id) : undefined}
@@ -457,6 +462,8 @@ export function CommentsPanel({
 interface CommentCardProps {
   comment: Comment;
   isSelected?: boolean;
+  /** The element anchor no longer resolves on the page the comment points at. */
+  isOrphan?: boolean;
   /** Set on the currently-selected card so the panel can scroll it into view. */
   cardRef?: RefObject<HTMLDivElement | null>;
   onClick?: () => void;
@@ -469,6 +476,7 @@ interface CommentCardProps {
 function CommentCard({
   comment: c,
   isSelected,
+  isOrphan,
   cardRef,
   onClick,
   onEdit,
@@ -547,6 +555,11 @@ function CommentCard({
       {c.anchor_content && (
         <p className="truncate font-mono text-sm text-muted-foreground">
           {displayAnchorContent(c.anchor_content)}
+        </p>
+      )}
+      {isOrphan && (
+        <p data-testid="comment-orphan" className="text-xs text-muted-foreground">
+          Element not found on this page
         </p>
       )}
 

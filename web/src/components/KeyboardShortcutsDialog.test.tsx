@@ -262,6 +262,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
+    expect(keysFor("Toggle annotation mode")).toEqual(["Ctrl", "⇧", "."]);
     expect(screen.queryByText("Open a new browser tab")).toBeNull();
     expect(screen.getByText("Open a new shell")).toBeTruthy();
     const workspaceTabRow = screen.getByText("Select a workspace tab").closest("li");

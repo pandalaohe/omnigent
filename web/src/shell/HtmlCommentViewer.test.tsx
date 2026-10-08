@@ -11,11 +11,14 @@
 //   • no `ready` within 4 s → an "unavailable" notice.
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
+import type { Comment } from "@/hooks/useComments";
 import { authenticatedFetch } from "@/lib/identity";
 import * as host from "@/lib/host";
+import { type ElementAnchorV1, encodeElementAnchor } from "./annotationAnchor";
 import { FileViewerContext } from "./FileViewerContext";
 import { HtmlCommentViewer, resolveFrameLinkPath } from "./HtmlCommentViewer";
 import {
@@ -24,6 +27,7 @@ import {
   HTML_PREVIEW_SANDBOX,
 } from "./codeViewerHelpers";
 import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
+import { ANNOTATE_SOURCE } from "./htmlAnnotateBridge";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
@@ -76,6 +80,18 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+/** React Query provider for the annotate hook's `useAddComment`. */
+function Providers({ children }: { children: ReactNode }) {
+  const queryClient = useMemo(
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      }),
+    [],
+  );
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+
 function ViewerContext({
   openFile,
   children,
@@ -94,7 +110,11 @@ function ViewerContext({
     }),
     [openFile],
   );
-  return <FileViewerContext.Provider value={value}>{children}</FileViewerContext.Provider>;
+  return (
+    <Providers>
+      <FileViewerContext.Provider value={value}>{children}</FileViewerContext.Provider>
+    </Providers>
+  );
 }
 
 function renderViewer(
@@ -102,7 +122,9 @@ function renderViewer(
     path?: string;
     content?: string;
     truncated?: boolean;
+    comments?: Comment[];
     onFrameChange?: (frame: { path: string; source: string } | null) => void;
+    onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
     onSetActiveSelection?: (
       sel: { start_index: number; end_index: number; anchor_content: string } | null,
     ) => void;
@@ -110,6 +132,7 @@ function renderViewer(
   } = {},
 ) {
   const onFrameChange = props.onFrameChange ?? vi.fn();
+  const onAnnotationOrphansChange = props.onAnnotationOrphansChange ?? vi.fn();
   const onSetActiveSelection = props.onSetActiveSelection ?? vi.fn();
   const openFile = props.openFile ?? vi.fn();
   const utils = render(
@@ -119,28 +142,76 @@ function renderViewer(
         path={props.path ?? ENTRY_PATH}
         content={props.content ?? ENTRY_SOURCE}
         truncated={props.truncated ?? false}
-        comments={[]}
+        comments={props.comments ?? []}
         activeSelection={null}
         onSetActiveSelection={onSetActiveSelection}
         onFrameChange={onFrameChange}
+        onAnnotationOrphansChange={onAnnotationOrphansChange}
       />
     </ViewerContext>,
   );
-  return { ...utils, onFrameChange, onSetActiveSelection, openFile };
+  return { ...utils, onFrameChange, onAnnotationOrphansChange, onSetActiveSelection, openFile };
+}
+
+function makeAnchor(y: number): ElementAnchorV1 {
+  return {
+    v: 1,
+    kind: "element",
+    page: { url: "", title: "", vw: 800, vh: 600, sx: 0, sy: 0, dpr: 1 },
+    target: {
+      label: "button.option",
+      css: "button.option",
+      xpath: "//button",
+      quote: { exact: "Alpha", prefix: "", suffix: "" },
+      fingerprint: "1:1:abcd",
+      neighborText: "",
+      tag: "BUTTON",
+      id: "",
+      role: "",
+      ariaLabel: "",
+      text: "Alpha",
+    },
+    rect: { x: 0, y, w: 120, h: 32 },
+    region: null,
+    selectedText: "",
+    console: [],
+    network: [],
+    screenshot: null,
+  };
+}
+
+/** One element-anchored comment row for `path` at vertical position `y`. */
+function elementComment(id: string, path: string, y: number): Comment {
+  const index = y * 10_000;
+  return {
+    id,
+    conversation_id: "conv_1",
+    path,
+    start_index: index,
+    end_index: index,
+    body: "note",
+    status: "draft",
+    created_at: 0,
+    updated_at: 0,
+    anchor_content: encodeElementAnchor(makeAnchor(y)),
+    created_by: null,
+  };
 }
 
 /** The viewer for one path, for tests that rerender it onto another path. */
 function viewerElement(path: string) {
   return (
-    <HtmlCommentViewer
-      conversationId="conv_1"
-      path={path}
-      content={ENTRY_SOURCE}
-      truncated={false}
-      comments={[]}
-      activeSelection={null}
-      onSetActiveSelection={() => {}}
-    />
+    <Providers>
+      <HtmlCommentViewer
+        conversationId="conv_1"
+        path={path}
+        content={ENTRY_SOURCE}
+        truncated={false}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+      />
+    </Providers>
   );
 }
 
@@ -149,13 +220,19 @@ function viewerElement(path: string) {
 async function openFrame() {
   const iframe = (await screen.findByTitle("HTML preview")) as HTMLIFrameElement;
   const postMessage = vi.fn();
+  const contentWindowFocus = vi.fn();
   Object.defineProperty(iframe, "contentWindow", {
     configurable: true,
-    value: { postMessage },
+    value: { postMessage, focus: contentWindowFocus },
   });
   await act(async () => {});
   fireEvent.load(iframe);
-  return { iframe, postMessage };
+  return { iframe, postMessage, contentWindowFocus };
+}
+
+/** Init posts of one protocol, in load order. */
+function initPosts(postMessage: ReturnType<typeof vi.fn>, type: string) {
+  return postMessage.mock.calls.filter(([message]) => (message as { type?: string }).type === type);
 }
 
 /** Send one bridge message into the parent over the port transferred at init. */
@@ -164,14 +241,72 @@ async function sendFromFrame(
   message: Record<string, unknown>,
   loadIndex = 0,
 ) {
-  const init = postMessage.mock.calls[loadIndex][0] as { nonce: string };
-  const port = postMessage.mock.calls[loadIndex][2][0] as MessagePort;
+  const init = initPosts(postMessage, BRIDGE_MSG.init)[loadIndex]!;
+  const port = init[2][0] as MessagePort;
   await act(async () => {
-    port.postMessage({ source: BRIDGE_SOURCE, nonce: init.nonce, ...message });
+    port.postMessage({
+      source: BRIDGE_SOURCE,
+      nonce: (init[0] as { nonce: string }).nonce,
+      ...message,
+    });
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
   });
+}
+
+/** Send one annotate-channel message over its own transferred port. */
+async function sendAnnotateFromFrame(
+  postMessage: ReturnType<typeof vi.fn>,
+  message: Record<string, unknown>,
+  loadIndex = 0,
+) {
+  const init = initPosts(postMessage, "annotate:init")[loadIndex]!;
+  const port = init[2][0] as MessagePort;
+  await act(async () => {
+    port.postMessage({
+      source: ANNOTATE_SOURCE,
+      nonce: (init[0] as { nonce: string }).nonce,
+      ...message,
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+/** Record the annotate messages the parent posts to the frame and answer its
+ * runtime loads, so the hook's ensurePart flow completes as in a real frame. */
+function observeAnnotatePort(postMessage: ReturnType<typeof vi.fn>, loadIndex = 0) {
+  const init = initPosts(postMessage, "annotate:init")[loadIndex]!;
+  const port = init[2][0] as MessagePort;
+  const sent: Record<string, unknown>[] = [];
+  port.onmessage = (event) => {
+    const msg = event.data as Record<string, unknown>;
+    sent.push(msg);
+    if (msg.type === "annotate:loadRuntime") {
+      port.postMessage({
+        source: ANNOTATE_SOURCE,
+        nonce: (init[0] as { nonce: string }).nonce,
+        type: "annotate:runtimeLoaded",
+        part: msg.part,
+        ok: true,
+      });
+    }
+  };
+  return { port, sent };
+}
+
+function lastAnnotateOf(sent: Record<string, unknown>[], type: string) {
+  for (let i = sent.length - 1; i >= 0; i--) {
+    if (sent[i]!.type === type) return sent[i];
+  }
+  return undefined;
+}
+
+function annotateIds(message: Record<string, unknown> | undefined): string[] {
+  const items = (message?.items ?? []) as { id: string }[];
+  return items.map((item) => item.id);
 }
 
 beforeEach(() => {
@@ -286,8 +421,8 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     // The reloaded document re-handshakes; an init carrying the stale nonce
     // would leave the bridge deaf and comments silently broken after a refresh.
     fireEvent.load(iframe);
-    expect(postMessage).toHaveBeenCalledTimes(2);
-    expect(postMessage.mock.calls[1][0]).toMatchObject({
+    expect(postMessage).toHaveBeenCalledTimes(4);
+    expect(initPosts(postMessage, BRIDGE_MSG.init)[1][0]).toMatchObject({
       source: BRIDGE_SOURCE,
       nonce: "nonce-2",
       type: BRIDGE_MSG.init,
@@ -398,16 +533,24 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("hands the minted nonce to the frame in the init message", async () => {
+  it("hands the minted nonce to the frame in the bridge and annotate init messages", async () => {
     renderViewer();
     const { postMessage } = await openFrame();
 
-    expect(postMessage).toHaveBeenCalledTimes(1);
+    // One init per protocol on the same load: the comment bridge first, the
+    // annotate stub second (its own MessageChannel).
+    expect(postMessage).toHaveBeenCalledTimes(2);
     expect(postMessage.mock.calls[0][0]).toMatchObject({
       source: BRIDGE_SOURCE,
       nonce: NONCE,
       type: BRIDGE_MSG.init,
     });
+    expect(postMessage.mock.calls[1][0]).toMatchObject({
+      source: ANNOTATE_SOURCE,
+      nonce: NONCE,
+      type: "annotate:init",
+    });
+    expect(postMessage.mock.calls[1][2]).toHaveLength(1);
   });
 
   it("fetches a linked page and lifts the joined workspace path and stripped source", async () => {
@@ -627,18 +770,20 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     function Parent() {
       const [active, setActive] = useState<ActiveSelection | null>(linked);
       return (
-        <HtmlCommentViewer
-          conversationId="conv_1"
-          path={ENTRY_PATH}
-          content={ENTRY_SOURCE}
-          truncated={false}
-          comments={[]}
-          activeSelection={active}
-          onSetActiveSelection={(sel) => {
-            selections.push(sel);
-            setActive(sel);
-          }}
-        />
+        <Providers>
+          <HtmlCommentViewer
+            conversationId="conv_1"
+            path={ENTRY_PATH}
+            content={ENTRY_SOURCE}
+            truncated={false}
+            comments={[]}
+            activeSelection={active}
+            onSetActiveSelection={(sel) => {
+              selections.push(sel);
+              setActive(sel);
+            }}
+          />
+        </Providers>
       );
     }
     render(<Parent />);
@@ -663,16 +808,18 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     const onFrameChange = vi.fn();
     const onSetActiveSelection = vi.fn();
     const tree = (p: string) => (
-      <HtmlCommentViewer
-        conversationId="conv_1"
-        path={p}
-        content={ENTRY_SOURCE}
-        truncated={false}
-        comments={[]}
-        activeSelection={null}
-        onSetActiveSelection={onSetActiveSelection}
-        onFrameChange={onFrameChange}
-      />
+      <Providers>
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          path={p}
+          content={ENTRY_SOURCE}
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={onSetActiveSelection}
+          onFrameChange={onFrameChange}
+        />
+      </Providers>
     );
     const { rerender } = render(tree(ENTRY_PATH));
     const { postMessage } = await openFrame();
@@ -763,6 +910,241 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(screen.queryByText("Comments are unavailable for this preview")).toBeNull();
+  });
+});
+
+describe("HtmlCommentViewer annotation toggle", () => {
+  it("stays hidden until the annotate channel reports ready", async () => {
+    renderViewer();
+    const { postMessage } = await openFrame();
+
+    expect(screen.queryByRole("button", { name: "Annotate" })).toBeNull();
+
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("ignores a frame mode-on and follows the parent toggle and frame mode-off", async () => {
+    renderViewer();
+    const { postMessage } = await openFrame();
+    observeAnnotatePort(postMessage);
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    // Only the parent turns the mode on; the frame cannot forge it.
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:modeChanged",
+      on: true,
+      reason: "user",
+    });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:modeChanged",
+      on: false,
+      reason: "escape",
+    });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("flips aria-pressed on click without a frame echo", async () => {
+    renderViewer();
+    const { postMessage } = await openFrame();
+    observeAnnotatePort(postMessage);
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "false"));
+  });
+});
+
+describe("HtmlCommentViewer annotation path", () => {
+  it("uses the linked page's path and comments after an in-frame navigation", async () => {
+    renderViewer({
+      comments: [
+        elementComment("c-entry", ENTRY_PATH, 100),
+        elementComment("c-linked", "reports/sub/page2.html", 200),
+      ],
+    });
+    const { postMessage } = await openFrame();
+    const { sent } = observeAnnotatePort(postMessage);
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+    await waitFor(() =>
+      expect(annotateIds(lastAnnotateOf(sent, "annotate:setAnnotations"))).toEqual(["c-entry"]),
+    );
+
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: LINKED_URL });
+    await waitFor(() =>
+      expect(annotateIds(lastAnnotateOf(sent, "annotate:setAnnotations"))).toEqual(["c-linked"]),
+    );
+
+    // A pick is only honoured while the parent holds the mode on.
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    authenticatedFetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify(elementComment("c-new", "reports/sub/page2.html", 300)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:picked",
+      anchor: makeAnchor(300),
+      screenshot: null,
+      viewportRect: { x: 10, y: 20, w: 120, h: 32 },
+    });
+
+    const textarea = await screen.findByPlaceholderText("What should change?");
+    fireEvent.change(textarea, { target: { value: "linked note" } });
+    fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+
+    const post = await waitFor(() => {
+      const call = authenticatedFetchMock.mock.calls.find(
+        ([url]) => url === "/v1/sessions/conv_1/comments",
+      );
+      expect(call).toBeTruthy();
+      return call!;
+    });
+    const body = JSON.parse((post[1] as RequestInit).body as string);
+    expect(body.path).toBe("reports/sub/page2.html");
+    expect(body.body).toBe("linked note");
+  });
+
+  it("saves under the linked page while its source fetch is still pending", async () => {
+    const pending = deferred<Response>();
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === LINKED_URL) return pending.promise;
+      const res = artifactResponses.get(url);
+      return res ? res.clone() : new Response("missing", { status: 404 });
+    });
+
+    renderViewer();
+    const { postMessage } = await openFrame();
+    observeAnnotatePort(postMessage);
+
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: LINKED_URL });
+
+    authenticatedFetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify(elementComment("c-new", "reports/sub/page2.html", 300)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    // A pick is only honoured while the parent holds the mode on.
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:picked",
+      anchor: makeAnchor(300),
+      screenshot: null,
+      viewportRect: { x: 10, y: 20, w: 120, h: 32 },
+    });
+
+    const textarea = await screen.findByPlaceholderText("What should change?");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    const post = await waitFor(() => {
+      const call = authenticatedFetchMock.mock.calls.find(
+        ([url]) => url === "/v1/sessions/conv_1/comments",
+      );
+      expect(call).toBeTruthy();
+      return call!;
+    });
+    const body = JSON.parse((post[1] as RequestInit).body as string);
+    expect(body.path).toBe("reports/sub/page2.html");
+
+    await act(async () => {
+      pending.resolve(new Response(LINKED_BODY, { status: 200 }));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  });
+
+  it("renders the owner composer for a pick and returns focus to the frame", async () => {
+    renderViewer();
+    const { postMessage, contentWindowFocus } = await openFrame();
+    const { sent } = observeAnnotatePort(postMessage);
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    const toggle = await screen.findByRole("button", { name: "Annotate" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    authenticatedFetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify(elementComment("c-new", ENTRY_PATH, 300)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:picked",
+      anchor: makeAnchor(300),
+      screenshot: null,
+      viewportRect: { x: 10, y: 20, w: 120, h: 32 },
+    });
+
+    const composer = await screen.findByTestId("annotation-composer");
+    expect(composer).toBeVisible();
+    expect(composer.querySelector("[title]")!.textContent).toBe("button.option");
+    const textarea = screen.getByPlaceholderText("What should change?");
+    expect(textarea).toHaveFocus();
+    fireEvent.change(textarea, { target: { value: "owner note" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() => expect(screen.queryByTestId("annotation-composer")).toBeNull());
+    expect(contentWindowFocus).toHaveBeenCalledTimes(1);
+    expect(lastAnnotateOf(sent, "annotate:pickDone")).toBeDefined();
+
+    // Escape cancels the next pick and returns focus the same way.
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:picked",
+      anchor: makeAnchor(320),
+      screenshot: null,
+      viewportRect: { x: 10, y: 20, w: 120, h: 32 },
+    });
+    const second = await screen.findByPlaceholderText("What should change?");
+    fireEvent.keyDown(second, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByTestId("annotation-composer")).toBeNull());
+    expect(contentWindowFocus).toHaveBeenCalledTimes(2);
+    expect(lastAnnotateOf(sent, "annotate:pickDone")).toBeDefined();
+  });
+
+  it("reports the ids whose anchors resolved as not found", async () => {
+    const { onAnnotationOrphansChange } = renderViewer({
+      comments: [elementComment("c-entry", ENTRY_PATH, 100)],
+    });
+    const { postMessage } = await openFrame();
+    await sendAnnotateFromFrame(postMessage, { type: "annotate:ready" });
+
+    await sendAnnotateFromFrame(postMessage, {
+      type: "annotate:resolved",
+      items: [
+        { id: "c-entry", found: true },
+        { id: "c-gone", found: false },
+      ],
+    });
+
+    await waitFor(() =>
+      expect(onAnnotationOrphansChange).toHaveBeenLastCalledWith(new Set(["c-gone"])),
+    );
   });
 });
 
@@ -880,29 +1262,22 @@ describe("HtmlCommentViewer embed mode", () => {
 
   it("shows the truncated banner in embed mode", () => {
     vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
-    const { rerender } = render(
-      <HtmlCommentViewer
-        conversationId="conv_1"
-        path={ENTRY_PATH}
-        content="<body>x</body>"
-        truncated={false}
-        comments={[]}
-        activeSelection={null}
-        onSetActiveSelection={() => {}}
-      />,
+    const viewer = (truncated: boolean) => (
+      <Providers>
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          path={ENTRY_PATH}
+          content="<body>x</body>"
+          truncated={truncated}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />
+      </Providers>
     );
+    const { rerender } = render(viewer(false));
     expect(screen.queryByText(/truncated/i)).toBeNull();
-    rerender(
-      <HtmlCommentViewer
-        conversationId="conv_1"
-        path={ENTRY_PATH}
-        content="<body>x</body>"
-        truncated={true}
-        comments={[]}
-        activeSelection={null}
-        onSetActiveSelection={() => {}}
-      />,
-    );
+    rerender(viewer(true));
     expect(screen.getByText(/truncated/i)).toBeTruthy();
   });
 });

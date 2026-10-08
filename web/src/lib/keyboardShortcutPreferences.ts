@@ -36,6 +36,7 @@ export type ShortcutActionId =
   | "toggleViewMode"
   | "toggleConversationsSidebar"
   | "toggleWorkspaceSidebar"
+  | "toggleAnnotationMode"
   | "selectWorkspaceTab1"
   | "selectWorkspaceTab2"
   | "selectWorkspaceTab3"
@@ -237,6 +238,13 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "view",
     scope: "global",
     defaultBindings: [chord("BracketRight", ["primary", "alt"])],
+  },
+  toggleAnnotationMode: {
+    id: "toggleAnnotationMode",
+    label: "Toggle annotation mode",
+    group: "view",
+    scope: "global",
+    defaultBindings: [chord("Period", ["primary", "shift"])],
   },
   selectWorkspaceTab1: {
     id: "selectWorkspaceTab1",
@@ -722,6 +730,26 @@ export function eventMatchesShortcutAction(
       eventMatchesShortcut(event, binding, platform),
     )
   );
+}
+
+/** A chord resolved to concrete modifier flags, for transports without a platform. */
+export interface ResolvedShortcutChord {
+  code: string;
+  ctrl: boolean;
+  meta: boolean;
+  alt: boolean;
+  shift: boolean;
+}
+
+export function resolvedShortcutChords(
+  actionId: ShortcutActionId,
+  platform = currentShortcutPlatform(),
+): ResolvedShortcutChord[] {
+  if (!isShortcutActionEnabled(actionId)) return [];
+  return resolveShortcutBindings(actionId, platform).map((binding) => ({
+    code: binding.code,
+    ...resolvedModifierFlags(binding, platform),
+  }));
 }
 
 function chordIdentity(binding: ShortcutChord, platform: ShortcutPlatform): string {

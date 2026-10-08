@@ -9,7 +9,9 @@
 // `useOptionalCommentSender` in `CommentSenderContext.tsx`.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { authenticatedFetch } from "@/lib/identity";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { useChatStore } from "@/store/chatStore";
 
 export interface Comment {
@@ -149,6 +151,18 @@ export function useUpdateComment(sessionId: string) {
   });
 }
 
+export interface CommentAttachment {
+  comment_id: string;
+  file_id: string;
+  filename: string;
+}
+
+export interface SendCommentsPayload {
+  comment_ids: string[];
+  instruction?: string;
+  respectQueue?: boolean;
+}
+
 /**
  * POST /v1/sessions/{id}/comments/send
  *
@@ -158,11 +172,17 @@ export function useUpdateComment(sessionId: string) {
  * skips the mutation entirely when no agent is registered. Consumers
  * then read the sender via `useOptionalCommentSender()` and treat
  * `null` as "no agent, hide the button".
+ *
+ * `respectQueue` mirrors the composer's send decision for annotation batches:
+ * it refuses a send from a session the user has navigated away from, and
+ * queues when the agent is busy (or has queued messages). Without it the
+ * behaviour is the historical direct send (Address All, Archived banner).
  */
 export function useSendCommentsToAgent(sessionId: string, agentId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (payload: { comment_ids: string[]; instruction?: string }) => {
+    mutationFn: async (payload: SendCommentsPayload) => {
+      const { respectQueue, ...body } = payload;
       const res = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
         {
@@ -170,38 +190,83 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
           headers: { "Content-Type": "application/json" },
           // Format the message without marking: the comments become
           // addressed only once the agent actually received it.
-          body: JSON.stringify({ ...payload, mark_addressed: false }),
+          body: JSON.stringify({ ...body, mark_addressed: false }),
         },
       );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const data = (await res.json()) as {
         formatted_message: string;
         sent_comment_ids: string[];
+        attachments?: CommentAttachment[];
       };
+      const attachments = data.attachments ?? [];
+      // Fetch every stored screenshot before dispatching: a missing image
+      // aborts the whole send, so numbering never drifts from what the agent
+      // receives. Promise.all preserves the reply's image order in `files`.
+      const files = await Promise.all(
+        attachments.map(async (attachment, index) => {
+          try {
+            const fileRes = await authenticatedFetch(
+              `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(attachment.file_id)}/content`,
+            );
+            if (!fileRes.ok) throw new Error(`${fileRes.status} ${fileRes.statusText}`);
+            const blob = await fileRes.blob();
+            return new File([blob], attachment.filename, {
+              type: fileRes.headers.get("Content-Type") ?? "application/octet-stream",
+            });
+          } catch {
+            throw new Error(`Couldn't attach screenshot ${index + 1}; nothing was sent`);
+          }
+        }),
+      );
+      const chat = useChatStore.getState();
+      if (respectQueue) {
+        if (chat.conversationId !== sessionId) {
+          throw new Error("Return to this session before sending.");
+        }
+        if (
+          shouldQueueSend(
+            sessionId,
+            chat.status,
+            chat.sessionStatus,
+            chat.queuedMessages,
+            readAlwaysSteer(),
+          )
+        ) {
+          chat.enqueueMessage(data.formatted_message, files);
+          await markSentCommentsAddressed(sessionId, data.sent_comment_ids);
+          await queryClient.invalidateQueries({ queryKey: ["comments", sessionId] });
+          return { ...data, attachments, delivered: true };
+        }
+      }
       // Pin delivery to the session whose comments were formatted, so a send
       // that resolves after the user switched chats still marks the right
       // comments only when it landed there.
-      const delivered = await useChatStore
-        .getState()
-        .send(data.formatted_message, agentId, [], { pinnedConversationId: sessionId });
-      if (!delivered) return { ...data, delivered };
-      await Promise.all(
-        data.sent_comment_ids.map(async (commentId) => {
-          const patch = await authenticatedFetch(
-            `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
-            {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status: "addressed" }),
-            },
-          );
-          if (!patch.ok) throw new Error(`${patch.status} ${patch.statusText}`);
-        }),
-      );
+      const delivered = await chat.send(data.formatted_message, agentId, files, {
+        pinnedConversationId: sessionId,
+      });
+      if (!delivered) return { ...data, attachments, delivered };
+      await markSentCommentsAddressed(sessionId, data.sent_comment_ids);
       await queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });
-      return { ...data, delivered };
+      return { ...data, attachments, delivered };
     },
   });
+}
+
+async function markSentCommentsAddressed(sessionId: string, commentIds: string[]): Promise<void> {
+  await Promise.all(
+    commentIds.map(async (commentId) => {
+      const patch = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "addressed" }),
+        },
+      );
+      if (!patch.ok) throw new Error(`${patch.status} ${patch.statusText}`);
+    }),
+  );
 }

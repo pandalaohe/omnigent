@@ -111,6 +111,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Toggle Chat / Terminal view", keys: [], actionId: "toggleViewMode" },
       { label: "Toggle conversations sidebar", keys: [], actionId: "toggleConversationsSidebar" },
       { label: "Focus or close workspace sidebar", keys: [], actionId: "toggleWorkspaceSidebar" },
+      { label: "Toggle annotation mode", keys: [], actionId: "toggleAnnotationMode" },
       {
         label: "Select a workspace tab",
         keys: [],

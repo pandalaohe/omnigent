@@ -16,7 +16,7 @@
 
 import { createPortal } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MessageSquarePlusIcon } from "lucide-react";
+import { MessageSquarePlusIcon, MousePointerClickIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import {
@@ -45,7 +45,9 @@ import {
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
+import { AnnotationComposer } from "./AnnotationComposer";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useHtmlAnnotate } from "./useHtmlAnnotate";
 
 interface HtmlCommentViewerProps {
   conversationId: string;
@@ -59,6 +61,8 @@ interface HtmlCommentViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** Lifts the page the frame currently displays (null once it unmounts). */
   onFrameChange?: (frame: { path: string; source: string } | null) => void;
+  /** Reports the ids of this page's element annotations that no longer resolve. */
+  onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
 }
 
 /** Floating "Add comment" button position + the resolved selection it commits. */
@@ -297,6 +301,7 @@ export function HtmlCommentViewer({
   activeSelection,
   onSetActiveSelection,
   onFrameChange,
+  onAnnotationOrphansChange,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const isEmbed = hasOmnigentHostFetcher();
@@ -334,6 +339,9 @@ export function HtmlCommentViewer({
   // source fetch, and until it lands `page` still shows the previous page, so
   // `sourcePending` blocks selection handling against those stale bytes.
   const [page, setPage] = useState<{ path: string; source: string } | null>(null);
+  // The path the frame's latest `ready` named, set before its source fetch
+  // lands: picks during that interval must already save under that page.
+  const [framePath, setFramePath] = useState<string | null>(null);
   const sourcePendingRef = useRef(false);
   // Bumped on every navigation and input change; a source response whose
   // generation is stale must not overwrite fresher state.
@@ -349,6 +357,16 @@ export function HtmlCommentViewer({
   const [bridgeMissing, setBridgeMissing] = useState(false);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  // The composer is positioned relative to this container, which also holds
+  // the iframe, so a position is iframe offset + viewport rect.
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  // State mirror of the frame element: the annotation hook takes the element
+  // (not the ref) and must re-run when the frame commits.
+  const [iframeEl, setIframeEl] = useState<HTMLIFrameElement | null>(null);
+  const setIframeNode = useCallback((el: HTMLIFrameElement | null) => {
+    iframeRef.current = el;
+    setIframeEl(el);
+  }, []);
   const portRef = useRef<MessagePort | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
 
@@ -371,6 +389,8 @@ export function HtmlCommentViewer({
   activeSelectionRef.current = activeSelection;
   const onFrameChangeRef = useRef(onFrameChange);
   onFrameChangeRef.current = onFrameChange;
+  const onAnnotationOrphansChangeRef = useRef(onAnnotationOrphansChange);
+  onAnnotationOrphansChangeRef.current = onAnnotationOrphansChange;
   const openFileRef = useRef(openFile);
   openFileRef.current = openFile;
   // The workspace root/home can arrive after the channel effect has run, so the
@@ -387,6 +407,7 @@ export function HtmlCommentViewer({
     frameTailRef.current = null;
     setRefreshed(null);
     setRefreshError(null);
+    setFramePath(null);
     showPage(null);
     setBridgeMissing(false);
   }, [conversationId, path, isEmbed, showPage]);
@@ -470,6 +491,7 @@ export function HtmlCommentViewer({
       const framePage = framePageFor(pathname, path);
       if (!framePage || !entry) return;
       const { pagePath } = framePage;
+      setFramePath(pagePath);
       frameTailRef.current = framePage.tail;
       // A ready naming another page means the frame replaced its document:
       // drop the previous page's selection and floating composer. The entry's
@@ -668,10 +690,54 @@ export function HtmlCommentViewer({
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, []);
 
+  // A marker click in the frame selects the same way the bridge's commentClick
+  // does; the refs keep the callback stable across renders.
+  const handleSelectAnnotationComment = useCallback((commentId: string) => {
+    const c = commentsRef.current.find((x) => x.id === commentId);
+    if (!c) return;
+    onSetActiveSelectionRef.current({
+      start_index: c.start_index,
+      end_index: c.end_index,
+      anchor_content: c.anchor_content ?? "",
+      comment_id: c.id,
+    });
+    setFloating(null);
+  }, []);
+
+  const annotate = useHtmlAnnotate({
+    iframe: iframeEl,
+    nonce,
+    // The frame may stand on a linked bundle page; annotations belong to that
+    // page's path, exactly as FileViewer keys the `comments` prop. `framePath`
+    // lands with the bridge `ready`, before the page's source fetch resolves.
+    path: framePath ?? page?.path ?? path,
+    sessionId: conversationId,
+    comments,
+    onSelectComment: handleSelectAnnotationComment,
+  });
+
+  // Lift the orphan set so the comments panel can label those cards; the ref
+  // keeps a fresh handler without re-running on every parent render.
+  useEffect(() => {
+    onAnnotationOrphansChangeRef.current?.(annotate.orphanIds);
+  }, [annotate.orphanIds]);
+
+  // When the composer closes (submit, cancel, mode off), focus returns to the
+  // frame so the mode's shortcut and Escape work without a click.
+  const hadPendingPickRef = useRef(false);
+  useEffect(() => {
+    if (hadPendingPickRef.current && !annotate.pendingPick) {
+      const frame = iframeRef.current;
+      frame?.focus();
+      frame?.contentWindow?.focus();
+    }
+    hadPendingPickRef.current = annotate.pendingPick !== null;
+  }, [annotate.pendingPick]);
+
   const preview =
     entry && !refreshError ? (
       <iframe
-        ref={iframeRef}
+        ref={setIframeNode}
         src={withBasePath(entry.url)}
         sandbox={HTML_PANEL_SANDBOX}
         title="HTML preview"
@@ -679,7 +745,7 @@ export function HtmlCommentViewer({
       />
     ) : embedDoc ? (
       <iframe
-        ref={iframeRef}
+        ref={setIframeNode}
         srcDoc={embedDoc.srcDoc}
         sandbox={HTML_PREVIEW_SANDBOX}
         title="HTML preview"
@@ -703,7 +769,32 @@ export function HtmlCommentViewer({
           Comments are unavailable for this preview
         </div>
       )}
-      <div className="min-h-0 flex-1">{preview}</div>
+      <div ref={previewContainerRef} className="relative min-h-0 flex-1">
+        {preview}
+        {annotate.pendingPick && canEdit && (
+          <AnnotationComposer
+            label={annotate.pendingPick.label}
+            viewportRect={annotate.pendingPick.viewportRect}
+            previewRef={previewContainerRef}
+            iframe={iframeEl}
+            onSubmit={annotate.submitPick}
+            onCancel={annotate.cancelPick}
+          />
+        )}
+        {annotate.available && canEdit && (
+          <button
+            type="button"
+            aria-label="Annotate"
+            aria-pressed={annotate.on}
+            title="Annotate (⌘⇧.) — screenshots reach agents that accept images"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={annotate.toggle}
+            className="absolute right-2 top-2 z-10 flex size-7 items-center justify-center rounded-md border border-border bg-popover/90 text-muted-foreground shadow-md backdrop-blur-xl backdrop-saturate-150 transition-colors hover:bg-secondary hover:text-foreground aria-pressed:bg-secondary aria-pressed:text-foreground"
+          >
+            <MousePointerClickIcon className="size-3.5" />
+          </button>
+        )}
+      </div>
       {floating &&
         canEdit &&
         createPortal(
