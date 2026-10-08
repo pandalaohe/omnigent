@@ -171,12 +171,12 @@ export function AskUserQuestionForm({
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
-  // Per-question option selection. Single-select stores a string;
-  // multi-select stores a deduped array.
+  // Per-question option selection. Single-select stores a string and starts
+  // on its first option; multi-select stores a deduped array and starts empty.
   const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
     const initial: Record<string, string | string[]> = {};
     for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect ? [] : "";
+      initial[questionKey(q)] = q.multiSelect ? [] : (q.options[0]?.label ?? "");
     }
     return initial;
   });

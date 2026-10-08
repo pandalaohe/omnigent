@@ -820,24 +820,43 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
   it("gates Submit until every question has at least one selection", () => {
     // Without this gate Submit fires with half-filled answers and
-    // the user can't tell which questions still need attention.
+    // the user can't tell which questions still need attention. The
+    // single-select question starts on its first option, so the gate
+    // here is exercised by the unanswered multi-select slide.
     render(
       <ApprovalCard
         elicitationId="elic_gate"
         message="Claude wants to call AskUserQuestion"
         phase="pre_tool_use"
         policyName="claude_native_permission"
-        contentPreview={sampleSinglePreview}
+        contentPreview=""
         requestedSchema={{}}
         status="pending"
         response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+            {
+              question: "Pick snacks",
+              options: [{ label: "Popcorn" }, { label: "Pretzels" }],
+              multiSelect: true,
+            },
+          ],
+        }}
       />,
     );
 
+    // Submit only exists on the last slide, where the multi-select is
+    // still unanswered.
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
     const submit = screen.getByRole("button", { name: /submit/i });
     expect(submit.hasAttribute("disabled")).toBe(true);
 
-    fireEvent.click(screen.getByLabelText("React"));
+    fireEvent.click(screen.getByLabelText("Popcorn"));
     expect(submit.hasAttribute("disabled")).toBe(false);
   });
 
@@ -1404,17 +1423,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    // No selection yet → no preview block.
-    expect(screen.queryByTestId("ask-user-question-previews")).toBeNull();
-
-    // Description is concatenated into the label text by the DOM
-    // so a literal ``getByLabelText("Two-pane")`` doesn't match;
-    // a regex picks out the label by its prefix.
-    fireEvent.click(screen.getByLabelText(/Two-pane/));
+    // The first option is preselected, so only its preview shows.
     const previews = screen.getByTestId("ask-user-question-previews");
     expect(previews.textContent).toContain("[editor] | [output]");
     expect(previews.textContent).not.toContain("[editor only]");
 
+    // Description is concatenated into the label text by the DOM
+    // so a literal ``getByLabelText("Single")`` doesn't match;
+    // a regex picks out the label by its prefix.
     fireEvent.click(screen.getByLabelText(/Single/));
     expect(screen.getByTestId("ask-user-question-previews").textContent).toContain("[editor only]");
   });
