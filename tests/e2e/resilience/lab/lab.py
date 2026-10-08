@@ -539,6 +539,13 @@ class Lab:
         self.observer = self._client(self.server_url)
         self._start_model()
         self._start_server()
+        # The scenarios drive a blocking approval; deferred approvals answer at once.
+        assert self.observer is not None
+        approval_prefs = self.observer.patch(
+            "/v1/me/preferences/approval_timeout",
+            json={"value": {"timeoutMinutes": 50, "stopTurn": True, "asyncApprovals": False}},
+        )
+        assert approval_prefs.is_success, approval_prefs.text
         if self.config.mode == "host":
             self._start_host()
         else:

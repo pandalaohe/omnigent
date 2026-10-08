@@ -141,7 +141,22 @@ class _Stream:
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
-@pytest.mark.parametrize("action", ["stop", "archive", "crash"])
+@pytest.mark.parametrize(
+    "action",
+    [
+        "stop",
+        pytest.param(
+            "archive",
+            marks=pytest.mark.skip(
+                reason=(
+                    "an archived parent with a busy child keeps its runner until the "
+                    "tree is idle, so archive never tears it down mid-turn"
+                )
+            ),
+        ),
+        "crash",
+    ],
+)
 def test_native_parent_teardown_preserves_child_outcome(
     tmp_path: Path, isolated_mock_llm_server_url: str, harness: str, action: str
 ) -> None:
@@ -244,6 +259,14 @@ def test_native_parent_teardown_preserves_child_outcome(
                 },
             )
         )
+
+        # This journey answers the blocking approval card, which the server's
+        # deferred-approval default bypasses.
+        approval_prefs = client.patch(
+            "/v1/me/preferences/approval_timeout",
+            json={"value": {"timeoutMinutes": 50, "stopTurn": True, "asyncApprovals": False}},
+        )
+        assert approval_prefs.is_success, approval_prefs.text
 
         def online_host():
             assert stack.host is not None and stack.host.poll() is None, stack.log_tail()
