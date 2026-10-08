@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from omnigent.entities.comment import Comment, CommentsFingerprint
+from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.comment_store.visitor_comments import VISITOR_COMMENT_NOTE
 from omnigent.tools.base import ToolContext
@@ -493,6 +494,39 @@ def test_visitor_drafts_hidden_and_sent_rows_marked(
     # The draft-status filter must not re-introduce the hidden visitor draft.
     drafts = _invoke(tool, {"status": "draft"})
     assert visitor_draft.id not in {c["id"] for c in drafts["comments"]}
+
+
+def test_owner_element_anchor_row_carries_annotation(
+    tool: ListCommentsTool,
+    store: _InMemoryCommentStore,
+) -> None:
+    """
+    An owner element anchor surfaces as a parsed ``annotation`` on its row.
+
+    The agent reads the structured payload to re-find the annotated element;
+    visitor rows with the same anchor shape must not gain the key.
+    """
+    anchor_content = (
+        ELEMENT_ANCHOR_PREFIX
+        + '{"v":1,"kind":"element","rect":{"x":0,"y":0,"w":1,"h":1},"target":{"label":"div.a"}}'
+    )
+    owner = store.add("conv-123", "reports/q3.html", "Fix", 0, 0, anchor_content=anchor_content)
+    visitor = store.add(
+        "conv-123",
+        "reports/q3.html",
+        "visitor",
+        10,
+        10,
+        anchor_content=anchor_content,
+        created_by="visitor:Alice",
+    )
+    store.update_comment(visitor.id, "conv-123", status="addressed")
+
+    result = _invoke(tool, {})
+    rows = {c["id"]: c for c in result["comments"]}
+
+    assert rows[owner.id]["annotation"]["target"]["label"] == "div.a"
+    assert "annotation" not in rows[visitor.id]
 
 
 def test_comment_fields_are_complete(

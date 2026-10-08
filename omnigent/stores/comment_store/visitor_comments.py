@@ -13,6 +13,7 @@ from dataclasses import asdict
 from typing import Any
 
 from omnigent.entities import Comment
+from omnigent.entities.element_annotation import parse_element_anchor
 from omnigent.stores.comment_store import COMMENT_STATUS_DRAFT
 
 # The marker prefix on a visitor comment's ``created_by``. No account id
@@ -81,8 +82,9 @@ def comment_rows(
     Visitor comments still in draft have not been sent to the agent by
     the owner, so they are omitted unless *include_visitor_drafts* is
     set (the owner's own read path). Every returned visitor row carries
-    the untrusted-data source marker and note; owner rows are returned
-    unchanged.
+    the untrusted-data source marker and note; an owner row whose
+    ``anchor_content`` is a valid element anchor carries the parsed,
+    clamped payload under ``annotation``.
 
     :param comments: The comments to serialize.
     :param include_visitor_drafts: When ``True``, keep visitor comments
@@ -94,9 +96,13 @@ def comment_rows(
         visitor = is_visitor_author(comment.created_by)
         if visitor and not include_visitor_drafts and comment.status == COMMENT_STATUS_DRAFT:
             continue
-        row = asdict(comment)
+        row: dict[str, Any] = asdict(comment)
         if visitor:
             row["source"] = VISITOR_SOURCE
             row["note"] = VISITOR_COMMENT_NOTE
+        else:
+            annotation = parse_element_anchor(comment.anchor_content)
+            if annotation is not None:
+                row["annotation"] = annotation
         rows.append(row)
     return rows

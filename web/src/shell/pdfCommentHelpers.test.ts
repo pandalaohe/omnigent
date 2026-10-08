@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ELEMENT_ANCHOR_PREFIX, clampElementAnchor, encodeElementAnchor } from "./annotationAnchor";
 import {
   PDF_ANCHOR_PREFIX,
   commentsMatchOffsets,
@@ -54,6 +55,20 @@ describe("displayAnchorContent", () => {
 
   it("passes through plain-text anchors unchanged", () => {
     expect(displayAnchorContent("plain anchor")).toBe("plain anchor");
+  });
+
+  it("returns the target label for element anchors, with a fallback when undecodable", () => {
+    const anchor = clampElementAnchor({
+      v: 1,
+      kind: "element",
+      rect: { x: 0, y: 0, w: 1, h: 1 },
+      target: { label: "div.filter-menu > button.option" },
+    });
+    expect(anchor).not.toBeNull();
+    expect(displayAnchorContent(encodeElementAnchor(anchor!))).toBe(
+      "div.filter-menu > button.option",
+    );
+    expect(displayAnchorContent(`${ELEMENT_ANCHOR_PREFIX}{`)).toBe("Element annotation");
   });
 });
 
