@@ -220,6 +220,28 @@ describe("managed first-message routing", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("does not replay on a new Server reached during the forced refresh", async () => {
+    let server = "server";
+    vi.doMock("./host", () => ({
+      getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
+      getOmnigentHostGeneration: vi.fn(() => 0),
+      getOmnigentServerIdentity: vi.fn(() => server),
+      hostFetch: fetchMock,
+      isDatabricksWorkspace: isWorkspace,
+    }));
+    const { authenticatedFetch, resolve, setSessionHost } = await setup();
+    resolve.mockImplementation(async (sessionId, options) => {
+      if (!options?.force) return;
+      server = "other-server";
+      setSessionHost(sessionId, "new-host");
+    });
+    const original = wrongReplica();
+    fetchMock.mockResolvedValueOnce(original);
+
+    expect(await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" })).toBe(original);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     { code: "invalid_argument", status: 400 },
     { code: "runner_unavailable", status: 503 },

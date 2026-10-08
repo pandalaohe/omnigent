@@ -685,6 +685,8 @@ export async function authenticatedFetch(
       init?.signal?.throwIfAborted();
       await resolveSessionHost(sessionId, { force: true });
       init?.signal?.throwIfAborted();
+      // The Server can also switch while the refresh is in flight.
+      if (currentIdentityConnectionId() !== dispatchConnectionId) return res;
       const hostId = getSessionHost(sessionId);
       if (hostId !== null) {
         clearHostKeyless(hostId);
