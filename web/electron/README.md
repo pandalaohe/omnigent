@@ -534,6 +534,41 @@ Other loopback addresses, private-network and metadata destinations, and
 non-web schemes remain restricted. Existing tool approvals are unchanged;
 whether a tool call asks for approval depends on the harness and its policy.
 
+### Agent access to local and private addresses
+
+Agent-driven navigation (`browser_navigate` and its redirects) is refused by
+default for `localhost` / `*.localhost` / `[::1]`, the loopback and RFC-1918
+private ranges (127/8, 10/8, 172.16/12, 192.168/16), and `fc00::/7` — including
+those addresses embedded in an IPv6 literal. Here `localhost` is the desktop
+machine, not the agent's remote host.
+
+When the agent is refused on one of those addresses, the desktop shows a native
+prompt: **Don't Allow / Allow Once / Always Allow**. _Allow Once_ lets the agent
+open that address for this navigation and keep using the page it opens — its
+redirects and the page's own navigation and links on that same `address:port` —
+until the agent navigates somewhere else or you navigate the pane yourself;
+nothing is saved. _Always Allow_ remembers that exact `address:port` for the
+connected server. An unanswered prompt closes after 25 s and counts as
+Don't Allow.
+
+Whole hosts and ranges can be listed by hand in `settings.json`, keyed by the
+connected server's origin:
+
+```json
+{
+  "agent_browser_allowlist": {
+    "https://omnigent.example.com": ["localhost:5173", "[fd12::1]:8080", "127.0.0.1:3000"]
+  }
+}
+```
+
+Entries accept a host, `host:port`, IPv4, an IPv4 CIDR, or a bracketed IPv6
+literal; all but CIDR may carry a `:port` (an entry without one matches any
+port). An IPv4 CIDR entry allows a whole LAN: list the subnet's network address
+followed by `/24`. A hand edit applies from the next navigation.
+`169.254.0.0/16` (metadata), `fe80::/10`, `0.0.0.0`, `::`, and non-http(s)
+schemes stay refused even when listed.
+
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including

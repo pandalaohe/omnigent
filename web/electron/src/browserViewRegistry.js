@@ -76,6 +76,10 @@ function createBrowserViewRegistry({
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
   onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
   isArcaAgentContext = () => false,
+  // Extra internal hosts/ranges this agent may reach, per agent context (main
+  // resolves the context's server origin against settings.json). A non-array
+  // answer means "no entries" — never a policy error.
+  getAgentAllowlist = () => [],
   cap = DEFAULT_CAP,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
@@ -107,6 +111,18 @@ function createBrowserViewRegistry({
     applyActiveVisibility();
     onSuppressionChange(overlaySuppressed);
     return { ok: true };
+  }
+
+  // Policy options for one agent context: the per-server allowlist plus any
+  // one-navigation grants. One helper so the first hop, the redirect guard and
+  // the window-open handler can never drift apart.
+  function agentNavPolicyOptions(context) {
+    const configured = getAgentAllowlist(context);
+    const onceGrants = Array.isArray(context?.allowOnce) ? context.allowOnce : [];
+    return {
+      allowLocalhost: isArcaAgentContext(context),
+      allowlist: [...(Array.isArray(configured) ? configured : []), ...onceGrants],
+    };
   }
 
   function makeEntry(conversationId, view) {
@@ -200,9 +216,7 @@ function createBrowserViewRegistry({
         return { action: "deny" };
       }
       if (entry.agentNavLocked) {
-        const verdict = isAgentNavigationAllowed(url, {
-          allowLocalhost: isArcaAgentContext(entry.agentContext),
-        });
+        const verdict = isAgentNavigationAllowed(url, agentNavPolicyOptions(entry.agentContext));
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
             conversationId: entry.conversationId,
@@ -267,9 +281,10 @@ function createBrowserViewRegistry({
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
-      const verdict = isAgentNavigationAllowed(targetUrl, {
-        allowLocalhost: isArcaAgentContext(entry.agentContext),
-      });
+      const verdict = isAgentNavigationAllowed(
+        targetUrl,
+        agentNavPolicyOptions(entry.agentContext),
+      );
       if (!verdict.ok) {
         try {
           event.preventDefault();
@@ -376,11 +391,13 @@ function createBrowserViewRegistry({
     // (user-typed) nav stays permissive. Checked before getOrCreate so a
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
-      const verdict = isAgentNavigationAllowed(url, {
-        allowLocalhost: isArcaAgentContext(opts.agentContext),
-      });
+      const verdict = isAgentNavigationAllowed(url, agentNavPolicyOptions(opts.agentContext));
       if (!verdict.ok) {
-        return { ok: false, error: verdict.error };
+        const refusal = { ok: false, error: verdict.error };
+        // Promptable (internal-class) refusals carry the grant the shell offers
+        // the user; every other refusal stays exactly as it was.
+        if (verdict.grant !== undefined) refusal.grant = verdict.grant;
+        return refusal;
       }
     }
     const result = getOrCreate(conversationId);

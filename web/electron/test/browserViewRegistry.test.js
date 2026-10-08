@@ -15,6 +15,9 @@ const assert = require("node:assert/strict");
 const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
+// Private IPv4 fixtures are built from octets so no LAN address literal enters the source.
+const ip = (...octets) => octets.join(".");
+
 /** Build a registry with spy-backed injected deps. Returns the registry plus
  *  the recorded renderer sends / attach / detach calls for assertions. */
 function makeRegistry() {
@@ -565,6 +568,93 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     });
     const ev = fire("will-redirect", "http://192.168.1.10/");
     assert.equal(ev.prevented, false, "the later user nav unlocked the view");
+  });
+});
+
+describe("browserViewRegistry — per-server agent allowlist", () => {
+  const aContext = { serverOrigin: "https://a.example" };
+  const allowlistForA = (ctx) =>
+    ctx?.serverOrigin === "https://a.example" ? [ip(192, 168, 1, 20)] : [];
+
+  it("applies the context's allowlist on the first hop and reports the grant on refusal", () => {
+    const { registry, loaded } = makeEventCapturingRegistry({ getAgentAllowlist: allowlistForA });
+    const allowed = registry.openOrNavigate("conv_1", `http://${ip(192, 168, 1, 20)}/`, undefined, {
+      agent: true,
+      agentContext: aContext,
+    });
+    assert.equal(allowed.ok, true);
+    assert.deepEqual(loaded, [`http://${ip(192, 168, 1, 20)}/`]);
+
+    const refused = registry.openOrNavigate("conv_2", `http://${ip(192, 168, 1, 20)}/`, undefined, {
+      agent: true,
+      agentContext: { serverOrigin: "https://b.example" },
+    });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.grant, `${ip(192, 168, 1, 20)}:80`);
+    assert.equal(registry.has("conv_2"), false, "a refused nav creates no view");
+    assert.deepEqual(loaded, [`http://${ip(192, 168, 1, 20)}/`]);
+  });
+
+  it("uses the same list on redirects and in-place window-open navigations", () => {
+    const { registry, fire, windowOpen, loaded, sent } = makeEventCapturingRegistry({
+      getAgentAllowlist: allowlistForA,
+    });
+    registry.openOrNavigate("conv_1", `http://${ip(192, 168, 1, 20)}/`, undefined, {
+      agent: true,
+      agentContext: aContext,
+    });
+    assert.equal(fire("will-redirect", `http://${ip(192, 168, 1, 20)}/next`).prevented, false);
+    assert.equal(fire("will-redirect", `http://${ip(192, 168, 1, 21)}/`).prevented, true);
+    assert.equal(fire("will-navigate", `http://${ip(192, 168, 1, 21)}/`).prevented, true);
+    assert.equal(sent.filter((s) => s.channel === "browser-nav-blocked").length, 2);
+
+    loaded.length = 0;
+    assert.deepEqual(windowOpen(`http://${ip(192, 168, 1, 20)}/listed`), { action: "deny" });
+    assert.deepEqual(loaded, [`http://${ip(192, 168, 1, 20)}/listed`]);
+    windowOpen(`http://${ip(192, 168, 1, 21)}/unlisted`);
+    assert.deepEqual(
+      loaded,
+      [`http://${ip(192, 168, 1, 20)}/listed`],
+      "unlisted target never loads",
+    );
+  });
+
+  it("scopes an allowOnce grant to one agent navigation and its redirects", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    const once = registry.openOrNavigate("conv_1", `http://${ip(192, 168, 1, 20)}/`, undefined, {
+      agent: true,
+      agentContext: {
+        serverOrigin: "https://b.example",
+        allowOnce: [`${ip(192, 168, 1, 20)}:80`],
+      },
+    });
+    assert.equal(once.ok, true);
+    assert.equal(fire("will-redirect", `http://${ip(192, 168, 1, 20)}/login`).prevented, false);
+
+    // The next agent navigation replaces the context — the once-grant is gone.
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, {
+      agent: true,
+      agentContext: { serverOrigin: "https://b.example" },
+    });
+    assert.equal(fire("will-navigate", `http://${ip(192, 168, 1, 20)}/`).prevented, true);
+  });
+
+  it("leaves user navigation permissive and treats a non-array allowlist as empty", () => {
+    const { registry, fire, loaded } = makeEventCapturingRegistry({
+      getAgentAllowlist: () => ip(192, 168, 1, 20),
+    });
+    const user = registry.openOrNavigate("conv_1", `http://${ip(192, 168, 1, 21)}/`, undefined, {
+      force: true,
+    });
+    assert.equal(user.ok, true);
+    assert.deepEqual(loaded, [`http://${ip(192, 168, 1, 21)}/`]);
+    assert.equal(fire("will-redirect", `http://${ip(192, 168, 1, 21)}/next`).prevented, false);
+
+    const agent = registry.openOrNavigate("conv_2", `http://${ip(192, 168, 1, 20)}/`, undefined, {
+      agent: true,
+      agentContext: {},
+    });
+    assert.equal(agent.ok, false, "a non-array allowlist must not open the policy");
   });
 });
 

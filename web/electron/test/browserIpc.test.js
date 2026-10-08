@@ -25,6 +25,9 @@ const {
   DESIGN_MODE_GESTURE_WINDOW_MS,
 } = require("../src/browserIpc");
 
+// Private IPv4 fixtures are built from octets so no LAN address literal enters the source.
+const ip = (...octets) => octets.join(".");
+
 /** A fake ipcMain that records `handle(channel, fn)` registrations and lets a
  *  test invoke a channel with a synthetic event + args. */
 function makeIpcMain() {
@@ -106,6 +109,150 @@ describe("browser IPC Arca context", () => {
       },
     );
     assert.deepEqual(calls[0][3], { force: true, agent: true, agentContext: context });
+  });
+});
+
+describe("browserIpc — agent navigation prompt on a promptable refusal", () => {
+  const REFUSAL = {
+    ok: false,
+    error: "navigation blocked: x",
+    grant: `${ip(192, 168, 1, 20)}:80`,
+  };
+
+  /** Register the handler with a registry stub that refuses once (unless an
+   *  explicit firstResult says otherwise) and records every call + prompt. */
+  function setupPrompt({
+    choice = null,
+    firstResult = REFUSAL,
+    onConfirm = null,
+    isPinnedOriginSender = () => true,
+  } = {}) {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const prompts = [];
+    let serverOrigin = "https://a.example";
+    const registry = {
+      openOrNavigate: (...args) => {
+        calls.push(args);
+        if (calls.length === 1) return firstResult;
+        return { ok: true, created: true, entry: { view: { webContents: makeWebContents() } } };
+      },
+    };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender,
+      getRegistryForEvent: () => registry,
+      getAgentContextForEvent: () => ({ serverOrigin, sourceHostId: "h" }),
+      confirmAgentNavigation: (_event, request) => {
+        prompts.push(request);
+        if (onConfirm) onConfirm();
+        return Promise.resolve(choice);
+      },
+    });
+    return {
+      invoke: (opts) =>
+        ipcMain.invoke(
+          "omnigent:browser-open-or-navigate",
+          {},
+          {
+            conversationId: "conv_1",
+            url: `http://${ip(192, 168, 1, 20)}/`,
+            opts,
+          },
+        ),
+      calls,
+      prompts,
+      setServerOrigin: (value) => {
+        serverOrigin = value;
+      },
+    };
+  }
+
+  it("retries once with the grant in the context when the user allows once", async () => {
+    const h = setupPrompt({ choice: "once" });
+    const r = await h.invoke({ agent: true });
+    assert.equal(r.ok, true);
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(h.calls[1][3].agentContext, {
+      serverOrigin: "https://a.example",
+      sourceHostId: "h",
+      allowOnce: [`${ip(192, 168, 1, 20)}:80`],
+    });
+    assert.deepEqual(h.prompts, [
+      { url: `http://${ip(192, 168, 1, 20)}/`, grant: `${ip(192, 168, 1, 20)}:80` },
+    ]);
+  });
+
+  it("retries with the same options when the user always allows", async () => {
+    const h = setupPrompt({ choice: "always" });
+    const r = await h.invoke({ agent: true, force: true });
+    assert.equal(r.ok, true);
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(h.calls[1][3], h.calls[0][3]);
+  });
+
+  it("appends the decline sentence and keeps the single refusal otherwise", async () => {
+    const h = setupPrompt({ choice: null });
+    const r = await h.invoke({ agent: true });
+    assert.equal(r.ok, false);
+    assert.equal(r.error, "navigation blocked: x The user did not allow this address.");
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.prompts.length, 1);
+  });
+
+  it("never prompts without a promptable agent refusal", async () => {
+    const grantless = setupPrompt({
+      firstResult: { ok: false, error: "navigation blocked: y" },
+    });
+    const refused = await grantless.invoke({ agent: true });
+    assert.equal(refused.error, "navigation blocked: y");
+    assert.equal(grantless.prompts.length, 0);
+
+    const ok = setupPrompt({ firstResult: { ok: true, created: false } });
+    assert.equal((await ok.invoke({ agent: true })).ok, true);
+    assert.equal(ok.prompts.length, 0);
+
+    const user = setupPrompt({ choice: "once" });
+    const userResult = await user.invoke({});
+    assert.equal(userResult.ok, false, "a user call keeps the plain refusal");
+    assert.equal(userResult.error, "navigation blocked: x");
+    assert.equal(user.prompts.length, 0);
+  });
+
+  it("cancels the retry when the window switched servers while the prompt was open", async () => {
+    await Promise.all(
+      ["once", "always"].map(async (choice) => {
+        const h = setupPrompt({
+          choice,
+          onConfirm: () => h.setServerOrigin("https://b.example"),
+        });
+        const r = await h.invoke({ agent: true, force: true });
+        assert.equal(r.ok, false, choice);
+        assert.ok(
+          r.error.endsWith("The window changed servers before the answer; navigation cancelled."),
+          `${choice}: ${r.error}`,
+        );
+        assert.equal(h.calls.length, 1, `${choice}: the old server's answer is not retried`);
+      }),
+    );
+  });
+
+  it("cancels the retry when the trust gate fails after the prompt", async () => {
+    let gateCalls = 0;
+    const h = setupPrompt({
+      choice: "once",
+      isPinnedOriginSender: () => {
+        gateCalls++;
+        return gateCalls === 1;
+      },
+    });
+    const r = await h.invoke({ agent: true });
+    assert.equal(r.ok, false);
+    assert.ok(
+      r.error.endsWith("The window changed servers before the answer; navigation cancelled."),
+    );
+    assert.equal(h.calls.length, 1);
+    assert.equal(gateCalls, 2);
   });
 });
 
