@@ -82,13 +82,14 @@ class _FakePeerStore(PeerMessageStore):
         limit: int = 20,
         *,
         sender_session_id: str | None = None,
+        oldest_first: bool = False,
     ) -> list[SessionPeerMessage]:
         rows = [r for r in self._rows.values() if r.receiver_session_id == session_id]
         if states is not None:
             rows = [r for r in rows if r.state in states]
         if sender_session_id is not None:
             rows = [r for r in rows if r.sender_session_id == sender_session_id]
-        rows.sort(key=lambda r: r.created_at, reverse=True)
+        rows.sort(key=lambda r: (r.created_at, r.id), reverse=not oldest_first)
         return rows[:limit]
 
     def list_due(self, states: tuple[str, ...], limit: int) -> list[SessionPeerMessage]:
@@ -989,6 +990,27 @@ async def test_older_delivering_record_holds_newer_from_same_sender(harness: _Ha
     await harness.sweeper._tick()
     assert _row(harness.store, older.id).state == "delivering"
     assert _row(harness.store, newer.id).state == "queued"
+    assert harness.deliver.calls == []
+
+
+async def test_older_delivering_record_found_behind_55_newer_same_pair(
+    harness: _Harness,
+) -> None:
+    """FIFO finds the oldest record even behind 50+ newer same-pair records."""
+    older = harness.seed_record(
+        id="peer_oldest", state="delivering", created_at=harness._now - 100
+    )
+    fillers = [
+        harness.seed_record(
+            id=f"peer_filler_{index}",
+            state="queued",
+            created_at=harness._now - 55 + index,
+        )
+        for index in range(55)
+    ]
+    await harness.sweeper._tick()
+    assert _row(harness.store, older.id).state == "delivering"
+    assert all(_row(harness.store, record.id).state == "queued" for record in fillers)
     assert harness.deliver.calls == []
 
 

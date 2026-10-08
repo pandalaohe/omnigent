@@ -198,3 +198,31 @@ def test_list_for_session_sender_filter_finds_record_behind_other_senders(
     assert older.id not in {r.id for r in unscoped}
     scoped = store.list_for_session(receiver, ("pending",), 50, sender_session_id=sender)
     assert [r.id for r in scoped] == [older.id]
+
+
+def test_list_for_session_oldest_first(store: SqlAlchemyPeerMessageStore) -> None:
+    """``oldest_first=True`` pages from the oldest record, not the newest."""
+    sender, receiver = _uid("of-sender"), _uid("of-receiver")
+    oldest = store.create(
+        _record(
+            "of-old",
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            created_at=100,
+        )
+    )
+    for index in range(55):
+        store.create(
+            _record(
+                f"of-new-{index}",
+                sender_session_id=sender,
+                receiver_session_id=receiver,
+                created_at=200 + index,
+            )
+        )
+    oldest_two = store.list_for_session(
+        receiver, ("pending",), 2, sender_session_id=sender, oldest_first=True
+    )
+    assert [r.id for r in oldest_two] == [oldest.id, _uid("of-new-0-id")]
+    newest_two = store.list_for_session(receiver, ("pending",), 2, sender_session_id=sender)
+    assert [r.id for r in newest_two] == [_uid("of-new-54-id"), _uid("of-new-53-id")]

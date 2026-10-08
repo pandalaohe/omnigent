@@ -336,8 +336,8 @@ def has_older_undelivered(
     ``queued``) until reconciliation settles it. "Older" is ``created_at``
     strictly smaller than *before_created_at* when given; equal-second ties
     stay unordered. *exclude_id* skips the record under judgment. The
-    sender-scoped lookback is bounded (50, newest first); other senders'
-    records never crowd it out.
+    sender-scoped lookup asks for the two oldest matching records, so the
+    true oldest is found no matter how many newer same-pair records exist.
 
     :param peer_message_store: Durable record store.
     :param sender_id: The sending session.
@@ -350,8 +350,9 @@ def has_older_undelivered(
     records = peer_message_store.list_for_session(
         receiver_id,
         ("pending", "queued", "delivering"),
-        50,
+        2,
         sender_session_id=sender_id,
+        oldest_first=True,
     )
     for record in records:
         if record.id == exclude_id:

@@ -6395,12 +6395,12 @@ async def _execute_timer_set(
 
 
 # Delays before each timer firing retry (4 retries after the first
-# attempt). Only a request that certainly did not land is retried: a
-# refused connection (ConnectError, nothing sent) or an explicit 502/503
-# (the gateway could not dispatch it). Everything else — a lost response
-# (RemoteProtocolError), a timeout, 500/504, or any 4xx — may mean the
-# server already accepted (or definitively refused) the firing, so
-# re-posting could double-fire it.
+# attempt). Only a request that never reached the server is retried: a
+# refused connection (ConnectError, nothing sent). Every HTTP status is a
+# server answer — a 502 in particular can be the server's native
+# forwarding path reporting a runner response lost after acceptance — and
+# so is a lost response (RemoteProtocolError), a timeout, or a 4xx; those
+# may mean the firing already landed, so re-posting could double-fire it.
 _TIMER_FIRE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
 
 
@@ -6443,12 +6443,13 @@ async def _timer_loop(
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
-            # Retry only requests that certainly did not land — a refused
-            # connection or an explicit 502/503 — up to
-            # ``_TIMER_FIRE_RETRY_DELAYS_S`` waits. A lost response, a
-            # timeout, 500/504 or a 4xx ends in the warning below without a
-            # retry because the server may already have accepted (or
-            # refused) the firing.
+            # Retry only requests that never reached the server — a refused
+            # connection (ConnectError) — up to ``_TIMER_FIRE_RETRY_DELAYS_S``
+            # waits. Every HTTP status (502/503 included: the server's own
+            # forwarding can turn a lost-after-acceptance runner response
+            # into one), a lost response, a timeout or a 4xx ends in the
+            # warning below without a retry because the server may already
+            # have accepted (or refused) the firing.
             for retry_delay_s in (*_TIMER_FIRE_RETRY_DELAYS_S, None):
                 try:
                     resp = await server_client.post(
@@ -6463,13 +6464,8 @@ async def _timer_loop(
                         },
                         timeout=30.0,
                     )
-                    # httpx does not raise on 4xx/5xx by default; retry an
-                    # explicit 502/503 (the gateway could not dispatch it)
-                    # and treat any other error status as a delivery
-                    # failure below.
-                    if retry_delay_s is not None and resp.status_code in (502, 503):
-                        await asyncio.sleep(retry_delay_s)
-                        continue
+                    # httpx does not raise on 4xx/5xx by default; any error
+                    # status is a delivery failure below, never a retry.
                     resp.raise_for_status()
                 except httpx.ConnectError:
                     # No connection was established, so the firing

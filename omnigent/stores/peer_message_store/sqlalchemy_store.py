@@ -122,8 +122,9 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         limit: int = 20,
         *,
         sender_session_id: str | None = None,
+        oldest_first: bool = False,
     ) -> list[SessionPeerMessage]:
-        """Return one receiver's records, newest first."""
+        """Return one receiver's records, newest first unless ``oldest_first``."""
         with self._session("list_peer_messages_for_session") as session:
             stmt = (
                 select(SqlSessionPeerMessage)
@@ -134,10 +135,15 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 stmt = stmt.where(SqlSessionPeerMessage.state.in_(sorted(states)))
             if sender_session_id is not None:
                 stmt = stmt.where(SqlSessionPeerMessage.sender_session_id == sender_session_id)
-            stmt = stmt.order_by(
-                desc(SqlSessionPeerMessage.created_at), desc(SqlSessionPeerMessage.id)
-            ).limit(limit)
-            rows = session.execute(stmt).scalars().all()
+            if oldest_first:
+                stmt = stmt.order_by(
+                    asc(SqlSessionPeerMessage.created_at), asc(SqlSessionPeerMessage.id)
+                )
+            else:
+                stmt = stmt.order_by(
+                    desc(SqlSessionPeerMessage.created_at), desc(SqlSessionPeerMessage.id)
+                )
+            rows = session.execute(stmt.limit(limit)).scalars().all()
             return [_record_to_entity(r) for r in rows]
 
     def list_due(

@@ -155,8 +155,8 @@ async def test_timer_delivery_logs_http_error_status(caplog: pytest.LogCaptureFi
 
     ``httpx`` does not raise on error status codes by default; without an
     explicit check the timer would silently ignore a rejected firing. A
-    4xx is a definitive refusal, so it is logged without a retry (5xx and
-    connection failures retry instead — see the retry tests below).
+    4xx is a definitive refusal, so it is logged without a retry (only a
+    directly refused connection retries — see the retry tests below).
     """
 
     class _ErrorResponder:
@@ -268,16 +268,35 @@ async def test_timer_firing_retries_connect_error_then_succeeds(
 
 
 @pytest.mark.asyncio
-async def test_timer_firing_retries_503_then_succeeds(
+async def test_timer_firing_does_not_retry_503(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A 503 certainly did not dispatch the firing, so it retries."""
+    """A 503 is a server answer: one POST, logged, no retry."""
     responder = _RetryResponder([httpx.Response(503), httpx.Response(202, json={"queued": True})])
 
-    sleeps = await _run_timer_loop(monkeypatch, responder)
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.tool_dispatch"):
+        sleeps = await _run_timer_loop(monkeypatch, responder)
 
-    assert responder.posts == 2
-    assert sleeps[1:] == [2.0]
+    assert responder.posts == 1
+    assert sleeps[1:] == []
+    assert any("firing persist failed" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_timer_firing_does_not_retry_502(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 502 can be a lost-after-acceptance forward: one POST, logged, no retry."""
+    responder = _RetryResponder([httpx.Response(502), httpx.Response(202, json={"queued": True})])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.tool_dispatch"):
+        sleeps = await _run_timer_loop(monkeypatch, responder)
+
+    assert responder.posts == 1
+    assert sleeps[1:] == []
+    assert any("firing persist failed" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -366,7 +385,7 @@ async def test_timer_firing_exhausts_retry_delays_then_logs(
     """Four retries follow the module delays, then the failure is logged."""
     from omnigent.runner.tool_dispatch import _TIMER_FIRE_RETRY_DELAYS_S
 
-    responder = _RetryResponder([httpx.Response(503)])
+    responder = _RetryResponder([httpx.ConnectError("connection refused")])
 
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.tool_dispatch"):
         sleeps = await _run_timer_loop(monkeypatch, responder)

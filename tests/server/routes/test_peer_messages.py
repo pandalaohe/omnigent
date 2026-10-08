@@ -42,6 +42,7 @@ from omnigent.server.routes.sessions.routes_peer import (
     PEER_SENDER_LIMIT,
     PeerSendRequest,
     format_peer_envelope,
+    has_older_undelivered,
     register_peer_routes,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -1159,6 +1160,48 @@ async def test_older_pair_record_behind_other_senders_still_blocks_steering(
     )
     assert resp.json()["disposition"] == "queued", resp.text
     assert fake.calls == []
+
+
+def test_has_older_undelivered_finds_oldest_behind_55_newer_same_pair(
+    peer_env: dict[str, Any],
+) -> None:
+    """The per-pair FIFO lookup finds the oldest record, not the newest page."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    store = peer_env["peer_store"]
+    now = int(time.time())
+    store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="oldest",
+            text="oldest",
+            state="delivering",
+            created_at=now - 100,
+            expires_at=now + 3600,
+        )
+    )
+    fillers = [
+        store.create(
+            SessionPeerMessage(
+                id=uuid.uuid4().hex,
+                sender_session_id=sender.id,
+                receiver_session_id=receiver.id,
+                ref=f"new-{index}",
+                text="new",
+                state="queued",
+                created_at=now - 55 + index,
+                expires_at=now + 3600,
+            )
+        )
+        for index in range(55)
+    ]
+    oldest_queued = fillers[0]
+    assert has_older_undelivered(
+        store, sender.id, receiver.id, oldest_queued.created_at, oldest_queued.id
+    )
+    assert not has_older_undelivered(store, sender.id, receiver.id, now - 200, None)
 
 
 async def test_older_delivering_record_blocks_steering(
