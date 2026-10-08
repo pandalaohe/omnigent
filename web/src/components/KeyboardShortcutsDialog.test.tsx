@@ -63,6 +63,42 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
+  it("follows a rebound newline chord and its alternate", () => {
+    render(<KeyboardShortcutsList />);
+    act(() => {
+      writeShortcutPreference("newLine", {
+        common: [
+          { code: "KeyJ", modifiers: ["control"] },
+          { code: "Enter", modifiers: ["alt", "shift"] },
+        ],
+      });
+    });
+
+    expect(keysFor("New line in message")).toEqual(["Ctrl", "J", "Alt", "⇧", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("CtrlJorAlt⇧↵");
+  });
+
+  it("drops the alternate when the newline has a single binding", () => {
+    render(<KeyboardShortcutsList />);
+    act(() => {
+      writeShortcutPreference("newLine", { common: [{ code: "KeyJ", modifiers: ["control"] }] });
+    });
+
+    expect(keysFor("New line in message")).toEqual(["Ctrl", "J"]);
+    expect(
+      within(screen.getByText("New line in message").closest("li")!).queryByText("or"),
+    ).toBeNull();
+  });
+
+  it("hides the newline row when the action is disabled", () => {
+    render(<KeyboardShortcutsList />);
+    act(() => {
+      writeShortcutPreference("newLine", { enabled: false });
+    });
+
+    expect(screen.queryByText("New line in message")).toBeNull();
+  });
+
   it("does not advertise inactive composer chords on touch-primary devices", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({

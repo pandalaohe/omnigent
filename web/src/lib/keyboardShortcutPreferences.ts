@@ -124,7 +124,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     label: "New line in message",
     group: "chats",
     scope: "composer",
-    defaultBindings: [chord("Enter", ["shift"])],
+    defaultBindings: [chord("Enter", ["shift"]), chord("Enter", ["alt"])],
   },
   recallPreviousPrompt: {
     id: "recallPreviousPrompt",
@@ -593,7 +593,7 @@ export function defaultShortcutBindings(
     return [chord("Enter", ["primary"])];
   }
   if (actionId === "newLine" && context.submitWithModEnter) {
-    return [chord("Enter")];
+    return [chord("Enter"), chord("Enter", ["alt"])];
   }
   if (actionId === "pinnedSession" && context.nativeShell) {
     return [chord("Digit*", ["primary"])];

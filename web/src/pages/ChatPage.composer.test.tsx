@@ -439,6 +439,34 @@ describe("Composer rebound recall and stop shortcuts", () => {
     fireEvent.keyDown(textarea(), { key: "n", code: "KeyN", altKey: true });
     expect(textarea()).toHaveValue("newer prompt");
   });
+
+  it("inserts a newline only on the rebound newline key", () => {
+    writeShortcutPreference("newLine", {
+      common: [{ code: "KeyJ", modifiers: ["control"] }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "firstsecond" } });
+    textarea().setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(textarea(), { key: "Enter", altKey: true })).toBe(true);
+    expect(textarea()).toHaveValue("firstsecond");
+
+    expect(fireEvent.keyDown(textarea(), { key: "j", code: "KeyJ", ctrlKey: true })).toBe(false);
+    expect(textarea()).toHaveValue("first\nsecond");
+  });
+
+  it("blocks Shift+Enter and Alt+Enter when the newline is disabled", () => {
+    writeShortcutPreference("newLine", { enabled: false });
+    const props = composerProps();
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "first" } });
+
+    expect(fireEvent.keyDown(textarea(), { key: "Enter", shiftKey: true })).toBe(false);
+    expect(textarea()).toHaveValue("first");
+    expect(fireEvent.keyDown(textarea(), { key: "Enter", altKey: true })).toBe(false);
+    expect(textarea()).toHaveValue("first");
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
 });
 
 describe("Composer session drafts", () => {
