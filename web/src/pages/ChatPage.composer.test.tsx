@@ -455,13 +455,15 @@ describe("Composer rebound recall and stop shortcuts", () => {
     expect(textarea()).toHaveValue("first\nsecond");
   });
 
-  it("blocks Shift+Enter when the newline is disabled", () => {
+  it("blocks Shift+Enter and Alt+Enter when the newline is disabled", () => {
     writeShortcutPreference("newLine", { enabled: false });
     const props = composerProps();
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "first" } });
 
     expect(fireEvent.keyDown(textarea(), { key: "Enter", shiftKey: true })).toBe(false);
+    expect(textarea()).toHaveValue("first");
+    expect(fireEvent.keyDown(textarea(), { key: "Enter", altKey: true })).toBe(false);
     expect(textarea()).toHaveValue("first");
     expect(props.onSend).not.toHaveBeenCalled();
   });
