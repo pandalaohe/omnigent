@@ -33,6 +33,10 @@ icon-only button, a load-time ``console.error`` and an image that 404s.
      the mode in the already-open preview without a document reload; the old
      chord is inert.
   6. The text-selection "Add comment" flow still works beside the new mode.
+  7. Hovering the trigger with the real mouse opens the CSS menu; the chord
+     pressed with focus in the frame turns the mode on via a real keydown's
+     user activation, and the picked option is named while the owner composer
+     holds focus.
 
 If this goes red, the regression sits at one of the seams: the annotate
 handshake (toggle hidden when the stub never answers), the picker's
@@ -112,7 +116,7 @@ _FIXTURE_HTML = Template(
     <div id="fixture-hover-wrap">
       <button id="fixture-hover-trigger" type="button">Hover for actions</button>
       <ul id="fixture-hover-menu">
-        <li><button type="button">Rename</button></li>
+        <li><button id="fixture-hover-rename" type="button">Rename</button></li>
         <li><button type="button">Duplicate</button></li>
       </ul>
     </div>
@@ -213,6 +217,29 @@ def _enter_annotation_mode(file_viewer: Locator) -> None:
     expect(toggle).to_have_attribute("aria-pressed", "true", timeout=15_000)
 
 
+def _click_in_frame(page: Page, preview: FrameLocator, selector: str) -> None:
+    """Click an element in the frame at its centre with the real mouse.
+
+    While the mode is on the pick runtime covers the page with a full-viewport
+    shield whose panel accepts pointer events, so ``locator.click()`` can never
+    pass Playwright's hit-target check ("element intercepts pointer events")
+    and would retry until timeout. A real user click lands on that shield too;
+    the picker's window listener then resolves the point with
+    ``elementFromPoint`` (temporarily opening the shield). ``page.mouse`` at
+    the element's centre drives exactly that route.
+
+    :param page: Playwright page (mouse coordinates are page-viewport based).
+    :param preview: The preview frame locator.
+    :param selector: CSS selector of the element to click in the frame.
+    :returns: None.
+    """
+    target = preview.locator(selector)
+    target.scroll_into_view_if_needed()
+    box = target.bounding_box()
+    assert box is not None, f"no bounding box for {selector}"
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+
 def _pick_and_note(
     page: Page,
     preview: FrameLocator,
@@ -231,21 +258,22 @@ def _pick_and_note(
         (stack).
     :returns: None.
     """
-    preview.locator(selector).click()
+    _click_in_frame(page, preview, selector)
     textarea = page.get_by_test_id("annotation-composer").locator("textarea")
     expect(textarea).to_be_focused(timeout=10_000)
     textarea.fill(note)
     textarea.press("Enter" if send else "ControlOrMeta+Enter")
 
 
-def _record_message_posts(page: Page, session_id: str) -> list[str]:
-    """Record user-message texts POSTed to the session's events endpoint.
+def _record_message_posts(page: Page, session_id: str) -> list[dict]:
+    """Record user-message POSTs to the session's events endpoint.
 
     :param page: Playwright page to watch.
     :param session_id: Session whose message posts to record.
-    :returns: The recorded ``input_text`` block texts, in POST order.
+    :returns: One dict per POST, in POST order: ``texts`` (the ``input_text``
+        block texts) and ``images`` (the ``input_image`` file ids).
     """
-    posts: list[str] = []
+    posts: list[dict] = []
 
     def record(request: Request) -> None:
         if request.method != "POST":
@@ -255,9 +283,16 @@ def _record_message_posts(page: Page, session_id: str) -> list[str]:
         body = request.post_data_json
         if not isinstance(body, dict) or body.get("type") != "message":
             return
+        texts: list[str] = []
+        images: list[str] = []
         for block in body.get("data", {}).get("content", []):
-            if isinstance(block, dict) and block.get("type") == "input_text":
-                posts.append(str(block.get("text", "")))
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "input_text":
+                texts.append(str(block.get("text", "")))
+            elif block.get("type") == "input_image":
+                images.append(str(block.get("file_id", "")))
+        posts.append({"texts": texts, "images": images})
 
     page.on("request", record)
     return posts
@@ -405,6 +440,9 @@ def test_click_pick_stacks_an_element_annotation(
     assert any(entry["url"].endswith("/" + _MISSING_IMAGE) for entry in anchor["network"]), anchor[
         "network"
     ]
+    # Playwright dispatches page events only during its own calls, and the
+    # comments poll above is plain HTTP; let queued request events drain first.
+    page.wait_for_timeout(300)
     assert posts == [], f"stacking must not send to chat: {posts}"
 
 
@@ -462,6 +500,55 @@ def test_open_dropdown_annotated_with_screenshot(
     expect(toggle).to_have_attribute("aria-pressed", "false", timeout=10_000)
     expect(preview.locator("#fixture-menu")).to_be_visible()
     expect(preview.locator("#fixture-menu-toggle")).to_have_attribute("aria-expanded", "true")
+
+
+def test_hover_menu_annotated_while_composer_owns_focus(
+    page: Page,
+    seeded_annotation_fixture: tuple[str, str, str],
+) -> None:
+    """T3 hover variant: a pinned hover menu survives the owner composer's focus.
+
+    The menu is opened by a real mouse hover before the mode turns on, so the
+    freeze pins the hover-revealed chain. The chord is then pressed with focus
+    inside the frame — a real keydown whose user activation propagates to the
+    parent and authorizes mode-on. While the owner composer owns focus the menu
+    must stay displayed, and the saved anchor must name the picked option.
+
+    :param page: Playwright page.
+    :param seeded_annotation_fixture: ``(base_url, session_id, path)`` of the
+        seeded fixture page.
+    :returns: None.
+    """
+    base_url, session_id, file_path = seeded_annotation_fixture
+    file_viewer, preview = _open_preview(page, base_url, session_id)
+    toggle = _annotate_toggle(file_viewer)
+    expect(toggle).to_be_visible(timeout=15_000)
+
+    # A real hover opens the CSS menu; the click focuses the trigger without
+    # moving the pointer off it, so the menu stays open.
+    trigger = preview.locator("#fixture-hover-trigger")
+    trigger.hover()
+    trigger.click()
+    hover_menu = preview.locator("#fixture-hover-menu")
+    expect(hover_menu).to_be_visible()
+    expect(trigger).to_be_focused()
+
+    page.keyboard.press(_DEFAULT_CHORD)
+    expect(toggle).to_have_attribute("aria-pressed", "true", timeout=15_000)
+
+    _click_in_frame(page, preview, "#fixture-hover-rename")
+    textarea = page.get_by_test_id("annotation-composer").locator("textarea")
+    expect(textarea).to_be_focused(timeout=10_000)
+    # Focus moved to the owner composer, yet the pinned hover menu remains.
+    expect(hover_menu).to_be_visible()
+
+    textarea.fill("Rename this action.")
+    textarea.press("ControlOrMeta+Enter")
+
+    comments = _wait_for_comments(base_url, session_id, file_path, 1)
+    assert len(comments) == 1, comments
+    anchor = _decode_element_anchor(comments[0])
+    assert anchor["target"]["text"] == "Rename", anchor["target"]
 
 
 def test_reload_reanchors_and_orphan_is_reported(
@@ -552,7 +639,13 @@ def test_send_batch_renders_cards(
         _pick_and_note(page, preview, targets[index], notes[index], send=False)
         _wait_for_comments(base_url, session_id, file_path, index + 1)
         expect(file_viewer.get_by_text(notes[index])).to_be_visible(timeout=15_000)
-    _pick_and_note(page, preview, targets[2], notes[2], send=True)
+    with page.expect_request(
+        lambda request: (
+            request.method == "POST"
+            and urlparse(request.url).path == f"/v1/sessions/{session_id}/events"
+        )
+    ) as sent_request:
+        _pick_and_note(page, preview, targets[2], notes[2], send=True)
 
     cards = page.get_by_test_id("annotation-card")
     expect(cards).to_have_count(3, timeout=30_000)
@@ -563,7 +656,20 @@ def test_send_batch_renders_cards(
     comments = _wait_for_addressed(base_url, session_id, file_path, 3)
     ordered = sorted(comments, key=lambda c: c["start_index"])
     assert [c["body"] for c in ordered] == notes, ordered
+    # Playwright dispatches page events only during its own calls, and the
+    # comments poll above is plain HTTP; let queued request events drain first.
+    page.wait_for_timeout(300)
     assert len(posts) == 1, posts
+    # The one delivered message carries the three distinct screenshot crops.
+    sent_body = sent_request.value.post_data_json
+    assert sent_body["type"] == "message", sent_body
+    images = [
+        str(block.get("file_id", ""))
+        for block in sent_body["data"]["content"]
+        if isinstance(block, dict) and block.get("type") == "input_image"
+    ]
+    assert len(images) == 3, sent_body
+    assert len(set(images)) == 3, sent_body
 
 
 def test_rebinding_takes_effect_without_reload(

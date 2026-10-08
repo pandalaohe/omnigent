@@ -194,6 +194,18 @@ function pickedMessage(overrides: Record<string, unknown> = {}): Record<string, 
   };
 }
 
+/** Stub the parent's transient user activation for one test; null removes it. */
+function stubUserActivation(isActive: boolean | null): void {
+  if (isActive === null) {
+    Reflect.deleteProperty(navigator, "userActivation");
+    return;
+  }
+  Object.defineProperty(navigator, "userActivation", {
+    configurable: true,
+    value: { isActive },
+  });
+}
+
 /** Run the composer's submit through the hook's API. */
 async function submitPick(
   result: { current: UseHtmlAnnotateResult },
@@ -259,6 +271,7 @@ beforeEach(() => {
 
 afterEach(() => {
   localStorage.clear();
+  Reflect.deleteProperty(navigator, "userActivation");
 });
 
 describe("useHtmlAnnotate handshake and shortcut", () => {
@@ -441,14 +454,55 @@ describe("useHtmlAnnotate mode", () => {
     expect(result.current.on).toBe(false);
   });
 
-  it("toggles from the frame's pre-runtime shortcut request", async () => {
-    const { frame } = setup();
+  it("refuses a forged toggleRequested while user activation is inactive", async () => {
+    stubUserActivation(false);
+    const { frame, result } = setup();
     await loadFrame(frame);
     await sendFromFrame(frame, { type: "annotate:ready" });
 
     await sendFromFrame(frame, { type: "annotate:toggleRequested" });
 
-    expect(lastType(frame, "annotate:loadRuntime")).toMatchObject({ part: "core" });
+    expect(result.current.on).toBe(false);
+    expect(lastType(frame, "annotate:loadRuntime")).toBeUndefined();
+  });
+
+  it("refuses a toggleRequested when the activation API is absent", async () => {
+    stubUserActivation(null);
+    const { frame, result } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+
+    await sendFromFrame(frame, { type: "annotate:toggleRequested" });
+
+    expect(result.current.on).toBe(false);
+    expect(lastType(frame, "annotate:loadRuntime")).toBeUndefined();
+  });
+
+  it("toggles from the frame's shortcut request under real user activation", async () => {
+    stubUserActivation(true);
+    const { frame, result } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+
+    await sendFromFrame(frame, { type: "annotate:toggleRequested" });
+    await sendFromFrame(frame, { type: "annotate:runtimeLoaded", part: "core", ok: true });
+    await sendFromFrame(frame, { type: "annotate:runtimeLoaded", part: "pick", ok: true });
+
+    expect(lastType(frame, "annotate:setMode")).toMatchObject({ on: true });
+    expect(result.current.on).toBe(true);
+  });
+
+  it("honours a toggleRequested as an unconditional off while the mode is on", async () => {
+    stubUserActivation(false);
+    const { frame, result } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+    await enterMode(frame, result.current.toggle);
+
+    await sendFromFrame(frame, { type: "annotate:toggleRequested" });
+
+    expect(lastType(frame, "annotate:setMode")).toMatchObject({ on: false });
+    expect(result.current.on).toBe(false);
   });
 
   it("toggles from the parent-focus shortcut", async () => {
@@ -565,7 +619,73 @@ describe("useHtmlAnnotate save and send", () => {
 
     expect(result.current.on).toBe(false);
     expect(result.current.pendingPick).toBeNull();
+    expect(lastType(frame, "annotate:pickDone")).toMatchObject({ type: "annotate:pickDone" });
     await flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("posts pickDone when the frame leaves the mode with a box open", async () => {
+    const { frame, result } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+    await enterMode(frame, result.current.toggle);
+
+    await sendFromFrame(frame, pickedMessage());
+    expect(result.current.pendingPick).not.toBeNull();
+    frame.sent.length = 0;
+
+    await sendFromFrame(frame, { type: "annotate:modeChanged", on: false, reason: "escape" });
+
+    expect(result.current.pendingPick).toBeNull();
+    expect(lastType(frame, "annotate:pickDone")).toMatchObject({ type: "annotate:pickDone" });
+  });
+
+  it("dismisses the pending pick when the path changes and posts pickDone", async () => {
+    const { frame, result, rerender } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+    await enterMode(frame, result.current.toggle);
+
+    await sendFromFrame(frame, pickedMessage());
+    expect(result.current.pendingPick).not.toBeNull();
+    frame.sent.length = 0;
+
+    await act(async () => {
+      rerender({
+        iframe: frame.iframe,
+        nonce: NONCE,
+        path: "reports/other.html",
+        sessionId: "conv_1",
+        comments: [],
+        onSelectComment: vi.fn(),
+      });
+    });
+
+    expect(result.current.pendingPick).toBeNull();
+    expect(lastType(frame, "annotate:pickDone")).toMatchObject({ type: "annotate:pickDone" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
+    expect(mocks.sender.mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("posts pickDone before the port closes on unmount", async () => {
+    const { frame, result, unmount } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+    await enterMode(frame, result.current.toggle);
+
+    await sendFromFrame(frame, pickedMessage());
+    expect(result.current.pendingPick).not.toBeNull();
+    frame.sent.length = 0;
+
+    await act(async () => {
+      unmount();
+      await flush();
+    });
+
+    await waitFor(() =>
+      expect(lastType(frame, "annotate:pickDone")).toMatchObject({ type: "annotate:pickDone" }),
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -916,6 +1036,130 @@ describe("useHtmlAnnotate save and send", () => {
     expect(frame.sent).toEqual([
       expect.objectContaining({ type: "annotate:pickDone", source: ANNOTATE_SOURCE, nonce: NONCE }),
     ]);
+  });
+
+  it("retires a listed save so a later delete cannot resurrect it", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(makeElementComment("c-stack", PATH, 200)));
+    const { frame, result, rerender } = setup();
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+    await enterMode(frame, result.current.toggle);
+
+    await sendFromFrame(frame, pickedMessage({ anchor: makeAnchor(200) }));
+    await submitPick(result, "stacked", "stack");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // The list shows the saved row, then the user deletes it.
+    await act(async () => {
+      rerender({
+        iframe: frame.iframe,
+        nonce: NONCE,
+        path: PATH,
+        sessionId: "conv_1",
+        comments: [makeElementComment("c-stack", PATH, 200)],
+        onSelectComment: vi.fn(),
+      });
+    });
+    await act(async () => {
+      rerender({
+        iframe: frame.iframe,
+        nonce: NONCE,
+        path: PATH,
+        sessionId: "conv_1",
+        comments: [],
+        onSelectComment: vi.fn(),
+      });
+    });
+
+    fetchMock.mockResolvedValueOnce(mockResponse(makeElementComment("c-new", PATH, 300)));
+    await sendFromFrame(frame, pickedMessage({ anchor: makeAnchor(300) }));
+    await submitPick(result, "send", "send");
+
+    await waitFor(() => expect(mocks.sender.mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mocks.sender.mutateAsync).toHaveBeenCalledWith({
+      comment_ids: ["c-new"],
+      respectQueue: true,
+    });
+  });
+
+  it("keeps queued sends and delivery memory across a session round trip", async () => {
+    const saves: ((value: Response) => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          saves.push(resolve);
+        }),
+    );
+    const sends: ((value: unknown) => void)[] = [];
+    mocks.sender.mutateAsync.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          sends.push(resolve);
+        }),
+    );
+    const { frame, result, rerender } = setup({
+      comments: [makeElementComment("c-existing", PATH, 100)],
+    });
+    await loadFrame(frame);
+    await sendFromFrame(frame, { type: "annotate:ready" });
+    await enterMode(frame, result.current.toggle);
+
+    await sendFromFrame(frame, pickedMessage({ anchor: makeAnchor(200) }));
+    await submitPick(result, "one", "send");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      rerender({
+        iframe: frame.iframe,
+        nonce: NONCE,
+        path: PATH,
+        sessionId: "conv_2",
+        comments: [],
+        onSelectComment: vi.fn(),
+      });
+    });
+    await act(async () => {
+      rerender({
+        iframe: frame.iframe,
+        nonce: NONCE,
+        path: PATH,
+        sessionId: "conv_1",
+        comments: [makeElementComment("c-existing", PATH, 100)],
+        onSelectComment: vi.fn(),
+      });
+    });
+
+    await sendFromFrame(frame, pickedMessage({ anchor: makeAnchor(300) }));
+    await submitPick(result, "two", "send");
+    // The chain survives the round trip: the second save waits for the first.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      saves[0]!(mockResponse(makeElementComment("c-one", PATH, 200)));
+      await flush();
+    });
+    await waitFor(() => expect(mocks.sender.mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mocks.sender.mutateAsync).toHaveBeenNthCalledWith(1, {
+      comment_ids: ["c-existing", "c-one"],
+      respectQueue: true,
+    });
+
+    await act(async () => {
+      sends[0]!(undefined);
+      await flush();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      saves[1]!(mockResponse(makeElementComment("c-two", PATH, 300)));
+      await flush();
+    });
+
+    await waitFor(() => expect(mocks.sender.mutateAsync).toHaveBeenCalledTimes(2));
+    // The already-delivered draft is not sent a second time.
+    expect(mocks.sender.mutateAsync).toHaveBeenNthCalledWith(2, {
+      comment_ids: ["c-two"],
+      respectQueue: true,
+    });
   });
 
   it("leaves a batch's ids eligible again when the send fails", async () => {

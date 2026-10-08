@@ -233,13 +233,17 @@ export function useHtmlAnnotate({
 
   // Picks are processed one at a time so a burst of submissions cannot build
   // overlapping batches. `savedRows` keeps this hook's saves the list has not
-  // shown yet; `deliveredIds` excludes ids a successful send already took.
+  // shown yet; `deliveredIds` excludes per session the ids a successful send
+  // already took. Chain and maps live for the hook's lifetime: switching
+  // sessions must not let old queued work resend or run concurrently.
   const pickedChainRef = useRef<Promise<void>>(Promise.resolve());
   const savedRowsRef = useRef<Map<string, SavedRow>>(new Map());
-  const deliveredIdsRef = useRef<Set<string>>(new Set());
+  const deliveredIdsRef = useRef<Map<string, Set<string>>>(new Map());
   // The pick the composer is editing; the ref lets submit/cancel read it
   // without re-creating their callbacks on every render.
   const pendingPickRef = useRef<PendingPick | null>(null);
+  // The session and path the open pick was made in; it dies when either moves.
+  const pendingPickContextRef = useRef<{ sessionId: string; path: string } | null>(null);
 
   // Element-anchored comments of this page, in reading order; `n` is the marker
   // number the frame paints. A row whose anchor fails to decode is a text comment.
@@ -281,6 +285,18 @@ export function useHtmlAnnotate({
       // The parent may close the port between messages; dropping is safe.
     }
   }, []);
+
+  /**
+   * Drop the open pick without saving it and release the frame's selection.
+   * `pickDone` goes out while the recorded port is still listening, so callers
+   * that close or clear the port must call this first.
+   */
+  const dismissPendingPick = useCallback((): void => {
+    if (!pendingPickRef.current) return;
+    applyPendingPick(null);
+    pendingPickContextRef.current = null;
+    postToFrame({ type: ANNOTATE_MSG.pickDone });
+  }, [applyPendingPick, postToFrame]);
 
   const postShortcut = useCallback(() => {
     postToFrame({
@@ -354,7 +370,7 @@ export function useHtmlAnnotate({
       // mirrored here: without it `on` never flips and the mode cannot be left.
       applyOn(false);
       // Leaving the mode drops the open pick without saving it.
-      applyPendingPick(null);
+      dismissPendingPick();
       return;
     }
     // Core covers anchoring and markers; pick adds freeze, the picker and the
@@ -363,7 +379,7 @@ export function useHtmlAnnotate({
     if (!(await ensurePart("pick")) || !readyRef.current) return;
     postToFrame({ type: ANNOTATE_MSG.setMode, on: true });
     applyOn(true);
-  }, [applyOn, applyPendingPick, ensurePart, postToFrame]);
+  }, [applyOn, dismissPendingPick, ensurePart, postToFrame]);
 
   const toggle = useCallback((): void => {
     void toggleMode();
@@ -375,6 +391,7 @@ export function useHtmlAnnotate({
   const handlePicked = useCallback(
     (message: AnnotatePicked): void => {
       if (pendingPickRef.current) return;
+      pendingPickContextRef.current = { sessionId: sessionIdRef.current, path: pathRef.current };
       applyPendingPick({
         anchor: message.anchor,
         screenshot: message.screenshot,
@@ -397,8 +414,7 @@ export function useHtmlAnnotate({
       const pickedPath = pathRef.current;
       const pickedSender = senderRef.current;
       const body = note.trim().slice(0, MAX_NOTE_CHARS);
-      applyPendingPick(null);
-      postToFrame({ type: ANNOTATE_MSG.pickDone });
+      dismissPendingPick();
 
       const run = async (): Promise<void> => {
         const anchor: ElementAnchorV1 = {
@@ -436,18 +452,25 @@ export function useHtmlAnnotate({
           return;
         }
         // Build the batch now, from the current list plus this hook's not-yet-
-        // listed saves, so an earlier queued pick's row is included.
+        // listed saves, so an earlier queued pick's row is included. Delivery
+        // memory is per session and survives switches.
+        const delivered = deliveredIdsRef.current.get(pickedSessionId);
         const ids = draftElementCommentIds(
           commentsRef.current,
           pickedSessionId,
           pickedPath,
           savedRowsRef.current,
-        ).filter((id) => !deliveredIdsRef.current.has(id));
+        ).filter((id) => !delivered?.has(id));
         if (ids.length === 0) return;
         try {
           const result = await pickedSender.mutateAsync({ comment_ids: ids, respectQueue: true });
           if (result?.delivered !== false) {
-            for (const id of ids) deliveredIdsRef.current.add(id);
+            let sentIds = deliveredIdsRef.current.get(pickedSessionId);
+            if (!sentIds) {
+              sentIds = new Set();
+              deliveredIdsRef.current.set(pickedSessionId, sentIds);
+            }
+            for (const id of ids) sentIds.add(id);
           }
         } catch (error) {
           showToast(error instanceof Error ? error.message : "Couldn't send annotations");
@@ -457,14 +480,12 @@ export function useHtmlAnnotate({
       // A failed pick must not stall the picks queued behind it.
       pickedChainRef.current = pickedChainRef.current.then(run, run);
     },
-    [applyPendingPick, postToFrame, queryClient],
+    [dismissPendingPick, queryClient],
   );
 
   const cancelPick = useCallback((): void => {
-    if (!pendingPickRef.current) return;
-    applyPendingPick(null);
-    postToFrame({ type: ANNOTATE_MSG.pickDone });
-  }, [applyPendingPick, postToFrame]);
+    dismissPendingPick();
+  }, [dismissPendingPick]);
 
   // Establish the annotate channel on every iframe document load. The bridge
   // effect and this one attach their own `load` listeners; the reset makes a
@@ -487,7 +508,7 @@ export function useHtmlAnnotate({
       }
       setAvailableState(false);
       applyOn(false);
-      applyPendingPick(null);
+      dismissPendingPick();
       setOrphanIds(EMPTY_ORPHANS);
     };
 
@@ -510,10 +531,15 @@ export function useHtmlAnnotate({
           // always honest because turning off is safe.
           if (!message.on) {
             applyOn(false);
-            applyPendingPick(null);
+            dismissPendingPick();
           }
           break;
         case ANNOTATE_MSG.toggleRequested:
+          // Page JS shares the frame's realm and can forge this message. Only a
+          // real keydown/click in the child frame grants transient activation
+          // to this window; page scripts cannot set it. An absent activation
+          // API fails closed. Turning off needs no activation.
+          if (!onRef.current && navigator.userActivation?.isActive !== true) break;
           void toggleMode();
           break;
         case ANNOTATE_MSG.resolved:
@@ -547,15 +573,16 @@ export function useHtmlAnnotate({
     iframe.addEventListener("load", onLoad);
     return () => {
       iframe.removeEventListener("load", onLoad);
+      // The frame still listens; release the open pick before the port closes.
+      resetDocument();
       channel?.port1.close();
       portRef.current = null;
-      resetDocument();
     };
   }, [
     iframe,
     nonce,
     applyOn,
-    applyPendingPick,
+    dismissPendingPick,
     handlePicked,
     handleRuntimeLoaded,
     postShortcut,
@@ -570,17 +597,25 @@ export function useHtmlAnnotate({
     void syncAnnotations();
   }, [syncAnnotations, elementItems]);
 
-  // A session switch starts a fresh submission queue and delivery memory, and
-  // drops any open pick without saving it.
+  // A save this hook made is its memory only until the list has shown it; from
+  // then on the current list decides, so a row deleted after listing cannot be
+  // resurrected by the not-yet-listed fallback.
   useEffect(() => {
-    if (pendingPickRef.current) {
-      applyPendingPick(null);
-      postToFrame({ type: ANNOTATE_MSG.pickDone });
+    if (savedRowsRef.current.size === 0) return;
+    const shown = new Set(comments.map((c) => c.id));
+    for (const id of savedRowsRef.current.keys()) {
+      if (shown.has(id)) savedRowsRef.current.delete(id);
     }
-    pickedChainRef.current = Promise.resolve();
-    savedRowsRef.current.clear();
-    deliveredIdsRef.current.clear();
-  }, [sessionId, applyPendingPick, postToFrame]);
+  }, [comments]);
+
+  // An open pick belongs to the session and path it was made in; either moving
+  // dismisses it. The frame may already have reloaded, but as long as this port
+  // listens the release goes out first.
+  useEffect(() => {
+    const picked = pendingPickContextRef.current;
+    if (!picked) return;
+    if (picked.sessionId !== sessionId || picked.path !== path) dismissPendingPick();
+  }, [sessionId, path, dismissPendingPick]);
 
   // Re-send the resolved chords on rebinding, so a live change applies without
   // a frame reload (T11).
