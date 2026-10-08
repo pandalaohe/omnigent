@@ -33,8 +33,64 @@ function header(rest: string, tail = REV4_TAIL): string {
   );
 }
 
+function currentEnvelope(rest: string, body = "Can you check the deploy status?"): string {
+  return `[Peer message from session ${SENDER_ID} msg=${PEER_ID} ${rest} ref=${REF}]\n\n${body}`;
+}
+
 describe("parsePeerMessage", () => {
-  it("parses the header without a project id", () => {
+  it("parses the current header without a project id", () => {
+    const parsed = parsePeerMessage(currentEnvelope('"Deploy review" (Claude)'));
+    expect(parsed).toEqual({
+      senderId: SENDER_ID,
+      title: "Deploy review",
+      agent: "Claude",
+      projectId: undefined,
+      ref: REF,
+      peerId: PEER_ID,
+      body: "Can you check the deploy status?",
+    });
+  });
+
+  it("parses the current header with a project id", () => {
+    const parsed = parsePeerMessage(currentEnvelope('"Deploy review" (Codex · omnigent)'));
+    expect(parsed).toEqual({
+      senderId: SENDER_ID,
+      title: "Deploy review",
+      agent: "Codex",
+      projectId: "omnigent",
+      ref: REF,
+      peerId: PEER_ID,
+      body: "Can you check the deploy status?",
+    });
+  });
+
+  it("parses a current title containing a single quote", () => {
+    const parsed = parsePeerMessage(currentEnvelope('"Bob\'s follow-up" (Claude)'));
+    expect(parsed?.title).toBe("Bob's follow-up");
+  });
+
+  it("keeps blank lines inside the current body", () => {
+    const parsed = parsePeerMessage(
+      currentEnvelope('"Deploy review" (Claude)', "First paragraph.\n\nSecond paragraph."),
+    );
+    expect(parsed?.body).toBe("First paragraph.\n\nSecond paragraph.");
+  });
+
+  it("keeps a current body that itself starts with an envelope header", () => {
+    const quoted =
+      `[Peer message from session ${SENDER_ID} msg=${PEER_ID} "Inner" (Claude) ref=inner]` +
+      `\n\ninner body`;
+    const parsed = parsePeerMessage(currentEnvelope('"Outer" (Codex)', quoted));
+    expect(parsed?.title).toBe("Outer");
+    expect(parsed?.body).toBe(quoted);
+  });
+
+  it("rejects a current header whose next line is not blank", () => {
+    const malformed = currentEnvelope('"Deploy review" (Claude)').replace("\n\n", "\n");
+    expect(parsePeerMessage(malformed)).toBeNull();
+  });
+
+  it("parses the legacy header without a project id", () => {
     const parsed = parsePeerMessage(envelope(header('"Deploy review" (Claude)')));
     expect(parsed).toEqual({
       senderId: SENDER_ID,
@@ -47,7 +103,7 @@ describe("parsePeerMessage", () => {
     });
   });
 
-  it("parses the header with a project id", () => {
+  it("parses the legacy header with a project id", () => {
     const parsed = parsePeerMessage(envelope(header('"Deploy review" (Codex · omnigent)')));
     expect(parsed).toEqual({
       senderId: SENDER_ID,
@@ -94,12 +150,12 @@ describe("parsePeerMessage", () => {
     });
   });
 
-  it("parses a title containing a single quote", () => {
+  it("parses a legacy title containing a single quote", () => {
     const parsed = parsePeerMessage(envelope(header('"Bob\'s follow-up" (Claude)')));
     expect(parsed?.title).toBe("Bob's follow-up");
   });
 
-  it("keeps blank lines inside the body", () => {
+  it("keeps blank lines inside the legacy body", () => {
     const parsed = parsePeerMessage(
       envelope(header('"Deploy review" (Claude)'), "First paragraph.\n\nSecond paragraph."),
     );

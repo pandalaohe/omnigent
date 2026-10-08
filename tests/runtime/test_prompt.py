@@ -617,16 +617,19 @@ def test_native_startup_instructions_worktree_then_global_last() -> None:
     )
 
 
-def test_child_question_instruction_with_peers_sends_to_the_mother() -> None:
-    """A child with peer messaging sends the decision to its mother and moves on."""
+def test_child_question_instruction_with_peers_ends_the_turn_and_keeps_redirect() -> None:
+    """A child with peer messaging ends the turn with its question, keeping
+    the successor-redirect rule."""
     text = child_session_question_instruction(peer_messaging_enabled=True)
 
     assert text.startswith(CHILD_SESSION_QUESTION_INSTRUCTION)
     assert "Do not show question cards to the user yourself." in text
-    assert "`sys_session_send`" in text
-    assert "then continue other work or end your turn" in text
-    assert "her reply arrives as a new message" in text
+    assert "as your final output" in text
+    assert "your mother receives it as your result" in text
     assert "`redirected_to`" in text
+    assert "that session is your mother from then on" in text
+    assert "then continue other work" not in text
+    assert "her reply arrives as a new message" not in text
 
 
 def test_child_question_instruction_without_peers_ends_the_turn() -> None:

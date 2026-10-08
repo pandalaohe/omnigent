@@ -221,6 +221,7 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    PEER_SESSION_GRANT,
     build_instructions,
     build_instructions_nullable,
     child_session_framework_instructions,
@@ -3057,21 +3058,24 @@ def create_runner_app(
             workspace=snapshot.workspace,
             worktree=snapshot.worktree,
         )
-        # A child session also carries the quiet-result rule (D9); the
-        # per-session text channel feeds both native startup and the
-        # per-turn framework instructions.
+        # A peer-enabled session carries the reply grant, and a child session
+        # also carries the quiet-result rule (D9); the per-session text channel
+        # feeds both native startup and the per-turn framework instructions.
         child_instructions = child_session_framework_instructions(
             has_parent=snapshot.parent_session_id is not None
         )
-        if child_instructions:
-            _session_global_instructions[session_id] = "\n\n".join(
+        _session_global_instructions[session_id] = (
+            "\n\n".join(
                 part
                 for part in [
                     _session_global_instructions[session_id],
+                    PEER_SESSION_GRANT if snapshot.peer_messaging_enabled else None,
                     *child_instructions,
                 ]
                 if part and part.strip()
             )
+            or None
+        )
         # A relay started before this init (resource access precedes the
         # handshake) read the previous flag; rebuild it in place on a flip.
         _stale_relay = _session_comment_relays.get(session_id)

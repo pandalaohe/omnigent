@@ -195,14 +195,11 @@ describe("parseSystemMessage", () => {
 
   it("labels expired and refused_by_user peer outcomes", () => {
     expect(
-      parseSystemMessage(
-        '[System: peer message peer_1 to session conv_a "T" expired]',
-      )?.label,
+      parseSystemMessage('[System: peer message peer_1 to session conv_a "T" expired]')?.label,
     ).toBe("Peer message expired");
     expect(
-      parseSystemMessage(
-        '[System: peer message peer_1 to session conv_a "T" refused_by_user]',
-      )?.label,
+      parseSystemMessage('[System: peer message peer_1 to session conv_a "T" refused_by_user]')
+        ?.label,
     ).toBe("Peer message refused by user");
   });
 
@@ -222,7 +219,11 @@ describe("parseSystemMessage", () => {
     const r = parseSystemMessage(
       '[System: peer message peer_1 to session conv_a "First" delivered]\nplain follow-up text',
     );
-    expect(r).toEqual({ kind: "generic", label: 'peer message peer_1 to session conv_a "First" delivered', body: "plain follow-up text" });
+    expect(r).toEqual({
+      kind: "generic",
+      label: 'peer message peer_1 to session conv_a "First" delivered',
+      body: "plain follow-up text",
+    });
   });
 
   it.each(["[Request interrupted by user]", "[Request interrupted by user for tool use]"])(
@@ -277,8 +278,8 @@ describe("isSystemUserContent", () => {
   it("treats an inbound peer-message envelope as a real turn, not a system marker", () => {
     // The envelope carries no [System: ...] wrapper — it's a real turn input
     // the receiving agent replies to (peerMessage.ts renders it, not this
-    // module's SystemMessageView). Rev 5 trimmed the instruction line; the
-    // rev 4 tail stays a real turn too (history).
+    // module's SystemMessageView). The current header-only format and the
+    // older instruction-line formats are all real turns (history).
     const envelope = (instruction: string): string =>
       '[Peer message from session a1b2c3d4e5f60718293a4b5c6d7e8f90 "Deploy review" (Claude) ' +
       "ref=corr-1 msg=00112233445566778899aabbccddeeff — sent by another Omnigent session, not " +
@@ -292,6 +293,11 @@ describe("isSystemUserContent", () => {
       `${rev5Instruction} Say accept, hold or refuse, then report ` +
       "the outcome when done. Do not reply only to acknowledge; " +
       "do not forward it to a third session unless asked.";
+    const currentEnvelope =
+      "[Peer message from session a1b2c3d4e5f60718293a4b5c6d7e8f90 " +
+      'msg=00112233445566778899aabbccddeeff "Deploy review" (Claude) ref=corr-1]\n\n' +
+      "Can you check the deploy?";
+    expect(isSystemUserContent(text(currentEnvelope))).toBe(false);
     expect(isSystemUserContent(text(envelope(rev5Instruction)))).toBe(false);
     expect(isSystemUserContent(text(envelope(rev4Instruction)))).toBe(false);
   });

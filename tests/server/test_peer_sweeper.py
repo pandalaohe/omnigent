@@ -361,9 +361,7 @@ async def test_pending_delivers_when_receiver_turns_idle(harness: _Harness) -> N
     assert _row(harness.store, record.id).state == "delivered"
     assert len(harness.deliver.calls) == 1
     assert harness.deliver.calls[0]["receiver"] == "receiver"
-    assert harness.post_event.calls[0]["session_id"] == "sender"
-    assert "delivered" in harness.post_event.calls[0]["text"]
-    assert record.id in harness.post_event.calls[0]["text"]
+    assert harness.post_event.calls == []
 
 
 async def test_queued_delivers(harness: _Harness) -> None:
@@ -439,7 +437,7 @@ async def test_released_record_delivers_despite_inbound_hold() -> None:
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
     assert len(h.deliver.calls) == 1
-    assert "delivered" in h.post_event.calls[0]["text"]
+    assert h.post_event.calls == []
 
 
 async def test_master_switch_off_fails_deferred_record_with_notice() -> None:
@@ -542,7 +540,7 @@ async def test_released_record_revert_keeps_marker_and_delivers_next_tick() -> N
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
     assert len(h.deliver.calls) == 1
-    assert "delivered" in h.post_event.calls[0]["text"]
+    assert h.post_event.calls == []
 
 
 async def test_transient_failure_retries_then_delivers(harness: _Harness) -> None:
@@ -555,9 +553,7 @@ async def test_transient_failure_retries_then_delivers(harness: _Harness) -> Non
 
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
-    assert len(harness.post_event.calls) == 1
-    assert "delivered" in harness.post_event.calls[0]["text"]
-    assert "failed" not in harness.post_event.calls[0]["text"]
+    assert harness.post_event.calls == []
 
 
 async def test_transient_failure_until_expiry_expires_with_one_notice(harness: _Harness) -> None:
@@ -600,7 +596,7 @@ async def test_uncertain_delivery_reconciles_delivered_via_marker_after_grace(
     harness: _Harness,
 ) -> None:
     """X2: past the grace, a marker in the receiver's transcript settles
-    an uncertain delivery as delivered, with one notice."""
+    an uncertain delivery as delivered, without a notice."""
     record = harness.seed_record(state="pending")
     harness.deliver.outcomes["receiver"] = ("uncertain", "not_ready")
     await harness.sweeper._tick()
@@ -611,8 +607,7 @@ async def test_uncertain_delivery_reconciles_delivered_via_marker_after_grace(
     await harness.sweeper._tick()
     updated = _row(harness.store, record.id)
     assert updated.state == "delivered"
-    assert len(harness.post_event.calls) == 1
-    assert "delivered" in harness.post_event.calls[0]["text"]
+    assert harness.post_event.calls == []
 
 
 async def test_uncertain_delivery_reconciles_to_pending_without_marker(
@@ -634,7 +629,7 @@ async def test_uncertain_delivery_reconciles_to_pending_without_marker(
 
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
-    assert len(harness.post_event.calls) == 1
+    assert harness.post_event.calls == []
 
 
 async def test_uncertain_delivery_past_expiry_expires_with_notice(
@@ -656,8 +651,7 @@ async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:
     """F6: two concurrent flush attempts for one sender post exactly once."""
     record = harness.seed_record(state="pending")
     harness.true_state.states["sender"] = "busy"
-    await harness.sweeper._tick()
-    assert _row(harness.store, record.id).state == "delivered"
+    await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
     assert len(harness.sweeper._parked["sender"]) == 1
 
     harness.true_state.states["sender"] = "idle"
@@ -696,9 +690,8 @@ async def test_notices_to_busy_sender_park_and_flush_as_one_message() -> None:
     r2 = h.seed_record(
         id="peer_2", receiver_session_id="receiver2", ref="ref-2", expires_at=h._now + 10
     )
-    await h.sweeper._tick()
-    assert _row(h.store, r1.id).state == "delivered"
-    assert _row(h.store, r2.id).state == "delivered"
+    await h.sweeper._notify_for(r1, "delivered", None, "Receiver", _APP)
+    await h.sweeper._notify_for(r2, "delivered", None, "Receiver Two", _APP)
     assert h.post_event.calls == []  # sender busy — both parked, nothing posted yet
     assert len(h.sweeper._parked["sender"]) == 2
 
@@ -789,7 +782,7 @@ async def test_startup_reconciliation_marker_found_is_delivered() -> None:
     await h.sweeper._reconcile_startup()
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
-    assert "delivered" in h.post_event.calls[0]["text"]
+    assert h.post_event.calls == []
 
 
 async def test_startup_reconciliation_marker_missing_reverts_to_pending() -> None:

@@ -10,12 +10,14 @@ forwarded) reverts for the next tick's retry; an *uncertain* outcome (the
 runner may have accepted the input despite a lost or unconfirmable
 response) is never retried blindly — the record stays in ``delivering``
 until ``_reconcile_stale_delivering`` settles it by searching the
-receiver's transcript for the record's ``msg=`` marker. Every terminal
-transition — delivered, failed, expired — and the action route's
-``refuse`` post a ``[System: ...]`` back-notice to the sender, idle-gated
-the same way: notices generated while the sender is mid-turn park in an
-in-memory per-sender queue and post as one batched message on a later
-tick when the sender goes idle. The parked queue is process-local and
+receiver's transcript for the record's ``msg=`` marker. Failed, expired
+and refused transitions — including the action route's ``refuse`` — post
+a ``[System: ...]`` back-notice to the sender; a delivered record posts
+none, since the sender learns of delivery from the reply itself or from
+``wait_for_reply_seconds``. Notices are idle-gated the same way: notices
+generated while the sender is mid-turn park in an in-memory per-sender
+queue and post as one batched message on a later tick when the sender
+goes idle. The parked queue is process-local and
 does not survive a restart (a survivable choice: the
 ``session_peer_messages`` row itself is durable and the sweeper's own
 tick keeps searching for it).
@@ -399,7 +401,6 @@ class PeerSweeper:
         await asyncio.to_thread(
             self._store.transition, record.id, result_state, reason, ("delivering",)
         )
-        await self._notify_for(record, result_state, reason, receiver_title, self._app)
 
     async def _revert_delivering(
         self, record: SessionPeerMessage, origin_state: str, reason: str
@@ -558,20 +559,9 @@ class PeerSweeper:
             1,
         )
         if matches:
-            moved = await asyncio.to_thread(
+            await asyncio.to_thread(
                 self._store.transition, record.id, "delivered", None, ("delivering",)
             )
-            if moved:
-                receiver = await asyncio.to_thread(
-                    self._conversation_store.get_conversation, record.receiver_session_id
-                )
-                await self._notify_for(
-                    record,
-                    "delivered",
-                    None,
-                    receiver.title if receiver is not None else None,
-                    self._app,
-                )
             return
         if record.expires_at <= now:
             # Past its deadline with no marker: end the record instead of
