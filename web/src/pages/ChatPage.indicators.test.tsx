@@ -9,6 +9,7 @@ import { BubbleView, WorkingIndicator } from "./ChatPage";
 import {
   ConnectionIndicator,
   RunnerLogRunawayBanner,
+  RunnerLogRunawayIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
 } from "./ChatIndicators";
@@ -66,6 +67,23 @@ describe("RunnerLogRunawayBanner", () => {
     ...(mb === undefined ? {} : { "omnigent.runner_log_runaway_mb": mb }),
     "omnigent.runner_log_runaway_seen": new Date().toISOString(),
   });
+
+  // Both surfaces render the same live warning, so tests mount them together
+  // and assert which one owns the screen.
+  function RunnerLogRunawaySurfaces({
+    labels,
+    fallbackLabels,
+  }: {
+    labels: Record<string, string> | undefined;
+    fallbackLabels?: Record<string, string> | undefined;
+  }) {
+    return (
+      <>
+        <RunnerLogRunawayBanner labels={labels} fallbackLabels={fallbackLabels} />
+        <RunnerLogRunawayIndicator labels={labels} fallbackLabels={fallbackLabels} />
+      </>
+    );
+  }
 
   beforeEach(() => {
     localStorage.clear();
@@ -216,6 +234,99 @@ describe("RunnerLogRunawayBanner", () => {
       />,
     );
     expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
+  });
+
+  it("shows the band, not the workspace-bar indicator, while the warning is undismissed", () => {
+    render(<RunnerLogRunawaySurfaces labels={confirmedLabels("7")} />);
+    expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("runner-log-runaway-indicator")).not.toBeInTheDocument();
+  });
+
+  it("collapses to the workspace-bar indicator once the warning is dismissed", () => {
+    render(<RunnerLogRunawaySurfaces labels={confirmedLabels("7")} />);
+    fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("runner-log-runaway-indicator")).toBeInTheDocument();
+  });
+
+  it("opens the details without touching the dismissal store", async () => {
+    render(<RunnerLogRunawaySurfaces labels={confirmedLabels("7")} />);
+    fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+    const storedBefore = localStorage.getItem("omnigent:runner-log-warnings");
+    const patchesBefore = queuePatchMock.mock.calls.length;
+
+    fireEvent.click(screen.getByTestId("runner-log-runaway-indicator"));
+
+    expect(screen.getByTestId("runner-log-runaway-indicator").querySelector("svg")).toHaveClass(
+      "text-warning",
+    );
+
+    const details = await screen.findByTestId("runner-log-runaway-details");
+    expect(details).toHaveTextContent(/writing warnings and errors to its log unusually fast/);
+    expect(details).toHaveTextContent("(7 MB in the last hour)");
+    expect(details).toHaveTextContent("Detected");
+    expect(details).toHaveTextContent("last confirmed");
+    expect(localStorage.getItem("omnigent:runner-log-warnings")).toBe(storedBefore);
+    expect(queuePatchMock.mock.calls.length).toBe(patchesBefore);
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+  });
+
+  it("hides both surfaces when a dismissed warning's lease has lapsed", () => {
+    localStorage.setItem(
+      "omnigent:runner-log-warnings",
+      JSON.stringify({ [RUNWAY_FLAG]: 1_758_000_000_000 }),
+    );
+    render(
+      <RunnerLogRunawaySurfaces
+        labels={{
+          ...confirmedLabels("7"),
+          "omnigent.runner_log_runaway_seen": new Date(Date.now() - 16 * 60 * 1000).toISOString(),
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("runner-log-runaway-indicator")).not.toBeInTheDocument();
+  });
+
+  it("hides the indicator once the dismissed warning's lease lapses", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <RunnerLogRunawaySurfaces
+          labels={{
+            ...confirmedLabels(),
+            "omnigent.runner_log_runaway_seen": new Date(Date.now() - 14 * 60 * 1000).toISOString(),
+          }}
+        />,
+      );
+      fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+      expect(screen.getByTestId("runner-log-runaway-indicator")).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(2 * 60 * 1000);
+      });
+      expect(screen.queryByTestId("runner-log-runaway-indicator")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restores the band and drops the indicator when a new detection instant arrives", () => {
+    const { rerender } = render(<RunnerLogRunawaySurfaces labels={confirmedLabels("7")} />);
+    fireEvent.click(screen.getByTestId("runner-log-runaway-dismiss"));
+    expect(screen.queryByTestId("runner-log-runaway-banner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("runner-log-runaway-indicator")).toBeInTheDocument();
+
+    rerender(
+      <RunnerLogRunawaySurfaces
+        labels={{
+          ...confirmedLabels("8"),
+          "omnigent.runner_log_runaway": "2026-09-23T10:25:00+00:00",
+        }}
+      />,
+    );
+    expect(screen.getByTestId("runner-log-runaway-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("runner-log-runaway-indicator")).not.toBeInTheDocument();
   });
 });
 

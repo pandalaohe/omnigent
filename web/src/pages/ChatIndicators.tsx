@@ -1,17 +1,13 @@
-import { useEffect, useState } from "react";
 import { Loader2Icon, TriangleAlertIcon, WifiOffIcon, XIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { useDismissedRunnerLogWarnings } from "@/hooks/useDismissedRunnerLogWarnings";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { useRunnerLogRunawayState } from "@/hooks/useRunnerLogRunawayState";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import {
-  RUNNER_LOG_RUNAWAY_LABEL_KEY,
-  runnerLogRunawayLeaseEnd,
-  runnerLogRunawayNotice,
-} from "@/lib/runnerLogRunaway";
+import { absoluteTime } from "@/lib/relativeTime";
 import { dismissRunnerLogWarning } from "@/lib/runnerLogWarningPreferences";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -60,7 +56,8 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
  * Warning band for a session whose runner is writing logs abnormally fast
  * (the host reported a runaway; the server stamped the session label).
  * Shows while the host keeps confirming the runner is over the cap;
- * dismissing hides the band until a new detection instant arrives. Tops the
+ * dismissing collapses it into RunnerLogRunawayIndicator until a new
+ * detection instant arrives. Tops the
  * composer stack so the warning is visible without scrolling.
  */
 export function RunnerLogRunawayBanner({
@@ -70,26 +67,9 @@ export function RunnerLogRunawayBanner({
   labels: Record<string, string> | undefined;
   fallbackLabels?: Record<string, string> | undefined;
 }) {
-  const effectiveLabels = labels ?? fallbackLabels;
-  const notice = runnerLogRunawayNotice(effectiveLabels);
-  const flag = effectiveLabels?.[RUNNER_LOG_RUNAWAY_LABEL_KEY];
-  const leaseEnd = runnerLogRunawayLeaseEnd(effectiveLabels);
-  const dismissed = useDismissedRunnerLogWarnings();
-  const [now, setNow] = useState(() => Date.now());
-
-  // One timer just past the lease end flips `now`, so the band disappears on
-  // its own when the host stops re-confirming the runaway report.
-  useEffect(() => {
-    if (leaseEnd === null) return;
-    const timer = window.setTimeout(
-      () => setNow(Date.now()),
-      Math.max(0, leaseEnd - Date.now()) + 1,
-    );
-    return () => window.clearTimeout(timer);
-  }, [leaseEnd]);
-
-  if (notice === null || leaseEnd === null || !flag || leaseEnd <= now) return null;
-  if (dismissed[flag] !== undefined) return null;
+  const runaway = useRunnerLogRunawayState(labels, fallbackLabels);
+  if (runaway === null || runaway.dismissed) return null;
+  const { flag, notice } = runaway;
   return (
     <div data-testid="runner-log-runaway-banner" role="status" className="mb-2">
       <Alert>
@@ -110,6 +90,60 @@ export function RunnerLogRunawayBanner({
         </AlertAction>
       </Alert>
     </div>
+  );
+}
+
+/**
+ * Collapsed runaway warning for the composer workspace bar: shown while a
+ * dismissed detection is still being re-confirmed, and opens the details
+ * without ever touching the dismissal store.
+ */
+export function RunnerLogRunawayIndicator({
+  labels,
+  fallbackLabels,
+}: {
+  labels: Record<string, string> | undefined;
+  fallbackLabels?: Record<string, string> | undefined;
+}) {
+  const runaway = useRunnerLogRunawayState(labels, fallbackLabels);
+  if (runaway === null || !runaway.dismissed) return null;
+  return (
+    <Popover modal={false}>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          aria-label="Runner log growth warning — show details"
+          data-testid="runner-log-runaway-indicator"
+          className="shrink-0 px-1 md:px-2"
+        >
+          <TriangleAlertIcon className="size-3.5 text-warning" aria-hidden />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="end"
+        collisionPadding={8}
+        data-testid="runner-log-runaway-details"
+        className="w-[min(22rem,calc(100vw-2rem))]"
+      >
+        <div className="flex items-start gap-2">
+          <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden />
+          <div className="flex min-w-0 flex-1 flex-col gap-1">
+            <p className="text-sm font-medium text-foreground">Runner log growth warning</p>
+            <p className="text-sm text-muted-foreground">{runaway.notice}</p>
+            <p className="text-xs text-muted-foreground">
+              Detected {absoluteTime(Date.parse(runaway.flag))} · last confirmed{" "}
+              {absoluteTime(Date.parse(runaway.seen))}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Clears by itself 15 minutes after the host stops confirming.
+            </p>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 
