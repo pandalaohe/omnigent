@@ -886,6 +886,8 @@ describe("picker", () => {
     };
     expect(anchor.kind).toBe("element");
     expect(anchor.rect).toMatchObject({ x: 10, y: 20, w: 100, h: 30 });
+    // The click path still captures with the crop margin around the element.
+    expect(ns.__lastCapture?.options.clip).toMatchObject({ x: 0, y: 4, width: 126, height: 62 });
     // The anchor's css resolves back to the picked element.
     expect(win.document.querySelector(anchor.target.css)).toBe(button);
 
@@ -932,7 +934,7 @@ describe("picker", () => {
     expect(ns.overlayRoot().querySelectorAll("[data-omni-pick]")).toHaveLength(0);
   });
 
-  it("picks a region on a drag and captures the box plus a margin", async () => {
+  it("picks a region on a drag and captures the drawn box", async () => {
     const win = startFrame('<p id="para">The quick brown fox jumps over the lazy dog</p>');
     const frame = await loadPick(win);
     const ns = win.__omniAnnotate;
@@ -976,7 +978,7 @@ describe("picker", () => {
     expect(anchor.region).toEqual({ x: 20, y: 30, w: 80, h: 30 });
     expect(anchor.rect).toEqual({ x: 10, y: 20, w: 200, h: 40 });
     expect(anchor.selectedText).toBe("The quick brown fox jumps over the lazy dog");
-    expect(ns.__lastCapture?.options.clip).toMatchObject({ x: 4, y: 14, width: 112, height: 62 });
+    expect(ns.__lastCapture?.options.clip).toMatchObject({ x: 20, y: 30, width: 80, height: 30 });
 
     // The selected outline is the drawn region box, not the covering element.
     const selected = ns.overlayRoot().querySelector('[data-omni-pick="selected"]') as HTMLElement;

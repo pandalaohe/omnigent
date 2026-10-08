@@ -377,7 +377,7 @@ function pickRegion(start, end) {
   );
   var rect = pageRect(target);
   var anchor = buildAnchor(target, rect, "region", region, collectSelectedText(clientBox));
-  openPickerCapture(anchor, region, marginRect(region), {
+  openPickerCapture(anchor, region, region, {
     x: clientBox.left,
     y: clientBox.top,
     w: clientBox.right - clientBox.left,
