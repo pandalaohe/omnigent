@@ -59,6 +59,8 @@ class PeerMessageStore(ABC):
         session_id: str,
         states: tuple[str, ...] | None = None,
         limit: int = 20,
+        *,
+        sender_session_id: str | None = None,
     ) -> list[SessionPeerMessage]:
         """
         Return records addressed to one receiver session, newest first.
@@ -66,6 +68,9 @@ class PeerMessageStore(ABC):
         :param session_id: The receiver session.
         :param states: When given, return only records in these states.
         :param limit: Maximum records to return.
+        :param sender_session_id: When given, return only records from
+            this sender. Used for a per-pair lookup that must not be
+            crowded out by other senders' records.
         :returns: :class:`SessionPeerMessage` instances in reverse
             creation order.
         """

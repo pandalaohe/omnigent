@@ -15,21 +15,22 @@ import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import SessionPeerMessage
-from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.entities.conversation import Conversation, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes import sessions as sessions_module
@@ -292,6 +293,71 @@ def _seed_trigger_depth(peer_env: dict[str, Any], depth: int) -> SessionPeerMess
     )
     _mirror_envelope(peer_env, record, conversation_id=sender.id, text="trigger body")
     return record
+
+
+def _steerable_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+    peer_env: dict[str, Any],
+    *,
+    harness: str = "claude-native",
+    cached_status: str = "running",
+) -> Conversation:
+    """A native receiver that reads steerable: mid-turn + a steerable harness."""
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    receiver = conv_store.create_conversation(
+        title=f"steer-{uuid.uuid4().hex[:6]}", agent_id=AGENT_ID, runner_id="rst"
+    )
+    peer_env["perm_store"].grant(ALICE, receiver.id, LEVEL_OWNER)
+    monkeypatch.setattr(
+        peer_module, "_is_native_terminal_session", lambda conv: conv.id == receiver.id
+    )
+
+    async def _present_runner_client(
+        session_id: str, runner_router: Any = None, **kwargs: Any
+    ) -> Any:
+        del session_id, runner_router, kwargs
+        return object()
+
+    monkeypatch.setattr(peer_module, "_get_runner_client", _present_runner_client)
+
+    async def _ready_ok(runner_client: Any, session_id: str, conv: Any, **kwargs: Any) -> Any:
+        del runner_client, session_id, conv, kwargs
+        from omnigent.server.routes.sessions import _NativeTerminalEnsureOutcome
+
+        return _NativeTerminalEnsureOutcome(error=None)
+
+    monkeypatch.setattr(peer_module, "_ensure_native_terminal_ready", _ready_ok)
+    monkeypatch.setattr(
+        peer_module, "_native_terminal_runtime", lambda conv: ("Claude", "model", harness)
+    )
+    monkeypatch.setitem(
+        cast(Any, sessions_module._session_status_cache), receiver.id, cached_status
+    )
+    # A confirmed native forward (item id with a pending id is the failure shape).
+    peer_env["fake"].outcome = {"queued": True, "pending_id": "pending_1"}
+    return receiver
+
+
+def _queued_record(
+    peer_env: dict[str, Any],
+    *,
+    sender_id: str,
+    receiver_id: str,
+) -> SessionPeerMessage:
+    """Seed an older queued record to clear the per-pair FIFO for a send."""
+    now = int(time.time())
+    return peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender_id,
+            receiver_session_id=receiver_id,
+            ref=f"older-{uuid.uuid4().hex}",
+            text="older",
+            state="queued",
+            created_at=now - 10,
+            expires_at=now + 3600,
+        )
+    )
 
 
 # ── envelope ────────────────────────────────────────────────────────
@@ -780,10 +846,11 @@ async def test_runner_unavailable_maps_offline(
         fake.error = None
 
 
-async def test_other_omnigent_error_maps_not_ready(
+async def test_other_omnigent_error_returns_queued_uncertain(
     peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
 ) -> None:
-    """Any other delivery error maps to failed(not_ready)."""
+    """A lost delivery response is uncertain: queued to the sender, the
+    record stays ``delivering`` for the sweeper's marker reconciliation."""
     sender = peer_env["sender"]
     receiver = peer_env["receiver"]
     fake: _FakePostEvent = peer_env["fake"]
@@ -794,8 +861,11 @@ async def test_other_omnigent_error_maps_not_ready(
             json={"sender_session_id": sender.id, "text": f"e2-{uuid.uuid4().hex}"},
             headers=_headers(ALICE, peer_env["sender_token"]),
         )
-        assert resp.json()["disposition"] == "failed"
-        assert resp.json()["reason"] == "not_ready"
+        body = resp.json()
+        assert body["disposition"] == "queued"
+        assert body["reason"] == "uncertain"
+        stored = peer_env["peer_store"].get(body["peer_id"])
+        assert stored is not None and stored.state == "delivering"
     finally:
         fake.error = None
 
@@ -815,8 +885,8 @@ async def test_uncertain_delivery_keeps_the_duplicate_guard(
         )
     finally:
         fake.error = None
-    assert first["disposition"] == "failed", first
-    assert first["reason"] == "not_ready"
+    assert first["disposition"] == "queued", first
+    assert first["reason"] == "uncertain"
     second = await peer_env["app"].state.peer_send(
         sender=sender, receiver_id=receiver.id, text=text, correlation_id=None
     )
@@ -852,7 +922,7 @@ async def test_native_item_id_without_pending_id_is_not_ready(
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Native persisted-failure shape maps to failed(not_ready)."""
+    """Native persisted-failure shape is definite: failed, nothing forwarded."""
     sender = peer_env["sender"]
     conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
     native = conv_store.create_conversation(title="native-recv", agent_id=AGENT_ID, runner_id="rn")
@@ -881,8 +951,11 @@ async def test_native_item_id_without_pending_id_is_not_ready(
             json={"sender_session_id": sender.id, "text": f"n-{uuid.uuid4().hex}"},
             headers=_headers(ALICE, peer_env["sender_token"]),
         )
-        assert resp.json()["disposition"] == "failed", resp.text
-        assert resp.json()["reason"] == "not_ready"
+        body = resp.json()
+        assert body["disposition"] == "failed", resp.text
+        assert body["reason"] == "not_ready"
+        stored = peer_env["peer_store"].get(body["peer_id"])
+        assert stored is not None and stored.state == "failed"
     finally:
         peer_env["fake"].outcome = {"queued": True, "item_id": "item_1"}
 
@@ -995,6 +1068,268 @@ async def test_busy_recheck_after_record_creation_queues_same_record(
     assert len(records) == 1, f"expected exactly one record, got {len(records)}"
     assert records[0].id == resp.json()["peer_id"]
     assert records[0].state == "queued"
+
+
+async def test_steerable_claude_native_receiver_delivers_inline(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy claude-native receiver takes the message without interrupting."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"steer-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "delivered", resp.text
+    assert len(fake.calls) == 1
+    stored = peer_env["peer_store"].get(resp.json()["peer_id"])
+    assert stored is not None and stored.state == "delivered"
+
+
+async def test_steerable_receiver_queues_behind_older_same_sender_record(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-pair FIFO: this sender's older undelivered record wins."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    _queued_record(peer_env, sender_id=sender.id, receiver_id=receiver.id)
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"fifo-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == []
+
+
+async def test_older_record_from_another_sender_does_not_block_steering(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIFO is per pair: another sender's queued record never blocks this one."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    _queued_record(peer_env, sender_id=uuid.uuid4().hex, receiver_id=receiver.id)
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"fifo-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "delivered", resp.text
+    assert len(fake.calls) == 1
+
+
+async def test_older_pair_record_behind_other_senders_still_blocks_steering(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender-scoped lookup finds the pair record behind 60 newer others."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    _queued_record(peer_env, sender_id=sender.id, receiver_id=receiver.id)
+    now = int(time.time())
+    for index in range(60):
+        peer_env["peer_store"].create(
+            SessionPeerMessage(
+                id=uuid.uuid4().hex,
+                sender_session_id=uuid.uuid4().hex,
+                receiver_session_id=receiver.id,
+                ref=f"other-{index}",
+                text="other",
+                state="queued",
+                created_at=now + 1 + index,
+                expires_at=now + 3600,
+            )
+        )
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"fifo-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == []
+
+
+async def test_older_delivering_record_blocks_steering(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-flight delivering record holds this pair's newer message."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    now = int(time.time())
+    peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref=f"inflight-{uuid.uuid4().hex}",
+            text="inflight",
+            state="delivering",
+            created_at=now - 10,
+            expires_at=now + 3600,
+        )
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"fifo-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == []
+
+
+async def test_blocking_pending_elicitation_keeps_receiver_queued(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dialog / approval owns the input: the receiver stays busy."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    pending_elicitations.record_publish(
+        receiver.id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit-block",
+            "params": {"message": "Approve?"},
+        },
+    )
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"el-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "queued", resp.text
+        assert fake.calls == []
+    finally:
+        pending_elicitations.reset_for_tests()
+
+
+async def test_async_question_card_still_steers(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An async question card never blocks the turn; the message steers."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    pending_elicitations.record_publish(
+        receiver.id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit-async",
+            "params": {"async_kind": "question", "message": "Which color?"},
+        },
+    )
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"el-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        assert resp.json()["disposition"] == "delivered", resp.text
+        assert len(fake.calls) == 1
+    finally:
+        pending_elicitations.reset_for_tests()
+
+
+async def test_persisted_elicitation_count_above_local_keeps_receiver_queued(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A count recorded elsewhere means a dialog this replica cannot classify."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    peer_env["conv_store"].set_pending_elicitation_count(receiver.id, 1)
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"el-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == []
+
+
+async def test_codex_native_running_receiver_queues(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex-native stays busy: a refused steer drops the input."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env, harness="codex-native")
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"cx-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == []
+
+
+async def test_sdk_running_receiver_queues(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SDK session mid-turn has no steer path and stays queued."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    fake: _FakePostEvent = peer_env["fake"]
+    monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "running")
+    resp = await peer_client.post(
+        f"/v1/sessions/{receiver.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"sdk-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == []
+
+
+async def test_inline_uncertain_leaves_record_delivering(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An HTTP failure from the post returns queued/uncertain and leaves the
+    record ``delivering`` for the sweeper's marker reconciliation."""
+    sender = peer_env["sender"]
+    fake: _FakePostEvent = peer_env["fake"]
+    receiver = _steerable_receiver(monkeypatch, peer_env)
+    fake.error = HTTPException(status_code=502, detail="gateway lost the response")
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"unc-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+    finally:
+        fake.error = None
+    body = resp.json()
+    assert body["disposition"] == "queued", resp.text
+    assert body["reason"] == "uncertain"
+    stored = peer_env["peer_store"].get(body["peer_id"])
+    assert stored is not None and stored.state == "delivering"
 
 
 async def test_relaunchable_receiver_delivers_inline(

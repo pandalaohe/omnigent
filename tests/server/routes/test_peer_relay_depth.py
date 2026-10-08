@@ -484,6 +484,36 @@ def test_ref_with_newline_is_parsed(stores: Stores) -> None:
     assert latest_input_depth(conversations, peers, session) == 4
 
 
+def test_truncated_current_header_is_not_an_envelope(stores: Stores) -> None:
+    """A message that merely starts like an envelope is not one."""
+    conversations, peers = stores
+    session = _conv(conversations, "truncated")
+    sender = _conv(conversations, "truncated-sender")
+    record = _seed_peer(peers, sender_id=sender, receiver_id=session, depth=11)
+    _append_user_text(
+        conversations,
+        session,
+        f'[Peer message from session {sender} msg={record.id} "',
+    )
+    assert latest_input_depth(conversations, peers, session) == 0
+
+
+def test_envelope_with_multiline_body_and_bracket_ref_is_parsed(stores: Stores) -> None:
+    """The full header, a multi-line body and a ``]`` in the ref still parse."""
+    conversations, peers = stores
+    session = _conv(conversations, "bracket-ref")
+    sender = _conv(conversations, "bracket-ref-sender")
+    record = _seed_peer(
+        peers,
+        sender_id=sender,
+        receiver_id=session,
+        depth=13,
+        ref="corr]with]brackets",
+    )
+    _append_envelope(conversations, record, ref="corr]with]brackets", body="line one\nline two")
+    assert latest_input_depth(conversations, peers, session) == 13
+
+
 def test_released_record_quoted_in_newer_envelope(stores: Stores) -> None:
     """T9e: the released (depth 0) outer record wins over its depth-30 quote."""
     conversations, peers = stores

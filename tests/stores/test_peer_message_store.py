@@ -170,3 +170,31 @@ def test_list_for_session_and_due(store: SqlAlchemyPeerMessageStore) -> None:
     due = store.list_due(("pending", "queued"), limit=10)
     assert {r.id for r in due} == {_uid("l2-id"), _uid("l3-id")}
     assert store.list_for_session(_uid("l-other")) == []
+
+
+def test_list_for_session_sender_filter_finds_record_behind_other_senders(
+    store: SqlAlchemyPeerMessageStore,
+) -> None:
+    """A sender-scoped list is not crowded out by newer other-sender records."""
+    sender, receiver = _uid("sf-sender"), _uid("sf-receiver")
+    older = store.create(
+        _record(
+            "sf-old",
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            created_at=100,
+        )
+    )
+    for index in range(60):
+        store.create(
+            _record(
+                f"sf-other-{index}",
+                sender_session_id=_uid(f"sf-other-sender-{index}"),
+                receiver_session_id=receiver,
+                created_at=200 + index,
+            )
+        )
+    unscoped = store.list_for_session(receiver, ("pending",), 50)
+    assert older.id not in {r.id for r in unscoped}
+    scoped = store.list_for_session(receiver, ("pending",), 50, sender_session_id=sender)
+    assert [r.id for r in scoped] == [older.id]

@@ -41,6 +41,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import (
@@ -66,6 +67,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _MID_TURN_STATUSES,
     _ensure_native_terminal_ready,
     _is_native_terminal_session,
+    _native_terminal_runtime,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.user_preferences_store import read_collab_settings
@@ -98,6 +100,9 @@ PEER_HOLD_LIFETIME = 24 * 3600
 # an identical resend is still a duplicate while the earlier copy sits here.
 _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
+# codex-native excluded: a refused steer drops the input; approval steer unverified.
+_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native"})
+
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
 _PEER_INBOUND_REFUSE = "refuse"
@@ -112,11 +117,14 @@ _SUCCESSOR_MAX_HOPS = 8
 _WS_COLLAPSE_RE = re.compile(r"\s+")
 
 # The current envelope header: ``msg=`` sits right after the sender id, so
-# the record id is captured unambiguously. Stored transcripts still carry
-# the older envelopes, matched by the legacy pattern (DOTALL: a correlation
-# id may contain newlines).
+# the record id is captured unambiguously. The whole header and the blank
+# separator must match, or a truncated prefix could pass as an envelope.
+# Stored transcripts still carry the older envelopes, matched by the legacy
+# pattern (DOTALL: a correlation id may contain newlines).
 _PEER_ENVELOPE_HEADER_RE = re.compile(
-    r'\A\[Peer message from session [0-9a-f]{32} msg=([0-9a-f]{32}) "'
+    r'\A\[Peer message from session [0-9a-f]{32} msg=([0-9a-f]{32}) "[^"]*" '
+    r"\(.*?\) ref=.*?\]\n\n",
+    re.DOTALL,
 )
 _LEGACY_PEER_ENVELOPE_HEADER_RE = re.compile(
     r'\A\[Peer message from session [0-9a-f]{32} "[^"]*" \(.*?\) ref=.*? '
@@ -309,6 +317,77 @@ def latest_input_depth(
     except Exception:
         _logger.warning("Peer relay depth lookup failed", exc_info=True)
         return 0
+
+
+def has_older_undelivered(
+    peer_message_store: PeerMessageStore,
+    sender_id: str,
+    receiver_id: str,
+    before_created_at: int | None = None,
+    exclude_id: str | None = None,
+) -> bool:
+    """Whether *sender_id* holds an older undelivered record to *receiver_id*.
+
+    Per-pair FIFO for steering: the inline send route and the sweeper both
+    defer a newer record while an earlier ``pending`` / ``queued`` /
+    ``delivering`` one from the same sender is still on its way to the same
+    receiver. In-flight ``delivering`` records block too, so an uncertain
+    record holds this pair's newer messages (they stay durable as
+    ``queued``) until reconciliation settles it. "Older" is ``created_at``
+    strictly smaller than *before_created_at* when given; equal-second ties
+    stay unordered. *exclude_id* skips the record under judgment. The
+    sender-scoped lookback is bounded (50, newest first); other senders'
+    records never crowd it out.
+
+    :param peer_message_store: Durable record store.
+    :param sender_id: The sending session.
+    :param receiver_id: The receiving session.
+    :param before_created_at: Only records created before this epoch second
+        count as older, or ``None`` for no ordering bound.
+    :param exclude_id: A record id to ignore, or ``None``.
+    :returns: ``True`` when an older undelivered record exists.
+    """
+    records = peer_message_store.list_for_session(
+        receiver_id,
+        ("pending", "queued", "delivering"),
+        50,
+        sender_session_id=sender_id,
+    )
+    for record in records:
+        if record.id == exclude_id:
+            continue
+        if before_created_at is not None and record.created_at >= before_created_at:
+            continue
+        return True
+    return False
+
+
+def _has_blocking_elicitation(conv: Conversation, events: list[dict[str, Any]]) -> bool:
+    """Whether a pending elicitation owns the receiver's input.
+
+    Async cards (``params.async_kind`` in question / approval) never block
+    the turn. A persisted ``pending_elicitation_count`` above the local
+    index size means an elicitation this replica cannot classify (recorded
+    elsewhere), so treat it as blocking.
+    """
+    for event in events:
+        params = event.get("params")
+        if not isinstance(params, dict) or params.get("async_kind") not in (
+            "question",
+            "approval",
+        ):
+            return True
+    persisted = conv.pending_elicitation_count or 0
+    return persisted > len(events)
+
+
+def _is_steerable_harness(conv: Conversation) -> bool:
+    """Whether a native receiver's harness may take steered peer input."""
+    try:
+        harness = _native_terminal_runtime(conv)[2]
+    except OmnigentError:
+        return False
+    return harness in _STEERABLE_NATIVE_HARNESSES
 
 
 @dataclass(frozen=True)
@@ -834,10 +913,10 @@ def register_peer_routes(
         """Return a session's true state and runner_online (D6/D7 table).
 
         ``state`` is one of ``offline`` / ``not_ready`` / ``busy`` /
-        ``idle``. A native session gets one readiness probe per call; an
-        SDK session is always ready. Shared by the send route (receiver)
-        and the sweeper (receiver readiness, sender notice idle-gate) so
-        both apply the exact same gate.
+        ``steerable`` / ``idle``. A native session gets one readiness probe
+        per call; an SDK session is always ready. Shared by the send route
+        (receiver) and the sweeper (receiver readiness, sender notice
+        idle-gate) so both apply the exact same gate.
 
         A dead runner on a live host is *relaunchable*, not offline: the
         events path relaunches it and initializes the terminal itself, so
@@ -846,10 +925,15 @@ def register_peer_routes(
         ``runner_online`` always stays the strict signal — only the
         offline/relaunchable classification folds in ``host_online``.
 
+        ``steerable`` is ``busy`` narrowed to when a message may enter a
+        running turn without interrupting it: a native receiver whose
+        readiness probe passed, whose harness is in
+        ``_STEERABLE_NATIVE_HARNESSES``, and whose input no dialog or
+        approval owns. A blocking pending elicitation keeps ``busy`` —
+        steering past it would answer on the user's behalf.
+
         Busy is re-read once more after any await above: a turn can start
-        concurrently while this coroutine is probing readiness, and a
-        Codex-native receiver must never be steered mid-turn (design
-        Decision 5).
+        concurrently while this coroutine is probing readiness.
         """
         liveness = _liveness(conv.id)
         runner_online = liveness.runner_online if liveness is not None else None
@@ -895,13 +979,20 @@ def register_peer_routes(
                         terminal_ready = outcome.error is None
         if native and terminal_ready is False:
             return "not_ready", runner_online
+        row = conv
         if not busy:
             fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
             if fresh is not None:
                 busy = (
                     _session_status_from_cache(fresh.id, fresh.live_status) in _MID_TURN_STATUSES
                 )
+                if busy:
+                    # Read the count off the row this busy verdict came from.
+                    row = fresh
         if busy:
+            if native and terminal_ready and _is_steerable_harness(conv):
+                if not _has_blocking_elicitation(row, pending_elicitations.snapshot_for(conv.id)):
+                    return "steerable", runner_online
             return "busy", runner_online
         return "idle", runner_online
 
@@ -989,7 +1080,13 @@ def register_peer_routes(
             and delivery.get("item_id") is not None
             and delivery.get("pending_id") is None
         ):
-            return "uncertain", "not_ready"
+            # Only the native terminal-start failure branch produces this
+            # shape (the ensure outcome errored and the message was
+            # persisted as a failure item): nothing was forwarded, so this
+            # is a definite failure and the record must not linger in
+            # ``delivering`` where reconciliation could mark it delivered
+            # from that persisted envelope.
+            return "failed", "not_ready"
         return "delivered", None
 
     @router.post(
@@ -1438,6 +1535,17 @@ def register_peer_routes(
                     return await _queued_response_for_record(record, runner_online)
                 if terminal_verdict is None and receiver_state == "busy":
                     return await _queued_response(ref, now, runner_online, depth)
+                if terminal_verdict is None and receiver_state == "steerable":
+                    # A steerable receiver may take this message at its next
+                    # tool boundary, but this sender's older undelivered
+                    # record must not be overtaken (per-pair FIFO).
+                    if await asyncio.to_thread(
+                        has_older_undelivered,
+                        peer_message_store,
+                        sender_id,
+                        receiver_id,
+                    ):
+                        return await _queued_response(ref, now, runner_online, depth)
             if terminal_verdict is not None:
                 return _terminal_response(
                     terminal_verdict, record, body.correlation_id, receiver, runner_online
@@ -1460,9 +1568,12 @@ def register_peer_routes(
             record = delivering
             # Re-check right before delivering: the readiness probe above and
             # this record's own creation each awaited a store write, during
-            # which a turn can start concurrently. A Codex-native receiver is
-            # never steered mid-turn (design Decision 5) — queue this same
-            # record instead of delivering into it (no second record).
+            # which a turn can start concurrently. Busy queues this same
+            # record instead of delivering into it (no second record): a
+            # dialog or approval owns the input, and a non-steerable harness
+            # must not be interrupted mid-turn; a busy claude-native receiver
+            # with a genuinely running turn reads back steerable and is
+            # steered to its next tool boundary.
             recheck_state, _recheck_runner_online = await _true_state(receiver)
             if recheck_state == "busy":
                 await asyncio.to_thread(
@@ -1483,11 +1594,18 @@ def register_peer_routes(
                 acting_user_id=acting_user_id,
                 require_init_success=require_init_success,
             )
-            # An uncertain forward may have landed: store failed (as today)
-            # but release like a delivered send so the duplicate guard
-            # still drops an immediate identical retry.
-            uncertain = result_state == "uncertain"
-            stored_state = "failed" if result_state == "rejected" or uncertain else result_state
+            if result_state == "uncertain":
+                # The runner may have accepted the input despite a lost or
+                # unconfirmable response. Leave the record in ``delivering``
+                # (no transition) so the sweeper settles it by the msg=
+                # marker after its grace, exactly as for a swept send; an
+                # identical immediate retry still drops as a duplicate
+                # because ``release`` keeps an uncertain send's reservation.
+                uncertain = True
+                response = await _queued_response_for_record(record, runner_online)
+                response["reason"] = "uncertain"
+                return response
+            stored_state = "failed" if result_state == "rejected" else result_state
             await asyncio.to_thread(
                 peer_message_store.transition,
                 record.id,
@@ -1497,7 +1615,6 @@ def register_peer_routes(
             )
             if stored_state == "failed":
                 terminal_verdict = f"failed:{reason}"
-            if terminal_verdict is not None:
                 return _terminal_response(
                     terminal_verdict, record, body.correlation_id, receiver, runner_online
                 )

@@ -120,6 +120,8 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         session_id: str,
         states: tuple[str, ...] | None = None,
         limit: int = 20,
+        *,
+        sender_session_id: str | None = None,
     ) -> list[SessionPeerMessage]:
         """Return one receiver's records, newest first."""
         with self._session("list_peer_messages_for_session") as session:
@@ -130,6 +132,8 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             )
             if states is not None:
                 stmt = stmt.where(SqlSessionPeerMessage.state.in_(sorted(states)))
+            if sender_session_id is not None:
+                stmt = stmt.where(SqlSessionPeerMessage.sender_session_id == sender_session_id)
             stmt = stmt.order_by(
                 desc(SqlSessionPeerMessage.created_at), desc(SqlSessionPeerMessage.id)
             ).limit(limit)
