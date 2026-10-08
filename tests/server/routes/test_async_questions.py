@@ -345,20 +345,8 @@ async def test_async_question_timeout_posts_nothing(
 
     real_start = orchestration.start_detached_elicitation
 
-    def _short_park(
-        session_id: str,
-        params: Any,
-        *,
-        conversation_store: Any,
-        on_result: Any,
-    ) -> str:
-        return real_start(
-            session_id,
-            params,
-            conversation_store=conversation_store,
-            on_result=on_result,
-            timeout_s=0.05,
-        )
+    def _short_park(session_id: str, params: Any, **kwargs: Any) -> str:
+        return real_start(session_id, params, **{**kwargs, "timeout_s": 0.05})
 
     monkeypatch.setattr(hooks_routes, "start_detached_elicitation", _short_park)
 

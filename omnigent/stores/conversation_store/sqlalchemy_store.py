@@ -47,6 +47,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlDetachedCard,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -125,6 +126,7 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     DailyCostState,
     DeletionClaimResult,
+    DetachedCard,
     NativeRecoveryItemSkipped,
     NativeReplayConflictError,
     NativeSubagentReconcileFingerprint,
@@ -328,6 +330,24 @@ def _to_session_succession(row: SqlSessionSuccession) -> SessionSuccession:
         error=row.error,
         created_at=row.created_at,
         updated_at=row.updated_at,
+    )
+
+
+def _to_detached_card(row: SqlDetachedCard) -> DetachedCard:
+    """Convert a detached card row with its JSON payloads decoded."""
+    return DetachedCard(
+        elicitation_id=row.elicitation_id,
+        session_id=row.session_id,
+        kind=row.kind,
+        state=row.state,
+        mirror=row.mirror,
+        params=json.loads(row.params),
+        payload=json.loads(row.payload),
+        grant_key=json.loads(row.grant_key) if row.grant_key is not None else None,
+        verdict=json.loads(row.verdict) if row.verdict is not None else None,
+        delivery_text=row.delivery_text,
+        created_at=row.created_at,
+        expires_at=row.expires_at,
     )
 
 
@@ -5257,6 +5277,95 @@ class SqlAlchemyConversationStore(ConversationStore):
             "update_succession",
             write,
         )
+
+    def add_detached_card(self, card: DetachedCard) -> None:
+        """Insert one detached card record after dropping expired ones."""
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> None:
+            session.execute(
+                delete(SqlDetachedCard).where(
+                    SqlDetachedCard.workspace_id == workspace_id,
+                    SqlDetachedCard.expires_at <= now_epoch(),
+                )
+            )
+            session.add(
+                SqlDetachedCard(
+                    elicitation_id=card.elicitation_id,
+                    session_id=card.session_id,
+                    kind=card.kind,
+                    state=card.state,
+                    mirror=card.mirror,
+                    params=json.dumps(card.params),
+                    payload=json.dumps(card.payload),
+                    grant_key=json.dumps(card.grant_key) if card.grant_key is not None else None,
+                    verdict=json.dumps(card.verdict) if card.verdict is not None else None,
+                    delivery_text=card.delivery_text,
+                    created_at=card.created_at,
+                    expires_at=card.expires_at,
+                )
+            )
+
+        run_write_transaction(self._conv_session_immediate, "add_detached_card", write)
+
+    def list_detached_cards(self) -> list[DetachedCard]:
+        """Return every detached card record in the workspace, oldest first."""
+        with self._conv_session("list_detached_cards") as session:
+            rows = session.scalars(
+                select(SqlDetachedCard)
+                .where(SqlDetachedCard.workspace_id == current_workspace_id())
+                .order_by(SqlDetachedCard.created_at, SqlDetachedCard.elicitation_id)
+            )
+            return [_to_detached_card(row) for row in rows]
+
+    def update_detached_card(self, elicitation_id: str, **fields: Any) -> None:
+        """Patch one detached card record."""
+        values: dict[str, Any] = dict(fields)
+        if values.get("verdict") is not None:
+            values["verdict"] = json.dumps(values["verdict"])
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlDetachedCard)
+                .where(
+                    SqlDetachedCard.workspace_id == workspace_id,
+                    SqlDetachedCard.elicitation_id == elicitation_id,
+                )
+                .values(**values)
+            )
+
+        run_write_transaction(self._conv_session_immediate, "update_detached_card", write)
+
+    def delete_detached_card(self, elicitation_id: str) -> None:
+        """Delete one detached card record."""
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> None:
+            session.execute(
+                delete(SqlDetachedCard).where(
+                    SqlDetachedCard.workspace_id == workspace_id,
+                    SqlDetachedCard.elicitation_id == elicitation_id,
+                )
+            )
+
+        run_write_transaction(self._conv_session_immediate, "delete_detached_card", write)
+
+    def delete_detached_grants(self, session_id: str, grant_key: list[str]) -> None:
+        """Delete the session's answered or settled records carrying *grant_key*."""
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> None:
+            session.execute(
+                delete(SqlDetachedCard).where(
+                    SqlDetachedCard.workspace_id == workspace_id,
+                    SqlDetachedCard.session_id == session_id,
+                    SqlDetachedCard.state != "pending",
+                    SqlDetachedCard.grant_key == json.dumps(grant_key),
+                )
+            )
+
+        run_write_transaction(self._conv_session_immediate, "delete_detached_grants", write)
 
     def clear_model_override_if_matches(
         self,

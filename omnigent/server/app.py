@@ -1797,27 +1797,35 @@ def create_app(
             name="succession-startup-resume",
         )
 
-        # Wake a blocked sub-agent's immediate parent: hooks
-        # ``pending_elicitations.record_publish`` to post a ``[System: …]``
-        # notice to the parent's ``/events``. Uninstalled at teardown so a
-        # fresh app instance doesn't inherit a prior run's observer (matters
-        # for multi-app test setups).
         from omnigent.server.routes.sessions import (
             configure_elicitation_source_resolver,
             configure_subagent_block_notifier,
         )
+        from omnigent.server.routes.sessions.routes_hooks import restore_detached_cards
 
-        _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
-            conversation_store,
-            runner_router,
-            agent_store=agent_store,
-        )
         # Name the child, agent, host and cwd on cards mirrored into an
         # ancestor's stream/snapshot (and in the parent's wake notice).
         configure_elicitation_source_resolver(
             agent_store,
             host_store,
             agent_cache,
+        )
+        # Reopen the previous process's detached cards before serving, so an
+        # answer can find its card. Ahead of the notifier: their parents were
+        # already woken once.
+        try:
+            await restore_detached_cards(conversation_store, runner_router)
+        except Exception:
+            _logger.exception("Restoring detached cards failed; continuing startup")
+        # Wake a blocked sub-agent's immediate parent: hooks
+        # ``pending_elicitations.record_publish`` to post a ``[System: …]``
+        # notice to the parent's ``/events``. Uninstalled at teardown so a
+        # fresh app instance doesn't inherit a prior run's observer (matters
+        # for multi-app test setups).
+        _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
+            conversation_store,
+            runner_router,
+            agent_store=agent_store,
         )
 
         from omnigent.runner.resource_registry import (
