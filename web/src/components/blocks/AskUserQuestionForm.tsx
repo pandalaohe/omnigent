@@ -440,12 +440,28 @@ export function AskUserQuestionForm({
     e.stopPropagation();
 
     switch (actionId) {
-      case "questionCardPreviousOption":
-        setHighlight((previous) => Math.max(0, previous - 1));
+      // Single-select: moving to a row selects it (custom row included).
+      // Multi-select: the arrows only move the highlight; Space confirms.
+      case "questionCardPreviousOption": {
+        const next = Math.max(0, highlight - 1);
+        setHighlight(next);
+        if (!current.multiSelect) {
+          const option = current.options[next];
+          if (option) handleSingleSelect(currentKey, option.label);
+          else handleCustomToggleSingle(currentKey);
+        }
         return;
-      case "questionCardNextOption":
-        setHighlight((previous) => Math.min(current.options.length, previous + 1));
+      }
+      case "questionCardNextOption": {
+        const next = Math.min(current.options.length, highlight + 1);
+        setHighlight(next);
+        if (!current.multiSelect) {
+          const option = current.options[next];
+          if (option) handleSingleSelect(currentKey, option.label);
+          else handleCustomToggleSingle(currentKey);
+        }
         return;
+      }
       case "questionCardSelectOption":
         selectHighlighted();
         return;
