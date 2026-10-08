@@ -3,19 +3,23 @@
 A ``session_peer_messages`` record that could not deliver inline
 (``pending`` / ``queued``) waits for this background loop: every tick it
 expires overdue records, fails records whose receiver has closed, and
-delivers the rest once the receiver's true state goes idle, through the
+delivers the rest once the receiver's true state goes idle or steerable
+(one sender's older undelivered record to the same receiver goes first),
+through the
 same ``deliver`` callable the inline send route uses
 (``routes_peer._deliver``). A definite failure (``offline`` — nothing was
 forwarded) reverts for the next tick's retry; an *uncertain* outcome (the
 runner may have accepted the input despite a lost or unconfirmable
 response) is never retried blindly — the record stays in ``delivering``
 until ``_reconcile_stale_delivering`` settles it by searching the
-receiver's transcript for the record's ``msg=`` marker. Every terminal
-transition — delivered, failed, expired — and the action route's
-``refuse`` post a ``[System: ...]`` back-notice to the sender, idle-gated
-the same way: notices generated while the sender is mid-turn park in an
-in-memory per-sender queue and post as one batched message on a later
-tick when the sender goes idle. The parked queue is process-local and
+receiver's transcript for the record's ``msg=`` marker. Failed, expired
+and refused transitions — including the action route's ``refuse`` — post
+a ``[System: ...]`` back-notice to the sender; a delivered record posts
+none, since the sender learns of delivery from the reply itself or from
+``wait_for_reply_seconds``. Notices are gated the same way: notices
+generated while the sender is mid-turn park in an in-memory per-sender
+queue and post as one batched message on a later tick when the sender
+goes idle or steerable. The parked queue is process-local and
 does not survive a restart (a survivable choice: the
 ``session_peer_messages`` row itself is durable and the sweeper's own
 tick keeps searching for it).
@@ -37,15 +41,19 @@ from starlette.requests import Request
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
-from omnigent.entities.conversation import Conversation
+from omnigent.entities.conversation import Conversation, MessageData
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.routes.sessions.routes_peer import (
     _PEER_INBOUND_HOLD,
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
     _PEER_RELEASED_REASON,
+    _first_text_block,
+    _peer_envelope_msg_id,
     effective_owner_id,
     format_peer_back_notice,
+    has_older_undelivered,
     is_reply_to_own,
 )
 from omnigent.server.schemas import SessionEventInput
@@ -63,6 +71,22 @@ _RECONCILE_GRACE_S = 120
 
 TrueStateFn = Callable[[Conversation], Awaitable[tuple[str, bool | None]]]
 DeliverFn = Callable[..., Awaitable[tuple[str, str | None]]]
+
+
+def _is_record_marker(item: Any, record_id: str) -> bool:
+    """Whether one transcript search hit is this record's envelope message.
+
+    The search is literal, so a hit may merely quote ``msg=<id>``; only a
+    user-role message whose first text block parses to *record_id* with the
+    envelope helper settles the record as delivered.
+    """
+    if getattr(item, "type", None) != "message":
+        return False
+    data = getattr(item, "data", None)
+    if not isinstance(data, MessageData) or data.role != "user":
+        return False
+    text = _first_text_block(data.content)
+    return text is not None and _peer_envelope_msg_id(text) == record_id
 
 
 class PeerSweeper:
@@ -190,6 +214,9 @@ class PeerSweeper:
         except Exception:
             _logger.exception("Peer sweeper failed to list due records")
             due = []
+        # Creation order keeps the per-pair FIFO rule from skipping newer
+        # records on this pass (the store's own order is only a hint).
+        due.sort(key=lambda record: (record.created_at, record.id))
         for record in due:
             try:
                 await self._process_due(record, now)
@@ -319,12 +346,23 @@ class PeerSweeper:
             # A rate-delayed record waits for its slot; expiry, closed,
             # refusal and owner checks above still ran first.
             return
+        if await asyncio.to_thread(
+            has_older_undelivered,
+            self._store,
+            record.sender_session_id,
+            record.receiver_session_id,
+            record.created_at,
+            record.id,
+        ):
+            # Per-pair FIFO: this sender's earlier undelivered record must
+            # reach the receiver first; a later tick delivers this one.
+            return
         # Captured before the CAS below: some store implementations hand
         # back the same mutable row on every read, so ``record.state``
         # itself can flip to ``delivering`` as a side effect of that CAS.
         origin_state = record.state
         state, _runner_online = await self._true_state(receiver)
-        if state != "idle":
+        if state not in ("idle", "steerable"):
             return
         moved = await asyncio.to_thread(
             self._store.transition, record.id, "delivering", None, (origin_state,)
@@ -341,12 +379,13 @@ class PeerSweeper:
                 self._store.transition, record.id, "failed", "closed", ("delivering",)
             )
             return
-        # Re-check busy immediately before delivering: the CAS above awaited
-        # a store write, during which a turn can start concurrently. A
-        # Codex-native receiver is never steered mid-turn (design
-        # Decision 5) — abandon this attempt and let a later tick retry.
+        # Re-check immediately before delivering: the CAS above awaited a
+        # store write, during which a turn can start concurrently or a
+        # dialog can open. Idle and steerable deliver; anything else
+        # abandons this attempt for a later tick (a dialog / approval or a
+        # non-steerable harness must not be interrupted mid-turn).
         recheck_state, _recheck_runner_online = await self._true_state(receiver)
-        if recheck_state != "idle":
+        if recheck_state not in ("idle", "steerable"):
             await self._revert_delivering(record, origin_state, "busy_recheck")
             return
         request = self._synthetic_request(receiver.id, self._app)
@@ -399,7 +438,6 @@ class PeerSweeper:
         await asyncio.to_thread(
             self._store.transition, record.id, result_state, reason, ("delivering",)
         )
-        await self._notify_for(record, result_state, reason, receiver_title, self._app)
 
     async def _revert_delivering(
         self, record: SessionPeerMessage, origin_state: str, reason: str
@@ -472,7 +510,7 @@ class PeerSweeper:
                 ):
                     return
                 state, _runner_online = await self._true_state(sender)
-                if state != "idle":
+                if state not in ("idle", "steerable"):
                     self._parked[sender.id] = lines + self._parked.get(sender.id, [])
                     return
                 joined = "\n".join(lines)
@@ -555,23 +593,12 @@ class PeerSweeper:
             self._conversation_store.search_visible_items_literal,
             record.receiver_session_id,
             f"msg={record.id}",
-            1,
+            5,
         )
-        if matches:
-            moved = await asyncio.to_thread(
+        if any(_is_record_marker(match, record.id) for match in matches):
+            await asyncio.to_thread(
                 self._store.transition, record.id, "delivered", None, ("delivering",)
             )
-            if moved:
-                receiver = await asyncio.to_thread(
-                    self._conversation_store.get_conversation, record.receiver_session_id
-                )
-                await self._notify_for(
-                    record,
-                    "delivered",
-                    None,
-                    receiver.title if receiver is not None else None,
-                    self._app,
-                )
             return
         if record.expires_at <= now:
             # Past its deadline with no marker: end the record instead of
@@ -591,6 +618,18 @@ class PeerSweeper:
                     receiver.title if receiver is not None else None,
                     self._app,
                 )
+            return
+        receiver = await asyncio.to_thread(
+            self._conversation_store.get_conversation, record.receiver_session_id
+        )
+        if (
+            receiver is not None
+            and _session_status_from_cache(receiver.id, receiver.live_status) == "running"
+        ):
+            # A prompt queued in a running Claude turn reaches the
+            # transcript only at the next tool boundary; reverting now
+            # would re-send a copy still on its way. Expiry above still
+            # ends the record.
             return
         await asyncio.to_thread(
             self._store.transition,

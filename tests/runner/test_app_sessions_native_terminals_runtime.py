@@ -758,6 +758,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         ),
     )
 
+    # runner.app composes the peer grant into the global text channel; the
+    # codex developer-instructions list must not add it a second time.
+    expected_global = f"G\n\n{PEER_SESSION_GRANT}" if peer_enabled else "G"
+
     try:
         if cancel_launch:
             with pytest.raises(asyncio.CancelledError):
@@ -780,7 +784,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             lambda _sid, event: published_events.append(event),
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
-            global_instructions="G",
+            global_instructions=expected_global,
             session_init=session_init,
         )
         await asyncio.sleep(0)
@@ -798,8 +802,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == (
-        f"Be a concise, careful coding assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nG"
-        + (f"\n\n{PEER_SESSION_GRANT}" if peer_enabled else "")
+        "Be a concise, careful coding assistant.\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{expected_global}"
     )
     # Persisted pass-through args must reach launch resolution (--profile layering).
     assert resolve_calls and all(

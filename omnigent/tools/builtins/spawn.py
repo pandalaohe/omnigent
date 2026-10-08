@@ -12,10 +12,13 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.exc import StatementError
+
 from omnigent.entities import (
     Conversation,
     ConversationItem,
 )
+from omnigent.errors import StaleCursorError
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
@@ -1268,14 +1271,17 @@ def _project_activity_item(
     *,
     max_chars: int = _ACTIVITY_MAX_CHARS,
     offset_chars: int = 0,
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
     """
     Project a conversation item into a compact dict.
 
     Handles three item types: messages (user/assistant text),
     function calls (tool name + args), and function call
-    outputs (tool name + result). Content fields are truncated
-    to ``max_chars``, which defaults to ``_ACTIVITY_MAX_CHARS``;
+    outputs (tool name + result). Every item carries its ``id``
+    and ``created_at`` so callers can page with ``before_item``
+    and correlate results; tool calls and results also carry
+    their ``call_id``. Content fields are truncated to
+    ``max_chars``, which defaults to ``_ACTIVITY_MAX_CHARS``;
     ``offset_chars`` skips that many leading characters first so
     callers can page through one long field window by window.
 
@@ -1284,34 +1290,48 @@ def _project_activity_item(
     :param max_chars: Maximum characters retained in each content field.
     :param offset_chars: Characters skipped from the start of each
         content field before the window is taken.
-    :returns: A compact dict with ``role``, ``type``, and
-        content fields.
+    :returns: A compact dict with the item identity, ``role``,
+        ``type``, and content fields.
     """
     # Convert Pydantic model to dict so .get() works uniformly
     # across all data types (MessageData, FunctionCallData, etc.).
     data = item.data.model_dump()
+    projected: dict[str, Any] = {
+        "id": item.id,
+        "created_at": item.created_at,
+    }
     if item.type == "function_call":
-        return {
-            "role": "assistant",
-            "type": "tool_call",
-            "name": data.get("name"),
-            "args": _truncate(
-                data.get("arguments", ""),
-                max_chars=max_chars,
-                offset_chars=offset_chars,
-            ),
-        }
+        projected.update(
+            {
+                "role": "assistant",
+                "type": "tool_call",
+                "name": data.get("name"),
+                "args": _truncate(
+                    data.get("arguments", ""),
+                    max_chars=max_chars,
+                    offset_chars=offset_chars,
+                ),
+            }
+        )
+        if data.get("call_id") is not None:
+            projected["call_id"] = data["call_id"]
+        return projected
     if item.type == "function_call_output":
-        return {
-            "role": "tool",
-            "type": "tool_result",
-            "name": data.get("name"),
-            "content": _truncate(
-                data.get("output", ""),
-                max_chars=max_chars,
-                offset_chars=offset_chars,
-            ),
-        }
+        projected.update(
+            {
+                "role": "tool",
+                "type": "tool_result",
+                "name": data.get("name"),
+                "content": _truncate(
+                    data.get("output", ""),
+                    max_chars=max_chars,
+                    offset_chars=offset_chars,
+                ),
+            }
+        )
+        if data.get("call_id") is not None:
+            projected["call_id"] = data["call_id"]
+        return projected
     # Message item — extract role and text content.
     role = data.get("role", "unknown")
     text_parts: list[str] = []
@@ -1322,15 +1342,18 @@ def _project_activity_item(
                 text_parts.append(text)
         elif isinstance(block, str):
             text_parts.append(block)
-    return {
-        "role": role,
-        "type": "text",
-        "content": _truncate(
-            "\n".join(text_parts),
-            max_chars=max_chars,
-            offset_chars=offset_chars,
-        ),
-    }
+    projected.update(
+        {
+            "role": role,
+            "type": "text",
+            "content": _truncate(
+                "\n".join(text_parts),
+                max_chars=max_chars,
+                offset_chars=offset_chars,
+            ),
+        }
+    )
+    return projected
 
 
 def _truncate(
@@ -1761,7 +1784,9 @@ class SysSessionGetHistoryTool(Tool):
             "access (not just sub-agents in your spawn tree), bounded "
             "by the server's per-user permission model. Returns the "
             "tail of conversation items (assistant/user messages, tool "
-            "calls, tool results) in chronological order. Returns "
+            "calls, tool results) in chronological order; each item "
+            "carries an id, and passing the oldest id you have as "
+            "before_item pages to the older items before it. Returns "
             "session_not_found if conversation_id is unknown, or "
             "session_out_of_tree if the server denies read access."
         )
@@ -1828,6 +1853,16 @@ class SysSessionGetHistoryTool(Tool):
                                 "until the ' [truncated]' suffix disappears."
                             ),
                         },
+                        "before_item": {
+                            "type": "string",
+                            "description": (
+                                "Pass the `id` of the oldest item you already "
+                                "have to read the items before it (e.g. "
+                                "`before_item=items[0].id` from a prior read). "
+                                "The page keeps chronological order and "
+                                "`has_more` says whether older items remain."
+                            ),
+                        },
                     },
                     "required": ["conversation_id"],
                     "additionalProperties": False,
@@ -1843,7 +1878,7 @@ class SysSessionGetHistoryTool(Tool):
             ``{"conversation_id": "conv_abc123", "content_max_chars": 12000}``.
         :param ctx: Server-side execution context.
         :returns: JSON ``{"conversation_id": ..., "agent": ...,
-            "title": ..., "items": [...]}`` on success;
+            "title": ..., "items": [...], "has_more": ...}`` on success;
             ``{"error": "...", ...}`` on failure.
         """
         resolution = _resolve_session_call(
@@ -1872,11 +1907,23 @@ class SysSessionGetHistoryTool(Tool):
         )
         if isinstance(content_offset_chars, str):
             return content_offset_chars
-        page = resolution.conv_store.list_items(
-            resolution.child.id,
-            limit=tail_items,
-            order="desc",
-        )
+        before_item = resolution.args.get("before_item")
+        if "before_item" in resolution.args and (
+            not isinstance(before_item, str) or not before_item
+        ):
+            return json.dumps({"error": "before_item must be a non-empty item id string"})
+        try:
+            page = resolution.conv_store.list_items(
+                resolution.child.id,
+                limit=tail_items,
+                order="desc",
+                after=before_item,
+            )
+        except (StaleCursorError, ValueError, StatementError):
+            # InvalidUuidError is a ValueError; SQLAlchemy can also surface
+            # the malformed id wrapped in a StatementError. Both mean the
+            # cursor cannot name a stored item, same as a stale cursor.
+            return json.dumps({"error": f"unknown before_item: {before_item}"})
         # ``list_items(order="desc")`` returns newest-first; reverse
         # to chronological order so the LLM reads top-to-bottom.
         items: list[dict[str, Any]] = [
@@ -1892,11 +1939,14 @@ class SysSessionGetHistoryTool(Tool):
         # this a peek on a sub-agent blocked on AskUserQuestion would
         # show no sign it needs input. Append the index's outstanding
         # prompts after the stored tail — they are the most recent
-        # thing the sub-agent did.
-        items.extend(
-            pending_elicitations.project_for_peek(event)
-            for event in pending_elicitations.snapshot_for(resolution.child.id)
-        )
+        # thing the sub-agent did. Only on the first page: they trail
+        # the tail, so a before_item page of older items must not
+        # repeat them.
+        if not before_item:
+            items.extend(
+                pending_elicitations.project_for_peek(event)
+                for event in pending_elicitations.snapshot_for(resolution.child.id)
+            )
         labelled = _agent_title_from_conversation(resolution.child)
         return json.dumps(
             {
@@ -1904,6 +1954,7 @@ class SysSessionGetHistoryTool(Tool):
                 "agent": labelled.agent,
                 "title": labelled.title,
                 "items": items,
+                "has_more": page.has_more,
             }
         )
 

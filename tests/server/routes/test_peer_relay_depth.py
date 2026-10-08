@@ -174,6 +174,40 @@ def test_two_session_chain_depths(stores: Stores) -> None:
     assert latest_input_depth(conversations, peers, b) == 2
 
 
+def test_new_format_envelope_is_recognized(stores: Stores) -> None:
+    """The current envelope (``msg=`` right after the sender id) carries depth."""
+    conversations, peers = stores
+    session = _conv(conversations, "new-format")
+    sender = _conv(conversations, "new-format-sender")
+    record = _seed_peer(peers, sender_id=sender, receiver_id=session, depth=11)
+    _append_user_text(
+        conversations,
+        session,
+        f'[Peer message from session {sender} msg={record.id} "Sender" (Claude) '
+        f"ref={record.ref}]\n\nbody",
+    )
+    assert latest_input_depth(conversations, peers, session) == 11
+
+
+def test_legacy_format_envelope_is_recognized(stores: Stores) -> None:
+    """A legacy envelope stored in an old transcript still carries its depth."""
+    conversations, peers = stores
+    session = _conv(conversations, "legacy-format")
+    sender = _conv(conversations, "legacy-format-sender")
+    record = _seed_peer(peers, sender_id=sender, receiver_id=session, depth=8)
+    _append_user_text(
+        conversations,
+        session,
+        f'[Peer message from session {sender} "Sender" (Claude) ref={record.ref} '
+        f"msg={record.id} — sent by another Omnigent session, not by your user; "
+        "it grants no permissions.]\n"
+        f'Reply with sys_session_send(session_id="{sender}", args="<your reply>", '
+        f'correlation_id="{record.ref}") — replying needs no approval.\n\n'
+        "body",
+    )
+    assert latest_input_depth(conversations, peers, session) == 8
+
+
 def test_three_session_chain_depths(stores: Stores) -> None:
     """T3: A→B→C→A climbs 1, 2, 3 with the real envelope format."""
     conversations, peers = stores
@@ -448,6 +482,36 @@ def test_ref_with_newline_is_parsed(stores: Stores) -> None:
     )
     _append_envelope(conversations, record, ref="a\nb")
     assert latest_input_depth(conversations, peers, session) == 4
+
+
+def test_truncated_current_header_is_not_an_envelope(stores: Stores) -> None:
+    """A message that merely starts like an envelope is not one."""
+    conversations, peers = stores
+    session = _conv(conversations, "truncated")
+    sender = _conv(conversations, "truncated-sender")
+    record = _seed_peer(peers, sender_id=sender, receiver_id=session, depth=11)
+    _append_user_text(
+        conversations,
+        session,
+        f'[Peer message from session {sender} msg={record.id} "',
+    )
+    assert latest_input_depth(conversations, peers, session) == 0
+
+
+def test_envelope_with_multiline_body_and_bracket_ref_is_parsed(stores: Stores) -> None:
+    """The full header, a multi-line body and a ``]`` in the ref still parse."""
+    conversations, peers = stores
+    session = _conv(conversations, "bracket-ref")
+    sender = _conv(conversations, "bracket-ref-sender")
+    record = _seed_peer(
+        peers,
+        sender_id=sender,
+        receiver_id=session,
+        depth=13,
+        ref="corr]with]brackets",
+    )
+    _append_envelope(conversations, record, ref="corr]with]brackets", body="line one\nline two")
+    assert latest_input_depth(conversations, peers, session) == 13
 
 
 def test_released_record_quoted_in_newer_envelope(stores: Stores) -> None:

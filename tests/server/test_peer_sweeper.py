@@ -16,7 +16,7 @@ from typing import Any, cast
 import pytest
 
 from omnigent.entities import SessionPeerMessage
-from omnigent.entities.conversation import Conversation
+from omnigent.entities.conversation import Conversation, ConversationItem, MessageData
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -49,6 +49,14 @@ def _conv(
     )
 
 
+def _envelope(record: SessionPeerMessage, *, sender: str = "a" * 32) -> str:
+    """A valid current-format envelope carrying *record*'s ``msg=`` marker."""
+    return (
+        f'[Peer message from session {sender} msg={record.id} "Title" '
+        f"(agent) ref={record.ref}]\n\nbody"
+    )
+
+
 class _FakePeerStore(PeerMessageStore):
     """In-memory store with a real lock, so CAS races are genuine."""
 
@@ -68,12 +76,20 @@ class _FakePeerStore(PeerMessageStore):
         return self._rows.get(peer_id)
 
     def list_for_session(
-        self, session_id: str, states: tuple[str, ...] | None = None, limit: int = 20
+        self,
+        session_id: str,
+        states: tuple[str, ...] | None = None,
+        limit: int = 20,
+        *,
+        sender_session_id: str | None = None,
+        oldest_first: bool = False,
     ) -> list[SessionPeerMessage]:
         rows = [r for r in self._rows.values() if r.receiver_session_id == session_id]
         if states is not None:
             rows = [r for r in rows if r.state in states]
-        rows.sort(key=lambda r: r.created_at, reverse=True)
+        if sender_session_id is not None:
+            rows = [r for r in rows if r.sender_session_id == sender_session_id]
+        rows.sort(key=lambda r: (r.created_at, r.id), reverse=not oldest_first)
         return rows[:limit]
 
     def list_due(self, states: tuple[str, ...], limit: int) -> list[SessionPeerMessage]:
@@ -174,9 +190,21 @@ class _FakeConversationStore:
 
     def search_visible_items_literal(
         self, conversation_id: str, query: str, limit: int = 20
-    ) -> list[str]:
-        texts = self.visible_text.get(conversation_id, [])
-        return [t for t in texts if query in t][:limit]
+    ) -> list[ConversationItem]:
+        # Mirror the real store: each hit is a decoded conversation item, so
+        # the sweeper's marker validation reads role/content, not raw text.
+        hits = [t for t in self.visible_text.get(conversation_id, []) if query in t][:limit]
+        return [
+            ConversationItem(
+                id=f"item_{i}",
+                type="message",
+                status="completed",
+                response_id="resp",
+                created_at=0,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for i, text in enumerate(hits)
+        ]
 
 
 class _TrueStateScript:
@@ -361,9 +389,7 @@ async def test_pending_delivers_when_receiver_turns_idle(harness: _Harness) -> N
     assert _row(harness.store, record.id).state == "delivered"
     assert len(harness.deliver.calls) == 1
     assert harness.deliver.calls[0]["receiver"] == "receiver"
-    assert harness.post_event.calls[0]["session_id"] == "sender"
-    assert "delivered" in harness.post_event.calls[0]["text"]
-    assert record.id in harness.post_event.calls[0]["text"]
+    assert harness.post_event.calls == []
 
 
 async def test_queued_delivers(harness: _Harness) -> None:
@@ -439,7 +465,7 @@ async def test_released_record_delivers_despite_inbound_hold() -> None:
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
     assert len(h.deliver.calls) == 1
-    assert "delivered" in h.post_event.calls[0]["text"]
+    assert h.post_event.calls == []
 
 
 async def test_master_switch_off_fails_deferred_record_with_notice() -> None:
@@ -542,7 +568,7 @@ async def test_released_record_revert_keeps_marker_and_delivers_next_tick() -> N
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
     assert len(h.deliver.calls) == 1
-    assert "delivered" in h.post_event.calls[0]["text"]
+    assert h.post_event.calls == []
 
 
 async def test_transient_failure_retries_then_delivers(harness: _Harness) -> None:
@@ -555,9 +581,7 @@ async def test_transient_failure_retries_then_delivers(harness: _Harness) -> Non
 
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
-    assert len(harness.post_event.calls) == 1
-    assert "delivered" in harness.post_event.calls[0]["text"]
-    assert "failed" not in harness.post_event.calls[0]["text"]
+    assert harness.post_event.calls == []
 
 
 async def test_transient_failure_until_expiry_expires_with_one_notice(harness: _Harness) -> None:
@@ -600,19 +624,18 @@ async def test_uncertain_delivery_reconciles_delivered_via_marker_after_grace(
     harness: _Harness,
 ) -> None:
     """X2: past the grace, a marker in the receiver's transcript settles
-    an uncertain delivery as delivered, with one notice."""
-    record = harness.seed_record(state="pending")
+    an uncertain delivery as delivered, without a notice."""
+    record = harness.seed_record(id="1" * 32, state="pending")
     harness.deliver.outcomes["receiver"] = ("uncertain", "not_ready")
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivering"
 
-    harness.conv_store.visible_text["receiver"] = [f"[Peer message ...] ref=ref1 msg={record.id}"]
+    harness.conv_store.visible_text["receiver"] = [_envelope(record)]
     harness._now += 130
     await harness.sweeper._tick()
     updated = _row(harness.store, record.id)
     assert updated.state == "delivered"
-    assert len(harness.post_event.calls) == 1
-    assert "delivered" in harness.post_event.calls[0]["text"]
+    assert harness.post_event.calls == []
 
 
 async def test_uncertain_delivery_reconciles_to_pending_without_marker(
@@ -634,7 +657,7 @@ async def test_uncertain_delivery_reconciles_to_pending_without_marker(
 
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
-    assert len(harness.post_event.calls) == 1
+    assert harness.post_event.calls == []
 
 
 async def test_uncertain_delivery_past_expiry_expires_with_notice(
@@ -656,8 +679,7 @@ async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:
     """F6: two concurrent flush attempts for one sender post exactly once."""
     record = harness.seed_record(state="pending")
     harness.true_state.states["sender"] = "busy"
-    await harness.sweeper._tick()
-    assert _row(harness.store, record.id).state == "delivered"
+    await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
     assert len(harness.sweeper._parked["sender"]) == 1
 
     harness.true_state.states["sender"] = "idle"
@@ -696,9 +718,8 @@ async def test_notices_to_busy_sender_park_and_flush_as_one_message() -> None:
     r2 = h.seed_record(
         id="peer_2", receiver_session_id="receiver2", ref="ref-2", expires_at=h._now + 10
     )
-    await h.sweeper._tick()
-    assert _row(h.store, r1.id).state == "delivered"
-    assert _row(h.store, r2.id).state == "delivered"
+    await h.sweeper._notify_for(r1, "delivered", None, "Receiver", _APP)
+    await h.sweeper._notify_for(r2, "delivered", None, "Receiver Two", _APP)
     assert h.post_event.calls == []  # sender busy — both parked, nothing posted yet
     assert len(h.sweeper._parked["sender"]) == 2
 
@@ -781,15 +802,13 @@ async def test_startup_reconciliation_marker_found_is_delivered() -> None:
     h.add_conv(_conv("sender", title="Sender"))
     h.add_conv(_conv("receiver", title="Receiver"))
     record = h.seed_record(
-        id="peer_deliv", state="delivering", ref="ref-found", updated_at=h._now - 200
+        id="2" * 32, state="delivering", ref="ref-found", updated_at=h._now - 200
     )
-    h.conv_store.visible_text["receiver"] = [
-        f"[Peer message ...] ref=ref-found msg={record.id} ..."
-    ]
+    h.conv_store.visible_text["receiver"] = [_envelope(record)]
     await h.sweeper._reconcile_startup()
     updated = _row(h.store, record.id)
     assert updated.state == "delivered"
-    assert "delivered" in h.post_event.calls[0]["text"]
+    assert h.post_event.calls == []
 
 
 async def test_startup_reconciliation_marker_missing_reverts_to_pending() -> None:
@@ -838,11 +857,9 @@ async def test_tick_reconciles_delivering_record_once_grace_elapses() -> None:
     h.add_conv(_conv("sender", title="Sender"))
     h.add_conv(_conv("receiver", title="Receiver"))
     record = h.seed_record(
-        id="peer_aged", state="delivering", ref="ref-aged", updated_at=h._now - 130
+        id="3" * 32, state="delivering", ref="ref-aged", updated_at=h._now - 130
     )
-    h.conv_store.visible_text["receiver"] = [
-        f"[Peer message ...] ref=ref-aged msg={record.id} ..."
-    ]
+    h.conv_store.visible_text["receiver"] = [_envelope(record)]
     await h.sweeper._tick()
     assert _row(h.store, record.id).state == "delivered"
 
@@ -932,3 +949,128 @@ async def test_notify_line_uses_sender_notice_path(harness: _Harness) -> None:
     await harness.sweeper.notify_line("sender", "peer result ready")
     assert harness.post_event.calls[0]["session_id"] == "sender"
     assert harness.post_event.calls[0]["text"] == "peer result ready"
+
+
+async def test_steerable_receiver_delivers(harness: _Harness) -> None:
+    """A busy-but-steerable receiver takes a due record without interrupting."""
+    record = harness.seed_record(state="queued")
+    harness.true_state.states["receiver"] = "steerable"
+    await harness.sweeper._tick()
+    assert _row(harness.store, record.id).state == "delivered"
+    assert len(harness.deliver.calls) == 1
+    assert harness.post_event.calls == []
+
+
+async def test_older_queued_record_holds_newer_from_same_sender(harness: _Harness) -> None:
+    """Per-pair FIFO: a newer record waits for the sender's older one."""
+    older = harness.seed_record(
+        id="peer_old",
+        state="queued",
+        not_before=harness._now + 30,
+        created_at=harness._now - 5,
+    )
+    newer = harness.seed_record(id="peer_new", state="queued", created_at=harness._now - 1)
+    await harness.sweeper._tick()
+    assert _row(harness.store, older.id).state == "queued"
+    assert _row(harness.store, newer.id).state == "queued"
+    assert harness.deliver.calls == []
+
+    harness._now += 30
+    await harness.sweeper._tick()
+    assert _row(harness.store, older.id).state == "delivered"
+    assert _row(harness.store, newer.id).state == "delivered"
+
+
+async def test_older_delivering_record_holds_newer_from_same_sender(harness: _Harness) -> None:
+    """An in-flight delivering record blocks this pair's newer message too."""
+    older = harness.seed_record(
+        id="peer_inflight", state="delivering", created_at=harness._now - 5
+    )
+    newer = harness.seed_record(id="peer_newer", state="queued", created_at=harness._now - 1)
+    await harness.sweeper._tick()
+    assert _row(harness.store, older.id).state == "delivering"
+    assert _row(harness.store, newer.id).state == "queued"
+    assert harness.deliver.calls == []
+
+
+async def test_older_delivering_record_found_behind_55_newer_same_pair(
+    harness: _Harness,
+) -> None:
+    """FIFO finds the oldest record even behind 50+ newer same-pair records."""
+    older = harness.seed_record(
+        id="peer_oldest", state="delivering", created_at=harness._now - 100
+    )
+    fillers = [
+        harness.seed_record(
+            id=f"peer_filler_{index}",
+            state="queued",
+            created_at=harness._now - 55 + index,
+        )
+        for index in range(55)
+    ]
+    await harness.sweeper._tick()
+    assert _row(harness.store, older.id).state == "delivering"
+    assert all(_row(harness.store, record.id).state == "queued" for record in fillers)
+    assert harness.deliver.calls == []
+
+
+async def test_older_record_from_another_sender_does_not_hold(harness: _Harness) -> None:
+    """FIFO is per pair: another sender's backlog never blocks this one."""
+    harness.add_conv(_conv("other", title="Other Sender"))
+    harness.seed_record(
+        id="peer_other",
+        sender_session_id="other",
+        state="queued",
+        not_before=harness._now + 30,
+        created_at=harness._now - 5,
+    )
+    newer = harness.seed_record(id="peer_mine", state="queued", created_at=harness._now - 1)
+    await harness.sweeper._tick()
+    assert _row(harness.store, newer.id).state == "delivered"
+    assert len(harness.deliver.calls) == 1
+
+
+async def test_notice_flushes_to_steerable_sender(harness: _Harness) -> None:
+    """A parked notice posts once the sender reads steerable, not idle."""
+    record = harness.seed_record(state="pending")
+    harness.true_state.states["sender"] = "steerable"
+    await harness.sweeper._notify_for(record, "expired", None, "Receiver", _APP)
+    assert len(harness.post_event.calls) == 1
+    assert harness.sweeper._parked.get("sender") == []
+
+
+async def test_reconcile_ignores_a_non_envelope_marker_hit(harness: _Harness) -> None:
+    """A literal ``msg=`` hit that is not this record's envelope is ignored."""
+    record = harness.seed_record(state="delivering", updated_at=harness._now - 200)
+    harness.conv_store.visible_text["receiver"] = [
+        f'[Peer message from session {"a" * 32} msg={"b" * 32} "T" (agent) ref=r]\n\n'
+        f"quotes msg={record.id} in the body"
+    ]
+    await harness.sweeper._reconcile_startup()
+    assert _row(harness.store, record.id).state == "pending"
+
+
+async def test_reconcile_ignores_a_truncated_envelope_prefix(harness: _Harness) -> None:
+    """A truncated current-format prefix is not this record's envelope."""
+    record = harness.seed_record(id="4" * 32, state="delivering", updated_at=harness._now - 200)
+    harness.conv_store.visible_text["receiver"] = [
+        f'[Peer message from session {"a" * 32} msg={record.id} "'
+    ]
+    await harness.sweeper._reconcile_startup()
+    assert _row(harness.store, record.id).state == "pending"
+
+
+async def test_reconcile_leaves_unmarked_delivering_while_receiver_running(
+    harness: _Harness,
+) -> None:
+    """A running receiver's queued prompt reaches the transcript only at the
+    next tool boundary; reverting now would re-send a copy still on its way."""
+    receiver = harness.conv_store.convs["receiver"]
+    harness.conv_store.convs["receiver"] = dataclasses.replace(receiver, live_status="running")
+    record = harness.seed_record(state="delivering", updated_at=harness._now - 200)
+    await harness.sweeper._reconcile_startup()
+    assert _row(harness.store, record.id).state == "delivering"
+
+    harness.conv_store.convs["receiver"] = dataclasses.replace(receiver, live_status=None)
+    await harness.sweeper._reconcile_startup()
+    assert _row(harness.store, record.id).state == "pending"

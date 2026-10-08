@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from omnigent.runner import create_runner_app
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    PEER_SESSION_GRANT,
     WORKTREE_INSTRUCTION,
     session_startup_extras,
 )
@@ -64,6 +65,7 @@ def _init_body(
     *,
     workspace: str | None = None,
     worktree: str | None = None,
+    peer_messaging_enabled: bool = False,
 ) -> dict[str, Any]:
     """Session-init POST body carrying *global_instructions* in the snapshot."""
     return {
@@ -82,6 +84,7 @@ def _init_body(
                 "worktree": worktree,
                 "labels": {},
                 "global_instructions": global_instructions,
+                "peer_messaging_enabled": peer_messaging_enabled,
             },
         },
     }
@@ -95,6 +98,7 @@ async def _init_session(
     *,
     workspace: str | None = None,
     worktree: str | None = None,
+    peer_messaging_enabled: bool = False,
 ) -> None:
     init = await client.post(
         "/v1/sessions",
@@ -104,6 +108,7 @@ async def _init_session(
             global_instructions,
             workspace=workspace,
             worktree=worktree,
+            peer_messaging_enabled=peer_messaging_enabled,
         ),
     )
     assert init.status_code == 201, init.text
@@ -269,3 +274,31 @@ async def test_without_a_worktree_the_recorded_value_is_the_global_text(
     assert recorded == ["GLOBAL-MARKER"]
     assert composed.endswith("GLOBAL-MARKER")
     assert "Your git working tree is" not in composed
+
+
+@pytest.mark.asyncio
+async def test_peer_grant_composes_only_for_a_peer_enabled_session() -> None:
+    """A peer-enabled session's recorded text carries the reply grant after the
+    global text; a session without the flag never composes the grant.
+
+    The map value is what the per-turn framework channel composes, so the
+    composed instructions are the observable proof of map membership.
+    """
+    app, harness_client = _build_turn_app()
+    peer_session, peer_agent = _ids()
+    plain_session, plain_agent = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(
+            client,
+            peer_session,
+            peer_agent,
+            "GLOBAL-MARKER",
+            peer_messaging_enabled=True,
+        )
+        await _init_session(client, plain_session, plain_agent, "GLOBAL-MARKER")
+        peer_composed = await _turn_instructions(client, harness_client, peer_session)
+        plain_composed = await _turn_instructions(client, harness_client, plain_session)
+
+    assert peer_composed.endswith(f"GLOBAL-MARKER\n\n{PEER_SESSION_GRANT}")
+    assert PEER_SESSION_GRANT not in plain_composed
+    assert plain_composed.endswith("GLOBAL-MARKER")

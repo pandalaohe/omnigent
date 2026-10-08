@@ -943,6 +943,39 @@ async def test_observe_ignores_async_question_events(
 
 
 @pytest.mark.asyncio
+async def test_observe_ignores_async_approval_events(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    An async approval card is not a block: it never wakes the parent.
+
+    The card is mirrored into ancestor chats for the human and the child
+    keeps working, so there is nothing to escalate and the debounce must
+    not arm.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="claude_code:auth-fix", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+    event = _request_event("elicit_async_approval", "pnpm vitest run")
+    event["params"]["async_kind"] = "approval"
+    event["params"]["approval_ref"] = "a123456"
+
+    notifier.observe(child.id, event)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert dispatch.calls == []
+    assert elicitation_armed(notifier, "elicit_async_approval") is False
+
+
+@pytest.mark.asyncio
 async def test_observe_retries_then_releases_arm_when_dispatch_raises(
     conv_store: SqlAlchemyConversationStore,
     caplog: pytest.LogCaptureFixture,
@@ -1314,32 +1347,6 @@ def test_block_reason_prefers_the_full_command_over_the_preview() -> None:
     }
 
     assert _block_reason(event) == long_command
-
-
-def test_format_block_notice_deferred_approval_wording() -> None:
-    """
-    A deferred approval's notice says it is waiting, not blocking.
-
-    The parent must not treat the child as stopped: the card is the
-    human's to answer and the child keeps working meanwhile.
-    """
-    conv = _make_conv(id="8af356d908005a65f872c246158c6293", title="claude_code:auth-fix")
-    event = {
-        "type": "response.elicitation_request",
-        "elicitation_id": "elicit_deferred",
-        "params": {
-            "mode": "form",
-            "message": "Claude wants to call **Bash**",
-            "async_kind": "approval",
-            "approval_ref": "a123456",
-            "command": "pnpm vitest run",
-        },
-    }
-
-    assert _format_block_notice(conv, event) == (
-        "[System: sub-agent auth-fix has an approval waiting for the user (#a123456): "
-        "pnpm vitest run. It is not blocked; surface it to the human.]"
-    )
 
 
 def test_format_block_notice_annotates_source_with_agent_host_and_cwd(
