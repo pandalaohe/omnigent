@@ -165,9 +165,8 @@ class SubagentBlockNotifier:
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
         params = event.get("params")
-        if isinstance(params, dict) and params.get("async_kind") == "question":
-            # Async question cards never block their session, so there is
-            # no block to escalate to the parent.
+        if isinstance(params, dict) and params.get("async_kind") in ("question", "approval"):
+            # Async cards never block their session: nothing to escalate.
             return
         event_type = event.get("type")
         if event_type == _STALE_TYPE:
@@ -429,13 +428,6 @@ def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
     label = _source_label(elicitation_source(child, param_dict))
     action = _block_reason(event)
     detail = f": {action}" if action else ""
-    if param_dict.get("async_kind") == "approval":
-        ref = param_dict.get("approval_ref")
-        ref_clause = f" (#{ref})" if isinstance(ref, str) and ref else ""
-        return (
-            f"[System: sub-agent {label} has an approval waiting for the user"
-            f"{ref_clause}{detail}. It is not blocked; surface it to the human.]"
-        )
     return (
         f"[System: sub-agent {label} is blocked awaiting human approval{detail}. "
         "Its approval prompt is mirrored into this conversation but has gone "
