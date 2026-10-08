@@ -6394,6 +6394,16 @@ async def _execute_timer_set(
     )
 
 
+# Delays before each timer firing retry (4 retries after the first
+# attempt). Only a request that certainly did not land is retried: a
+# refused connection (ConnectError, nothing sent) or an explicit 502/503
+# (the gateway could not dispatch it). Everything else — a lost response
+# (RemoteProtocolError), a timeout, 500/504, or any 4xx — may mean the
+# server already accepted (or definitively refused) the firing, so
+# re-posting could double-fire it.
+_TIMER_FIRE_RETRY_DELAYS_S: tuple[float, ...] = (2.0, 5.0, 10.0, 30.0)
+
+
 async def _timer_loop(
     *,
     timer_id: str,
@@ -6433,30 +6443,56 @@ async def _timer_loop(
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
-            try:
-                resp = await server_client.post(
-                    f"/v1/sessions/{conversation_id}/events",
-                    json={
-                        "type": "message",
-                        "data": {
-                            "role": "user",
-                            "is_meta": True,
-                            "content": [{"type": "input_text", "text": text}],
+            # Retry only requests that certainly did not land — a refused
+            # connection or an explicit 502/503 — up to
+            # ``_TIMER_FIRE_RETRY_DELAYS_S`` waits. A lost response, a
+            # timeout, 500/504 or a 4xx ends in the warning below without a
+            # retry because the server may already have accepted (or
+            # refused) the firing.
+            for retry_delay_s in (*_TIMER_FIRE_RETRY_DELAYS_S, None):
+                try:
+                    resp = await server_client.post(
+                        f"/v1/sessions/{conversation_id}/events",
+                        json={
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "is_meta": True,
+                                "content": [{"type": "input_text", "text": text}],
+                            },
                         },
-                    },
-                    timeout=30.0,
-                )
-                # httpx does not raise on 4xx/5xx by default; treat those
-                # as delivery failures so they share the warning path below.
-                resp.raise_for_status()
-            except (httpx.HTTPError, asyncio.TimeoutError):
-                _logger.warning(
-                    "Timer %s firing persist failed for %s",
-                    timer_id,
-                    conversation_id,
-                    exc_info=True,
-                    extra={"session_id": conversation_id},
-                )
+                        timeout=30.0,
+                    )
+                    # httpx does not raise on 4xx/5xx by default; retry an
+                    # explicit 502/503 (the gateway could not dispatch it)
+                    # and treat any other error status as a delivery
+                    # failure below.
+                    if retry_delay_s is not None and resp.status_code in (502, 503):
+                        await asyncio.sleep(retry_delay_s)
+                        continue
+                    resp.raise_for_status()
+                except httpx.ConnectError:
+                    # No connection was established, so the firing
+                    # certainly did not land and a retry cannot double it.
+                    if retry_delay_s is not None:
+                        await asyncio.sleep(retry_delay_s)
+                        continue
+                    _logger.warning(
+                        "Timer %s firing persist failed for %s",
+                        timer_id,
+                        conversation_id,
+                        exc_info=True,
+                        extra={"session_id": conversation_id},
+                    )
+                except (httpx.HTTPError, asyncio.TimeoutError):
+                    _logger.warning(
+                        "Timer %s firing persist failed for %s",
+                        timer_id,
+                        conversation_id,
+                        exc_info=True,
+                        extra={"session_id": conversation_id},
+                    )
+                break
             if not repeat:
                 break
     except asyncio.CancelledError:
@@ -7145,13 +7181,19 @@ def _project_api_item(
     :param max_chars: Maximum characters retained in each content field.
     :param offset_chars: Characters skipped from the start of each
         content field before the window is taken.
-    :returns: A compact dict — ``{type, tool, args}`` for tool calls,
-        ``{type, output}`` for tool results, ``{type, role, text}`` for
-        messages.
+    :returns: A compact dict — ``{id, created_at, type, tool, args}`` for
+        tool calls, ``{id, created_at, type, output}`` for tool results,
+        ``{id, created_at, type, role, text}`` for messages. Tool calls
+        and results also carry ``call_id`` when the API item has one; a
+        tool result carries ``tool`` when the API item has ``name``.
     """
     itype = _optional_string(item.get("type"))
+    common: _JsonObject = {
+        "id": _optional_string(item.get("id")),
+        "created_at": item.get("created_at"),
+    }
     if itype == "function_call":
-        return {
+        projected: _JsonObject = {
             "type": "function_call",
             "tool": _optional_string(item.get("name")),
             "args": _truncate_activity(
@@ -7160,15 +7202,27 @@ def _project_api_item(
                 offset_chars=offset_chars,
             ),
         }
+        call_id = _optional_string(item.get("call_id"))
+        if call_id is not None:
+            projected["call_id"] = call_id
+        return {**common, **projected}
     if itype == "function_call_output":
         output = item.get("output")
         rendered = output if isinstance(output, str) else json.dumps(output)
-        return {
+        projected = {
             "type": "function_call_output",
             "output": _truncate_activity(rendered, max_chars=max_chars, offset_chars=offset_chars),
         }
+        call_id = _optional_string(item.get("call_id"))
+        if call_id is not None:
+            projected["call_id"] = call_id
+        tool = _optional_string(item.get("name"))
+        if tool is not None:
+            projected["tool"] = tool
+        return {**common, **projected}
     if itype == "message":
         return {
+            **common,
             "type": "message",
             "role": _optional_string(item.get("role")),
             "text": _truncate_activity(
@@ -7177,7 +7231,7 @@ def _project_api_item(
                 offset_chars=offset_chars,
             ),
         }
-    return {"type": itype}
+    return {**common, "type": itype}
 
 
 async def _execute_session_query_tool(
@@ -9086,16 +9140,17 @@ async def _session_get_history_via_rest(
     Read a target session's recent items via ``GET .../items``.
 
     Mirrors :class:`SysSessionGetHistoryTool`: returns
-    ``{"conversation_id", "agent", "title", "items"}`` with items in
-    chronological order. The target's ``agent``/``title`` come from its
-    session snapshot. Maps a 404 to ``session_not_found`` and a
-    403/401 to ``session_out_of_tree`` (the server denied read access,
-    so from the caller's vantage the target is outside the sessions it
-    may read).
+    ``{"conversation_id", "agent", "title", "items", "has_more"}`` with
+    items in chronological order. ``before_item`` pages to the items
+    older than that item id (exclusive). The target's ``agent``/``title``
+    come from its session snapshot. Maps a 404 to ``session_not_found``
+    and a 403/401 to ``session_out_of_tree`` (the server denied read
+    access, so from the caller's vantage the target is outside the
+    sessions it may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``, ``content_max_chars``, and
-        ``content_offset_chars``.
+        optional ``tail_items``, ``content_max_chars``,
+        ``content_offset_chars``, and ``before_item``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -9119,10 +9174,16 @@ async def _session_get_history_via_rest(
     content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
     if isinstance(content_offset_chars, str):
         return content_offset_chars
+    before_item = args.get("before_item")
+    if "before_item" in args and (not isinstance(before_item, str) or not before_item):
+        return json.dumps({"error": "before_item must be a non-empty item id string"})
+    params: dict[str, str | int] = {"limit": tail_items, "order": "desc"}
+    if isinstance(before_item, str) and before_item:
+        params["after"] = before_item
     try:
         resp = await server_client.get(
             f"/v1/sessions/{target_id}/items",
-            params={"limit": tail_items, "order": "desc"},
+            params=params,
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -9133,7 +9194,9 @@ async def _session_get_history_via_rest(
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if resp.status_code != 200:
         return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
-    data: list[_JsonObject] = resp.json().get("data", [])
+    body = resp.json()
+    data: list[_JsonObject] = body.get("data", [])
+    has_more: bool = bool(body.get("has_more", False))
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
     items: list[_JsonObject] = [
@@ -9145,15 +9208,19 @@ async def _session_get_history_via_rest(
     # lives only in the Omnigent server's pending-elicitations index, replayed
     # on the snapshot), so append the snapshot's outstanding prompts
     # after the stored tail — they are the sub-agent's most recent act.
-    items.extend(
-        pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
-    )
+    # Only on the first page: they trail the tail, so a before_item
+    # page of older items must not repeat them.
+    if not before_item:
+        items.extend(
+            pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
+        )
     return json.dumps(
         {
             "conversation_id": target_id,
             "agent": meta.agent,
             "title": meta.title,
             "items": items,
+            "has_more": has_more,
         }
     )
 

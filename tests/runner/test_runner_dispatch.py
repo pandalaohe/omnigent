@@ -7131,17 +7131,20 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
                     "data": [
                         {
                             "id": "i2",
+                            "created_at": 2,
                             "type": "message",
                             "role": "assistant",
                             "content": [{"type": "output_text", "text": "found it"}],
                         },
                         {
                             "id": "i1",
+                            "created_at": 1,
                             "type": "message",
                             "role": "user",
                             "content": [{"type": "input_text", "text": "where is the bug"}],
                         },
                     ],
+                    "has_more": False,
                 },
             )
         if request.url.path == "/v1/sessions/conv_target":
@@ -7166,6 +7169,11 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
         ("user", "where is the bug"),
         ("assistant", "found it"),
     ]
+    assert [(i["id"], i["created_at"]) for i in out["items"]] == [
+        ("i1", 1),
+        ("i2", 2),
+    ]
+    assert out["has_more"] is False
 
 
 @pytest.mark.asyncio
@@ -7181,16 +7189,26 @@ async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None
                 json={
                     "object": "list",
                     "data": [
-                        {"id": "i3", "type": "response.error", "message": "ignored"},
+                        {
+                            "id": "i3",
+                            "created_at": 3,
+                            "type": "response.error",
+                            "message": "ignored",
+                        },
                         {
                             "id": "i2",
+                            "created_at": 2,
                             "type": "function_call_output",
+                            "name": "search",
+                            "call_id": "call_search",
                             "output": {"matches": 2},
                         },
                         {
                             "id": "i1",
+                            "created_at": 1,
                             "type": "function_call",
                             "name": "search",
+                            "call_id": "call_search",
                             "arguments": '{"query":"auth"}',
                         },
                     ],
@@ -7212,12 +7230,22 @@ async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None
 
     assert out["items"] == [
         {
+            "id": "i1",
+            "created_at": 1,
             "type": "function_call",
             "tool": "search",
+            "call_id": "call_search",
             "args": '{"query":"auth"}',
         },
-        {"type": "function_call_output", "output": '{"matches": 2}'},
-        {"type": "response.error"},
+        {
+            "id": "i2",
+            "created_at": 2,
+            "type": "function_call_output",
+            "tool": "search",
+            "call_id": "call_search",
+            "output": '{"matches": 2}',
+        },
+        {"id": "i3", "created_at": 3, "type": "response.error"},
     ]
 
 
@@ -7235,6 +7263,7 @@ async def test_session_peek_rest_handles_empty_and_mixed_message_content() -> No
                     "data": [
                         {
                             "id": "i2",
+                            "created_at": 2,
                             "type": "message",
                             "role": "assistant",
                             "content": [
@@ -7245,6 +7274,7 @@ async def test_session_peek_rest_handles_empty_and_mixed_message_content() -> No
                         },
                         {
                             "id": "i1",
+                            "created_at": 1,
                             "type": "message",
                             "role": "assistant",
                             "content": None,
@@ -7267,8 +7297,14 @@ async def test_session_peek_rest_handles_empty_and_mixed_message_content() -> No
         )
 
     assert out["items"] == [
-        {"type": "message", "role": "assistant", "text": ""},
-        {"type": "message", "role": "assistant", "text": "first second"},
+        {"id": "i1", "created_at": 1, "type": "message", "role": "assistant", "text": ""},
+        {
+            "id": "i2",
+            "created_at": 2,
+            "type": "message",
+            "role": "assistant",
+            "text": "first second",
+        },
     ]
 
 
@@ -7286,13 +7322,17 @@ async def test_session_peek_rest_truncates_tool_call_and_result_windows() -> Non
                     "data": [
                         {
                             "id": "i2",
+                            "created_at": 2,
                             "type": "function_call_output",
+                            "call_id": "call_search",
                             "output": "0123456789abcdef",
                         },
                         {
                             "id": "i1",
+                            "created_at": 1,
                             "type": "function_call",
                             "name": "search",
+                            "call_id": "call_search",
                             "arguments": "abcdefghijklmno",
                         },
                     ],
@@ -7321,15 +7361,118 @@ async def test_session_peek_rest_truncates_tool_call_and_result_windows() -> Non
 
     assert out["items"] == [
         {
+            "id": "i1",
+            "created_at": 1,
             "type": "function_call",
             "tool": "search",
+            "call_id": "call_search",
             "args": "defgh [truncated]",
         },
         {
+            "id": "i2",
+            "created_at": 2,
             "type": "function_call_output",
+            "call_id": "call_search",
             "output": "34567 [truncated]",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_before_item_pages_with_after_param() -> None:
+    """``before_item`` maps to the route's ``after`` cursor and pages older items."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            assert request.url.params["order"] == "desc"
+            assert request.url.params["after"] == "i5"
+            assert request.url.params["limit"] == "2"
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i4",
+                            "created_at": 4,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "four"}],
+                        },
+                        {
+                            "id": "i3",
+                            "created_at": 3,
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "three"}],
+                        },
+                    ],
+                    "has_more": True,
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "researcher:auth",
+                    "pending_elicitations": [
+                        {
+                            "type": "response.elicitation_request",
+                            "elicitation_id": "elicit_bio",
+                            "params": {"mode": "form", "message": "Answer 3 questions"},
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(
+                    {
+                        "conversation_id": "conv_target",
+                        "tail_items": 2,
+                        "before_item": "i5",
+                    }
+                ),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert [(i["id"], i["text"]) for i in out["items"]] == [
+        ("i3", "three"),
+        ("i4", "four"),
+    ]
+    assert out["has_more"] is True
+    # Parked elicitations trail the tail: a paged read must not repeat them.
+    assert all(i["type"] != "pending_elicitation" for i in out["items"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [123, "", None], ids=["int", "empty", "null"])
+async def test_session_peek_rest_rejects_invalid_before_item(bad: object) -> None:
+    """A present but non-string/empty ``before_item`` is rejected before any GET."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "before_item": bad}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out == {"error": "before_item must be a non-empty item id string"}
 
 
 @pytest.mark.asyncio

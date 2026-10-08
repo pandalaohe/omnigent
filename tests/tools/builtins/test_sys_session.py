@@ -334,7 +334,9 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
         "tail_items",
         "content_max_chars",
         "content_offset_chars",
+        "before_item",
     }
+    assert params["properties"]["before_item"]["type"] == "string"
 
 
 def test_peek_schema_tail_items_bounds() -> None:
@@ -470,18 +472,26 @@ def test_peek_projects_tool_call_and_result_items(
         )
     )
 
+    stored = session_fixture.conv_store.list_items(session_fixture.child_conv_id, order="asc").data
+    call_item, output_item = stored[-2], stored[-1]
     assert payload["items"] == [
         {
+            "id": call_item.id,
+            "created_at": call_item.created_at,
             "role": "assistant",
             "type": "tool_call",
             "name": "sys_os_shell",
             "args": '{"command":"pwd"}',
+            "call_id": "call_pwd",
         },
         {
+            "id": output_item.id,
+            "created_at": output_item.created_at,
             "role": "tool",
             "type": "tool_result",
             "name": None,
             "content": "/workspace/project",
+            "call_id": "call_pwd",
         },
     ]
 
@@ -567,8 +577,12 @@ def test_peek_joins_text_blocks_and_ignores_non_text_blocks(
         )
     )
 
+    stored = session_fixture.conv_store.list_items(session_fixture.child_conv_id, order="asc").data
+    last = stored[-1]
     assert payload["items"] == [
         {
+            "id": last.id,
+            "created_at": last.created_at,
             "role": "assistant",
             "type": "text",
             "content": "first\nsecond",
@@ -911,6 +925,169 @@ def test_peek_no_pending_elicitation_when_index_empty(
     # Exactly the two fixture messages — no synthesized elicitation.
     assert len(items) == 2
     assert all(item["type"] != "pending_elicitation" for item in items)
+
+
+def test_peek_before_item_pages_to_older_items(session_fixture: _Fixture) -> None:
+    """
+    ``before_item`` reads the items immediately older than the cursor.
+
+    The store's ``list_items(order="desc", after=X)`` cursor means
+    "further in sort order" — with a descending sort that is older —
+    so paging with ``items[0].id`` walks backwards through the
+    conversation without overlap and keeps chronological order.
+    """
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_paging",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": f"item {i}"}],
+                    agent="researcher",
+                ),
+            )
+            for i in range(3)
+        ],
+    )
+    tool = SysSessionGetHistoryTool()
+
+    def page(before_item: str | None = None) -> dict:
+        arguments: dict[str, object] = {
+            "conversation_id": session_fixture.child_conv_id,
+            "tail_items": 2,
+        }
+        if before_item is not None:
+            arguments["before_item"] = before_item
+        return json.loads(tool.invoke(json.dumps(arguments), session_fixture.ctx))
+
+    first = page()
+    assert [item["content"] for item in first["items"]] == ["item 1", "item 2"]
+    assert first["has_more"] is True
+
+    second = page(first["items"][0]["id"])
+    # The cursor item ("item 1") is excluded; the two immediately older
+    # items come back in chronological order.
+    assert [item["content"] for item in second["items"]] == [
+        "looking at handlers.py",
+        "item 0",
+    ]
+    assert second["has_more"] is True
+
+    third = page(second["items"][0]["id"])
+    assert [item["content"] for item in third["items"]] == ["find the auth bug"]
+    assert third["has_more"] is False
+
+    page_ids = [item["id"] for payload in (first, second, third) for item in payload["items"]]
+    assert len(page_ids) == len(set(page_ids)) == 5
+    for payload in (first, second, third):
+        for item in payload["items"]:
+            assert isinstance(item["id"], str) and item["id"]
+            assert isinstance(item["created_at"], int)
+
+
+def test_peek_has_more_false_at_conversation_start(session_fixture: _Fixture) -> None:
+    """A page reaching the oldest item reports ``has_more`` false."""
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps({"conversation_id": session_fixture.child_conv_id, "tail_items": 5}),
+            session_fixture.ctx,
+        )
+    )
+    assert len(payload["items"]) == 2
+    assert payload["has_more"] is False
+
+
+def test_peek_unknown_before_item_returns_error(session_fixture: _Fixture) -> None:
+    """An unknown cursor surfaces the store's stale-cursor error."""
+    unknown_id = "0" * 32
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "before_item": unknown_id,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+    assert "error" in payload
+    assert unknown_id in payload["error"]
+
+
+@pytest.mark.parametrize("bad", [123, "", None], ids=["int", "empty", "null"])
+def test_peek_before_item_must_be_a_non_empty_string(
+    session_fixture: _Fixture, bad: object
+) -> None:
+    """A present but non-string/empty cursor is rejected before the store read."""
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "before_item": bad,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+    assert payload == {"error": "before_item must be a non-empty item id string"}
+
+
+def test_peek_malformed_before_item_returns_unknown_error(session_fixture: _Fixture) -> None:
+    """A malformed cursor id surfaces the same unknown-cursor error."""
+    malformed = "not-an-item-id"
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "before_item": malformed,
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+    assert payload == {"error": f"unknown before_item: {malformed}"}
+
+
+def test_peek_before_item_page_omits_pending_elicitation(
+    session_fixture: _Fixture,
+) -> None:
+    """Parked prompts trail the tail, so a paged read must not repeat them."""
+    pending_elicitations.record_publish(
+        session_fixture.child_conv_id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_bio",
+            "params": {"mode": "form", "message": "Answer 3 questions"},
+        },
+    )
+    tool = SysSessionGetHistoryTool()
+    first = json.loads(
+        tool.invoke(
+            json.dumps({"conversation_id": session_fixture.child_conv_id, "tail_items": 2}),
+            session_fixture.ctx,
+        )
+    )
+    assert first["items"][-1]["type"] == "pending_elicitation"
+
+    older = json.loads(
+        tool.invoke(
+            json.dumps(
+                {
+                    "conversation_id": session_fixture.child_conv_id,
+                    "tail_items": 2,
+                    "before_item": first["items"][0]["id"],
+                }
+            ),
+            session_fixture.ctx,
+        )
+    )
+    assert older["items"] == []
+    assert older["has_more"] is False
 
 
 def test_peek_default_tail_when_omitted(session_fixture: _Fixture) -> None:
