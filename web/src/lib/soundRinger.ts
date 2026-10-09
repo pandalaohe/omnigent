@@ -35,8 +35,8 @@ export interface SoundRinger {
   dispose: () => void;
 }
 
-// One cue per class per window; a later alert of the same class is part of the
-// same burst.
+// done/error alerts arriving within this window collapse into one cue; a
+// needs_response cue is rate-limited to one per window.
 const BURST_WINDOW_MS = 2_000;
 // Minimum start-to-start distance between a "needs response" cue and a
 // done/error cue, applied to whichever one starts later.
@@ -84,7 +84,9 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
     needs_response: undefined,
     other: undefined,
   };
-  let lastOtherLevel: SoundLevel | undefined;
+  // done/error alerts gathered in the open collection window; their ids are
+  // already remembered. Null when no window is open.
+  let collecting: SoundAlert[] | null = null;
 
   function remember(alertId: string): void {
     rungIds.push(alertId);
@@ -95,48 +97,96 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
     }
   }
 
+  /** Push `start` out so the two classes stay CLASS_GAP_MS apart. */
+  function spacedStart(now: number, earlier: number | undefined): number {
+    return earlier !== undefined && now < earlier + CLASS_GAP_MS ? earlier + CLASS_GAP_MS : now;
+  }
+
+  /**
+   * Play `level` at `start`, or now when already due. A scheduled cue for a
+   * known alert re-checks its filters when it fires, since the device switch,
+   * quiet hours, mute, level, or viewed session may have changed.
+   */
+  function playCue(level: SoundLevel, start: number, now: number, alert?: SoundAlert): void {
+    if (start <= now) {
+      deps.play(level);
+      return;
+    }
+    let cancel = () => {};
+    cancel = deps.schedule(() => {
+      scheduled.delete(cancel);
+      if (alert !== undefined && !passesFilters(alert, deps.getContext())) return;
+      deps.play(level);
+    }, start - now);
+    scheduled.add(cancel);
+  }
+
+  function ringNeedsResponse(alert: SoundAlert): void {
+    const now = deps.nowMs();
+    const last = lastCueAt.needs_response;
+    if (last !== undefined && now - last < BURST_WINDOW_MS) return;
+    const start = spacedStart(now, lastCueAt.other);
+    remember(alert.alertId);
+    lastCueAt.needs_response = start;
+    playCue(alert.level, start, now, alert);
+  }
+
+  function closeCollection(alerts: SoundAlert[]): void {
+    const now = deps.nowMs();
+    const start = spacedStart(now, lastCueAt.needs_response);
+    lastCueAt.other = start;
+    if (start <= now) {
+      playCollected(alerts);
+      return;
+    }
+    let cancel = () => {};
+    cancel = deps.schedule(() => {
+      scheduled.delete(cancel);
+      playCollected(alerts);
+    }, start - now);
+    scheduled.add(cancel);
+  }
+
+  /** Re-filter the collected alerts and play the single surviving cue. */
+  function playCollected(alerts: SoundAlert[]): void {
+    const kept = alerts.filter((alert) => passesFilters(alert, deps.getContext()));
+    if (kept.length === 0) return;
+    deps.play(kept.some((alert) => alert.level === "error") ? "error" : "done");
+  }
+
+  function ringOther(alert: SoundAlert): void {
+    if (collecting !== null) {
+      collecting.push(alert);
+      remember(alert.alertId);
+      return;
+    }
+    const now = deps.nowMs();
+    const last = lastCueAt.other;
+    // A done/error right after an other cue is part of that burst, not a new one.
+    if (last !== undefined && now - last < BURST_WINDOW_MS) return;
+    remember(alert.alertId);
+    const alerts = [alert];
+    collecting = alerts;
+    let cancel = () => {};
+    cancel = deps.schedule(() => {
+      scheduled.delete(cancel);
+      collecting = null;
+      closeCollection(alerts);
+    }, BURST_WINDOW_MS);
+    scheduled.add(cancel);
+  }
+
   function ring(alert: SoundAlert): void {
     if (rungSet.has(alert.alertId)) return;
     if (!passesFilters(alert, deps.getContext())) return;
-
-    const now = deps.nowMs();
-    const cls = alertClass(alert.level);
-    const sameLast = lastCueAt[cls];
-    if (sameLast !== undefined && now - sameLast < BURST_WINDOW_MS) {
-      // A failure is worth surfacing even when it lands during a completion
-      // burst; completions after a failure stay silent.
-      const errorAfterDone =
-        cls === "other" && alert.level === "error" && lastOtherLevel === "done";
-      if (!errorAfterDone) return;
-    }
-
-    const otherLast = lastCueAt[cls === "needs_response" ? "other" : "needs_response"];
-    const start =
-      otherLast !== undefined && now < otherLast + CLASS_GAP_MS ? otherLast + CLASS_GAP_MS : now;
-
-    remember(alert.alertId);
-    lastCueAt[cls] = start;
-    if (cls === "other") lastOtherLevel = alert.level;
-    if (start > now) {
-      const level = alert.level;
-      let cancel = () => {};
-      cancel = deps.schedule(() => {
-        scheduled.delete(cancel);
-        // The context may have changed while the cue waited: re-check the
-        // device switch, quiet hours, session mute, level enablement, and
-        // the viewing rule, and drop the cue if any now fails.
-        if (!passesFilters(alert, deps.getContext())) return;
-        deps.play(level);
-      }, start - now);
-      scheduled.add(cancel);
-    } else {
-      deps.play(alert.level);
-    }
+    if (alertClass(alert.level) === "needs_response") ringNeedsResponse(alert);
+    else ringOther(alert);
   }
 
   function dispose(): void {
     for (const cancel of scheduled) cancel();
     scheduled.clear();
+    collecting = null;
   }
 
   return { ring, dispose };

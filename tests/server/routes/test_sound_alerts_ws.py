@@ -194,3 +194,48 @@ def test_claim_delivers_to_the_active_connection_only_once(
             headers={"X-Forwarded-Email": ALICE},
         )
         assert bad.status_code == 422
+
+
+def test_claim_delivers_to_the_active_ringer_even_without_watching_the_session(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """Claim routing follows activity, not which connection watched the session."""
+    session_id = _seed_session(stores, owner=ALICE, title="live")
+    client = TestClient(app)
+    with (
+        client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws_active,
+        client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws_idle,
+    ):
+        _hello(ws_active, "dev_a")
+        _hello(ws_idle, "dev_b")
+        ws_active.send_text(json.dumps({"type": "activity"}))
+        # The most recently active connection watches nothing; the idle one
+        # watches the alert's session. The alert still lands on the active one.
+        ws_active.send_text(json.dumps({"type": "watch", "session_ids": []}))
+        _recv_until(ws_active, {"snapshot"})
+        ws_idle.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        _recv_until(ws_idle, {"snapshot"})
+
+        body = {
+            "alert_id": f"{session_id}:needs_response:1",
+            "session_id": session_id,
+            "level": "needs_response",
+        }
+        response = client.post(
+            "/v1/me/sound-alerts/claim", json=body, headers={"X-Forwarded-Email": ALICE}
+        )
+        assert response.status_code == 202
+        assert response.json() == {"delivered": True}
+
+        frame = _recv_until(ws_active, {"sound_alert"})
+        assert frame == {
+            "type": "sound_alert",
+            "alert_id": body["alert_id"],
+            "session_id": session_id,
+            "level": "needs_response",
+        }
+        _assert_only_heartbeats(ws_idle)

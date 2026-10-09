@@ -72,11 +72,13 @@ async function migrateLegacySoundSetting(): Promise<void> {
   const next: SoundAlertDevicePreferences = { ...device, legacySoundMigrated: true };
   if (typeof legacy.enabled === "boolean") {
     next.enabled = legacy.enabled;
-    if (legacy.enabled && legacy.name) {
-      const systemSounds: Partial<Record<SoundLevel, string>> = {};
-      for (const level of SOUND_LEVELS) systemSounds[level] = legacy.name;
-      next.systemSounds = systemSounds;
-    }
+  }
+  // The chosen sound is the user's initial value whatever the old switch: fold
+  // it into every level so the migration preserves their pick.
+  if (legacy.name) {
+    const systemSounds: Partial<Record<SoundLevel, string>> = {};
+    for (const level of SOUND_LEVELS) systemSounds[level] = legacy.name;
+    next.systemSounds = systemSounds;
   }
   writeSoundAlertDevicePreferences(next);
 }

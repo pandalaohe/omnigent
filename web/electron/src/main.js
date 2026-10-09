@@ -3137,8 +3137,10 @@ function signalForeground() {
 // suppressed by macOS, so to make the alert audible in BOTH the foreground and
 // the background we play a system sound ourselves with `afplay` and mute the
 // toast's built-in sound (see the notify handler). The chosen sound and the
-// on/off switch live in the native Notifications menu, persisted in settings
-// (`notification_sound_enabled`, `notification_sound_name`).
+// on/off switch persist in settings (`notification_sound_enabled`,
+// `notification_sound_name`); the web app folds them into its own device
+// preferences once, and the notify path keeps reading the saved value so an
+// older web app stays audible.
 // ---------------------------------------------------------------------------
 
 // A pleasant default that ships on every macOS. Used when nothing is saved or
@@ -3167,8 +3169,8 @@ function systemSoundNames() {
 
 /**
  * Whether the notification sound is enabled. Opt-in: OFF unless the user has
- * explicitly turned it on via the Notifications menu, so a fresh install stays
- * silent until the user asks for sound.
+ * explicitly turned it on, so a fresh install stays silent until the user asks
+ * for sound.
  */
 function notificationSoundEnabled() {
   return loadSettings().notification_sound_enabled === true;
@@ -3191,8 +3193,8 @@ function currentNotificationSoundName() {
 
 /**
  * Play a system sound by name via `afplay`, fire-and-forget. No-op off macOS
- * (afplay is macOS-only). Used both for live notifications and for the menu's
- * pick-to-preview.
+ * (afplay is macOS-only). Used for live notifications and for the renderer's
+ * pick-to-preview over the system-sounds IPC.
  *
  * @param {string} name A name from `systemSoundNames()`, e.g. `"Glass"`.
  * @param {number} [volume] 0..1; omitted → afplay's own default.
@@ -3452,43 +3454,6 @@ function buildMenu() {
         ],
       },
     ];
-
-    // macOS notification-sound settings: an on/off switch plus a picker of
-    // system sounds. Selections persist in settings.json and are read live by
-    // the notify handler, so a change applies to the next notification without
-    // a relaunch. macOS-only because playback uses `afplay`.
-    if (isMac) {
-      /** @type {Electron.MenuItemConstructorOptions[]} */
-      const soundChoices = systemSoundNames().map((name) => ({
-        id: `notification_sound_${name}`,
-        label: name,
-        type: "radio",
-        checked: currentNotificationSoundName() === name,
-        click: () => {
-          const settings = loadSettings();
-          settings.notification_sound_name = name;
-          saveSettings(settings);
-          // Pick-to-preview: play the choice immediately so the user hears it,
-          // even when the sound is currently toggled off.
-          playSystemSound(name);
-        },
-      }));
-      debugSubmenu.push(
-        { type: "separator" },
-        {
-          id: "notification_sound_enabled",
-          label: "Play Notification Sound",
-          type: "checkbox",
-          checked: notificationSoundEnabled(),
-          click: (item) => {
-            const settings = loadSettings();
-            settings.notification_sound_enabled = item.checked;
-            saveSettings(settings);
-          },
-        },
-        { label: "Sound", submenu: soundChoices },
-      );
-    }
 
     debugSubmenu.push({ type: "separator" }, { role: "toggleDevTools" });
 

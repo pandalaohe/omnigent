@@ -170,19 +170,31 @@ describe("sound ringer", () => {
     expect(h.played).toEqual([]);
   });
 
-  it("spaces the later class 400 ms after the earlier one", () => {
+  it("spaces the other cue 400 ms after a needs_response cue that precedes its window close", () => {
     const h = createHarness();
 
+    h.ringer.ring(alert("done", "conv_1"));
+    h.advance(1_700);
     h.ringer.ring(alert("needs_response"));
-    h.advance(100);
-    h.ringer.ring(alert("error"));
     h.advance(1_000);
 
-    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response", "error"]);
+    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response", "done"]);
     expect(h.played[1].at - h.played[0].at).toBe(400);
   });
 
-  it("collapses a completion burst to one cue and lets an error through", () => {
+  it("spaces a needs_response cue 400 ms after an other cue that just played", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("done", "conv_1"));
+    h.advance(2_100);
+    h.ringer.ring(alert("needs_response"));
+    h.advance(1_000);
+
+    expect(h.played.map((entry) => entry.level)).toEqual(["done", "needs_response"]);
+    expect(h.played[1].at - h.played[0].at).toBe(400);
+  });
+
+  it("collapses a burst to one needs_response cue and one error cue", () => {
     const h = createHarness();
 
     h.ringer.ring(alert("done", "conv_1"));
@@ -194,51 +206,91 @@ describe("sound ringer", () => {
     h.ringer.ring(alert("error", "conv_4"));
     h.advance(100);
     h.ringer.ring(alert("needs_response", "conv_5"));
-    h.advance(1_000);
+    h.advance(2_000);
 
-    expect(h.played.map((entry) => entry.level)).toEqual(["done", "error", "needs_response"]);
-    const error = h.played.find((entry) => entry.level === "error");
-    const needs = h.played.find((entry) => entry.level === "needs_response");
-    expect(error).toBeDefined();
-    expect(needs).toBeDefined();
-    expect(needs?.at).toBe((error?.at ?? 0) + 400);
+    expect(h.played).toEqual([
+      { level: "needs_response", at: NOON + 400 },
+      { level: "error", at: NOON + 2_000 },
+    ]);
   });
 
-  it("drops a scheduled cue when the device is switched off before it fires", () => {
+  it("plays a lone done once when its collection window closes", () => {
     const h = createHarness();
 
+    h.ringer.ring(alert("done"));
+    h.advance(2_000);
+
+    expect(h.played).toEqual([{ level: "done", at: NOON + 2_000 }]);
+  });
+
+  it("collapses three dones in a window to one done", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("done", "conv_1"));
+    h.advance(100);
+    h.ringer.ring(alert("done", "conv_2"));
+    h.advance(100);
+    h.ringer.ring(alert("done", "conv_3"));
+    h.advance(2_000);
+
+    expect(h.played).toEqual([{ level: "done", at: NOON + 2_000 }]);
+  });
+
+  it("plays nothing when the collected alert stops passing filters at window close", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("error", "conv_1"));
+    h.setContext({ device: device({ enabled: false }) });
+    h.advance(3_000);
+
+    expect(h.played).toEqual([]);
+  });
+
+  it("drops a done that arrives 500 ms after an other cue played", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("done", "conv_1"));
+    h.advance(2_000);
+    h.advance(500);
+    h.ringer.ring(alert("done", "conv_2"));
+    h.advance(2_000);
+
+    expect(h.played).toEqual([{ level: "done", at: NOON + 2_000 }]);
+  });
+
+  it("drops a scheduled needs_response when the device is switched off before it fires", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("done", "conv_1"));
+    // The done cue plays when its collection window closes, so a needs_response
+    // arriving just after is scheduled 400 ms out rather than played at once.
+    h.advance(2_100);
     h.ringer.ring(alert("needs_response"));
-    // The error cue lands 400 ms after the needs_response one, so it is
-    // scheduled rather than played immediately.
-    h.ringer.ring(alert("error", "conv_b"));
     h.setContext({ device: device({ enabled: false }) });
     h.advance(1_000);
 
-    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response"]);
+    expect(h.played.map((entry) => entry.level)).toEqual(["done"]);
   });
 
-  it("cancels a scheduled cue on dispose", () => {
+  it("cancels a scheduled needs_response on dispose", () => {
     const h = createHarness();
 
+    h.ringer.ring(alert("done", "conv_1"));
+    h.advance(2_100);
     h.ringer.ring(alert("needs_response"));
-    h.ringer.ring(alert("error", "conv_b"));
     h.ringer.dispose();
     h.advance(1_000);
 
-    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response"]);
+    expect(h.played.map((entry) => entry.level)).toEqual(["done"]);
   });
 
-  it("lets an error join a completion burst but not a completion after an error", () => {
-    const withError = createHarness();
-    withError.ringer.ring(alert("done", "conv_1"));
-    withError.ringer.ring(alert("error", "conv_2"));
-    withError.advance(1_000);
-    expect(withError.played.map((entry) => entry.level)).toEqual(["done", "error"]);
+  it("cancels an open collection window on dispose", () => {
+    const h = createHarness();
 
-    const withDone = createHarness();
-    withDone.ringer.ring(alert("error", "conv_1"));
-    withDone.ringer.ring(alert("done", "conv_2"));
-    withDone.advance(1_000);
-    expect(withDone.played.map((entry) => entry.level)).toEqual(["error"]);
+    h.ringer.ring(alert("done", "conv_1"));
+    h.ringer.dispose();
+    h.advance(3_000);
+
+    expect(h.played).toEqual([]);
   });
 });

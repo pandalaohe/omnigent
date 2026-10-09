@@ -454,6 +454,22 @@ describe("useSoundAlerts", () => {
     expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "error" });
   });
 
+  it("claims nothing when runner_online flips off without a visible mark change", () => {
+    setConversations([conv("conv_a", { status: "idle", runner_online: true })]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
+
+    act(() => {
+      setConversations([conv("conv_a", { status: "idle", updated_at: 200, runner_online: false })]);
+      rerender();
+    });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    expect(claimFetchMock).not.toHaveBeenCalled();
+  });
+
   it("stays silent when already read while background work clears", () => {
     setConversations([conv("conv_a", { background_activity_count: 1 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
@@ -606,6 +622,11 @@ describe("useSoundAlerts", () => {
       level: "done",
     });
 
+    // A done cue collects for the burst window before it plays.
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+
     expect(playLevelMock).toHaveBeenCalledTimes(1);
     expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
   });
@@ -661,6 +682,22 @@ describe("useSoundAlerts", () => {
     expect(deviceStored()).toMatchObject({
       enabled: false,
       systemSounds: {},
+      legacySoundMigrated: true,
+    });
+  });
+
+  it("migrates the legacy sound name even when the legacy switch was off", async () => {
+    isNativeShellMock.mockReturnValue(true);
+    getLegacyNativeNotificationSoundMock.mockResolvedValue({ enabled: false, name: "Funk" });
+
+    renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(deviceStored()).toMatchObject({
+      enabled: false,
+      systemSounds: { done: "Funk", error: "Funk", needs_response: "Funk" },
       legacySoundMigrated: true,
     });
   });
