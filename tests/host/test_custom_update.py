@@ -293,6 +293,7 @@ def test_custom_update_rollback_does_not_fall_back_to_second_source(
     previous = "a" * 40
     calls: list[list[str]] = []
     drained: list[bool] = []
+    paused: list[bool] = []
 
     def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
@@ -312,12 +313,18 @@ def test_custom_update_rollback_does_not_fall_back_to_second_source(
         "_drain_custom_host_sessions",
         lambda *_a, **_k: drained.append(True),
     )
+    monkeypatch.setattr(
+        cli_module,
+        "_pause_custom_host_supervisor",
+        lambda *_a, **_k: paused.append(True),
+    )
 
     result = CliRunner().invoke(cli, ["host", "update", "custom", "--rollback"])
 
     assert result.exit_code != 0
     assert "rollback uses only the first configured source" in result.output
     assert drained == []
+    assert paused == []
     assert len(calls) == 2
     assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
