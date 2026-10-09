@@ -36,9 +36,6 @@ function problemText(
   hostName: (hostId: string) => string,
   bindingName: (bindingId: string) => string | null,
 ): string {
-  if (problem.code === "missing_primary") {
-    return `Host "${hostName(problem.host_id)}" has enabled bindings but no primary binding.`;
-  }
   const name = bindingName(problem.binding_id) ?? problem.binding_id;
   return `Binding "${name}" on host "${hostName(problem.host_id)}" points at a repository that is no longer registered.`;
 }
@@ -449,11 +446,7 @@ export function ProjectCollaborationSection({ projectId }: { projectId: string }
         <div className="flex flex-col gap-1">
           {data.problems.map((problem) => (
             <p
-              key={
-                problem.code === "missing_primary"
-                  ? `missing_primary-${problem.host_id}`
-                  : `dangling_repository-${problem.binding_id}`
-              }
+              key={`dangling_repository-${problem.binding_id}`}
               className="text-ui"
               data-testid="project-collaboration-problem"
             >

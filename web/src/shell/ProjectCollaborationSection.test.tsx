@@ -13,6 +13,7 @@ import {
   putProjectRepository,
   verifyProjectHostBinding,
   type ProjectCollaboration,
+  type ProjectRepository,
 } from "@/lib/projectsApi";
 import { ApiError } from "@/lib/sessionsApi";
 
@@ -69,11 +70,12 @@ function collaboration(overrides: Partial<ProjectCollaboration> = {}): ProjectCo
   };
 }
 
-function repo(overrides: Record<string, unknown> = {}) {
+function repo(overrides: Partial<ProjectRepository> = {}): ProjectRepository {
   return {
     id: "r_1",
     project_id: "p_1",
     name: "web",
+    role: "code",
     remote_url: "https://example.com/web.git",
     default_branch: "main",
     context_manifest_path: ".agents/project/manifest.json",
@@ -489,7 +491,6 @@ describe("ProjectCollaborationSection", () => {
           },
         ],
         problems: [
-          { code: "missing_primary", host_id: "h1" },
           {
             code: "dangling_repository",
             binding_id: "b_1",
@@ -502,13 +503,11 @@ describe("ProjectCollaborationSection", () => {
     renderSection();
 
     await waitFor(() =>
-      expect(screen.getAllByTestId("project-collaboration-problem")).toHaveLength(2),
+      expect(screen.getAllByTestId("project-collaboration-problem")).toHaveLength(1),
     );
     const lines = screen.getAllByTestId("project-collaboration-problem");
     expect(lines[0]).toHaveTextContent(/Laptop/);
-    expect(lines[0]).toHaveTextContent(/no primary binding/);
-    expect(lines[1]).toHaveTextContent(/Laptop/);
-    expect(lines[1]).toHaveTextContent(/no longer registered/);
+    expect(lines[0]).toHaveTextContent(/no longer registered/);
   });
 
   it("hints only when two checkouts on the same host share a folder", async () => {

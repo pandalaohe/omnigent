@@ -142,6 +142,12 @@ export interface ProjectHostEntry {
   /** Canonical directory path on that host, as the host returned it. */
   workspace: string;
   updated_at: number | null;
+  /**
+   * Whether the host checked the path on the PUT that returned this entry.
+   * Response-only: absent on list reads and on servers that predate it; a
+   * stored-but-unchecked path means the host was offline.
+   */
+  checked?: boolean;
 }
 
 interface ProjectEntryListResponse {
@@ -243,6 +249,8 @@ export interface ProjectRepository {
   id: string;
   project_id: string;
   name: string;
+  /** `"code"` is the repository the project changes; `"related"` is context. */
+  role: "code" | "related";
   remote_url: string;
   default_branch: string;
   context_manifest_path: string;
@@ -278,24 +286,53 @@ export interface ProjectHostBinding {
   updated_at: number | null;
   /** Hook outcome from the PUT/verify that returned this binding, if any. */
   post_bind?: PostBindResult;
+  /**
+   * Whether the host checked the path on the PUT/verify that returned this
+   * binding. Response-only: absent on list reads and on servers that predate
+   * it; a stored-but-unchecked path means the host was offline.
+   */
+  checked?: boolean;
+}
+
+/**
+ * The latest host setup command outcome for one folder, kept in memory by the
+ * server since it started (`at` is that run's ISO timestamp).
+ */
+export interface SetupOutcome {
+  host_id: string;
+  kind: "entry" | "binding";
+  /** Binding name for `"binding"`, or `null` for the project folder entry. */
+  target: string | null;
+  status: string;
+  exit_code: number | null;
+  output: string | null;
+  error: string | null;
+  at: string;
 }
 
 /** Machine-readable collaboration config problem. */
-export type ProjectCollaborationProblem =
-  | { code: "missing_primary"; host_id: string }
-  | { code: "dangling_repository"; binding_id: string; host_id: string; repository_id: string };
+export interface ProjectCollaborationProblem {
+  code: "dangling_repository";
+  binding_id: string;
+  host_id: string;
+  repository_id: string;
+}
 
 /** Collaboration config plus validation status for a project. */
 export interface ProjectCollaboration {
   repositories: ProjectRepository[];
   bindings: ProjectHostBinding[];
   problems: ProjectCollaborationProblem[];
+  /** Absent on servers that predate per-folder setup outcomes. */
+  setup_outcomes?: SetupOutcome[];
 }
 
 /** Body for `PUT .../repositories/{name}` (extra keys forbidden server-side). */
 export interface PutProjectRepositoryBody {
   remote_url: string;
   default_branch: string;
+  /** Omitted keeps the stored role; `"related"` on create. */
+  role?: "code" | "related";
   context_manifest_path?: string;
 }
 
@@ -303,6 +340,11 @@ export interface PutProjectRepositoryBody {
 export interface PutProjectHostBindingBody {
   workspace: string;
   repository_name: string;
+  /**
+   * @deprecated Ignored by the server; the primary binding is derived from
+   * the code repository. Kept for callers from before the Code tab; removal
+   * target 0.17.0.
+   */
   is_primary?: boolean;
   enabled?: boolean;
 }
@@ -386,6 +428,69 @@ export async function verifyProjectHostBinding(
     { method: "POST" },
   );
   return readCollaborationJsonOrThrow<ProjectHostBinding>(res);
+}
+
+/** Live git facts for one folder on a host, as the host reported them. */
+export interface HostFolderFacts {
+  exists: boolean;
+  is_dir: boolean;
+  is_repo: boolean;
+  /** Work-tree root, or `null` when git could not name one. */
+  toplevel: string | null;
+  /** Checked-out branch, or `null` when detached or unborn. */
+  branch: string | null;
+  /** Full HEAD commit sha, or `null` when unresolvable. */
+  head: string | null;
+  detached: boolean;
+  /** `null` when the status read timed out — unknown, not clean. */
+  dirty: boolean | null;
+  /** Credential-free fetch remotes; normalized to `[]` on a partial read. */
+  remotes: { name: string; url: string }[];
+  setup_command_configured: boolean;
+  error: string | null;
+}
+
+/**
+ * Result of a folder-facts read. `offline` covers an unreachable host and a
+ * timed-out read; `unsupported` is a host build without the facts frame.
+ */
+export type HostFolderFactsResult =
+  | { state: "ok"; facts: HostFolderFacts }
+  | { state: "offline" }
+  | { state: "unsupported" }
+  | { state: "error"; message: string };
+
+/**
+ * Read live git facts for a folder on a host. Resolves a discriminated result
+ * instead of throwing: the Code tab renders every state as a fact.
+ */
+export async function getHostFolderFacts(
+  hostId: string,
+  path: string,
+): Promise<HostFolderFactsResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/folder-facts?path=${encodeURIComponent(path)}`,
+  );
+  if (res.status === 409) return { state: "offline" };
+  if (res.status === 501) return { state: "unsupported" };
+  if (!res.ok) return { state: "error", message: await readError(res) };
+  const facts = (await res.json()) as HostFolderFacts;
+  return { state: "ok", facts: { ...facts, remotes: facts.remotes ?? [] } };
+}
+
+/** The text an agent receives at session start, and whether it was delivered. */
+export interface AgentCodeNote {
+  text: string | null;
+  delivered: boolean;
+  reason: "host_offline" | "host_update_needed" | null;
+}
+
+/** Fetch the code-location preview for one host (same text the agent gets). */
+export async function getAgentCodeNote(projectId: string, hostId: string): Promise<AgentCodeNote> {
+  const res = await authenticatedFetch(
+    `/v1/projects/${encodeURIComponent(projectId)}/hosts/${encodeURIComponent(hostId)}/agent-code-note`,
+  );
+  return readCollaborationJsonOrThrow<AgentCodeNote>(res);
 }
 
 export interface ProjectOrder {
