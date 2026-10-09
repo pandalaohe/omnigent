@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 import { resetWidthStoreForTesting } from "@/hooks/useResizableInlinePanel";
+import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "@/hooks/useResizableSidebar";
 import {
   writeWidenWorkspaceForContent,
   writeWorkspacePanelDefault,
@@ -100,10 +101,14 @@ function setInnerWidth(px: number): void {
 
 function FileOpenProbe() {
   const openFile = useFileViewer();
+  const { width } = useResizableSidebar();
   return (
-    <button type="button" onClick={() => openFile?.("README.md")}>
-      Open file
-    </button>
+    <>
+      <button type="button" onClick={() => openFile?.("README.md")}>
+        Open file
+      </button>
+      <span data-testid="sidebar-width">{width}</span>
+    </>
   );
 }
 
@@ -119,6 +124,7 @@ beforeEach(() => {
   // reloads the module-level stores from the cleared storage.
   localStorage.clear();
   resetWidthStoreForTesting();
+  resetSidebarWidthStoreForTesting();
   writeWorkspacePanelDefault("open");
   sessionStorage.clear();
   setInnerWidth(2000);
@@ -203,14 +209,34 @@ describe("Workspace rail content width", () => {
     renderShell();
 
     expect(rail().style.width).toBe("600px");
+    expect(screen.getByTestId("sidebar-width")).toHaveTextContent("320");
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Open file" }));
     expect(rail().style.width).toBe("840px");
+    expect(screen.getByTestId("sidebar-width")).toHaveTextContent("320");
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
     expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
 
     selectTab(/^Agents/);
     expect(rail().style.width).toBe("600px");
+    expect(screen.getByTestId("sidebar-width")).toHaveTextContent("320");
+    expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();
     expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+  });
+
+  it("drops the inline width while maximized and restores it on exit", () => {
+    renderShell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open file" }));
+    expect(rail().style.width).toBe("840px");
+
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(rail().style.width).toBe("");
+    expect(rail()).toHaveAttribute("data-maximized");
+
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(rail().style.width).toBe("840px");
   });
 
   it("keeps the normal width for an opened file when the setting is off", () => {

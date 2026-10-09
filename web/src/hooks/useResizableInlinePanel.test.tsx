@@ -307,6 +307,63 @@ describe("useResizableInlinePanel browser/file width", () => {
     expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(1000);
     expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
   });
+
+  it("keeps a drag in wide mode when the rail switches to normal content mid-drag", async () => {
+    const { result, rerender } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 })));
+    // Let the coalescing rAF flush run before the mode flips.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => resolve());
+        }),
+    );
+    rerender({ wide: false });
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+
+    // The width is written to the wide store, never the normal one.
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(1000);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+  });
+
+  it("still writes the wide width when mouseup arrives before the queued frame", () => {
+    const { result, rerender } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 })));
+    // Release with the move still queued: stop()'s flush must still target wide.
+    rerender({ wide: false });
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(1000);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+  });
+
+  it("keeps the comments floor in wide mode without overwriting the saved wide width", () => {
+    writePanelSizePreference("inlinePanelWideWidthPx", 500);
+    resetWidthStoreForTesting();
+
+    const { result } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, 720, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    // The 720 comments floor wins over the saved 500, which stays on disk.
+    expect(result.current.panelWidth).toBe(720);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(500);
+  });
 });
 
 describe("useResizableInlinePanel drag overlay", () => {

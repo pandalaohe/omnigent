@@ -232,8 +232,9 @@ export function useResizableInlinePanel(
   reservedRef.current = reservedPx;
   const persistEnabledRef = useRef(persistEnabled);
   persistEnabledRef.current = persistEnabled;
-  const wideRef = useRef(wide);
-  wideRef.current = wide;
+  // Frozen at mousedown so a mode switch mid-drag (rail content changing
+  // between wide and normal) can't redirect the width to the other store.
+  const dragWideRef = useRef(false);
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document. Without it, dragging
@@ -286,12 +287,13 @@ export function useResizableInlinePanel(
     (e: React.MouseEvent) => {
       if (!persistEnabled) return;
       e.preventDefault();
+      dragWideRef.current = wide;
       setIsDragging(true);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay, persistEnabled],
+    [addDragOverlay, persistEnabled, wide],
   );
 
   const onKeyDown = useCallback(
@@ -341,7 +343,7 @@ export function useResizableInlinePanel(
     function flush() {
       frame = 0;
       if (pending === null || !persistEnabledRef.current) return;
-      if (wideRef.current) {
+      if (dragWideRef.current) {
         setWideWidth(clamp(pending, minWidthRef.current, reservedRef.current));
       } else {
         setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
@@ -360,7 +362,7 @@ export function useResizableInlinePanel(
       setIsDragging(false);
       removeDragOverlay();
       if (persistEnabledRef.current) {
-        if (wideRef.current) {
+        if (dragWideRef.current) {
           writePanelSizePreference("inlinePanelWideWidthPx", wideWidth);
         } else {
           persistStoredWidth();

@@ -937,6 +937,7 @@ export function AppShell() {
     selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const railShowsWideContent =
     !mobileViewport &&
+    !pendingConversation &&
     !railShowsTerminal &&
     (selectedFilePath !== null ||
       (rightRailTab === "browser" && selectedTerminalKey === null && supportsBrowser()));
