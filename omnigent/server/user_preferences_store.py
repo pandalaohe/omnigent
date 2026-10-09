@@ -60,6 +60,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "keep_warm",
         "worktree_location",
         "runner_log_warnings",
+        "sound_alerts",
     }
 )
 
