@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -38,11 +38,18 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-const { projectsRef, pinnedRef } = vi.hoisted(() => ({
+const { projectsRef, pinnedRef, orderRef, orderStatusRef } = vi.hoisted(() => ({
   projectsRef: {
-    current: [] as { id: string; name: string; icon?: string | null }[],
+    current: [] as { id: string | null; name: string; icon?: string | null }[],
   },
   pinnedRef: { current: [] as unknown[] },
+  orderRef: {
+    current: {
+      sort_mode: "alphabetical" as "alphabetical" | "manual",
+      ordered_project_ids: [] as string[],
+    },
+  },
+  orderStatusRef: { current: 200 },
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -66,7 +73,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
-import { useConversations } from "@/hooks/useConversations";
+import { resolveOrCreateProjectId, useConversations } from "@/hooks/useConversations";
 
 const useConversationsMock = vi.mocked(useConversations);
 
@@ -80,6 +87,17 @@ const WORK_LAYOUT: SidebarLayout = {
   version: 1,
   sections: [
     { id: "sec_work", kind: "projects", name: "Work", maxRows: 10, projectIds: ["p_alpha"] },
+    { id: "default-favorites", kind: "favorites", name: "Pinned", maxRows: null, items: [] },
+    { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+    { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
+// A `projects` section holding nothing, so a folder can be dragged into it.
+const EMPTY_WORK_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    { id: "sec_work", kind: "projects", name: "Work", maxRows: null, projectIds: [] },
     { id: "default-favorites", kind: "favorites", name: "Pinned", maxRows: null, items: [] },
     { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
     { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
@@ -162,6 +180,8 @@ beforeEach(() => {
   localStorage.clear();
   projectsRef.current = PROJECTS;
   pinnedRef.current = [];
+  orderRef.current = { sort_mode: "alphabetical", ordered_project_ids: [] };
+  orderStatusRef.current = 200;
   recentRef.current = { status: 200, data: [] };
   fetchMock.mockReset();
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -176,7 +196,7 @@ beforeEach(() => {
       });
     }
     if (url.includes("/v1/projects/order")) {
-      return jsonResponse({ sort_mode: "alphabetical", ordered_project_ids: [] });
+      return jsonResponse(orderRef.current, orderStatusRef.current);
     }
     return jsonResponse({}, 404);
   });
@@ -487,5 +507,302 @@ describe("Sidebar sections", () => {
     fireEvent.mouseUp(document);
 
     platform.mockRestore();
+  });
+});
+
+// ── Section / project drag ───────────────────────────────────────────────────
+
+const HEADER_ROW = 30;
+const SECTION_BAND = 200;
+const SECTION_BASE = 1000;
+
+/** jsdom has no layout, so give section wrappers, header buttons and the
+ *  scroll container stacked rects for dnd-kit's pointer collision. Section
+ *  bands sit below every header band so a drop on a section body never lands
+ *  on a folder header. */
+function stubRects() {
+  return vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ) {
+    if (this.tagName === "NAV") return new DOMRect(0, 0, 400, 5000);
+    const sections = [...document.querySelectorAll("[data-section-id]")];
+    const sectionIndex = sections.indexOf(this);
+    if (sectionIndex >= 0) {
+      return new DOMRect(0, SECTION_BASE + sectionIndex * SECTION_BAND, 200, SECTION_BAND);
+    }
+    const headers = [...document.querySelectorAll('button[aria-roledescription="sortable"]')];
+    const headerIndex = headers.indexOf(this);
+    if (headerIndex >= 0) return new DOMRect(0, headerIndex * HEADER_ROW, 200, HEADER_ROW);
+    return new DOMRect(0, 0, 0, 0);
+  });
+}
+
+function headerButton(name: string): HTMLElement {
+  return screen.getByRole("button", { name });
+}
+
+function headerPoint(name: string): { clientX: number; clientY: number } {
+  const headers = [...document.querySelectorAll('button[aria-roledescription="sortable"]')];
+  const index = headers.indexOf(headerButton(name));
+  return { clientX: 50, clientY: index * HEADER_ROW + HEADER_ROW / 2 };
+}
+
+function sectionPoint(sectionId: string): { clientX: number; clientY: number } {
+  const sections = [...document.querySelectorAll("[data-section-id]")];
+  const index = sections.findIndex((el) => el.getAttribute("data-section-id") === sectionId);
+  return { clientX: 50, clientY: SECTION_BASE + index * SECTION_BAND + SECTION_BAND / 2 };
+}
+
+async function dragHeaderToPoint(
+  sourceEl: HTMLElement,
+  source: { clientX: number; clientY: number },
+  target: { clientX: number; clientY: number },
+) {
+  fireEvent.mouseDown(sourceEl, { button: 0, ...source });
+  fireEvent.mouseMove(document, { clientX: source.clientX, clientY: source.clientY - 10 });
+  await act(async () => {
+    fireEvent.mouseMove(document, target);
+  });
+  await act(async () => {
+    fireEvent.mouseUp(document, target);
+  });
+}
+
+function storedLayout(): SidebarLayout {
+  return JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as SidebarLayout;
+}
+
+function projectIdsOf(sectionId: string): string[] | undefined {
+  return storedLayout().sections.find((section) => section.id === sectionId)?.projectIds;
+}
+
+describe("sidebar section drag", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("moves a section header above another and saves the new order", async () => {
+    stubRects();
+    renderSidebar();
+
+    const source = headerButton("Use No Project for new sessions");
+    const start = headerPoint("Use No Project for new sessions");
+    const target = headerPoint("Projects");
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    expect(screen.queryByTestId("section-order-insertion")).not.toBeNull();
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    expect(storedLayout().sections.map((section) => section.id)).toEqual([
+      "default-favorites",
+      "default-other-sessions",
+      "default-other-projects",
+    ]);
+    expect(isBefore(screen.getByText("Sessions"), screen.getByText("Projects"))).toBe(true);
+  });
+
+  it("moves a project folder into a projects section and back onto Projects", async () => {
+    stubRects();
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(EMPTY_WORK_LAYOUT));
+    renderSidebar();
+    expect(within(sectionOf("Projects")).getByText("Alpha")).toBeInTheDocument();
+
+    await dragHeaderToPoint(
+      headerButton("Use Alpha for new sessions"),
+      headerPoint("Use Alpha for new sessions"),
+      sectionPoint("sec_work"),
+    );
+    await waitFor(() => expect(within(sectionOf("Work")).getByText("Alpha")).toBeInTheDocument());
+    expect(within(sectionOf("Projects")).queryByText("Alpha")).toBeNull();
+    expect(projectIdsOf("sec_work")).toEqual(["p_alpha"]);
+
+    await dragHeaderToPoint(
+      headerButton("Use Alpha for new sessions"),
+      headerPoint("Use Alpha for new sessions"),
+      sectionPoint("default-other-projects"),
+    );
+    await waitFor(() =>
+      expect(within(sectionOf("Projects")).getByText("Alpha")).toBeInTheDocument(),
+    );
+    expect(projectIdsOf("sec_work")).toEqual([]);
+  });
+
+  it("lets a folder move into a projects section when project order data is unavailable", async () => {
+    stubRects();
+    orderStatusRef.current = 404;
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(EMPTY_WORK_LAYOUT));
+    renderSidebar();
+
+    await dragHeaderToPoint(
+      headerButton("Use Alpha for new sessions"),
+      headerPoint("Use Alpha for new sessions"),
+      sectionPoint("sec_work"),
+    );
+
+    await waitFor(() => expect(projectIdsOf("sec_work")).toEqual(["p_alpha"]));
+  });
+
+  it("promotes a label-only project before moving it into a section", async () => {
+    stubRects();
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(EMPTY_WORK_LAYOUT));
+    projectsRef.current = [{ id: null, name: "Legacy", icon: null }, ...PROJECTS];
+    renderSidebar();
+    expect(within(sectionOf("Projects")).getByText("Legacy")).toBeInTheDocument();
+
+    await dragHeaderToPoint(
+      headerButton("Use Legacy for new sessions"),
+      headerPoint("Use Legacy for new sessions"),
+      sectionPoint("sec_work"),
+    );
+    await waitFor(() => expect(projectIdsOf("sec_work")).toEqual(["p_Legacy"]));
+  });
+
+  it("leaves the layout unchanged when a label-only promotion fails", async () => {
+    stubRects();
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(EMPTY_WORK_LAYOUT));
+    projectsRef.current = [{ id: null, name: "Legacy", icon: null }];
+    vi.mocked(resolveOrCreateProjectId).mockRejectedValueOnce(new Error("nope"));
+    const toasts: unknown[] = [];
+    const listener = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", listener);
+    renderSidebar();
+
+    await dragHeaderToPoint(
+      headerButton("Use Legacy for new sessions"),
+      headerPoint("Use Legacy for new sessions"),
+      sectionPoint("sec_work"),
+    );
+    await waitFor(() => expect(toasts).toContain("Couldn't move the project"));
+    expect(projectIdsOf("sec_work")).toEqual([]);
+    window.removeEventListener("omnigent:toast", listener);
+  });
+});
+
+describe("reordering folders inside a projects section", () => {
+  const TWO_PROJECT_LAYOUT: SidebarLayout = {
+    version: 1,
+    sections: [
+      {
+        id: "sec_work",
+        kind: "projects",
+        name: "Work",
+        maxRows: null,
+        projectIds: ["p_beta", "p_alpha"],
+      },
+      { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+      { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+    ],
+  };
+
+  it("moves a folder within the section's project order in manual mode", async () => {
+    orderRef.current = { sort_mode: "manual", ordered_project_ids: ["p_beta", "p_alpha"] };
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(TWO_PROJECT_LAYOUT));
+    renderSidebar();
+
+    await waitFor(() =>
+      expect(
+        isBefore(
+          within(sectionOf("Work")).getByText("Beta"),
+          within(sectionOf("Work")).getByText("Alpha"),
+        ),
+      ).toBe(true),
+    );
+
+    fireEvent.pointerDown(within(sectionOf("Work")).getAllByTestId("project-actions")[0], {
+      button: 0,
+    });
+    fireEvent.keyDown(screen.getByTestId("move-project"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move down" }));
+
+    await waitFor(() => expect(projectIdsOf("sec_work")).toEqual(["p_alpha", "p_beta"]));
+    expect(
+      isBefore(
+        within(sectionOf("Work")).getByText("Alpha"),
+        within(sectionOf("Work")).getByText("Beta"),
+      ),
+    ).toBe(true);
+  });
+
+  it("disables the folder move menu in alphabetical project order", async () => {
+    orderRef.current = { sort_mode: "alphabetical", ordered_project_ids: [] };
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(TWO_PROJECT_LAYOUT));
+    renderSidebar();
+
+    fireEvent.pointerDown(within(sectionOf("Work")).getAllByTestId("project-actions")[0], {
+      button: 0,
+    });
+    fireEvent.keyDown(screen.getByTestId("move-project"), { key: "ArrowRight" });
+
+    expect(screen.getByRole("menuitem", { name: "Move down" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+});
+
+describe("collapsed section marker freshness", () => {
+  it("refreshes a collapsed section's badge when a hidden session's state changes", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const mineKey = ["conversations", "", false, null, "mine"];
+    const initialData = conversationPage([
+      conversation("run1", { labels: { omni_project: "Alpha" }, status: "running" }),
+    ]).data;
+    qc.setQueryData(mineKey, initialData);
+    const cachedRows = () => {
+      const cached = qc.getQueryData(mineKey) as { pages: { data: Conversation[] }[] };
+      return cached.pages.flatMap((page) => page.data);
+    };
+    mockConversations(cachedRows());
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    projectsRef.current = [{ id: "p_alpha", name: "Alpha", icon: null }];
+
+    const view = render(tree());
+    // The expanded folder mounts and reports its running row.
+    expect(within(sectionOf("Work")).getByText("run1")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    expect(within(sectionOf("Work")).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "running",
+    );
+
+    // The folder is unmounted while collapsed; the conversations cache reports awaiting.
+    act(() => {
+      qc.setQueryData(
+        mineKey,
+        conversationPage([
+          conversation("run1", {
+            labels: { omni_project: "Alpha" },
+            pending_elicitations_count: 1,
+          }),
+        ]).data,
+      );
+    });
+    mockConversations(cachedRows());
+    view.rerender(tree());
+
+    return waitFor(() =>
+      expect(within(sectionOf("Work")).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "awaiting",
+      ),
+    );
   });
 });

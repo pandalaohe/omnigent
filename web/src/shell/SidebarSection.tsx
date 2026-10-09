@@ -4,7 +4,9 @@
 // with the list owner (device-local, keyed by section id).
 
 import { createContext, useContext, useRef, useState, type ReactNode, type RefObject } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useDroppable } from "@dnd-kit/core";
+import { useSortable } from "@dnd-kit/sortable";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   CheckIcon as CheckMarkIcon,
   FolderInputIcon,
@@ -52,6 +54,8 @@ import { cn } from "@/lib/utils";
 import type { MenuComponents } from "./Sidebar";
 import { NewSectionDialog } from "./NewSectionDialog";
 
+type HeaderDrag = ReturnType<typeof useSortable>;
+
 export interface SidebarLayoutContextValue {
   layout: SidebarLayout;
   saveLayout: SaveSidebarLayout;
@@ -63,6 +67,11 @@ export const SidebarLayoutContext = createContext<SidebarLayoutContextValue | nu
 export function useSidebarLayoutContext(): SidebarLayoutContextValue | null {
   return useContext(SidebarLayoutContext);
 }
+
+/** The sortable id of a section header in the list-level drag context. */
+export const sectionOrderId = (id: string) => `section-order:${id}`;
+/** The droppable id of a `projects` / `other_projects` section wrapper. */
+export const sectionDropId = (id: string) => `section:${id}`;
 
 export interface SidebarSectionBody {
   /** The capped scroll container when the section has a max height. */
@@ -102,18 +111,35 @@ export function SectionBody({
 }
 
 /**
- * Wraps one layout section: computes the height-cap/scroll descriptor and hands
- * the branch the section's options menu to place in its header.
+ * Wraps one layout section: computes the height-cap/scroll descriptor, makes
+ * the header a sortable and the whole section a project drop target, and hands
+ * the branch the section's options menu and header drag to place in its header.
  */
 export function SidebarSection({
   section,
   fallbackScrollRoot,
+  dragDisabled = true,
+  insertion,
+  projectDragActive = false,
+  dropHighlightClass,
   children,
 }: {
   section: SidebarSectionDef;
   /** The sidebar's scroll container, used when the section is uncapped. */
   fallbackScrollRoot: RefObject<HTMLElement | null>;
-  children: (body: SidebarSectionBody, headerAction: ReactNode) => ReactNode;
+  /** Disables the header sortable while another interaction owns the list. */
+  dragDisabled?: boolean;
+  /** Where to draw the section reorder line, when this section is the target. */
+  insertion?: "before" | "after";
+  /** Whether a project folder is being dragged, enabling the section drop. */
+  projectDragActive?: boolean;
+  /** Highlight class applied while a project is dragged over this section. */
+  dropHighlightClass?: string;
+  children: (
+    body: SidebarSectionBody,
+    headerAction: ReactNode,
+    headerDrag: HeaderDrag,
+  ) => ReactNode;
 }) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const maxHeight = section.maxRows === null ? null : section.maxRows * 29;
@@ -123,7 +149,38 @@ export function SidebarSection({
     maxHeight,
     scrollRoot: maxHeight === null ? fallbackScrollRoot : bodyRef,
   };
-  return <>{children(body, options)}</>;
+  const headerDrag = useSortable({
+    id: sectionOrderId(section.id),
+    data: { type: "section-order", id: section.id },
+    disabled: dragDisabled,
+  });
+  const isProjectSection = section.kind === "projects" || section.kind === "other_projects";
+  const { setNodeRef, isOver } = useDroppable({
+    id: sectionDropId(section.id),
+    data: { type: "section", id: section.id, kind: section.kind },
+    disabled: !isProjectSection,
+  });
+  const content = children(body, options, headerDrag);
+  if (content == null) return null;
+  return (
+    <div
+      ref={setNodeRef}
+      data-section-id={section.id}
+      className={cn(
+        "relative",
+        isProjectSection && projectDragActive && isOver && dropHighlightClass,
+      )}
+    >
+      {insertion && (
+        <span
+          data-testid="section-order-insertion"
+          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
+          style={insertion === "before" ? { top: 0 } : { bottom: 0 }}
+        />
+      )}
+      {content}
+    </div>
+  );
 }
 
 function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
@@ -350,6 +407,41 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
 }
 
 /**
+ * Move a project into a `projects` section (or out of every one, `null`),
+ * promoting a label-only folder to a first-class id first. Shared by the
+ * folder menu and the drag-onto-section path so both resolve the same way; a
+ * failed promotion toasts and leaves the layout untouched.
+ */
+export async function moveProjectToSectionWithPromotion({
+  projectId,
+  projectName,
+  sectionId,
+  saveLayout,
+  queryClient,
+}: {
+  projectId: string | null;
+  projectName: string;
+  sectionId: string | null;
+  saveLayout: SaveSidebarLayout;
+  queryClient: QueryClient;
+}): Promise<void> {
+  let id = projectId;
+  try {
+    if (id === null) {
+      id = await resolveOrCreateProjectId(projectName);
+      // The folder can only render once the created project appears in the
+      // list the layout resolves ids against.
+      await queryClient.invalidateQueries({ queryKey: ["projects"] });
+    }
+  } catch {
+    showToast("Couldn't move the project");
+    return;
+  }
+  if (id === null) return;
+  saveLayout((current) => moveProjectToSection(current, id, sectionId));
+}
+
+/**
  * The "Move to section" submenu of a project folder's menu. Owns the id
  * promotion (a label-only folder gets a first-class id) and writes the move
  * against the freshly read layout so an edit made while the project was being
@@ -373,22 +465,15 @@ export function MoveProjectToSectionMenu({
   const currentSectionId =
     context === null || projectId === null ? null : sectionOfProject(context.layout, projectId);
 
-  const moveToSection = async (sectionId: string | null) => {
+  const moveToSection = (sectionId: string | null) => {
     if (context === null) return;
-    let id = projectId;
-    try {
-      if (id === null) {
-        id = await resolveOrCreateProjectId(projectName);
-        // The folder can only render once the created project appears in the
-        // list the layout resolves ids against.
-        await queryClient.invalidateQueries({ queryKey: ["projects"] });
-      }
-    } catch {
-      showToast("Couldn't move the project");
-      return;
-    }
-    if (id === null) return;
-    context.saveLayout((current) => moveProjectToSection(current, id, sectionId));
+    void moveProjectToSectionWithPromotion({
+      projectId,
+      projectName,
+      sectionId,
+      saveLayout: context.saveLayout,
+      queryClient,
+    });
   };
 
   if (projectSections.length === 0) return null;
@@ -405,7 +490,7 @@ export function MoveProjectToSectionMenu({
             key={section.id}
             data-testid={`move-to-section-${section.id}`}
             disabled={currentSectionId === section.id}
-            onSelect={() => void moveToSection(section.id)}
+            onSelect={() => moveToSection(section.id)}
           >
             <span className="flex-1 truncate">{section.name}</span>
             {currentSectionId === section.id && (
@@ -416,7 +501,7 @@ export function MoveProjectToSectionMenu({
         <C.Item
           data-testid="move-to-section-other"
           disabled={currentSectionId === null}
-          onSelect={() => void moveToSection(null)}
+          onSelect={() => moveToSection(null)}
         >
           <span className="flex-1 truncate">Projects (no section)</span>
           {currentSectionId === null && (
