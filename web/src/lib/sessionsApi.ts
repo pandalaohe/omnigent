@@ -19,6 +19,7 @@ import { setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
+import { noteUserStopped } from "./userStoppedSessions";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -1694,6 +1695,7 @@ export function openSessionStream(
  * Native side chats include their observed response id to target the exact turn.
  */
 export function interrupt(sessionId: string, responseId?: string): Promise<PostEventResponse> {
+  noteUserStopped(sessionId);
   return postEvent(sessionId, {
     type: "interrupt",
     data: responseId ? { response_id: responseId } : {},
@@ -1708,6 +1710,7 @@ export function interrupt(sessionId: string, responseId?: string): Promise<PostE
  * of exiting from inside tmux, but driven from the web UI.
  */
 export function stopSession(sessionId: string): Promise<PostEventResponse> {
+  noteUserStopped(sessionId);
   return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 

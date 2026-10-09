@@ -18,6 +18,7 @@ export interface RingerContext {
   device: SoundAlertDevicePreferences;
   windowFocused: boolean;
   activeConversationId: string | undefined;
+  userStoppedRecently: (sessionId: string) => boolean;
   now: Date;
 }
 
@@ -54,13 +55,18 @@ function alertClass(level: SoundLevel): AlertClass {
  * Whether the current local context still allows this alert to play.
  *
  * Evaluated both when an alert arrives and again when a scheduled cue
- * fires, since the device switch, quiet hours, session mute, level
- * enablement, or the viewed session may all have changed in between.
+ * fires, since the device switch, quiet hours, session mute, the user-stop
+ * window, level enablement, or the viewed session may all have changed in
+ * between.
  */
 function passesFilters(alert: SoundAlert, context: RingerContext): boolean {
   if (!context.device.enabled) return false;
   if (isQuietNow(context.account.quietHours, context.now)) return false;
   if (context.account.mutedSessionIds.includes(alert.sessionId)) return false;
+  // The user's own stop/cancel is not a completion or failure to announce.
+  if (alert.level !== "needs_response" && context.userStoppedRecently(alert.sessionId)) {
+    return false;
+  }
   if (!isSoundLevelEnabled(context.account, alert.level)) return false;
   // The user is looking at this session; only a pending prompt still needs
   // their attention.

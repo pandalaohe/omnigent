@@ -28,6 +28,7 @@ import {
 import { canRingOnThisDevice, getSoundDeviceId, soundDeviceLabel } from "@/lib/soundDevice";
 import { createSoundRinger, type RingerContext } from "@/lib/soundRinger";
 import { initAudio, isAudioLocked, playLevel, subscribeAudioLock } from "@/lib/soundPlayer";
+import { wasUserStoppedRecently } from "@/lib/userStoppedSessions";
 import {
   alertId,
   buildRowSoundStates,
@@ -142,6 +143,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
         device: deviceRef.current,
         windowFocused: windowFocusedRef.current,
         activeConversationId: activeIdRef.current,
+        userStoppedRecently: (id) => wasUserStoppedRecently(id),
         now: new Date(),
       }),
       nowMs: () => Date.now(),

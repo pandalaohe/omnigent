@@ -766,4 +766,50 @@ describe("useSoundAlerts", () => {
 
     expect(socketHelloMock).toHaveBeenLastCalledWith(expect.objectContaining({ can_ring: true }));
   });
+
+  it("plays a done for the open conversation while the window is blurred and hidden", () => {
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    renderHook(() => useSoundAlerts("conv_a"));
+
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    emitFrame({
+      type: "sound_alert",
+      alert_id: "conv_a:done:200",
+      session_id: "conv_a",
+      level: "done",
+    });
+
+    // The viewing rule only suppresses a focused window, so the cue still
+    // plays once its collection window closes.
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+
+    expect(playLevelMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+  });
+
+  it("plays a needs_response for the open conversation at once while blurred and hidden", () => {
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    renderHook(() => useSoundAlerts("conv_a"));
+
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    emitFrame({
+      type: "sound_alert",
+      alert_id: "conv_a:needs_response:200",
+      session_id: "conv_a",
+      level: "needs_response",
+    });
+
+    expect(playLevelMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledWith(
+      "needs_response",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
 });
