@@ -10,8 +10,11 @@ import {
   isExplicitlyUnread,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
+import { authenticatedFetch } from "@/lib/identity";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
+import { isSoundLevelEnabled } from "@/lib/soundAlertPreferences";
+import { canRingOnThisDevice, getSoundDeviceId, soundDeviceLabel } from "@/lib/soundDevice";
 import { createSoundRinger, type RingerContext } from "@/lib/soundRinger";
 import { initAudio, playLevel } from "@/lib/soundPlayer";
 import {
@@ -20,6 +23,7 @@ import {
   detectEdges,
   isDoneCandidate,
   type RowSoundState,
+  type SoundAlert,
 } from "@/lib/soundAlertTransitions";
 
 // Agents that work in steps emit a dot per step; only a dot still showing
@@ -27,6 +31,9 @@ import {
 const DONE_SETTLE_MS = 10_000;
 // A reconnect re-baselines even if no data change follows.
 const REBASELINE_FALLBACK_MS = 1_500;
+// At most one activity frame per window; the server's 5-minute recency check
+// is far coarser, so this only bounds frame traffic.
+const ACTIVITY_THROTTLE_MS = 10_000;
 
 /** True when the app window currently has focus (SSR-safe default true). */
 function isWindowFocused(): boolean {
@@ -94,22 +101,57 @@ export function useSoundAlerts(activeConversationId?: string): void {
     });
   }
 
+  // Announce this device to the server so a claimed alert can be routed to a
+  // device that can actually play it. Re-announced when the device switch
+  // changes; the transport re-sends it on every reconnect.
+  useEffect(() => {
+    sessionUpdatesSocket.setHello({
+      device_id: getSoundDeviceId(),
+      device_label: soundDeviceLabel(),
+      can_ring: canRingOnThisDevice(device),
+    });
+  }, [device]);
+
   useEffect(() => {
     initAudio({ native: isNativeShell() });
   }, []);
 
+  // A delivered alert was claimed and routed to this one connection; the
+  // ringer still applies this device's local filters before playing.
+  useEffect(() => {
+    return sessionUpdatesSocket.subscribe((frame) => {
+      if (frame.type !== "sound_alert") return;
+      ringerRef.current?.ring({
+        sessionId: frame.session_id,
+        level: frame.level,
+        alertId: frame.alert_id,
+      });
+    });
+  }, []);
+
   // Focus is tracked from the authoritative DOM events (and any pointer/key
   // interaction, which implies our window has focus) rather than a polled
-  // `document.hasFocus()`, which can lie in the desktop shell.
+  // `document.hasFocus()`, which can lie in the desktop shell. Focus and
+  // interaction also tell the server this device is in use, throttled so a
+  // burst of keystrokes is one frame.
   useEffect(() => {
+    let lastActivitySentAt = 0;
+    const sendActivity = () => {
+      const now = Date.now();
+      if (now - lastActivitySentAt < ACTIVITY_THROTTLE_MS) return;
+      lastActivitySentAt = now;
+      sessionUpdatesSocket.sendActivity();
+    };
     const onFocus = () => {
       windowFocusedRef.current = true;
+      sendActivity();
     };
     const onBlur = () => {
       windowFocusedRef.current = false;
     };
     const onInteract = () => {
       windowFocusedRef.current = true;
+      sendActivity();
     };
     window.addEventListener("focus", onFocus);
     window.addEventListener("blur", onBlur);
@@ -185,8 +227,33 @@ export function useSoundAlerts(activeConversationId?: string): void {
       }
     }
 
-    const ringer = ringerRef.current;
-    if (ringer === null) return;
+    const deliver = (alert: SoundAlert) => {
+      const preferences = accountRef.current;
+      // Skip locally so a disabled level or muted session never costs a
+      // request; the server dedupes the rest across devices.
+      if (!isSoundLevelEnabled(preferences, alert.level)) return;
+      if (preferences.mutedSessionIds.includes(alert.sessionId)) return;
+      void (async () => {
+        try {
+          const response = await authenticatedFetch("/v1/me/sound-alerts/claim", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              alert_id: alert.alertId,
+              session_id: alert.sessionId,
+              level: alert.level,
+            }),
+          });
+          // A server without the claim route: ring locally so local
+          // detection still sounds.
+          if (response.status === 404 || response.status === 405) {
+            ringerRef.current?.ring(alert);
+          }
+        } catch {
+          // Alert delivery is best-effort; a network failure drops the cue.
+        }
+      })();
+    };
 
     if (rebaselinePending.current) {
       rebaselinePending.current = false;
@@ -199,7 +266,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
       previousRows.current = next;
       for (const [sessionId, state] of next) {
         if (state.mark.awaitingCount > 0) {
-          ringer.ring({
+          deliver({
             sessionId,
             level: "needs_response",
             alertId: alertId(sessionId, "needs_response", state),
@@ -211,7 +278,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
 
     const edges = detectEdges(previousRows.current, next);
     previousRows.current = next;
-    for (const alert of edges.immediate) ringer.ring(alert);
+    for (const alert of edges.immediate) deliver(alert);
     for (const sessionId of edges.settleStart) {
       const existing = settleTimers.current.get(sessionId);
       if (existing !== undefined) clearTimeout(existing);
@@ -222,7 +289,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
           // Re-check at fire time: the row may have resumed or been read.
           const state = latestRows.current.get(sessionId);
           if (state === undefined || !isDoneCandidate(state)) return;
-          ringer.ring({
+          deliver({
             sessionId,
             level: "done",
             alertId: alertId(sessionId, "done", state),

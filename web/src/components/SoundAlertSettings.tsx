@@ -12,6 +12,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { getSoundDeviceId, soundDeviceLabel } from "@/lib/soundDevice";
 import {
   BUILTIN_SOUNDS,
   SOUND_LEVELS,
@@ -57,6 +58,9 @@ export function SoundAlertsLockedHint() {
 export function SoundAlertSettings() {
   const { account, device } = useSoundAlertPreferences();
   const audioLocked = useAudioLocked();
+  const deviceId = getSoundDeviceId();
+  const deviceLabel = soundDeviceLabel();
+  const isPrimaryDevice = account.primaryDeviceId === deviceId;
 
   const updateLevel = (level: SoundLevel, patch: Partial<SoundAlertLevelPreferences>) =>
     writeSoundAlertPreferences({
@@ -96,6 +100,30 @@ export function SoundAlertSettings() {
             {Math.round(device.volume * 100)}%
           </span>
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-sm text-foreground">Primary device</span>
+          <span className="text-sm text-muted-foreground">
+            Plays when none of your devices was used in the last 5 minutes.
+          </span>
+        </div>
+        {isPrimaryDevice ? (
+          <span className="text-sm text-muted-foreground" data-testid="sound-alert-primary-device">
+            This device ({deviceLabel}) is the primary device
+          </span>
+        ) : (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="sound-alert-make-primary"
+            onClick={() => writeSoundAlertPreferences({ ...account, primaryDeviceId: deviceId })}
+          >
+            Make this the primary device
+          </Button>
+        )}
       </div>
 
       {SOUND_LEVELS.map((level) => (

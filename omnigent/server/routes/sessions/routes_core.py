@@ -8,6 +8,7 @@ import dataclasses
 import json
 import secrets
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
@@ -24,7 +25,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent.calling_defaults import load_master
@@ -63,6 +64,7 @@ from omnigent.sdk_permission_modes import (
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODES,
 )
+from omnigent.server import sound_alerts
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -395,6 +397,48 @@ async def _restore_refused_settings(
 def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     """Return whether Codex timed out before confirming a settings update it may still apply."""
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
+
+
+class SoundAlertClaimRequest(BaseModel):
+    """Body of ``POST /v1/me/sound-alerts/claim``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alert_id: str = Field(min_length=1, max_length=200)
+    session_id: str = Field(min_length=1, max_length=200)
+    level: Literal["done", "error", "needs_response"]
+
+
+def _sound_alert_primary_device_id(app_state: Any, owner: str) -> str | None:
+    """
+    Read the account's primary sound-alert device, ``None`` on any gap.
+
+    A malformed or absent preference must not break alert delivery, so a
+    missing store / envelope / namespace / key, a non-string value, or a
+    failed row read all resolve to ``None`` and the picker falls back to
+    the most recently active connection.
+
+    :param app_state: The FastAPI app state holding the preferences store.
+    :param owner: User id the preferences belong to.
+    :returns: The stored device id, or ``None``.
+    """
+    store = getattr(app_state, "user_preferences_store", None)
+    if store is None:
+        return None
+    try:
+        envelope = store.get(owner)
+    except Exception:
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    settings = envelope.get("settings")
+    if not isinstance(settings, dict):
+        return None
+    namespace = settings.get("sound_alerts")
+    if not isinstance(namespace, dict):
+        return None
+    value = namespace.get("primaryDeviceId")
+    return value if isinstance(value, str) and value else None
 
 
 def register_core_routes(
@@ -2420,12 +2464,21 @@ def register_core_routes(
           whenever the visible set changes (scroll / filter /
           pagination); it fully replaces the prior watch-set. Unknown
           message shapes are ignored for forward compatibility.
+          ``{"type": "hello", "device_id": str, "device_label": str,
+          "can_ring": bool}`` — announce this connection as a
+          sound-alert ringer for the user; re-sent when the device's
+          sound preferences change.
+          ``{"type": "activity"}`` — the user interacted with this
+          device; lets the alert picker prefer it.
         - **server → client**:
           ``{"type": "snapshot", "items": [SessionListItem, ...]}`` once
           per ``watch`` (full state for the new set), then
           ``{"type": "changed", "items": [...]}`` /
           ``{"type": "removed", "ids": [...]}`` deltas as watched
           sessions change, and ``{"type": "heartbeat"}`` when idle.
+          ``{"type": "sound_alert", "alert_id": str, "session_id": str,
+          "level": str}`` on the one connection chosen to play a
+          claimed alert.
 
         Watched-row freshness is pull-based — each interval the server
         re-reads the watched ids (the same read ``GET /v1/sessions`` does)
@@ -2453,6 +2506,8 @@ def register_core_routes(
             "session-updates stream connected",
             extra=debug_event("session_updates", phase="connected"),
         )
+        owner = user_id or RESERVED_USER_LOCAL
+        conn_id = uuid.uuid4().hex
 
         watched: list[str] = []
         # Last SessionListItem dump sent per id, used to diff. Keyed only
@@ -2484,6 +2539,19 @@ def register_core_routes(
             telemetry.inject_trace_context(frame)
             await websocket.send_text(json.dumps(frame))
             last_send_monotonic = time.monotonic()
+
+        async def _send_sound_alert(frame: dict[str, Any]) -> None:
+            """
+            Deliver a sound-alert frame from the claim route.
+
+            Registered as this connection's ringer ``send``; serializes
+            with the ticker/reader through the handler's emit lock like
+            every other frame on the stream.
+
+            :param frame: The ``sound_alert`` frame to send.
+            """
+            async with emit_lock:
+                await _send(frame)
 
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
@@ -2527,7 +2595,34 @@ def register_core_routes(
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(msg, dict) or msg.get("type") != "watch":
+                if not isinstance(msg, dict):
+                    continue
+                msg_type = msg.get("type")
+                if msg_type == "hello":
+                    # Device announcement; a repeated hello replaces the record.
+                    device_id = msg.get("device_id")
+                    device_label = msg.get("device_label")
+                    can_ring = msg.get("can_ring")
+                    if (
+                        isinstance(device_id, str)
+                        and len(device_id) <= 64
+                        and isinstance(device_label, str)
+                        and len(device_label) <= 80
+                        and isinstance(can_ring, bool)
+                    ):
+                        sound_alerts.register(
+                            owner,
+                            conn_id,
+                            device_id=device_id,
+                            device_label=device_label,
+                            can_ring=can_ring,
+                            send=_send_sound_alert,
+                        )
+                    continue
+                if msg_type == "activity":
+                    sound_alerts.touch(owner, conn_id)
+                    continue
+                if msg_type != "watch":
                     # Forward-compatible: ignore frames we don't understand.
                     continue
                 ids = msg.get("session_ids")
@@ -2702,12 +2797,44 @@ def register_core_routes(
                         extra=debug_event("session_updates", phase="error"),
                     )
         finally:
+            sound_alerts.unregister(owner, conn_id)
             _logger.info(
                 "session-updates stream disconnected",
                 extra=debug_event("session_updates", phase="disconnected"),
             )
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
+
+    @router.post("/me/sound-alerts/claim", status_code=status.HTTP_202_ACCEPTED)
+    async def claim_sound_alert(request: Request, body: SoundAlertClaimRequest) -> dict[str, bool]:
+        """
+        Claim one sound alert and deliver it to exactly one device.
+
+        Every client that detects the same transition calls this; the first
+        claim wins. The server picks one of the owner's registered ringer
+        connections (see :mod:`omnigent.server.sound_alerts`) and pushes the
+        alert to it — the chosen device plays, not necessarily the caller.
+
+        :param request: The incoming claim request.
+        :param body: Alert identity, session, and transition level.
+        :returns: ``{"delivered": bool}`` — whether a device accepted it.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        owner = user_id or RESERVED_USER_LOCAL
+        await _require_access(
+            user_id, body.session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        primary_device_id = await asyncio.to_thread(
+            _sound_alert_primary_device_id, request.app.state, owner
+        )
+        delivered = await sound_alerts.claim(
+            owner,
+            alert_id=body.alert_id,
+            session_id=body.session_id,
+            level=body.level,
+            primary_device_id=primary_device_id,
+        )
+        return {"delivered": delivered}
 
     # ── Codex-native goal controls ───────────────────────────────
 

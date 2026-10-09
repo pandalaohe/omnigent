@@ -12,7 +12,14 @@ const {
   isConversationUnseenMock,
   isExplicitlyUnreadMock,
   socketStatusListeners,
+  socketFrameListeners,
   socketConnectedRef,
+  socketHelloMock,
+  socketActivityMock,
+  claimFetchMock,
+  getSoundDeviceIdMock,
+  soundDeviceLabelMock,
+  canRingOnThisDeviceMock,
 } = vi.hoisted(() => ({
   initAudioMock: vi.fn(),
   playLevelMock: vi.fn().mockResolvedValue(undefined),
@@ -24,7 +31,14 @@ const {
   isConversationUnseenMock: vi.fn().mockReturnValue(false),
   isExplicitlyUnreadMock: vi.fn().mockReturnValue(false),
   socketStatusListeners: new Set<() => void>(),
+  socketFrameListeners: new Set<(frame: { type: string; [key: string]: unknown }) => void>(),
   socketConnectedRef: { current: false },
+  socketHelloMock: vi.fn(),
+  socketActivityMock: vi.fn(),
+  claimFetchMock: vi.fn(),
+  getSoundDeviceIdMock: vi.fn().mockReturnValue("dev_test"),
+  soundDeviceLabelMock: vi.fn().mockReturnValue("Test device"),
+  canRingOnThisDeviceMock: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("@/lib/soundPlayer", () => ({
@@ -32,6 +46,12 @@ vi.mock("@/lib/soundPlayer", () => ({
   playLevel: playLevelMock,
 }));
 vi.mock("@/lib/nativeBridge", () => ({ isNativeShell: isNativeShellMock }));
+vi.mock("@/lib/identity", () => ({ authenticatedFetch: claimFetchMock }));
+vi.mock("@/lib/soundDevice", () => ({
+  getSoundDeviceId: getSoundDeviceIdMock,
+  soundDeviceLabel: soundDeviceLabelMock,
+  canRingOnThisDevice: canRingOnThisDeviceMock,
+}));
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: useLoadedConversationsMock,
 }));
@@ -53,6 +73,12 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
       socketStatusListeners.add(listener);
       return () => socketStatusListeners.delete(listener);
     },
+    subscribe: (listener: (frame: { type: string; [key: string]: unknown }) => void) => {
+      socketFrameListeners.add(listener);
+      return () => socketFrameListeners.delete(listener);
+    },
+    setHello: socketHelloMock,
+    sendActivity: socketActivityMock,
   },
 }));
 
@@ -85,6 +111,20 @@ function setConversations(list: Conversation[]): void {
   });
 }
 
+/** Claim request bodies, in call order. */
+function claimBodies(): Record<string, unknown>[] {
+  return claimFetchMock.mock.calls.map(([, init]) => {
+    const body = (init as RequestInit | undefined)?.body;
+    return JSON.parse(typeof body === "string" ? body : "{}") as Record<string, unknown>;
+  });
+}
+
+function emitFrame(frame: { type: string; [key: string]: unknown }): void {
+  act(() => {
+    for (const listener of socketFrameListeners) listener(frame);
+  });
+}
+
 const latestErrorById = new Map<string, LatestSessionError | null>();
 
 describe("useSoundAlerts", () => {
@@ -103,7 +143,12 @@ describe("useSoundAlerts", () => {
       rows.map((row) => latestErrorById.get(row.id) ?? null),
     );
     socketStatusListeners.clear();
+    socketFrameListeners.clear();
     socketConnectedRef.current = false;
+    socketHelloMock.mockClear();
+    socketActivityMock.mockClear();
+    claimFetchMock.mockReset();
+    claimFetchMock.mockResolvedValue({ status: 202 });
     setConversations([]);
   });
 
@@ -119,7 +164,36 @@ describe("useSoundAlerts", () => {
     expect(initAudioMock).toHaveBeenCalledWith({ native: false });
   });
 
-  it("plays needs_response once when a session starts awaiting", () => {
+  it("announces this device to the alert registry", () => {
+    renderHook(() => useSoundAlerts());
+
+    expect(socketHelloMock).toHaveBeenCalledWith({
+      device_id: "dev_test",
+      device_label: "Test device",
+      can_ring: true,
+    });
+  });
+
+  it("sends at most one activity frame per 10 s of interaction", () => {
+    renderHook(() => useSoundAlerts());
+
+    act(() => {
+      window.dispatchEvent(new Event("keydown"));
+      window.dispatchEvent(new Event("pointerdown"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(socketActivityMock).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(socketActivityMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("claims needs_response once when a session starts awaiting", () => {
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
 
@@ -128,19 +202,21 @@ describe("useSoundAlerts", () => {
       rerender();
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith(
-      "needs_response",
-      expect.objectContaining({
-        levels: expect.objectContaining({
-          needs_response: { enabled: true, sound: "ping" },
-        }),
-      }),
-      expect.objectContaining({ enabled: true, volume: 0.7 }),
+    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimFetchMock).toHaveBeenCalledWith(
+      "/v1/me/sound-alerts/claim",
+      expect.objectContaining({ method: "POST" }),
     );
+    expect(claimBodies()).toHaveLength(1);
+    expect(claimBodies()[0]).toMatchObject({
+      session_id: "conv_a",
+      level: "needs_response",
+    });
+    expect(String(claimBodies()[0].alert_id)).toContain("conv_a:needs_response");
   });
 
-  it("does not play when the device master switch is off", () => {
+  it("still claims when the device master switch is off", () => {
     localStorage.setItem(
       SOUND_ALERTS_DEVICE_STORAGE_KEY,
       JSON.stringify({ enabled: false, volume: 0.7, systemSounds: {} }),
@@ -153,10 +229,12 @@ describe("useSoundAlerts", () => {
       rerender();
     });
 
+    // Another device may still play it; the switch only silences this one.
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
     expect(playLevelMock).not.toHaveBeenCalled();
   });
 
-  it("does not play when the level is disabled", () => {
+  it("does not claim when the level is disabled", () => {
     localStorage.setItem(
       SOUND_ALERTS_STORAGE_KEY,
       JSON.stringify({
@@ -171,6 +249,21 @@ describe("useSoundAlerts", () => {
       rerender();
     });
 
+    expect(claimFetchMock).not.toHaveBeenCalled();
+    expect(playLevelMock).not.toHaveBeenCalled();
+  });
+
+  it("does not claim an alert for a muted session", () => {
+    localStorage.setItem(SOUND_ALERTS_STORAGE_KEY, JSON.stringify({ mutedSessionIds: ["conv_a"] }));
+    setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+
+    act(() => {
+      setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
+      rerender();
+    });
+
+    expect(claimFetchMock).not.toHaveBeenCalled();
     expect(playLevelMock).not.toHaveBeenCalled();
   });
 
@@ -179,7 +272,7 @@ describe("useSoundAlerts", () => {
 
     renderHook(() => useSoundAlerts());
 
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
   });
 
   it("waits while the conversation list is still loading", () => {
@@ -187,10 +280,10 @@ describe("useSoundAlerts", () => {
 
     renderHook(() => useSoundAlerts());
 
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
   });
 
-  it("plays one done after the settle when a turn ends with nothing running", () => {
+  it("claims one done after the settle when a turn ends with nothing running", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
 
@@ -199,17 +292,17 @@ describe("useSoundAlerts", () => {
       setConversations([conv("conv_a", { updated_at: 200 })]);
       rerender();
     });
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
 
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "done" });
   });
 
-  it("stays silent while background work covers the dot, then plays when it clears", () => {
+  it("stays silent while background work covers the dot, then claims when it clears", () => {
     setConversations([conv("conv_a", { background_activity_count: 1 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
 
@@ -221,7 +314,7 @@ describe("useSoundAlerts", () => {
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
 
     act(() => {
       setConversations([conv("conv_a", { updated_at: 300 })]);
@@ -231,8 +324,8 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(10_000);
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "done" });
   });
 
   it("cancels the settle when the session starts running again", () => {
@@ -252,10 +345,10 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(10_000);
     });
 
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
   });
 
-  it("plays needs_response only, never done, for an awaiting row", () => {
+  it("claims needs_response only, never done, for an awaiting row", () => {
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
 
@@ -268,15 +361,11 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(10_000);
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith(
-      "needs_response",
-      expect.anything(),
-      expect.anything(),
-    );
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
   });
 
-  it("plays error when the session status fails", () => {
+  it("claims error when the session status fails", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
 
@@ -285,11 +374,11 @@ describe("useSoundAlerts", () => {
       rerender();
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith("error", expect.anything(), expect.anything());
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "error" });
   });
 
-  it("plays error when an idle row has a latest error", () => {
+  it("claims error when an idle row has a latest error", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
 
@@ -299,8 +388,8 @@ describe("useSoundAlerts", () => {
       rerender();
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith("error", expect.anything(), expect.anything());
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "error" });
   });
 
   it("stays silent when already read while background work clears", () => {
@@ -315,7 +404,7 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(10_000);
     });
 
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
   });
 
   it("follows the dot when goal markers are off and the goal is active", () => {
@@ -332,14 +421,14 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(10_000);
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "done" });
   });
 
-  it("rings a still-awaiting row once when the socket reconnects", () => {
+  it("re-claims a still-awaiting row when the socket reconnects", () => {
     setConversations([conv("conv_a", { pending_elicitations_count: 1 })]);
     renderHook(() => useSoundAlerts());
-    expect(playLevelMock).not.toHaveBeenCalled();
+    expect(claimFetchMock).not.toHaveBeenCalled();
 
     act(() => {
       socketConnectedRef.current = true;
@@ -349,12 +438,8 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(1_500);
     });
 
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith(
-      "needs_response",
-      expect.anything(),
-      expect.anything(),
-    );
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
 
     act(() => {
       socketConnectedRef.current = false;
@@ -366,6 +451,37 @@ describe("useSoundAlerts", () => {
       vi.advanceTimersByTime(1_500);
     });
 
+    // The reconnect re-sends the identical claim; the server drops the repeat.
+    expect(claimFetchMock).toHaveBeenCalledTimes(2);
+    expect(claimBodies()[1]).toEqual(claimBodies()[0]);
+  });
+
+  it("plays a sound_alert frame delivered to this connection", () => {
+    renderHook(() => useSoundAlerts());
+
+    emitFrame({
+      type: "sound_alert",
+      alert_id: "conv_a:done:200",
+      session_id: "conv_a",
+      level: "done",
+    });
+
     expect(playLevelMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+  });
+
+  it("rings locally when the server has no claim route", async () => {
+    claimFetchMock.mockResolvedValue({ status: 404 });
+    setConversations([conv("conv_a")]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+
+    await act(async () => {
+      setConversations([conv("conv_a", { updated_at: 200, status: "failed" })]);
+      rerender();
+    });
+
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledWith("error", expect.anything(), expect.anything());
   });
 });

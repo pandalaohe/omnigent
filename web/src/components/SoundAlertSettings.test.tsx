@@ -57,6 +57,7 @@ import { SOUND_ALERTS_STORAGE_KEY } from "@/lib/soundAlertPreferences";
 interface StoredPreferences {
   levels: Record<string, { enabled: boolean; sound: string }>;
   mutedSessionIds?: string[];
+  primaryDeviceId?: string | null;
 }
 
 function stored(): StoredPreferences | null {
@@ -114,5 +115,20 @@ describe("SoundAlertSettings", () => {
 
     expect(stored()?.mutedSessionIds ?? []).toEqual([]);
     expect(screen.queryByTestId("sound-alert-muted-sessions")).not.toBeInTheDocument();
+  });
+
+  it("makes this device the primary device", () => {
+    render(<SoundAlertSettings />);
+
+    fireEvent.click(screen.getByTestId("sound-alert-make-primary"));
+
+    // The written account preference is this device's persisted id, and the
+    // row flips to the primary-device summary.
+    const deviceId = localStorage.getItem("omnigent:sound-alerts-device-id");
+    expect(deviceId).not.toBeNull();
+    expect(stored()?.primaryDeviceId).toBe(deviceId);
+    expect(screen.getByTestId("sound-alert-primary-device")).toHaveTextContent(
+      /^This device \(.+\) is the primary device$/,
+    );
   });
 });

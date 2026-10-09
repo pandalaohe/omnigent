@@ -7,8 +7,9 @@
 // `omnigent/server/routes/sessions.py` for the wire protocol.
 //
 // This module owns only the transport (connect, reconnect, send watch-set,
-// dispatch frames). SessionUpdatesProvider wires the parsed frames into the
-// TanStack Query cache and derives the watch-set from it.
+// device hello/activity, dispatch frames). SessionUpdatesProvider wires the
+// parsed frames into the TanStack Query cache and derives the watch-set from
+// it.
 //
 // Identity rides the transport exactly like the terminal-attach WebSocket:
 // the browser cannot set `X-Forwarded-Email` on a WebSocket handshake, so we
@@ -28,7 +29,20 @@ export type SessionUpdatesFrame =
   | { type: "hosts_changed" }
   | { type: "projects_changed" }
   | { type: "system_status_changed" }
+  | {
+      type: "sound_alert";
+      alert_id: string;
+      session_id: string;
+      level: "done" | "error" | "needs_response";
+    }
   | { type: "heartbeat" };
+
+/** Device announcement sent so the server can pick a ringer connection. */
+export interface SoundAlertHello {
+  device_id: string;
+  device_label: string;
+  can_ring: boolean;
+}
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;
 
@@ -100,6 +114,8 @@ class SessionUpdatesSocket {
   private ws: WebSocket | null = null;
   private watched: string[] = [];
   private watchedKey = "";
+  private hello: SoundAlertHello | null = null;
+  private helloKey = "";
   private readonly listeners = new Set<FrameListener>();
   private readonly statusListeners = new Set<() => void>();
   private connected = false;
@@ -180,6 +196,33 @@ class SessionUpdatesSocket {
   }
 
   /**
+   * Announce this connection as a sound-alert ringer for the user.
+   *
+   * Stored and sent immediately when the socket is open; every (re)open
+   * re-sends it before the watch frame, so a connection the server might
+   * pick for an alert is never anonymous. A no-op when unchanged.
+   *
+   * @param hello - Device identity and whether this device may ring.
+   */
+  setHello(hello: SoundAlertHello): void {
+    const key = `${hello.device_id}\u0000${hello.device_label}\u0000${hello.can_ring}`;
+    if (key === this.helloKey) return;
+    this.helloKey = key;
+    this.hello = { ...hello };
+    if (this.ws?.readyState === WebSocket.OPEN) this.sendHello();
+  }
+
+  /**
+   * Tell the server the user just interacted with this device, so the alert
+   * picker prefers it. A no-op while the socket is closed.
+   */
+  sendActivity(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "activity" }));
+    }
+  }
+
+  /**
    * Subscribe to parsed server frames.
    *
    * @param listener - Called for every frame received.
@@ -208,6 +251,10 @@ class SessionUpdatesSocket {
       // Start the silence watchdog: from here we expect at least a
       // heartbeat within the window or we treat the link as dead.
       this.armWatchdog();
+      // Hello before watch: the server records this device before the first
+      // snapshot, so an alert claimed immediately after connect can already
+      // pick this connection.
+      this.sendHello();
       this.sendWatch();
     };
     ws.onmessage = (event) => this.handleMessage(event);
@@ -269,6 +316,12 @@ class SessionUpdatesSocket {
   private sendWatch(): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "watch", session_ids: this.watched }));
+    }
+  }
+
+  private sendHello(): void {
+    if (this.hello !== null && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "hello", ...this.hello }));
     }
   }
 
