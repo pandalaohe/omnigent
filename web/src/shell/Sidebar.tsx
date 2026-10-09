@@ -2100,17 +2100,31 @@ function reorderFavoriteItems(
   return items;
 }
 
-/** The next session after `id` in `order`, or the previous one when it's last. */
-function adjacentFavoriteSession(order: readonly FavoriteRef[], id: string): string | null {
+/**
+ * The session a favorites drag anchors on for the pin-timestamp rewrite: the
+ * session the moved one lands beside. A downward move lands the moved session
+ * just after its anchor, so the anchor is the nearest session before it; an
+ * upward move lands it just before, so the anchor is the nearest session after.
+ * A project-ref target holds no pin slot, so the anchor is the nearest session
+ * on that side.
+ */
+function favoriteReorderAnchor(
+  order: readonly FavoriteRef[],
+  id: string,
+  downward: boolean,
+): string | null {
   const index = order.findIndex((ref) => ref.type === "session" && ref.id === id);
   if (index < 0) return null;
-  for (let i = index + 1; i < order.length; i += 1) {
-    const ref = order[i];
-    if (ref !== undefined && ref.type === "session") return ref.id;
-  }
-  for (let i = index - 1; i >= 0; i -= 1) {
-    const ref = order[i];
-    if (ref !== undefined && ref.type === "session") return ref.id;
+  if (downward) {
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const ref = order[i];
+      if (ref !== undefined && ref.type === "session") return ref.id;
+    }
+  } else {
+    for (let i = index + 1; i < order.length; i += 1) {
+      const ref = order[i];
+      if (ref !== undefined && ref.type === "session") return ref.id;
+    }
   }
   return null;
 }
@@ -2734,7 +2748,7 @@ function ConversationList({
         if (activeRef.type === "session") {
           const before = splitFavoritesReorder(order).sessionOrder;
           if (before.join("\u0000") !== sessionOrder.join("\u0000")) {
-            const target = adjacentFavoriteSession(movedItems, activeRef.id);
+            const target = favoriteReorderAnchor(movedItems, activeRef.id, to > from);
             if (target !== null) {
               pendingWrites.push(...pinOrderWrites(sections.pinned, activeRef.id, target));
             }
@@ -3059,11 +3073,21 @@ function ConversationList({
       const snapshot = folderConversations.get(key);
       if (snapshot === undefined) return { group, rows: group.conversations };
       const current = new Map(group.conversations.map((c) => [c.id, c] as const));
+      // A collapsed copy unmounts and freezes its snapshot, but a sibling copy
+      // of the same folder (the owning section's, or another favorite's) still
+      // reports live rows; refresh each frozen row from that fresher copy by id.
+      const siblingPrefix = `${group.name}#`;
+      const siblings = new Map<string, Conversation>();
+      for (const [copyKey, list] of folderConversations) {
+        if (copyKey === key) continue;
+        if (copyKey !== group.name && !copyKey.startsWith(siblingPrefix)) continue;
+        for (const row of list) siblings.set(row.id, row);
+      }
       const rows: Conversation[] = [];
       const seen = new Set<string>();
       for (const row of snapshot) {
         seen.add(row.id);
-        const fresh = current.get(row.id);
+        const fresh = current.get(row.id) ?? siblings.get(row.id);
         if (fresh !== undefined) rows.push(fresh);
         else if (!windowIds.has(row.id)) rows.push(row);
       }

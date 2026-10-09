@@ -188,10 +188,12 @@ function LocationProbe() {
   return <div data-testid="location">{useLocation().pathname}</div>;
 }
 
-/** The sidebar with a live `/c/:id` route so the switch hotkey sees an active row. */
+/** The sidebar with a live `/c/:id` route so the switch hotkey sees an active
+    row. `rerenderTree` re-renders in place, so a test can change a mock and
+    have the sidebar react, as a poll or refetch would. */
 function renderSidebarAt(path: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <SidebarDataProvider>
         <TooltipProvider>
@@ -210,8 +212,10 @@ function renderSidebarAt(path: string) {
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const view = render(tree());
+  return { rerenderTree: () => view.rerender(tree()) };
 }
 
 function recentCalls(): unknown[][] {
@@ -1513,6 +1517,45 @@ const FAVORITES_REORDER_LAYOUT: SidebarLayout = {
   ],
 };
 
+// Three session refs, so a reorder has a session on each side of the target.
+const THREE_SESSION_FAVORITES_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    {
+      id: "sec_fav",
+      kind: "favorites",
+      name: "Favorites",
+      maxRows: null,
+      items: [
+        { type: "session", id: "s1" },
+        { type: "session", id: "s2" },
+        { type: "session", id: "s3" },
+      ],
+    },
+    { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
+// A session on each side of a project ref, so dropping on the ref crosses one.
+const PROJECT_REF_FAVORITES_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    {
+      id: "sec_fav",
+      kind: "favorites",
+      name: "Favorites",
+      maxRows: null,
+      items: [
+        { type: "session", id: "s1" },
+        { type: "session", id: "s2" },
+        { type: "project", id: "p_beta" },
+        { type: "session", id: "s3" },
+      ],
+    },
+    { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
 const FAVORITE_ROW_HEIGHT = 30;
 
 /** Stack the favorites section's items so a pointer can target each one. */
@@ -1868,6 +1911,105 @@ describe("sidebar project favorites", () => {
     expect(reorderPinsFn).not.toHaveBeenCalled();
   });
 
+  it("lands a downward session move just after the target", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(THREE_SESSION_FAVORITES_LAYOUT));
+    const s1 = conversation("s1", { labels: { "omnigent.pinned": "1000" } });
+    const s2 = conversation("s2", { labels: { "omnigent.pinned": "2000" } });
+    const s3 = conversation("s3", { labels: { "omnigent.pinned": "3000" } });
+    pinnedRef.current = [s1, s2, s3];
+    mockConversations([s1, s2, s3]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const source = within(fav).getByText("s1").closest("li") as HTMLElement;
+    const start = favoriteItemPoint(0);
+    const target = favoriteItemPoint(1);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    // A onto B gives [B, A, C], not [B, C, A]: A lands just after its target.
+    await waitFor(() => expect(reorderPinsFn).toHaveBeenCalledWith([{ id: "s1", pinnedAt: 2500 }]));
+    const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+    expect(favorites?.items).toEqual([
+      { type: "session", id: "s2" },
+      { type: "session", id: "s1" },
+      { type: "session", id: "s3" },
+    ]);
+  });
+
+  it("lands an upward session move just before the target", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(THREE_SESSION_FAVORITES_LAYOUT));
+    const s1 = conversation("s1", { labels: { "omnigent.pinned": "1000" } });
+    const s2 = conversation("s2", { labels: { "omnigent.pinned": "2000" } });
+    const s3 = conversation("s3", { labels: { "omnigent.pinned": "3000" } });
+    pinnedRef.current = [s1, s2, s3];
+    mockConversations([s1, s2, s3]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const source = within(fav).getByText("s3").closest("li") as HTMLElement;
+    const start = favoriteItemPoint(2);
+    const target = favoriteItemPoint(1);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    // C onto B gives [A, C, B].
+    await waitFor(() => expect(reorderPinsFn).toHaveBeenCalledWith([{ id: "s3", pinnedAt: 1500 }]));
+  });
+
+  it("anchors on the nearest session when a session is dropped on a project ref", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(PROJECT_REF_FAVORITES_LAYOUT));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const s1 = conversation("s1", { labels: { "omnigent.pinned": "1000" } });
+    const s2 = conversation("s2", { labels: { "omnigent.pinned": "2000" } });
+    const s3 = conversation("s3", { labels: { "omnigent.pinned": "3000" } });
+    pinnedRef.current = [s1, s2, s3];
+    mockConversations([s1, s2, s3]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    // DOM order: s1 (0), s2 (1), the Beta ref (2), s3 (3).
+    const source = within(fav).getByText("s1").closest("li") as HTMLElement;
+    const start = favoriteItemPoint(0);
+    const target = favoriteItemPoint(2);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    // s1 lands after the ref but just past s2: [s2, ref, s1, s3].
+    await waitFor(() => expect(reorderPinsFn).toHaveBeenCalledWith([{ id: "s1", pinnedAt: 2500 }]));
+    const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+    expect(favorites?.items).toEqual([
+      { type: "session", id: "s2" },
+      { type: "project", id: "p_beta" },
+      { type: "session", id: "s1" },
+      { type: "session", id: "s3" },
+    ]);
+  });
+
   it("keeps unresolved refs in place when a favorites row is reordered", async () => {
     localStorage.setItem(
       LAYOUT_STORAGE_KEY,
@@ -1968,5 +2110,66 @@ describe("sidebar project favorites", () => {
       ),
     );
     platform.mockRestore();
+  });
+
+  it("refreshes a collapsed favorite copy's snapshot from the owning folder", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p_beta" }],
+          },
+          { id: "sec_work", kind: "projects", name: "Work", maxRows: null, projectIds: ["p_beta"] },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["fav:sec_fav:Beta", "Beta"]),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    folderRowsRef.current.set("Beta", [
+      conversation("folder-only", {
+        labels: { omni_project: "Beta" },
+        status: "idle",
+        updated_at: 1,
+      }),
+    ]);
+    // The global window never holds the folder-page-only session.
+    mockConversations([conversation("plain", { updated_at: 0 })]);
+    const { rerenderTree } = renderSidebarAt("/c/plain");
+
+    // Both copies mount; the favorite copy reports the folder-page-only row.
+    await waitFor(() =>
+      expect(within(sectionOf("Favorites")).getByText("folder-only")).toBeInTheDocument(),
+    );
+
+    // Collapsing Favorites unmounts its copy, freezing its reported snapshot.
+    fireEvent.click(within(sectionOf("Favorites")).getByRole("button", { name: "Favorites" }));
+
+    // The owning folder's page now reports the session running.
+    folderRowsRef.current.set("Beta", [
+      conversation("folder-only", {
+        labels: { omni_project: "Beta" },
+        status: "running",
+        updated_at: 2,
+      }),
+    ]);
+    rerenderTree();
+
+    // The collapsed marker follows the owning copy, not the frozen snapshot.
+    await waitFor(() =>
+      expect(within(sectionOf("Favorites")).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      ),
+    );
   });
 });
