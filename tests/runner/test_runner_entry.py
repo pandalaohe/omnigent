@@ -584,6 +584,7 @@ def test_create_app_reuses_a_resolved_no_credential_result(
         entry_mod, "_make_auth_token_factory", lambda: resolutions.append(1) or None
     )
     monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    monkeypatch.setattr("omnigent.inner.codex_staging.reap_orphaned_codex_homes", lambda: 0)
 
     entry_mod.create_app(auth_token_factory=None, auth_resolved=auth_resolved)
 
@@ -2409,6 +2410,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     sync_clients: list[_TrackingSyncClient] = []
     terminal_sweeps: list[int] = []
     bridge_sweeps: list[int] = []
+    codex_home_sweeps: list[int] = []
     registry_reconciles: list[int] = []
 
     class _FakeProcessManager:
@@ -2466,6 +2468,10 @@ async def test_runner_shutdown_closes_terminal_registry(
         lambda: bridge_sweeps.append(1) or 0,
     )
     monkeypatch.setattr(
+        "omnigent.inner.codex_staging.reap_orphaned_codex_homes",
+        lambda: codex_home_sweeps.append(1) or 0,
+    )
+    monkeypatch.setattr(
         "omnigent.harnesses.codex_native.process_registry.reconcile_codex_native_process_registry",
         lambda: registry_reconciles.append(1) or 0,
     )
@@ -2494,6 +2500,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     assert process_managers[0].shutdown_called
     assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
     assert bridge_sweeps == ([] if host_owns_global_cleanup else [1])
+    assert codex_home_sweeps == ([] if host_owns_global_cleanup else [1])
     assert registry_reconciles == ([] if host_owns_global_cleanup else [1])
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"

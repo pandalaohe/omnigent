@@ -26,6 +26,17 @@ _NOW = 1_800_000_000.0
 _TS = "20260101-000000-000000"
 
 
+@pytest.fixture(autouse=True)
+def _stub_codex_home_sweep(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record codex-home sweeps without touching the developer's real temp root."""
+    sweeps: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.inner.codex_staging.reap_orphaned_codex_homes",
+        lambda: sweeps.append(1) or 0,
+    )
+    return sweeps
+
+
 def _runner_log(
     log_dir: Path,
     session: str,
@@ -60,6 +71,7 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
         "codex_process_registry",
         "terminal_orphans",
         "native_bridge_orphans",
+        "codex_home_orphans",
         "runner_log_retention",
     ]
     assert janitor._stage_skip_reasons == {
@@ -139,6 +151,7 @@ async def test_host_janitor_uses_absolute_unresolved_harness_tmp_parent(
 async def test_runner_lifecycle_trigger_reaps_native_bridge_dirs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    _stub_codex_home_sweep: list[int],
 ) -> None:
     bridge_sweeps: list[int] = []
 
@@ -172,6 +185,7 @@ async def test_runner_lifecycle_trigger_reaps_native_bridge_dirs(
     await janitor.shutdown()
 
     assert bridge_sweeps == [1]
+    assert _stub_codex_home_sweep == [1]
 
 
 async def test_codex_stage_logs_reaped_process_counts(
