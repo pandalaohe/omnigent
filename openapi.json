@@ -14979,6 +14979,62 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/hosts/{host_id}/agent-code-note": {
+      "get": {
+        "description": "Preview the code-location text the agent receives on one host.\n\nThe text is built from the same locations and formatter the runner\ninit snapshot uses, so the preview cannot drift from what a new\nsession on that host is told. `delivered` is false when the host\nis offline or its build predates the capability; the text is built\neither way.\n\n**Returns:** `{object, text, delivered, reason}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned by the caller.\n- `HTTPException` \u2014 404 if the host is unknown; 403 if it is owned by a different user.",
+        "operationId": "get_agent_code_note_v1_projects__project_id__hosts__host_id__agent_code_note_get",
+        "parameters": [
+          {
+            "description": "The project whose repositories are described.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The host whose folders are described.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Agent Code Note V1 Projects  Project Id  Hosts  Host Id  Agent Code Note Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Code Note",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}": {
       "delete": {
         "description": "Delete a host binding.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_host_binding.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned.",

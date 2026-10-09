@@ -24,8 +24,11 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import ProjectHostBinding, ProjectRepository
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostPostBindHookFrame, encode_host_frame
+from omnigent.runtime.prompt import project_code_instruction
 from omnigent.server.auth import AuthProvider
+from omnigent.server.project_placement import project_code_locations
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     _authorize_host_for_workspace,
 )
@@ -992,6 +995,55 @@ def create_project_collaboration_router(
             **_binding_to_response(refreshed),
             "checked": True,
             "post_bind": post_bind,
+        }
+
+    @router.get("/projects/{project_id}/hosts/{host_id}/agent-code-note")
+    async def get_agent_code_note(
+        request: Request, project_id: str, host_id: str
+    ) -> dict[str, Any]:
+        """Preview the code-location text the agent receives on one host.
+
+        The text is built from the same locations and formatter the runner
+        init snapshot uses, so the preview cannot drift from what a new
+        session on that host is told. ``delivered`` is false when the host
+        is offline or its build predates the capability; the text is built
+        either way.
+
+        :param request: The incoming request, used to identify the user.
+        :param project_id: The project whose repositories are described.
+        :param host_id: The host whose folders are described.
+        :returns: ``{object, text, delivered, reason}``.
+        :raises OmnigentError: 401 if unauthenticated, 404 if the project
+            is not found / not owned by the caller.
+        :raises HTTPException: 404 if the host is unknown; 403 if it is
+            owned by a different user.
+        """
+        user_id = require_user(request, auth_provider)
+        await _require_owned_project(project_store, project_id, user_id)
+        # Ownership only: a stale online row with no tunnel here is offline,
+        # not a wrong-replica error — the local registry decides delivery.
+        if host_store is not None:
+            await asyncio.to_thread(
+                resolve_host_owner,
+                user_id=user_id,
+                host_id=host_id,
+                host_store=host_store,
+            )
+        repositories = await asyncio.to_thread(repository_store.list_by_project, project_id)
+        bindings = await asyncio.to_thread(binding_store.list_by_project, project_id)
+        text = project_code_instruction(project_code_locations(repositories, bindings, host_id))
+        conn = host_registry.get(host_id) if host_registry is not None else None
+        if conn is None:
+            delivered, reason = False, "host_offline"
+        elif not conn.hello.project_code:
+            delivered, reason = False, "host_update_needed"
+        else:
+            delivered, reason = True, None
+        return {
+            "object": "agent_code_note",
+            "text": text,
+            "delivered": delivered,
+            "reason": reason,
         }
 
     return router

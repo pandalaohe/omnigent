@@ -15,6 +15,8 @@ from omnigent.entities import (
     ProjectHostEntry,
     ProjectRepository,
 )
+from omnigent.git_urls import redact_remote_url
+from omnigent.runner.session_init_protocol import ProjectCodeLocation
 from omnigent.server.routes._workspace_validation import (
     _is_subpath_of,
     _is_windows_absolute_path,
@@ -204,6 +206,52 @@ def resolve_new_branch_base(
         if repository.role == "code" and repository.default_branch:
             return repository.default_branch
     return None
+
+
+def project_code_locations(
+    repositories: list[ProjectRepository],
+    bindings: list[ProjectHostBinding],
+    host_id: str | None,
+) -> list[ProjectCodeLocation] | None:
+    """This host's enabled repository folders, for the agent's snapshot.
+
+    Only the host's enabled bindings count, paired with the repository
+    each names; the code repository comes first and the rest follow by
+    name. Remotes pass through :func:`redact_remote_url` so no stored
+    credential rides to the runner. No host / a sandbox session / no
+    enabled folder all read as "nothing to tell".
+
+    :param repositories: The project's registered repositories.
+    :param bindings: The project's per-host bindings.
+    :param host_id: Target host, or ``None``.
+    :returns: The ordered locations, or ``None`` when none apply.
+    """
+    if host_id is None or host_id == "__sandbox__":
+        return None
+    by_id = {repository.id: repository for repository in repositories}
+    locations: list[ProjectCodeLocation] = []
+    for binding in bindings:
+        if binding.host_id != host_id or not binding.enabled:
+            continue
+        repository = by_id.get(binding.repository_id)
+        if repository is None:
+            continue
+        locations.append(
+            ProjectCodeLocation(
+                name=repository.name,
+                role=repository.role,
+                folder=binding.workspace,
+                remote_url=redact_remote_url(repository.remote_url),
+                default_branch=repository.default_branch,
+            )
+        )
+    code = [location for location in locations if location.role == "code"]
+    related = sorted(
+        (location for location in locations if location.role != "code"),
+        key=lambda location: location.name,
+    )
+    ordered = code + related
+    return ordered or None
 
 
 def same_canonical_path(first: str, second: str) -> bool:

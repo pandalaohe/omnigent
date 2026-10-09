@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -13,7 +14,13 @@ import httpx
 import pytest
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import Conversation, MessageData, NewConversationItem
+from omnigent.entities import (
+    Conversation,
+    MessageData,
+    NewConversationItem,
+    ProjectHostBinding,
+    ProjectRepository,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
@@ -770,3 +777,205 @@ async def test_handshake_for_a_removed_agent_forwards_or_says_so() -> None:
         )
     assert raised.value.code == ErrorCode.SESSION_AGENT_MISSING
     assert client.calls == []
+
+
+class _ProjectRows:
+    """Sync store stub returning fixed rows, optionally raising."""
+
+    def __init__(self, rows: list[Any] | None = None, *, error: Exception | None = None) -> None:
+        self.rows = list(rows or [])
+        self.error = error
+        self.calls = 0
+
+    def list_by_project(self, _project_id: str) -> list[Any]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return list(self.rows)
+
+
+def _project_repository(
+    repository_id: str,
+    name: str,
+    *,
+    role: str = "related",
+    remote_url: str = "",
+    default_branch: str = "main",
+) -> ProjectRepository:
+    return ProjectRepository(
+        id=repository_id,
+        project_id="project_x",
+        name=name,
+        role=role,
+        remote_url=remote_url,
+        default_branch=default_branch,
+        context_manifest_path=".agents/project/manifest.json",
+        revision=1,
+        created_at=1,
+    )
+
+
+def _project_binding(
+    repository_id: str,
+    *,
+    host_id: str = "host_a",
+    workspace: str = "/opt/work/omnigent",
+    enabled: bool = True,
+    name: str = "primary",
+) -> ProjectHostBinding:
+    return ProjectHostBinding(
+        id=f"{name}-{host_id}",
+        project_id="project_x",
+        host_id=host_id,
+        name=name,
+        repository_id=repository_id,
+        workspace=workspace,
+        revision=1,
+        created_at=1,
+        enabled=enabled,
+    )
+
+
+def _project_conversation(
+    *, project_id: str | None = "project_x", host_id: str | None = "host_a"
+) -> Conversation:
+    return dataclasses.replace(_conversation(), project_id=project_id, host_id=host_id)
+
+
+def _code_initializer(
+    repositories: _ProjectRows, bindings: _ProjectRows
+) -> RunnerSessionInitializer:
+    return RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(),
+        server_version="test",
+        project_repository_store=repositories,
+        project_host_binding_store=bindings,
+    )
+
+
+@pytest.mark.asyncio
+async def test_init_snapshot_lists_this_hosts_enabled_repositories_code_first() -> None:
+    """Only this host's enabled folders ride the snapshot; code comes first."""
+    code = _project_repository(
+        "a" * 32,
+        "omnigent",
+        role="code",
+        remote_url="https://git.example.test/org/omnigent.git",
+        default_branch="release",
+    )
+    related = _project_repository(
+        "b" * 32, "coordination", remote_url="https://git.example.test/org/coordination.git"
+    )
+    initializer = _code_initializer(
+        _ProjectRows([related, code]),
+        _ProjectRows(
+            [
+                _project_binding(related.id, name="coordination"),
+                _project_binding(
+                    code.id, workspace="/opt/work/omnigent/fork/topic", name="primary"
+                ),
+                _project_binding(code.id, host_id="host_b", workspace="/opt/other"),
+                _project_binding(related.id, workspace="/opt/disabled", enabled=False, name="old"),
+            ]
+        ),
+    )
+    client = _Client()
+    client.release.set()
+
+    await initializer.initialize(_project_conversation(), client, timeout=10)  # type: ignore[arg-type]
+
+    snapshot = client.calls[0]["session_init"]["snapshot"]
+    assert snapshot["project_code"] == [
+        {
+            "name": "omnigent",
+            "role": "code",
+            "folder": "/opt/work/omnigent/fork/topic",
+            "remote_url": "https://git.example.test/org/omnigent.git",
+            "default_branch": "release",
+        },
+        {
+            "name": "coordination",
+            "role": "related",
+            "folder": "/opt/work/omnigent",
+            "remote_url": "https://git.example.test/org/coordination.git",
+            "default_branch": "main",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_init_snapshot_redacts_remote_credentials() -> None:
+    """A stored credentialed remote reaches the runner without its secret."""
+    code = _project_repository(
+        "a" * 32,
+        "omnigent",
+        role="code",
+        remote_url=(
+            "https://user:secret@git.example.test/org/omnigent.git?private_token=SECRETMARK#frag"
+        ),
+    )
+    initializer = _code_initializer(
+        _ProjectRows([code]),
+        _ProjectRows([_project_binding(code.id)]),
+    )
+    client = _Client()
+    client.release.set()
+
+    await initializer.initialize(_project_conversation(), client, timeout=10)  # type: ignore[arg-type]
+
+    snapshot = client.calls[0]["session_init"]["snapshot"]
+    assert snapshot["project_code"][0]["remote_url"] == (
+        "https://git.example.test/org/omnigent.git"
+    )
+    assert "secret" not in json.dumps(snapshot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("project_id", "host_id"),
+    [(None, "host_a"), ("project_x", None), ("project_x", "__sandbox__")],
+)
+async def test_init_snapshot_omits_project_code_when_nothing_applies(
+    project_id: str | None, host_id: str | None
+) -> None:
+    """No project, no host, or a sandbox host leaves the field out entirely."""
+    code = _project_repository("a" * 32, "omnigent", role="code")
+    repositories = _ProjectRows([code])
+    bindings = _ProjectRows([_project_binding(code.id)])
+    initializer = _code_initializer(repositories, bindings)
+    client = _Client()
+    client.release.set()
+
+    await initializer.initialize(  # type: ignore[arg-type]
+        _project_conversation(project_id=project_id, host_id=host_id), client, timeout=10
+    )
+
+    assert "project_code" not in client.calls[0]["session_init"]["snapshot"]
+    if project_id is None:
+        assert repositories.calls == 0
+        assert bindings.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_init_snapshot_store_error_still_starts_the_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing collaboration store logs and costs the field, not the session."""
+    bindings = _ProjectRows(
+        [_project_binding("a" * 32)],
+    )
+    initializer = _code_initializer(
+        _ProjectRows(error=RuntimeError("store down")),
+        bindings,
+    )
+    client = _Client()
+    client.release.set()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.runner_session_init"):
+        response = await initializer.initialize(  # type: ignore[arg-type]
+            _project_conversation(), client, timeout=10
+        )
+
+    assert response.status_code == 201
+    assert "project_code" not in client.calls[0]["session_init"]["snapshot"]
+    assert any("Could not load project code locations" in r.message for r in caplog.records)

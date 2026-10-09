@@ -59,6 +59,7 @@ _HOST_A = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
 _HOST_B = "b1b2c3d4e5f60718293a4b5c6d7e8f02"
 _HOST_OFFLINE = "c1b2c3d4e5f60718293a4b5c6d7e8f03"
 _HOST_HOOKED = "d1b2c3d4e5f60718293a4b5c6d7e8f04"
+_HOST_CODED = "e1b2c3d4e5f60718293a4b5c6d7e8f05"
 
 
 def _as_user(user: str) -> dict[str, str]:
@@ -82,7 +83,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
     }
 
 
-def _hello_text(name: str, *, post_bind_hook: bool = False) -> str:
+def _hello_text(name: str, *, post_bind_hook: bool = False, project_code: bool = False) -> str:
     """Encode a hello frame for tests."""
     return encode_host_frame(
         HostHelloFrame(
@@ -90,6 +91,7 @@ def _hello_text(name: str, *, post_bind_hook: bool = False) -> str:
             frame_protocol_version=1,
             name=name,
             post_bind_hook=post_bind_hook,
+            project_code=project_code,
         )
     )
 
@@ -183,7 +185,12 @@ async def _make_project(
 
 
 async def _connect_fake_host(
-    app: FastAPI, host_id: str, name: str, *, post_bind_hook: bool = False
+    app: FastAPI,
+    host_id: str,
+    name: str,
+    *,
+    post_bind_hook: bool = False,
+    project_code: bool = False,
 ) -> ApplicationCommunicator:
     """Open a tunnel and complete the hello handshake."""
     comm = ApplicationCommunicator(app, _websocket_scope(f"/v1/hosts/{host_id}/tunnel"))
@@ -191,7 +198,10 @@ async def _connect_fake_host(
     accepted = await comm.receive_output(timeout=5.0)
     assert accepted["type"] == "websocket.accept"
     await comm.send_input(
-        {"type": "websocket.receive", "text": _hello_text(name, post_bind_hook=post_bind_hook)}
+        {
+            "type": "websocket.receive",
+            "text": _hello_text(name, post_bind_hook=post_bind_hook, project_code=project_code),
+        }
     )
     registry = app.state.host_registry
     for _ in range(500):
@@ -1453,3 +1463,176 @@ async def test_binding_delete_sends_no_post_bind_frame(
     assert deleted.status_code == 200, deleted.text
     await asyncio.sleep(0.05)
     assert len(hooked_host["hooks"]["seen"]) == 1
+
+
+# ── Agent code note preview ───────────────────────────────
+
+
+async def test_agent_code_note_preview_for_capable_host(
+    collab_client: httpx.AsyncClient,
+    collab_app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A connected host with the capability is told the text it will deliver."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(
+        collab_client,
+        project_id,
+        name="omnigent",
+        remote_url="https://git.example.test/org/omnigent.git",
+        role="code",
+    )
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=_HOST_CODED,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent/fork/topic",
+    )
+    comm = await _connect_fake_host(collab_app, _HOST_CODED, "fake-coded", project_code=True)
+    drain = _start_stat_drain(comm, {})
+    try:
+        resp = await collab_client.get(
+            f"/v1/projects/{project_id}/hosts/{_HOST_CODED}/agent-code-note"
+        )
+    finally:
+        await _stop_fake_host(comm, drain)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "object": "agent_code_note",
+        "text": (
+            "This project's code on this host:\n"
+            '- omnigent (the code you change): "/opt/work/omnigent/fork/topic" — git '
+            '"https://git.example.test/org/omnigent.git", default branch "main"'
+        ),
+        "delivered": True,
+        "reason": None,
+    }
+
+
+async def test_agent_code_note_preview_for_offline_host_keeps_text(
+    collab_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An offline host still shows the built text, flagged undeliverable."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(collab_client, project_id, name="omnigent", role="code")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_OFFLINE, "offline-box", "local")
+    hosts.set_offline(_HOST_OFFLINE)
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=_HOST_OFFLINE,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent",
+    )
+
+    resp = await collab_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/agent-code-note"
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_offline"
+    assert body["text"] is not None
+    assert '"/opt/work/omnigent"' in body["text"]
+
+
+async def test_agent_code_note_preview_for_stale_online_host(
+    collab_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A fresh online row with no tunnel reports offline instead of 400."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(collab_client, project_id, name="omnigent", role="code")
+    # Unclean disconnect: the row is still fresh-online, but this replica
+    # holds no tunnel, so the preview must fall back to host_offline.
+    HostStore(db_uri).upsert_on_connect(_HOST_OFFLINE, "stale-box", "local")
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=_HOST_OFFLINE,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent",
+    )
+
+    resp = await collab_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/agent-code-note"
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_offline"
+
+
+async def test_agent_code_note_preview_reports_update_needed(
+    collab_client: httpx.AsyncClient,
+    db_uri: str,
+    live_host: dict[str, Any],
+) -> None:
+    """A connected host without the capability is flagged for update."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(collab_client, project_id, name="omnigent", role="code")
+    host_id = live_host["host_id"]
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=host_id,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent",
+    )
+
+    resp = await collab_client.get(f"/v1/projects/{project_id}/hosts/{host_id}/agent-code-note")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_update_needed"
+    assert body["text"] is not None
+
+
+async def test_agent_code_note_preview_not_owned_404(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """One user can never preview the note of another user's project."""
+    bob_project = await _make_project(multi_user_client, "Bob note", headers=_as_user(BOB))
+    resp = await multi_user_client.get(
+        f"/v1/projects/{bob_project}/hosts/{_HOST_A}/agent-code-note",
+        headers=_as_user(ALICE),
+    )
+    assert resp.status_code == 404
+
+
+async def test_agent_code_note_preview_for_foreign_host_403(
+    multi_user_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """One user can never probe another user's host through the preview."""
+    project_id = await _make_project(multi_user_client, "Alice note", headers=_as_user(ALICE))
+    HostStore(db_uri).upsert_on_connect(_HOST_B, "bob-box", BOB)
+    resp = await multi_user_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_B}/agent-code-note",
+        headers=_as_user(ALICE),
+    )
+    assert resp.status_code == 403
+
+
+async def test_agent_code_note_preview_for_own_offline_host(
+    multi_user_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An owned offline host still previews its text, flagged undeliverable."""
+    project_id = await _make_project(multi_user_client, "Alice note", headers=_as_user(ALICE))
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_OFFLINE, "alice-box", ALICE)
+    hosts.set_offline(_HOST_OFFLINE)
+    resp = await multi_user_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/agent-code-note",
+        headers=_as_user(ALICE),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_offline"

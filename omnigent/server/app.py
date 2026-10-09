@@ -1707,6 +1707,8 @@ def create_app(
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
+        project_repository_store=project_repository_store,
+        project_host_binding_store=project_host_binding_store,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
