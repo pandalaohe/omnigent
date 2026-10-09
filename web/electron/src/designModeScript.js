@@ -68,30 +68,45 @@ function buildDesignModeScript(nonce) {
     'font-size:13px', 'letter-spacing:-0.01em',
     'backdrop-filter:blur(20px)', '-webkit-backdrop-filter:blur(20px)',
   ].join(';') + ';';
-  popup.innerHTML =
-    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">' +
-      '<span id="__omni-popup-tag" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#0a84ff;font-weight:600;"></span>' +
-      '<span id="__omni-popup-text" style="flex:1;color:#aaaaae;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>' +
-      '<button id="__omni-popup-close" type="button" style="background:none;border:none;color:#7c7c80;cursor:pointer;font-size:18px;line-height:1;padding:0 4px;font-family:inherit;">&times;</button>' +
-    '</div>' +
-    '<div id="__omni-popup-row" style="display:flex;gap:6px;">' +
-      '<input id="__omni-popup-input" type="text" placeholder="What should change?" autocomplete="off" spellcheck="false" ' +
-        'style="flex:1;padding:7px 10px;font-size:13px;border:1px solid rgba(255,255,255,0.14);border-radius:8px;background:rgba(0,0,0,0.32);color:#f5f5f7;outline:none;font-family:inherit;" />' +
-      '<button id="__omni-popup-send" type="button" ' +
-        'style="padding:7px 14px;background:#0a84ff;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;transition:opacity 0.12s;">Send</button>' +
-    '</div>' +
-    '<div id="__omni-popup-feedback" style="display:none;font-size:13px;font-weight:500;padding:4px 0;"></div>' +
-    '<div id="__omni-popup-arrow" style="position:absolute;width:12px;height:12px;background:rgba(28,28,30,0.96);border:1px solid rgba(255,255,255,0.12);display:none;"></div>';
+  // Trusted Types pages reject HTML string sinks, so build the popup via DOM APIs.
+  const popupHeader = document.createElement('div');
+  popupHeader.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;';
+  const popupTag = document.createElement('span');
+  popupTag.id = '__omni-popup-tag';
+  popupTag.style.cssText = 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#0a84ff;font-weight:600;';
+  const popupText = document.createElement('span');
+  popupText.id = '__omni-popup-text';
+  popupText.style.cssText = 'flex:1;color:#aaaaae;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+  const popupClose = document.createElement('button');
+  popupClose.id = '__omni-popup-close';
+  popupClose.setAttribute('type', 'button');
+  popupClose.style.cssText = 'background:none;border:none;color:#7c7c80;cursor:pointer;font-size:18px;line-height:1;padding:0 4px;font-family:inherit;';
+  popupClose.textContent = '\\u00d7';
+  popupHeader.append(popupTag, popupText, popupClose);
+  const popupRow = document.createElement('div');
+  popupRow.id = '__omni-popup-row';
+  popupRow.style.cssText = 'display:flex;gap:6px;';
+  const popupInput = document.createElement('input');
+  popupInput.id = '__omni-popup-input';
+  popupInput.setAttribute('type', 'text');
+  popupInput.setAttribute('placeholder', 'What should change?');
+  popupInput.setAttribute('autocomplete', 'off');
+  popupInput.setAttribute('spellcheck', 'false');
+  popupInput.style.cssText = 'flex:1;padding:7px 10px;font-size:13px;border:1px solid rgba(255,255,255,0.14);border-radius:8px;background:rgba(0,0,0,0.32);color:#f5f5f7;outline:none;font-family:inherit;';
+  const popupSend = document.createElement('button');
+  popupSend.id = '__omni-popup-send';
+  popupSend.setAttribute('type', 'button');
+  popupSend.style.cssText = 'padding:7px 14px;background:#0a84ff;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;transition:opacity 0.12s;';
+  popupSend.textContent = 'Send';
+  popupRow.append(popupInput, popupSend);
+  const popupFeedback = document.createElement('div');
+  popupFeedback.id = '__omni-popup-feedback';
+  popupFeedback.style.cssText = 'display:none;font-size:13px;font-weight:500;padding:4px 0;';
+  const popupArrow = document.createElement('div');
+  popupArrow.id = '__omni-popup-arrow';
+  popupArrow.style.cssText = 'position:absolute;width:12px;height:12px;background:rgba(28,28,30,0.96);border:1px solid rgba(255,255,255,0.12);display:none;';
+  popup.append(popupHeader, popupRow, popupFeedback, popupArrow);
   layer.appendChild(popup);
-
-  const popupTag = popup.querySelector('#__omni-popup-tag');
-  const popupText = popup.querySelector('#__omni-popup-text');
-  const popupClose = popup.querySelector('#__omni-popup-close');
-  const popupRow = popup.querySelector('#__omni-popup-row');
-  const popupInput = popup.querySelector('#__omni-popup-input');
-  const popupSend = popup.querySelector('#__omni-popup-send');
-  const popupFeedback = popup.querySelector('#__omni-popup-feedback');
-  const popupArrow = popup.querySelector('#__omni-popup-arrow');
 
   let currentEl = null;
   let activeEl = null;
