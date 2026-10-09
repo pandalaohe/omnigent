@@ -19,10 +19,12 @@ none, since the sender learns of delivery from the reply itself or from
 ``wait_for_reply_seconds``. Notices are gated the same way: notices
 generated while the sender is mid-turn park in an in-memory per-sender
 queue and post as one batched message on a later tick when the sender
-goes idle or steerable. The parked queue is process-local and
-does not survive a restart (a survivable choice: the
-``session_peer_messages`` row itself is durable and the sweeper's own
-tick keeps searching for it).
+goes idle or steerable. Each parked line carries the terminal record's
+id, and the terminal transition sets that record's ``notice_owed_at``
+mark atomically, so a restart replays parked lines the process lost and
+a flush claims the mark before posting, so two processes post it once.
+A crash, cancel or store failure between a claim and its post (or its
+restore) loses that one notice rather than risking a duplicate.
 
 On startup, before the first tick, every ``delivering`` record left behind
 by a crash between runner acceptance and its own transition is reconciled
@@ -139,13 +141,18 @@ class PeerSweeper:
         self._interval = interval
         self._clock = clock
         self._batch_limit = batch_limit
-        self._parked: dict[str, list[str]] = {}
+        self._parked: dict[str, list[tuple[str | None, str]]] = {}
         self._flush_locks: dict[str, asyncio.Lock] = {}
         self._app: Any | None = None
         self._task: asyncio.Task[None] | None = None
 
     async def notify_line(
-        self, sender_session_id: str, line: str, *, app: Any | None = None
+        self,
+        sender_session_id: str,
+        line: str,
+        *,
+        app: Any | None = None,
+        peer_id: str | None = None,
     ) -> None:
         """Post one line through the sender's parked notice queue."""
         sender = await asyncio.to_thread(
@@ -156,16 +163,21 @@ class PeerSweeper:
             or is_session_closed(sender.labels, sender.title)
             or sender.archived_at is not None
         ):
+            # The closed sender can never take the notice: clear a durable
+            # mark so a later restart does not replay it forever.
+            if peer_id is not None:
+                await asyncio.to_thread(self._store.claim_notice, peer_id)
             return
-        self._parked.setdefault(sender.id, []).append(line)
+        self._parked.setdefault(sender.id, []).append((peer_id, line))
         await self._maybe_flush(sender, app if app is not None else self._app)
 
     async def start(self, app: Any) -> None:
-        """Reconcile crash-orphaned ``delivering`` records, then start the loop."""
+        """Reconcile crash-orphaned records, replay owed notices, start the loop."""
         if self._task is not None and not self._task.done():
             return
         self._app = app
         await self._reconcile_startup()
+        await self._replay_owed_notices()
         self._task = asyncio.create_task(self._run(), name="peer-sweeper")
 
     async def shutdown(self) -> None:
@@ -242,7 +254,12 @@ class PeerSweeper:
         receiver_title = receiver.title if receiver is not None else None
         if record.expires_at <= now:
             moved = await asyncio.to_thread(
-                self._store.transition, record.id, "expired", None, (record.state,)
+                self._store.transition,
+                record.id,
+                "expired",
+                None,
+                (record.state,),
+                notice=True,
             )
             if moved:
                 await self._notify_for(record, "expired", None, receiver_title, self._app)
@@ -253,7 +270,12 @@ class PeerSweeper:
             or receiver.archived_at is not None
         ):
             moved = await asyncio.to_thread(
-                self._store.transition, record.id, "failed", "closed", (record.state,)
+                self._store.transition,
+                record.id,
+                "failed",
+                "closed",
+                (record.state,),
+                notice=True,
             )
             if moved:
                 await self._notify_for(record, "failed", "closed", receiver_title, self._app)
@@ -278,6 +300,7 @@ class PeerSweeper:
                     "refused_by_user",
                     "receiver_refuses",
                     (record.state,),
+                    notice=True,
                 )
                 if moved:
                     await self._notify_for(
@@ -303,6 +326,7 @@ class PeerSweeper:
                     "failed",
                     "not_same_owner",
                     (record.state,),
+                    notice=True,
                 )
                 if moved:
                     await self._notify_for(
@@ -317,7 +341,12 @@ class PeerSweeper:
         )
         if not settings.enabled:
             moved = await asyncio.to_thread(
-                self._store.transition, record.id, "failed", "collab_disabled", (record.state,)
+                self._store.transition,
+                record.id,
+                "failed",
+                "collab_disabled",
+                (record.state,),
+                notice=True,
             )
             if moved:
                 await self._notify_for(
@@ -416,7 +445,12 @@ class PeerSweeper:
             return
         if result_state == "rejected":
             moved = await asyncio.to_thread(
-                self._store.transition, record.id, "failed", reason, ("delivering",)
+                self._store.transition,
+                record.id,
+                "failed",
+                reason,
+                ("delivering",),
+                notice=True,
             )
             if moved:
                 await self._notify_for(record, "failed", reason, receiver_title, self._app)
@@ -481,23 +515,24 @@ class PeerSweeper:
             state=state,
             reason=reason,
         )
-        await self.notify_line(record.sender_session_id, line, app=app)
+        await self.notify_line(record.sender_session_id, line, app=app, peer_id=record.id)
 
     async def _maybe_flush(self, sender: Conversation, app: Any) -> None:
         if not self._parked.get(sender.id):
             return
         lock = self._flush_locks.setdefault(sender.id, asyncio.Lock())
         async with lock:
-            # Take the parked lines out of the map before any await, so a
+            # Take the parked entries out of the map before any await, so a
             # concurrent flush attempt (the tick's own pass racing the
             # action route's direct ``notify()``) sees an empty slot and
             # bails at the top instead of posting the same lines twice; a
             # notice that parks while we're mid-flush lands in the fresh
             # list this leaves behind, not the one we're about to post.
-            lines = self._parked.get(sender.id)
-            if not lines:
+            entries = self._parked.get(sender.id)
+            if not entries:
                 return
             self._parked[sender.id] = []
+            claimed: list[str] = []
             # Everything from here through a successful post is wrapped: an
             # exception anywhere in this window (the fresh conversation read
             # in `_true_state`, the owner walk, or the post itself) must not
@@ -508,12 +543,30 @@ class PeerSweeper:
                     is_session_closed(sender.labels, sender.title)
                     or sender.archived_at is not None
                 ):
+                    # The closed sender can never take these lines; clear the
+                    # durable marks so a restart does not replay them forever.
+                    for peer_id, _line in entries:
+                        if peer_id is not None:
+                            claimed.append(peer_id)
+                            await asyncio.to_thread(self._store.claim_notice, peer_id)
                     return
                 state, _runner_online = await self._true_state(sender)
                 if state not in ("idle", "steerable"):
-                    self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+                    self._parked[sender.id] = entries + self._parked.get(sender.id, [])
                     return
-                joined = "\n".join(lines)
+                # Claim each record's owed mark before posting: a False claim
+                # means another process (or an earlier flush) already posted
+                # it, so this copy is dropped rather than duplicated.
+                remaining: list[tuple[str | None, str]] = []
+                for peer_id, line in entries:
+                    if peer_id is None:
+                        remaining.append((peer_id, line))
+                    elif await asyncio.to_thread(self._store.claim_notice, peer_id):
+                        claimed.append(peer_id)
+                        remaining.append((peer_id, line))
+                if not remaining:
+                    return
+                joined = "\n".join(line for _peer_id, line in remaining)
                 request = self._synthetic_request(sender.id, app)
                 sender_owner = effective_owner_id(
                     sender, self._conversation_store, self._permission_store
@@ -528,13 +581,49 @@ class PeerSweeper:
                     acting_user_id=sender_owner,
                 )
             except asyncio.CancelledError:
-                self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+                await self._restore_claimed(claimed)
+                self._parked[sender.id] = entries + self._parked.get(sender.id, [])
                 raise
             except Exception:
                 _logger.exception("Peer sweeper failed to flush notices for sender %s", sender.id)
                 # Restore (old lines first) for a later attempt rather than
                 # silently dropping the notice.
-                self._parked[sender.id] = lines + self._parked.get(sender.id, [])
+                await self._restore_claimed(claimed)
+                self._parked[sender.id] = entries + self._parked.get(sender.id, [])
+
+    async def _restore_claimed(self, claimed: list[str]) -> None:
+        """Best-effort restore of owed marks whose posts never happened."""
+        for peer_id in claimed:
+            try:
+                await asyncio.to_thread(self._store.set_notice_owed, peer_id, self._clock())
+            except Exception:
+                _logger.exception(
+                    "Peer sweeper failed to restore owed notice for record %s", peer_id
+                )
+
+    async def _replay_owed_notices(self) -> None:
+        """Re-park durable back-notices left unposted by a previous run."""
+        try:
+            records = await asyncio.to_thread(self._store.list_notice_owed)
+        except Exception:
+            _logger.exception("Peer sweeper failed to list owed notices")
+            return
+        for record in records:
+            try:
+                receiver = await asyncio.to_thread(
+                    self._conversation_store.get_conversation, record.receiver_session_id
+                )
+                await self._notify_for(
+                    record,
+                    record.state,
+                    record.reason,
+                    receiver.title if receiver is not None else None,
+                    self._app,
+                )
+            except Exception:
+                _logger.exception(
+                    "Peer sweeper failed to replay owed notice for record %s", record.id
+                )
 
     @staticmethod
     def _synthetic_request(session_id: str, app: Any) -> Request:
@@ -605,7 +694,12 @@ class PeerSweeper:
             # granting another grace window, which would postpone expiry
             # indefinitely across repeated uncertain deliveries.
             moved = await asyncio.to_thread(
-                self._store.transition, record.id, "expired", None, ("delivering",)
+                self._store.transition,
+                record.id,
+                "expired",
+                None,
+                ("delivering",),
+                notice=True,
             )
             if moved:
                 receiver = await asyncio.to_thread(

@@ -108,6 +108,7 @@ class PeerMessageStore(ABC):
         *,
         expires_at: int | None = None,
         relay_depth: int | None = None,
+        notice: bool = False,
     ) -> bool:
         """
         Compare-and-set a record's state.
@@ -127,7 +128,41 @@ class PeerMessageStore(ABC):
             ``delivering`` record's expiry when it reverts to ``pending``.
         :param relay_depth: New relay depth, or omitted to leave it. Used
             by the release action, which resets a held record's chain.
+        :param notice: When ``True``, the same write records that the
+            terminal state owes its sender a back-notice. Atomic with the
+            compare-and-set so a lost race leaves no mark.
         :returns: ``True`` when exactly one row changed, else ``False``.
+        """
+        ...
+
+    @abstractmethod
+    def list_notice_owed(self) -> list[SessionPeerMessage]:
+        """
+        Return every record whose back-notice has not posted yet.
+
+        :returns: :class:`SessionPeerMessage` instances with a non-NULL
+            ``notice_owed_at``, ordered by ``notice_owed_at``, ``id``.
+        """
+        ...
+
+    @abstractmethod
+    def claim_notice(self, peer_id: str) -> bool:
+        """
+        Clear one record's owed back-notice, claiming it for posting.
+
+        :param peer_id: The record whose notice to claim.
+        :returns: ``True`` when a mark was present and cleared, else
+            ``False``.
+        """
+        ...
+
+    @abstractmethod
+    def set_notice_owed(self, peer_id: str, owed_at: int) -> None:
+        """
+        Restore one record's owed back-notice after a failed post.
+
+        :param peer_id: The record whose notice to restore.
+        :param owed_at: Unix epoch seconds to record as the owed time.
         """
         ...
 

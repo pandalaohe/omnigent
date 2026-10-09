@@ -97,6 +97,64 @@ def test_transition_compare_and_set(store: SqlAlchemyPeerMessageStore) -> None:
     assert store.transition("0" * 32, "queued", expected_states=("pending",)) is False
 
 
+def test_notice_owed_at_round_trips(store: SqlAlchemyPeerMessageStore) -> None:
+    """``create`` and ``get`` carry the owed mark."""
+    seeded = store.create(_record("no", notice_owed_at=4321))
+    assert seeded.notice_owed_at == 4321
+    fetched = store.get(seeded.id)
+    assert fetched is not None
+    assert fetched.notice_owed_at == 4321
+    plain = store.create(_record("no-none"))
+    assert plain.notice_owed_at is None
+
+
+def test_transition_notice_mark_follows_the_cas(store: SqlAlchemyPeerMessageStore) -> None:
+    """``notice=True`` sets the mark only when the conditional update wins."""
+    record = store.create(_record("n1"))
+    assert (
+        store.transition(record.id, "expired", expected_states=("queued",), notice=True) is False
+    )
+    assert store.get(record.id).notice_owed_at is None  # type: ignore[union-attr]
+    assert (
+        store.transition(record.id, "expired", expected_states=("pending",), notice=True) is True
+    )
+    marked = store.get(record.id)
+    assert marked is not None
+    assert marked.notice_owed_at is not None
+
+
+def test_list_notice_owed_returns_only_marked_rows(store: SqlAlchemyPeerMessageStore) -> None:
+    """Owed rows come back oldest-mark-first, all of them, only when marked."""
+    first = store.create(_record("o1"))
+    second = store.create(_record("o2"))
+    unmarked = store.create(_record("o3"))
+    store.set_notice_owed(first.id, 100)
+    store.set_notice_owed(second.id, 200)
+    owed = store.list_notice_owed()
+    assert [r.id for r in owed] == [first.id, second.id]
+    assert [r.notice_owed_at for r in owed] == [100, 200]
+    assert store.get(unmarked.id).notice_owed_at is None  # type: ignore[union-attr]
+
+
+def test_claim_notice_once_then_false_and_set_restores(
+    store: SqlAlchemyPeerMessageStore,
+) -> None:
+    """``claim_notice`` wins exactly once; ``set_notice_owed`` restores it."""
+    record = store.create(_record("c1"))
+    assert store.claim_notice(record.id) is False
+    store.set_notice_owed(record.id, 123)
+    marked = store.get(record.id)
+    assert marked is not None
+    assert marked.notice_owed_at == 123
+    assert marked.updated_at is None
+    assert store.claim_notice(record.id) is True
+    claimed = store.get(record.id)
+    assert claimed is not None
+    assert claimed.notice_owed_at is None
+    assert claimed.updated_at is None
+    assert store.claim_notice(record.id) is False
+
+
 def test_find_unreplied_returns_newest(store: SqlAlchemyPeerMessageStore) -> None:
     """Only the pair's newest unreplied record is returned."""
     sender, receiver = _uid("u-sender"), _uid("u-receiver")

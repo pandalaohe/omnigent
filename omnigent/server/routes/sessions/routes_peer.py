@@ -1857,6 +1857,7 @@ def register_peer_routes(
             "refused_by_user",
             None,
             ("held", "pending", "queued"),
+            notice=True,
         )
         if not moved:
             current = await asyncio.to_thread(peer_message_store.get, peer_id)

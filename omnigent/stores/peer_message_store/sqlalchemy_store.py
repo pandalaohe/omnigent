@@ -44,6 +44,7 @@ def _record_to_entity(row: SqlSessionPeerMessage) -> SessionPeerMessage:
         replied_at=row.replied_at,
         relay_depth=row.relay_depth,
         not_before=row.not_before,
+        notice_owed_at=row.notice_owed_at,
         workspace_id=row.workspace_id,
     )
 
@@ -100,6 +101,7 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 replied_at=record.replied_at,
                 relay_depth=record.relay_depth,
                 not_before=record.not_before,
+                notice_owed_at=record.notice_owed_at,
             )
             session.add(row)
             session.flush()
@@ -172,15 +174,19 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         *,
         expires_at: int | None = None,
         relay_depth: int | None = None,
+        notice: bool = False,
     ) -> bool:
         """Compare-and-set a record's state; ``False`` on a lost race."""
-        values: dict[str, Any] = {"state": state, "updated_at": now_epoch()}
+        now = now_epoch()
+        values: dict[str, Any] = {"state": state, "updated_at": now}
         if reason is not None:
             values["reason"] = reason
         if expires_at is not None:
             values["expires_at"] = expires_at
         if relay_depth is not None:
             values["relay_depth"] = relay_depth
+        if notice:
+            values["notice_owed_at"] = now
 
         def write(session: Session) -> bool:
             stmt = update(SqlSessionPeerMessage).where(
@@ -196,6 +202,56 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             return bool(result.rowcount)
 
         return run_write_transaction(self._session_immediate, "transition_peer_message", write)
+
+    def list_notice_owed(self) -> list[SessionPeerMessage]:
+        """Return every record whose back-notice has not posted yet."""
+        with self._session("select_peer_messages_owed_notice") as session:
+            stmt = (
+                select(SqlSessionPeerMessage)
+                .where(SqlSessionPeerMessage.workspace_id == current_workspace_id())
+                .where(SqlSessionPeerMessage.notice_owed_at.is_not(None))
+                .order_by(
+                    asc(SqlSessionPeerMessage.notice_owed_at),
+                    asc(SqlSessionPeerMessage.id),
+                )
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_record_to_entity(r) for r in rows]
+
+    def claim_notice(self, peer_id: str) -> bool:
+        """Clear one record's owed mark; ``False`` when none was owed."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    update(SqlSessionPeerMessage)
+                    .where(
+                        SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                        SqlSessionPeerMessage.id == peer_id,
+                        SqlSessionPeerMessage.notice_owed_at.is_not(None),
+                    )
+                    .values(notice_owed_at=None)
+                ),
+            )
+            return bool(result.rowcount)
+
+        return run_write_transaction(self._session_immediate, "claim_peer_notice", write)
+
+    def set_notice_owed(self, peer_id: str, owed_at: int) -> None:
+        """Restore one record's owed mark for a later post attempt."""
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlSessionPeerMessage)
+                .where(
+                    SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                    SqlSessionPeerMessage.id == peer_id,
+                )
+                .values(notice_owed_at=owed_at)
+            )
+
+        run_write_transaction(self._session_immediate, "restore_peer_notice", write)
 
     def mark_replied(
         self,
