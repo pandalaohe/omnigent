@@ -261,6 +261,28 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertIn("model=", executor._codex_config_overrides[0])
         self.assertIn('model_provider="omnigent_databricks"', executor._codex_config_overrides[1])
 
+    def test_constructor_forwards_host_provider_env_key_only_when_unpinned(self):
+        with tempfile.TemporaryDirectory() as home:
+            codex_dir = Path(home) / ".codex"
+            codex_dir.mkdir()
+            (codex_dir / "config.toml").write_text(
+                'model_provider = "gateway"\n'
+                "[model_providers.gateway]\n"
+                'base_url = "https://gateway.example.com/v1"\n'
+                'env_key = "GATEWAY_API_KEY"\n'
+            )
+            for override, forwarded in ((None, True), ("openai", False)):
+                with (
+                    patch(
+                        "omnigent.inner.codex_executor._find_codex_cli",
+                        return_value="/usr/bin/codex",
+                    ),
+                    patch.dict("os.environ", {"HOME": home, "GATEWAY_API_KEY": "gw"}, clear=True),
+                ):
+                    executor = CodexExecutor(model_provider_override=override)
+
+                self.assertEqual("GATEWAY_API_KEY" in executor._env, forwarded)
+
     def test_constructor_does_not_force_codex_debug_env_by_default(self):
         with (
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),

@@ -96,6 +96,7 @@ from omnigent.inner.codex_executor import (
     codex_router_hooks_settings,
     codex_router_session_id,
     codex_routing_hook_skip_reason,
+    forward_host_provider_env_key,
     materialize_codex_provider_config,
     read_codex_model_catalog,
     strip_codex_agent_pid_env,
@@ -3601,6 +3602,9 @@ def build_codex_native_server(
         override.split("=", 1)[0] == "model" for override in config_overrides
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
+    forward_host_provider_env_key(
+        env, config_overrides, _bridged_codex_config(codex_config_profile(terminal_launch_args))
+    )
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,

@@ -936,6 +936,38 @@ def test_subscription_default_follows_terminal_profile(_isolated: Path) -> None:
     assert launch.config_overrides == []
 
 
+@pytest.mark.parametrize(
+    ("overrides", "forwarded"),
+    [([], True), (['model_provider="openai"'], False)],
+    ids=["follows-host", "pinned"],
+)
+def test_native_server_forwards_host_provider_env_key(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch, overrides: list[str], forwarded: bool
+) -> None:
+    """A launch following the host config carries its provider's ``env_key`` credential."""
+    _write_host_codex_config(
+        _isolated,
+        'model_provider = "gateway"\n'
+        "[model_providers.gateway]\n"
+        'base_url = "https://gateway.example.com/v1"\n'
+        'env_key = "GATEWAY_API_KEY"\n',
+    )
+    monkeypatch.setenv("GATEWAY_API_KEY", "gw-test-key")
+
+    server = build_codex_native_server(
+        socket_path=_isolated / "codex.sock",
+        codex_home=_isolated / "private-codex-home",
+        cwd=_isolated,
+        model=None,
+        profile=None,
+        bridge_dir=_isolated / "bridge",
+        codex_path=sys.executable,
+        extra_config_overrides=overrides,
+    )
+
+    assert ("GATEWAY_API_KEY" in server.env) is forwarded
+
+
 def test_subscription_default_over_config_provider_keeps_openai_pin(_isolated: Path) -> None:
     """Choosing the subscription over the offered config provider pins ``openai``."""
     _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
