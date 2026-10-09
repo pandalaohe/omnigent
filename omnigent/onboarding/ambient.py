@@ -421,6 +421,29 @@ def codex_config_detection() -> DetectedProvider | None:
     )
 
 
+def codex_subscription_pins_openai(config: dict[str, object] | None) -> bool:
+    """Return whether a Codex subscription launch pins the built-in ``openai`` provider.
+
+    A subscription stands for the host Codex CLI as configured, whatever tool
+    wrote that config (a relay or router table, a profile, an ``env_key`` or a
+    built-in provider), so the launch follows it. The pin stays when the
+    effective provider is ``openai`` anyway, and when it is the provider
+    :func:`codex_config_detection` offers as its own ``cli-config`` entry:
+    choosing the subscription then means choosing the Codex login over it.
+
+    :param config: The parsed ``config.toml`` the launch bridges, with any
+        selected profile already applied; ``None`` when missing or malformed.
+    :returns: ``True`` when the launch should pin ``model_provider="openai"``.
+    """
+    if config is None:
+        return True
+    provider_id = codex_auth_readiness.effective_codex_model_provider(config)
+    if provider_id is None or provider_id == "openai":
+        return True
+    detection = codex_config_detection()
+    return detection is not None and detection.model_provider == provider_id
+
+
 def _slug(value: str) -> str:
     """Slugify a provider id into a config-friendly provider entry name part.
 

@@ -785,6 +785,28 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     return env
 
 
+def forward_host_provider_env_key(
+    env: MutableMapping[str, str],
+    config_overrides: Iterable[str],
+    config: dict[str, object] | None,
+) -> None:
+    """Forward the credential variable of the host config's default provider.
+
+    Only for a launch that pins no ``model_provider``: Codex then routes through
+    the host's own default, whose ``env_key`` variable the env scrub drops.
+    """
+    from omnigent.onboarding.codex_auth_readiness import effective_provider_env_key
+
+    if config is None or any(
+        override.split("=", 1)[0].strip() == "model_provider" for override in config_overrides
+    ):
+        return
+    name = effective_provider_env_key(config)
+    value = os.environ.get(name) if name else None
+    if name and value:
+        env[name] = value
+
+
 def codex_skill_sources(
     bundle_dir: Path | None,
     home: Path,
@@ -5256,6 +5278,13 @@ class CodexExecutor(Executor):
             # tools exposed by Omnigent as dynamicTools. The top-level web_search
             # key accepts "live", "cached", or "disabled".
             self._codex_config_overrides.append('web_search="disabled"')
+        from omnigent.onboarding.codex_auth_readiness import load_codex_config
+
+        forward_host_provider_env_key(
+            self._env,
+            self._codex_config_overrides,
+            load_codex_config(_codex_home_config_source_from_env() / "config.toml"),
+        )
         self._tool_executor: CodexToolExecutor | None = None
         self._raw_elicitation_handler: CodexElicitationHandler | None = None
         self._session_states: dict[str, _CodexSessionState] = {}

@@ -75,6 +75,19 @@ def effective_custom_provider_table(
     return provider_id, table
 
 
+def effective_provider_env_key(config: dict[str, object]) -> str | None:
+    """Return the variable the effective custom provider reads its credential from.
+
+    ``None`` without an ``env_key``, or when ``requires_openai_auth`` makes
+    Codex ignore it.
+    """
+    selected = effective_custom_provider_table(config)
+    if selected is None or selected[1].get("requires_openai_auth") is True:
+        return None
+    env_key = selected[1].get("env_key")
+    return env_key.strip() if isinstance(env_key, str) and env_key.strip() else None
+
+
 def effective_self_sufficient_builtin_provider(config: dict[str, object]) -> str | None:
     """Return the selected built-in provider id when Codex needs no login for it.
 
