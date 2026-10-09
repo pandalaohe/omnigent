@@ -30,6 +30,7 @@ import {
   openSessionStream,
   postEvent,
   continueFailedTurn,
+  RECENT_SESSIONS_TOUCHED_EVENT,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1707,6 +1708,31 @@ describe("postEvent", () => {
     expect(out.pendingId).toBe("pending_abc123");
     expect(out.itemId).toBeUndefined();
   });
+
+  it("dispatches the recent-sessions touched event for a user message", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
+    const onTouched = vi.fn();
+    window.addEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+
+    await postEvent("conv_abc", {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "hi" }] },
+    });
+
+    expect(onTouched).toHaveBeenCalledTimes(1);
+    window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+  });
+
+  it("does not dispatch for a non-user event", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+    const onTouched = vi.fn();
+    window.addEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+
+    await postEvent("conv_abc", { type: "interrupt", data: {} });
+
+    expect(onTouched).not.toHaveBeenCalled();
+    window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+  });
 });
 
 describe("continueArchivedSession", () => {
@@ -1933,6 +1959,17 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+
+  it("dispatches the recent-sessions touched event after a successful resolve", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+    const onTouched = vi.fn();
+    window.addEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+
+    await approve("conv_abc", "elic_xyz", { action: "accept" });
+
+    expect(onTouched).toHaveBeenCalledTimes(1);
+    window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
   });
 });
 

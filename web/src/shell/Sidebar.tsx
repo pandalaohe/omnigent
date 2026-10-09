@@ -237,6 +237,7 @@ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useSystemStatusSummary, type SystemStatusLevel } from "@/hooks/useSystemStatus";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useSidebarLayout } from "@/hooks/useSidebarLayout";
+import { useRecentSessions, RecentSessionsUnavailableError } from "@/hooks/useRecentSessions";
 import type { SidebarSectionDef } from "@/lib/sidebarLayout";
 import {
   MoveProjectToSectionMenu,
@@ -1881,6 +1882,16 @@ interface ResolvedSection {
   flatSessions: Conversation[];
 }
 
+/** Per-row identity for a section that may render a session more than once. */
+interface ConversationRowMeta {
+  /** Unique dnd id for this copy; equals the session id on the canonical copy. */
+  instanceKey: string;
+  /** Whether this copy owns the active-row scroll / drag registration. */
+  canonical: boolean;
+  /** Trailing muted project name, set on recent copies. */
+  projectLabel?: string;
+}
+
 function ConversationList({
   conversationsQuery,
   unreadConversations,
@@ -2428,6 +2439,46 @@ function ConversationList({
     [],
   );
 
+  // The recent section's count drives its query; enabled whenever the section
+  // exists — a collapsed section still needs its members for the header marker.
+  const recentSection = useMemo(
+    () => layout.sections.find((section) => section.kind === "recent") ?? null,
+    [layout.sections],
+  );
+  const recentQuery = useRecentSessions(recentSection?.count ?? 5, recentSection !== null);
+  const recentUnavailable = recentQuery.error instanceof RecentSessionsUnavailableError;
+  // Replace each recent row with the freshest copy the sidebar already holds
+  // (pinned / folder / flat), so live status updates apply; a session the
+  // sidebar doesn't hold renders from the query row.
+  const recentRows = useMemo(() => {
+    const rows = recentQuery.data ?? [];
+    if (rows.length === 0) return rows;
+    const byId = new Map<string, Conversation>();
+    for (const c of sections.pinned) byId.set(c.id, c);
+    for (const c of loadedSections.sessions) byId.set(c.id, c);
+    for (const group of sections.projectGroups) {
+      for (const c of group.conversations) byId.set(c.id, c);
+    }
+    for (const list of folderConversations.values()) {
+      for (const c of list) byId.set(c.id, c);
+    }
+    return rows.map((row) => byId.get(row.id) ?? row);
+  }, [
+    recentQuery.data,
+    sections.pinned,
+    sections.projectGroups,
+    loadedSections.sessions,
+    folderConversations,
+  ]);
+  const projectLabelFor = useCallback(
+    (conversation: Conversation): string | undefined => {
+      const firstClass =
+        conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
+      return firstClass ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? undefined;
+    },
+    [projectNamesById],
+  );
+
   // The one ordered projection of the layout: each section resolved once, in
   // layout order, into the groups it renders (a `projects` section's ids in
   // alphabetical-or-manual order, `other_projects`' unclaimed folders), its
@@ -2462,6 +2513,7 @@ function ConversationList({
           flatSessions = sections.sessions;
           break;
         case "recent":
+          flatSessions = recentRows;
           break;
       }
       return { section, collapsed, groups, flatSessions };
@@ -2475,7 +2527,36 @@ function ConversationList({
     unclaimedProjectGroups,
     folderConversations,
     projectOrder.data?.sort_mode,
+    recentRows,
   ]);
+
+  // Which rendered copy of each session is canonical: the owning folder /
+  // Sessions / Pinned copy when it is visible, else the first visible copy in
+  // layout order. Recent copies of a session that renders elsewhere are
+  // non-canonical — they carry a per-section instance key and skip drag.
+  const canonicalInstanceKeys = useMemo(() => {
+    const firstRendered = new Map<string, string>();
+    const owningRendered = new Map<string, string>();
+    const record = (id: string, key: string, owning: boolean) => {
+      if (!firstRendered.has(id)) firstRendered.set(id, key);
+      if (owning && !owningRendered.has(id)) owningRendered.set(id, key);
+    };
+    for (const { section, collapsed, groups, flatSessions } of projection) {
+      if (collapsed) continue;
+      const owning = section.kind !== "recent";
+      const keyFor = (id: string) => (owning ? id : `${section.id}:${id}`);
+      for (const { group, rows } of groups) {
+        if (!expandedProjects.includes(group.name)) continue;
+        for (const conversation of rows) record(conversation.id, keyFor(conversation.id), owning);
+      }
+      for (const conversation of flatSessions) {
+        record(conversation.id, keyFor(conversation.id), owning);
+      }
+    }
+    const canonical = new Map<string, string>();
+    for (const [id, key] of firstRendered) canonical.set(id, owningRendered.get(id) ?? key);
+    return canonical;
+  }, [projection, expandedProjects]);
 
   // The deduped union of every session any section renders. Hooks can't run
   // per section in a loop, so the section markers below read errors from one
@@ -2525,14 +2606,12 @@ function ConversationList({
   }, [projection, errorsById, startingConversationId, showGoalSessionMarkers]);
 
   // Whether any section will actually paint a header. An implicit favorites
-  // with no pins and a not-yet-rendering recent section paint nothing; if every
-  // section is one of those (or the layout is empty), the user needs a fallback
-  // entry to create a section.
+  // with no pins paints nothing; if every section is one of those (or the
+  // layout is empty), the user needs a fallback entry to create a section.
   const rendersSectionHeader = useMemo(
     () =>
       projection.some(
         ({ section, flatSessions }) =>
-          section.kind !== "recent" &&
           !(section.kind === "favorites" && section.implicit === true && flatSessions.length === 0),
       ),
     [projection],
@@ -2601,8 +2680,13 @@ function ConversationList({
   // session hotkey. Sections render in layout order.
   const orderedConversationIds = useMemo(() => {
     const ids: string[] = [];
+    const seen = new Set<string>();
     const push = (list: readonly Conversation[]) => {
-      for (const conversation of list) ids.push(conversation.id);
+      for (const conversation of list) {
+        if (seen.has(conversation.id)) continue;
+        seen.add(conversation.id);
+        ids.push(conversation.id);
+      }
     };
     // A project's chats are navigable only when the section that contains the
     // folder is expanded AND that individual folder is expanded (folders are
@@ -2675,11 +2759,16 @@ function ConversationList({
   getVisibleIdsRef.current = () => {
     if (selectionScope === "projects") {
       const ids: string[] = [];
+      const seen = new Set<string>();
       for (const { collapsed, groups } of projection) {
         if (collapsed) continue;
         for (const { group, rows } of groups) {
           if (!expandedProjects.includes(group.name)) continue;
-          for (const conversation of rows) ids.push(conversation.id);
+          for (const conversation of rows) {
+            if (seen.has(conversation.id)) continue;
+            seen.add(conversation.id);
+            ids.push(conversation.id);
+          }
         }
       }
       return ids;
@@ -2688,7 +2777,7 @@ function ConversationList({
     if (sessionsSection === undefined || sessionsSection.collapsed) {
       return [];
     }
-    return sessionsSection.flatSessions.map((c) => c.id);
+    return [...new Set(sessionsSection.flatSessions.map((c) => c.id))];
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
@@ -3255,9 +3344,53 @@ function ConversationList({
                                 )}
                               </SidebarSection>
                             );
-                          case "recent":
-                            // Recent rows arrive with the recent-sessions slice.
-                            return null;
+                          case "recent": {
+                            const recentEmptyMessage = recentUnavailable
+                              ? "Recent sessions need a newer server."
+                              : recentQuery.isLoading
+                                ? undefined
+                                : "Sessions you message or answer will show here.";
+                            return (
+                              <SidebarSection
+                                key={section.id}
+                                section={section}
+                                fallbackScrollRoot={scrollContainerRef}
+                              >
+                                {(body, optionsAction) => (
+                                  <ConversationSection
+                                    title={section.name}
+                                    conversations={flatSessions}
+                                    activeConversationId={displayedActiveId}
+                                    pinnedConversationIds={pinnedConversationIds}
+                                    marker={marker?.state ?? null}
+                                    backgroundActivityCount={marker?.backgroundActivityCount ?? 0}
+                                    collapsed={sectionCollapsed}
+                                    onToggleCollapsed={toggleCollapsed}
+                                    onRowClick={onRowClick}
+                                    onTogglePinned={onTogglePinned}
+                                    selectionMode={false}
+                                    selectedIds={selectedIds}
+                                    onToggleSelected={onToggleSelected}
+                                    onProjectAssigned={expandProject}
+                                    headerAction={optionsAction}
+                                    bodyRef={body.bodyRef}
+                                    bodyMaxHeight={body.maxHeight}
+                                    emptyMessage={recentEmptyMessage}
+                                    rowMeta={(conversation) => {
+                                      const key = `${section.id}:${conversation.id}`;
+                                      const isCanonical =
+                                        canonicalInstanceKeys.get(conversation.id) === key;
+                                      return {
+                                        instanceKey: isCanonical ? conversation.id : key,
+                                        canonical: isCanonical,
+                                        projectLabel: projectLabelFor(conversation),
+                                      };
+                                    }}
+                                  />
+                                )}
+                              </SidebarSection>
+                            );
+                          }
                         }
                       },
                     )}
@@ -3908,6 +4041,7 @@ function ConversationSection({
   afterHeader,
   footer,
   onProjectAssigned,
+  rowMeta,
   bodyRef,
   bodyMaxHeight,
 }: {
@@ -3956,6 +4090,9 @@ function ConversationSection({
   /** Called with the project name when a row is filed into one, so the sidebar
       can expand that (possibly brand-new) project folder. */
   onProjectAssigned?: (projectName: string) => void;
+  /** Per-row identity and canonical marker for sections that can duplicate a
+      session (recent). Defaults to the row's own id as canonical. */
+  rowMeta?: (conversation: Conversation) => ConversationRowMeta;
   /** Ref to the body container, so a capped section can scroll it and root the
       infinite-scroll observers on it. */
   bodyRef?: RefObject<HTMLDivElement | null>;
@@ -4059,21 +4196,30 @@ function ConversationSection({
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {conversations.map((conv) => (
-                <ConversationRow
-                  key={conv.id}
-                  conversation={conv}
-                  isActive={conv.id === activeConversationId}
-                  isPinned={pinnedConversationIds.includes(conv.id)}
-                  onClick={onRowClick}
-                  onTogglePinned={onTogglePinned}
-                  selectionMode={selectionMode}
-                  isSelected={selectedIds.has(conv.id)}
-                  onToggleSelected={onToggleSelected}
-                  onProjectAssigned={onProjectAssigned}
-                  showGoalSessionMarkers={showGoalSessionMarkers}
-                />
-              ))}
+              {conversations.map((conv) => {
+                const meta = rowMeta?.(conv) ?? {
+                  instanceKey: conv.id,
+                  canonical: true,
+                };
+                return (
+                  <ConversationRow
+                    key={meta.instanceKey}
+                    conversation={conv}
+                    instanceKey={meta.instanceKey}
+                    canonical={meta.canonical}
+                    projectLabel={meta.projectLabel}
+                    isActive={conv.id === activeConversationId}
+                    isPinned={pinnedConversationIds.includes(conv.id)}
+                    onClick={onRowClick}
+                    onTogglePinned={onTogglePinned}
+                    selectionMode={selectionMode}
+                    isSelected={selectedIds.has(conv.id)}
+                    onToggleSelected={onToggleSelected}
+                    onProjectAssigned={onProjectAssigned}
+                    showGoalSessionMarkers={showGoalSessionMarkers}
+                  />
+                );
+              })}
             </ul>
           )}
           {footer}
@@ -4658,6 +4804,9 @@ const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
 function ConversationRowImpl({
   conversation,
+  instanceKey,
+  canonical,
+  projectLabel,
   isActive,
   isPinned,
   onClick,
@@ -4669,6 +4818,12 @@ function ConversationRowImpl({
   showGoalSessionMarkers,
 }: {
   conversation: Conversation;
+  /** Unique dnd id for this copy; defaults to the session id. */
+  instanceKey?: string;
+  /** Whether this copy carries the canonical marker and drag registration. */
+  canonical?: boolean;
+  /** Trailing muted project name; recent copies only. */
+  projectLabel?: string;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
   // read, so only the two rows whose value flips re-render on a switch.
@@ -4684,6 +4839,8 @@ function ConversationRowImpl({
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
+  const resolvedInstanceKey = instanceKey ?? conversation.id;
+  const isCanonical = canonical ?? true;
   let pinTooltip = isPinned ? "Unpin" : "Pin";
   if (pinSaving) pinTooltip = "Saving pins…";
   else if (!isPinned && atPinCap) pinTooltip = "Unpin a session first";
@@ -4703,9 +4860,9 @@ function ConversationRowImpl({
   // sidebar so it's comfortably in view rather than pinned to an edge.
   const rowRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || !isCanonical) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [isActive]);
+  }, [isActive, isCanonical]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -4925,9 +5082,10 @@ function ConversationRowImpl({
     setNodeRef: setDragNodeRef,
     isDragging,
   } = useDraggable({
-    id: conversation.id,
+    id: resolvedInstanceKey,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
+    disabled:
+      !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow || !isCanonical,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -4948,9 +5106,9 @@ function ConversationRowImpl({
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
-    id: `pin-order:${conversation.id}`,
+    id: `pin-order:${resolvedInstanceKey}`,
     data: { type: "pin-order", id: conversation.id },
-    disabled: !pinOrder || !isPinned,
+    disabled: !pinOrder || !isPinned || !isCanonical,
   });
   // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
   let pinInsertion: "before" | "after" | undefined;
@@ -5204,6 +5362,14 @@ function ConversationRowImpl({
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
+        {projectLabel && (
+          <span
+            data-testid="conversation-project-label"
+            className="max-w-[76px] shrink-0 truncate text-muted-foreground text-xs"
+          >
+            {projectLabel}
+          </span>
+        )}
       </div>
     </Link>
   );
@@ -5226,6 +5392,7 @@ function ConversationRowImpl({
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
+      data-sidebar-canonical={isCanonical ? "true" : undefined}
       onMouseDown={(event) => {
         // Portaled dialogs bubble through this row but must not start a drag.
         if (event.currentTarget.contains(event.target as Node)) {
@@ -5790,6 +5957,9 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
 // are stabilized at the list owner so they don't defeat it.
 const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
+    prev.instanceKey === next.instanceKey &&
+    prev.canonical === next.canonical &&
+    prev.projectLabel === next.projectLabel &&
     prev.isActive === next.isActive &&
     prev.isPinned === next.isPinned &&
     prev.showGoalSessionMarkers === next.showGoalSessionMarkers &&

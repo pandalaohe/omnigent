@@ -49,6 +49,7 @@ export function conversationHooksMock() {
     useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     fetchProjectSessionIds: () => Promise.resolve([]),
     PROJECT_LABEL_KEY,
+    applySessionTombstones: (page: unknown) => page,
   };
 }
 

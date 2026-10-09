@@ -74,6 +74,7 @@ export interface SidebarSectionBody {
 }
 
 const MAX_ROWS_OPTIONS = [5, 10, 15, 20, 30];
+const RECENT_COUNT_OPTIONS = Array.from({ length: 20 }, (_, index) => index + 1);
 
 /**
  * Renders the section body. Always present so the branch has one place for the
@@ -241,6 +242,29 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
               </DropdownMenuRadioGroup>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          {section.kind === "recent" && (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger data-testid="section-show">Show</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="max-h-64 overflow-y-auto">
+                <DropdownMenuRadioGroup
+                  value={String(section.count ?? 5)}
+                  onValueChange={(value) =>
+                    updateSection((current) => ({ ...current, count: Number(value) }))
+                  }
+                >
+                  {RECENT_COUNT_OPTIONS.map((count) => (
+                    <DropdownMenuRadioItem
+                      key={count}
+                      value={String(count)}
+                      data-testid={`section-show-${count}`}
+                    >
+                      {count}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             data-testid="remove-section"

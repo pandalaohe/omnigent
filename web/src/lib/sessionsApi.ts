@@ -31,6 +31,25 @@ import type {
   SessionStatus,
 } from "./types";
 
+/**
+ * Broadcast when the user's own interaction (a user message or an approval)
+ * may have reordered their recent sessions. The recent-sessions query listens
+ * and invalidates; the event keeps this module free of a query client.
+ */
+export const RECENT_SESSIONS_TOUCHED_EVENT = "omnigent:recent-sessions-touched";
+
+/** Whether this event is a human-origin touch the server records as recent. */
+function isRecentSessionsTouchingEvent(event: SessionEventInput): boolean {
+  if (event.type === "approval") return true;
+  return event.type === "message" && (event.data as { role?: unknown }).role === "user";
+}
+
+function notifyRecentSessionsTouched(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(RECENT_SESSIONS_TOUCHED_EVENT));
+  }
+}
+
 /** Returns the client surface label for the X-Omnigent-Client telemetry header. */
 function getClientSurface(): string {
   if (isElectronShell()) return "desktop";
@@ -1646,7 +1665,7 @@ export async function postEvent(
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return postEventResponseFromWire(
+  const result = postEventResponseFromWire(
     (await res.json()) as {
       queued: boolean;
       item_id?: string;
@@ -1657,6 +1676,8 @@ export async function postEvent(
       recovery?: PostEventResponse["recovery"];
     },
   );
+  if (isRecentSessionsTouchingEvent(event)) notifyRecentSessionsTouched();
+  return result;
 }
 
 /**
@@ -1778,7 +1799,9 @@ export async function approve(
       body: JSON.stringify(result),
     },
   );
-  return postEventResponseFromWire(
+  const response = postEventResponseFromWire(
     await readJsonOrThrow<{ queued: boolean; item_id?: string }>(res),
   );
+  notifyRecentSessionsTouched();
+  return response;
 }

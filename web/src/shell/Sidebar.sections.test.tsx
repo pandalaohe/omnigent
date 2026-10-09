@@ -4,13 +4,39 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
-import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import type { Conversation } from "@/hooks/useConversations";
+import type * as IdentityModule from "@/lib/identity";
 import type { SidebarLayout } from "@/lib/sidebarLayout";
+import { Sidebar } from "@/shell/Sidebar";
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [] }),
 }));
+
+const { fetchMock, recentRef } = vi.hoisted(() => ({
+  fetchMock: vi.fn(),
+  recentRef: { current: { status: 200, data: [] as Conversation[] } },
+}));
+
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return { ...actual, authenticatedFetch: fetchMock };
+});
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 404 ? "Not Found" : "OK",
+    json: async () => body,
+  } as unknown as Response;
+}
 
 const { projectsRef, pinnedRef } = vi.hoisted(() => ({
   projectsRef: {
@@ -40,7 +66,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
-import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { useConversations } from "@/hooks/useConversations";
 
 const useConversationsMock = vi.mocked(useConversations);
 
@@ -57,6 +83,24 @@ const WORK_LAYOUT: SidebarLayout = {
     { id: "default-favorites", kind: "favorites", name: "Pinned", maxRows: null, items: [] },
     { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
     { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
+const RECENT_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    { id: "sec_recent", kind: "recent", name: "Recent", maxRows: null, count: 5 },
+    { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+    { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
+// A recent section above a projects section, so one session renders twice.
+const RECENT_FOLDER_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    { id: "sec_recent", kind: "recent", name: "Recent", maxRows: null, count: 5 },
+    { id: "sec_work", kind: "projects", name: "Work", maxRows: null, projectIds: ["p_alpha"] },
   ],
 };
 
@@ -78,12 +122,64 @@ function sectionOf(title: string): HTMLElement {
   return header as HTMLElement;
 }
 
+function LocationProbe() {
+  return <div data-testid="location">{useLocation().pathname}</div>;
+}
+
+/** The sidebar with a live `/c/:id` route so the switch hotkey sees an active row. */
+function renderSidebarAt(path: string) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[path]}>
+            <Routes>
+              <Route
+                path="/c/:conversationId"
+                element={
+                  <>
+                    <LocationProbe />
+                    <Sidebar open onClose={vi.fn()} />
+                  </>
+                }
+              />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
+    </QueryClientProvider>,
+  );
+}
+
+function recentCalls(): unknown[][] {
+  return fetchMock.mock.calls.filter((call) => String(call[0]).includes("/v1/me/recent-sessions"));
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   useConversationsMock.mockReset();
   localStorage.clear();
   projectsRef.current = PROJECTS;
   pinnedRef.current = [];
+  recentRef.current = { status: 200, data: [] };
+  fetchMock.mockReset();
+  fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/v1/me/recent-sessions")) {
+      if (recentRef.current.status === 404) return jsonResponse({}, 404);
+      return jsonResponse({
+        data: recentRef.current.data,
+        first_id: null,
+        last_id: null,
+        has_more: false,
+      });
+    }
+    if (url.includes("/v1/projects/order")) {
+      return jsonResponse({ sort_mode: "alphabetical", ordered_project_ids: [] });
+    }
+    return jsonResponse({}, 404);
+  });
   mockConversations([conversation("plain")]);
 });
 
@@ -290,5 +386,106 @@ describe("Sidebar sections", () => {
 
     const badge = within(sectionOf("Work")).getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "awaiting");
+  });
+
+  it("renders recent rows in server order with the project label and status marker", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_LAYOUT));
+    recentRef.current.data = [
+      conversation("r_new", {
+        updated_at: 2,
+        project_id: "p_alpha",
+        pending_elicitations_count: 1,
+      }),
+      conversation("r_old", { updated_at: 1, labels: { omni_project: "Beta" } }),
+    ];
+    renderSidebar();
+
+    const recent = sectionOf("Recent");
+    const newRow = await within(recent).findByText("r_new");
+    const oldRow = within(recent).getByText("r_old");
+    expect(isBefore(newRow, oldRow)).toBe(true);
+    expect(
+      within(recent)
+        .getAllByTestId("conversation-project-label")
+        .map((el) => el.textContent),
+    ).toEqual(["Alpha", "Beta"]);
+    expect(within(recent).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "awaiting",
+    );
+  });
+
+  it("changes the recent count from the Show submenu and refetches with the new limit", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_LAYOUT));
+    renderSidebar();
+    await waitFor(() => expect(recentCalls()).toHaveLength(1));
+
+    fireEvent.pointerDown(within(sectionOf("Recent")).getByTestId("section-options"), {
+      button: 0,
+    });
+    fireEvent.click(await screen.findByTestId("section-show"));
+    fireEvent.click(await screen.findByTestId("section-show-8"));
+
+    await waitFor(() => {
+      const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as SidebarLayout;
+      expect(stored.sections.find((section) => section.kind === "recent")?.count).toBe(8);
+    });
+    await waitFor(() =>
+      expect(recentCalls().some((call) => String(call[0]).includes("limit=8"))).toBe(true),
+    );
+  });
+
+  it("shows the old-server note when the recent route 404s and does not retry", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_LAYOUT));
+    recentRef.current.status = 404;
+    renderSidebar();
+
+    expect(
+      await within(sectionOf("Recent")).findByText("Recent sessions need a newer server."),
+    ).toBeInTheDocument();
+    expect(recentCalls()).toHaveLength(1);
+  });
+
+  it("visits a duplicated session once and drags only the canonical copy", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_FOLDER_LAYOUT));
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    projectsRef.current = [{ id: "p_alpha", name: "Alpha", icon: null }];
+    const s1 = conversation("s1", { labels: { omni_project: "Alpha" }, updated_at: 2 });
+    const s2 = conversation("s2", { labels: { omni_project: "Alpha" }, updated_at: 1 });
+    mockConversations([s1, s2]);
+    recentRef.current.data = [s1];
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    renderSidebarAt("/c/s2");
+
+    await waitFor(() =>
+      expect(document.querySelectorAll('li[data-sidebar-session-id="s1"]')).toHaveLength(2),
+    );
+    expect(
+      document.querySelectorAll('li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]'),
+    ).toHaveLength(1);
+
+    // Cmd+] steps to s1, then again to s2: s1 is visited once, not twice.
+    fireEvent.keyDown(document.body, { code: "BracketRight", metaKey: true, bubbles: true });
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s1"));
+    fireEvent.keyDown(document.body, { code: "BracketRight", metaKey: true, bubbles: true });
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s2"));
+
+    const recentRow = document.querySelector(
+      'li[data-sidebar-session-id="s1"]:not([data-sidebar-canonical])',
+    ) as HTMLElement;
+    fireEvent.mouseDown(recentRow, { button: 0, clientX: 50, clientY: 20 });
+    fireEvent.mouseMove(document, { clientX: 50, clientY: 40 });
+    expect(recentRow).not.toHaveClass("opacity-40");
+    fireEvent.mouseUp(document);
+
+    const canonicalRow = document.querySelector(
+      'li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]',
+    ) as HTMLElement;
+    fireEvent.mouseDown(canonicalRow, { button: 0, clientX: 50, clientY: 20 });
+    fireEvent.mouseMove(document, { clientX: 50, clientY: 40 });
+    expect(canonicalRow).toHaveClass("opacity-40");
+    fireEvent.mouseUp(document);
+
+    platform.mockRestore();
   });
 });

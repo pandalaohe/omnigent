@@ -484,7 +484,7 @@ export function clearSessionTombstones(): void {
 /**
  * Apply optimistic delete/archive state to a freshly fetched page.
  */
-function applySessionTombstones(
+export function applySessionTombstones(
   page: ConversationsPage,
   dropArchiving = false,
   originalPage = page,
