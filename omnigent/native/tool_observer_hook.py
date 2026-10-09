@@ -9,6 +9,11 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# A ceiling, not a cost: the hook is bounded by interpreter start plus the 1 s
+# relay timeout, and the harness's own PostToolUse hook already bounds
+# post-tool latency, so a tight cap only turns a slow start into a failure.
+_HOOK_TIMEOUT_S = 10
+
 
 def hook_settings(bridge_dir: Path, python: str, module: str) -> dict[str, object]:
     """Use each harness's existing owned hook module and trust registration."""
@@ -17,7 +22,7 @@ def hook_settings(bridge_dir: Path, python: str, module: str) -> dict[str, objec
         "command": shlex.join(
             [python, "-I", "-m", module, "observe-tool", "--bridge-dir", str(bridge_dir)]
         ),
-        "timeout": 3,
+        "timeout": _HOOK_TIMEOUT_S,
     }
 
 
