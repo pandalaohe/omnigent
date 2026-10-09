@@ -125,7 +125,7 @@ from omnigent.sdk_permission_modes import (
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODES,
 )
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import session_live_state, shutdown_state, sound_alerts
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -3606,6 +3606,7 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    resolver_owner: str | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -3654,6 +3655,10 @@ async def _resolve_elicitation(
     :param conversation_store: Optional store used to mirror the
         resolved signal into ancestor streams when ``session_id`` is
         a child session. ``None`` keeps the signal scoped locally.
+    :param resolver_owner: Owner to note as having stopped the turn
+        when this verdict is a cancel marked ``interrupt`` that lands
+        on a live, session-owned harness Future, or ``None`` to skip
+        the note.
     """
     # Empty-string default is intentional, NOT a fail-loud miss: the
     # resolve-URL caller always supplies the id (it comes from the URL
@@ -3696,6 +3701,12 @@ async def _resolve_elicitation(
                     exc_info=True,
                 )
             else:
+                if (
+                    resolver_owner is not None
+                    and verdict_result.action == "cancel"
+                    and (verdict_result.meta or {}).get("interrupt") is True
+                ):
+                    sound_alerts.note_user_stop(resolver_owner, session_id)
                 harness_future.set_result(verdict_result)
                 # The waiter may be a zombie: a proxy can sever the
                 # long-poll client-side while holding the backend

@@ -21,7 +21,13 @@ from fastapi.testclient import TestClient
 import omnigent.server.routes.sessions as sessions_routes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import sound_alerts
+from omnigent.server._elicitation_registry import (
+    _harness_elicitation_owners,
+    _harness_elicitation_registry,
+    _harness_pre_resolved_elicitations,
+)
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
@@ -395,90 +401,189 @@ async def test_cancelled_interrupt_request_keeps_the_stop_note(
     routes_events._interrupt_fenced_sessions.discard(session_id)
 
 
+def _register_harness_future(session_id: str, elicitation_id: str) -> asyncio.Future[Any]:
+    """Register a live, session-owned harness Future for ``elicitation_id``."""
+    future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    _harness_elicitation_registry[elicitation_id] = future
+    _harness_elicitation_owners[elicitation_id] = session_id
+    _harness_pre_resolved_elicitations.pop(elicitation_id, None)
+    return future
+
+
+def _clear_harness_future(elicitation_id: str) -> None:
+    """Drop the Future, owner, and tombstone planted for ``elicitation_id``."""
+    _harness_elicitation_registry.pop(elicitation_id, None)
+    _harness_elicitation_owners.pop(elicitation_id, None)
+    _harness_pre_resolved_elicitations.pop(elicitation_id, None)
+
+
+def _resolve_url(app: FastAPI, session_id: str, elicitation_id: str, body: dict[str, Any]):
+    return TestClient(app).post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json=body,
+        headers={"X-Forwarded-Email": ALICE},
+    )
+
+
+def _approval_event(app: FastAPI, session_id: str, data: dict[str, Any]):
+    return TestClient(app).post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "approval", "data": data},
+        headers={"X-Forwarded-Email": ALICE},
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("entry_point", "interrupt", "fails", "suppressed"),
-    [
-        ("approval", True, False, True),
-        ("approval", False, False, False),
-        ("resolve", True, False, True),
-        ("resolve", False, False, False),
-        ("approval", True, True, False),
-        ("resolve", True, True, False),
-    ],
-)
-async def test_cancel_interrupt_marker_controls_completion_alerts(
+async def test_resolve_url_interrupting_cancel_on_live_future_silences_done(
+    app: FastAPI, stores
+) -> None:
+    """A cancel-and-interrupt landing on the owned Future notes the session."""
+    session_id = _seed_session(stores, owner=ALICE, title="resolve interrupt")
+    frames = _register_fake_ringer()
+    elicitation_id = "elicit_a"
+    _register_harness_future(session_id, elicitation_id)
+    try:
+        response = _resolve_url(
+            app,
+            session_id,
+            elicitation_id,
+            {"action": "cancel", "_meta": {"interrupt": True}},
+        )
+        assert response.status_code == 202, response.text
+        assert await _claim_done(session_id, f"{session_id}:done:after_resolve") is False
+        assert frames == []
+    finally:
+        _clear_harness_future(elicitation_id)
+
+
+@pytest.mark.asyncio
+async def test_approval_event_interrupting_cancel_on_live_future_silences_done(
+    app: FastAPI, stores
+) -> None:
+    """The approval event path notes the same owned-Future cancel."""
+    session_id = _seed_session(stores, owner=ALICE, title="approval interrupt")
+    frames = _register_fake_ringer()
+    elicitation_id = "elicit_a"
+    _register_harness_future(session_id, elicitation_id)
+    try:
+        response = _approval_event(
+            app,
+            session_id,
+            {
+                "elicitation_id": elicitation_id,
+                "action": "cancel",
+                "_meta": {"interrupt": True},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert await _claim_done(session_id, f"{session_id}:done:after_approval") is False
+        assert frames == []
+    finally:
+        _clear_harness_future(elicitation_id)
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_interrupt_on_live_future_keeps_done(app: FastAPI, stores) -> None:
+    """A plain cancel is not the user's stop, so completion still rings."""
+    session_id = _seed_session(stores, owner=ALICE, title="resolve plain cancel")
+    frames = _register_fake_ringer()
+    elicitation_id = "elicit_a"
+    _register_harness_future(session_id, elicitation_id)
+    try:
+        response = _resolve_url(app, session_id, elicitation_id, {"action": "cancel"})
+        assert response.status_code == 202, response.text
+        assert await _claim_done(session_id, f"{session_id}:done:after_cancel") is True
+        assert [frame["level"] for frame in frames] == ["done"]
+    finally:
+        _clear_harness_future(elicitation_id)
+
+
+@pytest.mark.asyncio
+async def test_interrupting_cancel_without_live_future_keeps_done(app: FastAPI, stores) -> None:
+    """A runner-side verdict ignores the marker, so the note is not taken."""
+    session_id = _seed_session(stores, owner=ALICE, title="runner-side interrupt")
+    frames = _register_fake_ringer()
+    elicitation_id = "elicit_a"
+    _clear_harness_future(elicitation_id)
+    try:
+        response = _approval_event(
+            app,
+            session_id,
+            {
+                "elicitation_id": elicitation_id,
+                "action": "cancel",
+                "_meta": {"interrupt": True},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert await _claim_done(session_id, f"{session_id}:done:after_runner") is True
+        assert [frame["level"] for frame in frames] == ["done"]
+    finally:
+        _clear_harness_future(elicitation_id)
+
+
+@pytest.mark.asyncio
+async def test_interrupting_cancel_note_survives_a_later_resolver_failure(
     app: FastAPI,
     stores,
     monkeypatch: pytest.MonkeyPatch,
-    entry_point: str,
-    interrupt: bool,
-    fails: bool,
-    suppressed: bool,
 ) -> None:
-    """Only a successful cancel marked to interrupt silences its session."""
-    from omnigent.server.routes.sessions import routes_elicitations, routes_events
-
-    session_id = _seed_session(stores, owner=ALICE, title=f"{entry_point} {interrupt} {fails}")
+    """The stop landed once the Future was set, so a later failure keeps the note."""
+    session_id = _seed_session(stores, owner=ALICE, title="resolve late failure")
     frames = _register_fake_ringer()
-    claims_during_resolution: list[bool] = []
+    elicitation_id = "elicit_a"
+    future = _register_harness_future(session_id, elicitation_id)
 
-    async def _resolve(
-        _session_id: str, _data: dict[str, Any], _runner_router: Any, _store: Any
-    ) -> None:
-        claims_during_resolution.append(
-            await _claim_done(_session_id, f"{_session_id}:done:during_resolution")
-        )
-        if fails:
-            raise OmnigentError("runner unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
+    def _explode(*_args: Any) -> None:
+        raise RuntimeError("ancestor fan-out failed")
 
-    monkeypatch.setattr(routes_events, "_resolve_elicitation", _resolve)
-    monkeypatch.setattr(routes_elicitations, "_resolve_elicitation", _resolve)
-    monkeypatch.setattr(routes_events, "_apply_pending_policy_ask_writes", _resolve_noop)
-    monkeypatch.setattr(routes_elicitations, "_apply_pending_policy_ask_writes", _resolve_noop)
-
-    meta = {"_meta": {"interrupt": True}} if interrupt else {}
-    if fails:
-        with pytest.raises(OmnigentError) as error:
-            if entry_point == "approval":
-                TestClient(app).post(
-                    f"/v1/sessions/{session_id}/events",
-                    json={
-                        "type": "approval",
-                        "data": {"elicitation_id": "elicit_a", "action": "cancel", **meta},
-                    },
-                    headers={"X-Forwarded-Email": ALICE},
-                )
-            else:
-                TestClient(app).post(
-                    f"/v1/sessions/{session_id}/elicitations/elicit_a/resolve",
-                    json={"action": "cancel", **meta},
-                    headers={"X-Forwarded-Email": ALICE},
-                )
-        assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
-    elif entry_point == "approval":
-        response = TestClient(app).post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "approval",
-                "data": {"elicitation_id": "elicit_a", "action": "cancel", **meta},
-            },
-            headers={"X-Forwarded-Email": ALICE},
-        )
-        assert response.status_code == 202, response.text
-    else:
-        response = TestClient(app).post(
-            f"/v1/sessions/{session_id}/elicitations/elicit_a/resolve",
-            json={"action": "cancel", **meta},
-            headers={"X-Forwarded-Email": ALICE},
-        )
-        assert response.status_code == 202, response.text
-
-    assert claims_during_resolution == [not interrupt]
-    after_resolution = await _claim_done(session_id, f"{session_id}:done:after_resolution")
-    assert after_resolution is not suppressed
-    assert len(frames) == (2 if not interrupt else (1 if fails else 0))
+    monkeypatch.setattr(orchestration, "_publish_elicitation_resolved_to_ancestors", _explode)
+    try:
+        with pytest.raises(RuntimeError):
+            _resolve_url(
+                app,
+                session_id,
+                elicitation_id,
+                {"action": "cancel", "_meta": {"interrupt": True}},
+            )
+        assert future.done()
+        assert await _claim_done(session_id, f"{session_id}:done:after_late") is False
+        assert frames == []
+    finally:
+        _clear_harness_future(elicitation_id)
 
 
-async def _resolve_noop(*_args: Any) -> None:
-    return None
+@pytest.mark.asyncio
+async def test_cancelled_interrupt_request_forgets_note_when_shared_delivery_fails(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request cancelled mid-delivery still forgets a failed shared delivery."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = _seed_session(stores, owner=ALICE, title="cancelled interrupt failure")
+    frames = _register_fake_ringer()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def _deliver(_session_id: str, _runner_router: Any) -> None:
+        started.set()
+        await release.wait()
+        raise OmnigentError("runner unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    monkeypatch.setattr(routes_events, "_deliver_interrupt_once", _deliver)
+    endpoint = next(route.endpoint for route in app.routes if route.name == "post_event")
+    request = Request({"type": "http", "headers": [(b"x-forwarded-email", ALICE.encode())]})
+    task = asyncio.create_task(endpoint(request, session_id, SessionEventInput(type="interrupt")))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    delivery = routes_events._interrupt_delivery_tasks.get(session_id)
+    assert delivery is not None
+    release.set()
+    with pytest.raises(OmnigentError):
+        await delivery
+    assert await _claim_done(session_id, f"{session_id}:done:after_cancel") is True
+    assert [frame["level"] for frame in frames] == ["done"]
+    routes_events._interrupt_fenced_sessions.discard(session_id)

@@ -183,22 +183,6 @@ def forget_user_stop(owner: str, session_id: str) -> None:
             _user_stops.pop(owner, None)
 
 
-def is_interrupting_cancel(data: dict[str, Any]) -> bool:
-    """
-    Check whether a cancellation verdict also ends the user's turn.
-
-    :param data: Elicitation verdict dict with ``action`` and optional
-        ``_meta`` or ``meta`` fields.
-    :returns: Whether the verdict is a cancel marked with ``interrupt: true``.
-    """
-    meta = data.get("_meta")
-    if meta is None:
-        meta = data.get("meta")
-    return (
-        data.get("action") == "cancel" and isinstance(meta, dict) and meta.get("interrupt") is True
-    )
-
-
 def _activity_basis(record: _Connection) -> float:
     """Most recent activity signal: last activity, else connect time."""
     return record.last_activity if record.last_activity is not None else record.connected_at

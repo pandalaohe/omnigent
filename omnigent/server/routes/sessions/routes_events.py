@@ -408,6 +408,12 @@ def _forget_interrupt_delivery(session_id: str, task: asyncio.Task[None]) -> Non
         task.exception()
 
 
+def _forget_interrupt_stop_note(owner: str, session_id: str, task: asyncio.Task[None]) -> None:
+    """Forget the stop note when the shared interrupt delivery failed."""
+    if task.cancelled() or task.exception() is not None:
+        sound_alerts.forget_user_stop(owner, session_id)
+
+
 async def _archive_blocks_external_user_work(
     request: Request | _RunnerEventContext,
     conv: Any,
@@ -2057,11 +2063,14 @@ def register_events_routes(
                     )
                 # Multiple clients share the same delivery result. Shield it so one
                 # disconnected request cannot cancel the interrupt for every waiter.
-                try:
-                    await asyncio.shield(delivery)
-                except Exception:
-                    sound_alerts.forget_user_stop(owner, session_id)
-                    raise
+                # This request forgets the stop note if the shared delivery fails,
+                # even when the request is cancelled before that happens.
+                delivery.add_done_callback(
+                    lambda done, owner=owner, sid=session_id: _forget_interrupt_stop_note(
+                        owner, sid, done
+                    )
+                )
+                await asyncio.shield(delivery)
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
@@ -2284,18 +2293,13 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            interrupting_cancel = sound_alerts.is_interrupting_cancel(body.data)
-            owner = user_id or RESERVED_USER_LOCAL
-            if interrupting_cancel:
-                sound_alerts.note_user_stop(owner, session_id)
-            try:
-                await _resolve_elicitation(
-                    session_id, body.data, runner_router, conversation_store
-                )
-            except Exception:
-                if interrupting_cancel:
-                    sound_alerts.forget_user_stop(owner, session_id)
-                raise
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                resolver_owner=user_id or RESERVED_USER_LOCAL,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
