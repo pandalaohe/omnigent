@@ -12,7 +12,8 @@ export type UserPreferenceNamespace =
   | "session_collab"
   | "host_colors"
   | "keep_warm"
-  | "runner_log_warnings";
+  | "runner_log_warnings"
+  | "sidebar_layout";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -22,6 +23,12 @@ export interface UserPreferencesEnvelope {
 /** Window event fired after the Server acknowledges a namespace patch. */
 export const USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT =
   "omnigent:user-preference-patch-acknowledged";
+
+/**
+ * Window event fired when the Server permanently rejects a namespace patch
+ * (HTTP 422). Detail: `{ namespace, status: 422 }`.
+ */
+export const USER_PREFERENCES_PATCH_REJECTED_EVENT = "omnigent:user-preference-rejected";
 
 type PreferenceFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -83,6 +90,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
       storageKey: "omnigent:runner-log-warnings",
       eventName: "omnigent:runner-log-warnings-changed",
     },
+    sidebar_layout: {
+      storageKey: "omnigent:sidebar-layout",
+      eventName: "omnigent:sidebar-layout-changed",
+    },
   };
 
 const USER_PREFERENCES_SCOPE_KEY = "omnigent:user-preferences-owner";
@@ -106,6 +117,9 @@ let refreshListenersInstalled = false;
 let lastFocusRefreshAt = 0;
 const pendingTimers = new Map<UserPreferenceNamespace, number>();
 const lastAcknowledged = new Map<UserPreferenceNamespace, string>();
+// Last known Server value per namespace: a permanently rejected patch (HTTP
+// 422) restores local state from here instead of retrying.
+const lastServerValues = new Map<UserPreferenceNamespace, unknown>();
 interface PendingPatch {
   syncValue: unknown | null;
   serialized: string;
@@ -281,6 +295,7 @@ function hydrateServerEnvelope(envelope: UserPreferencesEnvelope): void {
   try {
     for (const namespace of Object.keys(CATEGORY_CONFIG) as UserPreferenceNamespace[]) {
       const serverNamespace = envelope.settings[namespace] ?? null;
+      lastServerValues.set(namespace, serverNamespace);
       if (dirty.has(namespace)) {
         const retained = readDirtyValue(namespace);
         if (retained.found) applyNamespace(namespace, retained.value);
@@ -348,6 +363,7 @@ function cancelPreferenceActivity(): void {
   patchesAfterFlight.clear();
   inFlightPatches.clear();
   lastAcknowledged.clear();
+  lastServerValues.clear();
   syncGeneration += 1;
 }
 
@@ -445,6 +461,38 @@ export async function initializeUserPreferencesSync(
   hydrateServerEnvelope(serverValue);
 }
 
+function announceRejectedNamespace(namespace: UserPreferenceNamespace): void {
+  window.dispatchEvent(
+    new CustomEvent(USER_PREFERENCES_PATCH_REJECTED_EVENT, {
+      detail: { namespace, status: 422 },
+    }),
+  );
+}
+
+/**
+ * A 422 is permanent for a namespace: cancel any queued work, drop the dirty
+ * mark, restore the last Server value (absent → remove the local key) exactly
+ * as hydration does, and announce the rejection. No retry is scheduled.
+ */
+function discardRejectedNamespace(namespace: UserPreferenceNamespace): void {
+  const queuedTimer = pendingTimers.get(namespace);
+  if (queuedTimer !== undefined) {
+    window.clearTimeout(queuedTimer);
+    pendingTimers.delete(namespace);
+  }
+  patchesAfterFlight.delete(namespace);
+  const serverValue = lastServerValues.get(namespace) ?? null;
+  clearDirty(namespace);
+  lastAcknowledged.set(namespace, serializedNamespaceValue(namespace, serverValue));
+  applyingServerPreferences = true;
+  try {
+    applyNamespace(namespace, serverValue);
+  } finally {
+    applyingServerPreferences = false;
+  }
+  announceRejectedNamespace(namespace);
+}
+
 function schedulePatch(
   namespace: UserPreferenceNamespace,
   syncValue: unknown | null,
@@ -478,8 +526,28 @@ function schedulePatch(
             body: JSON.stringify({ value: syncValue }),
           });
           if (!isCurrentPreferenceGeneration(generation)) return;
+          if (response?.status === 422) {
+            const current = latestNamespaceValue(namespace);
+            const currentSerialized = serializedNamespaceValue(namespace, current);
+            if (currentSerialized !== serialized) {
+              // A newer local edit arrived while this patch was in flight: send
+              // the newest value next (a stale queued patch could cancel its timer).
+              markDirty(namespace, current);
+              patchesAfterFlight.set(namespace, {
+                syncValue: current,
+                serialized: currentSerialized,
+                delayMs: 0,
+                attempt: 0,
+              });
+              announceRejectedNamespace(namespace);
+            } else {
+              discardRejectedNamespace(namespace);
+            }
+            return;
+          }
           if (!response?.ok) throw new Error("preference patch failed");
           lastAcknowledged.set(namespace, serialized);
+          lastServerValues.set(namespace, syncValue);
           window.dispatchEvent(
             new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
               detail: { namespace },

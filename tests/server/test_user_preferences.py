@@ -1944,3 +1944,41 @@ async def test_preferences_api_initialize_validates_worktree_location(
         assert accepted.json()["settings"]["worktree_location"] == {
             "pathTemplate": _ENTRY_TEMPLATE
         }
+
+
+@pytest.mark.asyncio
+async def test_preferences_api_accepts_the_sidebar_layout_namespace(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The sidebar layout namespace is allowlisted and round-trips whole values."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    layout = {
+        "version": 1,
+        "sections": [
+            {
+                "id": "s1",
+                "kind": "projects",
+                "name": "Work",
+                "maxRows": 10,
+                "projectIds": ["p1", "p2"],
+            },
+            {"id": "s2", "kind": "other_projects", "name": "Projects", "maxRows": None},
+            {"id": "s3", "kind": "other_sessions", "name": "Sessions", "maxRows": None},
+        ],
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "sidebar@example.com"}
+        patched = await client.patch(
+            "/v1/me/preferences/sidebar_layout",
+            headers=headers,
+            json={"value": layout},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["settings"]["sidebar_layout"] == layout
+
+        synced_me = await client.get("/v1/me", headers=headers)
+        assert synced_me.status_code == 200
+        assert synced_me.json()["preferences"]["settings"]["sidebar_layout"] == layout

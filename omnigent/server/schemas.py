@@ -91,6 +91,7 @@ UserPreferenceNamespace = Literal[
     "keep_warm",
     "worktree_location",
     "runner_log_warnings",
+    "sidebar_layout",
 ]
 
 

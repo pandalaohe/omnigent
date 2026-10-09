@@ -7,6 +7,7 @@ import {
   refreshUserPreferencesFromServer,
   resetUserPreferencesSyncForTests,
   USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT,
+  USER_PREFERENCES_PATCH_REJECTED_EVENT,
 } from "./userPreferencesSync";
 import {
   readApprovalTimeoutPreferences,
@@ -562,6 +563,150 @@ describe("user preference synchronization", () => {
     await vi.advanceTimersByTimeAsync(251);
     await vi.runOnlyPendingTimersAsync();
     expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem("omnigent:user-preferences-dirty")).toBeNull();
+  });
+
+  it("still retries a 500 patch as before", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 500 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    queueUserPreferencePatch("usage_context", { version: 1, showCodexRateLimits: true });
+    await vi.advanceTimersByTimeAsync(251);
+    await vi.runOnlyPendingTimersAsync();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem("omnigent:user-preferences-dirty")).toBeNull();
+  });
+
+  it("treats a 422 namespace patch as permanent and restores the Server value", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 422 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { usage_context: { version: 1, showCodexRateLimits: true } } },
+      fetcher,
+      "alice",
+    );
+    const rejected = vi.fn();
+    window.addEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, rejected);
+
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({ version: 1, showCodexRateLimits: false }),
+    );
+    queueUserPreferencePatch("usage_context", { version: 1, showCodexRateLimits: false });
+    await vi.advanceTimersByTimeAsync(251);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(rejected).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: { namespace: "usage_context", status: 422 } }),
+    );
+    expect(localStorage.getItem("omnigent:user-preferences-dirty")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("omnigent:usage-context-preferences")!)).toEqual({
+      version: 1,
+      showCodexRateLimits: true,
+    });
+    window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, rejected);
+  });
+
+  it("restores the last acknowledged value when a later patch is rejected", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 422 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    const saved = { version: 1, showCodexRateLimits: false };
+    localStorage.setItem("omnigent:usage-context-preferences", JSON.stringify(saved));
+    queueUserPreferencePatch("usage_context", saved);
+    await vi.advanceTimersByTimeAsync(251);
+
+    const rejected = { version: 1, showCodexRateLimits: true };
+    localStorage.setItem("omnigent:usage-context-preferences", JSON.stringify(rejected));
+    queueUserPreferencePatch("usage_context", rejected);
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(localStorage.getItem("omnigent:usage-context-preferences")!)).toEqual(saved);
+  });
+
+  it("keeps a newer queued edit when the in-flight patch is rejected", async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (response: Response) => void;
+    const fetcher = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+
+    const first = { version: 1, showCodexRateLimits: false };
+    localStorage.setItem("omnigent:usage-context-preferences", JSON.stringify(first));
+    queueUserPreferencePatch("usage_context", first);
+    await vi.advanceTimersByTimeAsync(251);
+
+    const second = { version: 1, showCodexRateLimits: true };
+    localStorage.setItem("omnigent:usage-context-preferences", JSON.stringify(second));
+    queueUserPreferencePatch("usage_context", second);
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    resolveFirst(new Response(null, { status: 422 }));
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.map((call) => (call[1] as RequestInit).body)).toEqual([
+      JSON.stringify({ value: first }),
+      JSON.stringify({ value: second }),
+    ]);
+    expect(JSON.parse(localStorage.getItem("omnigent:usage-context-preferences")!)).toEqual(second);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(localStorage.getItem("omnigent:user-preferences-dirty")).toBeNull();
+  });
+
+  it("sends the newest edit when a rejected patch had both a queued and a pending edit behind it", async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (response: Response) => void;
+    const fetcher = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    const key = "omnigent:usage-context-preferences";
+    const edit = (value: object) => {
+      localStorage.setItem(key, JSON.stringify(value));
+      queueUserPreferencePatch("usage_context", value);
+    };
+
+    const first = { version: 1, showCodexRateLimits: false };
+    edit(first);
+    await vi.advanceTimersByTimeAsync(251);
+    edit({ version: 1, showCodexRateLimits: true });
+    await vi.advanceTimersByTimeAsync(251);
+    const third = { version: 1, showCodexRateLimits: true, showClaudeRateLimits: false };
+    edit(third);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    resolveFirst(new Response(null, { status: 422 }));
+    await vi.runOnlyPendingTimersAsync();
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(fetcher.mock.calls.map((call) => (call[1] as RequestInit).body)).toEqual([
+      JSON.stringify({ value: first }),
+      JSON.stringify({ value: third }),
+    ]);
+    expect(JSON.parse(localStorage.getItem(key)!)).toEqual(third);
     expect(localStorage.getItem("omnigent:user-preferences-dirty")).toBeNull();
   });
 
