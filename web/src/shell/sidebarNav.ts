@@ -467,6 +467,7 @@ export type SidebarDropTarget =
   | { type: "ungroup" }
   | { type: "pin" }
   | { type: "pin-order"; id: string }
+  | { type: "fav-item"; refType: "session" | "project"; refId: string }
   | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
@@ -527,6 +528,17 @@ export function resolveSidebarDrop(
     return target.id === source.id
       ? { kind: "none" }
       : { kind: "reorder-pin", targetId: target.id };
+  }
+  if (target.type === "fav-item") {
+    // A project ref isn't a pin slot: an unpinned session pins to the end, a
+    // pinned one has nowhere to go. A session ref behaves like a pin slot.
+    if (target.refType === "project") {
+      return source.isPinned ? { kind: "none" } : { kind: "pin" };
+    }
+    if (!source.isPinned) return { kind: "pin", targetId: target.refId };
+    return target.refId === source.id
+      ? { kind: "none" }
+      : { kind: "reorder-pin", targetId: target.refId };
   }
   // Ungroup (dropped on "Chats" / the fallback strip): land it in the flat list.
   if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };

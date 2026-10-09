@@ -39,7 +39,12 @@ export function useRecentSessions(count: number, enabled: boolean) {
   const query = useQuery<Conversation[]>({
     queryKey: ["recent-sessions", count],
     queryFn: () => fetchRecentSessions(count),
-    enabled,
+    // Disable the query once the capability error lands: a disabled query is
+    // skipped by invalidateQueries, so an archive / delete caller's Recent
+    // invalidation can't refetch the known-unavailable route. The error stays
+    // in state for the old-server note.
+    enabled: (recentQuery) =>
+      enabled && !(recentQuery.state.error instanceof RecentSessionsUnavailableError),
     refetchOnWindowFocus: (queryState) =>
       !(queryState.state.error instanceof RecentSessionsUnavailableError),
     refetchInterval: (queryState) =>

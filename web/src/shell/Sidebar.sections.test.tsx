@@ -39,8 +39,8 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-const { projectsRef, pinnedRef, orderRef, orderStatusRef, pinFn, folderRowsRef } = vi.hoisted(
-  () => ({
+const { projectsRef, pinnedRef, orderRef, orderStatusRef, pinFn, folderRowsRef, reorderPinsFn } =
+  vi.hoisted(() => ({
     projectsRef: {
       current: [] as { id: string | null; name: string; icon?: string | null }[],
     },
@@ -53,9 +53,9 @@ const { projectsRef, pinnedRef, orderRef, orderStatusRef, pinFn, folderRowsRef }
     },
     orderStatusRef: { current: 200 },
     pinFn: vi.fn((_vars: unknown) => Promise.resolve({})),
+    reorderPinsFn: vi.fn((_writes: unknown) => undefined),
     folderRowsRef: { current: new Map<string, unknown[]>() },
-  }),
-);
+  }));
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
@@ -63,6 +63,7 @@ vi.mock("@/hooks/useConversations", async () => {
     ...conversationHooksMock(),
     resolveOrCreateProjectId: vi.fn((name: string) => Promise.resolve(`p_${name}`)),
     useTogglePinnedConversation: () => ({ mutate: vi.fn(), mutateAsync: pinFn }),
+    useReorderPinnedConversations: () => ({ mutate: reorderPinsFn }),
     useProjects: () => ({ data: projectsRef.current }),
     usePinnedConversations: () => ({
       data: { conversations: pinnedRef.current, filterHonored: true },
@@ -200,6 +201,7 @@ beforeEach(() => {
   recentRef.current = { status: 200, data: [] };
   pinFn.mockReset();
   pinFn.mockResolvedValue({});
+  reorderPinsFn.mockReset();
   folderRowsRef.current = new Map();
   fetchMock.mockReset();
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -951,6 +953,53 @@ describe("reordering folders inside a projects section", () => {
       "true",
     );
   });
+
+  it("keeps an own-section body drop within the section when a neighbouring folder is nearer", async () => {
+    stubRects();
+    orderRef.current = {
+      sort_mode: "manual",
+      ordered_project_ids: ["p_alpha", "p_beta", "p_gamma"],
+    };
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_work",
+            kind: "projects",
+            name: "Work",
+            maxRows: null,
+            projectIds: ["p_alpha", "p_beta"],
+          },
+          { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    renderSidebar();
+    await waitForProjectOrderReady("Alpha");
+
+    // A point near the bottom of Work's body: geometrically nearer Gamma (in
+    // the neighbouring Projects section) than Alpha's own header.
+    const workRect = document
+      .querySelector('[data-section-id="sec_work"]')!
+      .getBoundingClientRect();
+    const dropPoint = {
+      clientX: workRect.left + workRect.width / 2,
+      clientY: workRect.bottom - 10,
+    };
+
+    await dragHeaderToPoint(
+      headerButton("Use Alpha for new sessions"),
+      headerPoint("Use Alpha for new sessions"),
+      dropPoint,
+    );
+
+    // The own-section fallback must not treat the drop as a cross-section move:
+    // Alpha stays in Work (reordered within it), not moved to Projects.
+    expect(projectIdsOf("sec_work")).toEqual(["p_beta", "p_alpha"]);
+  });
 });
 
 describe("collapsed section marker freshness", () => {
@@ -1160,5 +1209,281 @@ describe("sidebar favorites", () => {
         items: [{ type: "session", id: "s1" }],
       });
     });
+  });
+});
+
+// ── Project favorites ─────────────────────────────────────────────────────────
+
+const FAVORITES_PROJECT_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    {
+      id: "sec_fav",
+      kind: "favorites",
+      name: "Favorites",
+      maxRows: null,
+      items: [
+        { type: "project", id: "p_beta" },
+        { type: "session", id: "s1" },
+      ],
+    },
+    { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+    { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
+// Only the favorites section, so a project copy's header isn't duplicated.
+const FAVORITES_REORDER_LAYOUT: SidebarLayout = {
+  version: 1,
+  sections: [
+    {
+      id: "sec_fav",
+      kind: "favorites",
+      name: "Favorites",
+      maxRows: null,
+      items: [
+        { type: "project", id: "p_beta" },
+        { type: "session", id: "s1" },
+      ],
+    },
+    { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+  ],
+};
+
+const FAVORITE_ROW_HEIGHT = 30;
+
+/** Stack the favorites section's items so a pointer can target each one. */
+function stubFavoriteItemRects() {
+  return vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ) {
+    const fav = document.querySelector('[data-section-id="sec_fav"]');
+    const list = fav?.querySelector("ul");
+    if (list == null) return new DOMRect(0, 0, 0, 0);
+    const items = [
+      ...list.querySelectorAll("[data-project-order-name], li[data-sidebar-session-id]"),
+    ];
+    const index = items.indexOf(this);
+    if (index < 0) return new DOMRect(0, 0, 0, 0);
+    return new DOMRect(0, index * FAVORITE_ROW_HEIGHT, 200, FAVORITE_ROW_HEIGHT);
+  });
+}
+
+function favoriteItemPoint(index: number): { clientX: number; clientY: number } {
+  return { clientX: 100, clientY: index * FAVORITE_ROW_HEIGHT + FAVORITE_ROW_HEIGHT / 2 };
+}
+
+describe("sidebar project favorites", () => {
+  afterEach(() => {
+    fireEvent.mouseUp(document);
+    vi.restoreAllMocks();
+  });
+
+  it("T10 renders a project ref, its session ref, then an unreferenced pin", () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_PROJECT_LAYOUT));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const s1 = conversation("s1", { labels: { "omnigent.pinned": "1000" }, updated_at: 2 });
+    const s3 = conversation("s3", { labels: { "omnigent.pinned": "2000" }, updated_at: 1 });
+    pinnedRef.current = [s1, s3];
+    mockConversations([s1, s3]);
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const beta = within(fav).getByText("Beta");
+    const s1row = within(fav).getByText("s1");
+    const s3row = within(fav).getByText("s3");
+    expect(isBefore(beta, s1row)).toBe(true);
+    expect(isBefore(s1row, s3row)).toBe(true);
+    // The project copy doesn't remove the folder from its own section.
+    expect(within(sectionOf("Projects")).getByText("Beta")).toBeInTheDocument();
+  });
+
+  it("expands the favorite copy independently of the section copy", () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_PROJECT_LAYOUT));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const s1 = conversation("s1", { labels: { omni_project: "Beta" }, updated_at: 2 });
+    mockConversations([s1]);
+    folderRowsRef.current.set("Beta", [s1]);
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const proj = sectionOf("Projects");
+    expect(within(fav).queryByText("s1")).toBeNull();
+    expect(within(proj).queryByText("s1")).toBeNull();
+
+    fireEvent.click(within(fav).getByRole("button", { name: "Beta" }));
+    expect(within(fav).getByText("s1")).toBeInTheDocument();
+    expect(within(proj).queryByText("s1")).toBeNull();
+
+    fireEvent.click(within(proj).getByRole("button", { name: "Beta" }));
+    expect(within(proj).getByText("s1")).toBeInTheDocument();
+
+    // Collapsing the copy unregisters only its own folder rows; the section
+    // copy's stay registered and rendered.
+    fireEvent.click(within(fav).getByRole("button", { name: "Beta" }));
+    expect(within(fav).queryByText("s1")).toBeNull();
+    expect(within(proj).getByText("s1")).toBeInTheDocument();
+  });
+
+  it("adds a label-only project to favorites from the menu, promoting it first", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    projectsRef.current = [{ id: null, name: "Legacy", icon: null }, ...PROJECTS];
+    renderSidebar();
+
+    fireEvent.pointerDown(
+      within(sectionOf("Projects")).getByLabelText("Project actions for Legacy"),
+      { button: 0 },
+    );
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("favorite-project"));
+
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.kind === "favorites");
+      expect(favorites?.items).toEqual([{ type: "project", id: "p_Legacy" }]);
+    });
+    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Legacy");
+  });
+
+  it("adds a project to favorites by dragging its folder onto the favorites section", async () => {
+    stubRects();
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          { id: "sec_fav", kind: "favorites", name: "Favorites", maxRows: null, items: [] },
+          { id: "sec_work", kind: "projects", name: "Work", maxRows: null, projectIds: [] },
+          { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    renderSidebar();
+    // Wait for the project-order query so the folder header drag is enabled.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(within(sectionOf("Projects")).getByText("Alpha")).toBeInTheDocument();
+
+    await dragHeaderToPoint(
+      headerButton("Use Alpha for new sessions"),
+      headerPoint("Use Alpha for new sessions"),
+      sectionPoint("sec_fav"),
+    );
+
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+      expect(favorites?.items).toEqual([{ type: "project", id: "p_alpha" }]);
+    });
+  });
+
+  it("reorders a project ref below a session and writes no pin timestamps", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_REORDER_LAYOUT));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const source = within(fav).getByRole("button", { name: "Use Beta for new sessions" });
+    const start = favoriteItemPoint(0);
+    const target = favoriteItemPoint(1);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+      expect(favorites?.items).toEqual([
+        { type: "session", id: "s1" },
+        { type: "project", id: "p_beta" },
+      ]);
+    });
+    expect(reorderPinsFn).not.toHaveBeenCalled();
+  });
+
+  it("reorders a session above another and writes the pin timestamps", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_REORDER_LAYOUT));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const s1 = conversation("s1", { labels: { "omnigent.pinned": "1000" } });
+    const s3 = conversation("s3", { labels: { "omnigent.pinned": "2000" } });
+    pinnedRef.current = [s1, s3];
+    mockConversations([s1, s3]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    // DOM order: Beta copy (0), s1 (1), s3 (2).
+    const source = within(fav).getByText("s3").closest("li") as HTMLElement;
+    const start = favoriteItemPoint(2);
+    const target = favoriteItemPoint(1);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    await waitFor(() => expect(reorderPinsFn).toHaveBeenCalledWith([{ id: "s3", pinnedAt: 999 }]));
+  });
+
+  it("T16 renders one favorites section from a layout with two and offers no Favorites kind", () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav_a",
+            kind: "favorites",
+            name: "First",
+            maxRows: null,
+            items: [{ type: "session", id: "s1" }],
+          },
+          {
+            id: "sec_fav_b",
+            kind: "favorites",
+            name: "Second",
+            maxRows: null,
+            items: [{ type: "project", id: "p_beta" }],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    renderSidebar();
+
+    expect(screen.queryByText("Second")).toBeNull();
+    const fav = sectionOf("First");
+    expect(within(fav).getByText("Beta")).toBeInTheDocument();
+    expect(within(fav).getByText("s1")).toBeInTheDocument();
+
+    fireEvent.pointerDown(within(sectionOf("Sessions")).getByTestId("section-options"), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByTestId("new-section"));
+    expect(screen.queryByTestId("new-section-kind-favorites")).toBeNull();
   });
 });

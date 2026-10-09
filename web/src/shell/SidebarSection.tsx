@@ -42,6 +42,7 @@ import { showToast } from "@/components/ui/toast";
 import { resolveOrCreateProjectId } from "@/hooks/useConversations";
 import type { SaveSidebarLayout } from "@/hooks/useSidebarLayout";
 import {
+  addFavorite,
   moveProjectToSection,
   moveSection,
   removeSection,
@@ -75,6 +76,8 @@ export function useSidebarLayoutContext(): SidebarLayoutContextValue | null {
 export const sectionOrderId = (id: string) => `section-order:${id}`;
 /** The droppable id of a `projects` / `other_projects` section wrapper. */
 export const sectionDropId = (id: string) => `section:${id}`;
+/** The droppable id of a favorites section wrapper (a project drag drops here). */
+export const favoritesDropId = (id: string) => `favorites:${id}`;
 
 export interface SidebarSectionBody {
   /** The capped scroll container when the section has a max height. */
@@ -158,11 +161,17 @@ export function SidebarSection({
     disabled: dragDisabled,
   });
   const isProjectSection = section.kind === "projects" || section.kind === "other_projects";
-  const { setNodeRef, isOver } = useDroppable({
-    id: sectionDropId(section.id),
-    data: { type: "section", id: section.id, kind: section.kind },
-    disabled: !isProjectSection,
-  });
+  const isFavoritesSection = section.kind === "favorites";
+  const acceptsProjectDrop = isProjectSection || isFavoritesSection;
+  const { setNodeRef, isOver } = useDroppable(
+    isFavoritesSection
+      ? { id: favoritesDropId(section.id), data: { type: "favorites", id: section.id } }
+      : {
+          id: sectionDropId(section.id),
+          data: { type: "section", id: section.id, kind: section.kind },
+          disabled: !isProjectSection,
+        },
+  );
   const content = children(body, options, headerDrag);
   if (content == null) return null;
   return (
@@ -171,7 +180,7 @@ export function SidebarSection({
       data-section-id={section.id}
       className={cn(
         "relative",
-        isProjectSection && projectDragActive && isOver && dropHighlightClass,
+        acceptsProjectDrop && projectDragActive && isOver && dropHighlightClass,
       )}
     >
       {insertion && (
@@ -442,6 +451,37 @@ export async function moveProjectToSectionWithPromotion({
   }
   if (id === null) return;
   saveLayout((current) => moveProjectToSection(current, id, sectionId));
+}
+
+/**
+ * Add a project to favorites, promoting a label-only folder to a first-class
+ * id first (same path as a section move). A failed promotion toasts and leaves
+ * the layout untouched; `addFavorite` creates the favorites section when none
+ * exists.
+ */
+export async function addProjectToFavoritesWithPromotion({
+  projectId,
+  projectName,
+  saveLayout,
+  queryClient,
+}: {
+  projectId: string | null;
+  projectName: string;
+  saveLayout: SaveSidebarLayout;
+  queryClient: QueryClient;
+}): Promise<void> {
+  let id = projectId;
+  try {
+    if (id === null) {
+      id = await resolveOrCreateProjectId(projectName);
+      await queryClient.invalidateQueries({ queryKey: ["projects"] });
+    }
+  } catch {
+    showToast("Couldn't add the project to favorites");
+    return;
+  }
+  if (id === null) return;
+  saveLayout((current) => addFavorite(current, { type: "project", id }));
 }
 
 /**

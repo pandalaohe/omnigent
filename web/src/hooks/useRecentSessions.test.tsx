@@ -63,6 +63,13 @@ describe("useRecentSessions", () => {
       });
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Archive / delete invalidate the Recent key; the disabled query must not
+      // refetch the route the server already said it doesn't have.
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: ["recent-sessions"] });
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       unmount();
       focusManager.setFocused(undefined);
