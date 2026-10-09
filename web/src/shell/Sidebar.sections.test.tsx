@@ -435,6 +435,23 @@ describe("Sidebar sections", () => {
     );
   });
 
+  it("keeps the first Recent copy canonical for an unfiled session", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_LAYOUT));
+    const session = conversation("s1");
+    mockConversations([session]);
+    recentRef.current.data = [session];
+    renderSidebar();
+
+    await waitFor(() =>
+      expect(document.querySelectorAll('li[data-sidebar-session-id="s1"]')).toHaveLength(2),
+    );
+
+    const recentRow = sectionOf("Recent").querySelector('li[data-sidebar-session-id="s1"]');
+    const sessionsRow = sectionOf("Sessions").querySelector('li[data-sidebar-session-id="s1"]');
+    expect(recentRow).toHaveAttribute("data-sidebar-canonical", "true");
+    expect(sessionsRow).not.toHaveAttribute("data-sidebar-canonical");
+  });
+
   it("changes the recent count from the Show submenu and refetches with the new limit", async () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_LAYOUT));
     renderSidebar();
@@ -481,6 +498,16 @@ describe("Sidebar sections", () => {
       expect(document.querySelectorAll('li[data-sidebar-session-id="s1"]')).toHaveLength(2),
     );
     expect(
+      sectionOf("Work").querySelector(
+        'li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]',
+      ),
+    ).not.toBeNull();
+    expect(
+      sectionOf("Recent").querySelector(
+        'li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]',
+      ),
+    ).toBeNull();
+    expect(
       document.querySelectorAll('li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]'),
     ).toHaveLength(1);
 
@@ -512,14 +539,11 @@ describe("Sidebar sections", () => {
 
 // ── Section / project drag ───────────────────────────────────────────────────
 
-const HEADER_ROW = 30;
-const SECTION_BAND = 200;
+const HEADER_ROW = 40;
+const SECTION_BAND = 400;
 const SECTION_BASE = 1000;
 
-/** jsdom has no layout, so give section wrappers, header buttons and the
- *  scroll container stacked rects for dnd-kit's pointer collision. Section
- *  bands sit below every header band so a drop on a section body never lands
- *  on a folder header. */
+/** jsdom has no layout, so section wrappers enclose their sortable headers. */
 function stubRects() {
   return vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
     this: Element,
@@ -528,11 +552,22 @@ function stubRects() {
     const sections = [...document.querySelectorAll("[data-section-id]")];
     const sectionIndex = sections.indexOf(this);
     if (sectionIndex >= 0) {
-      return new DOMRect(0, SECTION_BASE + sectionIndex * SECTION_BAND, 200, SECTION_BAND);
+      return new DOMRect(0, SECTION_BASE + sectionIndex * SECTION_BAND, 240, SECTION_BAND - 40);
     }
-    const headers = [...document.querySelectorAll('button[aria-roledescription="sortable"]')];
-    const headerIndex = headers.indexOf(this);
-    if (headerIndex >= 0) return new DOMRect(0, headerIndex * HEADER_ROW, 200, HEADER_ROW);
+    const section = this.closest("[data-section-id]");
+    if (section !== null && this.matches('button[aria-roledescription="sortable"]')) {
+      const sectionHeaders = [
+        ...section.querySelectorAll('button[aria-roledescription="sortable"]'),
+      ];
+      const headerIndex = sectionHeaders.indexOf(this);
+      const index = sections.indexOf(section);
+      return new DOMRect(
+        0,
+        SECTION_BASE + index * SECTION_BAND + 10 + headerIndex * HEADER_ROW,
+        200,
+        HEADER_ROW - 10,
+      );
+    }
     return new DOMRect(0, 0, 0, 0);
   });
 }
@@ -542,27 +577,33 @@ function headerButton(name: string): HTMLElement {
 }
 
 function headerPoint(name: string): { clientX: number; clientY: number } {
-  const headers = [...document.querySelectorAll('button[aria-roledescription="sortable"]')];
-  const index = headers.indexOf(headerButton(name));
-  return { clientX: 50, clientY: index * HEADER_ROW + HEADER_ROW / 2 };
+  const rect = headerButton(name).getBoundingClientRect();
+  return { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
 }
 
 function sectionPoint(sectionId: string): { clientX: number; clientY: number } {
   const sections = [...document.querySelectorAll("[data-section-id]")];
-  const index = sections.findIndex((el) => el.getAttribute("data-section-id") === sectionId);
-  return { clientX: 50, clientY: SECTION_BASE + index * SECTION_BAND + SECTION_BAND / 2 };
+  const section = sections.find((el) => el.getAttribute("data-section-id") === sectionId);
+  if (section === undefined) throw new Error(`No section with id ${sectionId}`);
+  const rect = section.getBoundingClientRect();
+  return { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
 }
 
 async function dragHeaderToPoint(
   sourceEl: HTMLElement,
   source: { clientX: number; clientY: number },
   target: { clientX: number; clientY: number },
+  expectProjectInsertion = false,
 ) {
   fireEvent.mouseDown(sourceEl, { button: 0, ...source });
   fireEvent.mouseMove(document, { clientX: source.clientX, clientY: source.clientY - 10 });
   await act(async () => {
     fireEvent.mouseMove(document, target);
   });
+  if (expectProjectInsertion) {
+    expect(sourceEl).toHaveClass("opacity-40");
+    expect(screen.queryByTestId("project-order-insertion")).not.toBeNull();
+  }
   await act(async () => {
     fireEvent.mouseUp(document, target);
   });
@@ -576,9 +617,83 @@ function projectIdsOf(sectionId: string): string[] | undefined {
   return storedLayout().sections.find((section) => section.id === sectionId)?.projectIds;
 }
 
+async function waitForProjectOrderReady(projectName: string) {
+  fireEvent.pointerDown(screen.getByLabelText(`Project actions for ${projectName}`), {
+    button: 0,
+  });
+  fireEvent.keyDown(screen.getByTestId("move-project"), { key: "ArrowRight" });
+  await waitFor(() =>
+    expect(screen.getByRole("menuitem", { name: "Move down" })).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    ),
+  );
+  fireEvent.pointerDown(document.body, { button: 0 });
+  await waitFor(() => expect(screen.queryByTestId("move-project")).toBeNull());
+}
+
+async function startKeyboardDrag(source: HTMLElement) {
+  fireEvent.keyDown(source, { code: "Space", key: " " });
+  await act(
+    async () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      }),
+  );
+}
+
 describe("sidebar section drag", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("reorders a section header with the keyboard in the default layout", async () => {
+    stubRects();
+    renderSidebar();
+
+    const source = headerButton("Use No Project for new sessions");
+    await startKeyboardDrag(source);
+    expect(source).toHaveClass("opacity-40");
+    await act(async () => {
+      fireEvent.keyDown(source, { code: "ArrowUp", key: "ArrowUp" });
+    });
+    fireEvent.keyDown(source, { code: "Space", key: " " });
+
+    await waitFor(() =>
+      expect(storedLayout().sections.map((section) => section.id)).toEqual([
+        "default-favorites",
+        "default-other-sessions",
+        "default-other-projects",
+      ]),
+    );
+  });
+
+  it("reorders a project folder with the keyboard in the default layout", async () => {
+    stubRects();
+    orderRef.current = {
+      sort_mode: "manual",
+      ordered_project_ids: ["p_alpha", "p_beta", "p_gamma"],
+    };
+    renderSidebar();
+    await waitForProjectOrderReady("Alpha");
+
+    const source = headerButton("Use Alpha for new sessions");
+    await startKeyboardDrag(source);
+    expect(source).toHaveClass("opacity-40");
+    await act(async () => {
+      fireEvent.keyDown(source, { code: "ArrowDown", key: "ArrowDown" });
+    });
+    fireEvent.keyDown(source, { code: "Space", key: " " });
+
+    await waitFor(() => {
+      const saves = fetchMock.mock.calls.filter(
+        ([url, init]) => String(url) === "/v1/projects/order" && init?.method === "PUT",
+      );
+      expect(saves).toHaveLength(1);
+      expect(JSON.parse((saves[0]![1] as RequestInit).body as string)).toEqual({
+        ordered_project_ids: ["p_beta", "p_alpha", "p_gamma"],
+      });
+    });
   });
 
   it("moves a section header above another and saves the new order", async () => {
@@ -604,6 +719,33 @@ describe("sidebar section drag", () => {
       "default-other-projects",
     ]);
     expect(isBefore(screen.getByText("Sessions"), screen.getByText("Projects"))).toBe(true);
+  });
+
+  it("reorders a default-layout folder when released on the Projects body", async () => {
+    stubRects();
+    orderRef.current = {
+      sort_mode: "manual",
+      ordered_project_ids: ["p_alpha", "p_beta", "p_gamma"],
+    };
+    renderSidebar();
+    await waitForProjectOrderReady("Alpha");
+
+    await dragHeaderToPoint(
+      headerButton("Use Alpha for new sessions"),
+      headerPoint("Use Alpha for new sessions"),
+      sectionPoint("default-other-projects"),
+      true,
+    );
+
+    await waitFor(() => {
+      const saves = fetchMock.mock.calls.filter(
+        ([url, init]) => String(url) === "/v1/projects/order" && init?.method === "PUT",
+      );
+      expect(saves).toHaveLength(1);
+      expect(JSON.parse((saves[0]![1] as RequestInit).body as string)).toEqual({
+        ordered_project_ids: ["p_beta", "p_gamma", "p_alpha"],
+      });
+    });
   });
 
   it("moves a project folder into a projects section and back onto Projects", async () => {
@@ -724,6 +866,54 @@ describe("reordering folders inside a projects section", () => {
       isBefore(
         within(sectionOf("Work")).getByText("Alpha"),
         within(sectionOf("Work")).getByText("Beta"),
+      ),
+    ).toBe(true);
+  });
+
+  it("reorders a folder by mouse when its own section body is the drop target", async () => {
+    stubRects();
+    orderRef.current = { sort_mode: "manual", ordered_project_ids: ["p_beta", "p_alpha"] };
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(TWO_PROJECT_LAYOUT));
+    renderSidebar();
+    await waitForProjectOrderReady("Beta");
+
+    await dragHeaderToPoint(
+      headerButton("Use Beta for new sessions"),
+      headerPoint("Use Beta for new sessions"),
+      sectionPoint("sec_work"),
+      true,
+    );
+
+    await waitFor(() => expect(projectIdsOf("sec_work")).toEqual(["p_alpha", "p_beta"]));
+  });
+
+  it("moves down across an unresolved project reference", async () => {
+    orderRef.current = { sort_mode: "manual", ordered_project_ids: ["p_alpha", "p_beta"] };
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        ...TWO_PROJECT_LAYOUT,
+        sections: TWO_PROJECT_LAYOUT.sections.map((section) =>
+          section.id === "sec_work"
+            ? { ...section, projectIds: ["p_alpha", "missing", "p_beta"] }
+            : section,
+        ),
+      }),
+    );
+    renderSidebar();
+    await waitForProjectOrderReady("Alpha");
+
+    fireEvent.pointerDown(within(sectionOf("Work")).getAllByTestId("project-actions")[0], {
+      button: 0,
+    });
+    fireEvent.keyDown(screen.getByTestId("move-project"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move down" }));
+
+    await waitFor(() => expect(projectIdsOf("sec_work")).toEqual(["p_beta", "missing", "p_alpha"]));
+    expect(
+      isBefore(
+        within(sectionOf("Work")).getByText("Beta"),
+        within(sectionOf("Work")).getByText("Alpha"),
       ),
     ).toBe(true);
   });

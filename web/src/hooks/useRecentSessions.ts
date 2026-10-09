@@ -40,19 +40,24 @@ export function useRecentSessions(count: number, enabled: boolean) {
     queryKey: ["recent-sessions", count],
     queryFn: () => fetchRecentSessions(count),
     enabled,
-    refetchOnWindowFocus: true,
-    refetchInterval: enabled ? 60_000 : false,
+    refetchOnWindowFocus: (queryState) =>
+      !(queryState.state.error instanceof RecentSessionsUnavailableError),
+    refetchInterval: (queryState) =>
+      enabled && !(queryState.state.error instanceof RecentSessionsUnavailableError)
+        ? 60_000
+        : false,
     retry: (failureCount, error) =>
       error instanceof RecentSessionsUnavailableError ? false : failureCount < 3,
   });
 
   useEffect(() => {
     const onTouched = () => {
+      if (query.error instanceof RecentSessionsUnavailableError) return;
       void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
     };
     window.addEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
     return () => window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
-  }, [queryClient]);
+  }, [queryClient, query.error]);
 
   return query;
 }

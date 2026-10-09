@@ -1,5 +1,5 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -37,21 +37,37 @@ describe("useRecentSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("treats a 404 as a capability signal and does not retry", async () => {
+  it("stops every automatic fetch after a 404 capability signal", async () => {
     fetchMock.mockResolvedValue(jsonResponse({}, 404));
     // A retrying client proves the hook's own retry decision, not the client's.
     const client = new QueryClient({
       defaultOptions: { queries: { retry: 3, retryDelay: 0 } },
     });
-    const { result } = renderHook(() => useRecentSessions(5, true), {
+    vi.useFakeTimers();
+    const { result, unmount } = renderHook(() => useRecentSessions(5, true), {
       wrapper: wrapperFor(client),
     });
 
-    await waitFor(() => expect(result.current.isError).toBe(true));
+    try {
+      await vi.waitFor(() => expect(result.current.isError).toBe(true));
 
-    expect(result.current.error).toBeInstanceOf(RecentSessionsUnavailableError);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/me/recent-sessions?limit=5");
+      expect(result.current.error).toBeInstanceOf(RecentSessionsUnavailableError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/me/recent-sessions?limit=5");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3 * 60_000);
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+        window.dispatchEvent(new Event(RECENT_SESSIONS_TOUCHED_EVENT));
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      focusManager.setFocused(undefined);
+      vi.useRealTimers();
+    }
   });
 
   it("refetches when the touched event fires", async () => {

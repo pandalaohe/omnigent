@@ -1676,7 +1676,7 @@ export async function postEvent(
       recovery?: PostEventResponse["recovery"];
     },
   );
-  if (isRecentSessionsTouchingEvent(event)) notifyRecentSessionsTouched();
+  if (isRecentSessionsTouchingEvent(event) && !result.denied) notifyRecentSessionsTouched();
   return result;
 }
 

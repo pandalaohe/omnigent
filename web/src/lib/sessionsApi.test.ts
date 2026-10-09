@@ -1662,9 +1662,20 @@ describe("postEvent", () => {
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
   });
 
-  it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {
+  it("surfaces 4xx without dispatching a recent touch", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 422 }));
-    await expect(postEvent("conv_abc", { type: "bogus", data: {} })).rejects.toThrow(/422/);
+    const onTouched = vi.fn();
+    window.addEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+
+    await expect(
+      postEvent("conv_abc", {
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "hi" }] },
+      }),
+    ).rejects.toThrow(/422/);
+
+    expect(onTouched).not.toHaveBeenCalled();
+    window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
   });
 
   it("sends the local opt-out header when background titles are disabled", async () => {
@@ -1720,6 +1731,20 @@ describe("postEvent", () => {
     });
 
     expect(onTouched).toHaveBeenCalledTimes(1);
+    window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+  });
+
+  it("does not dispatch for a denied user message", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, denied: true }));
+    const onTouched = vi.fn();
+    window.addEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
+
+    await postEvent("conv_abc", {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "hi" }] },
+    });
+
+    expect(onTouched).not.toHaveBeenCalled();
     window.removeEventListener(RECENT_SESSIONS_TOUCHED_EVENT, onTouched);
   });
 
