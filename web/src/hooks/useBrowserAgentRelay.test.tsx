@@ -596,7 +596,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
   });
 
   it("screenshot: reports 'No browser open' when the bridge has no image", async () => {
-    installBridge({ browserScreenshot: vi.fn().mockResolvedValue({ ok: true }) });
+    installBridge({ browserScreenshot: vi.fn().mockResolvedValue({ ok: false }) });
     await runAction(actionEvent("screenshot"));
     expect((postedResult().result as { error: string }).error).toMatch(/No browser open/);
   });
@@ -694,6 +694,110 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     });
     await runAction(actionEvent("click", { selector: "x" }));
     expect((postedResult().result as { ok: boolean; error: string }).error).toBe("execute blew up");
+  });
+
+  it("screenshot: a rejected capture IPC call still posts {ok:false} (outer catch)", async () => {
+    installBridge({
+      browserScreenshot: vi.fn().mockRejectedValue(new Error("capture IPC blew up")),
+    });
+    await runAction(actionEvent("screenshot"));
+    expect((postedResult().result as { ok: boolean; error: string }).error).toBe(
+      "capture IPC blew up",
+    );
+  });
+});
+
+describe("useBrowserAgentRelay — hidden pane handling", () => {
+  beforeEach(() => {
+    authenticatedFetch.mockResolvedValue(WON);
+  });
+
+  it("snapshot: reports the hidden-pane error when the page has no layout size", async () => {
+    const innerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    const innerHeight = Object.getOwnPropertyDescriptor(window, "innerHeight");
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 0 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 0 });
+    try {
+      const bridge = installBridge({
+        browserExecute: vi.fn(async (_id: string, js: string) => ({
+          ok: true,
+          result: window.eval(js),
+        })),
+      });
+      await runAction(actionEvent("snapshot"));
+      expect(bridge.browserExecute).toHaveBeenCalled();
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error:
+          "the page has no layout size because its browser pane is hidden; open this session's Browser tab and retry",
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", innerWidth!);
+      Object.defineProperty(window, "innerHeight", innerHeight!);
+    }
+  });
+
+  it("snapshot: succeeds when the page has a layout size", async () => {
+    const bridge = installBridge({
+      browserExecute: vi.fn(async (_id: string, js: string) => ({
+        ok: true,
+        result: window.eval(js),
+      })),
+    });
+    await runAction(actionEvent("snapshot"));
+    expect(bridge.browserExecute).toHaveBeenCalled();
+    expect((postedResult().result as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("screenshot: retries while the pane is hidden and returns the data URL once surfaced", async () => {
+    vi.useFakeTimers();
+    try {
+      installBridge({
+        browserScreenshot: vi
+          .fn()
+          .mockResolvedValueOnce({ ok: false, noSurface: true })
+          .mockResolvedValueOnce({ ok: true, dataUrl: "data:image/png;base64," })
+          .mockResolvedValueOnce({ ok: true, dataUrl: "data:image/png;base64,REAL" }),
+      });
+      authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+      renderRelay();
+      emitBrowserActionRequest(actionEvent("screenshot"), CONV);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(postedResult().result).toEqual({ ok: true, data_url: "data:image/png;base64,REAL" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("screenshot: gives up with the pane-hidden message when the shell keeps returning an empty image", async () => {
+    vi.useFakeTimers();
+    try {
+      const bridge = installBridge({
+        browserScreenshot: vi
+          .fn()
+          .mockResolvedValue({ ok: true, dataUrl: "data:image/png;base64," }),
+      });
+      renderRelay();
+      emitBrowserActionRequest(actionEvent("screenshot"), CONV);
+      await vi.advanceTimersByTimeAsync(3500);
+      expect(bridge.browserScreenshot.mock.calls.length).toBeGreaterThan(1);
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error:
+          "screenshot needs this session's browser pane on screen and it is hidden (another session or panel tab is showing); browser_snapshot, browser_click and browser_type work while it is hidden",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("screenshot: returns a non-surface failure immediately without retrying", async () => {
+    const bridge = installBridge({
+      browserScreenshot: vi.fn().mockResolvedValue({ ok: false, error: "capture blew up" }),
+    });
+    await runAction(actionEvent("screenshot"));
+    expect(bridge.browserScreenshot).toHaveBeenCalledTimes(1);
+    expect(postedResult().result).toEqual({ ok: false, error: "capture blew up" });
   });
 });
 

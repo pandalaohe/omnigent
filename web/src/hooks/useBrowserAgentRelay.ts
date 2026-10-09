@@ -30,7 +30,7 @@ interface BrowserDesktopBridge {
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
-  ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
+  ) => Promise<{ ok: boolean; dataUrl?: string; error?: string; noSurface?: boolean }>;
   browserExecute?: (
     conversationId: string,
     js: string,
@@ -64,6 +64,14 @@ function jsNumber(n: number): string {
   return JSON.stringify(n);
 }
 
+// A hidden view cannot be captured; poll while the surfacing action opens the
+// session's Browser tab (older shells even report an empty PNG as success).
+const SCREENSHOT_SURFACE_RETRY_MS = 250;
+const SCREENSHOT_SURFACE_TIMEOUT_MS = 3000;
+const EMPTY_SCREENSHOT_DATA_URL = "data:image/png;base64,";
+const SCREENSHOT_PANE_HIDDEN_ERROR =
+  "screenshot needs this session's browser pane on screen and it is hidden (another session or panel tab is showing); browser_snapshot, browser_click and browser_type work while it is hidden";
+
 /** In-page JS producing an a11y-style tree with stable `[ref=N]` ids. Refs live
  *  in `window.__omni_refs__` (resolved by click/type) under a per-snapshot
  *  `__omni_snapshot_id__`, so a stale ref is rejected with a precise error.
@@ -73,6 +81,9 @@ function jsNumber(n: number): string {
  *  but the snapshot_id check turns a mis-click into a clean error).
  *  Returns JSON: `{ snapshot_id, url, title, tree }`. */
 const SNAPSHOT_JS = `(() => {
+  if (!window.innerWidth || !window.innerHeight) {
+    return JSON.stringify({ error: "the page has no layout size because its browser pane is hidden; open this session's Browser tab and retry" });
+  }
   const snapshotId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
   window.__omni_refs__ = new Map();
   window.__omni_snapshot_id__ = snapshotId;
@@ -242,12 +253,27 @@ async function dispatch(
         return { ok: true, data: { final_url: url } };
       }
       case "screenshot": {
-        if (!desktop.browserScreenshot) {
+        const screenshot = desktop.browserScreenshot;
+        if (!screenshot) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        const r = await desktop.browserScreenshot(conversationId);
-        if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
-        return { ok: true, data_url: r.dataUrl };
+        const deadline = Date.now() + SCREENSHOT_SURFACE_TIMEOUT_MS;
+        const capture = async (): Promise<ActionResult> => {
+          const r = await screenshot(conversationId);
+          const noSurface =
+            (!r?.ok && !!r?.noSurface) ||
+            (!!r?.ok && (!r.dataUrl || r.dataUrl === EMPTY_SCREENSHOT_DATA_URL));
+          if (!noSurface) {
+            if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
+            return { ok: true, data_url: r.dataUrl };
+          }
+          if (Date.now() >= deadline) return { ok: false, error: SCREENSHOT_PANE_HIDDEN_ERROR };
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, SCREENSHOT_SURFACE_RETRY_MS);
+          });
+          return capture();
+        };
+        return await capture();
       }
       case "snapshot": {
         if (!desktop.browserExecute) {
@@ -257,6 +283,7 @@ async function dispatch(
         if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
+          if (typeof parsed.error === "string") return { ok: false, error: parsed.error };
           return { ok: true, data: parsed };
         } catch (e) {
           return { ok: false, error: `snapshot parse failed: ${(e as Error).message}` };

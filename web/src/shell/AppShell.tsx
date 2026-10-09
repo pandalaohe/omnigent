@@ -43,7 +43,7 @@ import {
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
-import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onBrowserActionRequest, surfacesBrowserPane } from "@/lib/browserActionBus";
 import { onArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
@@ -1883,9 +1883,9 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // Auto-open a Browser soft tab on a `navigate` action — agent-issued
-  // (browser_navigate) or a chat link the user routed in-app — so the load
-  // never lands in a hidden pane, even behind an open file or shell tab.
+  // Auto-open a Browser soft tab on a `navigate` or `screenshot` action —
+  // agent-issued (browser_navigate / browser_screenshot) or a chat link the
+  // user routed in-app — so the action never lands in a hidden pane.
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
@@ -1900,7 +1900,7 @@ export function AppShell() {
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || !sourceConversationId) return;
+      if (!surfacesBrowserPane(evt.action) || !sourceConversationId) return;
       surfaceBrowserTab(sourceConversationId);
     });
     return () => {

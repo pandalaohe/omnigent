@@ -157,6 +157,38 @@ describe("browser soft tabs", () => {
     expect(result.current.agentBrowser).toBe(true);
   });
 
+  it("opens the owning session's agent browser for a screenshot action", () => {
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.add());
+    const selected = result.current.selected;
+    const event = {
+      type: "browser_action_request" as const,
+      actionId: "screenshot-1",
+      action: "screenshot",
+      args: {},
+    };
+    act(() => emitBrowserActionRequest(event, "session-b"));
+    expect(result.current.selected).toBe(selected);
+    act(() => emitBrowserActionRequest(event, "session-a"));
+    expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
+    expect(result.current.agentBrowser).toBe(true);
+  });
+
+  it("does not surface the browser for a snapshot action", () => {
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.add());
+    const selected = result.current.selected;
+    const event = {
+      type: "browser_action_request" as const,
+      actionId: "snapshot-1",
+      action: "snapshot",
+      args: {},
+    };
+    act(() => emitBrowserActionRequest(event, "session-a"));
+    expect(result.current.selected).toBe(selected);
+    expect(result.current.tabs).toEqual([selected]);
+  });
+
   it("closes and later recreates the agent browser soft tab", async () => {
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
     Object.assign(window, { omnigentDesktop: { browserClose } });

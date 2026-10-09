@@ -19,6 +19,12 @@ export type BrowserActionListener = (
 
 const listeners = new Set<BrowserActionListener>();
 
+/** Actions that need the owning session's browser pane surfaced: navigate
+ *  loads it, screenshot can only capture a view that is on screen. */
+export function surfacesBrowserPane(action: string): boolean {
+  return action === "navigate" || action === "screenshot";
+}
+
 /** Subscribe to browser action requests; returns an unsubscribe. */
 export function onBrowserActionRequest(listener: BrowserActionListener): () => void {
   listeners.add(listener);

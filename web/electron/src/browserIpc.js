@@ -423,10 +423,22 @@ function registerBrowserIpc({
     if (!entry) return { ok: false, error: "No browser view" };
     try {
       const image = await entry.view.webContents.capturePage();
-      const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
+      const png = image.toPNG();
+      if (image.isEmpty() || png.length === 0) {
+        return {
+          ok: false,
+          noSurface: true,
+          error: "browser view is not on screen; nothing to capture",
+        };
+      }
+      const dataUrl = `data:image/png;base64,${png.toString("base64")}`;
       return { ok: true, dataUrl };
     } catch (e) {
-      return { ok: false, error: e && e.message ? e.message : String(e) };
+      return {
+        ok: false,
+        error: e && e.message ? e.message : String(e),
+        noSurface: g.registry.activeConversationId() !== conversationId,
+      };
     }
   });
 
