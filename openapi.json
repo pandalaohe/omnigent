@@ -7955,6 +7955,13 @@
             "title": "Background Activity Count",
             "type": "integer"
           },
+          "child_pending_elicitations_count": {
+            "default": 0,
+            "description": "Pending approval / input prompts on live direct child sessions. Lets the sidebar light a parent row's \"needs attention\" badge when only a sub-agent is blocked on the user.",
+            "format": "int64",
+            "title": "Child Pending Elicitations Count",
+            "type": "integer"
+          },
           "comments_count": {
             "default": 0,
             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
@@ -8112,6 +8119,18 @@
               }
             ],
             "title": "Parent Session Id"
+          },
+          "pending_elicitation_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque key of the outstanding prompts counted in this row's Needs response state (own and live direct children); changes when a new prompt appears, stable otherwise. `None` when the in-memory index holds none.",
+            "title": "Pending Elicitation Key"
           },
           "pending_elicitations_count": {
             "default": 0,
@@ -10411,6 +10430,40 @@
         "title": "SmartRoutingSourcesInfo",
         "type": "object"
       },
+      "SoundAlertClaimRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/me/sound-alerts/claim`.",
+        "properties": {
+          "alert_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Alert Id",
+            "type": "string"
+          },
+          "level": {
+            "enum": [
+              "done",
+              "error",
+              "needs_response"
+            ],
+            "title": "Level",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alert_id",
+          "session_id",
+          "level"
+        ],
+        "title": "SoundAlertClaimRequest",
+        "type": "object"
+      },
       "StoreHarnessCredentialRequest": {
         "description": "Request body for `POST /v1/hosts/{id}/harnesses/{harness}/credential`.\n\nCarries the credential in the body (never the URL). The secret field is\noptional so the `adopt` kind \u2014 which references an existing host env var\nby name rather than sending a value \u2014 can omit it.",
         "properties": {
@@ -11409,7 +11462,8 @@
                 "host_colors",
                 "keep_warm",
                 "worktree_location",
-                "runner_log_warnings"
+                "runner_log_warnings",
+                "sound_alerts"
               ]
             },
             "title": "Settings",
@@ -14082,6 +14136,7 @@
                         "runner_log_warnings",
                         "session_collab",
                         "session_navigation",
+                        "sound_alerts",
                         "usage_context",
                         "worktree_location"
                       ]
@@ -14164,7 +14219,8 @@
                 "host_colors",
                 "keep_warm",
                 "worktree_location",
-                "runner_log_warnings"
+                "runner_log_warnings",
+                "sound_alerts"
               ],
               "title": "Namespace",
               "type": "string"
@@ -14222,6 +14278,52 @@
           }
         },
         "summary": "Patch User Preferences Namespace"
+      }
+    },
+    "/v1/me/sound-alerts/claim": {
+      "post": {
+        "description": "Claim one sound alert and deliver it to exactly one device.\n\nEvery client that detects the same transition calls this; the first\nclaim wins. The server picks one of the owner's registered ringer\nconnections (see `omnigent.server.sound_alerts`) and pushes the\nalert to it \u2014 the chosen device plays, not necessarily the caller.\n\n**Parameters**\n\n- `body` \u2014 Alert identity, session, and transition level.\n\n**Returns:** `{\"delivered\": bool}` \u2014 whether a device accepted it.",
+        "operationId": "claim_sound_alert_v1_me_sound_alerts_claim_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundAlertClaimRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Claim Sound Alert V1 Me Sound Alerts Claim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Sound Alert",
+        "tags": [
+          "sessions"
+        ]
       }
     },
     "/v1/policies": {
