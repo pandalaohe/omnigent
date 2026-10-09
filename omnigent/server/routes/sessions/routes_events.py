@@ -71,7 +71,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, sound_alerts
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -84,6 +84,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
@@ -1966,71 +1967,77 @@ def register_events_routes(
         if stop_codex_side_chat and is_session_closed(conv.labels, conv.title):
             return {"queued": False}
         if body.type == _INTERRUPT_TYPE or stop_codex_side_chat:
+            owner = user_id or RESERVED_USER_LOCAL
+            sound_alerts.note_user_stop(owner, session_id)
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             if codex_child:
-                target_session_id = session_id
-                interrupt_payload: dict[str, Any] = {"type": "interrupt"}
-                # Native child boundaries come from the Codex forwarder.
-                child_thread_id = (conv.labels or {}).get(
-                    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
-                )
-                response_id = body.data.get("response_id") or _session_active_response_cache.get(
-                    session_id
-                )
-                if response_id is None:
-                    status = _session_status_cache.get(session_id, conv.live_status)
-                    if status in ("running", "waiting"):
+                try:
+                    target_session_id = session_id
+                    interrupt_payload: dict[str, Any] = {"type": "interrupt"}
+                    # Native child boundaries come from the Codex forwarder.
+                    child_thread_id = (conv.labels or {}).get(
+                        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
+                    )
+                    response_id = body.data.get(
+                        "response_id"
+                    ) or _session_active_response_cache.get(session_id)
+                    if response_id is None:
+                        status = _session_status_cache.get(session_id, conv.live_status)
+                        if status in ("running", "waiting"):
+                            raise OmnigentError(
+                                "The side chat's active turn is not available yet. Try interrupting again.",
+                                code=ErrorCode.CONFLICT,
+                            )
+                        if stop_codex_side_chat:
+                            await asyncio.to_thread(
+                                conversation_store.set_labels,
+                                session_id,
+                                {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                            )
+                        return {"queued": False}
+                    if (
+                        not isinstance(response_id, str)
+                        or not response_id.startswith("codex_")
+                        or response_id in ("codex_", "codex_native")
+                        or not conv.parent_conversation_id
+                        or not child_thread_id
+                    ):
                         raise OmnigentError(
-                            "The side chat's active turn is not available yet. Try interrupting again.",
-                            code=ErrorCode.CONFLICT,
+                            "Cannot identify the Codex side-chat turn to interrupt.",
+                            code=ErrorCode.INVALID_INPUT,
                         )
-                    if stop_codex_side_chat:
-                        await asyncio.to_thread(
-                            conversation_store.set_labels,
-                            session_id,
-                            {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
-                        )
-                    return {"queued": False}
-                if (
-                    not isinstance(response_id, str)
-                    or not response_id.startswith("codex_")
-                    or response_id in ("codex_", "codex_native")
-                    or not conv.parent_conversation_id
-                    or not child_thread_id
-                ):
-                    raise OmnigentError(
-                        "Cannot identify the Codex side-chat turn to interrupt.",
-                        code=ErrorCode.INVALID_INPUT,
+                    target_session_id = conv.parent_conversation_id
+                    interrupt_payload.update(
+                        codex_side_thread_id=child_thread_id,
+                        codex_side_turn_id=response_id.removeprefix("codex_"),
                     )
-                target_session_id = conv.parent_conversation_id
-                interrupt_payload.update(
-                    codex_side_thread_id=child_thread_id,
-                    codex_side_turn_id=response_id.removeprefix("codex_"),
-                )
-                runner_client = await _get_runner_client(
-                    target_session_id,
-                    runner_router,
-                )
-                interrupt_delivered = False
-                if runner_client is not None:
-                    try:
-                        interrupt_resp = await runner_client.post(
-                            f"/v1/sessions/{target_session_id}/events",
-                            json=interrupt_payload,
-                            timeout=5.0,
-                        )
-                        interrupt_delivered = interrupt_resp.status_code < 400
-                    except (httpx.HTTPError, ConnectionError):
-                        # WSTunnelTransport raises bare ConnectionError on tunnel close.
-                        _logger.exception(
-                            "Interrupt forward failed for %r",
-                            session_id,
-                        )
-                if not interrupt_delivered:
-                    raise OmnigentError(
-                        "Couldn't interrupt the side chat. Please try again.",
-                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    runner_client = await _get_runner_client(
+                        target_session_id,
+                        runner_router,
                     )
+                    interrupt_delivered = False
+                    if runner_client is not None:
+                        try:
+                            interrupt_resp = await runner_client.post(
+                                f"/v1/sessions/{target_session_id}/events",
+                                json=interrupt_payload,
+                                timeout=5.0,
+                            )
+                            interrupt_delivered = interrupt_resp.status_code < 400
+                        except (httpx.HTTPError, ConnectionError):
+                            # WSTunnelTransport raises bare ConnectionError on tunnel close.
+                            _logger.exception(
+                                "Interrupt forward failed for %r",
+                                session_id,
+                            )
+                    if not interrupt_delivered:
+                        raise OmnigentError(
+                            "Couldn't interrupt the side chat. Please try again.",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
+                except Exception:
+                    sound_alerts.forget_user_stop(owner, session_id)
+                    raise
             else:
                 delivery = _interrupt_delivery_tasks.get(session_id)
                 if delivery is None:
@@ -2050,7 +2057,11 @@ def register_events_routes(
                     )
                 # Multiple clients share the same delivery result. Shield it so one
                 # disconnected request cannot cancel the interrupt for every waiter.
-                await asyncio.shield(delivery)
+                try:
+                    await asyncio.shield(delivery)
+                except Exception:
+                    sound_alerts.forget_user_stop(owner, session_id)
+                    raise
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
@@ -2059,6 +2070,8 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            owner = user_id or RESERVED_USER_LOCAL
+            sound_alerts.note_user_stop(owner, session_id)
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -2075,6 +2088,7 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                sound_alerts.forget_user_stop(owner, session_id)
                 raise
             native_watchdog.disarm(session_id, retire=True)
             stop_conv = None
@@ -2270,7 +2284,18 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            interrupting_cancel = sound_alerts.is_interrupting_cancel(body.data)
+            owner = user_id or RESERVED_USER_LOCAL
+            if interrupting_cancel:
+                sound_alerts.note_user_stop(owner, session_id)
+            try:
+                await _resolve_elicitation(
+                    session_id, body.data, runner_router, conversation_store
+                )
+            except Exception:
+                if interrupting_cancel:
+                    sound_alerts.forget_user_stop(owner, session_id)
+                raise
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(

@@ -10,16 +10,20 @@ receives the frame.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import sound_alerts
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.schemas import SessionEventInput
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -127,6 +131,34 @@ def _hello(ws: object, device_id: str) -> None:
                 "can_ring": True,
             }
         )
+    )
+
+
+def _register_fake_ringer() -> list[dict[str, Any]]:
+    """Register one in-process device and collect any delivered frames."""
+    frames: list[dict[str, Any]] = []
+
+    async def send(frame: dict[str, Any]) -> None:
+        frames.append(frame)
+
+    sound_alerts.register(
+        ALICE,
+        "fake_ringer",
+        device_id="dev_fake",
+        device_label="Fake device",
+        can_ring=True,
+        send=send,
+    )
+    return frames
+
+
+async def _claim_done(session_id: str, alert_id: str) -> bool:
+    return await sound_alerts.claim(
+        ALICE,
+        alert_id=alert_id,
+        session_id=session_id,
+        level="done",
+        primary_device_id=None,
     )
 
 
@@ -239,3 +271,214 @@ def test_claim_delivers_to_the_active_ringer_even_without_watching_the_session(
             "level": "needs_response",
         }
         _assert_only_heartbeats(ws_idle)
+
+
+@pytest.mark.asyncio
+async def test_delivered_interrupt_is_noted_before_the_delivery_starts(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal claim racing with runner delivery is already silenced."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = _seed_session(stores, owner=ALICE, title="interrupt")
+    frames = _register_fake_ringer()
+    claims_during_delivery: list[bool] = []
+
+    async def _deliver(_session_id: str, _runner_router: Any) -> None:
+        claims_during_delivery.append(
+            await _claim_done(_session_id, f"{_session_id}:done:during_delivery")
+        )
+
+    monkeypatch.setattr(routes_events, "_deliver_interrupt_once", _deliver)
+    try:
+        response = TestClient(app).post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "interrupt", "data": {}},
+            headers={"X-Forwarded-Email": ALICE},
+        )
+
+        assert response.status_code == 202, response.text
+        assert claims_during_delivery == [False]
+        assert await _claim_done(session_id, f"{session_id}:done:after_delivery") is False
+        assert frames == []
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_interrupt_forgets_the_stop_note(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected interrupt leaves real completion alerts enabled."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = _seed_session(stores, owner=ALICE, title="interrupt failure")
+    frames = _register_fake_ringer()
+
+    async def _fail_delivery(_session_id: str, _runner_router: Any) -> None:
+        raise OmnigentError("runner unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    monkeypatch.setattr(routes_events, "_deliver_interrupt_once", _fail_delivery)
+    try:
+        with pytest.raises(OmnigentError) as error:
+            TestClient(app).post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+                headers={"X-Forwarded-Email": ALICE},
+            )
+        assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+        assert await _claim_done(session_id, f"{session_id}:done:after_failure") is True
+        assert [frame["level"] for frame in frames] == ["done"]
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_stop_forgets_the_stop_note(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop that the runner rejects leaves completion alerts enabled."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = _seed_session(stores, owner=ALICE, title="stop failure")
+    frames = _register_fake_ringer()
+
+    async def _fail_stop(_session_id: str, _runner_router: Any) -> bool:
+        raise OmnigentError("runner unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    monkeypatch.setattr(routes_events, "_stop_session_via_runner", _fail_stop)
+    with pytest.raises(OmnigentError) as error:
+        TestClient(app).post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+            headers={"X-Forwarded-Email": ALICE},
+        )
+    assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert await _claim_done(session_id, f"{session_id}:done:after_failure") is True
+    assert [frame["level"] for frame in frames] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_interrupt_request_keeps_the_stop_note(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = _seed_session(stores, owner=ALICE, title="cancelled interrupt")
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def _deliver(_session_id: str, _runner_router: Any) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(routes_events, "_deliver_interrupt_once", _deliver)
+    endpoint = next(route.endpoint for route in app.routes if route.name == "post_event")
+    request = Request({"type": "http", "headers": [(b"x-forwarded-email", ALICE.encode())]})
+    task = asyncio.create_task(endpoint(request, session_id, SessionEventInput(type="interrupt")))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    delivery = routes_events._interrupt_delivery_tasks.get(session_id)
+    assert delivery is not None
+    release.set()
+    await delivery
+    assert await _claim_done(session_id, f"{session_id}:done:after_cancel") is False
+    routes_events._interrupt_fenced_sessions.discard(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_point", "interrupt", "fails", "suppressed"),
+    [
+        ("approval", True, False, True),
+        ("approval", False, False, False),
+        ("resolve", True, False, True),
+        ("resolve", False, False, False),
+        ("approval", True, True, False),
+        ("resolve", True, True, False),
+    ],
+)
+async def test_cancel_interrupt_marker_controls_completion_alerts(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+    interrupt: bool,
+    fails: bool,
+    suppressed: bool,
+) -> None:
+    """Only a successful cancel marked to interrupt silences its session."""
+    from omnigent.server.routes.sessions import routes_elicitations, routes_events
+
+    session_id = _seed_session(stores, owner=ALICE, title=f"{entry_point} {interrupt} {fails}")
+    frames = _register_fake_ringer()
+    claims_during_resolution: list[bool] = []
+
+    async def _resolve(
+        _session_id: str, _data: dict[str, Any], _runner_router: Any, _store: Any
+    ) -> None:
+        claims_during_resolution.append(
+            await _claim_done(_session_id, f"{_session_id}:done:during_resolution")
+        )
+        if fails:
+            raise OmnigentError("runner unavailable", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    monkeypatch.setattr(routes_events, "_resolve_elicitation", _resolve)
+    monkeypatch.setattr(routes_elicitations, "_resolve_elicitation", _resolve)
+    monkeypatch.setattr(routes_events, "_apply_pending_policy_ask_writes", _resolve_noop)
+    monkeypatch.setattr(routes_elicitations, "_apply_pending_policy_ask_writes", _resolve_noop)
+
+    meta = {"_meta": {"interrupt": True}} if interrupt else {}
+    if fails:
+        with pytest.raises(OmnigentError) as error:
+            if entry_point == "approval":
+                TestClient(app).post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "approval",
+                        "data": {"elicitation_id": "elicit_a", "action": "cancel", **meta},
+                    },
+                    headers={"X-Forwarded-Email": ALICE},
+                )
+            else:
+                TestClient(app).post(
+                    f"/v1/sessions/{session_id}/elicitations/elicit_a/resolve",
+                    json={"action": "cancel", **meta},
+                    headers={"X-Forwarded-Email": ALICE},
+                )
+        assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    elif entry_point == "approval":
+        response = TestClient(app).post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "approval",
+                "data": {"elicitation_id": "elicit_a", "action": "cancel", **meta},
+            },
+            headers={"X-Forwarded-Email": ALICE},
+        )
+        assert response.status_code == 202, response.text
+    else:
+        response = TestClient(app).post(
+            f"/v1/sessions/{session_id}/elicitations/elicit_a/resolve",
+            json={"action": "cancel", **meta},
+            headers={"X-Forwarded-Email": ALICE},
+        )
+        assert response.status_code == 202, response.text
+
+    assert claims_during_resolution == [not interrupt]
+    after_resolution = await _claim_done(session_id, f"{session_id}:done:after_resolution")
+    assert after_resolution is not suppressed
+    assert len(frames) == (2 if not interrupt else (1 if fails else 0))
+
+
+async def _resolve_noop(*_args: Any) -> None:
+    return None

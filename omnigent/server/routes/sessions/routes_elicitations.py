@@ -15,6 +15,7 @@ from omnigent.runtime import (
     pending_elicitations,
 )
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import sound_alerts
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -25,6 +26,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -132,7 +134,18 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        interrupting_cancel = sound_alerts.is_interrupting_cancel(_resolve_data)
+        owner = user_id or RESERVED_USER_LOCAL
+        if interrupting_cancel:
+            sound_alerts.note_user_stop(owner, session_id)
+        try:
+            await _resolve_elicitation(
+                session_id, _resolve_data, runner_router, conversation_store
+            )
+        except Exception:
+            if interrupting_cancel:
+                sound_alerts.forget_user_stop(owner, session_id)
+            raise
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

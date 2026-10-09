@@ -44,7 +44,6 @@ function createHarness(overrides: Partial<RingerContext> = {}) {
       device: device(),
       windowFocused: false,
       activeConversationId: undefined,
-      userStoppedRecently: () => false,
       now: new Date(now),
       ...contextOverrides,
     }),
@@ -169,34 +168,6 @@ describe("sound ringer", () => {
     h.ringer.ring(alert("error"));
 
     expect(h.played).toEqual([]);
-  });
-
-  it("drops done and error for a session the user just stopped", () => {
-    const h = createHarness({ userStoppedRecently: (id) => id === "conv_a" });
-
-    h.ringer.ring(alert("done"));
-    h.advance(2_001);
-    h.ringer.ring(alert("error"));
-    h.advance(2_001);
-
-    expect(h.played).toEqual([]);
-  });
-
-  it("still plays needs_response for a session the user just stopped", () => {
-    const h = createHarness({ userStoppedRecently: (id) => id === "conv_a" });
-
-    h.ringer.ring(alert("needs_response"));
-
-    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response"]);
-  });
-
-  it("plays a done for another session while one was just stopped", () => {
-    const h = createHarness({ userStoppedRecently: (id) => id === "conv_a" });
-
-    h.ringer.ring(alert("done", "conv_b"));
-    h.advance(2_000);
-
-    expect(h.played).toEqual([{ level: "done", at: NOON + 2_000 }]);
   });
 
   it("spaces the other cue 400 ms after a needs_response cue that precedes its window close", () => {

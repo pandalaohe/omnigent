@@ -32,6 +32,8 @@ _ACTIVE_WINDOW_S = 300.0
 # Per-owner claimed-id memory: newest 1000 claims, no older than 24 h.
 _MAX_CLAIMED_IDS = 1000
 _CLAIMED_TTL_S = 24 * 60 * 60.0
+_USER_STOP_WINDOW_S = 60.0
+_MAX_USER_STOP_NOTES = 200
 
 
 @dataclass
@@ -63,6 +65,8 @@ class _Connection:
 _connections: WorkspaceScopedCache[str, dict[str, _Connection]] = WorkspaceScopedCache()
 # owner -> alert_id -> claimed_at (insertion-ordered for pruning).
 _claimed: WorkspaceScopedCache[str, OrderedDict[str, float]] = WorkspaceScopedCache()
+# owner -> session_id -> stopped_at (insertion-ordered for pruning).
+_user_stops: WorkspaceScopedCache[str, OrderedDict[str, float]] = WorkspaceScopedCache()
 
 _lock = threading.Lock()
 
@@ -138,6 +142,61 @@ def touch(owner: str, conn_id: str) -> None:
         record = _connections.get(owner, {}).get(conn_id)
         if record is not None:
             record.last_activity = time.monotonic()
+
+
+def _prune_user_stops(stops: OrderedDict[str, float], now: float) -> None:
+    """Drop stop notes past the age or count cap."""
+    cutoff = now - _USER_STOP_WINDOW_S
+    while stops and (len(stops) > _MAX_USER_STOP_NOTES or next(iter(stops.values())) < cutoff):
+        stops.popitem(last=False)
+
+
+def note_user_stop(owner: str, session_id: str) -> None:
+    """
+    Record the owner's recent stop or interrupt for one session.
+
+    :param owner: User id, or ``RESERVED_USER_LOCAL`` when there is none.
+    :param session_id: Session the user asked to stop.
+    """
+    with _lock:
+        now = time.monotonic()
+        stops = _user_stops.setdefault(owner, OrderedDict())
+        stops.pop(session_id, None)
+        stops[session_id] = now
+        _prune_user_stops(stops, now)
+
+
+def forget_user_stop(owner: str, session_id: str) -> None:
+    """
+    Remove a stop note when the requested stop did not land.
+
+    :param owner: Owner passed to :func:`note_user_stop`.
+    :param session_id: Session whose stop note should be removed.
+    """
+    with _lock:
+        stops = _user_stops.get(owner)
+        if stops is None:
+            return
+        _prune_user_stops(stops, time.monotonic())
+        stops.pop(session_id, None)
+        if not stops:
+            _user_stops.pop(owner, None)
+
+
+def is_interrupting_cancel(data: dict[str, Any]) -> bool:
+    """
+    Check whether a cancellation verdict also ends the user's turn.
+
+    :param data: Elicitation verdict dict with ``action`` and optional
+        ``_meta`` or ``meta`` fields.
+    :returns: Whether the verdict is a cancel marked with ``interrupt: true``.
+    """
+    meta = data.get("_meta")
+    if meta is None:
+        meta = data.get("meta")
+    return (
+        data.get("action") == "cancel" and isinstance(meta, dict) and meta.get("interrupt") is True
+    )
 
 
 def _activity_basis(record: _Connection) -> float:
@@ -224,11 +283,19 @@ async def claim(
     """
     now = time.monotonic()
     with _lock:
+        stops = _user_stops.get(owner)
+        if stops is not None:
+            _prune_user_stops(stops, now)
+            if not stops:
+                _user_stops.pop(owner, None)
+                stops = None
         claims = _claimed.setdefault(owner, OrderedDict())
         if alert_id in claims:
             return False
         claims[alert_id] = now
         _prune_claims(claims, now)
+        if level in ("done", "error") and stops is not None and session_id in stops:
+            return False
         record = _choose_ringer_locked(owner, primary_device_id, now)
     frame = {"type": "sound_alert", "alert_id": alert_id, "session_id": session_id, "level": level}
     # A dead connection is unregistered and skipped once; past that, further
@@ -248,7 +315,7 @@ async def claim(
 
 def reset_for_tests() -> None:
     """
-    Clear all connections and claims.
+    Clear all connections, claims, and stop notes.
 
     Test-isolation hook mirroring :func:`omnigent.server.presence.reset_for_tests`:
     the registry is module-global, so an entry leaked by one test is
@@ -257,3 +324,4 @@ def reset_for_tests() -> None:
     with _lock:
         _connections.clear()
         _claimed.clear()
+        _user_stops.clear()
