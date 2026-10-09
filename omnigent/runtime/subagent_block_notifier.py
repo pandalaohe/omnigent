@@ -117,6 +117,10 @@ class SubagentBlockNotifier:
     :param loop: The Omnigent server's event loop, captured at registration
         time so :meth:`observe` (which runs synchronously on the publish
         path, possibly off the loop) can schedule async handling onto it.
+    :param foreign_turn_sender: Optional resolver returning the peer sender
+        whose message started the child's active turn, or ``None`` when the
+        turn is not foreign. When it returns a sender, both notices go there
+        instead of the parent.
     """
 
     def __init__(
@@ -124,10 +128,12 @@ class SubagentBlockNotifier:
         conversation_store: ConversationStore,
         wake_dispatch: WakeDispatch,
         loop: asyncio.AbstractEventLoop,
+        foreign_turn_sender: Callable[[Conversation], str | None] | None = None,
     ) -> None:
         self._conversation_store = conversation_store
         self._wake_dispatch = wake_dispatch
         self._loop = loop
+        self._foreign_turn_sender = foreign_turn_sender
         self._lock = threading.Lock()
         # Debounce: armed ids (one wake per block), cleared + re-armed on resolve.
         self._notified: set[str] = set()
@@ -299,10 +305,26 @@ class SubagentBlockNotifier:
         if child is None or child.parent_conversation_id is None:
             # Top-level session: no parent; the resolve event clears the arm.
             return
-        parent_id = child.parent_conversation_id
+        recipient_id = child.parent_conversation_id
+        to_sender = False
+        if self._foreign_turn_sender is not None:
+            try:
+                sender_id = await asyncio.to_thread(self._foreign_turn_sender, child)
+            except Exception:
+                _logger.warning(
+                    "subagent block notifier: foreign turn sender lookup failed for %s",
+                    child.id,
+                    exc_info=True,
+                )
+                sender_id = None
+            if sender_id:
+                recipient_id = sender_id
+                to_sender = True
         # Formatting resolves the child's source through the server stores,
         # so keep that work off the event loop.
-        notice = await asyncio.to_thread(_format_block_notice, child, event)
+        notice = await asyncio.to_thread(
+            _format_block_notice, child, event, sender_recipient=to_sender
+        )
         # Register the resolve signal before dispatching so a resolve that
         # lands while the wake is in flight is never missed; the arm check
         # and registration share one critical section, so a resolve landing
@@ -314,7 +336,7 @@ class SubagentBlockNotifier:
             self._resolution_signals[elicitation_id] = signal
         try:
             outcome = await self._deliver_with_retry(
-                parent_id, child, notice, armed_id=elicitation_id
+                recipient_id, child, notice, armed_id=elicitation_id
             )
             if outcome is _WakeOutcome.FAILED:
                 # Release the arm so a later publish of this id can retry.
@@ -330,7 +352,10 @@ class SubagentBlockNotifier:
                     return
                 verdict = self._verdicts.pop(elicitation_id, None)
             await self._deliver_with_retry(
-                parent_id, child, _format_resolution_notice(child, verdict), armed_id=None
+                recipient_id,
+                child,
+                _format_resolution_notice(child, verdict, sender_recipient=to_sender),
+                armed_id=None,
             )
         finally:
             with self._lock:
@@ -340,7 +365,7 @@ class SubagentBlockNotifier:
 
     async def _deliver_with_retry(
         self,
-        parent_id: str,
+        recipient_id: str,
         child: Conversation,
         notice: str,
         *,
@@ -360,7 +385,8 @@ class SubagentBlockNotifier:
         publish path; ``CancelledError`` (a ``BaseException`` raised by
         :meth:`close`) is not caught and still tears the handler down.
 
-        :param parent_id: Parent session id to wake, e.g. ``"conv_parent123"``.
+        :param recipient_id: Session id to wake — the parent, or the verified
+            foreign sender of the blocked child's active turn.
         :param child: The blocked child :class:`Conversation`.
         :param notice: Pre-formatted ``[System: …]`` notice text.
         :param armed_id: Correlation id whose arm gates the dispatch, or
@@ -375,14 +401,14 @@ class SubagentBlockNotifier:
                         # slot is already clear; nothing (stale) to wake.
                         return _WakeOutcome.MOOT
             try:
-                if await self._wake_dispatch(parent_id, child, notice):
+                if await self._wake_dispatch(recipient_id, child, notice):
                     return _WakeOutcome.DELIVERED
             except Exception:
                 # Broad: injected dispatch error types are unknown; don't crash the publish path.
                 _logger.warning(
-                    "subagent block notifier: wake dispatch raised for parent=%s child=%s "
+                    "subagent block notifier: wake dispatch raised for recipient=%s child=%s "
                     "(attempt %d/%d)",
-                    parent_id,
+                    recipient_id,
                     child.id,
                     attempt + 1,
                     1 + _WAKE_RETRIES,
@@ -392,21 +418,23 @@ class SubagentBlockNotifier:
                 await _sleep(_WAKE_RETRY_BACKOFF_S)
         _logger.warning(
             "subagent block notifier: notice undelivered after %d attempt(s) for "
-            "parent=%s child=%s",
+            "recipient=%s child=%s",
             1 + _WAKE_RETRIES,
-            parent_id,
+            recipient_id,
             child.id,
         )
         return _WakeOutcome.FAILED
 
 
-def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
+def _format_block_notice(
+    child: Conversation, event: dict[str, Any], *, sender_recipient: bool = False
+) -> str:
     """
-    Build the ``[System: …]`` notice posted into the parent session.
+    Build the ``[System: …]`` notice posted into the wake recipient.
 
     Mirrors the shape of the runner's terminal-completion wake notice
     (``_format_subagent_wake_notice``). Describes the situation and asks
-    the parent to surface it — it does not prescribe a specific tool.
+    the recipient to surface it — it does not prescribe a specific tool.
 
     The child is named from the shared source resolver rather than the
     event, because this runs on the child's original (unstamped) event.
@@ -414,6 +442,9 @@ def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
     :param child: The blocked child :class:`Conversation`.
     :param event: The ``response.elicitation_request`` event dict; its
         ``params`` supply the action and the card's source fields.
+    :param sender_recipient: When ``True`` the recipient is the peer sender
+        whose message started the blocked turn, not the parent; the wording
+        must not claim the prompt is mirrored into the recipient's chat.
     :returns: A one-line ``[System: …]`` notice, e.g. ``"[System:
         sub-agent auth-refactor (Claude Code @ laptop, /repo) is blocked
         awaiting human approval: pnpm test. Its approval prompt is
@@ -428,6 +459,13 @@ def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
     label = _source_label(elicitation_source(child, param_dict))
     action = _block_reason(event)
     detail = f": {action}" if action else ""
+    if sender_recipient:
+        return (
+            f"[System: session {label}, which is handling your peer message, is "
+            f"blocked awaiting human approval{detail}. The human sees its approval "
+            "prompt in its own chat — do not wait silently. It cannot continue "
+            "until the request is resolved.]"
+        )
     return (
         f"[System: sub-agent {label} is blocked awaiting human approval{detail}. "
         "Its approval prompt is mirrored into this conversation but has gone "
@@ -463,14 +501,16 @@ def _source_label(source: dict[str, str]) -> str:
     return f"{label} ({', '.join(parts)})" if parts else label
 
 
-def _format_resolution_notice(child: Conversation, action: str | None) -> str:
+def _format_resolution_notice(
+    child: Conversation, action: str | None, *, sender_recipient: bool = False
+) -> str:
     """
     Build the follow-up notice sent after a woken block resolves.
 
-    Sent only when a block notice was actually delivered, so the parent
+    Sent only when a block notice was actually delivered, so the recipient
     stops acting on it (offering to relay answers, polling the child)
     once the human has dealt with the prompt directly. The human's
-    verdict is stated verbatim so the parent agent cannot narrate an
+    verdict is stated verbatim so the recipient agent cannot narrate an
     approval that did not happen (a decline must never be retold as
     "approved" into the transcript); when no verdict was recorded
     (timeout, severed wait, older runner) the notice says so and points
@@ -481,12 +521,20 @@ def _format_resolution_notice(child: Conversation, action: str | None) -> str:
     :param action: The MCP verdict from the resolution event —
         ``"accept"``, ``"decline"``, or ``"cancel"`` — or ``None``
         when the resolution carried no verdict.
+    :param sender_recipient: When ``True`` the recipient is the peer sender
+        whose message started the blocked turn, not the parent.
     :returns: A one-line ``[System: …]`` notice, e.g. ``"[System:
         sub-agent codex/auth-refactor's pending approval has been
         resolved (action: decline — NOT approved) and it is
         continuing. …]"``.
     """
     label = _child_label(child)
+    if sender_recipient:
+        return (
+            f"[System: session {label}, which is handling your peer message, has "
+            f"had its pending approval resolved {_verdict_clause(action)} and it is "
+            "continuing. No action is needed on the earlier block notice.]"
+        )
     return (
         f"[System: sub-agent {label}'s pending approval has been resolved "
         f"{_verdict_clause(action)} and it is continuing. No action is needed "

@@ -127,8 +127,8 @@ _WS_COLLAPSE_RE = re.compile(r"\s+")
 # Stored transcripts still carry the older envelopes, matched by the legacy
 # pattern (DOTALL: a correlation id may contain newlines).
 _PEER_ENVELOPE_HEADER_RE = re.compile(
-    r'\A\[Peer message from session [0-9a-f]{32} msg=([0-9a-f]{32}) "[^"]*" '
-    r"\(.*?\) ref=.*?\]\n\n",
+    r"\A\[Peer message from session (?P<sender>[0-9a-f]{32}) msg=(?P<msg>[0-9a-f]{32}) "
+    r'"(?P<title>[^"]*)" \((?P<origin>.*?)\) ref=(?P<ref>.*?)\]\n\n',
     re.DOTALL,
 )
 _LEGACY_PEER_ENVELOPE_HEADER_RE = re.compile(
@@ -141,8 +141,9 @@ _LEGACY_PEER_ENVELOPE_HEADER_RE = re.compile(
 def _peer_envelope_msg_id(text: str) -> str | None:
     """Return the record id an envelope header carries, current or legacy."""
     match = _PEER_ENVELOPE_HEADER_RE.match(text)
-    if match is None:
-        match = _LEGACY_PEER_ENVELOPE_HEADER_RE.match(text)
+    if match is not None:
+        return match.group("msg")
+    match = _LEGACY_PEER_ENVELOPE_HEADER_RE.match(text)
     return match.group(1) if match is not None else None
 
 

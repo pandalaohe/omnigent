@@ -18,11 +18,13 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
 
-from omnigent.entities.conversation import Conversation
+from omnigent.entities import SessionPeerMessage
+from omnigent.entities.conversation import Conversation, MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations, subagent_block_notifier
 from omnigent.runtime.subagent_block_notifier import (
     SubagentBlockNotifier,
@@ -30,10 +32,15 @@ from omnigent.runtime.subagent_block_notifier import (
     _child_label,
     _format_block_notice,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import helpers as session_helpers
+from omnigent.server.routes.sessions.routes_peer import format_peer_envelope
+from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 
 # Wall-clock ceiling for polling the recording dispatch. The notifier
 # hops through ``run_coroutine_threadsafe`` and an escalation sleep, so
@@ -1374,3 +1381,208 @@ def test_format_block_notice_annotates_source_with_agent_host_and_cwd(
         "sub-agent auth-fix (Claude Code @ laptop, /repo/worktree) is blocked "
         "awaiting human approval: Run the tests." in notice
     )
+
+
+@pytest.mark.asyncio
+async def test_foreign_turn_sender_recipient_gets_sender_wording(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """A verified foreign sender is woken instead of the parent, with sender wording."""
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="claude_code:peerwork", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+        foreign_turn_sender=lambda _child: "sender-session",
+    )
+
+    notifier.observe(child.id, _request_event("elicit_peer", message="Run rm -rf?"))
+    await _wait_for_calls(dispatch, expected=1)
+
+    block = dispatch.calls[0]
+    assert block.parent_id == "sender-session"
+    assert "handling your peer message" in block.notice
+    # The sender's chat never mirrors the child's approval card.
+    assert "mirrored into this conversation" not in block.notice
+
+    notifier.observe(child.id, _resolved_event("elicit_peer", action="accept"))
+    await _wait_for_calls(dispatch, expected=2)
+
+    resolution = dispatch.calls[1]
+    assert resolution.parent_id == "sender-session"
+    assert "handling your peer message" in resolution.notice
+
+
+@pytest.mark.asyncio
+async def test_foreign_turn_sender_none_uses_parent(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """No verified foreign sender means today's parent target and wording."""
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="claude_code:own", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+        foreign_turn_sender=lambda _child: None,
+    )
+
+    notifier.observe(child.id, _request_event("elicit_own", message="Run rm -rf?"))
+    await _wait_for_calls(dispatch, expected=1)
+
+    call = dispatch.calls[0]
+    assert call.parent_id == parent.id
+    assert "mirrored into this conversation" in call.notice
+
+
+@pytest.mark.asyncio
+async def test_foreign_turn_sender_raises_uses_parent(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """A raising resolver falls back to the parent, never crashing the wake."""
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="claude_code:boom", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+
+    def _boom(_child: Conversation) -> str | None:
+        raise RuntimeError("store down")
+
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+        foreign_turn_sender=_boom,
+    )
+
+    notifier.observe(child.id, _request_event("elicit_boom", message="Run rm -rf?"))
+    await _wait_for_calls(dispatch, expected=1)
+
+    call = dispatch.calls[0]
+    assert call.parent_id == parent.id
+    assert "mirrored into this conversation" in call.notice
+
+
+@pytest_asyncio.fixture
+async def peer_store(tmp_path: Path) -> AsyncIterator[SqlAlchemyPeerMessageStore]:
+    """Per-test SQLite-backed peer record store."""
+    yield SqlAlchemyPeerMessageStore(f"sqlite:///{tmp_path / 'peers.db'}")
+
+
+def _seed_foreign_envelope(
+    conv_store: SqlAlchemyConversationStore,
+    peer_store: SqlAlchemyPeerMessageStore,
+    child_id: str,
+) -> str:
+    """Append a verified foreign envelope as the child's newest input."""
+    sender = conv_store.create_conversation(kind="default", title="sender")
+    record = peer_store.create(
+        SessionPeerMessage(
+            id=uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=child_id,
+            ref="ref-1",
+            text="do the thing",
+            state="delivered",
+            created_at=1,
+            expires_at=2,
+        )
+    )
+    envelope = format_peer_envelope(
+        sender_session_id=sender.id,
+        sender_title="Sender",
+        sender_agent_name="claude",
+        sender_project_id=None,
+        ref="ref-1",
+        peer_id=record.id,
+        text="do the thing",
+    )
+    conv_store.append(
+        child_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp-1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": envelope}]),
+            )
+        ],
+    )
+    return sender.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_on", [True, False], ids=["peer-on", "peer-off"])
+async def test_configured_notifier_routes_notices_by_turn_origin(
+    conv_store: SqlAlchemyConversationStore,
+    peer_store: SqlAlchemyPeerMessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    peer_on: bool,
+) -> None:
+    """The wired resolver sends a foreign turn's notices to its sender.
+
+    Flag on with a child whose newest input is a verified foreign envelope:
+    the block notice and its resolution go to the sender. Flag off: to the
+    parent. No injected lambda — the server wiring builds the resolver from
+    the real conversation and peer stores.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:peerwork", parent_conversation_id=parent.id
+    )
+    sender_id = _seed_foreign_envelope(conv_store, peer_store, child.id)
+
+    recipients: list[str] = []
+    fired = asyncio.Event()
+    sentinel_client = object()
+
+    async def _fake_get_runner_client(session_id: str, runner_router: Any) -> object:
+        return sentinel_client
+
+    async def _record_dispatch(
+        session_id: str,
+        conv: Conversation,
+        body: SessionEventInput,
+        conversation_store: SqlAlchemyConversationStore,
+        runner_client: object,
+        *,
+        agent_name: str | None = None,
+        file_store: Any | None = None,
+        artifact_store: Any | None = None,
+        has_mcp_servers: bool = False,
+        runner_router: Any | None = None,
+        agent_revision: str | None = None,
+    ) -> str:
+        recipients.append(session_id)
+        fired.set()
+        return "item_wake"
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)
+
+    flags = FeatureFlags(frozenset({Feature.SESSION_PEER_MESSAGING}) if peer_on else frozenset())
+    uninstall = sessions_module.configure_subagent_block_notifier(
+        conv_store, None, peer_message_store=peer_store, feature_flags=flags
+    )
+    try:
+        pending_elicitations.record_publish(
+            child.id, _request_event("elicit_peer", message="Codex wants to run 'git fetch'")
+        )
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+        fired.clear()
+        pending_elicitations.record_publish(
+            child.id, _resolved_event("elicit_peer", action="accept")
+        )
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    finally:
+        uninstall()
+
+    expected = sender_id if peer_on else parent.id
+    assert recipients == [expected, expected]
