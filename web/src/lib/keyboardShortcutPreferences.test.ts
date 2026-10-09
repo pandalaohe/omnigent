@@ -3,21 +3,30 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   KEYBOARD_SHORTCUTS_STORAGE_KEY,
+  SHORTCUT_ACTION_IDS,
   deleteShortcutPlatformOverride,
   eventMatchesShortcut,
   eventMatchesShortcutAction,
   findShortcutConflicts,
   defaultShortcutBindings,
+  macWindowsKeyPositionNotes,
   readKeyboardShortcutPreferences,
+  readMacWindowsKeyPositions,
+  resetShortcutPreference,
   resolveShortcutBindings,
   resolvedShortcutChords,
   shortcutAriaKeys,
   shortcutBindingLabels,
   shortcutChordFromEvent,
+  writeMacWindowsKeyPositions,
   writeShortcutPreference,
   type ShortcutActionId,
   type ShortcutChord,
+  type ShortcutPlatform,
 } from "./keyboardShortcutPreferences";
+import { queueUserPreferencePatch } from "./userPreferencesSync";
+
+vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 
 const ctrlN: ShortcutChord = {
   code: "KeyN",
@@ -29,9 +38,12 @@ const altN: ShortcutChord = {
   modifiers: ["alt"],
 };
 
+const ALL_PLATFORMS: ShortcutPlatform[] = ["macos", "windows", "linux"];
+
 describe("keyboardShortcutPreferences", () => {
   beforeEach(() => {
     localStorage.clear();
+    vi.mocked(queueUserPreferencePatch).mockReset();
   });
 
   it("falls back to the action default when no preference exists", () => {
@@ -322,5 +334,212 @@ describe("keyboardShortcutPreferences", () => {
       "Control+=",
     );
     expect(shortcutAriaKeys({ code: "Space", modifiers: [] }, "windows")).toEqual("Space");
+  });
+
+  describe("Windows key positions on macOS", () => {
+    it("leaves every default unchanged while the switch is off", () => {
+      for (const actionId of SHORTCUT_ACTION_IDS) {
+        for (const platform of ALL_PLATFORMS) {
+          expect(resolveShortcutBindings(actionId, platform)).toEqual(
+            DEFAULT_SHORTCUT_DEFINITIONS[actionId].defaultBindings,
+          );
+        }
+      }
+      expect(resolveShortcutBindings("sendMessage", "macos", { submitWithModEnter: true })).toEqual(
+        [{ code: "Enter", modifiers: ["primary"] }],
+      );
+      expect(resolveShortcutBindings("pinnedSession", "macos", { nativeShell: true })).toEqual([
+        { code: "Digit*", modifiers: ["primary"] },
+      ]);
+    });
+
+    it("maps macOS defaults onto Windows key positions when enabled", () => {
+      writeMacWindowsKeyPositions(true);
+
+      expect(resolveShortcutBindings("pollSessions", "macos")).toEqual([
+        { code: "Backquote", modifiers: ["meta"] },
+      ]);
+      expect(resolveShortcutBindings("archiveSession", "macos")).toEqual([
+        { code: "KeyW", modifiers: ["alt"] },
+      ]);
+      expect(resolveShortcutBindings("newLine", "macos")).toEqual([
+        { code: "Enter", modifiers: ["shift"] },
+        { code: "Enter", modifiers: ["alt"] },
+      ]);
+      expect(resolveShortcutBindings("newLine", "macos", { submitWithModEnter: true })).toEqual([
+        { code: "Enter", modifiers: [] },
+        { code: "Enter", modifiers: ["alt"] },
+      ]);
+      expect(resolveShortcutBindings("newSession", "macos")).toEqual([
+        { code: "KeyN", modifiers: ["control", "meta"] },
+      ]);
+      expect(resolveShortcutBindings("pinnedSession", "macos")).toEqual([
+        { code: "Digit*", modifiers: ["control", "meta"] },
+      ]);
+      expect(resolveShortcutBindings("commandPalette", "macos")).toEqual([
+        { code: "KeyK", modifiers: ["control"] },
+      ]);
+      expect(resolveShortcutBindings("approvePrompt", "macos")).toEqual([
+        { code: "Enter", modifiers: ["control"] },
+      ]);
+      // Pure-Control defaults do not change on macOS.
+      expect(resolveShortcutBindings("openModelPicker", "macos")).toEqual([
+        { code: "KeyM", modifiers: ["control", "shift"] },
+      ]);
+    });
+
+    it("labels the mapped Poll and new-session defaults", () => {
+      writeMacWindowsKeyPositions(true);
+
+      expect(
+        shortcutBindingLabels(resolveShortcutBindings("pollSessions", "macos")[0], "macos"),
+      ).toEqual(["⌘", "~"]);
+      expect(
+        shortcutBindingLabels(resolveShortcutBindings("newSession", "macos")[0], "macos"),
+      ).toEqual(["⌃", "⌘", "N"]);
+    });
+
+    it("leaves Windows and Linux defaults unchanged while enabled", () => {
+      writeMacWindowsKeyPositions(true);
+
+      for (const actionId of SHORTCUT_ACTION_IDS) {
+        for (const platform of ["windows", "linux"] as const) {
+          expect(resolveShortcutBindings(actionId, platform)).toEqual(
+            DEFAULT_SHORTCUT_DEFINITIONS[actionId].defaultBindings,
+          );
+        }
+      }
+    });
+
+    it("returns recorded bindings unmapped", () => {
+      writeMacWindowsKeyPositions(true);
+      writeShortcutPreference("pollSessions", {
+        common: [{ code: "Backquote", modifiers: ["control"] }],
+      });
+      writeShortcutPreference("archiveSession", {
+        common: [ctrlN],
+        platformOverrides: { macos: [{ code: "KeyW", modifiers: ["primary"] }] },
+      });
+
+      expect(resolveShortcutBindings("pollSessions", "macos")).toEqual([
+        { code: "Backquote", modifiers: ["control"] },
+      ]);
+      expect(resolveShortcutBindings("archiveSession", "macos")).toEqual([
+        { code: "KeyW", modifiers: ["primary"] },
+      ]);
+    });
+
+    it("keeps the macOS conflict set identical to the switch-off set", () => {
+      const conflictsWhileOff = new Map(
+        SHORTCUT_ACTION_IDS.map((actionId) => [
+          actionId,
+          findShortcutConflicts(actionId, resolveShortcutBindings(actionId, "macos"), "macos"),
+        ]),
+      );
+      writeMacWindowsKeyPositions(true);
+
+      for (const actionId of SHORTCUT_ACTION_IDS) {
+        expect(
+          findShortcutConflicts(actionId, resolveShortcutBindings(actionId, "macos"), "macos"),
+        ).toEqual(conflictsWhileOff.get(actionId));
+      }
+    });
+
+    it("matches ⌘` for Poll only while the switch is on", () => {
+      const commandBackquote = new KeyboardEvent("keydown", {
+        code: "Backquote",
+        key: "`",
+        metaKey: true,
+      });
+      const optionBackquote = new KeyboardEvent("keydown", {
+        code: "Backquote",
+        key: "`",
+        altKey: true,
+      });
+
+      expect(eventMatchesShortcutAction(commandBackquote, "pollSessions", "macos")).toBe(false);
+      expect(eventMatchesShortcutAction(optionBackquote, "pollSessions", "macos")).toBe(true);
+
+      writeMacWindowsKeyPositions(true);
+
+      expect(eventMatchesShortcutAction(commandBackquote, "pollSessions", "macos")).toBe(true);
+      expect(eventMatchesShortcutAction(optionBackquote, "pollSessions", "macos")).toBe(false);
+    });
+
+    it("persists the switch through the keyboard-shortcuts namespace", () => {
+      writeMacWindowsKeyPositions(true);
+
+      expect(readMacWindowsKeyPositions()).toBe(true);
+      expect(JSON.parse(localStorage.getItem(KEYBOARD_SHORTCUTS_STORAGE_KEY) ?? "null")).toEqual({
+        version: 1,
+        actions: {},
+        macWindowsKeyPositions: true,
+      });
+      expect(queueUserPreferencePatch).toHaveBeenLastCalledWith("keyboard_shortcuts", {
+        version: 1,
+        actions: {},
+        macWindowsKeyPositions: true,
+      });
+    });
+
+    it("removes the stored record when the switch is turned off with no actions", () => {
+      writeMacWindowsKeyPositions(true);
+      writeMacWindowsKeyPositions(false);
+
+      expect(readMacWindowsKeyPositions()).toBe(false);
+      expect(localStorage.getItem(KEYBOARD_SHORTCUTS_STORAGE_KEY)).toBeNull();
+      expect(queueUserPreferencePatch).toHaveBeenLastCalledWith("keyboard_shortcuts", null);
+    });
+
+    it("keeps the switch through preference edits and override deletion", () => {
+      writeMacWindowsKeyPositions(true);
+      writeShortcutPreference("newSession", { common: [altN] });
+      writeShortcutPreference("archiveSession", {
+        common: [ctrlN],
+        platformOverrides: { macos: [{ code: "KeyW", modifiers: ["primary"] }] },
+      });
+
+      resetShortcutPreference("newSession");
+      deleteShortcutPlatformOverride("archiveSession", "macos");
+
+      expect(readMacWindowsKeyPositions()).toBe(true);
+      expect(readKeyboardShortcutPreferences().actions.archiveSession).toEqual({
+        common: [ctrlN],
+        platformOverrides: {},
+      });
+    });
+
+    it("treats a stored non-boolean flag as off", () => {
+      localStorage.setItem(
+        KEYBOARD_SHORTCUTS_STORAGE_KEY,
+        JSON.stringify({ version: 1, actions: {}, macWindowsKeyPositions: "true" }),
+      );
+
+      expect(readMacWindowsKeyPositions()).toBe(false);
+      expect(readKeyboardShortcutPreferences()).toEqual({ version: 1, actions: {} });
+    });
+
+    it("explains the taken keys while enabled on macOS", () => {
+      writeMacWindowsKeyPositions(true);
+
+      expect(macWindowsKeyPositionNotes("pollSessions", {}, "macos")).toEqual([
+        "macOS uses ⌘` to move focus to the next window. To use it here, turn off System Settings → Keyboard → Keyboard Shortcuts → Keyboard → “Move focus to next window”.",
+      ]);
+      expect(macWindowsKeyPositionNotes("archiveSession", {}, "macos")).toEqual([
+        "Keeps ⌥W: ⌘W closes the window or tab.",
+      ]);
+      expect(macWindowsKeyPositionNotes("newLine", {}, "macos")).toEqual([
+        "Keeps ⌥↵: ⌘↵ is the composer's send-all key.",
+      ]);
+    });
+
+    it("shows no notes off macOS or while the switch is off", () => {
+      writeMacWindowsKeyPositions(true);
+      expect(macWindowsKeyPositionNotes("pollSessions", {}, "windows")).toEqual([]);
+      expect(macWindowsKeyPositionNotes("pollSessions", {}, "linux")).toEqual([]);
+
+      writeMacWindowsKeyPositions(false);
+      expect(macWindowsKeyPositionNotes("pollSessions", {}, "macos")).toEqual([]);
+    });
   });
 });

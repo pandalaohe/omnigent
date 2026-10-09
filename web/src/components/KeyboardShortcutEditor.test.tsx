@@ -1,10 +1,11 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KeyboardShortcutEditor } from "./KeyboardShortcutEditor";
 import {
   isShortcutRecordingActive,
   readKeyboardShortcutPreferences,
+  readMacWindowsKeyPositions,
   resolveShortcutBindings,
 } from "@/lib/keyboardShortcutPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
@@ -23,6 +24,7 @@ describe("KeyboardShortcutEditor", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    vi.restoreAllMocks();
   });
 
   it("lists the question-card group and records its actions", () => {
@@ -191,5 +193,26 @@ describe("KeyboardShortcutEditor", () => {
     expect(screen.getByText(/needs a modifier to hold/)).toBeTruthy();
     expect(isShortcutRecordingActive()).toBe(false);
     expect(readKeyboardShortcutPreferences().actions.recentSessions).toBeUndefined();
+  });
+
+  it("offers Windows key positions on macOS and previews the mapped defaults", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    render(<KeyboardShortcutEditor />);
+
+    const toggle = screen.getByRole("switch", { name: "Use Windows key positions" });
+    fireEvent.click(toggle);
+
+    expect(readMacWindowsKeyPositions()).toBe(true);
+    const pollRow = actionRow("Poll sessions");
+    expect(within(pollRow).getByText("⌘")).toBeTruthy();
+    expect(within(pollRow).getByText("~")).toBeTruthy();
+    expect(screen.getByText(/macOS uses ⌘` to move focus/)).toBeTruthy();
+    expect(screen.getByText("Keeps ⌥W: ⌘W closes the window or tab.")).toBeTruthy();
+  });
+
+  it("does not offer Windows key positions off macOS", () => {
+    render(<KeyboardShortcutEditor />);
+
+    expect(screen.queryByRole("switch", { name: "Use Windows key positions" })).toBeNull();
   });
 });
