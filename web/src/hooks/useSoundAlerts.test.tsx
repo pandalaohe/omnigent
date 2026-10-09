@@ -359,6 +359,73 @@ describe("useSoundAlerts", () => {
     expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "done" });
   });
 
+  it("a stopped turn in a session the user is not viewing claims done and plays it", () => {
+    setConversations([conv("conv_a", { status: "running" })]);
+    const { rerender } = renderHook(() => useSoundAlerts("conv_b"));
+    settleInitialSnapshot();
+
+    // The stopped turn gets an unseen mark while another session is open.
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      isConversationUnseenMock.mockReturnValue(true);
+      setConversations([conv("conv_a", { updated_at: 200, status: "idle" })]);
+      rerender();
+    });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    const claim = claimBodies()[0];
+    expect(claim).toMatchObject({ session_id: "conv_a", level: "done" });
+
+    emitFrame({
+      type: "sound_alert",
+      alert_id: claim.alert_id,
+      session_id: "conv_a",
+      level: "done",
+    });
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+
+    expect(playLevelMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+  });
+
+  it("a stopped turn inside the open, focused session plays nothing", () => {
+    setConversations([conv("conv_a", { status: "running" })]);
+    const { rerender } = renderHook(() => useSoundAlerts("conv_a"));
+    settleInitialSnapshot();
+
+    // The visible done mark claims, then focused viewing suppresses playback.
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      isConversationUnseenMock.mockReturnValue(true);
+      setConversations([conv("conv_a", { updated_at: 200, status: "idle" })]);
+      rerender();
+    });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    const claim = claimBodies()[0];
+    expect(claim).toMatchObject({ session_id: "conv_a", level: "done" });
+
+    emitFrame({
+      type: "sound_alert",
+      alert_id: claim.alert_id,
+      session_id: "conv_a",
+      level: "done",
+    });
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+
+    expect(playLevelMock).not.toHaveBeenCalled();
+  });
+
   it("stays silent while background work covers the dot, then claims when it clears", () => {
     setConversations([conv("conv_a", { background_activity_count: 1 })]);
     const { rerender } = renderHook(() => useSoundAlerts());

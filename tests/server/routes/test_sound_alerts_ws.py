@@ -135,8 +135,8 @@ def test_claim_delivers_to_the_active_connection_only_once(
 ) -> None:
     """The device used last receives the alert; repeats and other users don't."""
     session_id = _seed_session(stores, owner=ALICE, title="live")
-    client = TestClient(app)
     with (
+        TestClient(app) as client,
         client.websocket_connect(
             "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
         ) as ws_active,
@@ -150,12 +150,14 @@ def test_claim_delivers_to_the_active_connection_only_once(
         _hello(ws_active, "dev_a")
         _hello(ws_idle, "dev_b")
         _hello(ws_bob, "dev_bob")
-        ws_active.send_text(json.dumps({"type": "activity"}))
-        # The watch/snapshot round trip proves each connection's reader has
-        # processed the hello (and activity) sent ahead of it.
+        # Register each connection before marking one active.
         for ws in (ws_active, ws_idle, ws_bob):
             ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
             _recv_until(ws, {"snapshot"})
+        ws_active.send_text(json.dumps({"type": "activity"}))
+        # This snapshot proves the active connection processed the activity.
+        ws_active.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        _recv_until(ws_active, {"snapshot"})
 
         body = {
             "alert_id": f"{session_id}:needs_response:1",
@@ -201,8 +203,8 @@ def test_claim_delivers_to_the_active_ringer_even_without_watching_the_session(
 ) -> None:
     """Claim routing follows activity, not which connection watched the session."""
     session_id = _seed_session(stores, owner=ALICE, title="live")
-    client = TestClient(app)
     with (
+        TestClient(app) as client,
         client.websocket_connect(
             "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
         ) as ws_active,
@@ -212,13 +214,14 @@ def test_claim_delivers_to_the_active_ringer_even_without_watching_the_session(
     ):
         _hello(ws_active, "dev_a")
         _hello(ws_idle, "dev_b")
-        ws_active.send_text(json.dumps({"type": "activity"}))
-        # The most recently active connection watches nothing; the idle one
-        # watches the alert's session. The alert still lands on the active one.
         ws_active.send_text(json.dumps({"type": "watch", "session_ids": []}))
         _recv_until(ws_active, {"snapshot"})
         ws_idle.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
         _recv_until(ws_idle, {"snapshot"})
+        ws_active.send_text(json.dumps({"type": "activity"}))
+        # A follow-up snapshot proves the active connection processed it.
+        ws_active.send_text(json.dumps({"type": "watch", "session_ids": []}))
+        _recv_until(ws_active, {"snapshot"})
 
         body = {
             "alert_id": f"{session_id}:needs_response:1",
