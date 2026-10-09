@@ -6,6 +6,7 @@
 // logic the WebLinksAddon delegates to — the click handler that makes
 // terminal URLs clickable — so we pin it here.
 
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -1326,6 +1327,34 @@ describe("TerminalSession", () => {
     socket.closed = false; // prove the second close() isn't invoked
     session.dispose();
     expect(socket.closed).toBe(false);
+  });
+
+  it("disposes the terminal core before the WebGL addon", () => {
+    // WHY: disposing the addon while the terminal is alive makes xterm
+    // rebuild a DOM renderer that re-measures every glyph with forced
+    // layouts, freezing session switches for seconds.
+    const coreDisposedAtAddonDispose: boolean[] = [];
+    let activatedTerminal: Terminal | null = null;
+    const activateSpy = vi
+      .spyOn(WebglAddon.prototype, "activate")
+      .mockImplementation((terminal) => {
+        activatedTerminal = terminal;
+      });
+    const disposeSpy = vi.spyOn(WebglAddon.prototype, "dispose").mockImplementation(() => {
+      const core = (activatedTerminal as unknown as { _core: { _store: { _isDisposed: boolean } } })
+        ._core;
+      // The real addon checks this same private predicate to decide whether
+      // to rebuild the DOM renderer; record it as the addon is disposed.
+      coreDisposedAtAddonDispose.push(core._store._isDisposed);
+    });
+    try {
+      const { session } = makeSession();
+      session.dispose();
+      expect(coreDisposedAtAddonDispose).toEqual([true]);
+    } finally {
+      activateSpy.mockRestore();
+      disposeSpy.mockRestore();
+    }
   });
 
   it("observes the container for resize", () => {

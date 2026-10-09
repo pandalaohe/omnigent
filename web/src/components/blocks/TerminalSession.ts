@@ -657,8 +657,6 @@ export function touchScrollPayload(
 export class TerminalSession {
   private readonly term: Terminal;
   private readonly fit: FitAddon;
-  /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
-  private readonly webgl: WebglAddon | null;
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
@@ -766,7 +764,7 @@ export class TerminalSession {
     this.term.open(container);
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
-    this.webgl = loadWebglRenderer(this.term);
+    loadWebglRenderer(this.term);
     try {
       this.fit.fit();
     } catch (err) {
@@ -1067,9 +1065,9 @@ export class TerminalSession {
     } catch {
       /* noop */
     }
-    // Dispose the WebGL renderer before the terminal so its canvas and
-    // GL context are released while the terminal still owns them.
-    this.webgl?.dispose();
+    // term.dispose() tears down the core before its addons, so the WebGL
+    // addon skips rebuilding a DOM renderer (which would re-measure every
+    // glyph with a forced layout) on the way out.
     this.term.dispose();
   }
 
