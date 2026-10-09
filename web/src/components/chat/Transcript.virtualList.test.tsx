@@ -2,15 +2,26 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
+import type { ElicitationBlock } from "@/lib/blocks";
+import { MemoryRouter } from "react-router-dom";
+import { useChatStore } from "@/store/chatStore";
 import type { Virtualizer } from "@tanstack/react-virtual";
 import {
   isNativeFindShortcut,
   measureRowAndPin,
+  Transcript,
   type TranscriptGeometry,
   VirtualBubbleList,
 } from "./Transcript";
 
-afterEach(cleanup);
+vi.mock("@/hooks/useArcaShutdownBanner", () => ({
+  useArcaShutdownBanner: () => ({ showForHost: () => false }),
+}));
+
+afterEach(() => {
+  cleanup();
+  useChatStore.setState({ blocks: [], conversationId: null, sessionStatus: "idle" });
+});
 
 const bubble: Extract<Bubble, { kind: "user" }> = {
   kind: "user",
@@ -197,6 +208,71 @@ it("keeps every action row hover-only when the final message is from the user", 
   for (const button of screen.getAllByRole("button", { name: "Copy" })) {
     expect(actionFooter(button)).toHaveClass("md:opacity-0");
   }
+});
+
+const pendingElicitation: ElicitationBlock = {
+  type: "elicitation",
+  ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+  elicitationId: "elic_1",
+  targetSessionId: null,
+  message: "Allow shell command?",
+  phase: "tool_call",
+  policyName: "ask-before-shell",
+  contentPreview: "{}",
+  requestedSchema: {},
+  url: null,
+  status: "pending",
+  response: null,
+};
+
+function renderTranscript(blocks: ElicitationBlock[]) {
+  useChatStore.setState({ blocks, conversationId: "conv-test", sessionStatus: "running" });
+  return render(
+    <MemoryRouter>
+      <Transcript
+        hostId={null}
+        setConversationEl={vi.fn()}
+        containerEl={null}
+        scroller={null}
+        setScroller={vi.fn()}
+        sendScrollNonce={0}
+        hasMoreHistory={false}
+        loadingMoreHistory={false}
+        isMobileViewport
+        showsWorking
+        agentsError={null}
+        sandboxLaunching={false}
+        conversationId="conv-test"
+        scrollToBottomOnSessionOpen={false}
+        openedConversationIdRef={{ current: null }}
+        spacerMeasureRef={{ current: null }}
+      />
+    </MemoryRouter>,
+  );
+}
+
+it("keeps the pending elicitation card after the working indicator", () => {
+  renderTranscript([pendingElicitation]);
+
+  const working = screen.getByTestId("working-indicator");
+  const cards = screen.getAllByTestId("bottom-elicitation");
+  const lastCard = cards.at(-1)!;
+
+  expect(
+    working.compareDocumentPosition(lastCard) & Node.DOCUMENT_POSITION_FOLLOWING,
+    "Working indicator should precede the pending elicitation card",
+  ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  expect(
+    (lastCard.compareDocumentPosition(working) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+    "No working indicator should follow the last pending elicitation card",
+  ).toBe(false);
+});
+
+it("shows the working indicator when no elicitation is pending", () => {
+  renderTranscript([]);
+
+  expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  expect(screen.queryByTestId("bottom-elicitation")).not.toBeInTheDocument();
 });
 
 it("keeps a renamed top bubble's row across a history prepend", () => {
