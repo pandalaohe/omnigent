@@ -5259,6 +5259,40 @@ describe("Composer sendText (code-block send)", () => {
     expect(textarea()).toHaveValue("my draft");
   });
 
+  it.each([
+    { asyncKind: "question" as const, expected: true },
+    { asyncKind: "approval" as const, expected: true },
+    { asyncKind: null, expected: false },
+  ])("sends past a pending $asyncKind card: $expected", ({ asyncKind, expected }) => {
+    const card: ElicitationBlock = {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+      elicitationId: "elic_1",
+      targetSessionId: null,
+      message: "Pick one",
+      phase: "tool_call",
+      policyName: "ask-user",
+      contentPreview: "{}",
+      requestedSchema: {},
+      url: null,
+      status: "pending",
+      response: null,
+      asyncKind,
+    };
+    setComposerState({ blocks: [card] });
+    const onSend = vi.fn();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps({ onSend })} ref={ref} />);
+
+    let sent = !expected;
+    act(() => {
+      sent = ref.current?.sendText("ls -la") ?? !expected;
+    });
+
+    expect(sent).toBe(expected);
+    expect(onSend).toHaveBeenCalledTimes(expected ? 1 : 0);
+  });
+
   it.each([{ disabled: true }, { sendDisabledReason: "x" }])(
     "refuses to send when the composer is gated: %j",
     (overrides) => {

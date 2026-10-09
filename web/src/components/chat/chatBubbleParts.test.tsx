@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CodeBlockSendContext } from "@/components/ai-elements/message";
+import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
@@ -131,6 +133,67 @@ describe("AssistantBubble fork source", () => {
 
     expect(openForkDialog).toHaveBeenCalledOnce();
     expect(openForkDialog).toHaveBeenCalledWith(expected);
+  });
+});
+
+describe("AssistantBubble code-block send with a pending card", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_code",
+    stableId: "code_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [
+      { kind: "text", itemId: "code_text", text: "Run this:\n\n```\nls -la\n```\n", final: true },
+    ],
+  };
+
+  function pendingCard(asyncKind: ElicitationBlock["asyncKind"]): ElicitationBlock {
+    return {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_code", itemId: null },
+      elicitationId: "elic_1",
+      targetSessionId: null,
+      message: "Pick one",
+      phase: "tool_call",
+      policyName: "ask-user",
+      contentPreview: "{}",
+      requestedSchema: {},
+      url: null,
+      status: "pending",
+      response: null,
+      asyncKind,
+    };
+  }
+
+  function renderLastBubble(asyncKind: ElicitationBlock["asyncKind"], send = vi.fn(() => true)) {
+    useChatStore.setState({ sessionStatus: "idle", blocks: [pendingCard(asyncKind)] });
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CodeBlockSendContext.Provider value={send}>
+          <BubbleView bubble={bubble} isLastAssistant />
+        </CodeBlockSendContext.Provider>
+      </QueryClientProvider>,
+    );
+    return send;
+  }
+
+  it.each(["question", "approval"] as const)(
+    "keeps the send arrow on a finished reply while an async %s card is pending",
+    async (asyncKind) => {
+      const send = renderLastBubble(asyncKind);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Send as message" }));
+
+      expect(send).toHaveBeenCalledWith("ls -la");
+    },
+  );
+
+  it("withholds the send arrow while a blocking card parks the turn", async () => {
+    renderLastBubble(null);
+
+    await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(screen.queryByRole("button", { name: "Send as message" })).toBeNull();
   });
 });
 

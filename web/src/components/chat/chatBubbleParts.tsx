@@ -1012,7 +1012,7 @@ function AssistantBubble({
   const conversationId = sessionId ?? scopedConversationId ?? activeConversationId;
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
   const rootHasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
+    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending" && b.asyncKind == null),
   );
   // Archive/library viewers (readOnly) never show a live status regardless of
   // scope — there's no session to be pending on.
@@ -1022,11 +1022,14 @@ function AssistantBubble({
       ? scopedState.sessionStatus
       : rootSessionStatus;
   // A pending elicitation means the turn is parked awaiting the user — still in
-  // flight even when its lifecycle or the session status reads settled.
+  // flight even when its lifecycle or the session status reads settled. Async
+  // cards never park the turn, so a reply that ended with one reads settled.
   const hasPendingElicitation = readOnly
     ? false
     : scopedConversationId
-      ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
+      ? scopedState.blocks.some(
+          (b) => b.type === "elicitation" && b.status === "pending" && b.asyncKind == null,
+        )
       : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
