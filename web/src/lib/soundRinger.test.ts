@@ -246,16 +246,35 @@ describe("sound ringer", () => {
     expect(h.played).toEqual([]);
   });
 
-  it("drops a done that arrives 500 ms after an other cue played", () => {
+  it("opens a new collection for an error arriving after the previous window closed", () => {
     const h = createHarness();
 
     h.ringer.ring(alert("done", "conv_1"));
     h.advance(2_000);
     h.advance(500);
+    h.ringer.ring(alert("error", "conv_2"));
+    h.advance(2_000);
+
+    expect(h.played).toEqual([
+      { level: "done", at: NOON + 2_000 },
+      { level: "error", at: NOON + 4_500 },
+    ]);
+  });
+
+  it("a window that played nothing does not suppress the next alert", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("done", "conv_1"));
+    h.setContext({ device: device({ enabled: false }) });
+    h.advance(2_000);
+    expect(h.played).toEqual([]);
+
+    h.setContext({ device: device({ enabled: true }) });
+    h.advance(500);
     h.ringer.ring(alert("done", "conv_2"));
     h.advance(2_000);
 
-    expect(h.played).toEqual([{ level: "done", at: NOON + 2_000 }]);
+    expect(h.played).toEqual([{ level: "done", at: NOON + 4_500 }]);
   });
 
   it("drops a scheduled needs_response when the device is switched off before it fires", () => {

@@ -35,8 +35,8 @@ export interface SoundRinger {
   dispose: () => void;
 }
 
-// done/error alerts arriving within this window collapse into one cue; a
-// needs_response cue is rate-limited to one per window.
+// done/error alerts within a collection window collapse into one cue;
+// needs_response cues are rate-limited to one per 2_000 ms.
 const BURST_WINDOW_MS = 2_000;
 // Minimum start-to-start distance between a "needs response" cue and a
 // done/error cue, applied to whichever one starts later.
@@ -160,10 +160,6 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
       remember(alert.alertId);
       return;
     }
-    const now = deps.nowMs();
-    const last = lastCueAt.other;
-    // A done/error right after an other cue is part of that burst, not a new one.
-    if (last !== undefined && now - last < BURST_WINDOW_MS) return;
     remember(alert.alertId);
     const alerts = [alert];
     collecting = alerts;
