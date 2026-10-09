@@ -155,6 +155,7 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
+    _child_pending_elicitations_by_parent,
     _codex_plan_mode_enabled,
     _delete_stored_session_bundle_after_failure,
     _discovery_key,
@@ -2137,6 +2138,11 @@ def register_core_routes(
             for child_id, child in child_rows.items()
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
+        child_pending_counts = await _child_pending_elicitations_by_parent(
+            child_ids_by_parent,
+            child_rows,
+            liveness_lookup,
+        )
         keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, page.data)
         cold_after_by_session = await _cold_after_by_session_for(page.data, request.app.state)
         items: list[SessionListItem] = [
@@ -2149,6 +2155,7 @@ def register_core_routes(
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
+                child_pending_count=child_pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
@@ -2411,6 +2418,11 @@ def register_core_routes(
             for child_id, child in child_rows.items()
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
+        child_pending_counts = await _child_pending_elicitations_by_parent(
+            child_ids_by_parent,
+            child_rows,
+            liveness_lookup,
+        )
         keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, convs)
         cold_after_by_session = await _cold_after_by_session_for(convs, app_state)
         items = [
@@ -2423,6 +2435,7 @@ def register_core_routes(
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
+                child_pending_count=child_pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,

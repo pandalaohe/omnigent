@@ -32,6 +32,7 @@ export function rowMark(
     | "status"
     | "foreground_status"
     | "pending_elicitations_count"
+    | "child_pending_elicitations_count"
     | "goal_state"
     | "warm_state"
     | "background_activity_count"

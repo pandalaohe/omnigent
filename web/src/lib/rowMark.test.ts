@@ -36,6 +36,14 @@ describe("rowMark", () => {
     expect(mark).toEqual({ state: "awaiting", awaitingCount: 2, background: false, goal: "none" });
   });
 
+  it("reports awaiting when only a live child has a parked prompt", () => {
+    // Children have no sidebar row; the sound-alert diff reads this mark, so
+    // the child-only prompt must register as awaiting on the parent.
+    const mark = rowMark(conv({ child_pending_elicitations_count: 1 }), ctx());
+
+    expect(mark).toEqual({ state: "awaiting", awaitingCount: 1, background: false, goal: "none" });
+  });
+
   it("reports running ahead of starting and errors", () => {
     expect(rowMark(conv({ foreground_status: "running" }), ctx({ starting: true })).state).toBe(
       "running",

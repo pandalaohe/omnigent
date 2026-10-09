@@ -1599,6 +1599,62 @@ async def _apply_liveness_to_items(
             item.background_activity_count = 0
 
 
+async def _child_pending_elicitations_by_parent(
+    child_ids_by_parent: Mapping[str, list[str]],
+    child_rows: Mapping[str, Conversation],
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
+) -> dict[str, int]:
+    """
+    Sum each parent's outstanding child elicitations, live children only.
+
+    Sub-agent children have no sidebar row of their own, so a prompt
+    parked on a live direct child surfaces on the parent's row. Each
+    child's count follows the same rule as the builder's own count: the
+    larger of the in-memory index and the persisted row for a
+    runner-bound child, the index alone for an unbound one. Children
+    whose runner is confirmed offline are dropped — their parked prompt
+    died with the runner, matching :func:`_apply_liveness_to_items` —
+    unless no liveness lookup is wired, in which case every child counts.
+
+    :param child_ids_by_parent: Map from parent id to its direct child
+        ids, as returned by
+        ``list_child_conversation_ids_by_parent()``.
+    :param child_rows: Loaded child conversations keyed by child id.
+        Children missing from it contribute nothing.
+    :param liveness_lookup: Bulk liveness lookup from session id to a
+        :class:`SessionLiveness` pair, or ``None`` when this server
+        cannot compute liveness. Only children with a non-zero pending
+        count are queried.
+    :returns: Map from parent id to its summed live-child pending count
+        (``0`` for parents whose children have none).
+    """
+    all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
+    index_counts = pending_elicitations.counts_for(list(all_child_ids))
+    child_counts: dict[str, int] = {}
+    for child_id in all_child_ids:
+        child = child_rows.get(child_id)
+        if child is None:
+            continue
+        index_count = index_counts.get(child_id, 0)
+        if child.runner_id is not None:
+            child_counts[child_id] = max(index_count, child.pending_elicitation_count or 0)
+        else:
+            child_counts[child_id] = index_count
+    if liveness_lookup is not None:
+        pending_child_ids = [cid for cid, count in child_counts.items() if count > 0]
+        if pending_child_ids:
+            liveness = await asyncio.to_thread(liveness_lookup, pending_child_ids)
+            child_counts = {
+                child_id: count
+                for child_id, count in child_counts.items()
+                if count == 0 or liveness[child_id].runner_online
+            }
+    return {
+        parent_id: sum(child_counts.get(child_id, 0) for child_id in child_ids)
+        for parent_id, child_ids in child_ids_by_parent.items()
+    }
+
+
 def _elicitation_source_label(conv: Conversation) -> str:
     """
     Derive the human label for a mirrored card's source line.
@@ -13246,6 +13302,7 @@ __all__ = [
     "_build_skill_slash_command_policy_body",
     "_canonical_tool_input",
     "_canonical_worktree_path",
+    "_child_pending_elicitations_by_parent",
     "_child_session_current_task_status_from_cached_status",
     "_child_session_summary_from_conversation",
     "_child_summary_identity",

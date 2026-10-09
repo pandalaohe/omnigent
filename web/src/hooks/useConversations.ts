@@ -257,6 +257,11 @@ export interface Conversation {
   agent_name?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
+  /**
+   * Outstanding approval prompts on live direct child sessions, rolled up
+   * into this parent's badge because children have no sidebar row.
+   */
+  child_pending_elicitations_count?: number;
   status?: "idle" | "running" | "failed";
   /** This session's own turn status, excluding active child-session rollup. */
   foreground_status?: "idle" | "running" | "failed";
@@ -609,6 +614,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     agent_template_id: wire.agent_template_id ?? undefined,
     agent_name: wire.agent_name ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
+    child_pending_elicitations_count: wire.child_pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
     host_online: wire.host_online ?? undefined,

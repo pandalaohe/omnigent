@@ -33,12 +33,22 @@ export function getConversationForegroundStatus(
 
 export function getSessionState(
   conversation:
-    | Pick<Conversation, "status" | "foreground_status" | "pending_elicitations_count">
+    | Pick<
+        Conversation,
+        | "status"
+        | "foreground_status"
+        | "pending_elicitations_count"
+        | "child_pending_elicitations_count"
+      >
     | undefined
     | null,
   latestError: LatestSessionError | null = null,
 ): SessionState | null {
-  const pending = conversation?.pending_elicitations_count ?? 0;
+  // Children have no sidebar row of their own, so their parked prompts roll
+  // into the parent's badge: one click reaches the blocked sub-agent.
+  const pending =
+    (conversation?.pending_elicitations_count ?? 0) +
+    (conversation?.child_pending_elicitations_count ?? 0);
   if (pending > 0) return { kind: "awaiting", count: pending };
   // Older servers omit foreground_status, so retain the aggregate status as a
   // compatibility fallback. New servers keep child-only work out of the spinner.
