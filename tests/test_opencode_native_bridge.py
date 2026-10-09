@@ -19,6 +19,8 @@ from omnigent.harnesses.opencode_native.bridge import (
     ensure_auth_secret,
     prepare_bridge_dir,
     read_bridge_state,
+    read_session_instructions,
+    session_instructions_path,
     update_active_message_id,
     update_last_event_id,
     update_model_override,
@@ -27,6 +29,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     write_cost_popup_config,
     write_opencode_policy_plugin,
     write_relay_bridge_config,
+    write_session_instructions,
     xdg_config_home_for_bridge_dir,
     xdg_data_home_for_bridge_dir,
 )
@@ -170,6 +173,37 @@ def test_write_opencode_policy_plugin(bridge_dir: Path) -> None:
     assert "export const OmnigentPolicyPlugin" in src
     # Idempotent overwrite (re-launch ships fresh code, no error).
     assert write_opencode_policy_plugin(bridge_dir) == path
+
+
+def test_write_read_session_instructions_round_trips(bridge_dir: Path) -> None:
+    text = "Be a concise, careful coding assistant."
+    path = write_session_instructions(bridge_dir, text)
+    assert path == session_instructions_path(bridge_dir)
+    # Written exactly, with no added trailing newline.
+    assert path.read_text(encoding="utf-8") == text
+    assert read_session_instructions(bridge_dir) == text
+    # Mode 0600.
+    assert (os.stat(path).st_mode & 0o777) == 0o600
+
+
+def test_write_read_session_instructions_preserves_carriage_returns(bridge_dir: Path) -> None:
+    """CR / CRLF sequences round-trip byte-for-byte (no newline translation)."""
+    text = "Author\r\nline\n\nG"
+    write_session_instructions(bridge_dir, text)
+    assert read_session_instructions(bridge_dir) == text
+
+
+def test_write_session_instructions_none_removes_file(bridge_dir: Path) -> None:
+    path = write_session_instructions(bridge_dir, "text")
+    assert path is not None and path.exists()
+    assert write_session_instructions(bridge_dir, None) is None
+    assert not path.exists()
+    # Idempotent: removing again is a no-op.
+    assert write_session_instructions(bridge_dir, None) is None
+
+
+def test_read_session_instructions_missing_is_none(bridge_dir: Path) -> None:
+    assert read_session_instructions(bridge_dir) is None
 
 
 def test_update_last_event_id(bridge_dir: Path) -> None:
