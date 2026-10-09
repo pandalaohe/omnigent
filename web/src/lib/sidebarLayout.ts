@@ -322,10 +322,13 @@ export function kindsAvailableToCreate(layout: SidebarLayout): SectionKind[] {
 
 /**
  * The rendered rows of a favorites section. Session order is always pin order
- * (old clients reorder pins; the new UI follows), while `items` records which
- * sessions belong to the section and where project refs sit among the session
- * slots. Pinned sessions with no ref anywhere append after the slots; project
- * refs render in place only while the project is known.
+ * (old clients reorder pins; the new UI follows): the section's session refs
+ * are slots, and those slots are filled, in order, by every still-pinned
+ * session sorted by pin time — referenced or not. Pinned sessions past the slot
+ * count append after the last row, so a section with fewer refs than pins still
+ * renders every pin in order. Project refs keep their places among the slots
+ * and render only while the project is known; a ref to a session that was
+ * unpinned elsewhere holds no slot and is skipped.
  */
 export function favoritesRows(
   section: SidebarSectionDef,
@@ -335,10 +338,10 @@ export function favoritesRows(
   if (section.kind !== "favorites") return [];
   const items = section.items ?? [];
   const pinned = new Set(pinnedByTime);
-  const referenced = new Set(items.filter((ref) => ref.type === "session").map((ref) => ref.id));
-  // Only refs to still-pinned sessions are slots; a ref unpinned elsewhere
-  // holds no place, so unreferenced pins cannot jump into it.
-  const slotted = pinnedByTime.filter((id) => referenced.has(id));
+  // One slot per ref to a still-pinned session; the slots take the first pins
+  // in pin order, and the remaining pins append after every row.
+  const slots = items.filter((ref) => ref.type === "session" && pinned.has(ref.id)).length;
+  const slotted = pinnedByTime.slice(0, slots);
   const rows: FavoriteRef[] = [];
   let slot = 0;
   for (const ref of items) {
@@ -349,8 +352,9 @@ export function favoritesRows(
       slot += 1;
     }
   }
+  const consumed = new Set(slotted);
   for (const id of pinnedByTime) {
-    if (!referenced.has(id)) rows.push({ type: "session", id });
+    if (!consumed.has(id)) rows.push({ type: "session", id });
   }
   return rows;
 }

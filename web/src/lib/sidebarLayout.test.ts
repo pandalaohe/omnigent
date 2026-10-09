@@ -388,6 +388,18 @@ describe("favoritesRows", () => {
     ]);
   });
 
+  it("fills the slots with every pin in pin order, so partial refs stay in order", () => {
+    // One session ref but two pins: the slot takes the first pin (a) and the
+    // remaining pin (b) appends, so the rendered order is the full pin order.
+    const section = makeSection("f", "favorites", {
+      items: [{ type: "session", id: "b" }],
+    });
+    expect(favoritesRows(section, ["a", "b"], new Set())).toEqual([
+      { type: "session", id: "a" },
+      { type: "session", id: "b" },
+    ]);
+  });
+
   it("returns no rows for a non-favorites section", () => {
     expect(favoritesRows(makeSection("p", "projects"), ["s1"], new Set())).toEqual([]);
   });

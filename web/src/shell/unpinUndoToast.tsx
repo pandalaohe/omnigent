@@ -39,17 +39,22 @@ function isPinnedNow(queryClient: QueryClient, id: string): boolean {
  * @param writePin - The pin toggle's `mutateAsync`.
  * @param id - The session to unpin.
  * @param before - The session's cached row before the unpin, if any.
+ * @param onUnpinned - Called once the write lands, so a caller can follow it
+ *   with a layout edit (e.g. dropping the session's favorites ref). Not called
+ *   when the unpin is refused or fails.
  */
 export function unpinWithUndo(
   queryClient: QueryClient,
   writePin: WritePin,
   id: string,
   before: Pick<Conversation, "title" | "labels"> | undefined,
+  onUnpinned?: () => void,
 ): void {
   const previous = Number(before?.labels?.[PINNED_LABEL_KEY]);
   const pinnedAt = Number.isFinite(previous) && previous > 0 ? previous : undefined;
   writePin({ id, pinned: false })
     .then(() => {
+      onUnpinned?.();
       toast("Unpinned session", {
         id: UNPIN_UNDO_TOAST_ID,
         description: before?.title || undefined,

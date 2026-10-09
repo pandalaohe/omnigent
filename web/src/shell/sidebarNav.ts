@@ -449,19 +449,24 @@ export function pinOrderWrites(
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
 
 /** The session being dragged: its id, the project it's currently filed under
-    (`null` when it lives in the flat list, outside any project), and whether
-    it's already pinned. */
+    (`null` when it lives in the flat list, outside any project), whether it's
+    already pinned, and whether the dragged copy belongs to the favorites
+    section (a favorites copy only reorders pins / removes itself from
+    favorites; a folder / Sessions copy only files / unfiles and never changes
+    the pin). */
 export interface SidebarDragSource {
   id: string;
   project: string | null;
   isPinned: boolean;
+  favoritesCopy?: boolean;
 }
 
 /** What a row was dropped onto. A project folder files the session into that
-    project; the "ungroup" zone removes it from its project; the "pin" zone
-    pins it (which moves it out of its project via pin-precedence). `null` is a
-    drop that landed on nothing droppable (e.g. "Shared with me", which is
-    never a target — sessions can't be filed there). */
+    project; the "ungroup" zone removes it from its project (or, for a favorites
+    copy, from favorites); the "pin" zone pins it; a pinned row / favorites item
+    is a pin-reorder slot. `null` is a drop that landed on nothing droppable
+    (e.g. "Shared with me", which is never a target — sessions can't be filed
+    there). */
 export type SidebarDropTarget =
   | { type: "project"; name: string }
   | { type: "ungroup" }
@@ -476,35 +481,39 @@ export type SidebarDropTarget =
     floats it into the Pinned section); `unpin` just unpins it (so it leaves
     Pinned and falls back to its project / the flat list); `none` is a no-op.
 
-    `move`/`ungroup` carry an `unpin` flag: a PINNED session is shown in the
-    Pinned section regardless of its project label, so moving/unfiling it has no
-    visible effect until it's also unpinned. Dragging a pinned row onto a
-    project / Chats therefore unpins it too, so it actually lands where dropped
-    (this is why a pinned session previously appeared "stuck" in Pinned). */
+    Filing / unfiling never changes the pin: a pinned session now stays in its
+    folder too, so moving it between folders is invisible to the pin label.
+    `move` / `ungroup` therefore carry no unpin. */
 export type SidebarDropAction =
-  | { kind: "move"; project: string; unpin: boolean }
-  | { kind: "ungroup"; project: string; unpin: boolean }
+  | { kind: "move"; project: string }
+  | { kind: "ungroup"; project: string }
   | { kind: "pin"; targetId?: string }
   | { kind: "unpin" }
   | { kind: "reorder-pin"; targetId: string }
   | { kind: "none" };
 
 /**
- * Pure resolution of a sidebar drag-and-drop: given the dragged session and the
- * target it was released over, decide whether to file it into a project, remove
- * it from its project, pin/unpin it, or do nothing. Kept side-effect-free so the
- * routing is unit-testable independent of dnd-kit and the mutation hooks.
+ * Pure resolution of a sidebar drag-and-drop: given the dragged session copy and
+ * the target it was released over, decide whether to file it into a project,
+ * remove it from its project, pin/unpin it, or do nothing. Kept side-effect-free
+ * so the routing is unit-testable independent of dnd-kit and the mutation hooks.
  *
- * - Dropped on a project folder it isn't already in → `move` (+`unpin` if pinned).
- * - Dropped on its OWN folder → `none`, unless pinned (then `move` to re-reveal
- *   it in that folder by unpinning — no visible change otherwise).
- * - Dropped on the ungroup zone while filed → `ungroup` (+`unpin` if pinned).
- * - Dropped on the ungroup zone while unfiled → `unpin` if pinned, else `none`.
- * - Dropped on the pin zone while not already pinned → `pin`.
- * - Dropped on the pin zone while already pinned → `none`.
- * - Dropped on another pinned row while pinned → `reorder-pin`; while unpinned →
- *   `pin` with that row as `targetId`, so it's pinned into that slot.
- * - Dropped on nothing → `none`.
+ * The dragged copy's role decides the outcome:
+ *
+ * A favorites copy (rendered by the favorites section):
+ * - Dropped on another pinned row / favorites item → `reorder-pin` (or `pin`
+ *   into the slot when not pinned yet).
+ * - Dropped on the ungroup / Sessions zone → `unpin`, which the caller pairs
+ *   with dropping the favorites ref.
+ *
+ * A folder / Sessions copy:
+ * - Dropped on a project folder it isn't already in → `move`.
+ * - Dropped on its own folder → `none`.
+ * - Dropped on the ungroup zone while filed → `ungroup`.
+ * - Never changes the pin: a pinned copy dropped on the Pinned zone or a
+ *   pinned row is `none`. An unpinned copy keeps today's pin-by-drag.
+ *
+ * Dropped on nothing → `none`.
  */
 export function resolveSidebarDrop(
   source: SidebarDragSource,
@@ -512,36 +521,44 @@ export function resolveSidebarDrop(
 ): SidebarDropAction {
   if (!target) return { kind: "none" };
   if (target.type === "project") {
-    // Same project, not pinned → nothing to do. Same project but pinned → the
-    // session is hidden up in Pinned, so re-file it (a no-op label write) and
-    // unpin so it drops into this folder.
-    if (target.name === source.project && !source.isPinned) return { kind: "none" };
-    return { kind: "move", project: target.name, unpin: source.isPinned };
+    if (target.name === source.project) return { kind: "none" };
+    return { kind: "move", project: target.name };
+  }
+  if (target.type === "ungroup") {
+    // A favorites copy dropped here leaves favorites (unpin + ref drop); a
+    // folder / Sessions copy unfiles but never unpins.
+    if (source.favoritesCopy) return { kind: "unpin" };
+    if (source.project) return { kind: "ungroup", project: source.project };
+    return { kind: "none" };
   }
   if (target.type === "pin") {
-    // Pinning an already-pinned session is a no-op; otherwise pin it (the list
-    // floats pinned sessions out of their project into the Pinned section).
-    return source.isPinned ? { kind: "none" } : { kind: "pin" };
+    if (source.favoritesCopy || source.isPinned) return { kind: "none" };
+    return { kind: "pin" };
   }
   if (target.type === "pin-order") {
-    if (!source.isPinned) return { kind: "pin", targetId: target.id };
-    return target.id === source.id
-      ? { kind: "none" }
-      : { kind: "reorder-pin", targetId: target.id };
+    if (source.favoritesCopy) {
+      return target.id === source.id
+        ? { kind: "none" }
+        : { kind: "reorder-pin", targetId: target.id };
+    }
+    // A pinned folder / Sessions copy never changes the pin; an unpinned one
+    // pins into the dropped-on slot.
+    if (source.isPinned) return { kind: "none" };
+    return { kind: "pin", targetId: target.id };
   }
   if (target.type === "fav-item") {
     // A project ref isn't a pin slot: an unpinned session pins to the end, a
     // pinned one has nowhere to go. A session ref behaves like a pin slot.
     if (target.refType === "project") {
-      return source.isPinned ? { kind: "none" } : { kind: "pin" };
+      return source.favoritesCopy || source.isPinned ? { kind: "none" } : { kind: "pin" };
     }
-    if (!source.isPinned) return { kind: "pin", targetId: target.refId };
-    return target.refId === source.id
-      ? { kind: "none" }
-      : { kind: "reorder-pin", targetId: target.refId };
+    if (source.favoritesCopy) {
+      return target.refId === source.id
+        ? { kind: "none" }
+        : { kind: "reorder-pin", targetId: target.refId };
+    }
+    if (source.isPinned) return { kind: "none" };
+    return { kind: "pin", targetId: target.refId };
   }
-  // Ungroup (dropped on "Chats" / the fallback strip): land it in the flat list.
-  if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };
-  // No project label: only meaningful if pinned (unpin → it drops into Chats).
-  return source.isPinned ? { kind: "unpin" } : { kind: "none" };
+  return { kind: "none" };
 }

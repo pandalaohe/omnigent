@@ -558,12 +558,15 @@ describe("conversationDisplayLabel", () => {
 });
 
 // Drag-and-drop routing: dropping a session onto a project folder files it
-// there; onto the "Chats" / remove-from-project zone unfiles it; onto "Pinned"
-// pins it. "Shared with me" is never a drop target, so dropping there yields a
-// null target → no-op.
+// there; onto the "Chats" / remove-from-project zone unfiles it (never unpins);
+// onto "Pinned" pins it. A favorites copy only reorders pins or leaves
+// favorites. "Shared with me" is never a drop target, so dropping there yields
+// a null target → no-op.
 describe("resolveSidebarDrop", () => {
-  // Source builder — defaults to an unfiled, unpinned session.
-  const src = (over: Partial<{ project: string | null; isPinned: boolean }> = {}) => ({
+  // Source builder — defaults to an unfiled, unpinned folder / Sessions copy.
+  const src = (
+    over: Partial<{ project: string | null; isPinned: boolean; favoritesCopy: boolean }> = {},
+  ) => ({
     id: "c1",
     project: null,
     isPinned: false,
@@ -574,14 +577,13 @@ describe("resolveSidebarDrop", () => {
     expect(resolveSidebarDrop(src(), { type: "project", name: "Sprint 42" })).toEqual({
       kind: "move",
       project: "Sprint 42",
-      unpin: false,
     });
   });
 
   it("moves a filed session into a different project", () => {
     expect(
       resolveSidebarDrop(src({ project: "Backlog" }), { type: "project", name: "Sprint 42" }),
-    ).toEqual({ kind: "move", project: "Sprint 42", unpin: false });
+    ).toEqual({ kind: "move", project: "Sprint 42" });
   });
 
   it("is a no-op when dropped on its own project folder (no pointless PATCH)", () => {
@@ -594,7 +596,6 @@ describe("resolveSidebarDrop", () => {
     expect(resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "ungroup" })).toEqual({
       kind: "ungroup",
       project: "Sprint 42",
-      unpin: false,
     });
   });
 
@@ -616,48 +617,65 @@ describe("resolveSidebarDrop", () => {
     ).toEqual({ kind: "none" });
   });
 
-  // Pinned sessions float into the Pinned section regardless of project label,
-  // so moving/unfiling one must ALSO unpin it or it appears stuck in Pinned.
-  it("moves AND unpins a pinned session dropped on a different project", () => {
+  // Filing / unfiling never touches the pin: a pinned session stays pinned and
+  // simply moves between folders / the flat list.
+  it("moves a pinned session to a different project without unpinning it", () => {
     expect(
       resolveSidebarDrop(src({ project: "Backlog", isPinned: true }), {
         type: "project",
         name: "Sprint 42",
       }),
-    ).toEqual({ kind: "move", project: "Sprint 42", unpin: true });
+    ).toEqual({ kind: "move", project: "Sprint 42" });
   });
 
-  it("unpins a pinned session dropped on its OWN project folder so it lands there", () => {
-    // Not a no-op when pinned: the session is hidden up in Pinned, so re-file
-    // (harmless same-label write) and unpin to reveal it in the folder.
+  it("is a no-op when a pinned session is dropped on its own project folder", () => {
     expect(
       resolveSidebarDrop(src({ project: "Sprint 42", isPinned: true }), {
         type: "project",
         name: "Sprint 42",
       }),
-    ).toEqual({ kind: "move", project: "Sprint 42", unpin: true });
+    ).toEqual({ kind: "none" });
   });
 
-  it("ungroups AND unpins a pinned, filed session dropped on Chats", () => {
+  it("ungroups a pinned, filed session dropped on Chats without unpinning it", () => {
     expect(
       resolveSidebarDrop(src({ project: "Sprint 42", isPinned: true }), { type: "ungroup" }),
-    ).toEqual({ kind: "ungroup", project: "Sprint 42", unpin: true });
+    ).toEqual({ kind: "ungroup", project: "Sprint 42" });
   });
 
-  it("unpins a pinned, unfiled session dropped on Chats (drops it into the flat list)", () => {
+  it("is a no-op when a pinned, unfiled folder / Sessions copy is dropped on Chats", () => {
     expect(resolveSidebarDrop(src({ isPinned: true }), { type: "ungroup" })).toEqual({
-      kind: "unpin",
-    });
-  });
-
-  it("reorders a pinned session dropped on another pinned row", () => {
-    expect(resolveSidebarDrop(src({ isPinned: true }), { type: "pin-order", id: "c2" })).toEqual({
-      kind: "reorder-pin",
-      targetId: "c2",
-    });
-    expect(resolveSidebarDrop(src({ isPinned: true }), { type: "pin-order", id: "c1" })).toEqual({
       kind: "none",
     });
+  });
+
+  it("reorders a favorites copy dropped on another pin", () => {
+    expect(
+      resolveSidebarDrop(src({ isPinned: true, favoritesCopy: true }), {
+        type: "pin-order",
+        id: "c2",
+      }),
+    ).toEqual({ kind: "reorder-pin", targetId: "c2" });
+    expect(
+      resolveSidebarDrop(src({ isPinned: true, favoritesCopy: true }), {
+        type: "pin-order",
+        id: "c1",
+      }),
+    ).toEqual({ kind: "none" });
+  });
+
+  it("does not reorder a pinned folder / Sessions copy dropped on another pin", () => {
+    expect(resolveSidebarDrop(src({ isPinned: true }), { type: "pin-order", id: "c2" })).toEqual({
+      kind: "none",
+    });
+  });
+
+  it("unpins a favorites copy dropped on the ungroup / Sessions zone", () => {
+    expect(
+      resolveSidebarDrop(src({ project: "Sprint 42", isPinned: true, favoritesCopy: true }), {
+        type: "ungroup",
+      }),
+    ).toEqual({ kind: "unpin" });
   });
 
   it("pins an unpinned session dropped on a pinned row", () => {

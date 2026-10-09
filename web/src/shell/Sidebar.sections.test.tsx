@@ -39,12 +39,33 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-const { projectsRef, pinnedRef, orderRef, orderStatusRef, pinFn, folderRowsRef, reorderPinsFn } =
-  vi.hoisted(() => ({
+const {
+  projectsRef,
+  pinnedRef,
+  pinnedStore,
+  orderRef,
+  orderStatusRef,
+  pinFn,
+  folderRowsRef,
+  reorderPinsFn,
+} = vi.hoisted(() => {
+  const pinnedListeners = new Set<() => void>();
+  const rows = { current: [] as unknown[] };
+  const store = {
+    subscribe(cb: () => void) {
+      pinnedListeners.add(cb);
+      return () => pinnedListeners.delete(cb);
+    },
+    emit() {
+      pinnedListeners.forEach((cb) => cb());
+    },
+  };
+  return {
     projectsRef: {
       current: [] as { id: string | null; name: string; icon?: string | null }[],
     },
-    pinnedRef: { current: [] as unknown[] },
+    pinnedRef: rows,
+    pinnedStore: store,
     orderRef: {
       current: {
         sort_mode: "alphabetical" as "alphabetical" | "manual",
@@ -52,23 +73,25 @@ const { projectsRef, pinnedRef, orderRef, orderStatusRef, pinFn, folderRowsRef, 
       },
     },
     orderStatusRef: { current: 200 },
-    pinFn: vi.fn((_vars: unknown) => Promise.resolve({})),
+    pinFn: vi.fn(),
     reorderPinsFn: vi.fn((_writes: unknown) => undefined),
     folderRowsRef: { current: new Map<string, unknown[]>() },
-  }));
+  };
+});
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  const { useSyncExternalStore } = await import("react");
   return {
     ...conversationHooksMock(),
     resolveOrCreateProjectId: vi.fn((name: string) => Promise.resolve(`p_${name}`)),
     useTogglePinnedConversation: () => ({ mutate: vi.fn(), mutateAsync: pinFn }),
     useReorderPinnedConversations: () => ({ mutate: reorderPinsFn }),
     useProjects: () => ({ data: projectsRef.current }),
-    usePinnedConversations: () => ({
-      data: { conversations: pinnedRef.current, filterHonored: true },
-      isSuccess: true,
-    }),
+    usePinnedConversations: () => {
+      const rows = useSyncExternalStore(pinnedStore.subscribe, () => pinnedRef.current);
+      return { data: { conversations: rows, filterHonored: true }, isSuccess: true };
+    },
     useProjectSessions: (name: string) => {
       const rows = folderRowsRef.current.get(name) ?? [];
       return {
@@ -200,7 +223,19 @@ beforeEach(() => {
   orderStatusRef.current = 200;
   recentRef.current = { status: 200, data: [] };
   pinFn.mockReset();
-  pinFn.mockResolvedValue({});
+  // Mirror the server-authoritative pin set into the reactive store so the
+  // sidebar re-renders on a pin/unpin, like the real query does.
+  pinFn.mockImplementation((vars: { id: string; pinned: boolean; pinnedAt?: number }) => {
+    const rest = (pinnedRef.current as { id: string }[]).filter((row) => row.id !== vars.id);
+    pinnedRef.current = vars.pinned
+      ? [
+          conversation(vars.id, { labels: { "omnigent.pinned": String(vars.pinnedAt ?? 1000) } }),
+          ...rest,
+        ]
+      : rest;
+    pinnedStore.emit();
+    return Promise.resolve({});
+  });
   reorderPinsFn.mockReset();
   folderRowsRef.current = new Map();
   fetchMock.mockReset();
@@ -1133,7 +1168,7 @@ describe("sidebar favorites", () => {
     platform.mockRestore();
   });
 
-  it("pins an unpinned session and appends a favorites ref from the menu", async () => {
+  it("pins an unpinned session from the menu without persisting the default layout", async () => {
     mockConversations([conversation("s1")]);
     renderSidebar();
 
@@ -1142,10 +1177,9 @@ describe("sidebar favorites", () => {
     await user.click(await screen.findByTestId("favorite-conversation"));
 
     await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: true }));
-    await waitFor(() => {
-      const favorites = storedLayout().sections.find((section) => section.kind === "favorites");
-      expect(favorites?.items).toEqual([{ type: "session", id: "s1" }]);
-    });
+    // The default layout's implicit Pinned section needs no write: the pin is
+    // the membership and an unreferenced pin already appends in pin order.
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull();
   });
 
   it("unpins and drops the favorites ref from the menu", async () => {
@@ -1206,9 +1240,143 @@ describe("sidebar favorites", () => {
       expect(stored.sections[0]).toMatchObject({
         kind: "favorites",
         name: "Favorites",
-        items: [{ type: "session", id: "s1" }],
+        items: [],
       });
     });
+  });
+
+  it.each([
+    ["rejected at the cap", "You can pin up to 30 sessions."],
+    ["failed on the network", "Network request failed"],
+  ])("leaves the layout unchanged when the pin is %s", async (_name, message) => {
+    const initial = {
+      version: 1,
+      sections: [
+        { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+      ],
+    };
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(initial));
+    pinFn.mockRejectedValueOnce(new Error(message));
+    mockConversations([conversation("s1")]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("favorite-conversation"));
+
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: true }));
+    // The ref is written only after the pin is accepted; no section appears.
+    expect(storedLayout().sections.some((section) => section.kind === "favorites")).toBe(false);
+    expect(storedLayout().sections).toEqual(initial.sections);
+  });
+
+  it("drops the explicit ref when the quick button unpins a favorited session", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Pinned",
+            maxRows: null,
+            items: [{ type: "session", id: "s1" }],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    renderSidebar();
+
+    fireEvent.click(within(sectionOf("Pinned")).getByTestId("quick-pin-conversation"));
+
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: false }));
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.kind === "favorites");
+      expect(favorites?.items).toEqual([]);
+    });
+  });
+
+  it("leaves no stored layout and no empty Pinned header after pin then unpin on the default layout", async () => {
+    mockConversations([conversation("s1")]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByTestId("quick-pin-conversation"));
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: true }));
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    fireEvent.click(within(sectionOf("Pinned")).getByTestId("quick-pin-conversation"));
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: false }));
+
+    // R7: the implicit Pinned section is never persisted, so unpinning leaves
+    // no empty header behind.
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull();
+  });
+
+  it("unpins and drops the ref when a canonical favorites copy is dropped on the Sessions zone", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Pinned",
+            maxRows: null,
+            items: [{ type: "session", id: "s1" }],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    const rects = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.tagName === "NAV") return new DOMRect(0, 0, 400, 5000);
+      if (this instanceof HTMLElement && this.dataset.testid === "sidebar-chats-drop-zone") {
+        return new DOMRect(0, 1000, 300, 200);
+      }
+      if (this.matches("li[data-sidebar-session-id]")) {
+        const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
+        const index = rows.indexOf(this);
+        return new DOMRect(0, index * 30, 200, 30);
+      }
+      return new DOMRect(0, 0, 0, 0);
+    });
+    renderSidebar();
+
+    // The favorites copy is canonical here (the session is unfiled), but its
+    // role still only reorders / leaves favorites.
+    const favoritesRow = sectionOf("Pinned").querySelector<HTMLElement>(
+      'li[data-sidebar-session-id="s1"]',
+    )!;
+    const start = favoritesRow.getBoundingClientRect();
+    fireEvent.mouseDown(favoritesRow, {
+      button: 0,
+      clientX: start.left + 10,
+      clientY: start.top + 10,
+    });
+    fireEvent.mouseMove(document, { clientX: start.left + 10, clientY: start.top });
+    await act(async () => {
+      fireEvent.mouseMove(document, { clientX: 150, clientY: 1050 });
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, { clientX: 150, clientY: 1050 });
+    });
+
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: false }));
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.kind === "favorites");
+      expect(favorites?.items).toEqual([]);
+    });
+    rects.mockRestore();
   });
 });
 

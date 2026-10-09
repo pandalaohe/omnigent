@@ -55,7 +55,12 @@ export type SaveSidebarLayout = (next: SidebarLayout | SidebarLayoutUpdater) => 
 function writeSidebarLayout(next: SidebarLayout | SidebarLayoutUpdater): void {
   // localStorage is the synchronous truth: an updater re-reads it so an edit
   // that landed while its caller awaited isn't clobbered by a stale snapshot.
-  const current = typeof next === "function" ? next(readSidebarLayout()) : next;
+  const read = readSidebarLayout();
+  const current = typeof next === "function" ? next(read) : next;
+  // An updater that returns the value it was handed made no change: skip the
+  // write and the sync, so a pin/unpin on the default (implicit) layout never
+  // persists it and strips the `implicit` marker.
+  if (current === read) return;
   const value = persistableLayout(normalizeLayout(current));
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value));

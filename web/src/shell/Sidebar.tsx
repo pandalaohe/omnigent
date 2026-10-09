@@ -239,13 +239,15 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { useSidebarLayout } from "@/hooks/useSidebarLayout";
 import { useRecentSessions, RecentSessionsUnavailableError } from "@/hooks/useRecentSessions";
 import {
-  addFavorite,
   favoritesRows,
+  insertSection,
   moveSection,
+  newSectionId,
   removeFavorite,
   sectionOfProject,
   splitFavoritesReorder,
   type FavoriteRef,
+  type SidebarLayout,
   type SidebarSectionDef,
 } from "@/lib/sidebarLayout";
 import {
@@ -1019,28 +1021,12 @@ function SidebarImpl({
     // key after the migration (gated on the query settling) mutates it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pinnedConversations, pinnedLoaded, ownedPinIds]);
-  const queryClient = useQueryClient();
-  const togglePinnedMutation = useTogglePinnedConversation();
-  const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   // The migration compares the legacy key against what the SERVER already owns
   // (not the union — a legacy-only id must still count as "to migrate").
   const serverPinnedIdSet = useMemo(
     () => new Set(pinnedConversations.map((c) => c.id)),
     [pinnedConversations],
   );
-  // Stable identity (useStableCallback) so its changing deps don't defeat the row memo.
-  const togglePinnedConversation = useStableCallback((conversationId: string) => {
-    if (!pinnedIdSet.has(conversationId)) {
-      togglePinnedMutation.mutate({ id: conversationId, pinned: true });
-      return;
-    }
-    unpinWithUndo(
-      queryClient,
-      togglePinnedMutation.mutateAsync,
-      conversationId,
-      pinnedConversations.find((c) => c.id === conversationId),
-    );
-  });
 
   // One-time migration: pins used to live only in localStorage. Push any
   // still-local pins up to the server (as the `omnigent.pinned` label) the
@@ -1519,7 +1505,6 @@ function SidebarImpl({
                     pinnedConversationIds={pinnedConversationIds}
                     pinnedConversations={pinnedConversations}
                     pinReorderEnabled={pinnedFilterHonored}
-                    onTogglePinned={togglePinnedConversation}
                     onEnterSelectionMode={enterSelectionMode}
                     selectionMode={selectionMode}
                     selectionScope={selectionScope}
@@ -1993,7 +1978,6 @@ interface ConversationListProps {
   // False against a server that can't store pins (they live in localStorage,
   // which has no order), so drag-to-reorder is off there.
   pinReorderEnabled: boolean;
-  onTogglePinned: (conversationId: string) => void;
   onEnterSelectionMode: (scope: SelectionScope) => void;
   selectionMode: boolean;
   selectionScope: SelectionScope;
@@ -2041,6 +2025,25 @@ interface ConversationRowMeta {
   projectLabel?: string;
   /** Favorites copy: registers the pin-reorder target and drags to reorder pins. */
   pinReorderCopy?: boolean;
+  /** Sessions copy: still drags (to file / unfile) even when non-canonical. */
+  moveCopy?: boolean;
+}
+
+/** A freshly created favorites section; empty, so every pin renders in pin order. */
+function newFavoritesSection(): SidebarSectionDef {
+  return { id: newSectionId(), kind: "favorites", name: "Favorites", maxRows: 10, items: [] };
+}
+
+/** Ensure exactly one favorites section, created at the top when none exists. */
+function ensureFavoritesSection(current: SidebarLayout): SidebarLayout {
+  return insertSection(current, newFavoritesSection());
+}
+
+/** Drop a session ref, but leave the implicit default favorites untouched. */
+function dropFavoriteRef(current: SidebarLayout, id: string): SidebarLayout {
+  const favorites = current.sections.find((section) => section.kind === "favorites");
+  if (favorites === undefined || favorites.implicit === true) return current;
+  return removeFavorite(current, { type: "session", id });
 }
 
 function ConversationList({
@@ -2059,7 +2062,6 @@ function ConversationList({
   pinnedConversationIds,
   pinnedConversations,
   pinReorderEnabled,
-  onTogglePinned,
   onEnterSelectionMode,
   selectionMode,
   selectionScope,
@@ -2112,24 +2114,35 @@ function ConversationList({
   const pinWriting = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const { mutate: reorderPins } = useReorderPinnedConversations();
 
-  // Pin (server) plus the favorites ref in one action. The pin path owns the
-  // cap / ownership checks and the optimistic cache move; the ref is written
-  // only once the pin is accepted — a refused pin rejects and leaves the layout
-  // untouched.
-  const favoriteActions = useMemo(
-    () => ({
-      add: (id: string) => {
-        pinAt({ id, pinned: true })
-          .then(() => saveLayout((current) => addFavorite(current, { type: "session", id })))
-          .catch(() => {});
-      },
-      remove: (id: string) => {
-        pinAt({ id, pinned: false })
-          .then(() => saveLayout((current) => removeFavorite(current, { type: "session", id })))
-          .catch(() => {});
-      },
-    }),
+  // Pin (server) plus the favorites layout in one action. The pin path owns the
+  // cap / ownership checks and the optimistic cache move; the layout is touched
+  // only once the pin is accepted — a refused or failed pin leaves it untouched.
+  // A session add needs no ref (an unreferenced pin already appends in pin
+  // order), so it only creates a favorites section when none exists; a remove
+  // drops the ref only when one exists and the section is explicit.
+  const pinFavorite = useCallback(
+    (id: string) => {
+      pinAt({ id, pinned: true })
+        .then(() => saveLayout(ensureFavoritesSection))
+        .catch(() => {});
+    },
     [pinAt, saveLayout],
+  );
+  const unpinFavorite = useCallback(
+    (id: string) => {
+      unpinWithUndo(
+        queryClient,
+        pinAt,
+        id,
+        pinnedConversations.find((c) => c.id === id),
+        () => saveLayout((current) => dropFavoriteRef(current, id)),
+      );
+    },
+    [pinAt, queryClient, pinnedConversations, saveLayout],
+  );
+  const favoriteActions = useMemo(
+    () => ({ add: pinFavorite, remove: unpinFavorite }),
+    [pinFavorite, unpinFavorite],
   );
   const sidebarLayoutContextValue = useMemo(
     () => ({
@@ -2141,17 +2154,11 @@ function ConversationList({
     [layout, saveLayout, favoriteActions],
   );
 
-  // Any pin path (quick button, mobile Pin item, hotkeys) routes through here:
-  // when the layout has no favorites section, create one so the newly pinned
-  // session has somewhere to render. Only write when there is no section —
-  // saveLayout persists unconditionally, and rewriting the default layout would
-  // drop the implicit marker and leave an empty "Pinned" header after unpin.
+  // Any pin path (quick button, mobile Pin item, hotkeys, favorites menu)
+  // routes through here.
   const handleTogglePinned = useStableCallback((conversationId: string) => {
-    const pinning = !pinnedConversationIds.includes(conversationId);
-    onTogglePinned(conversationId);
-    if (!pinning) return;
-    if (layout.sections.some((section) => section.kind === "favorites")) return;
-    saveLayout((current) => addFavorite(current, { type: "session", id: conversationId }));
+    if (pinnedConversationIds.includes(conversationId)) unpinFavorite(conversationId);
+    else pinFavorite(conversationId);
   });
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
@@ -2747,18 +2754,19 @@ function ConversationList({
       if (!dragged) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
       const action = resolveSidebarDrop(
-        { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
+        {
+          id: dragged.id,
+          project: dragged.project,
+          isPinned: dragged.isPinned,
+          favoritesCopy: dragged.reorderOnly,
+        },
         target,
       );
-      // A favorites copy drags only to reorder pins; its folder / Sessions twin
-      // owns move / ungroup.
-      if (dragged.reorderOnly && action.kind !== "reorder-pin" && action.kind !== "none") return;
+      // A favorites copy drags only to reorder pins or to leave favorites; its
+      // folder / Sessions twin owns move / ungroup.
+      if (dragged.reorderOnly && action.kind !== "reorder-pin" && action.kind !== "unpin") return;
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
-        // Unpin a pinned session so it actually drops into the folder instead of
-        // staying floated up in Pinned (pin outranks project membership). No
-        // Undo pill: re-pinning would leave the session filed in the new folder.
-        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
         // Open the (possibly brand-new) folder so the session is visible in it.
         expandProject(action.project);
         return;
@@ -2779,8 +2787,7 @@ function ConversationList({
       if (action.kind === "pin" && action.targetId) {
         // Pin into the dropped-on slot; the new pin goes through the pin toggle
         // (cap / ownership checks), and only once it's accepted are any
-        // renumbered neighbours rewritten through the batch. The drop also
-        // records a favorites ref so the pin keeps a slot in the section.
+        // renumbered neighbours rewritten through the batch.
         const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
@@ -2789,7 +2796,7 @@ function ConversationList({
         if (pin) {
           pinAt({ id: pin.id, pinned: true, pinnedAt: pin.pinnedAt })
             .then(() => {
-              saveLayout((current) => addFavorite(current, { type: "session", id: pin.id }));
+              saveLayout(ensureFavoritesSection);
               if (rest.length > 0) reorderPins(rest);
             })
             .catch(() => {});
@@ -2797,32 +2804,29 @@ function ConversationList({
         return;
       }
       if (action.kind === "pin") {
-        // Dropped on the favorites section: pin through the toggle and append a
-        // favorites ref once accepted.
+        // Dropped on the favorites section: pin through the toggle; a favorites
+        // section is created only when the layout has none.
         pinAt({ id: dragged.id, pinned: true })
-          .then(() =>
-            saveLayout((current) => addFavorite(current, { type: "session", id: dragged.id })),
-          )
+          .then(() => saveLayout(ensureFavoritesSection))
           .catch(() => {});
         return;
       }
       if (action.kind === "unpin") {
-        // Unpinning a pinned session drops it back into its project / Chats.
-        onTogglePinned(dragged.id);
+        // A favorites copy dropped on the ungroup / Sessions zone leaves
+        // favorites: unpin and drop its ref.
+        unpinFavorite(dragged.id);
         return;
       }
       if (action.kind === "ungroup") {
         // Unfile silently — a first-class project persists when emptied, so
         // dragging out its last session deletes nothing. Mirrors the kebab flow.
         moveToProject.mutate({ id: dragged.id, project: "" });
-        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
       }
     },
     [
       activeDrag,
       moveToProject,
       expandProject,
-      onTogglePinned,
       projects,
       saveOrder,
       sections.pinned,
@@ -2833,6 +2837,7 @@ function ConversationList({
       queryClient,
       moveProjectInSection,
       applyFavoriteReorder,
+      unpinFavorite,
       projectOrder.data,
     ],
   );
@@ -3444,6 +3449,9 @@ function ConversationList({
             const isProjectDrag = activeType === "project-order";
             const isSectionDrag = activeType === "section-order";
             const isReorderOnly = args.active.data.current?.reorderOnly === true;
+            // A pinned folder / Sessions copy only files / unfiles; it must not
+            // land on a pin or a pin-reorder slot (that would change the pin).
+            const isPinnedMoveOnly = args.active.data.current?.isPinned === true && !isReorderOnly;
             let collisionRect = args.collisionRect;
             if (collisionRect.width === 0 && collisionRect.height === 0) {
               if (args.pointerCoordinates) {
@@ -3469,8 +3477,12 @@ function ConversationList({
             }
             const droppableContainers = args.droppableContainers.filter((container) => {
               const type = container.data.current?.type;
-              // A favorites copy drags only onto other favorites items to reorder.
-              if (isReorderOnly) return type === "fav-item";
+              // A favorites copy drags only to reorder pins or to leave
+              // favorites (the ungroup / Sessions zone).
+              if (isReorderOnly)
+                return type === "pin-order" || type === "fav-item" || type === "ungroup";
+              // A pinned folder / Sessions copy only files / unfiles.
+              if (isPinnedMoveOnly) return type === "project" || type === "ungroup";
               // A project drag may reorder a folder header or land on a
               // section; a session drag must never land on either.
               if (isProjectDrag)
@@ -4080,6 +4092,7 @@ function ConversationList({
                                         return {
                                           instanceKey: isCanonical ? conversation.id : key,
                                           canonical: isCanonical,
+                                          moveCopy: true,
                                         };
                                       }}
                                       onRowClick={onRowClick}
@@ -5077,6 +5090,7 @@ function ConversationSection({
                     instanceKey={meta.instanceKey}
                     canonical={meta.canonical}
                     pinReorderCopy={meta.pinReorderCopy}
+                    moveCopy={meta.moveCopy}
                     projectLabel={meta.projectLabel}
                     isActive={conv.id === activeConversationId}
                     isPinned={pinnedConversationIds.includes(conv.id)}
@@ -5698,6 +5712,7 @@ function ConversationRowImpl({
   instanceKey,
   canonical,
   pinReorderCopy,
+  moveCopy,
   favoriteItem,
   projectLabel,
   isActive,
@@ -5717,6 +5732,8 @@ function ConversationRowImpl({
   canonical?: boolean;
   /** Favorites copy: pin-reorder target + pin-reorder drag. */
   pinReorderCopy?: boolean;
+  /** Sessions copy: still drags (to file / unfile) even when non-canonical. */
+  moveCopy?: boolean;
   /** Favorites row: its section and index, so it's a `fav-item` reorder target. */
   favoriteItem?: { sectionId: string; index: number };
   /** Trailing muted project name; recent copies only. */
@@ -5739,9 +5756,10 @@ function ConversationRowImpl({
   const layoutContext = useSidebarLayoutContext();
   const resolvedInstanceKey = instanceKey ?? conversation.id;
   const isCanonical = canonical ?? true;
-  // A non-canonical favorites copy drags only to reorder pins; its folder /
-  // Sessions twin owns the move/ungroup drag.
-  const reorderOnly = (pinReorderCopy ?? false) && !isCanonical;
+  // The copy's role decides the drag: a favorites-section copy only reorders
+  // pins (or leaves favorites), regardless of which copy is canonical; a folder
+  // / Sessions copy only files / unfiles and never changes the pin.
+  const reorderOnly = pinReorderCopy === true;
   let pinTooltip = isPinned ? "Unpin" : "Pin";
   if (pinSaving) pinTooltip = "Saving pins…";
   else if (!isPinned && atPinCap) pinTooltip = "Unpin a session first";
@@ -5998,7 +6016,7 @@ function ConversationRowImpl({
       isArchived ||
       isEditing ||
       isProvisionalRow ||
-      (!isCanonical && !pinReorderCopy),
+      (!isCanonical && !pinReorderCopy && !moveCopy),
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -6893,6 +6911,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.instanceKey === next.instanceKey &&
     prev.canonical === next.canonical &&
     prev.pinReorderCopy === next.pinReorderCopy &&
+    prev.moveCopy === next.moveCopy &&
     prev.favoriteItem?.sectionId === next.favoriteItem?.sectionId &&
     prev.favoriteItem?.index === next.favoriteItem?.index &&
     prev.projectLabel === next.projectLabel &&
