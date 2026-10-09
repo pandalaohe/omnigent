@@ -12,7 +12,8 @@ export type UserPreferenceNamespace =
   | "session_collab"
   | "host_colors"
   | "keep_warm"
-  | "runner_log_warnings";
+  | "runner_log_warnings"
+  | "sound_alerts";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -82,6 +83,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     runner_log_warnings: {
       storageKey: "omnigent:runner-log-warnings",
       eventName: "omnigent:runner-log-warnings-changed",
+    },
+    sound_alerts: {
+      storageKey: "omnigent:sound-alerts",
+      eventName: "omnigent:sound-alerts-changed",
     },
   };
 

@@ -4,9 +4,18 @@ import type { Conversation } from "@/hooks/useConversations";
 
 function conv(
   partial: Partial<
-    Pick<Conversation, "status" | "foreground_status" | "pending_elicitations_count">
+    Pick<
+      Conversation,
+      | "status"
+      | "foreground_status"
+      | "pending_elicitations_count"
+      | "child_pending_elicitations_count"
+    >
   >,
-): Pick<Conversation, "status" | "foreground_status" | "pending_elicitations_count"> {
+): Pick<
+  Conversation,
+  "status" | "foreground_status" | "pending_elicitations_count" | "child_pending_elicitations_count"
+> {
   return partial;
 }
 
@@ -16,6 +25,28 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "running", pending_elicitations_count: 3 }))).toEqual({
       kind: "awaiting",
       count: 3,
+    });
+  });
+
+  it("rolls a live child's parked prompt into the parent's awaiting count", () => {
+    // Children have no sidebar row, so a blocked sub-agent surfaces on the
+    // parent as if the prompt were its own.
+    expect(getSessionState(conv({ status: "idle", child_pending_elicitations_count: 1 }))).toEqual({
+      kind: "awaiting",
+      count: 1,
+    });
+  });
+
+  it("sums the session's own and child pending prompts", () => {
+    expect(
+      getSessionState(conv({ pending_elicitations_count: 1, child_pending_elicitations_count: 2 })),
+    ).toEqual({ kind: "awaiting", count: 3 });
+  });
+
+  it("reads only the own count when the child count is absent", () => {
+    expect(getSessionState(conv({ pending_elicitations_count: 2 }))).toEqual({
+      kind: "awaiting",
+      count: 2,
     });
   });
 

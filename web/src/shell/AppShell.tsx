@@ -28,6 +28,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { useSoundAlerts } from "@/hooks/useSoundAlerts";
 import { useSystemStatusNotifications } from "@/hooks/useSystemStatusNotifications";
 import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -570,6 +571,9 @@ export function AppShell() {
   // the active conversation id, which suppresses the notification/badge for
   // the session the user is actively viewing.
   useIdleNotifications(conversationId);
+  // Play a local sound when a session newly needs the user's response; the
+  // open conversation only rings for prompts (see the ringer's viewing rule).
+  useSoundAlerts(conversationId);
   // New resource-monitor findings ride the same notification path (this hook
   // reads the sidebar's nudge-driven summary; it adds no poll).
   useSystemStatusNotifications();

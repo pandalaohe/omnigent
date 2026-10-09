@@ -133,6 +133,7 @@ import { KeepWarmSettings } from "@/components/KeepWarmSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { SessionCollabSettings } from "@/components/SessionCollabSettings";
+import { SoundAlertSettings } from "@/components/SoundAlertSettings";
 import {
   MobileSessionTitleSetting,
   SessionNavigationSettings,
@@ -2314,6 +2315,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Approvals & Questions" testId="settings-group-approvals">
           <ApprovalTimeoutSettings />
+        </SettingsGroup>
+        <SettingsGroup title="Sound alerts" testId="settings-group-sound-alerts">
+          <SoundAlertSettings />
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />

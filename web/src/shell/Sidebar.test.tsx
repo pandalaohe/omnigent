@@ -1597,6 +1597,20 @@ describe("Sidebar session list", () => {
     expect(within(idleRow).queryByText("now")).toBeNull();
   });
 
+  it("shows the Needs response pill when only a child session is waiting", () => {
+    // Children have no sidebar row of their own; a sub-agent parked on an
+    // approval must still surface on its parent so the user can find it.
+    mockConversations([
+      conv("conv_parent", "Claude Code", { child_pending_elicitations_count: 1 }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_parent/ }).closest("li")!;
+    const badge = within(row).getByTestId("session-state-badge");
+    expect(badge).toHaveAttribute("data-state", "awaiting");
+    expect(within(badge).getByText("Needs response")).toBeInTheDocument();
+  });
+
   it("shows a starting spinner on the bound session while a send is waking it", () => {
     // The launch/relaunch window: the user sent a message (local status
     // "streaming") but the server hasn't confirmed `running` — a cold boot or

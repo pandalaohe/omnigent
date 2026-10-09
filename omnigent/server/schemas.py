@@ -91,6 +91,7 @@ UserPreferenceNamespace = Literal[
     "keep_warm",
     "worktree_location",
     "runner_log_warnings",
+    "sound_alerts",
 ]
 
 
@@ -3177,6 +3178,14 @@ class SessionListItem(BaseModel):
         passing through ``session_stream`` and decrements when a
         verdict is dispatched. ``0`` when the session has no
         outstanding elicitations.
+    :param child_pending_elicitations_count: Pending approval / input
+        prompts on live direct child sessions. Lets the sidebar light a
+        parent row's "needs attention" badge when only a sub-agent is
+        blocked on the user.
+    :param pending_elicitation_key: Opaque key of the outstanding prompts
+        counted in this row's Needs response state (own and live direct
+        children); changes when a new prompt appears, stable otherwise.
+        ``None`` when the in-memory index holds none.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3261,6 +3270,8 @@ class SessionListItem(BaseModel):
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
+    child_pending_elicitations_count: int = 0
+    pending_elicitation_key: str | None = None
     workspace: str | None = None
     worktree: str | None = None
     git_branch: str | None = None
