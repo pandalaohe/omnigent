@@ -42,6 +42,8 @@ function isPinnedNow(queryClient: QueryClient, id: string): boolean {
  * @param onUnpinned - Called once the write lands, so a caller can follow it
  *   with a layout edit (e.g. dropping the session's favorites ref). Not called
  *   when the unpin is refused or fails.
+ * @param onRePinned - Called after an accepted Undo re-pins the session, so a
+ *   caller can restore the layout edit it made alongside the unpin.
  */
 export function unpinWithUndo(
   queryClient: QueryClient,
@@ -49,6 +51,7 @@ export function unpinWithUndo(
   id: string,
   before: Pick<Conversation, "title" | "labels"> | undefined,
   onUnpinned?: () => void,
+  onRePinned?: () => void,
 ): void {
   const previous = Number(before?.labels?.[PINNED_LABEL_KEY]);
   const pinnedAt = Number.isFinite(previous) && previous > 0 ? previous : undefined;
@@ -63,7 +66,9 @@ export function unpinWithUndo(
           label: "Undo",
           onClick: () => {
             if (isPinnedNow(queryClient, id)) return;
-            void writePin({ id, pinned: true, pinnedAt }).catch(() => {});
+            void writePin({ id, pinned: true, pinnedAt })
+              .then(() => onRePinned?.())
+              .catch(() => {});
           },
         },
         testId: "unpin-undo-toast-item",

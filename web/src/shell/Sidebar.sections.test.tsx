@@ -8,7 +8,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { toast } from "sonner";
 
+import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type { Conversation } from "@/hooks/useConversations";
@@ -1108,6 +1110,7 @@ describe("collapsed section marker freshness", () => {
 describe("sidebar favorites", () => {
   afterEach(() => {
     fireEvent.mouseUp(document);
+    toast.dismiss();
     vi.restoreAllMocks();
   });
 
@@ -1319,6 +1322,94 @@ describe("sidebar favorites", () => {
     // no empty header behind.
     expect(screen.queryByText("Pinned")).toBeNull();
     expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull();
+  });
+
+  it("does not persist the implicit Pinned section when pins are reordered, so unpinning both hides it", async () => {
+    pinnedRef.current = [
+      conversation("a", { labels: { "omnigent.pinned": "1000" } }),
+      conversation("b", { labels: { "omnigent.pinned": "2000" } }),
+    ];
+    mockConversations([conversation("a"), conversation("b")]);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
+      const index = rows.indexOf(this);
+      return index < 0 ? new DOMRect(0, 0, 0, 0) : new DOMRect(0, index * 30, 200, 30);
+    });
+    renderSidebar();
+
+    // Drag the first pin below the second; the reorder writes pin timestamps.
+    const rowA = sectionOf("Pinned").querySelector<HTMLElement>(
+      'li[data-sidebar-session-id="a"][data-sidebar-canonical="true"]',
+    )!;
+    fireEvent.mouseDown(rowA, { button: 0, clientX: 100, clientY: 15 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 5 });
+    await act(async () => {
+      fireEvent.mouseMove(document, { clientX: 100, clientY: 45 });
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, { clientX: 100, clientY: 45 });
+    });
+
+    await waitFor(() => expect(reorderPinsFn).toHaveBeenCalled());
+    // A pin-only reorder never persists the implicit default layout.
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull();
+
+    // Unpinning both leaves no stored layout and no empty Pinned header.
+    fireEvent.click(within(sectionOf("Pinned")).getAllByTestId("quick-pin-conversation")[0]!);
+    await waitFor(() => expect(pinnedRef.current).toHaveLength(1));
+    fireEvent.click(within(sectionOf("Pinned")).getAllByTestId("quick-pin-conversation")[0]!);
+    await waitFor(() => expect(pinnedRef.current).toHaveLength(0));
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull();
+  });
+
+  it("restores a session's favorites slot when an unpin is undone", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [
+              { type: "session", id: "s1" },
+              { type: "project", id: "p_beta" },
+            ],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    render(<Toaster />);
+    renderSidebar();
+
+    fireEvent.click(within(sectionOf("Favorites")).getByTestId("quick-pin-conversation"));
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: false }));
+    // The accepted unpin drops the session ref, leaving the project ref.
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+      expect(favorites?.items).toEqual([{ type: "project", id: "p_beta" }]);
+    });
+
+    // Undo re-pins and puts the ref back above the project ref, not appended.
+    const pill = await screen.findByTestId("unpin-undo-toast-item");
+    fireEvent.click(within(pill).getByRole("button", { name: "Undo" }));
+
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+      expect(favorites?.items).toEqual([
+        { type: "session", id: "s1" },
+        { type: "project", id: "p_beta" },
+      ]);
+    });
   });
 
   it("unpins and drops the ref when a canonical favorites copy is dropped on the Sessions zone", async () => {

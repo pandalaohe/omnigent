@@ -2052,11 +2052,24 @@ function ensureFavoritesSection(current: SidebarLayout): SidebarLayout {
   return insertSection(current, newFavoritesSection());
 }
 
-/** Drop a session ref, but leave the implicit default favorites untouched. */
-function dropFavoriteRef(current: SidebarLayout, id: string): SidebarLayout {
+/** Re-insert a session ref at its old slot, but leave the implicit default favorites untouched. */
+function insertFavoriteRefAt(
+  current: SidebarLayout,
+  ref: FavoriteRef,
+  index: number,
+): SidebarLayout {
   const favorites = current.sections.find((section) => section.kind === "favorites");
   if (favorites === undefined || favorites.implicit === true) return current;
-  return removeFavorite(current, { type: "session", id });
+  const items = favorites.items ?? [];
+  if (items.some((item) => item.type === ref.type && item.id === ref.id)) return current;
+  const at = Math.max(0, Math.min(index, items.length));
+  const next = [...items.slice(0, at), ref, ...items.slice(at)];
+  return {
+    ...current,
+    sections: current.sections.map((section) =>
+      section.id === favorites.id ? { ...section, items: next } : section,
+    ),
+  };
 }
 
 /**
@@ -2186,12 +2199,30 @@ function ConversationList({
   );
   const unpinFavorite = useCallback(
     (id: string) => {
+      // Remember where the session's ref sat when the drop removes it, so an
+      // Undo can restore it among the section's project refs, not append it.
+      let removed: { ref: FavoriteRef; index: number } | null = null;
       unpinWithUndo(
         queryClient,
         pinAt,
         id,
         pinnedConversations.find((c) => c.id === id),
-        () => saveLayout((current) => dropFavoriteRef(current, id)),
+        () => {
+          saveLayout((current) => {
+            const favorites = current.sections.find((section) => section.kind === "favorites");
+            if (favorites === undefined || favorites.implicit === true) return current;
+            const items = favorites.items ?? [];
+            const index = items.findIndex((ref) => ref.type === "session" && ref.id === id);
+            if (index < 0) return current;
+            removed = { ref: items[index]!, index };
+            return removeFavorite(current, { type: "session", id });
+          });
+        },
+        () => {
+          if (removed === null) return;
+          const { ref, index } = removed;
+          saveLayout((current) => insertFavoriteRefAt(current, ref, index));
+        },
       );
     },
     [pinAt, queryClient, pinnedConversations, saveLayout],
@@ -2700,7 +2731,6 @@ function ConversationList({
         if (from < 0 || to < 0 || from === to) return current;
         const moved = arrayMove(order, from, to);
         const { items: movedItems, sessionOrder } = splitFavoritesReorder(moved);
-        const items = reorderFavoriteItems(section.items ?? [], movedItems, isResolved);
         if (activeRef.type === "session") {
           const before = splitFavoritesReorder(order).sessionOrder;
           if (before.join("\u0000") !== sessionOrder.join("\u0000")) {
@@ -2710,6 +2740,11 @@ function ConversationList({
             }
           }
         }
+        // The implicit default favorites section is never persisted by a
+        // pin-only reorder: its sessions render in pin order, so rewriting the
+        // timestamps is the whole edit and no layout write is needed.
+        if (section.implicit === true) return current;
+        const items = reorderFavoriteItems(section.items ?? [], movedItems, isResolved);
         return {
           ...current,
           sections: current.sections.map((candidate) =>
