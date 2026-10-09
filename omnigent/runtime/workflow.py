@@ -604,9 +604,10 @@ def configure_agent_harness_with_provider(
       emit the ``HARNESS_*_GATEWAY_*`` env vars (see
       :func:`_apply_provider_family`).
     - ``subscription`` — the native/CLI harness carries its own login; no
-      gateway vars. For codex, pin the built-in ``openai`` provider
-      (``HARNESS_CODEX_MODEL_PROVIDER``) so a custom default in the user's
-      ``~/.codex/config.toml`` cannot shadow the subscription.
+      gateway vars. For codex, follow the default provider in the user's
+      ``~/.codex/config.toml``, pinning the built-in ``openai`` provider
+      (``HARNESS_CODEX_MODEL_PROVIDER``) only where
+      :func:`~omnigent.onboarding.ambient.codex_subscription_pins_openai` says.
     - ``cli-config`` — pin the entry's ``model_provider``
       (``HARNESS_CODEX_MODEL_PROVIDER``); the provider table + credential
       come from the user's ``~/.codex/config.toml``, which the executor
@@ -663,14 +664,17 @@ def configure_agent_harness_with_provider(
         # kinds; subscription routing — toggling the CLI's logged-in model
         # — is a later chunk.)
         if harness_type == "codex":
-            # The codex executor symlinks the user's ~/.codex/config.toml
-            # into the per-session CODEX_HOME, so a custom default
-            # ``model_provider`` there (e.g. isaac's Databricks Unity Gateway)
-            # would silently hijack a Subscription selection. Pin codex's
-            # built-in ``openai`` provider so "Subscription" always means
-            # the ChatGPT login — a no-op when the user's config sets no
-            # custom default.
-            env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+            # The executor bridges the user's config.toml into the session
+            # CODEX_HOME. Follow its default provider (a relay or profile a
+            # switcher tool wrote) unless it is the cli-config provider the
+            # user chose the subscription over — see the helper.
+            from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+            from omnigent.onboarding.ambient import codex_subscription_pins_openai
+            from omnigent.onboarding.codex_auth_readiness import load_codex_config
+
+            config = load_codex_config(_codex_home_config_source_from_env() / "config.toml")
+            if codex_subscription_pins_openai(config):
+                env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
         return
 
     if entry.kind == CLI_CONFIG_KIND:

@@ -96,6 +96,7 @@ from omnigent.inner.codex_executor import (
     codex_router_hooks_settings,
     codex_router_session_id,
     codex_routing_hook_skip_reason,
+    forward_host_provider_env_key,
     materialize_codex_provider_config,
     read_codex_model_catalog,
     strip_codex_agent_pid_env,
@@ -3601,6 +3602,9 @@ def build_codex_native_server(
         override.split("=", 1)[0] == "model" for override in config_overrides
     ):
         config_overrides.append(f"model={json.dumps(pinned_model)}")
+    forward_host_provider_env_key(
+        env, config_overrides, _bridged_codex_config(codex_config_profile(terminal_launch_args))
+    )
     return CodexNativeAppServer(
         codex_path=resolved_codex,
         socket_path=socket_path,
@@ -3987,37 +3991,61 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
-def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
-    """Built-in provider the bridged config selects without any Codex login, if any.
+def _bridged_codex_config(config_profile: str | None) -> dict[str, object] | None:
+    """The bridged ``config.toml`` with the selected profile layered over it.
 
-    Layers the selected profile over ``config.toml`` the way
-    :func:`materialize_codex_config_profile` does at start.
+    Layers the profile the way :func:`materialize_codex_config_profile` does at
+    start; ``None`` when the config or the selected profile is unusable.
     """
-    from omnigent.onboarding.codex_auth_readiness import (
-        effective_self_sufficient_builtin_provider,
-        load_codex_config,
-    )
+    from omnigent.onboarding.codex_auth_readiness import load_codex_config
 
     source_home = _codex_home_config_source_from_env()
     config_path = source_home / "config.toml"
     config = load_codex_config(config_path) if config_path.exists() else {}
+    if config is None or config_profile is None:
+        return config
+    overlay = load_codex_config(source_home / f"{config_profile}.config.toml")
+    if overlay is None:
+        # Codex < 0.134 keeps file profiles inline; newer codex fails at start on a
+        # missing file anyway, so the fallback only matters where it is correct.
+        profiles = config.get("profiles")
+        overlay = profiles.get(config_profile) if isinstance(profiles, dict) else None
+    if not isinstance(overlay, dict):
+        return None
+    _merge_tables(config, copy.deepcopy(overlay))
+    return config
+
+
+def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
+    """Built-in provider the bridged config selects without any Codex login, if any."""
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_self_sufficient_builtin_provider,
+    )
+
+    config = _bridged_codex_config(config_profile)
     if config is None:
         return None
-    if config_profile is not None:
-        overlay = load_codex_config(source_home / f"{config_profile}.config.toml")
-        if overlay is None:
-            # Codex < 0.134 keeps file profiles inline; newer codex fails at start on a
-            # missing file anyway, so the fallback only matters where it is correct.
-            profiles = config.get("profiles")
-            overlay = profiles.get(config_profile) if isinstance(profiles, dict) else None
-        if not isinstance(overlay, dict):
-            return None
-        _merge_tables(config, copy.deepcopy(overlay))
     return effective_self_sufficient_builtin_provider(config)
 
 
+def _subscription_overrides(config_profile: str | None) -> list[str]:
+    """``-c`` overrides for a launch on Codex's own login.
+
+    Empty when the bridged config's default provider carries the launch (see
+    :func:`~omnigent.onboarding.ambient.codex_subscription_pins_openai`).
+    """
+    from omnigent.onboarding.ambient import codex_subscription_pins_openai
+
+    if codex_subscription_pins_openai(_bridged_codex_config(config_profile)):
+        return ['model_provider="openai"']
+    return []
+
+
 def _resolve_subscription_launch(
-    entry: ProviderEntry, model: str | None, explicit: dict[str, object]
+    entry: ProviderEntry,
+    model: str | None,
+    explicit: dict[str, object],
+    config_profile: str | None = None,
 ) -> NativeCodexLaunch:
     """Resolve a native-Codex launch when the Codex default is a ``subscription``.
 
@@ -4035,13 +4063,10 @@ def _resolve_subscription_launch(
     :param explicit: The explicit parsed config mapping (``providers:`` block),
         used for the fall-through search over other configured/detected
         providers.
+    :param config_profile: The terminal's ``--profile`` selector, if any.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
-    # Pin codex's built-in ``openai`` provider: the bridged config.toml may
-    # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
-    # Gateway), which would silently hijack a Subscription selection. A
-    # no-op when the user's config sets no custom default.
-    subscription_overrides = ['model_provider="openai"']
+    subscription_overrides = _subscription_overrides(config_profile)
     if _codex_login_usable():
         log_info_once(
             _logger,
@@ -4176,6 +4201,11 @@ def resolve_native_codex_launch(
     # codex's built-in provider in that case so the dismissal holds at run
     # time. An undetectable/undismissed custom provider keeps its routing.
     no_provider_overrides = ['model_provider="openai"'] if config_provider_dismissed else []
+    try:
+        config_profile = codex_config_profile(terminal_launch_args)
+    except ValueError:
+        # Malformed selectors are reported where launch args are validated, at start.
+        config_profile = None
     if spec is not None and (
         spec.executor.auth is not None
         or spec.executor.profile
@@ -4203,7 +4233,7 @@ def resolve_native_codex_launch(
                         "sign-in screen and never starts a thread"
                     )
                 return NativeCodexLaunch(
-                    config_overrides=['model_provider="openai"'],
+                    config_overrides=_subscription_overrides(config_profile),
                     model=model,
                     profile=None,
                     summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
@@ -4310,12 +4340,7 @@ def resolve_native_codex_launch(
             )
 
     if entry is None:
-        try:
-            ambient_profile = codex_config_profile(terminal_launch_args)
-        except ValueError:
-            # Malformed selectors are reported where launch args are validated, at start.
-            ambient_profile = None
-        ambient_builtin = _ambient_builtin_codex_provider(ambient_profile)
+        ambient_builtin = _ambient_builtin_codex_provider(config_profile)
         if ambient_builtin is not None:
             log_info_once(
                 _logger,
@@ -4351,7 +4376,7 @@ def resolve_native_codex_launch(
             login_required=not _codex_login_usable(),
         )
     if entry.kind == SUBSCRIPTION_KIND:
-        return _resolve_subscription_launch(entry, model, explicit)
+        return _resolve_subscription_launch(entry, model, explicit, config_profile)
 
     launch = _codex_provider_launch(entry, model)
     if launch is not None:
