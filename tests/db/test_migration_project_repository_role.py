@@ -1,4 +1,4 @@
-"""Tests for the project-repository-role migration (``a27c20261009``).
+"""Tests for the project-repository-role migration (``a28c20261009``).
 
 Upgrade adds ``project_repositories.role`` and backfills one code repository
 per project: the one the most primary+enabled bindings reference, tie-broken
@@ -17,8 +17,8 @@ from alembic.script import ScriptDirectory
 
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
-_PREVIOUS = "a26c20261009"
-_MIGRATION = "a27c20261009"
+_PREVIOUS = "a27c20261009"
+_MIGRATION = "a28c20261009"
 
 
 def _run(uri: str, engine: sa.Engine, action: str, revision: str) -> None:

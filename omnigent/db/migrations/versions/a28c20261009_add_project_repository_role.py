@@ -1,7 +1,7 @@
 """add project repository role
 
-Revision ID: a27c20261009
-Revises: a26c20261009
+Revision ID: a28c20261009
+Revises: a27c20261009
 Create Date: 2026-10-09 00:00:00.000000
 
 Adds ``project_repositories.role`` (``"code"`` or ``"related"``, NOT NULL,
@@ -21,8 +21,8 @@ from typing import Any
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "a27c20261009"
-down_revision: str | None = "a26c20261009"
+revision: str = "a28c20261009"
+down_revision: str | None = "a27c20261009"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
