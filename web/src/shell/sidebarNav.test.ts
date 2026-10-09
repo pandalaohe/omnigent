@@ -678,6 +678,16 @@ describe("resolveSidebarDrop", () => {
     ).toEqual({ kind: "unpin" });
   });
 
+  it("reorders a favorites copy dropped on a project ref in the same section", () => {
+    expect(
+      resolveSidebarDrop(src({ isPinned: true, favoritesCopy: true }), {
+        type: "fav-item",
+        refType: "project",
+        refId: "p1",
+      }),
+    ).toEqual({ kind: "reorder-pin", targetId: "p1" });
+  });
+
   it("pins an unpinned session dropped on a pinned row", () => {
     expect(resolveSidebarDrop(src(), { type: "pin-order", id: "c2" })).toEqual({
       kind: "pin",

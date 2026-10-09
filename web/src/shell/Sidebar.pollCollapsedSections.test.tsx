@@ -252,6 +252,35 @@ describe("sidebar Poll vs the sidebar's own rows", () => {
     await pressPollAndExpect("/c/tail");
   });
 
+  it("polls a favorite copy's own folder row when only that copy is expanded", async () => {
+    localStorage.setItem(
+      "omnigent:sidebar-layout",
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p1" }],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["fav:sec_fav:Proj"]),
+    );
+    projectsRef.current = [{ id: "p1", name: "Proj" }];
+    folderRowsRef.current.set("Proj", [conversation("folder-only", { updated_at: 3 })]);
+    mockConversations([conversation("active", { updated_at: 1 })]);
+    renderAt("/c/active");
+
+    await pressPollAndExpect("/c/folder-only");
+  });
+
   it("still jumps to a collapsed folder's own row when it is unread", async () => {
     projectsRef.current = [{ id: "p1", name: "Proj" }];
     folderRowsRef.current.set("Proj", [

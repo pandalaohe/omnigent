@@ -274,6 +274,7 @@ import {
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   orderByPinnedTimestamp,
   pinOrderWrites,
+  type PinOrderWrite,
   readCollapsedSidebarSectionIds,
   readPinnedConversationIds,
   resolveSidebarDrop,
@@ -1645,8 +1646,13 @@ function ProjectFolder({
       folder paginates independently of the global window, so bulk-selection in
       the projects scope must resolve selected rows against these — not the
       global list — or an out-of-window member would silently drop from the
-      action. */
-  onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
+      action. The copy's instance key keeps a favorite copy's rows separate from
+      the owning section copy's. */
+  onConversationsLoaded?: (
+    name: string,
+    conversations: Conversation[],
+    instanceKey?: string,
+  ) => void;
   /** Set on a favorites copy: the section it sits in and its row index. The
       copy is a reorder target (not a project drop target) and disables its
       header's project-order drag. */
@@ -1702,8 +1708,8 @@ function ProjectFolder({
   // resolves them (the parent sources its action set from these, not the global
   // paginated window).
   useEffect(() => {
-    onConversationsLoaded?.(name, conversations);
-  }, [name, conversations, onConversationsLoaded]);
+    onConversationsLoaded?.(name, conversations, folderInstanceKey);
+  }, [name, conversations, onConversationsLoaded, folderInstanceKey]);
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -1884,6 +1890,7 @@ function FavoriteProjectCopy({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
+  onConversationsLoaded,
 }: {
   entry: ResolvedProjectGroup;
   sectionId: string;
@@ -1905,6 +1912,11 @@ function FavoriteProjectCopy({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  onConversationsLoaded?: (
+    name: string,
+    conversations: Conversation[],
+    instanceKey?: string,
+  ) => void;
 }) {
   const group = entry.group;
   const headerDrag = useSortable({
@@ -1946,6 +1958,7 @@ function FavoriteProjectCopy({
       selectedIds={selectedIds}
       onToggleSelected={onToggleSelected}
       onProjectAssigned={onProjectAssigned}
+      onConversationsLoaded={onConversationsLoaded}
       favoriteItem={{ sectionId, index }}
       headerDrag={headerDrag}
       projectOrderId={`fav-project-own:${sectionId}:${group.id ?? group.name}`}
@@ -2044,6 +2057,49 @@ function dropFavoriteRef(current: SidebarLayout, id: string): SidebarLayout {
   const favorites = current.sections.find((section) => section.kind === "favorites");
   if (favorites === undefined || favorites.implicit === true) return current;
   return removeFavorite(current, { type: "session", id });
+}
+
+/**
+ * Reorder a favorites section's stored `items` to the moved resolved order
+ * `moved`, replacing each still-resolved ref in place. A ref that no longer
+ * resolves (a deleted project, a session unpinned elsewhere) keeps its position;
+ * a `moved` entry with no stored counterpart (a pin that had no ref) appends.
+ */
+function reorderFavoriteItems(
+  stored: readonly FavoriteRef[],
+  moved: readonly FavoriteRef[],
+  isResolved: (ref: FavoriteRef) => boolean,
+): FavoriteRef[] {
+  const items: FavoriteRef[] = [];
+  let cursor = 0;
+  for (const ref of stored) {
+    if (!isResolved(ref)) {
+      items.push(ref);
+      continue;
+    }
+    items.push(moved[cursor] ?? ref);
+    cursor += 1;
+  }
+  for (; cursor < moved.length; cursor += 1) {
+    const ref = moved[cursor];
+    if (ref !== undefined) items.push(ref);
+  }
+  return items;
+}
+
+/** The next session after `id` in `order`, or the previous one when it's last. */
+function adjacentFavoriteSession(order: readonly FavoriteRef[], id: string): string | null {
+  const index = order.findIndex((ref) => ref.type === "session" && ref.id === id);
+  if (index < 0) return null;
+  for (let i = index + 1; i < order.length; i += 1) {
+    const ref = order[i];
+    if (ref !== undefined && ref.type === "session") return ref.id;
+  }
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const ref = order[i];
+    if (ref !== undefined && ref.type === "session") return ref.id;
+  }
+  return null;
 }
 
 function ConversationList({
@@ -2623,31 +2679,49 @@ function ConversationList({
   );
 
   // Reorder the favorites section's items when a row (project copy or session)
-  // is dropped onto another: the new slot pattern goes to the layout, and a
-  // session move's pin writes are handled by the caller.
+  // is dropped onto another favorites row: the new slot pattern goes to the
+  // layout, and — when the session subsequence changed — the pin timestamps are
+  // rewritten. Refs that no longer resolve keep their place.
   const applyFavoriteReorder = useCallback(
     (activeRef: FavoriteRef, overRef: FavoriteRef) => {
-      const section = layout.sections.find((candidate) => candidate.kind === "favorites");
-      if (section === undefined) return;
+      const pinnedIds = sections.pinned.map((c) => c.id);
+      const pinnedIdSet = new Set(pinnedIds);
       const knownProjectIds = new Set(projectGroupsById.keys());
-      const order = favoritesRows(
-        section,
-        sections.pinned.map((c) => c.id),
-        knownProjectIds,
-      );
-      const key = (ref: FavoriteRef) => `${ref.type}:${ref.id}`;
-      const from = order.findIndex((ref) => key(ref) === key(activeRef));
-      const to = order.findIndex((ref) => key(ref) === key(overRef));
-      if (from < 0 || to < 0 || from === to) return;
-      const { items } = splitFavoritesReorder(arrayMove(order, from, to));
-      saveLayout((current) => ({
-        ...current,
-        sections: current.sections.map((candidate) =>
-          candidate.id === section.id ? { ...candidate, items } : candidate,
-        ),
-      }));
+      const isResolved = (ref: FavoriteRef) =>
+        ref.type === "project" ? knownProjectIds.has(ref.id) : pinnedIdSet.has(ref.id);
+      const pendingWrites: PinOrderWrite[] = [];
+      saveLayout((current) => {
+        const section = current.sections.find((candidate) => candidate.kind === "favorites");
+        if (section === undefined) return current;
+        const order = favoritesRows(section, pinnedIds, knownProjectIds);
+        const key = (ref: FavoriteRef) => `${ref.type}:${ref.id}`;
+        const from = order.findIndex((ref) => key(ref) === key(activeRef));
+        const to = order.findIndex((ref) => key(ref) === key(overRef));
+        if (from < 0 || to < 0 || from === to) return current;
+        const moved = arrayMove(order, from, to);
+        const { items: movedItems, sessionOrder } = splitFavoritesReorder(moved);
+        const items = reorderFavoriteItems(section.items ?? [], movedItems, isResolved);
+        if (activeRef.type === "session") {
+          const before = splitFavoritesReorder(order).sessionOrder;
+          if (before.join("\u0000") !== sessionOrder.join("\u0000")) {
+            const target = adjacentFavoriteSession(movedItems, activeRef.id);
+            if (target !== null) {
+              pendingWrites.push(...pinOrderWrites(sections.pinned, activeRef.id, target));
+            }
+          }
+        }
+        return {
+          ...current,
+          sections: current.sections.map((candidate) =>
+            candidate.id === section.id ? { ...candidate, items } : candidate,
+          ),
+        };
+      });
+      // The updater runs synchronously against the stored layout; the mutation
+      // stays outside it so the updater stays a pure read-modify-write.
+      if (pendingWrites.length > 0) reorderPins(pendingWrites);
     },
-    [layout.sections, sections.pinned, projectGroupsById, saveLayout],
+    [sections.pinned, projectGroupsById, saveLayout, reorderPins],
   );
 
   const handleDragEnd = useCallback(
@@ -2772,15 +2846,16 @@ function ConversationList({
         return;
       }
       if (action.kind === "reorder-pin") {
-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
-        if (writes.length > 0) reorderPins(writes);
-        // A session reorder inside favorites also records the new slot pattern
-        // (a session can move across a project ref).
-        if (target?.type === "fav-item" && target.refType === "session") {
+        if (target?.type === "fav-item") {
+          // A mixed reorder across any favorites row (session or project):
+          // the helper writes the slot pattern and any needed pin timestamps.
           applyFavoriteReorder(
             { type: "session", id: dragged.id },
-            { type: "session", id: target.refId },
+            { type: target.refType, id: target.refId },
           );
+        } else {
+          const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+          if (writes.length > 0) reorderPins(writes);
         }
         return;
       }
@@ -2855,19 +2930,21 @@ function ConversationList({
     });
   }, []);
 
-  // Sessions each expanded ProjectFolder has actually rendered, keyed by
-  // project name. A folder paginates independently of the global window, so its
-  // rows can include members the global list hasn't loaded; projects-scope
-  // selection must resolve against these to avoid silently dropping an
-  // out-of-window row from a bulk action. Folders report via
-  // `onConversationsLoaded`; collapsed folders report `[]`.
+  // Sessions each expanded ProjectFolder has actually rendered, keyed by project
+  // name and the copy's instance key. A folder paginates independently of the
+  // global window, so its rows can include members the global list hasn't
+  // loaded; projects-scope selection and the projection must resolve against
+  // these. A favorite copy reports under its own key, so neither copy's rows
+  // overwrite the other's. Folders report via `onConversationsLoaded`; collapsed
+  // folders report `[]`.
   const [folderConversations, setFolderConversations] = useState<Map<string, Conversation[]>>(
     () => new Map(),
   );
   const handleFolderConversationsLoaded = useCallback(
-    (name: string, conversations: Conversation[]) => {
+    (name: string, conversations: Conversation[], instanceKey?: string) => {
+      const key = instanceKey === undefined ? name : `${name}#${instanceKey}`;
       setFolderConversations((prev) => {
-        const existing = prev.get(name);
+        const existing = prev.get(key);
         // Row objects, not ids: Poll reads pending cards and updated_at from
         // this map, and a changed row arrives as a fresh object while
         // react-query keeps unchanged rows referentially stable.
@@ -2879,7 +2956,7 @@ function ConversationList({
           return prev;
         }
         const next = new Map(prev);
-        next.set(name, conversations);
+        next.set(key, conversations);
         return next;
       });
     },
@@ -2942,8 +3019,9 @@ function ConversationList({
     const windowIds = new Set<string>();
     for (const c of allConversations) windowIds.add(c.id);
     for (const c of pinnedConversations) windowIds.add(c.id);
-    const withRows = (group: SidebarProjectGroup): ResolvedProjectGroup => {
-      const snapshot = folderConversations.get(group.name);
+    const withRows = (group: SidebarProjectGroup, instanceKey?: string): ResolvedProjectGroup => {
+      const key = instanceKey === undefined ? group.name : `${group.name}#${instanceKey}`;
+      const snapshot = folderConversations.get(key);
       if (snapshot === undefined) return { group, rows: group.conversations };
       const current = new Map(group.conversations.map((c) => [c.id, c] as const));
       const rows: Conversation[] = [];
@@ -2983,7 +3061,7 @@ function ConversationList({
             } else {
               const group = projectGroupsById.get(ref.id);
               if (group !== undefined)
-                groups.push({ ...withRows(group), instanceKeyPrefix: prefix });
+                groups.push({ ...withRows(group, prefix), instanceKeyPrefix: prefix });
             }
           }
           break;
@@ -2993,11 +3071,11 @@ function ConversationList({
             .map((projectId) => projectGroupsById.get(projectId))
             .filter((group): group is SidebarProjectGroup => group !== undefined);
           if (alphabetical) resolved.sort((a, b) => a.name.localeCompare(b.name));
-          groups = resolved.map(withRows);
+          groups = resolved.map((group) => withRows(group));
           break;
         }
         case "other_projects":
-          groups = unclaimedProjectGroups.map(withRows);
+          groups = unclaimedProjectGroups.map((group) => withRows(group));
           break;
         case "other_sessions":
           flatSessions = sections.sessions;
@@ -3040,7 +3118,9 @@ function ConversationList({
         const expandedKey =
           instanceKeyPrefix !== undefined ? `${instanceKeyPrefix}:${group.name}` : group.name;
         if (!expandedProjects.includes(expandedKey)) continue;
-        const folder = sectionFolder || instanceKeyPrefix !== undefined;
+        // Only the owning section folder outranks other copies; a favorite
+        // folder copy is just the first copy in layout order.
+        const folder = sectionFolder;
         for (const conversation of rows) {
           const key =
             instanceKeyPrefix !== undefined
@@ -3247,8 +3327,11 @@ function ConversationList({
     const visibleIds = new Set<string>();
     for (const { collapsed, groups, flatSessions } of projection) {
       if (collapsed) continue;
-      for (const { group, rows } of groups) {
-        if (!expandedProjects.includes(group.name)) continue;
+      for (const { group, rows, instanceKeyPrefix } of groups) {
+        // A favorite copy expands under its own `fav:<section>:<name>` key.
+        const expandedKey =
+          instanceKeyPrefix !== undefined ? `${instanceKeyPrefix}:${group.name}` : group.name;
+        if (!expandedProjects.includes(expandedKey)) continue;
         for (const conversation of rows) visibleIds.add(conversation.id);
       }
       for (const conversation of flatSessions) visibleIds.add(conversation.id);
@@ -3488,7 +3571,14 @@ function ConversationList({
               if (isProjectDrag)
                 return type === "project-order" || type === "section" || type === "favorites";
               if (isSectionDrag) return type === "section-order";
-              return type !== "project-order" && type !== "section" && type !== "section-order";
+              // A session drop must not land on the project-only favorites
+              // wrapper; the section's own pin target handles it.
+              return (
+                type !== "project-order" &&
+                type !== "section" &&
+                type !== "section-order" &&
+                type !== "favorites"
+              );
             });
             const folderContainers = droppableContainers.filter(
               (container) => container.data.current?.type === "project-order",
@@ -3825,6 +3915,9 @@ function ConversationList({
                                                     selectedIds={selectedIds}
                                                     onToggleSelected={onToggleSelected}
                                                     onProjectAssigned={expandProject}
+                                                    onConversationsLoaded={
+                                                      handleFolderConversationsLoaded
+                                                    }
                                                   />
                                                 );
                                               })}

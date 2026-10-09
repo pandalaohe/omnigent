@@ -48,6 +48,7 @@ const {
   pinFn,
   folderRowsRef,
   reorderPinsFn,
+  moveToProjectFn,
 } = vi.hoisted(() => {
   const pinnedListeners = new Set<() => void>();
   const rows = { current: [] as unknown[] };
@@ -75,6 +76,7 @@ const {
     orderStatusRef: { current: 200 },
     pinFn: vi.fn(),
     reorderPinsFn: vi.fn((_writes: unknown) => undefined),
+    moveToProjectFn: vi.fn(),
     folderRowsRef: { current: new Map<string, unknown[]>() },
   };
 });
@@ -87,6 +89,7 @@ vi.mock("@/hooks/useConversations", async () => {
     resolveOrCreateProjectId: vi.fn((name: string) => Promise.resolve(`p_${name}`)),
     useTogglePinnedConversation: () => ({ mutate: vi.fn(), mutateAsync: pinFn }),
     useReorderPinnedConversations: () => ({ mutate: reorderPinsFn }),
+    useMoveToProject: () => ({ mutate: moveToProjectFn }),
     useProjects: () => ({ data: projectsRef.current }),
     usePinnedConversations: () => {
       const rows = useSyncExternalStore(pinnedStore.subscribe, () => pinnedRef.current);
@@ -237,6 +240,7 @@ beforeEach(() => {
     return Promise.resolve({});
   });
   reorderPinsFn.mockReset();
+  moveToProjectFn.mockReset();
   folderRowsRef.current = new Map();
   fetchMock.mockReset();
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -1653,5 +1657,225 @@ describe("sidebar project favorites", () => {
     });
     fireEvent.click(screen.getByTestId("new-section"));
     expect(screen.queryByTestId("new-section-kind-favorites")).toBeNull();
+  });
+
+  it("pins a folder session dropped on the Favorites header instead of unfiling it", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          { id: "sec_fav", kind: "favorites", name: "Favorites", maxRows: null, items: [] },
+          { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Beta"]));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const s1 = conversation("s1", { labels: { omni_project: "Beta" }, updated_at: 1 });
+    mockConversations([s1]);
+
+    // The Favorites wrapper covers the drop point; the section's own pin zone
+    // covers it too but with far corners, so before the fix the wrapper wins.
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.tagName === "NAV") return new DOMRect(0, 0, 400, 5000);
+      if (this instanceof HTMLElement && this.dataset.sectionId === "sec_fav") {
+        return new DOMRect(0, 1000, 200, 100);
+      }
+      if (this instanceof HTMLElement && this.dataset.testid === "sidebar-pin-drop-zone") {
+        return new DOMRect(-500, -500, 2000, 2000);
+      }
+      if (this.matches('li[data-sidebar-session-id="s1"]')) {
+        return new DOMRect(0, 0, 200, 30);
+      }
+      return new DOMRect(0, 0, 0, 0);
+    });
+    renderSidebar();
+
+    const row = within(sectionOf("Projects")).getByText("s1").closest("li") as HTMLElement;
+    fireEvent.mouseDown(row, { button: 0, clientX: 100, clientY: 15 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 5 });
+    await act(async () => {
+      fireEvent.mouseMove(document, { clientX: 100, clientY: 1050 });
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, { clientX: 100, clientY: 1050 });
+    });
+
+    await waitFor(() => expect(pinFn).toHaveBeenCalledWith({ id: "s1", pinned: true }));
+    expect(moveToProjectFn).not.toHaveBeenCalled();
+  });
+
+  it("keeps the owning section folder canonical when a favorite copy is also expanded", () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p_beta" }],
+          },
+          { id: "sec_work", kind: "projects", name: "Work", maxRows: null, projectIds: ["p_beta"] },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["fav:sec_fav:Beta", "Beta"]),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const s1 = conversation("s1", { labels: { omni_project: "Beta" }, updated_at: 1 });
+    pinnedRef.current = [s1];
+    folderRowsRef.current.set("Beta", [s1]);
+    mockConversations([s1]);
+    renderSidebar();
+
+    const canonical = document.querySelectorAll(
+      'li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]',
+    );
+    expect(canonical).toHaveLength(1);
+    expect(sectionOf("Work").contains(canonical[0]!)).toBe(true);
+  });
+
+  it("reorders a session above a project ref by dropping it on the project ref", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_REORDER_LAYOUT));
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const source = within(fav).getByText("s1").closest("li") as HTMLElement;
+    const start = favoriteItemPoint(1);
+    const target = favoriteItemPoint(0);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+      expect(favorites?.items).toEqual([
+        { type: "session", id: "s1" },
+        { type: "project", id: "p_beta" },
+      ]);
+    });
+    expect(reorderPinsFn).not.toHaveBeenCalled();
+  });
+
+  it("keeps unresolved refs in place when a favorites row is reordered", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [
+              { type: "project", id: "p_missing" },
+              { type: "project", id: "p_beta" },
+              { type: "session", id: "s_gone" },
+              { type: "session", id: "s1" },
+            ],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    pinnedRef.current = [conversation("s1", { labels: { "omnigent.pinned": "1000" } })];
+    mockConversations([conversation("s1")]);
+    stubFavoriteItemRects();
+    renderSidebar();
+
+    const fav = sectionOf("Favorites");
+    const source = within(fav).getByText("s1").closest("li") as HTMLElement;
+    const start = favoriteItemPoint(1);
+    const target = favoriteItemPoint(0);
+
+    fireEvent.mouseDown(source, { button: 0, ...start });
+    fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+    await act(async () => {
+      fireEvent.mouseMove(document, target);
+    });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    await waitFor(() => {
+      const favorites = storedLayout().sections.find((section) => section.id === "sec_fav");
+      expect(favorites?.items).toEqual([
+        { type: "project", id: "p_missing" },
+        { type: "session", id: "s1" },
+        { type: "session", id: "s_gone" },
+        { type: "project", id: "p_beta" },
+      ]);
+    });
+    expect(reorderPinsFn).not.toHaveBeenCalled();
+  });
+
+  it("sources a favorite copy's folder-page rows into the projection", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p_beta" }],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["fav:sec_fav:Beta"]),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const folderOnly = conversation("folder-only", {
+      labels: { omni_project: "Beta" },
+      status: "running",
+      updated_at: 3,
+    });
+    folderRowsRef.current.set("Beta", [folderOnly]);
+    // The global window never holds the folder-page-only session.
+    mockConversations([conversation("plain", { updated_at: 1 })]);
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    renderSidebarAt("/c/plain");
+
+    // It is in the keyboard order: Cmd+] lands on the folder-page-only row.
+    fireEvent.keyDown(document.body, { code: "BracketRight", metaKey: true, bubbles: true });
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/folder-only"));
+
+    // ...and the collapsed Favorites marker rolls up its state.
+    fireEvent.click(within(sectionOf("Favorites")).getByRole("button", { name: "Favorites" }));
+    await waitFor(() =>
+      expect(within(sectionOf("Favorites")).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      ),
+    );
+    platform.mockRestore();
   });
 });

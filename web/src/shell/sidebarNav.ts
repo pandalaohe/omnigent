@@ -547,15 +547,17 @@ export function resolveSidebarDrop(
     return { kind: "pin", targetId: target.id };
   }
   if (target.type === "fav-item") {
-    // A project ref isn't a pin slot: an unpinned session pins to the end, a
-    // pinned one has nowhere to go. A session ref behaves like a pin slot.
-    if (target.refType === "project") {
-      return source.favoritesCopy || source.isPinned ? { kind: "none" } : { kind: "pin" };
-    }
+    // A favorites copy reorders across any favorites row (session or project);
+    // the caller splits the move into the slot pattern and pin writes.
     if (source.favoritesCopy) {
       return target.refId === source.id
         ? { kind: "none" }
         : { kind: "reorder-pin", targetId: target.refId };
+    }
+    // A project ref isn't a pin slot: an unpinned session pins to the end, a
+    // pinned one has nowhere to go. A session ref behaves like a pin slot.
+    if (target.refType === "project") {
+      return source.isPinned ? { kind: "none" } : { kind: "pin" };
     }
     if (source.isPinned) return { kind: "none" };
     return { kind: "pin", targetId: target.refId };
