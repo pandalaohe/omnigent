@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
@@ -174,6 +175,13 @@ def _seed_child_with_pending(
     assert conversation_store.set_runner_id(child.id, "rnr_child")
     conversation_store.set_pending_elicitation_count(child.id, pending)
     return child.id
+
+
+def _list_row(app: FastAPI, session_id: str, *, owner: str = ALICE) -> dict:
+    """Return one row of ``GET /v1/sessions`` keyed by id."""
+    resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": owner})
+    assert resp.status_code == 200
+    return {item["id"]: item for item in resp.json()["data"]}[session_id]
 
 
 def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[str, object]:
@@ -417,6 +425,71 @@ def test_child_pending_elicitations_clear_after_resolve(
         changed = _recv_until(ws, {"changed"})
         changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
         assert changed_items[parent_id]["child_pending_elicitations_count"] == 0
+
+
+def test_pending_elicitation_key_absent_with_nothing_pending(app: FastAPI, stores) -> None:
+    """A row with no outstanding prompts carries no prompt key."""
+    session_id = _seed_session(stores, owner=ALICE, title="quiet")
+
+    assert _list_row(app, session_id).get("pending_elicitation_key") is None
+
+
+def test_pending_elicitation_key_set_after_own_prompt(app: FastAPI, stores) -> None:
+    """Recording an own prompt sets the key to a hash of its id."""
+    session_id = _seed_session(stores, owner=ALICE, title="prompted")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_1"},
+    )
+
+    assert _list_row(app, session_id)["pending_elicitation_key"] == "40deb586a95d9d1a"
+
+
+def test_pending_elicitation_key_stable_across_unrelated_change(app: FastAPI, stores) -> None:
+    """An unrelated title change leaves a still-pending prompt's key alone."""
+    conversation_store = stores[0]
+    session_id = _seed_session(stores, owner=ALICE, title="prompted")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_1"},
+    )
+    before = _list_row(app, session_id)["pending_elicitation_key"]
+
+    conversation_store.update_conversation_with_changes(session_id, title="renamed")
+
+    assert _list_row(app, session_id)["pending_elicitation_key"] == before
+
+
+def test_pending_elicitation_key_changes_across_prompt_cycles(app: FastAPI, stores) -> None:
+    """Resolve then a fresh prompt yields a different key at the same count."""
+    session_id = _seed_session(stores, owner=ALICE, title="cycles")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_1"},
+    )
+    first = _list_row(app, session_id)["pending_elicitation_key"]
+
+    pending_elicitations.resolve(session_id, "elic_1")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_2"},
+    )
+    second = _list_row(app, session_id)["pending_elicitation_key"]
+
+    assert first == "40deb586a95d9d1a"
+    assert second == "00d5a66639eb7857"
+
+
+def test_pending_elicitation_key_includes_live_child_prompt(app: FastAPI, stores) -> None:
+    """A parked prompt on a live child sets the parent row's key."""
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child_id = _seed_child_with_pending(stores, parent_id, pending=0)
+    pending_elicitations.record_publish(
+        child_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_child"},
+    )
+
+    assert _list_row(app, parent_id)["pending_elicitation_key"] == "4f03a3a1b74e0f0d"
 
 
 def test_background_shell_count_flows_through_updates_stream(

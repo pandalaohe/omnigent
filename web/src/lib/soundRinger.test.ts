@@ -34,8 +34,9 @@ function alert(level: SoundLevel, sessionId = "conv_a"): SoundAlert {
 
 function createHarness(overrides: Partial<RingerContext> = {}) {
   let now = NOON;
+  let contextOverrides: Partial<RingerContext> = { ...overrides };
   const played: { level: SoundLevel; at: number }[] = [];
-  let queue: { fn: () => void; at: number }[] = [];
+  let queue: { fn: () => void; at: number; cancelled: boolean }[] = [];
   const ringer = createSoundRinger({
     play: (level) => played.push({ level, at: now }),
     getContext: () => ({
@@ -44,16 +45,21 @@ function createHarness(overrides: Partial<RingerContext> = {}) {
       windowFocused: false,
       activeConversationId: undefined,
       now: new Date(now),
-      ...overrides,
+      ...contextOverrides,
     }),
     nowMs: () => now,
     schedule: (fn, ms) => {
-      queue.push({ fn, at: now + ms });
+      const entry = { fn, at: now + ms, cancelled: false };
+      queue.push(entry);
+      return () => {
+        entry.cancelled = true;
+      };
     },
   });
   function advance(ms: number): void {
     const target = now + ms;
     for (;;) {
+      queue = queue.filter((entry) => !entry.cancelled);
       queue.sort((a, b) => a.at - b.at);
       const next = queue[0];
       if (next === undefined || next.at > target) break;
@@ -66,7 +72,10 @@ function createHarness(overrides: Partial<RingerContext> = {}) {
   function setTime(date: Date): void {
     now = date.getTime();
   }
-  return { ringer, played, advance, setTime };
+  function setContext(next: Partial<RingerContext>): void {
+    contextOverrides = { ...contextOverrides, ...next };
+  }
+  return { ringer, played, advance, setTime, setContext };
 }
 
 describe("sound ringer", () => {
@@ -193,6 +202,30 @@ describe("sound ringer", () => {
     expect(error).toBeDefined();
     expect(needs).toBeDefined();
     expect(needs?.at).toBe((error?.at ?? 0) + 400);
+  });
+
+  it("drops a scheduled cue when the device is switched off before it fires", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("needs_response"));
+    // The error cue lands 400 ms after the needs_response one, so it is
+    // scheduled rather than played immediately.
+    h.ringer.ring(alert("error", "conv_b"));
+    h.setContext({ device: device({ enabled: false }) });
+    h.advance(1_000);
+
+    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response"]);
+  });
+
+  it("cancels a scheduled cue on dispose", () => {
+    const h = createHarness();
+
+    h.ringer.ring(alert("needs_response"));
+    h.ringer.ring(alert("error", "conv_b"));
+    h.ringer.dispose();
+    h.advance(1_000);
+
+    expect(h.played.map((entry) => entry.level)).toEqual(["needs_response"]);
   });
 
   it("lets an error join a completion burst but not a completion after an error", () => {

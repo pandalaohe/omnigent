@@ -234,6 +234,37 @@ async def test_owners_are_isolated() -> None:
     assert len(sent_bob.frames) == 1
 
 
+async def test_repeated_hello_keeps_connection_activity_history() -> None:
+    """A re-announced connection keeps its recency and stays the active ringer."""
+    sent_a = _Recorder()
+    _register(ALICE, "c_a", "dev_a", sent_a, can_ring=False)
+    connected_at = _record(ALICE, "c_a").connected_at
+    sound_alerts.touch(ALICE, "c_a")
+    activity_at = _record(ALICE, "c_a").last_activity
+
+    # The same connection toggles its ring switch on in a second hello.
+    _register(ALICE, "c_a", "dev_a", sent_a, can_ring=True)
+    _register(ALICE, "c_b", "dev_b", _Recorder())
+    # c_b connected later; only c_a's retained activity should make it win.
+    _record(ALICE, "c_b").connected_at = connected_at + 100.0
+
+    record = _record(ALICE, "c_a")
+    assert record.connected_at == connected_at
+    assert record.last_activity == activity_at
+    assert record.can_ring is True
+
+    delivered = await sound_alerts.claim(
+        ALICE,
+        alert_id="conv_a:done:1",
+        session_id="conv_a",
+        level="done",
+        primary_device_id=None,
+    )
+
+    assert delivered is True
+    assert len(sent_a.frames) == 1
+
+
 async def test_two_connections_of_one_device_ring_once() -> None:
     """Two tabs of the same device never both play one alert."""
     sent_a = _Recorder()

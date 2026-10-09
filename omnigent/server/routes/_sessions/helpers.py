@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import re
@@ -1599,11 +1600,27 @@ async def _apply_liveness_to_items(
             item.background_activity_count = 0
 
 
+class ChildPendingElicitations(NamedTuple):
+    """
+    A parent's rolled-up live-child pending prompts.
+
+    :param counts: Map from parent id to its summed live-child pending
+        count (``0`` for parents whose children have none).
+    :param latest_ids_by_parent: Map from parent id to the most recently
+        inserted outstanding elicitation id of each counted live child.
+        Children whose count came only from the persisted row (no
+        in-memory index entry on this replica) contribute no id.
+    """
+
+    counts: dict[str, int]
+    latest_ids_by_parent: dict[str, list[str]]
+
+
 async def _child_pending_elicitations_by_parent(
     child_ids_by_parent: Mapping[str, list[str]],
     child_rows: Mapping[str, Conversation],
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
-) -> dict[str, int]:
+) -> ChildPendingElicitations:
     """
     Sum each parent's outstanding child elicitations, live children only.
 
@@ -1625,11 +1642,12 @@ async def _child_pending_elicitations_by_parent(
         :class:`SessionLiveness` pair, or ``None`` when this server
         cannot compute liveness. Only children with a non-zero pending
         count are queried.
-    :returns: Map from parent id to its summed live-child pending count
-        (``0`` for parents whose children have none).
+    :returns: The summed live-child pending count per parent, plus the
+        latest outstanding elicitation id of each counted child.
     """
     all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
     index_counts = pending_elicitations.counts_for(list(all_child_ids))
+    child_latest_ids = pending_elicitations.latest_ids_for(list(all_child_ids))
     child_counts: dict[str, int] = {}
     for child_id in all_child_ids:
         child = child_rows.get(child_id)
@@ -1649,10 +1667,50 @@ async def _child_pending_elicitations_by_parent(
                 for child_id, count in child_counts.items()
                 if count == 0 or liveness[child_id].runner_online
             }
-    return {
+    counts = {
         parent_id: sum(child_counts.get(child_id, 0) for child_id in child_ids)
         for parent_id, child_ids in child_ids_by_parent.items()
     }
+    latest_ids_by_parent = {
+        parent_id: [
+            child_latest_ids[child_id]
+            for child_id in child_ids
+            if child_counts.get(child_id, 0) > 0 and child_id in child_latest_ids
+        ]
+        for parent_id, child_ids in child_ids_by_parent.items()
+    }
+    return ChildPendingElicitations(
+        counts=counts,
+        latest_ids_by_parent=latest_ids_by_parent,
+    )
+
+
+def _pending_elicitation_key(
+    own_latest_id: str | None,
+    child_latest_ids: Sequence[str],
+) -> str | None:
+    """
+    Derive the opaque key identifying one row's outstanding prompts.
+
+    The key must be stable while the same prompts are pending and change
+    the moment a new one appears, so an alert id built from it is
+    de-duplicated per prompt rather than per row update. Hashes the
+    sorted latest ids so a set that merely reorders reads the same.
+
+    :param own_latest_id: This session's own latest outstanding
+        elicitation id, or ``None`` when it has none.
+    :param child_latest_ids: Latest outstanding elicitation id of each
+        counted live direct child.
+    :returns: The first 16 hex chars of a sha256 over the sorted ids, or
+        ``None`` when there are no ids.
+    """
+    ids = list(child_latest_ids)
+    if own_latest_id is not None:
+        ids.append(own_latest_id)
+    if not ids:
+        return None
+    digest = hashlib.sha256(",".join(sorted(ids)).encode("utf-8")).hexdigest()
+    return digest[:16]
 
 
 def _elicitation_source_label(conv: Conversation) -> str:
@@ -13392,6 +13450,7 @@ __all__ = [
     "_parse_external_conversation_item",
     "_parse_session_create_metadata",
     "_parse_skill_slash_command",
+    "_pending_elicitation_key",
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",

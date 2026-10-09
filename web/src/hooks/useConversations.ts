@@ -262,6 +262,13 @@ export interface Conversation {
    * into this parent's badge because children have no sidebar row.
    */
   child_pending_elicitations_count?: number;
+  /**
+   * Opaque key of the prompts counted in this row's Needs response state
+   * (own and live direct children). Changes when a new prompt appears and
+   * is stable otherwise, so the sound-alert id de-dupes per prompt rather
+   * than per row update. `null`/absent when none are indexed.
+   */
+  pending_elicitation_key?: string | null;
   status?: "idle" | "running" | "failed";
   /** This session's own turn status, excluding active child-session rollup. */
   foreground_status?: "idle" | "running" | "failed";
@@ -615,6 +622,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     agent_name: wire.agent_name ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     child_pending_elicitations_count: wire.child_pending_elicitations_count ?? 0,
+    pending_elicitation_key: wire.pending_elicitation_key ?? null,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
     host_online: wire.host_online ?? undefined,

@@ -25,7 +25,14 @@ export interface SoundRingerDeps {
   play: (level: SoundLevel) => void;
   getContext: () => RingerContext;
   nowMs: () => number;
-  schedule: (fn: () => void, ms: number) => void;
+  /** Schedule `fn` after `ms`; returns a cancel function for `dispose`. */
+  schedule: (fn: () => void, ms: number) => () => void;
+}
+
+export interface SoundRinger {
+  ring: (alert: SoundAlert) => void;
+  /** Cancel every scheduled cue (call on unmount). */
+  dispose: () => void;
 }
 
 // One cue per class per window; a later alert of the same class is part of the
@@ -43,9 +50,34 @@ function alertClass(level: SoundLevel): AlertClass {
   return level === "needs_response" ? "needs_response" : "other";
 }
 
-export function createSoundRinger(deps: SoundRingerDeps): { ring: (alert: SoundAlert) => void } {
+/**
+ * Whether the current local context still allows this alert to play.
+ *
+ * Evaluated both when an alert arrives and again when a scheduled cue
+ * fires, since the device switch, quiet hours, session mute, level
+ * enablement, or the viewed session may all have changed in between.
+ */
+function passesFilters(alert: SoundAlert, context: RingerContext): boolean {
+  if (!context.device.enabled) return false;
+  if (isQuietNow(context.account.quietHours, context.now)) return false;
+  if (context.account.mutedSessionIds.includes(alert.sessionId)) return false;
+  if (!isSoundLevelEnabled(context.account, alert.level)) return false;
+  // The user is looking at this session; only a pending prompt still needs
+  // their attention.
+  if (
+    alert.level !== "needs_response" &&
+    context.windowFocused &&
+    context.activeConversationId === alert.sessionId
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
   const rungIds: string[] = [];
   const rungSet = new Set<string>();
+  const scheduled = new Set<() => void>();
   // Last cue start per class. A scheduled cue records its planned start, so a
   // later alert can neither stack on it nor start too close to it.
   const lastCueAt: Record<AlertClass, number | undefined> = {
@@ -65,20 +97,7 @@ export function createSoundRinger(deps: SoundRingerDeps): { ring: (alert: SoundA
 
   function ring(alert: SoundAlert): void {
     if (rungSet.has(alert.alertId)) return;
-    const context = deps.getContext();
-    if (!context.device.enabled) return;
-    if (isQuietNow(context.account.quietHours, context.now)) return;
-    if (context.account.mutedSessionIds.includes(alert.sessionId)) return;
-    if (!isSoundLevelEnabled(context.account, alert.level)) return;
-    // The user is looking at this session; only a pending prompt still needs
-    // their attention.
-    if (
-      alert.level !== "needs_response" &&
-      context.windowFocused &&
-      context.activeConversationId === alert.sessionId
-    ) {
-      return;
-    }
+    if (!passesFilters(alert, deps.getContext())) return;
 
     const now = deps.nowMs();
     const cls = alertClass(alert.level);
@@ -100,11 +119,25 @@ export function createSoundRinger(deps: SoundRingerDeps): { ring: (alert: SoundA
     if (cls === "other") lastOtherLevel = alert.level;
     if (start > now) {
       const level = alert.level;
-      deps.schedule(() => deps.play(level), start - now);
+      let cancel = () => {};
+      cancel = deps.schedule(() => {
+        scheduled.delete(cancel);
+        // The context may have changed while the cue waited: re-check the
+        // device switch, quiet hours, session mute, level enablement, and
+        // the viewing rule, and drop the cue if any now fails.
+        if (!passesFilters(alert, deps.getContext())) return;
+        deps.play(level);
+      }, start - now);
+      scheduled.add(cancel);
     } else {
       deps.play(alert.level);
     }
   }
 
-  return { ring };
+  function dispose(): void {
+    for (const cancel of scheduled) cancel();
+    scheduled.clear();
+  }
+
+  return { ring, dispose };
 }

@@ -40,8 +40,10 @@ import {
 // Agents that work in steps emit a dot per step; only a dot still showing
 // after the settle window is a real turn end.
 const DONE_SETTLE_MS = 10_000;
-// A reconnect re-baselines even if no data change follows.
-const REBASELINE_FALLBACK_MS = 1_500;
+// A snapshot frame is applied to the query cache by the provider's own
+// listener, which may run after this hook's; wait a beat before recomputing
+// so the rebaseline reads the fresh rows.
+const SNAPSHOT_SETTLE_MS = 50;
 // At most one activity frame per window; the server's 5-minute recency check
 // is far coarser, so this only bounds frame traffic.
 const ACTIVITY_THROTTLE_MS = 10_000;
@@ -54,8 +56,10 @@ function isWindowFocused(): boolean {
 
 /**
  * Fold the shell's legacy notification-sound setting into device-local alert
- * preferences once, then mark it migrated. No legacy values (or an older shell
- * without the bridge) still records the marker so this never runs again.
+ * preferences once, then mark it migrated. A null read means the bridge is
+ * absent (older shell) or failed, so the marker is left unset and the next
+ * mount retries; only a successful read (an object, even with null fields)
+ * applies and marks it.
  */
 async function migrateLegacySoundSetting(): Promise<void> {
   if (readSoundAlertDevicePreferences().legacySoundMigrated) return;
@@ -64,8 +68,9 @@ async function migrateLegacySoundSetting(): Promise<void> {
   // bridge call was in flight.
   const device = readSoundAlertDevicePreferences();
   if (device.legacySoundMigrated) return;
+  if (legacy === null) return;
   const next: SoundAlertDevicePreferences = { ...device, legacySoundMigrated: true };
-  if (legacy && typeof legacy.enabled === "boolean") {
+  if (typeof legacy.enabled === "boolean") {
     next.enabled = legacy.enabled;
     if (legacy.enabled && legacy.name) {
       const systemSounds: Partial<Record<SoundLevel, string>> = {};
@@ -113,7 +118,9 @@ export function useSoundAlerts(activeConversationId?: string): void {
   const latestRows = useRef<Map<string, RowSoundState>>(new Map());
   const settleTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const rebaselinePending = useRef(false);
-  const rebaselineTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Starts true: the initial page load counts as a connect, so nothing is
+  // detected until the first snapshot arrives and re-baselines.
+  const awaitingSnapshot = useRef(true);
   const [recomputeTick, setRecomputeTick] = useState(0);
   // Re-announce to the server when the browser's audio unlocks, so a tab that
   // couldn't ring yet starts being chosen once the user interacts.
@@ -134,7 +141,8 @@ export function useSoundAlerts(activeConversationId?: string): void {
       }),
       nowMs: () => Date.now(),
       schedule: (fn, ms) => {
-        setTimeout(fn, ms);
+        const timer = setTimeout(fn, ms);
+        return () => clearTimeout(timer);
       },
     });
   }
@@ -169,6 +177,18 @@ export function useSoundAlerts(activeConversationId?: string): void {
   // ringer still applies this device's local filters before playing.
   useEffect(() => {
     return sessionUpdatesSocket.subscribe((frame) => {
+      if (frame.type === "snapshot") {
+        // The first snapshot after (re)connect re-baselines on the fresh
+        // rows and re-claims still-pending prompts (the server dedupes).
+        // The provider applies the frame to the cache in its own listener,
+        // possibly after this one, so recompute a beat later.
+        if (awaitingSnapshot.current) {
+          awaitingSnapshot.current = false;
+          rebaselinePending.current = true;
+          setTimeout(() => setRecomputeTick((tick) => tick + 1), SNAPSHOT_SETTLE_MS);
+        }
+        return;
+      }
       if (frame.type !== "sound_alert") return;
       ringerRef.current?.ring({
         sessionId: frame.session_id,
@@ -214,35 +234,28 @@ export function useSoundAlerts(activeConversationId?: string): void {
     };
   }, []);
 
-  // A (re)connect may have dropped edges while the stream was down; the next
-  // recompute re-baselines and re-announces still-pending rows.
+  // A dropped connection may have missed edges; hold detection until the next
+  // snapshot re-baselines, and drop any cue that was mid-settle.
   useEffect(() => {
     const onStatusChange = () => {
-      if (!sessionUpdatesSocket.isConnected()) return;
-      rebaselinePending.current = true;
-      if (rebaselineTimer.current !== null) return;
-      rebaselineTimer.current = setTimeout(() => {
-        rebaselineTimer.current = null;
-        setRecomputeTick((tick) => tick + 1);
-      }, REBASELINE_FALLBACK_MS);
+      if (sessionUpdatesSocket.isConnected()) return;
+      awaitingSnapshot.current = true;
+      for (const timer of settleTimers.current.values()) clearTimeout(timer);
+      settleTimers.current.clear();
     };
     const unsubscribe = sessionUpdatesSocket.subscribeStatus(onStatusChange);
-    if (sessionUpdatesSocket.isConnected()) onStatusChange();
-    return () => {
-      unsubscribe();
-      if (rebaselineTimer.current !== null) {
-        clearTimeout(rebaselineTimer.current);
-        rebaselineTimer.current = null;
-      }
-    };
+    if (!sessionUpdatesSocket.isConnected()) onStatusChange();
+    return () => unsubscribe();
   }, []);
 
   // Clear pending cues on unmount so none fires into a torn-down tree.
   useEffect(() => {
     const timers = settleTimers.current;
+    const ringer = ringerRef.current;
     return () => {
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      ringer?.dispose();
     };
   }, []);
 
@@ -276,6 +289,11 @@ export function useSoundAlerts(activeConversationId?: string): void {
       }
     }
 
+    // Until the snapshot for this (re)connect lands, refresh the rows but
+    // detect no edges and start no timers: any change across the gap is
+    // unknowable, and the rebaseline re-claims still-pending prompts.
+    if (awaitingSnapshot.current) return;
+
     const deliver = (alert: SoundAlert) => {
       const preferences = accountRef.current;
       // Skip locally so a disabled level or muted session never costs a
@@ -284,7 +302,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
       if (preferences.mutedSessionIds.includes(alert.sessionId)) return;
       void (async () => {
         try {
-          const response = await authenticatedFetch("/v1/me/sound-alerts/claim", {
+          await authenticatedFetch("/v1/me/sound-alerts/claim", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -293,11 +311,6 @@ export function useSoundAlerts(activeConversationId?: string): void {
               level: alert.level,
             }),
           });
-          // A server without the claim route: ring locally so local
-          // detection still sounds.
-          if (response.status === 404 || response.status === 405) {
-            ringerRef.current?.ring(alert);
-          }
         } catch {
           // Alert delivery is best-effort; a network failure drops the cue.
         }
@@ -306,10 +319,6 @@ export function useSoundAlerts(activeConversationId?: string): void {
 
     if (rebaselinePending.current) {
       rebaselinePending.current = false;
-      if (rebaselineTimer.current !== null) {
-        clearTimeout(rebaselineTimer.current);
-        rebaselineTimer.current = null;
-      }
       for (const timer of settleTimers.current.values()) clearTimeout(timer);
       settleTimers.current.clear();
       previousRows.current = next;

@@ -174,6 +174,7 @@ from omnigent.server.routes._sessions.helpers import (
     _note_settings_write,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
+    _pending_elicitation_key,
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
     _place_project_session,
@@ -2058,6 +2059,7 @@ def register_core_routes(
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
+        own_pending_ids = pending_elicitations.latest_ids_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
         # Preview excerpts ride one batched message read capped by the page
         # size; per-row ``list_items`` would be N+1 traffic. The child rail
@@ -2138,7 +2140,7 @@ def register_core_routes(
             for child_id, child in child_rows.items()
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
-        child_pending_counts = await _child_pending_elicitations_by_parent(
+        child_pending = await _child_pending_elicitations_by_parent(
             child_ids_by_parent,
             child_rows,
             liveness_lookup,
@@ -2155,7 +2157,11 @@ def register_core_routes(
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
-                child_pending_count=child_pending_counts.get(conv.id, 0),
+                child_pending_count=child_pending.counts.get(conv.id, 0),
+                pending_key=_pending_elicitation_key(
+                    own_pending_ids.get(conv.id),
+                    child_pending.latest_ids_by_parent.get(conv.id, []),
+                ),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,
@@ -2407,6 +2413,7 @@ def register_core_routes(
             _comments_fingerprints_for(conv_ids),
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
+        own_pending_ids = pending_elicitations.latest_ids_for(conv_ids)
         all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
         child_rows = (
             await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
@@ -2418,7 +2425,7 @@ def register_core_routes(
             for child_id, child in child_rows.items()
             if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
         }
-        child_pending_counts = await _child_pending_elicitations_by_parent(
+        child_pending = await _child_pending_elicitations_by_parent(
             child_ids_by_parent,
             child_rows,
             liveness_lookup,
@@ -2435,7 +2442,11 @@ def register_core_routes(
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
-                child_pending_count=child_pending_counts.get(conv.id, 0),
+                child_pending_count=child_pending.counts.get(conv.id, 0),
+                pending_key=_pending_elicitation_key(
+                    own_pending_ids.get(conv.id),
+                    child_pending.latest_ids_by_parent.get(conv.id, []),
+                ),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
                 activity_unverified_child_ids=activity_unverified_child_ids,

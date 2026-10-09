@@ -11,6 +11,12 @@ import { rowMark, type RowMark, type RowMarkContext } from "@/lib/rowMark";
 export interface RowSoundState {
   mark: RowMark;
   updatedAt: number;
+  /**
+   * Server-provided key identifying the row's outstanding prompts, or null
+   * when the index holds none. A needs_response alert id keys off this so a
+   * prompt cycle re-alerts even when the row's updated_at does not move.
+   */
+  pendingKey: string | null;
 }
 
 export interface SoundAlert {
@@ -32,8 +38,15 @@ export function isDoneCandidate(state: RowSoundState): boolean {
 
 /** Stable identity for de-duplication across re-deliveries of one edge. */
 export function alertId(sessionId: string, level: SoundLevel, s: RowSoundState): string {
-  const base = `${sessionId}:${level}:${s.updatedAt}`;
-  return level === "needs_response" ? `${base}:${s.mark.awaitingCount}` : base;
+  if (level === "needs_response") {
+    // The prompt key identifies the specific prompt(s) awaiting; updated_at
+    // does not move for a new prompt, so fall back to it only when the
+    // server supplied no key (older server / no index entry).
+    return s.pendingKey !== null
+      ? `${sessionId}:needs_response:${s.pendingKey}`
+      : `${sessionId}:needs_response:${s.updatedAt}:${s.mark.awaitingCount}`;
+  }
+  return `${sessionId}:${level}:${s.updatedAt}`;
 }
 
 /**
@@ -104,6 +117,7 @@ export function buildRowSoundStates(
     states.set(conversation.id, {
       mark: rowMark(conversation, ctxFor(conversation)),
       updatedAt: conversation.updated_at,
+      pendingKey: conversation.pending_elicitation_key ?? null,
     });
   }
   return states;

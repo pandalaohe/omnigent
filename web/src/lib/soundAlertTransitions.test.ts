@@ -32,10 +32,15 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   };
 }
 
-function rowState(partial: Partial<RowMark> = {}, updatedAt = 100): RowSoundState {
+function rowState(
+  partial: Partial<RowMark> = {},
+  updatedAt = 100,
+  pendingKey: string | null = null,
+): RowSoundState {
   return {
     mark: { state: "none", awaitingCount: 0, background: false, goal: "none", ...partial },
     updatedAt,
+    pendingKey,
   };
 }
 
@@ -177,6 +182,30 @@ describe("sound alert transitions", () => {
     expect(alertId("conv_a", "needs_response", rowState({ awaitingCount: 3 }, 42))).toBe(
       "conv_a:needs_response:42:3",
     );
+  });
+
+  it("keys a needs_response id off the prompt key, not updated_at", () => {
+    const first = rowState({ state: "awaiting", awaitingCount: 1 }, 100, "key_a");
+    const later = rowState({ state: "awaiting", awaitingCount: 1 }, 999, "key_a");
+
+    expect(alertId("conv_a", "needs_response", first)).toBe(
+      alertId("conv_a", "needs_response", later),
+    );
+  });
+
+  it("distinguishes a new prompt by key even at the same count and updated_at", () => {
+    const first = rowState({ state: "awaiting", awaitingCount: 1 }, 100, "key_a");
+    const second = rowState({ state: "awaiting", awaitingCount: 1 }, 100, "key_b");
+
+    expect(alertId("conv_a", "needs_response", first)).not.toBe(
+      alertId("conv_a", "needs_response", second),
+    );
+  });
+
+  it("falls back to the old id form when the server supplies no prompt key", () => {
+    const state = rowState({ state: "awaiting", awaitingCount: 2 }, 42, null);
+
+    expect(alertId("conv_a", "needs_response", state)).toBe("conv_a:needs_response:42:2");
   });
 
   it("ignores child sessions", () => {

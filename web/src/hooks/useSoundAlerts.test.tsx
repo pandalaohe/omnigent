@@ -147,6 +147,17 @@ function emitFrame(frame: { type: string; [key: string]: unknown }): void {
   });
 }
 
+/**
+ * Deliver the connect snapshot and let its deferred rebaseline settle, so the
+ * current rows become the detection baseline — mirroring the live socket.
+ */
+function settleInitialSnapshot(): void {
+  emitFrame({ type: "snapshot", items: [] });
+  act(() => {
+    vi.advanceTimersByTime(50);
+  });
+}
+
 /** The persisted device preferences, or null. */
 function deviceStored(): Record<string, unknown> | null {
   return JSON.parse(localStorage.getItem(SOUND_ALERTS_DEVICE_STORAGE_KEY) ?? "null") as Record<
@@ -233,6 +244,7 @@ describe("useSoundAlerts", () => {
   it("claims needs_response once when a session starts awaiting", () => {
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
@@ -260,6 +272,7 @@ describe("useSoundAlerts", () => {
     );
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
@@ -280,6 +293,7 @@ describe("useSoundAlerts", () => {
     );
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
@@ -294,6 +308,7 @@ describe("useSoundAlerts", () => {
     localStorage.setItem(SOUND_ALERTS_STORAGE_KEY, JSON.stringify({ mutedSessionIds: ["conv_a"] }));
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
@@ -323,6 +338,7 @@ describe("useSoundAlerts", () => {
   it("claims one done after the settle when a turn ends with nothing running", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       isConversationUnseenMock.mockReturnValue(true);
@@ -342,6 +358,7 @@ describe("useSoundAlerts", () => {
   it("stays silent while background work covers the dot, then claims when it clears", () => {
     setConversations([conv("conv_a", { background_activity_count: 1 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       isConversationUnseenMock.mockReturnValue(true);
@@ -368,6 +385,7 @@ describe("useSoundAlerts", () => {
   it("cancels the settle when the session starts running again", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       isConversationUnseenMock.mockReturnValue(true);
@@ -388,6 +406,7 @@ describe("useSoundAlerts", () => {
   it("claims needs_response only, never done, for an awaiting row", () => {
     setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       isConversationUnseenMock.mockReturnValue(true);
@@ -405,6 +424,7 @@ describe("useSoundAlerts", () => {
   it("claims error when the session status fails", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       setConversations([conv("conv_a", { updated_at: 200, status: "failed" })]);
@@ -418,6 +438,7 @@ describe("useSoundAlerts", () => {
   it("claims error when an idle row has a latest error", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       latestErrorById.set("conv_a", "error");
@@ -432,6 +453,7 @@ describe("useSoundAlerts", () => {
   it("stays silent when already read while background work clears", () => {
     setConversations([conv("conv_a", { background_activity_count: 1 })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       setConversations([conv("conv_a", { updated_at: 200 })]);
@@ -448,6 +470,7 @@ describe("useSoundAlerts", () => {
     useSessionNavigationPreferencesMock.mockReturnValue({ showGoalSessionMarkers: false });
     setConversations([conv("conv_a", { goal_state: "active" })]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     act(() => {
       isConversationUnseenMock.mockReturnValue(true);
@@ -462,35 +485,77 @@ describe("useSoundAlerts", () => {
     expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "done" });
   });
 
-  it("re-claims a still-awaiting row when the socket reconnects", () => {
+  it("cancels a pending done settle when the socket disconnects", () => {
+    setConversations([conv("conv_a")]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
+
+    act(() => {
+      isConversationUnseenMock.mockReturnValue(true);
+      setConversations([conv("conv_a", { updated_at: 200 })]);
+      rerender();
+    });
+    expect(claimFetchMock).not.toHaveBeenCalled();
+
+    act(() => {
+      socketConnectedRef.current = false;
+      for (const listener of socketStatusListeners) listener();
+    });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    expect(claimFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("detects no edges while awaiting the snapshot", () => {
+    setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+
+    act(() => {
+      setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
+      rerender();
+    });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+
+    expect(claimFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("re-baselines on the snapshot and claims still-awaiting rows once", () => {
     setConversations([conv("conv_a", { pending_elicitations_count: 1 })]);
     renderHook(() => useSoundAlerts());
     expect(claimFetchMock).not.toHaveBeenCalled();
 
+    emitFrame({ type: "snapshot", items: [] });
     act(() => {
-      socketConnectedRef.current = true;
-      for (const listener of socketStatusListeners) listener();
-    });
-    act(() => {
-      vi.advanceTimersByTime(1_500);
+      vi.advanceTimersByTime(50);
     });
 
     expect(claimFetchMock).toHaveBeenCalledTimes(1);
     expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
 
+    // A later snapshot is not a new baseline and claims nothing.
+    emitFrame({ type: "snapshot", items: [] });
     act(() => {
-      socketConnectedRef.current = false;
-      for (const listener of socketStatusListeners) listener();
-      socketConnectedRef.current = true;
-      for (const listener of socketStatusListeners) listener();
+      vi.advanceTimersByTime(50);
     });
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("detects an edge after the snapshot rebaseline", () => {
+    setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
+
     act(() => {
-      vi.advanceTimersByTime(1_500);
+      setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
+      rerender();
     });
 
-    // The reconnect re-sends the identical claim; the server drops the repeat.
-    expect(claimFetchMock).toHaveBeenCalledTimes(2);
-    expect(claimBodies()[1]).toEqual(claimBodies()[0]);
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
   });
 
   it("plays a sound_alert frame delivered to this connection", () => {
@@ -507,10 +572,11 @@ describe("useSoundAlerts", () => {
     expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
   });
 
-  it("rings locally when the server has no claim route", async () => {
+  it("drops a failed claim instead of ringing locally", async () => {
     claimFetchMock.mockResolvedValue({ status: 404 });
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());
+    settleInitialSnapshot();
 
     await act(async () => {
       setConversations([conv("conv_a", { updated_at: 200, status: "failed" })]);
@@ -518,8 +584,7 @@ describe("useSoundAlerts", () => {
     });
 
     expect(claimFetchMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledTimes(1);
-    expect(playLevelMock).toHaveBeenCalledWith("error", expect.anything(), expect.anything());
+    expect(playLevelMock).not.toHaveBeenCalled();
   });
 
   it("tells a native shell its own alert sounds are live", () => {
@@ -579,6 +644,38 @@ describe("useSoundAlerts", () => {
     });
 
     expect(getLegacyNativeNotificationSoundMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the migration marker unset when the shell reports no setting", async () => {
+    isNativeShellMock.mockReturnValue(true);
+    getLegacyNativeNotificationSoundMock.mockResolvedValue(null);
+
+    renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // An unavailable/failed read must not freeze the migration as done; the
+    // next mount retries.
+    expect(deviceStored()?.legacySoundMigrated).not.toBe(true);
+  });
+
+  it("marks the migration done for a setting object with null fields", async () => {
+    isNativeShellMock.mockReturnValue(true);
+    getLegacyNativeNotificationSoundMock.mockResolvedValue({ enabled: null, name: null });
+
+    renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // A successful read (an object) marks it done without changing the
+    // defaults, since neither field carries a value.
+    expect(deviceStored()).toMatchObject({
+      enabled: true,
+      systemSounds: {},
+      legacySoundMigrated: true,
+    });
   });
 
   it("does not advertise ringing while audio is locked, then re-announces once unlocked", () => {

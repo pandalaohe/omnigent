@@ -2289,6 +2289,7 @@ def _build_session_list_item(
     permissions_enabled: bool,
     pending_count: int,
     child_pending_count: int = 0,
+    pending_key: str | None = None,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
     activity_unverified_child_ids: set[str] | None = None,
@@ -2334,6 +2335,10 @@ def _build_session_list_item(
         this conversation's live direct children, summed per child with
         the same persisted-row fallback as ``pending_count`` and
         filtered to live child runners by the caller.
+    :param pending_key: Opaque key identifying this row's outstanding
+        prompts (own plus counted live children), from
+        :func:`_pending_elicitation_key`. ``None`` when none are
+        indexed.
     :param child_session_ids: Direct sub-agent children for this
         conversation, as returned by
         ``conversation_store.list_child_conversation_ids_by_parent()``.
@@ -2440,6 +2445,7 @@ def _build_session_list_item(
             else pending_count
         ),
         child_pending_elicitations_count=child_pending_count,
+        pending_elicitation_key=pending_key,
         workspace=conv.workspace,
         worktree=conv.worktree,
         git_branch=conv.git_branch,

@@ -79,9 +79,10 @@ def register(
     """
     Add or update one ringer connection for an owner.
 
-    A second ``hello`` on the same connection replaces its record, so a
-    device that re-announces itself (e.g. after toggling its switch)
-    updates rather than duplicates.
+    A second ``hello`` on the same connection updates its device fields
+    but keeps ``connected_at`` and ``last_activity`` — a device that
+    re-announces itself (e.g. after toggling its switch) is still the
+    same session, so its recency signal must survive the re-announce.
 
     :param owner: User id, or ``RESERVED_USER_LOCAL`` when there is none.
     :param conn_id: Server-minted id unique to the connection.
@@ -90,17 +91,24 @@ def register(
     :param can_ring: Whether the device may be chosen to play.
     :param send: Async callable delivering one frame over the connection.
     """
-    record = _Connection(
-        conn_id=conn_id,
-        device_id=device_id,
-        device_label=device_label,
-        can_ring=can_ring,
-        connected_at=time.monotonic(),
-        last_activity=None,
-        send=send,
-    )
     with _lock:
-        _connections.setdefault(owner, {})[conn_id] = record
+        records = _connections.setdefault(owner, {})
+        existing = records.get(conn_id)
+        if existing is not None:
+            existing.device_id = device_id
+            existing.device_label = device_label
+            existing.can_ring = can_ring
+            existing.send = send
+            return
+        records[conn_id] = _Connection(
+            conn_id=conn_id,
+            device_id=device_id,
+            device_label=device_label,
+            can_ring=can_ring,
+            connected_at=time.monotonic(),
+            last_activity=None,
+            send=send,
+        )
 
 
 def unregister(owner: str, conn_id: str) -> None:
