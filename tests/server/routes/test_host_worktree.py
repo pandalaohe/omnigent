@@ -10,6 +10,7 @@ without a live host process. Mirrors ``test_workspace_validation.py``.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -26,6 +27,7 @@ from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
     create_worktree_on_host,
+    folder_facts_on_host,
     remove_worktree_on_host,
 )
 
@@ -351,6 +353,7 @@ async def test_create_worktree_timeout_raises_unavailable(
     conn = registry.get("host_silent")
     assert conn is not None
 
+    started = time.monotonic()
     with pytest.raises(WorktreeHostUnavailableError) as exc:
         await create_worktree_on_host(
             host_registry=registry,
@@ -359,4 +362,43 @@ async def test_create_worktree_timeout_raises_unavailable(
             branch_name="x",
             base_branch=None,
         )
+    # The default timeout is read at call time; a definition-time binding
+    # would wait the real 150 s and blow this bound.
+    assert time.monotonic() - started < 1.0
     assert "did not respond" in exc.value.message
+
+
+async def test_folder_facts_deregister_fails_parked_future() -> None:
+    """Deregistering the host settles a parked folder-facts read at once.
+
+    Without the registry draining ``pending_folder_facts``, the awaiting
+    proxy would wait out its 15 s timeout after the host is already gone.
+    """
+    registry = HostRegistry()
+    registry.register(
+        host_id="host_ff_drop",
+        ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
+        hello=HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="ff-host",
+            project_code=True,
+        ),
+        owner=None,
+    )
+    conn = registry.get("host_ff_drop")
+    assert conn is not None
+
+    task = asyncio.create_task(
+        folder_facts_on_host(host_registry=registry, host_conn=conn, path="/repo")
+    )
+    while not conn.pending_folder_facts:
+        await asyncio.sleep(0)
+
+    started = time.monotonic()
+    assert registry.deregister("host_ff_drop") is True
+    with pytest.raises(WorktreeHostUnavailableError) as exc:
+        await asyncio.wait_for(task, timeout=1.0)
+    assert time.monotonic() - started < 1.0
+    assert "connection lost" in exc.value.message
+    assert conn.pending_folder_facts == {}

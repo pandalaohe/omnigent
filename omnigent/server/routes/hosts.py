@@ -2401,4 +2401,72 @@ def create_hosts_router(
 
         return {"object": "list", "data": worktrees}
 
+    @router.get("/hosts/{host_id}/folder-facts")
+    async def get_host_folder_facts(
+        request: Request,
+        host_id: str,
+        path: str = Query(...),
+    ) -> dict[str, Any]:
+        """
+        Read live git facts for a folder on a host.
+
+        Backs the project settings Code tab: branch, HEAD, dirty state,
+        credential-free remotes, and whether the host has a setup command
+        configured. Owner-scoped exactly like the worktrees endpoint. A
+        missing path or a non-repo folder is a 200 with ``exists`` /
+        ``is_repo`` false — not an error — because the dialog shows those
+        states as facts.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param path: Absolute folder path on the host to read facts for,
+            e.g. ``"/Users/alice/myrepo"``.
+        :returns: ``{"object": "folder_facts", exists, is_dir, is_repo,
+            toplevel, branch, head, detached, dirty, remotes,
+            setup_command_configured, error}``.
+        :raises HTTPException: 404 if host not found, 403 if not owned
+            by caller, 409 if the host is offline or unresponsive, 501 if
+            the host build predates the folder-facts frame, 400 on an
+            empty or NUL-containing path.
+        """
+        from omnigent.server.routes._host_worktree import (
+            FolderFactsUnsupportedError,
+            WorktreeProxyError,
+            folder_facts_on_host,
+        )
+
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        if not path.strip():
+            raise HTTPException(status_code=400, detail="path must not be empty")
+        if "\x00" in path:
+            raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+
+        try:
+            facts = await folder_facts_on_host(
+                host_registry=host_registry,
+                host_conn=conn,
+                path=path,
+            )
+        except FolderFactsUnsupportedError as exc:
+            raise HTTPException(status_code=501, detail=exc.message) from exc
+        except WorktreeProxyError as exc:
+            # Covers connection loss, timeout and a host-reported read
+            # failure — all "the host couldn't answer right now".
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+
+        return {"object": "folder_facts", **facts}
+
     return router

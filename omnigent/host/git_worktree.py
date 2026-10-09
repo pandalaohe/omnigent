@@ -1,8 +1,9 @@
 """Host-side git worktree operations for session-start worktrees.
 
 Runs ``git`` (via argv lists, never a shell) on the host in response to
-``host.create_worktree`` / ``host.remove_worktree`` frames. Branch names
-are validated against git ref-format rules before reaching argv. See
+``host.create_worktree`` / ``host.remove_worktree`` frames, and reads
+display-only facts for ``host.folder_facts``. Branch names are validated
+against git ref-format rules before reaching argv. See
 designs/SESSION_GIT_WORKTREE.md.
 """
 
@@ -12,15 +13,21 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, overload
+
+from omnigent.git_urls import redact_remote_url
 
 _logger = logging.getLogger(__name__)
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
 _GIT_TIMEOUT_S: float = 120.0
+
+# Folder facts are display-only; a hung git (huge repo, network
+# filesystem) must not hold the host's worker thread for minutes.
+_FOLDER_FACTS_GIT_TIMEOUT_S: float = 10.0
 
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
@@ -408,6 +415,166 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
             records
         )
     ]
+
+
+@dataclass
+class FolderFacts:
+    """Read-only git facts about one folder on the host.
+
+    A missing path, a file, a folder outside any work tree, a bare
+    repository, and a missing git binary are field values plus ``error``
+    text — the settings dialog renders them; nothing raises.
+
+    :param exists: Whether the path exists on the host.
+    :param is_dir: Whether the path is a directory.
+    :param is_repo: Whether the folder lies in a non-bare git work tree.
+    :param toplevel: The work tree's root as git reports it, e.g.
+        ``"/Users/alice/myrepo"``.
+    :param branch: The checked-out branch, e.g. ``"main"``. ``None`` when
+        HEAD is detached, unborn, or otherwise unresolvable.
+    :param head: Full sha of the checked-out commit, or ``None``.
+    :param detached: Whether HEAD points at a commit instead of a branch.
+    :param dirty: ``True`` when ``git status`` lists any change, ``False``
+        when clean, ``None`` when the status read timed out (unknown).
+    :param remotes: Fetch remotes in ``git remote -v`` order, e.g.
+        ``[{"name": "origin", "url": "https://h/x.git"}]``; URLs are
+        credential-free.
+    :param error: Why the facts are incomplete, or ``None`` when complete.
+    """
+
+    exists: bool
+    is_dir: bool
+    is_repo: bool
+    toplevel: str | None = None
+    branch: str | None = None
+    head: str | None = None
+    detached: bool = False
+    dirty: bool | None = None
+    remotes: list[dict[str, str]] = field(default_factory=list)
+    error: str | None = None
+
+
+def read_folder_facts(path: str) -> FolderFacts:
+    """Read display-only git facts for a folder on the host.
+
+    Every expected failure is a field value with ``error`` text, never an
+    exception: a missing path, a file, a folder outside a git work tree, a
+    bare repository, or a git binary that is not installed. Each git
+    command is bounded by :data:`_FOLDER_FACTS_GIT_TIMEOUT_S`; a timed-out
+    ``status`` leaves ``dirty`` unknown (``None``) instead of guessing.
+
+    :param path: Absolute directory path on the host, e.g.
+        ``"/Users/alice/myrepo"``.
+    :returns: The folder's :class:`FolderFacts`.
+    """
+    if not os.path.exists(path):
+        return FolderFacts(
+            exists=False,
+            is_dir=False,
+            is_repo=False,
+            error=f"path does not exist: {path}",
+        )
+    if not os.path.isdir(path):
+        return FolderFacts(
+            exists=True,
+            is_dir=False,
+            is_repo=False,
+            error=f"path is not a directory: {path}",
+        )
+    try:
+        top = _run_git(
+            ["rev-parse", "--show-toplevel"], cwd=path, timeout=_FOLDER_FACTS_GIT_TIMEOUT_S
+        )
+    except WorktreeError as exc:
+        return FolderFacts(exists=True, is_dir=True, is_repo=False, error=exc.message)
+    if top.returncode != 0:
+        stderr_lines = top.stderr.splitlines()
+        if any(line.startswith("fatal: not a git repository") for line in stderr_lines):
+            detail = f"not a git repository: {path}"
+        else:
+            detail = _git_error("git rev-parse --show-toplevel failed", top).message
+        return FolderFacts(exists=True, is_dir=True, is_repo=False, error=detail)
+
+    facts = FolderFacts(
+        exists=True,
+        is_dir=True,
+        is_repo=True,
+        toplevel=top.stdout.strip(),
+    )
+    try:
+        branch = _run_git(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=path,
+            timeout=_FOLDER_FACTS_GIT_TIMEOUT_S,
+        )
+        head = _run_git(["rev-parse", "HEAD"], cwd=path, timeout=_FOLDER_FACTS_GIT_TIMEOUT_S)
+    except WorktreeError as exc:
+        facts.error = exc.message
+    else:
+        if branch.returncode == 0:
+            name = branch.stdout.strip()
+            if name == "HEAD":
+                # Detached: rev-parse names the pseudo-branch HEAD.
+                facts.detached = True
+            elif name:
+                facts.branch = name
+        if head.returncode == 0:
+            facts.head = head.stdout.strip() or None
+        if facts.branch is None and not facts.detached and head.returncode == 0:
+            # A resolved HEAD that names no branch is detached in any shape.
+            facts.detached = True
+
+    try:
+        status = _run_git(
+            ["status", "--porcelain", "--untracked-files=normal"],
+            cwd=path,
+            timeout=_FOLDER_FACTS_GIT_TIMEOUT_S,
+        )
+    except WorktreeError as exc:
+        facts.error = facts.error or exc.message
+    else:
+        if status.returncode == 0:
+            facts.dirty = bool(status.stdout.strip())
+        else:
+            facts.error = facts.error or _git_error("git status failed", status).message
+
+    try:
+        remotes = _run_git(["remote", "-v"], cwd=path, timeout=_FOLDER_FACTS_GIT_TIMEOUT_S)
+    except WorktreeError as exc:
+        facts.error = facts.error or exc.message
+    else:
+        if remotes.returncode == 0:
+            facts.remotes = _parse_folder_remotes(remotes.stdout)
+        else:
+            facts.error = facts.error or _git_error("git remote -v failed", remotes).message
+    return facts
+
+
+def _parse_folder_remotes(stdout: str) -> list[dict[str, str]]:
+    """Parse the fetch lines of ``git remote -v`` into credential-free rows.
+
+    :param stdout: Command stdout, e.g.
+        ``"origin\\thttps://h/x.git (fetch)\\n"``.
+    :returns: ``{"name", "url"}`` dicts in print order, exact duplicates
+        removed; push and malformed lines are skipped.
+    """
+    remotes: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in stdout.splitlines():
+        if not line.endswith("(fetch)"):
+            continue
+        name, sep, rest = line.partition("\t")
+        if not sep:
+            continue
+        url = rest.removesuffix(" (fetch)").strip()
+        if not name or not url:
+            continue
+        url = redact_remote_url(url)
+        if (name, url) in seen:
+            continue
+        seen.add((name, url))
+        remotes.append({"name": name, "url": url})
+    return remotes
 
 
 def _local_branch_exists(repo_root: str, branch_name: str) -> bool:

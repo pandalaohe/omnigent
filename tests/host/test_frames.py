@@ -17,6 +17,8 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFolderFactsFrame,
+    HostFolderFactsResultFrame,
     HostFrameKind,
     HostFsRequestFrame,
     HostFsResultFrame,
@@ -3030,3 +3032,77 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostFolderFactsFrame(request_id="req_ff", path="/opt/work/omnigent/fork/myrepo"),
+        HostFolderFactsResultFrame(
+            request_id="req_ff",
+            status="ok",
+            exists=True,
+            is_dir=True,
+            is_repo=True,
+            toplevel="/opt/work/omnigent/fork/myrepo",
+            branch="main",
+            head="a" * 40,
+            detached=False,
+            dirty=True,
+            remotes=[{"name": "origin", "url": "https://git.example.test/x.git"}],
+            setup_command_configured=True,
+        ),
+        HostFolderFactsResultFrame(
+            request_id="req_ff",
+            status="ok",
+            exists=False,
+            error="path does not exist: /opt/work/missing",
+        ),
+        # A timed-out status read leaves dirty unknown (None).
+        HostFolderFactsResultFrame(
+            request_id="req_ff",
+            status="ok",
+            exists=True,
+            is_dir=True,
+            is_repo=True,
+            toplevel="/opt/work/omnigent/fork/myrepo",
+            dirty=None,
+            remotes=[],
+            error="git command timed out after 10s",
+        ),
+        HostFolderFactsResultFrame(request_id="req_ff", status="failed", error="boom"),
+    ],
+)
+def test_folder_facts_frames_round_trip(
+    frame: HostFolderFactsFrame | HostFolderFactsResultFrame,
+) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_hello_frame_project_code_capability_round_trip() -> None:
+    """The folder-facts capability advertised in hello survives the tunnel."""
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="new-host",
+        project_code=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.project_code is True
+
+
+def test_hello_frame_omitted_project_code_is_legacy_false() -> None:
+    """An older host that omits the capability reads as unsupported."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "older-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.project_code is False

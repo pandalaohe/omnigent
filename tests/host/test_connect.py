@@ -47,6 +47,8 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFolderFactsFrame,
+    HostFolderFactsResultFrame,
     HostFsRequestFrame,
     HostHarnessReadinessFrame,
     HostHarnessStartupFrame,
@@ -9425,6 +9427,52 @@ async def test_dispatch_create_worktree_passes_path_template_to_creator(
     assert isinstance(result, HostCreateWorktreeResultFrame)
     assert result.request_id == "req_wt_10"
     assert result.status == "ok"
+    _cleanup_host(host)
+
+
+# ── host.folder_facts dispatch ──────────────────────────
+
+
+async def test_dispatch_folder_facts_reports_configured_bool_not_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured setup command stays on the host; only its bool travels."""
+    from omnigent.host import connect as connect_module
+    from omnigent.host.git_worktree import FolderFacts
+
+    secret = "EXAMPLE_SETUP_COMMAND_TOKEN"
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {"host": {"post_bind_command": ["/bin/example-setup", f"--token={secret}"]}}
+        )
+    )
+    host = HostProcess(
+        HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        "http://localhost:8000",
+        config_path=config,
+    )
+    monkeypatch.setattr(
+        connect_module,
+        "read_folder_facts",
+        lambda path: FolderFacts(exists=True, is_dir=True, is_repo=True, toplevel=path),
+    )
+    ws = _FakeTunnel()
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        ws,
+        HostFolderFactsFrame(request_id="req_ff_11", path=str(tmp_path)),
+    )
+
+    assert len(ws.sent) == 1
+    encoded = ws.sent[0]
+    result = decode_host_frame(encoded)
+    assert isinstance(result, HostFolderFactsResultFrame)
+    assert result.request_id == "req_ff_11"
+    assert result.status == "ok"
+    assert result.setup_command_configured is True
+    assert secret not in encoded
+    assert "/bin/example-setup" not in encoded
     _cleanup_host(host)
 
 
