@@ -316,6 +316,9 @@ describe("ProjectCodeSection", () => {
     expect(screen.getByTestId("project-code-no-code-repo")).toHaveTextContent(
       "No code repository yet",
     );
+    expect(screen.getByTestId("project-code-no-code-repo")).toHaveTextContent(
+      "Mark one repository as Code we change; on hosts where it has a folder, new worktrees come from it and agents are told it is the code to change.",
+    );
 
     cleanup();
     getMock.mockResolvedValue(collaboration({ repositories: [repo({ role: "code" })] }));
@@ -482,7 +485,7 @@ describe("ProjectCodeSection", () => {
 
     await screen.findByTestId("project-code-root-h3");
     expect(screen.getByTestId("project-code-root-h3")).toHaveTextContent(
-      "New sessions open in: /opt/work/omnigent/legacy (legacy project default)",
+      "New sessions open in: /opt/work/omnigent/legacy (from the project's single-folder setting)",
     );
     expect(screen.getByTestId("project-code-root-h3")).toHaveTextContent(
       "New worktrees come from: /opt/work/omnigent/legacy",
@@ -516,6 +519,11 @@ describe("ProjectCodeSection", () => {
     renderSection();
 
     await screen.findByTestId("project-code-binding-facts-h1-web-setup");
+    expect(
+      screen.getByText(
+        "A command this host runs after a folder is saved (configured on the host).",
+      ),
+    ).toBeInTheDocument();
     const outcome = screen.getByTestId("project-code-binding-facts-h1-web-setup-outcome");
     expect(outcome).toHaveTextContent("Last run: ok");
     expect(outcome).toHaveTextContent("2026-10-09 12:34 UTC");
@@ -947,5 +955,124 @@ describe("ProjectCodeSection", () => {
     await waitFor(() => expect(screen.getByTestId("project-code-add-name")).toHaveValue("second"));
     expect(screen.getByTestId("project-code-add-remote")).toHaveValue("upstream");
     expect(screen.getByTestId("project-code-add-branch")).toHaveValue("second");
+  });
+
+  it("explains each code control with a true sentence", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent")]);
+    getHostRootsMock.mockResolvedValue({
+      roots: [
+        {
+          host_id: "h1",
+          workspace: "/opt/work/omnigent",
+          source: "entry",
+          checkout: "/opt/work/omnigent/fork/web",
+        },
+      ],
+      default_host_id: "h1",
+      default_host_reason: "single_root",
+    });
+    renderSection();
+
+    await screen.findByTestId("project-code-repo-web");
+    expect(screen.getByText(/The code this project works with/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Code we change: on hosts where it has a folder, new worktrees come from it and agents are told it is the code to change. Related code: on hosts where it has a folder, agents are told where it is, for reference.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("New worktrees branch from this when no base branch is given."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Where new sessions on this host start.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Where this repository is checked out on this host."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Sessions open in the project folder. If the project has no project folder on any host, sessions open in the code repository's folder. New worktrees come from the code repository's folder when this host has one.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Changes reach new sessions only. After a runner restart, resumed sessions receive the current repository information in their agent instructions.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says a related repository's default branch is unused", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo({ role: "related" })] }));
+    renderSection();
+
+    await screen.findByTestId("project-code-repo-web");
+    expect(screen.getByText("Kept for reference; sessions do not use it.")).toBeInTheDocument();
+  });
+
+  it("explains the add-form remote and name fields", async () => {
+    getMock.mockResolvedValue(collaboration());
+    renderSection();
+
+    await openAddForm();
+    await chooseFolder();
+    await screen.findByTestId("project-code-add-name");
+    expect(
+      screen.getByText("Which of the folder's remotes identifies this repository."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("A short name for this repository (letters, digits, . _ -)."),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a repository folder that equals the project folder only once", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent/fork/web")]);
+    renderSection();
+
+    await screen.findByTestId("project-code-binding-same-h1-web");
+    expect(screen.getByTestId("project-code-binding-same-h1-web")).toHaveTextContent(
+      "Same as the project folder",
+    );
+    expect(screen.getAllByText("/opt/work/omnigent/fork/web")).toHaveLength(1);
+  });
+
+  it("lets a folder with several remotes pick which one to use", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    getFactsMock.mockResolvedValue({
+      state: "ok",
+      facts: okFacts({
+        remotes: [
+          { name: "origin", url: "https://git.example.test/acme/web.git" },
+          { name: "upstream", url: "https://git.example.test/upstream/web.git" },
+        ],
+      }),
+    });
+    putRepoMock.mockResolvedValue(repo());
+    renderSection();
+
+    const select = await screen.findByTestId("project-code-binding-facts-h1-web-remote-select");
+    fireEvent.change(select, { target: { value: "upstream" } });
+    fireEvent.click(screen.getByTestId("project-code-binding-facts-h1-web-use-remote"));
+
+    await waitFor(() =>
+      expect(putRepoMock).toHaveBeenCalledWith("p_1", "web", {
+        remote_url: "https://git.example.test/upstream/web.git",
+        default_branch: "main",
+        context_manifest_path: ".agents/project/manifest.json",
+      }),
+    );
+  });
+
+  it("disables Add and shows the folder status when the folder is missing", async () => {
+    getMock.mockResolvedValue(collaboration());
+    getFactsMock.mockResolvedValue({
+      state: "ok",
+      facts: okFacts({ exists: false, is_dir: false, is_repo: false, branch: null, head: null }),
+    });
+    renderSection();
+
+    await openAddForm();
+    await chooseFolder();
+    await screen.findByText("folder missing");
+    expect(screen.getByTestId("project-code-add-submit")).toBeDisabled();
   });
 });

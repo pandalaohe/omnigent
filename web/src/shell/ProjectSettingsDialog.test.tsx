@@ -503,7 +503,7 @@ describe("ProjectSettingsDialog", () => {
     });
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
-    const warning = "Directory saved; post-bind command failed: boom (exit code 1)";
+    const warning = "Directory saved; host setup command failed: boom (exit code 1)";
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-entry-post-bind-h3")).toHaveTextContent(warning),
     );
@@ -1583,5 +1583,52 @@ describe("ProjectSettingsDialog", () => {
         },
       }),
     );
+  });
+
+  it("explains the real-project hosts list and points to the Code tab", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+
+    await screen.findByTestId("project-settings-directories-empty");
+    expect(screen.getByText("Agent, model and effort to use on each host.")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-directories-empty")).toHaveTextContent(
+      "No host defaults yet. Folders are set in the Code tab.",
+    );
+    expect(screen.getByTestId("project-settings-add-host")).toHaveTextContent("Add host defaults");
+
+    const codeTab = screen.getByRole("tab", { name: "Code" });
+    expect(codeTab).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(screen.getByTestId("project-settings-open-code-tab"));
+    expect(codeTab).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps the directory wording for a label-only folder", async () => {
+    renderDialog(null);
+
+    expect(screen.getByText("Per-host directories and session defaults")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-directories-empty")).toHaveTextContent(
+      "No project directory yet",
+    );
+  });
+
+  it("omits the no-directory line for a real project row without a folder", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { calling_defaults: { h1: { agent_id: "ag_1" } } },
+    });
+    renderDialog();
+
+    await screen.findByTestId("project-settings-entry-h1");
+    expect(screen.queryByTestId("project-settings-host-path-h1")).not.toBeInTheDocument();
+  });
+
+  it("explains the all-hosts fallback in plain words", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+
+    await screen.findByTestId("project-settings-all-hosts");
+    fireEvent.click(screen.getByTestId("project-settings-all-hosts"));
+    expect(screen.getByText("Used for hosts without their own defaults.")).toBeInTheDocument();
   });
 });

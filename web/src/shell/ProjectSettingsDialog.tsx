@@ -1179,7 +1179,7 @@ export function ProjectSettingsDialog({
             role="status"
             data-testid={`project-settings-entry-post-bind-${row.hostId}`}
           >
-            Directory saved; post-bind command {hookStatusLabel(rowOutcome.status)}
+            Directory saved; host setup command {hookStatusLabel(rowOutcome.status)}
             {rowOutcome.error ? `: ${rowOutcome.error}` : ""}
             {typeof rowOutcome.exit_code === "number" ? ` (exit code ${rowOutcome.exit_code})` : ""}
             {rowOutcome.output ? (
@@ -1490,16 +1490,18 @@ export function ProjectSettingsDialog({
             <Trash2Icon />
           </Button>
         </div>
-        <span
-          className={cn(
-            "min-w-0 truncate text-xs",
-            row.path ? "font-mono" : "text-muted-foreground",
-          )}
-          title={row.path || undefined}
-          data-testid={`project-settings-host-path-${row.hostId}`}
-        >
-          {row.path || "No directory"}
-        </span>
+        {(row.path || !isRealProject) && (
+          <span
+            className={cn(
+              "min-w-0 truncate text-xs",
+              row.path ? "font-mono" : "text-muted-foreground",
+            )}
+            title={row.path || undefined}
+            data-testid={`project-settings-host-path-${row.hostId}`}
+          >
+            {row.path || "No directory"}
+          </span>
+        )}
         <span
           className="min-w-0 max-w-full truncate self-start rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
           title={summary}
@@ -1564,9 +1566,7 @@ export function ProjectSettingsDialog({
       className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
       data-testid="project-settings-all-hosts-detail"
     >
-      <p className="text-sm text-muted-foreground">
-        The legacy fallback for hosts without their own set.
-      </p>
+      <p className="text-sm text-muted-foreground">Used for hosts without their own defaults.</p>
       <Field label="Agent" hint="Default agent / harness for new sessions">
         <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
           <AgentHarnessPicker
@@ -1746,7 +1746,9 @@ export function ProjectSettingsDialog({
             <div className="flex min-w-0 flex-col">
               <span className="font-medium text-ui">Hosts</span>
               <span className="text-muted-foreground text-sm">
-                Per-host directories and session defaults
+                {isRealProject
+                  ? "Agent, model and effort to use on each host."
+                  : "Per-host directories and session defaults"}
               </span>
             </div>
             <div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,15rem)_minmax(0,1fr)]">
@@ -1759,7 +1761,22 @@ export function ProjectSettingsDialog({
                     className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
                     data-testid="project-settings-directories-empty"
                   >
-                    No project directory yet
+                    {isRealProject ? (
+                      <>
+                        No host defaults yet. Folders are set in the{" "}
+                        <button
+                          type="button"
+                          className="underline"
+                          data-testid="project-settings-open-code-tab"
+                          onClick={() => setActiveTab("code")}
+                        >
+                          Code tab
+                        </button>
+                        .
+                      </>
+                    ) : (
+                      "No project directory yet"
+                    )}
                   </p>
                 )}
                 {hostRows.map((row) =>
@@ -1776,7 +1793,7 @@ export function ProjectSettingsDialog({
                 {isCompact && selectedRowId === ALL_HOSTS && renderAllHostsDetail()}
                 {addableHosts.length > 0 && (
                   // A menu-shaped Select: its value never changes, so picking a
-                  // host adds a row and the trigger keeps reading "Add host".
+                  // host adds a defaults row and the trigger keeps its label.
                   <Select
                     value={NONE}
                     onValueChange={(value) => {
@@ -1786,10 +1803,10 @@ export function ProjectSettingsDialog({
                     disabled={isLoading || saving}
                   >
                     <SelectTrigger className="w-full" data-testid="project-settings-add-host">
-                      <SelectValue placeholder="Add host" />
+                      <SelectValue placeholder="Add host defaults" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value={NONE}>Add host</SelectItem>
+                      <SelectItem value={NONE}>Add host defaults</SelectItem>
                       {addableHosts.map((host) => (
                         <SelectItem key={host.host_id} value={host.host_id}>
                           {host.name}

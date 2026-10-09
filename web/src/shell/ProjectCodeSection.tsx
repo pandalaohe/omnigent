@@ -123,6 +123,7 @@ function FolderFactsLine({
     queryFn: () => getHostFolderFacts(hostId, path),
     retry: false,
   });
+  const [chosenRemoteName, setChosenRemoteName] = useState<string | null>(null);
 
   if (factsQuery.isPending) {
     return (
@@ -163,6 +164,8 @@ function FolderFactsLine({
 
   const facts = result.facts;
   const remote = defaultRemote(facts.remotes);
+  const chosenRemote =
+    facts.remotes.find((candidate) => candidate.name === chosenRemoteName) ?? remote;
   const remoteMismatch =
     repository !== undefined &&
     repository.remote_url !== "" &&
@@ -182,22 +185,43 @@ function FolderFactsLine({
           None of this folder&apos;s remote URLs matches the repository URL.
         </p>
       )}
-      {onUseRemote && remote && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className={mutedButtonClassName}
-          data-testid={`${testId}-use-remote`}
-          onClick={() => onUseRemote(remote.url)}
-          disabled={disabled}
-        >
-          Use this folder&apos;s remote
-        </Button>
+      {onUseRemote && chosenRemote && (
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {facts.remotes.length > 1 && (
+            <select
+              className="rounded-md border bg-transparent px-2 py-1 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              data-testid={`${testId}-remote-select`}
+              aria-label="Remote to use"
+              value={chosenRemote.name}
+              onChange={(event) => setChosenRemoteName(event.target.value)}
+              disabled={disabled}
+            >
+              {facts.remotes.map((candidate) => (
+                <option key={candidate.name} value={candidate.name}>
+                  {candidate.name}
+                </option>
+              ))}
+            </select>
+          )}
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className={mutedButtonClassName}
+            data-testid={`${testId}-use-remote`}
+            onClick={() => onUseRemote(chosenRemote.url)}
+            disabled={disabled}
+          >
+            Use this folder&apos;s remote
+          </Button>
+        </div>
       )}
       {facts.setup_command_configured && onRunAgain && (
         <div className="space-y-1" data-testid={`${testId}-setup`}>
           <p className="text-sm font-medium">Host setup command</p>
+          <p className="text-sm text-muted-foreground">
+            A command this host runs after a folder is saved (configured on the host).
+          </p>
           <p className="text-sm text-muted-foreground" data-testid={`${testId}-setup-outcome`}>
             {outcome ? (
               <>
@@ -534,7 +558,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
   const canSubmitAdd =
     addMode === "address"
       ? addName.trim().length > 0
-      : addFacts?.state === "ok" && addFolder.trim().length > 0 && !!effectiveAddHostId;
+      : addFacts?.state === "ok" &&
+        addFacts.facts.exists &&
+        addFacts.facts.is_dir &&
+        addFolder.trim().length > 0 &&
+        !!effectiveAddHostId;
 
   const submitAdd = () => {
     const name =
@@ -640,6 +668,9 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
             <div className="min-w-0 flex-1 basis-48">
               <p className="text-sm font-medium">Project folder</p>
+              <p className="text-sm text-muted-foreground">
+                Where new sessions on this host start.
+              </p>
               {entry ? (
                 <p
                   className="truncate font-mono text-sm text-muted-foreground"
@@ -743,23 +774,27 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
               <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
                 <div className="min-w-0 flex-1 basis-48">
                   <p className="text-sm font-medium">{repository.name} folder</p>
+                  <p className="text-sm text-muted-foreground">
+                    Where this repository is checked out on this host.
+                  </p>
                   {binding ? (
-                    <p
-                      className="truncate font-mono text-sm text-muted-foreground"
-                      title={binding.workspace}
-                    >
-                      {binding.workspace}
-                    </p>
+                    sameAsEntry ? (
+                      <p
+                        className="text-sm text-muted-foreground"
+                        data-testid={`project-code-binding-same-${hostId}-${repository.name}`}
+                      >
+                        Same as the project folder
+                      </p>
+                    ) : (
+                      <p
+                        className="truncate font-mono text-sm text-muted-foreground"
+                        title={binding.workspace}
+                      >
+                        {binding.workspace}
+                      </p>
+                    )
                   ) : (
                     <p className="text-sm text-muted-foreground">No folder set</p>
-                  )}
-                  {sameAsEntry && (
-                    <p
-                      className="text-sm text-muted-foreground"
-                      data-testid={`project-code-binding-same-${hostId}-${repository.name}`}
-                    >
-                      Same as the project folder
-                    </p>
                   )}
                 </div>
                 <div className="flex shrink-0 gap-1">
@@ -891,7 +926,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           >
             <p>
               New sessions open in: {root.workspace}
-              {root.source === "config" ? " (legacy project default)" : ""}
+              {root.source === "config" ? " (from the project's single-folder setting)" : ""}
             </p>
             <p>New worktrees come from: {root.checkout ?? root.workspace}</p>
           </div>
@@ -919,7 +954,10 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         <p className="text-sm text-muted-foreground" data-testid="project-code-immediate-note">
           Changes here save immediately.
         </p>
-        <p className="text-sm text-muted-foreground">Changes reach new sessions only.</p>
+        <p className="text-sm text-muted-foreground">
+          Changes reach new sessions only. After a runner restart, resumed sessions receive the
+          current repository information in their agent instructions.
+        </p>
       </div>
 
       {actionError && (
@@ -930,6 +968,10 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
 
       <section className="min-w-0 space-y-3" data-testid="project-code-repositories">
         <h3 className="font-medium text-ui">Repositories</h3>
+        <p className="text-sm text-muted-foreground">
+          The code this project works with. Each repository is a git project; one is the code your
+          sessions change.
+        </p>
         {repositories.length === 0 && (
           <p className="text-sm text-muted-foreground">No repositories yet.</p>
         )}
@@ -938,7 +980,8 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             className="text-sm text-amber-700 dark:text-amber-400"
             data-testid="project-code-no-code-repo"
           >
-            No code repository yet
+            No code repository yet. Mark one repository as Code we change; on hosts where it has a
+            folder, new worktrees come from it and agents are told it is the code to change.
           </p>
         )}
         {repositories.map((repository) => (
@@ -974,6 +1017,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             <div className="flex min-w-0 flex-wrap gap-4">
               <label className="space-y-1 text-sm">
                 <span className="block font-medium">Role</span>
+                <span className="block text-muted-foreground">
+                  Code we change: on hosts where it has a folder, new worktrees come from it and
+                  agents are told it is the code to change. Related code: on hosts where it has a
+                  folder, agents are told where it is, for reference.
+                </span>
                 <select
                   className={inputClassName}
                   data-testid={`project-code-repo-role-${repository.name}`}
@@ -990,6 +1038,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
               </label>
               <label className="min-w-0 flex-1 space-y-1 text-sm">
                 <span className="block font-medium">Default branch</span>
+                <span className="block text-muted-foreground">
+                  {repository.role === "code"
+                    ? "New worktrees branch from this when no base branch is given."
+                    : "Kept for reference; sessions do not use it."}
+                </span>
                 <input
                   className={inputClassName}
                   data-testid={`project-code-repo-branch-${repository.name}`}
@@ -1125,10 +1178,19 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 )}
                 {addFacts?.state === "ok" && (
                   <>
+                    <p
+                      className="text-sm text-muted-foreground"
+                      data-testid="project-code-add-facts"
+                    >
+                      {folderFactsText(addFacts.facts)}
+                    </p>
                     <div className="space-y-1">
                       <label htmlFor={`${formId}-add-remote`} className="block font-medium">
                         Git remote
                       </label>
+                      <p className="text-sm text-muted-foreground">
+                        Which of the folder&apos;s remotes identifies this repository.
+                      </p>
                       <select
                         id={`${formId}-add-remote`}
                         className={inputClassName}
@@ -1162,6 +1224,9 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                       <label htmlFor={`${formId}-add-name`} className="block font-medium">
                         Name
                       </label>
+                      <p className="text-sm text-muted-foreground">
+                        A short name for this repository (letters, digits, . _ -).
+                      </p>
                       <input
                         id={`${formId}-add-name`}
                         className={inputClassName}
@@ -1310,8 +1375,9 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           </Button>
         </div>
         <p className="text-sm text-muted-foreground">
-          Sessions open in the project folder; new worktrees come from the code repository&apos;s
-          folder when this host has one.
+          Sessions open in the project folder. If the project has no project folder on any host,
+          sessions open in the code repository&apos;s folder. New worktrees come from the code
+          repository&apos;s folder when this host has one.
         </p>
         {cardHostIds.map(renderHostCard)}
         {addableHosts.length > 0 && (
