@@ -1,7 +1,8 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readPanelSizePreference } from "@/lib/panelSizePreferences";
+import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWidenWorkspaceForContent } from "@/lib/workspacePanelPreferences";
 import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizableInlinePanel";
 
 // useResizableInlinePanel keeps its device-wide width in a module-level store
@@ -187,6 +188,181 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     rerender({ reserved: reservedPx });
     // chat = viewport - sidebar - gap - panel.
     expect(1000 - reservedPx - 8 - result.current.panelWidth).toBeGreaterThanOrEqual(480);
+  });
+});
+
+describe("useResizableInlinePanel browser/file width", () => {
+  // The rail keeps a second, independent width while it shows a browser tab or
+  // an opened file. `reservedPx` is 320 (the open left sidebar), so the wide
+  // default is max(normal, round((2000 - 320) / 2)) = max(normal, 840).
+  it("uses the wide default while wide content shows and restores the normal width after", () => {
+    const { result, rerender } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: false } },
+    );
+
+    expect(result.current.panelWidth).toBe(600);
+
+    rerender({ wide: true });
+    expect(result.current.panelWidth).toBe(840);
+
+    rerender({ wide: false });
+    expect(result.current.panelWidth).toBe(600);
+  });
+
+  it("keeps the two widths independent across keyboard steps", () => {
+    const { result, rerender } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: false } },
+    );
+
+    rerender({ wide: true });
+    expect(result.current.panelWidth).toBe(840);
+
+    act(() =>
+      result.current.handleProps.onKeyDown({
+        key: "ArrowLeft",
+        preventDefault: () => {},
+      } as React.KeyboardEvent),
+    );
+    expect(result.current.panelWidth).toBe(860);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(860);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+
+    rerender({ wide: false });
+    expect(result.current.panelWidth).toBe(600);
+
+    // A step in normal mode writes only the normal width.
+    act(() =>
+      result.current.handleProps.onKeyDown({
+        key: "ArrowLeft",
+        preventDefault: () => {},
+      } as React.KeyboardEvent),
+    );
+    expect(result.current.panelWidth).toBe(620);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBe(620);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(860);
+
+    // Returning to wide content restores the remembered wide width.
+    rerender({ wide: true });
+    expect(result.current.panelWidth).toBe(860);
+  });
+
+  it("never starts the wide mode narrower than the normal width", () => {
+    writePanelSizePreference("inlinePanelWidthPx", 1000);
+    resetWidthStoreForTesting();
+
+    const { result } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    expect(result.current.panelWidth).toBe(1000);
+  });
+
+  it("caps the wide width at the chat floor without overwriting the preference", () => {
+    setInnerWidth(1512);
+    writePanelSizePreference("inlinePanelWideWidthPx", 900);
+    resetWidthStoreForTesting();
+
+    const { result } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    // 1512 - 320 sidebar - 480 chat - 8 gap = 704 ceiling; the saved 900 is
+    // squeezed at render time but left intact on disk.
+    expect(result.current.panelWidth).toBe(704);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(900);
+  });
+
+  it("falls back to the normal width when the setting is off and reacts when it turns on", () => {
+    writeWidenWorkspaceForContent(false);
+
+    const { result } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    expect(result.current.panelWidth).toBe(600);
+
+    act(() => writeWidenWorkspaceForContent(true));
+    expect(result.current.panelWidth).toBe(840);
+  });
+
+  it("persists only the wide width when dragged in wide mode", () => {
+    const { result } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 })));
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+
+    // 2000 - 1000 = 1000, within the 1192 sidebar-aware ceiling.
+    expect(result.current.panelWidth).toBe(1000);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(1000);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+  });
+
+  it("keeps a drag in wide mode when the rail switches to normal content mid-drag", async () => {
+    const { result, rerender } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 })));
+    // Let the coalescing rAF flush run before the mode flips.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() => resolve());
+        }),
+    );
+    rerender({ wide: false });
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+
+    // The width is written to the wide store, never the normal one.
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(1000);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+  });
+
+  it("still writes the wide width when mouseup arrives before the queued frame", () => {
+    const { result, rerender } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, undefined, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1000 })));
+    // Release with the move still queued: stop()'s flush must still target wide.
+    rerender({ wide: false });
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(1000);
+    expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
+  });
+
+  it("keeps the comments floor in wide mode without overwriting the saved wide width", () => {
+    writePanelSizePreference("inlinePanelWideWidthPx", 500);
+    resetWidthStoreForTesting();
+
+    const { result } = renderHook(
+      ({ wide }) => useResizableInlinePanel(SESSION, 720, 320, true, wide),
+      { initialProps: { wide: true } },
+    );
+
+    // The 720 comments floor wins over the saved 500, which stays on disk.
+    expect(result.current.panelWidth).toBe(720);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(500);
   });
 });
 

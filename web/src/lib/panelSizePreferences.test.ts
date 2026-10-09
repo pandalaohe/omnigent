@@ -29,6 +29,33 @@ describe("panelSizePreferences", () => {
     });
   });
 
+  it("round-trips the wide inline panel width alongside the others", () => {
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    writePanelSizePreference("inlinePanelWideWidthPx", 840);
+
+    // The browser/file width is its own field; writing it must not disturb the
+    // normal inline width.
+    expect(readPanelSizePreferences()).toEqual({
+      inlinePanelWidthPx: 420,
+      inlinePanelWideWidthPx: 840,
+    });
+  });
+
+  it("drops an invalid wide width while valid siblings survive", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ pushPanelWidthPx: 700, inlinePanelWideWidthPx: -5 }),
+    );
+    expect(readPanelSizePreferences()).toEqual({ pushPanelWidthPx: 700 });
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBeNull();
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ inlinePanelWidthPx: 500, inlinePanelWideWidthPx: "x" }),
+    );
+    expect(readPanelSizePreferences()).toEqual({ inlinePanelWidthPx: 500 });
+  });
+
   it("ignores malformed JSON", () => {
     // Corrupt localStorage should not break app boot.
     localStorage.setItem(STORAGE_KEY, "}{not json");

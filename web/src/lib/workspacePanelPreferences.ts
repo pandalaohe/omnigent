@@ -90,3 +90,42 @@ export function readDefaultWorkspacePanelOpen(): boolean {
 export function writeDefaultWorkspacePanelOpen(open: boolean): void {
   writeWorkspacePanelDefault(open ? "open" : "collapsed");
 }
+
+const WIDEN_FOR_CONTENT_KEY = "omnigent:workspace-panel-widen-for-content";
+export const WIDEN_FOR_CONTENT_CHANGED_EVENT = "omnigent:workspace-panel-widen-for-content-changed";
+
+/** Whether the rail uses its own width while it shows a browser tab or an opened file. On by default. */
+export function readWidenWorkspaceForContent(): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    return window.localStorage.getItem(WIDEN_FOR_CONTENT_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+/** Persist whether the rail uses its own width for browser/file content. The default clears the key. */
+export function writeWidenWorkspaceForContent(enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (enabled) {
+      window.localStorage.removeItem(WIDEN_FOR_CONTENT_KEY);
+    } else {
+      window.localStorage.setItem(WIDEN_FOR_CONTENT_KEY, "0");
+    }
+  } catch {
+    // localStorage quota or access errors shouldn't break settings.
+  }
+  window.dispatchEvent(new Event(WIDEN_FOR_CONTENT_CHANGED_EVENT));
+}
+
+/** Subscribe to widen-for-content changes in this tab and from other tabs. */
+export function subscribeWidenWorkspaceForContent(callback: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(WIDEN_FOR_CONTENT_CHANGED_EVENT, callback);
+  window.addEventListener("storage", callback);
+  return () => {
+    window.removeEventListener(WIDEN_FOR_CONTENT_CHANGED_EVENT, callback);
+    window.removeEventListener("storage", callback);
+  };
+}

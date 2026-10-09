@@ -934,6 +934,8 @@ export function AppShell() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
+  // The desktop rail takes its own width while WorkspacePanel reports a browser tab or an opened file.
+  const [railShowsWideContent, setRailShowsWideContent] = useState(false);
   const {
     panelWidth: inlinePanelWidth,
     handleProps: inlinePanelHandleProps,
@@ -943,6 +945,7 @@ export function AppShell() {
     inlinePanelMinWidth,
     sidebarOpen ? sidebarWidth : 0,
     rootSessionResolved,
+    !mobileViewport && railShowsWideContent,
   );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
@@ -2699,6 +2702,7 @@ export function AppShell() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
+                    onWideContentChange={setRailShowsWideContent}
                   />
                 )}
                 {(goalFrameState === "active" || goalFrameState === "paused") && (

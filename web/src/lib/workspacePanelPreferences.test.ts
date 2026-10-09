@@ -1,14 +1,18 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   normalizeWorkspacePanelDefault,
   readDefaultWorkspacePanelOpen,
+  readWidenWorkspaceForContent,
   readWorkspacePanelDefault,
+  subscribeWidenWorkspaceForContent,
   WORKSPACE_PANEL_DEFAULT,
   writeDefaultWorkspacePanelOpen,
+  writeWidenWorkspaceForContent,
   writeWorkspacePanelDefault,
 } from "./workspacePanelPreferences";
 
 const STORAGE_KEY = "omnigent:default-workspace-panel";
+const WIDEN_KEY = "omnigent:workspace-panel-widen-for-content";
 
 afterEach(() => {
   localStorage.clear();
@@ -41,6 +45,33 @@ describe("workspacePanelPreferences — read/write", () => {
     expect(readWorkspacePanelDefault()).toBe("open");
     expect(readDefaultWorkspacePanelOpen()).toBe(true);
     expect(localStorage.getItem(STORAGE_KEY)).toBe("open");
+  });
+});
+
+describe("workspacePanelPreferences — widen for content", () => {
+  it("defaults on and round-trips through storage", () => {
+    expect(readWidenWorkspaceForContent()).toBe(true);
+    expect(localStorage.getItem(WIDEN_KEY)).toBeNull();
+
+    writeWidenWorkspaceForContent(false);
+    expect(readWidenWorkspaceForContent()).toBe(false);
+    expect(localStorage.getItem(WIDEN_KEY)).toBe("0");
+
+    writeWidenWorkspaceForContent(true);
+    expect(readWidenWorkspaceForContent()).toBe(true);
+    expect(localStorage.getItem(WIDEN_KEY)).toBeNull();
+  });
+
+  it("notifies subscribers on write and stops after unsubscribe", () => {
+    const listener = vi.fn();
+    const unsubscribe = subscribeWidenWorkspaceForContent(listener);
+
+    writeWidenWorkspaceForContent(false);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    writeWidenWorkspaceForContent(true);
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 });
 
