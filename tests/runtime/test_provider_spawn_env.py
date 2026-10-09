@@ -1841,6 +1841,101 @@ def test_codex_undismissed_config_provider_routes_via_detection(
     assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "Databricks"
 
 
+# Host ~/.codex/config.toml shapes a provider-switcher tool may write; none is
+# offered as its own cli-config provider, so a codex subscription stands for them.
+_HOST_ROUTED_CODEX_CONFIGS = {
+    "relay-rides-login": """
+model_provider = "relay"
+
+[model_providers.relay]
+name = "relay"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+""",
+    "profile-selected-router": """
+profile = "work"
+
+[profiles.work]
+model_provider = "router"
+
+[model_providers.router]
+name = "router"
+base_url = "http://127.0.0.1:4000/v1"
+""",
+    "env-key": """
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "https://gateway.example.com/v1"
+env_key = "GATEWAY_API_KEY"
+""",
+    "builtin-ollama": 'model_provider = "ollama"\n',
+}
+
+
+def _write_host_codex(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, config_toml: str
+) -> None:
+    """Write a host ``~/.codex`` with *config_toml* and an API-key ``auth.json``."""
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = config_home / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(config_toml)
+    (codex_dir / "auth.json").write_text('{"OPENAI_API_KEY": "sk-host-key"}')
+
+
+@pytest.mark.parametrize("configured", [True, False], ids=["configured", "detected"])
+@pytest.mark.parametrize("shape", sorted(_HOST_ROUTED_CODEX_CONFIGS))
+def test_codex_subscription_follows_host_codex_config(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, shape: str, configured: bool
+) -> None:
+    """A codex subscription follows the host Codex CLI's own default provider.
+
+    Switcher tools route the CLI by rewriting ~/.codex: a relay riding the
+    auth.json key, a profile, an env_key or built-in provider. An ``openai`` pin
+    sends the host's credential to api.openai.com instead.
+    """
+    _write_host_codex(config_home, monkeypatch, _HOST_ROUTED_CODEX_CONFIGS[shape])
+    if configured:
+        _write_config(
+            config_home,
+            {
+                "providers": {
+                    "codex-sub": {"kind": "subscription", "cli": "codex", "default": True}
+                }
+            },
+        )
+    spec = _make_spec(harness="codex")
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_CODEX_MODEL_PROVIDER" not in env
+    assert "HARNESS_CODEX_GATEWAY" not in env
+
+
+def test_codex_subscription_over_config_provider_keeps_openai_pin(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Choosing the subscription over the offered config provider pins ``openai``.
+
+    The config default is offered as its own cli-config provider, so a
+    subscription default means the Codex login, not that provider.
+    """
+    _write_host_codex(config_home, monkeypatch, _DISMISSIBLE_CODEX_CONFIG_TOML)
+    _write_config(
+        config_home,
+        {"providers": {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}}},
+    )
+    spec = _make_spec(harness="codex")
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
+
+
 # ── Kimi Code CLI spawn-env ────────────────────────────────────────────────
 
 

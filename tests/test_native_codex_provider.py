@@ -878,6 +878,81 @@ def test_spec_subscription_logged_in_is_not_login_required(
     assert launch.login_required is False
 
 
+_RELAY_TABLE_TOML = """
+[model_providers.relay]
+name = "relay"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"""
+
+
+def _write_host_codex_config(home: Path, config_toml: str) -> None:
+    """Write ``~/.codex/config.toml`` beside a logged-in ``auth.json``."""
+    _write_codex_login(home, logged_in=True)
+    (home / ".codex" / "config.toml").write_text(config_toml, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "config_toml",
+    [
+        'model_provider = "relay"\n' + _RELAY_TABLE_TOML,
+        'profile = "work"\n[profiles.work]\nmodel_provider = "relay"\n' + _RELAY_TABLE_TOML,
+    ],
+    ids=["relay", "profile"],
+)
+def test_subscription_default_follows_host_codex_config(_isolated: Path, config_toml: str) -> None:
+    """A subscription default leaves the host config's relay provider in charge."""
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+    _write_host_codex_config(_isolated, config_toml)
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == []
+    assert launch.login_required is False
+
+
+def test_spec_subscription_follows_host_codex_config(_isolated: Path) -> None:
+    """A spec-named subscription leaves the host config's relay provider in charge."""
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+    _write_host_codex_config(_isolated, 'model_provider = "relay"\n' + _RELAY_TABLE_TOML)
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.config_overrides == []
+
+
+def test_subscription_default_follows_terminal_profile(_isolated: Path) -> None:
+    """A terminal ``--profile`` selecting a relay is not overridden by an openai pin."""
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+    _write_host_codex_config(
+        _isolated, '[profiles.work]\nmodel_provider = "relay"\n' + _RELAY_TABLE_TOML
+    )
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "work"])
+
+    assert launch.config_overrides == []
+
+
+def test_subscription_default_over_config_provider_keeps_openai_pin(_isolated: Path) -> None:
+    """Choosing the subscription over the offered config provider pins ``openai``."""
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+    _write_host_codex_config(
+        _isolated,
+        'model_provider = "Databricks"\n'
+        "[model_providers.Databricks]\n"
+        'base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"\n'
+        "[model_providers.Databricks.auth]\n"
+        'command = "jq"\n',
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == ['model_provider="openai"']
+
+
 def test_default_provider_without_credential_logged_out_marks_login_required(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
