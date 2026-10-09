@@ -2,6 +2,11 @@ import type { Conversation } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  DEFAULT_FAVORITES_SECTION_ID,
+  DEFAULT_OTHER_PROJECTS_SECTION_ID,
+  DEFAULT_OTHER_SESSIONS_SECTION_ID,
+} from "@/lib/sidebarLayout";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -89,13 +94,77 @@ export function setLegacyPinnedConversationId(id: string, pinned: boolean): void
 
 // Titles of sidebar sections the user has collapsed, e.g. ["Archived"].
 // Keyed by display title — stable identifiers for these fixed groups.
+// Legacy: read once to migrate onto COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY
+// (titles are no longer stable now that user sections are renamable).
 export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sidebar-sections";
+
+// Ids of the sidebar sections the user has collapsed. Device-local (never
+// synced): another device's layout has its own section ids.
+export const COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY = "omnigent:collapsed-sidebar-section-ids";
 
 // Names of project folders the user has expanded. Project folders default to
 // COLLAPSED (so the sidebar stays short as project count grows), so this is
 // the inverse of the fixed-section collapse set: a project shows its rows only
 // when its name is present here.
 export const EXPANDED_PROJECT_SECTIONS_STORAGE_KEY = "omnigent:expanded-project-sections";
+
+// Default collapse state: every section starts expanded. Once the user toggles
+// any header, the stored array (even an empty one) becomes the preference and
+// persists across reloads.
+const DEFAULT_COLLAPSED_SIDEBAR_SECTION_IDS: string[] = [];
+
+// The legacy collapse preference was keyed by section title; the default
+// sections' stable ids replace those titles.
+const LEGACY_COLLAPSED_SECTION_IDS: Record<string, string> = {
+  Pinned: DEFAULT_FAVORITES_SECTION_ID,
+  Projects: DEFAULT_OTHER_PROJECTS_SECTION_ID,
+  Chats: DEFAULT_OTHER_SESSIONS_SECTION_ID,
+};
+
+export function readCollapsedSidebarSectionIds(): string[] {
+  if (typeof window === "undefined") return DEFAULT_COLLAPSED_SIDEBAR_SECTION_IDS;
+  try {
+    const raw = window.localStorage.getItem(COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY);
+    if (raw !== null) {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return DEFAULT_COLLAPSED_SIDEBAR_SECTION_IDS;
+      return parsed.filter((value): value is string => typeof value === "string");
+    }
+    // First read on this device: migrate the legacy titles, write the new key
+    // (the legacy key stays in place for older clients).
+    const ids = readCollapsedSidebarSections()
+      .map((title) => LEGACY_COLLAPSED_SECTION_IDS[title])
+      .filter((id): id is string => id !== undefined);
+    writeCollapsedSidebarSectionIds(ids);
+    return ids;
+  } catch {
+    // Same contract as pins: corrupt storage means "back to defaults",
+    // never a broken sidebar.
+    return DEFAULT_COLLAPSED_SIDEBAR_SECTION_IDS;
+  }
+}
+
+export function writeCollapsedSidebarSectionIds(ids: string[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(COLLAPSED_SIDEBAR_SECTION_IDS_STORAGE_KEY, JSON.stringify(ids));
+  } catch {
+    // Collapse state is a local navigation preference; losing it is fine.
+  }
+}
+
+function readCollapsedSidebarSections(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is string => typeof value === "string");
+  } catch {
+    return [];
+  }
+}
 
 // Snapshot of the active chat's updated_at at the moment the user
 // entered it. Used as the sort key for the active row so subsequent

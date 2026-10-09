@@ -46,8 +46,17 @@ function persistableLayout(layout: SidebarLayout): SidebarLayout {
   };
 }
 
-function writeSidebarLayout(next: SidebarLayout): void {
-  const value = persistableLayout(normalizeLayout(next));
+/** Apply an edit to the layout as it is now, not to a snapshot captured earlier. */
+export type SidebarLayoutUpdater = (current: SidebarLayout) => SidebarLayout;
+
+/** Save a whole layout, or an updater run against the freshly read stored value. */
+export type SaveSidebarLayout = (next: SidebarLayout | SidebarLayoutUpdater) => void;
+
+function writeSidebarLayout(next: SidebarLayout | SidebarLayoutUpdater): void {
+  // localStorage is the synchronous truth: an updater re-reads it so an edit
+  // that landed while its caller awaited isn't clobbered by a stale snapshot.
+  const current = typeof next === "function" ? next(readSidebarLayout()) : next;
+  const value = persistableLayout(normalizeLayout(current));
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
   } catch {
@@ -59,7 +68,7 @@ function writeSidebarLayout(next: SidebarLayout): void {
 
 export function useSidebarLayout(): {
   layout: SidebarLayout;
-  saveLayout: (next: SidebarLayout) => void;
+  saveLayout: SaveSidebarLayout;
 } {
   const [layout, setLayout] = useState<SidebarLayout>(readSidebarLayout);
 
@@ -82,7 +91,7 @@ export function useSidebarLayout(): {
     return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
   }, []);
 
-  const saveLayout = useCallback((next: SidebarLayout) => writeSidebarLayout(next), []);
+  const saveLayout = useCallback<SaveSidebarLayout>((next) => writeSidebarLayout(next), []);
 
   return { layout, saveLayout };
 }

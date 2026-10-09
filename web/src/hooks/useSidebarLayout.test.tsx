@@ -99,4 +99,37 @@ describe("useSidebarLayout", () => {
     );
     expect(toast.error).toHaveBeenCalledWith("Sidebar layout not saved");
   });
+
+  it("applies an updater to the freshly stored layout, keeping a concurrent edit", () => {
+    const { result } = renderHook(() => useSidebarLayout());
+
+    // An edit lands while an async caller (e.g. id promotion) is still awaiting.
+    act(() =>
+      result.current.saveLayout(
+        insertSection(result.current.layout, {
+          id: "sec_a",
+          kind: "projects",
+          name: "A",
+          maxRows: null,
+          projectIds: [],
+        }),
+      ),
+    );
+
+    // The caller resumes and applies its own edit through an updater.
+    act(() =>
+      result.current.saveLayout((current) =>
+        insertSection(
+          current,
+          { id: "sec_b", kind: "projects", name: "B", maxRows: null, projectIds: [] },
+          current.sections.length,
+        ),
+      ),
+    );
+
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)!) as SidebarLayout;
+    const ids = stored.sections.map((section) => section.id);
+    expect(ids).toContain("sec_a");
+    expect(ids).toContain("sec_b");
+  });
 });

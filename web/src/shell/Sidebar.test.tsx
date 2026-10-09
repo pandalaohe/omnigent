@@ -3321,8 +3321,8 @@ describe("Sidebar default section collapse", () => {
   });
 
   it("honors a persisted collapse of the Sessions list across remount", () => {
-    // "Chats" is the persisted collapse key (kept stable across the label
-    // rename); the header it collapses now reads "Sessions".
+    // "Chats" is the legacy title-keyed collapse value, migrated onto the
+    // Sessions section's id on read (the header now reads "Sessions").
     localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Chats"]));
     mockConversations([conv("conv_recent", "Claude Code")]);
     renderSidebar();
@@ -3374,11 +3374,11 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     rerender(tree());
 
     // The Pinned section auto-expands so the freshly-pinned session is visible,
-    // and the expansion is persisted (dropped from the collapsed list).
+    // and the expansion is persisted (dropped from the collapsed id list).
     expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
-    expect(JSON.parse(localStorage.getItem("omnigent:collapsed-sidebar-sections")!)).not.toContain(
-      "Pinned",
-    );
+    expect(
+      JSON.parse(localStorage.getItem("omnigent:collapsed-sidebar-section-ids")!),
+    ).not.toContain("default-favorites");
   });
 });
 
