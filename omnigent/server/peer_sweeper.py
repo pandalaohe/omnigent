@@ -71,7 +71,7 @@ _DEFAULT_INTERVAL_S = 2.0
 _DEFAULT_BATCH_LIMIT = 500
 _RECONCILE_GRACE_S = 120
 
-TrueStateFn = Callable[[Conversation], Awaitable[tuple[str, bool | None]]]
+TrueStateFn = Callable[..., Awaitable[tuple[str, bool | None]]]
 DeliverFn = Callable[..., Awaitable[tuple[str, str | None]]]
 
 
@@ -390,7 +390,7 @@ class PeerSweeper:
         # back the same mutable row on every read, so ``record.state``
         # itself can flip to ``delivering`` as a side effect of that CAS.
         origin_state = record.state
-        state, _runner_online = await self._true_state(receiver)
+        state, _runner_online = await self._true_state(receiver, receiver=True)
         if state not in ("idle", "steerable"):
             return
         moved = await asyncio.to_thread(
@@ -413,7 +413,7 @@ class PeerSweeper:
         # dialog can open. Idle and steerable deliver; anything else
         # abandons this attempt for a later tick (a dialog / approval or a
         # non-steerable harness must not be interrupted mid-turn).
-        recheck_state, _recheck_runner_online = await self._true_state(receiver)
+        recheck_state, _recheck_runner_online = await self._true_state(receiver, receiver=True)
         if recheck_state not in ("idle", "steerable"):
             await self._revert_delivering(record, origin_state, "busy_recheck")
             return

@@ -25,6 +25,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation, MessageData, NewConversationItem
@@ -296,17 +297,25 @@ def _seed_trigger_depth(peer_env: dict[str, Any], depth: int) -> SessionPeerMess
     return record
 
 
-def _steerable_receiver(
+def _native_receiver(
     monkeypatch: pytest.MonkeyPatch,
     peer_env: dict[str, Any],
     *,
+    kind: str = "default",
+    parent_id: str | None = None,
     harness: str = "claude-native",
-    cached_status: str = "running",
+    cached_status: str | None = None,
+    wrapper: str | None = None,
 ) -> Conversation:
-    """A native receiver that reads steerable: mid-turn + a steerable harness."""
+    """A native terminal receiver, optionally a dispatched child or a mirror."""
     conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
     receiver = conv_store.create_conversation(
-        title=f"steer-{uuid.uuid4().hex[:6]}", agent_id=AGENT_ID, runner_id="rst"
+        kind=kind,
+        title=f"nat-{uuid.uuid4().hex[:6]}",
+        agent_id=AGENT_ID,
+        runner_id="rst",
+        parent_conversation_id=parent_id,
+        labels={WRAPPER_LABEL_KEY: wrapper} if wrapper is not None else None,
     )
     peer_env["perm_store"].grant(ALICE, receiver.id, LEVEL_OWNER)
     monkeypatch.setattr(
@@ -331,12 +340,34 @@ def _steerable_receiver(
     monkeypatch.setattr(
         peer_module, "_native_terminal_runtime", lambda conv: ("Claude", "model", harness)
     )
-    monkeypatch.setitem(
-        cast(Any, sessions_module._session_status_cache), receiver.id, cached_status
-    )
+    if cached_status is not None:
+        monkeypatch.setitem(
+            cast(Any, sessions_module._session_status_cache), receiver.id, cached_status
+        )
     # A confirmed native forward (item id with a pending id is the failure shape).
     peer_env["fake"].outcome = {"queued": True, "pending_id": "pending_1"}
     return receiver
+
+
+def _steerable_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+    peer_env: dict[str, Any],
+    *,
+    harness: str = "claude-native",
+    cached_status: str = "running",
+) -> Conversation:
+    """A native receiver that reads steerable: mid-turn + a steerable harness."""
+    return _native_receiver(monkeypatch, peer_env, harness=harness, cached_status=cached_status)
+
+
+def _owned_parent(peer_env: dict[str, Any], *, title: str = "parent") -> Conversation:
+    """Create an owned top-level session to parent a child receiver."""
+    conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
+    parent = conv_store.create_conversation(
+        title=f"{title}-{uuid.uuid4().hex[:6]}", agent_id=AGENT_ID, runner_id="rpar"
+    )
+    peer_env["perm_store"].grant(ALICE, parent.id, LEVEL_OWNER)
+    return parent
 
 
 def _queued_record(
@@ -559,7 +590,7 @@ async def test_not_same_owner_before_is_subagent(
 async def test_is_subagent_same_owner(
     peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
 ) -> None:
-    """A same-owner sub-agent receiver is refused(is_subagent)."""
+    """A same-owner child that is not a reachable native child is refused."""
     sender = peer_env["sender"]
     conv_store: SqlAlchemyConversationStore = peer_env["conv_store"]
     parent = conv_store.create_conversation(title="p2", agent_id=AGENT_ID)
@@ -574,6 +605,188 @@ async def test_is_subagent_same_owner(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["reason"] == "is_subagent"
+
+
+@pytest.mark.parametrize(
+    ("harness", "disposition"),
+    [
+        ("claude-native", "delivered"),
+        ("codex-native", "delivered"),
+        ("pi-native", "is_subagent"),
+        ("sdk", "is_subagent"),
+    ],
+    ids=["claude-native", "codex-native", "pi-native", "sdk"],
+)
+async def test_dispatched_child_harness_gate(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    disposition: str,
+) -> None:
+    """A dispatched claude/codex native child receives; other harnesses are
+    refused is_subagent."""
+    sender = peer_env["sender"]
+    parent = _owned_parent(peer_env)
+    child = _native_receiver(
+        monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id, harness=harness
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{child.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"g-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if disposition == "delivered":
+        assert body["disposition"] == "delivered", resp.text
+        assert len(peer_env["fake"].calls) == 1
+    else:
+        assert body["reason"] == disposition, resp.text
+        assert peer_env["fake"].calls == []
+
+
+async def test_child_native_runtime_read_error_is_refused(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native runtime read error refuses rather than admitting an
+    unreachable child."""
+    sender = peer_env["sender"]
+    parent = _owned_parent(peer_env)
+    child = _native_receiver(monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id)
+
+    def _raise(conv: Conversation) -> tuple[str, str, str]:
+        raise OmnigentError("native runtime read failed", code=ErrorCode.INTERNAL_ERROR)
+
+    monkeypatch.setattr(peer_module, "_native_terminal_runtime", _raise)
+    resp = await peer_client.post(
+        f"/v1/sessions/{child.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"r-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reason"] == "is_subagent", resp.text
+    assert peer_env["fake"].calls == []
+
+
+async def test_sibling_child_sender_is_not_refused(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling of the receiver (same parent) sends without a family refusal."""
+    parent = _owned_parent(peer_env)
+    child = _native_receiver(monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id)
+    sibling_token, sibling_runner = _runner_pair()
+    sibling = peer_env["conv_store"].create_conversation(
+        kind="sub_agent",
+        title=f"sib-{uuid.uuid4().hex[:6]}",
+        agent_id=AGENT_ID,
+        parent_conversation_id=parent.id,
+        runner_id=sibling_runner,
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{child.id}/peer-messages",
+        json={"sender_session_id": sibling.id, "text": f"s-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, sibling_token),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["disposition"] == "delivered", resp.text
+
+
+async def test_parent_owned_mirror_child_is_refused(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native mirror child routes input through its parent: refused."""
+    sender = peer_env["sender"]
+    parent = _owned_parent(peer_env)
+    mirror = _native_receiver(
+        monkeypatch,
+        peer_env,
+        kind="sub_agent",
+        parent_id=parent.id,
+        wrapper="claude-code-native-ui-subagent",
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{mirror.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"m-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reason"] == "is_subagent"
+    assert peer_env["fake"].calls == []
+
+
+async def test_reply_to_a_child_thread_is_delivered(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply on a thread the child started reaches it and marks the record."""
+    sender = peer_env["sender"]
+    parent = _owned_parent(peer_env)
+    child = _native_receiver(monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id)
+    ref = f"thread-{uuid.uuid4().hex}"
+    original = peer_env["peer_store"].create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=child.id,
+            receiver_session_id=sender.id,
+            ref=ref,
+            text="question",
+            state="delivered",
+            created_at=1,
+            expires_at=2,
+        )
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{child.id}/peer-messages",
+        json={
+            "sender_session_id": sender.id,
+            "text": f"a-{uuid.uuid4().hex}",
+            "correlation_id": ref,
+        },
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    body = resp.json()
+    assert body["disposition"] == "delivered", resp.text
+    assert body["reply_to"] == original.id
+    replied = peer_env["peer_store"].get(original.id)
+    assert replied is not None
+    assert replied.replied_at is not None
+
+
+async def test_busy_steerable_child_receiver_queues(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy steerable child queues; the same top-level receiver delivers."""
+    sender = peer_env["sender"]
+    parent = _owned_parent(peer_env)
+    child = _native_receiver(
+        monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id, cached_status="running"
+    )
+    resp = await peer_client.post(
+        f"/v1/sessions/{child.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"q-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert peer_env["fake"].calls == []
+
+    top = _steerable_receiver(monkeypatch, peer_env)
+    resp = await peer_client.post(
+        f"/v1/sessions/{top.id}/peer-messages",
+        json={"sender_session_id": sender.id, "text": f"t-{uuid.uuid4().hex}"},
+        headers=_headers(ALICE, peer_env["sender_token"]),
+    )
+    assert resp.json()["disposition"] == "delivered", resp.text
+    assert len(peer_env["fake"].calls) == 1
 
 
 async def test_duplicate_before_closed(
@@ -1069,6 +1282,39 @@ async def test_busy_recheck_after_record_creation_queues_same_record(
     assert len(records) == 1, f"expected exactly one record, got {len(records)}"
     assert records[0].id == resp.json()["peer_id"]
     assert records[0].state == "queued"
+
+
+async def test_busy_recheck_child_is_queued_not_steered(
+    peer_client: httpx.AsyncClient,
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that goes busy during the delivering record's creation queues
+    at the recheck: a child never reads steerable, so it is not steered."""
+    sender = peer_env["sender"]
+    parent = _owned_parent(peer_env)
+    child = _native_receiver(monkeypatch, peer_env, kind="sub_agent", parent_id=parent.id)
+    fake: _FakePostEvent = peer_env["fake"]
+    peer_store: Any = peer_env["peer_store"]
+    real_create = peer_store.create
+
+    def _create_then_go_busy(record: Any) -> Any:
+        created = real_create(record)
+        if created.state == "delivering":
+            sessions_module._session_status_cache[child.id] = "running"
+        return created
+
+    monkeypatch.setattr(peer_store, "create", _create_then_go_busy)
+    try:
+        resp = await peer_client.post(
+            f"/v1/sessions/{child.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"brc-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+    assert resp.json()["disposition"] == "queued", resp.text
+    assert fake.calls == [], "a child went busy but the message was steered"
 
 
 async def test_steerable_claude_native_receiver_delivers_inline(
