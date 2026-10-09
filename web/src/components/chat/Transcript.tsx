@@ -399,9 +399,15 @@ function TranscriptImpl({
                   onGeometryChange={onGeometryChange}
                   pinRef={bottomPinRef}
                 />
-                {/* Pending elicitation cards, floated to the bottom of the chat
-                so an outstanding question stays in view. Newest renders last,
-                nearest the composer. Above the Working… indicator. */}
+                {/* Working… shimmer, lit for the whole busy turn. */}
+                {showWorkingIndicator && <WorkingIndicator />}
+                {/* Managed-sandbox stage cue; only when Working is absent. */}
+                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {/* MCP-server startup band (codex-native); clears once the
+                round settles (failures stay in host logs, not the chat). */}
+                <McpStartupIndicator />
+                {/* Pending elicitation cards render last, below status rows, so a
+                status row appearing or disappearing never moves the question. */}
                 {display.pendingElicitations.map((item) => (
                   <Message
                     key={item.elicitationId}
@@ -414,13 +420,6 @@ function TranscriptImpl({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
-                {/* Managed-sandbox stage cue; only when Working is absent. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-                {/* MCP-server startup band (codex-native); clears once the
-                round settles (failures stay in host logs, not the chat). */}
-                <McpStartupIndicator />
               </>
             )}
             {/* Frames the initially loaded turn at the top of the viewport. */}
