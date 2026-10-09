@@ -49,6 +49,7 @@ import {
   bubbleKey,
   buildPendingBubbles,
   collectPendingElicitations,
+  computeIsTurnActive,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
@@ -132,6 +133,9 @@ function TranscriptImpl({
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const turnActive = useChatStore((s) =>
+    computeIsTurnActive(s.sessionStatus, s.status === "streaming"),
+  );
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
@@ -204,6 +208,10 @@ function TranscriptImpl({
       hasMoreHistory,
       loadingMoreHistory,
       showsWorking,
+      // Background shells outliving a finished turn keep `showsWorking` lit (the
+      // pill owns that state) but must not make the settled last reply live
+      // again. The side chat already feeds bubbles turn activity only.
+      replyLive: showsWorking && turnActive,
     }),
     [
       conversationId,
@@ -217,6 +225,7 @@ function TranscriptImpl({
       hasMoreHistory,
       loadingMoreHistory,
       showsWorking,
+      turnActive,
     ],
   );
   const [nativeFindConversationId, setNativeFindConversationId] = useState<string | null>(null);
@@ -390,7 +399,7 @@ function TranscriptImpl({
                   bubbles={display.streamBubbles}
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
-                  showsWorking={display.showsWorking}
+                  showsWorking={display.replyLive}
                   sessionIdle={sessionStatus === "idle"}
                   conversationId={display.conversationId}
                   hasTasks={display.hasTasks}
