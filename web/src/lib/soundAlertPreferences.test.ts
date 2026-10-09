@@ -132,14 +132,25 @@ describe("sound alert device preferences", () => {
       enabled: true,
       volume: 0.7,
       systemSounds: {},
+      legacySoundMigrated: false,
     });
   });
 
   it("clamps the volume into 0..1 and rejects non-numbers", () => {
-    writeSoundAlertDevicePreferences({ enabled: true, volume: 2, systemSounds: {} });
+    writeSoundAlertDevicePreferences({
+      enabled: true,
+      volume: 2,
+      systemSounds: {},
+      legacySoundMigrated: false,
+    });
     expect(readSoundAlertDevicePreferences().volume).toBe(1);
 
-    writeSoundAlertDevicePreferences({ enabled: true, volume: -1, systemSounds: {} });
+    writeSoundAlertDevicePreferences({
+      enabled: true,
+      volume: -1,
+      systemSounds: {},
+      legacySoundMigrated: false,
+    });
     expect(readSoundAlertDevicePreferences().volume).toBe(0);
 
     localStorage.setItem(SOUND_ALERTS_DEVICE_STORAGE_KEY, JSON.stringify({ volume: "loud" }));
@@ -160,6 +171,21 @@ describe("sound alert device preferences", () => {
       enabled: false,
       volume: 0.25,
       systemSounds: { done: "Glass" },
+      legacySoundMigrated: false,
     });
+  });
+
+  it("keeps the legacy-migration flag as a boolean", () => {
+    localStorage.setItem(
+      SOUND_ALERTS_DEVICE_STORAGE_KEY,
+      JSON.stringify({ legacySoundMigrated: "yes" }),
+    );
+    expect(readSoundAlertDevicePreferences().legacySoundMigrated).toBe(false);
+
+    localStorage.setItem(
+      SOUND_ALERTS_DEVICE_STORAGE_KEY,
+      JSON.stringify({ legacySoundMigrated: true }),
+    );
+    expect(readSoundAlertDevicePreferences().legacySoundMigrated).toBe(true);
   });
 });

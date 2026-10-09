@@ -11,12 +11,23 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { authenticatedFetch } from "@/lib/identity";
-import { isNativeShell } from "@/lib/nativeBridge";
+import {
+  getLegacyNativeNotificationSound,
+  isNativeShell,
+  setNativeSoundAlertsActive,
+} from "@/lib/nativeBridge";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
-import { isSoundLevelEnabled } from "@/lib/soundAlertPreferences";
+import {
+  SOUND_LEVELS,
+  isSoundLevelEnabled,
+  readSoundAlertDevicePreferences,
+  writeSoundAlertDevicePreferences,
+  type SoundAlertDevicePreferences,
+  type SoundLevel,
+} from "@/lib/soundAlertPreferences";
 import { canRingOnThisDevice, getSoundDeviceId, soundDeviceLabel } from "@/lib/soundDevice";
 import { createSoundRinger, type RingerContext } from "@/lib/soundRinger";
-import { initAudio, playLevel } from "@/lib/soundPlayer";
+import { initAudio, isAudioLocked, playLevel, subscribeAudioLock } from "@/lib/soundPlayer";
 import {
   alertId,
   buildRowSoundStates,
@@ -39,6 +50,30 @@ const ACTIVITY_THROTTLE_MS = 10_000;
 function isWindowFocused(): boolean {
   if (typeof document === "undefined") return true;
   return typeof document.hasFocus === "function" ? document.hasFocus() : true;
+}
+
+/**
+ * Fold the shell's legacy notification-sound setting into device-local alert
+ * preferences once, then mark it migrated. No legacy values (or an older shell
+ * without the bridge) still records the marker so this never runs again.
+ */
+async function migrateLegacySoundSetting(): Promise<void> {
+  if (readSoundAlertDevicePreferences().legacySoundMigrated) return;
+  const legacy = await getLegacyNativeNotificationSound();
+  // Re-read: a concurrent mount may have completed the migration while the
+  // bridge call was in flight.
+  const device = readSoundAlertDevicePreferences();
+  if (device.legacySoundMigrated) return;
+  const next: SoundAlertDevicePreferences = { ...device, legacySoundMigrated: true };
+  if (legacy && typeof legacy.enabled === "boolean") {
+    next.enabled = legacy.enabled;
+    if (legacy.enabled && legacy.name) {
+      const systemSounds: Partial<Record<SoundLevel, string>> = {};
+      for (const level of SOUND_LEVELS) systemSounds[level] = legacy.name;
+      next.systemSounds = systemSounds;
+    }
+  }
+  writeSoundAlertDevicePreferences(next);
 }
 
 /**
@@ -80,6 +115,9 @@ export function useSoundAlerts(activeConversationId?: string): void {
   const rebaselinePending = useRef(false);
   const rebaselineTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [recomputeTick, setRecomputeTick] = useState(0);
+  // Re-announce to the server when the browser's audio unlocks, so a tab that
+  // couldn't ring yet starts being chosen once the user interacts.
+  const [audioLocked, setAudioLocked] = useState(isAudioLocked);
 
   const ringerRef = useRef<ReturnType<typeof createSoundRinger> | null>(null);
   if (ringerRef.current === null) {
@@ -102,18 +140,29 @@ export function useSoundAlerts(activeConversationId?: string): void {
   }
 
   // Announce this device to the server so a claimed alert can be routed to a
-  // device that can actually play it. Re-announced when the device switch
-  // changes; the transport re-sends it on every reconnect.
+  // device that can actually play it. A locked browser tab can't ring yet, so
+  // it advertises false and re-announces when the audio unlocks. Re-sent when
+  // the device switch changes; the transport re-sends it on every reconnect.
   useEffect(() => {
     sessionUpdatesSocket.setHello({
       device_id: getSoundDeviceId(),
       device_label: soundDeviceLabel(),
-      can_ring: canRingOnThisDevice(device),
+      can_ring: canRingOnThisDevice(device) && !audioLocked,
     });
-  }, [device]);
+  }, [device, audioLocked]);
 
+  useEffect(() => subscribeAudioLock(() => setAudioLocked(isAudioLocked())), []);
+
+  // In a native shell the web app owns alert sounds, so tell the shell to mute
+  // its legacy notification sound. The legacy setting is folded into device
+  // preferences once on the same mount.
   useEffect(() => {
-    initAudio({ native: isNativeShell() });
+    const native = isNativeShell();
+    initAudio({ native });
+    if (!native) return;
+    setNativeSoundAlertsActive(true);
+    void migrateLegacySoundSetting();
+    return () => setNativeSoundAlertsActive(false);
   }, []);
 
   // A delivered alert was claimed and routed to this one connection; the

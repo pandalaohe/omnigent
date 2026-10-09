@@ -12,7 +12,12 @@ vi.mock("@/lib/nativeBridge", () => ({
 
 import { canRingOnThisDevice, getSoundDeviceId, soundDeviceLabel } from "./soundDevice";
 
-const DEVICE_SOUNDS = { enabled: true, volume: 0.7, systemSounds: {} };
+const DEVICE_SOUNDS = {
+  enabled: true,
+  volume: 0.7,
+  systemSounds: {},
+  legacySoundMigrated: false,
+};
 
 function setOs(platform: string, userAgent: string): void {
   vi.spyOn(window.navigator, "platform", "get").mockReturnValue(platform);

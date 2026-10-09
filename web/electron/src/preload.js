@@ -54,6 +54,36 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       navigatePath: params?.navigatePath,
     }),
   /**
+   * This machine's built-in alert sound names (no extension), sorted. Empty on
+   * platforms without a known system-sound directory.
+   * @returns {Promise<string[]>}
+   */
+  listSystemSounds: () => ipcRenderer.invoke("omnigent:system-sounds:list"),
+  /**
+   * Play one built-in sound at 0..1 volume. Resolves `{played: true}` on macOS
+   * (afplay), `{bytes}` (a WAV body) on Windows for the renderer to decode, or
+   * `{played: false}` for an unknown name / unsupported platform.
+   * @param {string} name
+   * @param {number} volume
+   * @returns {Promise<{ played: boolean } | { bytes: Uint8Array }>}
+   */
+  playSystemSound: (name, volume) =>
+    ipcRenderer.invoke("omnigent:system-sounds:play", name, volume),
+  /**
+   * Tell the shell whether the web app's own sound alerts are live, so its
+   * legacy notification sound stays quiet. Fire-and-forget.
+   * @param {boolean} active
+   */
+  setSoundAlertsActive: (active) => {
+    ipcRenderer.send("omnigent:sound-alerts-active", active === true);
+  },
+  /**
+   * The legacy Notification-menu sound setting — `{enabled, name}` with nulls
+   * for unset values — read once for the web layer's one-time migration.
+   * @returns {Promise<{ enabled: boolean | null, name: string | null }>}
+   */
+  getLegacyNotificationSound: () => ipcRenderer.invoke("omnigent:legacy-notification-sound"),
+  /**
    * Subscribe to OS-notification clicks. The main process sends the in-app
    * path the clicked notification carried, which we forward to the SPA so it
    * can route there. Returns an unsubscribe function.

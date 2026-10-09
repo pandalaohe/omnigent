@@ -196,12 +196,15 @@ export interface SoundAlertDevicePreferences {
   volume: number;
   /** Overrides for OS-provided sounds; filled by a later slice. */
   systemSounds: Partial<Record<SoundLevel, string>>;
+  /** One-time marker: the old shell sound setting has been folded in. */
+  legacySoundMigrated: boolean;
 }
 
 export const SOUND_ALERT_DEVICE_DEFAULTS: SoundAlertDevicePreferences = {
   enabled: true,
   volume: 0.7,
   systemSounds: {},
+  legacySoundMigrated: false,
 };
 
 export function clampSoundVolume(volume: number): number {
@@ -236,6 +239,8 @@ export function normalizeSoundAlertDevicePreferences(value: unknown): SoundAlert
         ? clampSoundVolume(raw.volume)
         : SOUND_ALERT_DEVICE_DEFAULTS.volume,
     systemSounds: normalizeSystemSounds(raw.systemSounds),
+    legacySoundMigrated:
+      typeof raw.legacySoundMigrated === "boolean" ? raw.legacySoundMigrated : false,
   };
 }
 

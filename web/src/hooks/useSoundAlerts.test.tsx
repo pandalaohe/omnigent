@@ -4,7 +4,11 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 const {
   initAudioMock,
   playLevelMock,
+  isAudioLockedMock,
+  subscribeAudioLockMock,
   isNativeShellMock,
+  setNativeSoundAlertsActiveMock,
+  getLegacyNativeNotificationSoundMock,
   useLoadedConversationsMock,
   useSessionErrorStatesMock,
   useSessionNavigationPreferencesMock,
@@ -20,32 +24,50 @@ const {
   getSoundDeviceIdMock,
   soundDeviceLabelMock,
   canRingOnThisDeviceMock,
-} = vi.hoisted(() => ({
-  initAudioMock: vi.fn(),
-  playLevelMock: vi.fn().mockResolvedValue(undefined),
-  isNativeShellMock: vi.fn().mockReturnValue(false),
-  useLoadedConversationsMock: vi.fn(),
-  useSessionErrorStatesMock: vi.fn(),
-  useSessionNavigationPreferencesMock: vi.fn(),
-  useUnseenTickMock: vi.fn().mockReturnValue(0),
-  isConversationUnseenMock: vi.fn().mockReturnValue(false),
-  isExplicitlyUnreadMock: vi.fn().mockReturnValue(false),
-  socketStatusListeners: new Set<() => void>(),
-  socketFrameListeners: new Set<(frame: { type: string; [key: string]: unknown }) => void>(),
-  socketConnectedRef: { current: false },
-  socketHelloMock: vi.fn(),
-  socketActivityMock: vi.fn(),
-  claimFetchMock: vi.fn(),
-  getSoundDeviceIdMock: vi.fn().mockReturnValue("dev_test"),
-  soundDeviceLabelMock: vi.fn().mockReturnValue("Test device"),
-  canRingOnThisDeviceMock: vi.fn().mockReturnValue(true),
-}));
+  audioLock,
+} = vi.hoisted(() => {
+  const lockState = { locked: false, listeners: new Set<() => void>() };
+  return {
+    initAudioMock: vi.fn(),
+    playLevelMock: vi.fn().mockResolvedValue(undefined),
+    isAudioLockedMock: vi.fn(() => lockState.locked),
+    subscribeAudioLockMock: vi.fn((listener: () => void) => {
+      lockState.listeners.add(listener);
+      return () => lockState.listeners.delete(listener);
+    }),
+    isNativeShellMock: vi.fn().mockReturnValue(false),
+    setNativeSoundAlertsActiveMock: vi.fn(),
+    getLegacyNativeNotificationSoundMock: vi.fn().mockResolvedValue(null),
+    useLoadedConversationsMock: vi.fn(),
+    useSessionErrorStatesMock: vi.fn(),
+    useSessionNavigationPreferencesMock: vi.fn(),
+    useUnseenTickMock: vi.fn().mockReturnValue(0),
+    isConversationUnseenMock: vi.fn().mockReturnValue(false),
+    isExplicitlyUnreadMock: vi.fn().mockReturnValue(false),
+    socketStatusListeners: new Set<() => void>(),
+    socketFrameListeners: new Set<(frame: { type: string; [key: string]: unknown }) => void>(),
+    socketConnectedRef: { current: false },
+    socketHelloMock: vi.fn(),
+    socketActivityMock: vi.fn(),
+    claimFetchMock: vi.fn(),
+    getSoundDeviceIdMock: vi.fn().mockReturnValue("dev_test"),
+    soundDeviceLabelMock: vi.fn().mockReturnValue("Test device"),
+    canRingOnThisDeviceMock: vi.fn().mockReturnValue(true),
+    audioLock: lockState,
+  };
+});
 
 vi.mock("@/lib/soundPlayer", () => ({
   initAudio: initAudioMock,
   playLevel: playLevelMock,
+  isAudioLocked: isAudioLockedMock,
+  subscribeAudioLock: subscribeAudioLockMock,
 }));
-vi.mock("@/lib/nativeBridge", () => ({ isNativeShell: isNativeShellMock }));
+vi.mock("@/lib/nativeBridge", () => ({
+  isNativeShell: isNativeShellMock,
+  setNativeSoundAlertsActive: setNativeSoundAlertsActiveMock,
+  getLegacyNativeNotificationSound: getLegacyNativeNotificationSoundMock,
+}));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: claimFetchMock }));
 vi.mock("@/lib/soundDevice", () => ({
   getSoundDeviceId: getSoundDeviceIdMock,
@@ -125,6 +147,14 @@ function emitFrame(frame: { type: string; [key: string]: unknown }): void {
   });
 }
 
+/** The persisted device preferences, or null. */
+function deviceStored(): Record<string, unknown> | null {
+  return JSON.parse(localStorage.getItem(SOUND_ALERTS_DEVICE_STORAGE_KEY) ?? "null") as Record<
+    string,
+    unknown
+  > | null;
+}
+
 const latestErrorById = new Map<string, LatestSessionError | null>();
 
 describe("useSoundAlerts", () => {
@@ -133,7 +163,14 @@ describe("useSoundAlerts", () => {
     localStorage.clear();
     initAudioMock.mockClear();
     playLevelMock.mockClear();
+    isAudioLockedMock.mockClear();
+    subscribeAudioLockMock.mockClear();
+    audioLock.locked = false;
+    audioLock.listeners.clear();
     isNativeShellMock.mockReturnValue(false);
+    setNativeSoundAlertsActiveMock.mockClear();
+    getLegacyNativeNotificationSoundMock.mockReset();
+    getLegacyNativeNotificationSoundMock.mockResolvedValue(null);
     isConversationUnseenMock.mockReturnValue(false);
     isExplicitlyUnreadMock.mockReturnValue(false);
     useUnseenTickMock.mockReturnValue(0);
@@ -483,5 +520,78 @@ describe("useSoundAlerts", () => {
     expect(claimFetchMock).toHaveBeenCalledTimes(1);
     expect(playLevelMock).toHaveBeenCalledTimes(1);
     expect(playLevelMock).toHaveBeenCalledWith("error", expect.anything(), expect.anything());
+  });
+
+  it("tells a native shell its own alert sounds are live", () => {
+    isNativeShellMock.mockReturnValue(true);
+
+    renderHook(() => useSoundAlerts());
+
+    expect(setNativeSoundAlertsActiveMock).toHaveBeenCalledWith(true);
+  });
+
+  it("migrates the legacy shell sound setting into device preferences", async () => {
+    isNativeShellMock.mockReturnValue(true);
+    getLegacyNativeNotificationSoundMock.mockResolvedValue({ enabled: true, name: "Glass" });
+
+    renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(deviceStored()).toMatchObject({
+      enabled: true,
+      systemSounds: { done: "Glass", error: "Glass", needs_response: "Glass" },
+      legacySoundMigrated: true,
+    });
+  });
+
+  it("migrates a disabled legacy switch to a disabled device master switch", async () => {
+    isNativeShellMock.mockReturnValue(true);
+    getLegacyNativeNotificationSoundMock.mockResolvedValue({ enabled: false, name: null });
+
+    renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(deviceStored()).toMatchObject({
+      enabled: false,
+      systemSounds: {},
+      legacySoundMigrated: true,
+    });
+  });
+
+  it("runs the legacy migration only once", async () => {
+    isNativeShellMock.mockReturnValue(true);
+    getLegacyNativeNotificationSoundMock.mockResolvedValue({ enabled: true, name: "Glass" });
+
+    const first = renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(getLegacyNativeNotificationSoundMock).toHaveBeenCalledTimes(1);
+
+    first.unmount();
+    renderHook(() => useSoundAlerts());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(getLegacyNativeNotificationSoundMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not advertise ringing while audio is locked, then re-announces once unlocked", () => {
+    audioLock.locked = true;
+    renderHook(() => useSoundAlerts());
+
+    expect(socketHelloMock).toHaveBeenLastCalledWith(expect.objectContaining({ can_ring: false }));
+
+    act(() => {
+      audioLock.locked = false;
+      for (const listener of audioLock.listeners) listener();
+    });
+
+    expect(socketHelloMock).toHaveBeenLastCalledWith(expect.objectContaining({ can_ring: true }));
   });
 });

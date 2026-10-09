@@ -12,6 +12,7 @@ import {
   type SoundAlertPreferences,
   type SoundLevel,
 } from "./soundAlertPreferences";
+import { playNativeSystemSound } from "./nativeBridge";
 
 type AudioContextConstructor = new () => AudioContext;
 
@@ -212,12 +213,57 @@ export async function playBuiltinSound(
   }
 }
 
-export function playLevel(
+/**
+ * Decode and play raw audio bytes (a WAV body from the shell) through a gain
+ * node at `volume`. Returns false when no running context can play them.
+ */
+async function playDecodedBytes(bytes: Uint8Array, volume: number): Promise<boolean> {
+  const current = context;
+  if (!current || current.state !== "running") return false;
+  try {
+    const data = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
+    const decoded = await current.decodeAudioData(data);
+    if (context !== current) return false;
+    const master = current.createGain();
+    master.gain.value = clampSoundVolume(volume);
+    master.connect(current.destination);
+    const source = current.createBufferSource();
+    source.buffer = decoded;
+    source.connect(master);
+    source.start();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Play the sound for `level`. A device-level system-sound override is played
+ * through the shell (macOS afplay, or decoded WAV bytes on Windows); anything
+ * unavailable or failing falls back to the account's synthesized built-in
+ * sound. `resume: true` is for call sites inside a user gesture (the settings
+ * preview), where unlocking the context first is both allowed and required.
+ */
+export async function playLevel(
   level: SoundLevel,
   preferences: SoundAlertPreferences,
   device: SoundAlertDevicePreferences,
+  options: { resume?: boolean } = {},
 ): Promise<void> {
-  return playBuiltinSound(preferences.levels[level].sound, device.volume);
+  const systemName = device.systemSounds[level];
+  if (systemName) {
+    const result = await playNativeSystemSound(systemName, device.volume);
+    if ("bytes" in result) {
+      if (options.resume) await ensureRunning();
+      if (await playDecodedBytes(result.bytes, device.volume)) return;
+    } else if (result.played) {
+      return;
+    }
+  }
+  return playBuiltinSound(preferences.levels[level].sound, device.volume, options);
 }
 
 export function resetSoundPlayerForTests(): void {

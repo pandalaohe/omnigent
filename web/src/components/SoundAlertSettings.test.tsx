@@ -2,12 +2,23 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-const { playBuiltinSoundMock } = vi.hoisted(() => ({ playBuiltinSoundMock: vi.fn() }));
+const { playLevelMock, nativeShellState, listSystemSoundsMock } = vi.hoisted(() => ({
+  playLevelMock: vi.fn(),
+  nativeShellState: { value: false },
+  listSystemSoundsMock: vi.fn().mockResolvedValue([] as string[]),
+}));
 
 vi.mock("@/lib/soundPlayer", () => ({
   isAudioLocked: () => false,
   subscribeAudioLock: () => () => {},
-  playBuiltinSound: playBuiltinSoundMock,
+  playLevel: playLevelMock,
+}));
+
+vi.mock("@/lib/nativeBridge", () => ({
+  isElectronShell: () => false,
+  isIOSShell: () => false,
+  isNativeShell: () => nativeShellState.value,
+  listNativeSystemSounds: listSystemSoundsMock,
 }));
 
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
@@ -45,6 +56,8 @@ vi.mock("@/components/ui/select", async () => {
     SelectTrigger,
     SelectValue: () => null,
     SelectContent: ({ children }: { children: ReactNode }) => children,
+    SelectGroup: ({ children }: { children: ReactNode }) => children,
+    SelectLabel: () => null,
     SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
       <option value={value}>{children}</option>
     ),
@@ -52,7 +65,10 @@ vi.mock("@/components/ui/select", async () => {
 });
 
 import { SoundAlertSettings } from "./SoundAlertSettings";
-import { SOUND_ALERTS_STORAGE_KEY } from "@/lib/soundAlertPreferences";
+import {
+  SOUND_ALERTS_DEVICE_STORAGE_KEY,
+  SOUND_ALERTS_STORAGE_KEY,
+} from "@/lib/soundAlertPreferences";
 
 interface StoredPreferences {
   levels: Record<string, { enabled: boolean; sound: string }>;
@@ -66,9 +82,18 @@ function stored(): StoredPreferences | null {
   ) as StoredPreferences | null;
 }
 
+function deviceStored(): { systemSounds?: Record<string, string> } | null {
+  return JSON.parse(localStorage.getItem(SOUND_ALERTS_DEVICE_STORAGE_KEY) ?? "null") as {
+    systemSounds?: Record<string, string>;
+  } | null;
+}
+
 beforeEach(() => {
   localStorage.clear();
-  playBuiltinSoundMock.mockClear();
+  playLevelMock.mockClear();
+  nativeShellState.value = false;
+  listSystemSoundsMock.mockReset();
+  listSystemSoundsMock.mockResolvedValue([]);
 });
 
 afterEach(() => cleanup());
@@ -99,7 +124,9 @@ describe("SoundAlertSettings", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: "Play" })[0]);
 
-    expect(playBuiltinSoundMock).toHaveBeenCalledWith("chime", 0.7, { resume: true });
+    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything(), {
+      resume: true,
+    });
   });
 
   it("summarizes muted sessions and can unmute all", () => {
@@ -130,5 +157,50 @@ describe("SoundAlertSettings", () => {
     expect(screen.getByTestId("sound-alert-primary-device")).toHaveTextContent(
       /^This device \(.+\) is the primary device$/,
     );
+  });
+
+  it("lists system sounds in native mode and shows a device override", async () => {
+    nativeShellState.value = true;
+    listSystemSoundsMock.mockResolvedValue(["Glass", "Ping"]);
+    localStorage.setItem(
+      SOUND_ALERTS_DEVICE_STORAGE_KEY,
+      JSON.stringify({ systemSounds: { done: "Glass" } }),
+    );
+    render(<SoundAlertSettings />);
+
+    expect(await screen.findAllByRole("option", { name: "Glass" })).not.toHaveLength(0);
+    expect(screen.getByTestId("sound-alert-sound-done")).toHaveValue("system:Glass");
+    expect(screen.getByTestId("sound-alert-system-sounds-hint")).toHaveTextContent(
+      "System sounds apply to this device only.",
+    );
+  });
+
+  it("writes a device override when a system sound is chosen", async () => {
+    nativeShellState.value = true;
+    listSystemSoundsMock.mockResolvedValue(["Glass"]);
+    render(<SoundAlertSettings />);
+    await screen.findAllByRole("option", { name: "Glass" });
+
+    fireEvent.change(screen.getByTestId("sound-alert-sound-done"), {
+      target: { value: "system:Glass" },
+    });
+
+    expect(deviceStored()?.systemSounds).toEqual({ done: "Glass" });
+  });
+
+  it("clears the device override when a built-in sound is chosen", async () => {
+    nativeShellState.value = true;
+    listSystemSoundsMock.mockResolvedValue(["Glass"]);
+    localStorage.setItem(
+      SOUND_ALERTS_DEVICE_STORAGE_KEY,
+      JSON.stringify({ systemSounds: { done: "Glass" } }),
+    );
+    render(<SoundAlertSettings />);
+    await screen.findAllByRole("option", { name: "Glass" });
+
+    fireEvent.change(screen.getByTestId("sound-alert-sound-done"), { target: { value: "pop" } });
+
+    expect(stored()?.levels.done.sound).toBe("pop");
+    expect(deviceStored()?.systemSounds?.done).toBeUndefined();
   });
 });

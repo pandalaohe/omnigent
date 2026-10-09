@@ -5,13 +5,15 @@ import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { isNativeShell, listNativeSystemSounds } from "@/lib/nativeBridge";
 import { getSoundDeviceId, soundDeviceLabel } from "@/lib/soundDevice";
 import {
   BUILTIN_SOUNDS,
@@ -25,13 +27,17 @@ import {
   type SoundAlertQuietHours,
   type SoundLevel,
 } from "@/lib/soundAlertPreferences";
-import { isAudioLocked, playBuiltinSound, subscribeAudioLock } from "@/lib/soundPlayer";
+import { isAudioLocked, playLevel, subscribeAudioLock } from "@/lib/soundPlayer";
 
 const LEVEL_LABELS: Record<SoundLevel, string> = {
   done: "Done (unread dot)",
   error: "Error",
   needs_response: "Needs response",
 };
+
+// Distinguishes a device-local system-sound override from a built-in id in the
+// level Select's value space.
+const SYSTEM_SOUND_PREFIX = "system:";
 
 function useAudioLocked(): boolean {
   const [locked, setLocked] = useState(isAudioLocked);
@@ -61,6 +67,19 @@ export function SoundAlertSettings() {
   const deviceId = getSoundDeviceId();
   const deviceLabel = soundDeviceLabel();
   const isPrimaryDevice = account.primaryDeviceId === deviceId;
+  const [systemSounds, setSystemSounds] = useState<string[]>([]);
+
+  // System sounds exist only inside a native shell; the list arrives async.
+  useEffect(() => {
+    if (!isNativeShell()) return;
+    let cancelled = false;
+    void listNativeSystemSounds().then((names) => {
+      if (!cancelled) setSystemSounds(names);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const updateLevel = (level: SoundLevel, patch: Partial<SoundAlertLevelPreferences>) =>
     writeSoundAlertPreferences({
@@ -71,6 +90,28 @@ export function SoundAlertSettings() {
     writeSoundAlertPreferences({ ...account, quietHours: { ...account.quietHours, ...patch } });
   const updateDevice = (patch: Partial<SoundAlertDevicePreferences>) =>
     writeSoundAlertDevicePreferences({ ...device, ...patch });
+
+  const soundValue = (level: SoundLevel): string => {
+    const override = device.systemSounds[level];
+    return override ? `${SYSTEM_SOUND_PREFIX}${override}` : account.levels[level].sound;
+  };
+
+  const chooseSound = (level: SoundLevel, value: string) => {
+    if (value.startsWith(SYSTEM_SOUND_PREFIX)) {
+      const name = value.slice(SYSTEM_SOUND_PREFIX.length);
+      if (!name) return;
+      updateDevice({ systemSounds: { ...device.systemSounds, [level]: name } });
+      return;
+    }
+    // A built-in choice clears this level's device override.
+    const nextSystemSounds: Partial<Record<SoundLevel, string>> = {};
+    for (const other of SOUND_LEVELS) {
+      const override = device.systemSounds[other];
+      if (other !== level && override) nextSystemSounds[other] = override;
+    }
+    updateDevice({ systemSounds: nextSystemSounds });
+    updateLevel(level, { sound: value as BuiltinSoundId });
+  };
 
   return (
     <div className="flex flex-col gap-3" data-testid="sound-alert-settings">
@@ -141,10 +182,7 @@ export function SoundAlertSettings() {
             {LEVEL_LABELS[level]}
           </label>
           <div className="flex items-center gap-2">
-            <Select
-              value={account.levels[level].sound}
-              onValueChange={(sound) => updateLevel(level, { sound: sound as BuiltinSoundId })}
-            >
+            <Select value={soundValue(level)} onValueChange={(value) => chooseSound(level, value)}>
               <SelectTrigger
                 aria-label={`${LEVEL_LABELS[level]} sound`}
                 data-testid={`sound-alert-sound-${level}`}
@@ -158,6 +196,16 @@ export function SoundAlertSettings() {
                     {sound.label}
                   </SelectItem>
                 ))}
+                {systemSounds.length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>System sounds</SelectLabel>
+                    {systemSounds.map((name) => (
+                      <SelectItem key={`system:${name}`} value={`${SYSTEM_SOUND_PREFIX}${name}`}>
+                        {name}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
               </SelectContent>
             </Select>
             <Button
@@ -167,7 +215,7 @@ export function SoundAlertSettings() {
               onClick={() =>
                 // The click is a user gesture: unlock before playing so the
                 // first preview in a fresh tab is audible.
-                void playBuiltinSound(account.levels[level].sound, device.volume, { resume: true })
+                void playLevel(level, account, device, { resume: true })
               }
             >
               Play
@@ -175,6 +223,12 @@ export function SoundAlertSettings() {
           </div>
         </div>
       ))}
+
+      {systemSounds.length > 0 && (
+        <p className="text-sm text-muted-foreground" data-testid="sound-alert-system-sounds-hint">
+          System sounds apply to this device only.
+        </p>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
         <label className="flex items-center gap-2 text-sm text-foreground">

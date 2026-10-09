@@ -1,10 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { BUILTIN_SOUNDS } from "./soundAlertPreferences";
+const { playNativeSystemSoundMock } = vi.hoisted(() => ({
+  playNativeSystemSoundMock: vi.fn(),
+}));
+
+vi.mock("./nativeBridge", () => ({
+  playNativeSystemSound: playNativeSystemSoundMock,
+}));
+
+import {
+  BUILTIN_SOUNDS,
+  SOUND_ALERT_DEFAULTS,
+  SOUND_ALERT_DEVICE_DEFAULTS,
+  type SoundAlertDevicePreferences,
+} from "./soundAlertPreferences";
 import {
   initAudio,
   isAudioLocked,
   playBuiltinSound,
+  playLevel,
   resetSoundPlayerForTests,
   subscribeAudioLock,
 } from "./soundPlayer";
@@ -32,6 +46,12 @@ class FakeOscillatorNode {
   stop = vi.fn();
 }
 
+class FakeBufferSource {
+  buffer: unknown = null;
+  connect = vi.fn();
+  start = vi.fn();
+}
+
 class FakeAudioContext {
   static instances: FakeAudioContext[] = [];
   static ignoreResume = false;
@@ -40,6 +60,7 @@ class FakeAudioContext {
   destination = { name: "destination" };
   gainNodes: FakeGainNode[] = [];
   oscillators: FakeOscillatorNode[] = [];
+  bufferSources: FakeBufferSource[] = [];
 
   constructor() {
     FakeAudioContext.instances.push(this);
@@ -57,6 +78,14 @@ class FakeAudioContext {
     return node;
   }
 
+  createBufferSource(): FakeBufferSource {
+    const node = new FakeBufferSource();
+    this.bufferSources.push(node);
+    return node;
+  }
+
+  decodeAudioData = vi.fn(async (_data: ArrayBuffer) => ({ duration: 0.5 }));
+
   resume = vi.fn(async () => {
     if (FakeAudioContext.ignoreResume) return;
     this.state = "running";
@@ -72,12 +101,20 @@ function removeAudioContext(): void {
   delete (window as unknown as { webkitAudioContext?: unknown }).webkitAudioContext;
 }
 
+function deviceWith(
+  overrides: Partial<SoundAlertDevicePreferences> = {},
+): SoundAlertDevicePreferences {
+  return { ...SOUND_ALERT_DEVICE_DEFAULTS, ...overrides };
+}
+
 describe("sound player", () => {
   beforeEach(() => {
     FakeAudioContext.instances = [];
     FakeAudioContext.ignoreResume = false;
     installAudioContext();
     resetSoundPlayerForTests();
+    playNativeSystemSoundMock.mockReset();
+    playNativeSystemSoundMock.mockResolvedValue({ played: false });
   });
 
   afterEach(() => {
@@ -172,5 +209,45 @@ describe("sound player", () => {
       const [stop] = oscillator.stop.mock.calls[0];
       expect(stop - start).toBeLessThanOrEqual(0.6);
     }
+  });
+
+  it("plays a device system-sound override through the shell, not the built-in", async () => {
+    initAudio({ native: true });
+    playNativeSystemSoundMock.mockResolvedValue({ played: true });
+
+    await playLevel("done", SOUND_ALERT_DEFAULTS, deviceWith({ systemSounds: { done: "Glass" } }));
+
+    expect(playNativeSystemSoundMock).toHaveBeenCalledWith("Glass", 0.7);
+    expect(FakeAudioContext.instances[0].oscillators).toHaveLength(0);
+  });
+
+  it("falls back to the built-in sound when the shell does not play the system sound", async () => {
+    initAudio({ native: true });
+    playNativeSystemSoundMock.mockResolvedValue({ played: false });
+
+    await playLevel("done", SOUND_ALERT_DEFAULTS, deviceWith({ systemSounds: { done: "Glass" } }));
+
+    expect(FakeAudioContext.instances[0].oscillators.length).toBeGreaterThan(0);
+  });
+
+  it("decodes shell WAV bytes and plays them through a gain node at the device volume", async () => {
+    initAudio({ native: true });
+    playNativeSystemSoundMock.mockResolvedValue({ bytes: new Uint8Array([1, 2, 3, 4]) });
+
+    await playLevel(
+      "done",
+      SOUND_ALERT_DEFAULTS,
+      deviceWith({ systemSounds: { done: "ding" }, volume: 0.3 }),
+    );
+
+    const context = FakeAudioContext.instances[0];
+    expect(context.decodeAudioData).toHaveBeenCalledTimes(1);
+    const [decoded] = context.decodeAudioData.mock.calls[0];
+    expect((decoded as ArrayBuffer).byteLength).toBe(4);
+    expect(context.bufferSources).toHaveLength(1);
+    expect(context.bufferSources[0].start).toHaveBeenCalled();
+    expect(context.oscillators).toHaveLength(0);
+    const master = context.gainNodes.find((node) => node.connectedTo.includes(context.destination));
+    expect(master?.gain.value).toBe(0.3);
   });
 });

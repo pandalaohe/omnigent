@@ -25,7 +25,7 @@ function account(overrides: Partial<SoundAlertPreferences> = {}): SoundAlertPref
 }
 
 function device(overrides: Partial<SoundAlertDevicePreferences> = {}): SoundAlertDevicePreferences {
-  return { enabled: true, volume: 0.7, systemSounds: {}, ...overrides };
+  return { enabled: true, volume: 0.7, systemSounds: {}, legacySoundMigrated: false, ...overrides };
 }
 
 function alert(level: SoundLevel, sessionId = "conv_a"): SoundAlert {
