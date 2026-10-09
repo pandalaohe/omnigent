@@ -250,6 +250,7 @@ def build_native_controls(
     _run_turn_bg: Callable[[_JsonObject, str, str], Coroutine[Any, Any, None]],
     _sdk_compact_inprogress: set[str],
     _session_cursor_model_names: dict[str, dict[str, str]],
+    _session_global_instructions: dict[str, str | None],
     _session_harness_name: Callable[[str], str | None],
     _session_histories: dict[str, list[_JsonObject]],
     _session_message_buffers: dict[str, list[dict[str, Any]]],
@@ -1683,6 +1684,7 @@ def build_native_controls(
                 agent_spec=spec,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
+                global_instructions=_session_global_instructions.get(conv_id),
             )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(

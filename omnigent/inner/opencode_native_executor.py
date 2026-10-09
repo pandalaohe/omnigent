@@ -22,6 +22,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR,
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     read_bridge_state,
+    read_session_instructions,
 )
 from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
 from omnigent.native.native_server_harness import NativeServerHarness
@@ -54,8 +55,16 @@ class OpenCodeNativeExecutor(NativeServerHarness):
         )
 
     def _gate_system_prompt(self, system_prompt: str) -> str | None:
-        """Attach the runner's composed instructions to this turn; ``None`` omits the field."""
-        return system_prompt or None
+        """Attach the runner's composed instructions to this turn; ``None`` omits the field.
+
+        Also omits when the session instructions file already carries the same
+        text: the file loads into every turn, so re-sending it would duplicate it.
+        """
+        if not system_prompt:
+            return None
+        if system_prompt == read_session_instructions(self._bridge_dir):
+            return None
+        return system_prompt
 
     def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """

@@ -66,6 +66,11 @@ from omnigent.runner.app import (
     _publish_terminal_pending,
     _terminal_lookup_miss_log_state,
 )
+from omnigent.runner.native import (
+    NativeLaunchContext,
+    _launch_opencode,
+    _OpenCodeNativeLaunchConfig,
+)
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -5161,3 +5166,129 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
 
     await fake_client.aclose()
+
+
+class _OpenCodeStartSentinel(Exception):
+    """Raised by the fake server so the launch stops right after the config write."""
+
+
+async def _run_opencode_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_spec: AgentSpec,
+    global_instructions: str | None,
+) -> tuple[Path, Path]:
+    """Drive ``_launch_opencode`` up to the server start.
+
+    Stops at the fake server's ``start()`` and returns ``(bridge_dir,
+    config_path)`` so callers can inspect the synthesized ``opencode.json``.
+    """
+    from omnigent.harnesses.opencode_native import app_server as opencode_app_server
+    from omnigent.harnesses.opencode_native import bridge as opencode_bridge
+    from omnigent.harnesses.opencode_native import provider as opencode_provider
+    from omnigent.runner.native import orchestration as orchestration_mod
+
+    monkeypatch.setattr(opencode_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
+    monkeypatch.setattr(opencode_bridge, "seed_opencode_auth", lambda *a, **k: None)
+    monkeypatch.setattr(opencode_provider, "resolve_bound_opencode_gateway", lambda *a, **k: None)
+    monkeypatch.setattr(opencode_provider, "resolve_databricks_gateway", lambda *a, **k: None)
+    monkeypatch.setattr(opencode_provider, "managed_connect_opencode_config", lambda *a, **k: None)
+    monkeypatch.setattr(
+        opencode_provider, "maybe_merge_user_provider_config", lambda config: config
+    )
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+
+    async def _fake_launch_config(*, session_id: str, server_client: Any) -> Any:
+        return _OpenCodeNativeLaunchConfig(
+            workspace=tmp_path / "ws",
+            policy_server_url="http://127.0.0.1:1",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr(orchestration_mod, "_opencode_native_launch_config", _fake_launch_config)
+
+    class _FakeServer:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def start(self) -> None:
+            raise _OpenCodeStartSentinel
+
+    monkeypatch.setattr(opencode_app_server, "OpenCodeNativeServer", _FakeServer)
+
+    session_id = "opencode-launch-session"
+    with pytest.raises(_OpenCodeStartSentinel):
+        await _launch_opencode(
+            NativeLaunchContext(
+                session_id=session_id,
+                resource_registry=object(),  # type: ignore[arg-type]
+                publish_event=lambda *_: None,
+                agent_spec=agent_spec,
+                global_instructions=global_instructions,
+            )
+        )
+    bridge_dir = opencode_bridge.bridge_dir_for_bridge_id(session_id)
+    config_path = (
+        opencode_bridge.xdg_config_home_for_bridge_dir(bridge_dir) / "opencode" / "opencode.json"
+    )
+    return bridge_dir, config_path
+
+
+@pytest.mark.asyncio
+async def test_launch_opencode_registers_session_instructions_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch registers the composed session text as a config instructions file."""
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="opencode-agent",
+        instructions="Be a concise, careful coding assistant.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    bridge_dir, config_path = await _run_opencode_launch(
+        tmp_path, monkeypatch, agent_spec=agent_spec, global_instructions="G"
+    )
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["instructions"] == [str(bridge_dir / "session_instructions.md")]
+    assert (bridge_dir / "session_instructions.md").read_text(encoding="utf-8") == (
+        "Be a concise, careful coding assistant.\n\n"
+        + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+        + "\n\nG"
+    )
+
+
+@pytest.mark.asyncio
+async def test_launch_opencode_overwrites_stale_instructions_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Framework-only text is written even with no author/global text, overwriting stale."""
+    from omnigent.harnesses.opencode_native import bridge as opencode_bridge
+
+    monkeypatch.setattr(opencode_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
+    stale_bridge_dir = opencode_bridge.bridge_dir_for_bridge_id("opencode-launch-session")
+    stale_bridge_dir.mkdir(parents=True, exist_ok=True)
+    stale_file = stale_bridge_dir / "session_instructions.md"
+    stale_file.write_text("stale text from an earlier launch", encoding="utf-8")
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="opencode-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    bridge_dir, config_path = await _run_opencode_launch(
+        tmp_path, monkeypatch, agent_spec=agent_spec, global_instructions=None
+    )
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["instructions"] == [str(bridge_dir / "session_instructions.md")]
+    assert (bridge_dir / "session_instructions.md").read_text(encoding="utf-8") == (
+        EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    )

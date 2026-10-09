@@ -9562,6 +9562,7 @@ def create_runner_app(
         _run_turn_bg=_run_turn_bg,
         _sdk_compact_inprogress=_sdk_compact_inprogress,
         _session_cursor_model_names=_session_cursor_model_names,
+        _session_global_instructions=_session_global_instructions,
         _session_harness_name=_session_harness_name,
         _session_histories=_session_histories,
         _session_message_buffers=_session_message_buffers,
