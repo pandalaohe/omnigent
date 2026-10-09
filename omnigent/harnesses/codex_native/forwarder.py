@@ -26,6 +26,7 @@ from omnigent.harnesses.codex_egress import (
 )
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
+    CODEX_TOOL_OBSERVER_STATUS_MESSAGE,
     CodexAppServerClient,
     CodexAppServerResponseError,
     CodexMessage,
@@ -3818,7 +3819,8 @@ async def _handle_hook_completed(
     Codex. An entry's position in ``run.entries``
     keys its item, so a replayed notification derives the same
     idempotency keys; the thread id in the key keeps identical run ids on
-    different threads apart.
+    different threads apart. A run marked as the tool observer is softened
+    to an info-level notice that says the tool call is unaffected.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -3843,6 +3845,7 @@ async def _handle_hook_completed(
     entries = run.get("entries")
     if not isinstance(entries, list):
         return
+    observer_run = run.get("statusMessage") == CODEX_TOOL_OBSERVER_STATUS_MESSAGE
     # Hook run ids embed the hooks file path; response ids are stored in 64 chars.
     digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
     response_id = f"codex_hook_{digest}"
@@ -3858,7 +3861,12 @@ async def _handle_hook_completed(
         text = entry.get("text")
         if not isinstance(text, str) or not text.strip():
             continue
-        code, level = notice
+        if observer_run:
+            code, level = "codex_tool_observer", "info"
+            message = f"Omnigent tool observer: {text}. The tool call itself is not affected."
+        else:
+            code, level = notice
+            message = text
         await _post_external_item(
             client,
             session_id,
@@ -3867,7 +3875,7 @@ async def _handle_hook_completed(
                 "source": "harness",
                 "code": code,
                 "level": level,
-                "message": text,
+                "message": message,
             },
             response_id=response_id,
             source_id=f"codex-hook:{thread_id}:{run_id}:{index}",

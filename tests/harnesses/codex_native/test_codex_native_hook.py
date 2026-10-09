@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -177,6 +178,34 @@ def _run_hook(
     """
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     return codex_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+
+def test_hook_import_does_not_pull_policy_or_bridge_modules() -> None:
+    """
+    Importing the hook module must not drag in the policy/bridge modules.
+
+    ``observe-tool`` runs after every tool call under a short Codex hook
+    timeout; its budget is interpreter start plus this import, and the
+    policy/bridge modules pull httpx and friends the observer never needs.
+    A fresh ``-I`` interpreter is the only way to see what the module
+    actually imports at top level.
+    """
+    code = (
+        "import sys\n"
+        "import omnigent.harnesses.codex_native.hook\n"
+        "print([name for name in ("
+        "'httpx',"
+        "'omnigent.harnesses.codex_native.bridge',"
+        "'omnigent.native.native_policy_hook',"
+        ") if name in sys.modules])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "[]"
 
 
 def test_pre_tool_use_converts_posts_and_returns_deny(

@@ -18,12 +18,17 @@ _PATH_RUN_ID = (
 _RESPONSE_ID_MAX_CHARS = SqlConversationItem.__table__.c.response_id.type.length
 
 
-async def _forward(tmp_path, entries, *, thread="parent", run_id="hook-1", replay=False):
+async def _forward(
+    tmp_path, entries, *, thread="parent", run_id="hook-1", replay=False, status_message=None
+):
     """Exercise real event routing and HTTP payload generation."""
     client = AsyncMock()
     client.post.return_value = httpx.Response(200)
     state = fwd._CodexForwarderState()
     state.subagents_by_thread["child"] = "child-session"
+    run: dict[str, object] = {"id": run_id, "entries": entries}
+    if status_message is not None:
+        run["statusMessage"] = status_message
     await fwd._handle_event(
         client,
         session_id="parent-session",
@@ -32,7 +37,7 @@ async def _forward(tmp_path, entries, *, thread="parent", run_id="hook-1", repla
             "method": "hook/completed",
             "params": {
                 "threadId": thread,
-                "run": {"id": run_id, "entries": entries},
+                "run": run,
             },
         },
         usage_coalescer=fwd._SessionUsageCoalescer(client, "parent-session"),
@@ -42,6 +47,35 @@ async def _forward(tmp_path, entries, *, thread="parent", run_id="hook-1", repla
         is_replay=replay,
     )
     return client.post.call_args_list
+
+
+@pytest.mark.asyncio
+async def test_marked_observer_run_is_softened_to_an_info_notice(tmp_path: Path) -> None:
+    """The observer's own hook failure is informational; a user hook's is not."""
+    from omnigent.harnesses.codex_native.app_server import CODEX_TOOL_OBSERVER_STATUS_MESSAGE
+
+    observer_posts = await _forward(
+        tmp_path,
+        [{"kind": "error", "text": "hook timed out after 3s"}],
+        status_message=CODEX_TOOL_OBSERVER_STATUS_MESSAGE,
+    )
+    assert len(observer_posts) == 1
+    observer = ErrorData.model_validate(observer_posts[0].kwargs["json"]["data"]["item_data"])
+    assert observer.level == "info"
+    assert observer.code == "codex_tool_observer"
+    assert "hook timed out after 3s" in observer.message
+    assert "not affected" in observer.message
+
+    user_posts = await _forward(
+        tmp_path,
+        [{"kind": "error", "text": "hook timed out after 3s"}],
+        run_id="hook-user",
+        status_message="running lint",
+    )
+    assert len(user_posts) == 1
+    user = ErrorData.model_validate(user_posts[0].kwargs["json"]["data"]["item_data"])
+    assert user.level == "error"
+    assert user.code == "codex_hook_error"
 
 
 @pytest.mark.asyncio
