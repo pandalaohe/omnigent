@@ -31,6 +31,8 @@ import {
   ArchiveIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
+  BellIcon,
+  BellOffIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
@@ -208,6 +210,10 @@ import {
 } from "@/hooks/useSessionState";
 import { useSessionErrorStates } from "@/hooks/useSessionErrors";
 import type { LatestSessionError } from "@/lib/sessionError";
+import { rowMark } from "@/lib/rowMark";
+import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
+import { readSoundAlertPreferences, writeSoundAlertPreferences } from "@/lib/soundAlertPreferences";
+import { SoundAlertsLockedHint } from "@/components/SoundAlertSettings";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -2952,6 +2958,9 @@ function ConversationList({
                   )}
                 </>
               )}
+              {/* Browsers keep audio locked until a gesture; the hint clears
+                  itself the moment the context unlocks. */}
+              <SoundAlertsLockedHint />
             </div>
           </PinSavingContext.Provider>
         </RowEditHoldContext.Provider>
@@ -3871,6 +3880,10 @@ function ConversationMenuItems({
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
+  // Sound mutes are account-scoped and synced; the menu mounts lazily, so
+  // reading them here doesn't subscribe every row to preference changes.
+  const { account: soundAccount } = useSoundAlertPreferences();
+  const soundsMuted = soundAccount.mutedSessionIds.includes(conversation.id);
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -4039,6 +4052,22 @@ function ConversationMenuItems({
           Mark as read
         </C.Item>
       )}
+      <C.Item
+        data-testid={soundsMuted ? "unmute-sounds-conversation" : "mute-sounds-conversation"}
+        onSelect={() => {
+          // Read at select time so back-to-back mutes don't overwrite each
+          // other with the account snapshot this menu rendered with.
+          const preferences = readSoundAlertPreferences();
+          const mutedSessionIds = preferences.mutedSessionIds.includes(conversation.id)
+            ? preferences.mutedSessionIds.filter((id) => id !== conversation.id)
+            : [...preferences.mutedSessionIds, conversation.id];
+          writeSoundAlertPreferences({ ...preferences, mutedSessionIds });
+          setMenuOpen(false);
+        }}
+      >
+        {soundsMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
+        {soundsMuted ? "Unmute sounds" : "Mute sounds"}
+      </C.Item>
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
@@ -4516,7 +4545,6 @@ function ConversationRowImpl({
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const goalState = showGoalSessionMarkers ? (conversation.goal_state ?? null) : null;
   // A write for another conversation leaves this primitive snapshot unchanged,
   // so useSyncExternalStore skips the heavy row render. The status fed in is the
   // fork's foreground status rather than the raw one, so a session busy only in
@@ -4527,9 +4555,6 @@ function ConversationRowImpl({
     getConversationForegroundStatus(conversation),
   );
   const isLogicallyUnread = readState.unseen && (!isActive || readState.explicitlyUnread);
-  // A session already framed by an active goal marker advertises the goal
-  // instead of the dot, so it never double-signals.
-  const hasUnseenMessages = isLogicallyUnread && goalState !== "active";
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !isLogicallyUnread;
   // Badge precedence: a pending approval ("Needs response") outranks the
@@ -4539,7 +4564,6 @@ function ConversationRowImpl({
   // ahead of the dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
   const [latestError] = useSessionErrorStates(errorConversations);
-  const derivedState = getSessionState(conversation, latestError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -4550,17 +4574,35 @@ function ConversationRowImpl({
   const isStartingUp = useChatStore(
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
-  const sessionState =
-    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
-      ? derivedState
-      : isStartingUp
-        ? { kind: "starting" as const }
-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
+  const mark = rowMark(conversation, {
+    unseen: isLogicallyUnread,
+    latestError,
+    showGoalMarkers: showGoalSessionMarkers,
+    starting: isStartingUp,
+  });
+  const goalState = mark.goal === "none" ? null : mark.goal;
+  // A session already framed by an active goal marker advertises the goal
+  // instead of the dot, so it never double-signals.
+  const hasUnseenMessages = isLogicallyUnread && goalState !== "active";
+  const sessionState: SessionState | null =
+    mark.state === "awaiting"
+      ? { kind: "awaiting", count: mark.awaitingCount }
+      : mark.state === "running"
+        ? { kind: "running" }
+        : mark.state === "starting"
+          ? { kind: "starting" }
+          : mark.state === "error"
+            ? { kind: "error" }
+            : mark.state === "disconnected"
+              ? { kind: "disconnected" }
+              : mark.state === "unseen"
+                ? { kind: "unseen" }
+                : null;
   // Cold keep-warm: recolor the unseen dot / awaiting tag, and show a blue
   // dot of its own when the idle row has no other session state to display.
   const isCold = conversation.warm_state === "cold";
   const keepWarm = conversation.keep_warm ?? null;
-  const hasColdIdleDot = isCold && sessionState === null;
+  const hasColdIdleDot = mark.state === "cold";
   const backgroundActivityCount = Math.max(0, conversation.background_activity_count ?? 0);
   const hasBackgroundActivity = backgroundActivityCount > 0;
   const hasGoalMarker = goalState === "active" || goalState === "paused";

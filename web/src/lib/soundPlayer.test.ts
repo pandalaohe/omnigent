@@ -34,6 +34,7 @@ class FakeOscillatorNode {
 
 class FakeAudioContext {
   static instances: FakeAudioContext[] = [];
+  static ignoreResume = false;
   state: "suspended" | "running" = "suspended";
   currentTime = 0;
   destination = { name: "destination" };
@@ -57,6 +58,7 @@ class FakeAudioContext {
   }
 
   resume = vi.fn(async () => {
+    if (FakeAudioContext.ignoreResume) return;
     this.state = "running";
   });
 }
@@ -73,6 +75,7 @@ function removeAudioContext(): void {
 describe("sound player", () => {
   beforeEach(() => {
     FakeAudioContext.instances = [];
+    FakeAudioContext.ignoreResume = false;
     installAudioContext();
     resetSoundPlayerForTests();
   });
@@ -110,6 +113,30 @@ describe("sound player", () => {
   it("is a silent no-op while locked", async () => {
     await expect(playBuiltinSound("chime", 0.5)).resolves.toBeUndefined();
     expect(FakeAudioContext.instances).toHaveLength(0);
+  });
+
+  it("falls back to a gesture unlock when native autoplay is refused", () => {
+    FakeAudioContext.ignoreResume = true;
+    initAudio({ native: true });
+
+    expect(isAudioLocked()).toBe(true);
+    expect(FakeAudioContext.instances[0].resume).toHaveBeenCalledTimes(1);
+
+    window.dispatchEvent(new Event("pointerdown"));
+
+    expect(FakeAudioContext.instances[0].resume).toHaveBeenCalledTimes(2);
+  });
+
+  it("unlocks and plays when asked to resume from a user gesture", async () => {
+    initAudio({ native: false });
+    expect(isAudioLocked()).toBe(true);
+
+    await playBuiltinSound("ping", 0.5, { resume: true });
+
+    const context = FakeAudioContext.instances[0];
+    expect(context.state).toBe("running");
+    expect(context.oscillators.length).toBeGreaterThan(0);
+    expect(isAudioLocked()).toBe(false);
   });
 
   it("stays silent when the runtime has no AudioContext", async () => {

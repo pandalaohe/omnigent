@@ -38,6 +38,22 @@ function useAudioLocked(): boolean {
   return locked;
 }
 
+/**
+ * One-line unlock hint for outside Settings (the sidebar's list footer).
+ * Hidden once audio unlocks, in a native shell, or when nothing would play.
+ */
+export function SoundAlertsLockedHint() {
+  const audioLocked = useAudioLocked();
+  const { account, device } = useSoundAlertPreferences();
+  const anyLevelEnabled = SOUND_LEVELS.some((level) => isSoundLevelEnabled(account, level));
+  if (!audioLocked || isNativeShell() || !device.enabled || !anyLevelEnabled) return null;
+  return (
+    <p className="px-2 py-1 text-ui text-muted-foreground" data-testid="sound-alerts-locked-hint">
+      Click anywhere in the app to enable sounds.
+    </p>
+  );
+}
+
 export function SoundAlertSettings() {
   const { account, device } = useSoundAlertPreferences();
   const audioLocked = useAudioLocked();
@@ -120,7 +136,11 @@ export function SoundAlertSettings() {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => void playBuiltinSound(account.levels[level].sound, device.volume)}
+              onClick={() =>
+                // The click is a user gesture: unlock before playing so the
+                // first preview in a fresh tab is audible.
+                void playBuiltinSound(account.levels[level].sound, device.volume, { resume: true })
+              }
             >
               Play
             </Button>
@@ -159,6 +179,27 @@ export function SoundAlertSettings() {
           />
         </div>
       </div>
+
+      {account.mutedSessionIds.length > 0 && (
+        <div
+          className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3"
+          data-testid="sound-alert-muted-sessions"
+        >
+          <span className="text-sm text-muted-foreground">
+            {account.mutedSessionIds.length} muted{" "}
+            {account.mutedSessionIds.length === 1 ? "session" : "sessions"}
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="sound-alert-unmute-all"
+            onClick={() => writeSoundAlertPreferences({ ...account, mutedSessionIds: [] })}
+          >
+            Unmute all
+          </Button>
+        </div>
+      )}
 
       {audioLocked && !isNativeShell() && (
         <p className="text-sm text-muted-foreground">Click anywhere in the app to enable sounds.</p>

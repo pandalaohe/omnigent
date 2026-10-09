@@ -1,53 +1,109 @@
 // Pure edge detection for sound alerts.
 //
-// The hook owns the previous-snapshot ref; this module only diffs two
-// snapshots. The row state starts minimal (awaiting count) and grows with
-// later slices that add the done/error marks.
+// The hook owns the previous-snapshot ref and the settle timers; this module
+// only diffs two snapshots. The first snapshot after load and any session
+// absent from the previous one are baselines, not edges.
 
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionState } from "@/hooks/useSessionState";
-import type { SoundLevel } from "@/lib/soundAlertPreferences";
+import type { SoundAlertQuietHours, SoundLevel } from "@/lib/soundAlertPreferences";
+import { rowMark, type RowMark, type RowMarkContext } from "@/lib/rowMark";
 
 export interface RowSoundState {
-  awaitingCount: number;
+  mark: RowMark;
+  updatedAt: number;
 }
 
 export interface SoundAlert {
   sessionId: string;
   level: SoundLevel;
+  alertId: string;
+}
+
+export interface EdgeResult {
+  immediate: SoundAlert[];
+  settleStart: string[];
+  settleCancel: string[];
+}
+
+/** A dot the user has not seen that is not covered by background work. */
+export function isDoneCandidate(state: RowSoundState): boolean {
+  return state.mark.state === "unseen" && !state.mark.background;
+}
+
+/** Stable identity for de-duplication across re-deliveries of one edge. */
+export function alertId(sessionId: string, level: SoundLevel, s: RowSoundState): string {
+  const base = `${sessionId}:${level}:${s.updatedAt}`;
+  return level === "needs_response" ? `${base}:${s.mark.awaitingCount}` : base;
 }
 
 /**
  * Alerts for sessions whose state changed between two snapshots.
  *
  * `previous === null` is the first snapshot after load and a session absent
- * from `previous` is newly loaded: both are baselines, not edges. Only a
- * rising awaiting count on a known session fires, once per transition.
+ * from `previous` is newly loaded: both are baselines, not edges.
  */
 export function detectEdges(
   previous: Map<string, RowSoundState> | null,
   next: Map<string, RowSoundState>,
-): SoundAlert[] {
-  if (previous === null) return [];
-  const alerts: SoundAlert[] = [];
+): EdgeResult {
+  const result: EdgeResult = { immediate: [], settleStart: [], settleCancel: [] };
+  if (previous === null) return result;
   for (const [sessionId, state] of next) {
     const prior = previous.get(sessionId);
     if (prior === undefined) continue;
-    if (state.awaitingCount > prior.awaitingCount) {
-      alerts.push({ sessionId, level: "needs_response" });
+    if (state.mark.awaitingCount > prior.mark.awaitingCount) {
+      result.immediate.push({
+        sessionId,
+        level: "needs_response",
+        alertId: alertId(sessionId, "needs_response", state),
+      });
     }
+    const enteredFailure =
+      (state.mark.state === "error" || state.mark.state === "disconnected") &&
+      prior.mark.state !== "error" &&
+      prior.mark.state !== "disconnected";
+    if (enteredFailure) {
+      result.immediate.push({
+        sessionId,
+        level: "error",
+        alertId: alertId(sessionId, "error", state),
+      });
+    }
+    const done = isDoneCandidate(state);
+    if (done && !isDoneCandidate(prior)) result.settleStart.push(sessionId);
+    else if (!done && isDoneCandidate(prior)) result.settleCancel.push(sessionId);
   }
-  return alerts;
+  return result;
+}
+
+function parseTimeOfDay(value: string): number {
+  const [hours, minutes] = value.split(":");
+  return Number(hours) * 60 + Number(minutes);
+}
+
+/** Whether the account's quiet-hours window covers the given local time. */
+export function isQuietNow(quietHours: SoundAlertQuietHours, now: Date): boolean {
+  if (!quietHours.enabled) return false;
+  const start = parseTimeOfDay(quietHours.start);
+  const end = parseTimeOfDay(quietHours.end);
+  if (start === end) return false;
+  const current = now.getHours() * 60 + now.getMinutes();
+  if (start < end) return current >= start && current < end;
+  // The window wraps past midnight.
+  return current >= start || current < end;
 }
 
 /** Top-level rows only: a child's prompts are its parent's to surface. */
-export function buildRowSoundStates(conversations: Conversation[]): Map<string, RowSoundState> {
+export function buildRowSoundStates(
+  conversations: readonly Conversation[],
+  ctxFor: (conversation: Conversation) => RowMarkContext,
+): Map<string, RowSoundState> {
   const states = new Map<string, RowSoundState>();
   for (const conversation of conversations) {
     if (conversation.parent_session_id) continue;
-    const state = getSessionState(conversation);
     states.set(conversation.id, {
-      awaitingCount: state?.kind === "awaiting" ? state.count : 0,
+      mark: rowMark(conversation, ctxFor(conversation)),
+      updatedAt: conversation.updated_at,
     });
   }
   return states;

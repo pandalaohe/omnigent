@@ -2,6 +2,14 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
+const { playBuiltinSoundMock } = vi.hoisted(() => ({ playBuiltinSoundMock: vi.fn() }));
+
+vi.mock("@/lib/soundPlayer", () => ({
+  isAudioLocked: () => false,
+  subscribeAudioLock: () => () => {},
+  playBuiltinSound: playBuiltinSoundMock,
+}));
+
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> lets the tests drive the sound choice directly.
 vi.mock("@/components/ui/select", async () => {
@@ -48,14 +56,18 @@ import { SOUND_ALERTS_STORAGE_KEY } from "@/lib/soundAlertPreferences";
 
 interface StoredPreferences {
   levels: Record<string, { enabled: boolean; sound: string }>;
+  mutedSessionIds?: string[];
 }
 
-function stored(): StoredPreferences {
-  return JSON.parse(localStorage.getItem(SOUND_ALERTS_STORAGE_KEY) ?? "null") as StoredPreferences;
+function stored(): StoredPreferences | null {
+  return JSON.parse(
+    localStorage.getItem(SOUND_ALERTS_STORAGE_KEY) ?? "null",
+  ) as StoredPreferences | null;
 }
 
 beforeEach(() => {
   localStorage.clear();
+  playBuiltinSoundMock.mockClear();
 });
 
 afterEach(() => cleanup());
@@ -69,8 +81,8 @@ describe("SoundAlertSettings", () => {
     fireEvent.click(toggle);
 
     expect(toggle).toHaveAttribute("aria-checked", "false");
-    expect(stored().levels.done.enabled).toBe(false);
-    expect(stored().levels.error.enabled).toBe(true);
+    expect(stored()?.levels.done.enabled).toBe(false);
+    expect(stored()?.levels.error.enabled).toBe(true);
   });
 
   it("writes a sound choice from the select", () => {
@@ -78,6 +90,29 @@ describe("SoundAlertSettings", () => {
 
     fireEvent.change(screen.getByTestId("sound-alert-sound-done"), { target: { value: "pop" } });
 
-    expect(stored().levels.done.sound).toBe("pop");
+    expect(stored()?.levels.done.sound).toBe("pop");
+  });
+
+  it("resumes audio for the preview", () => {
+    render(<SoundAlertSettings />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Play" })[0]);
+
+    expect(playBuiltinSoundMock).toHaveBeenCalledWith("chime", 0.7, { resume: true });
+  });
+
+  it("summarizes muted sessions and can unmute all", () => {
+    localStorage.setItem(
+      SOUND_ALERTS_STORAGE_KEY,
+      JSON.stringify({ mutedSessionIds: ["conv_a", "conv_b"] }),
+    );
+    render(<SoundAlertSettings />);
+
+    expect(screen.getByTestId("sound-alert-muted-sessions")).toHaveTextContent("2 muted sessions");
+
+    fireEvent.click(screen.getByTestId("sound-alert-unmute-all"));
+
+    expect(stored()?.mutedSessionIds ?? []).toEqual([]);
+    expect(screen.queryByTestId("sound-alert-muted-sessions")).not.toBeInTheDocument();
   });
 });

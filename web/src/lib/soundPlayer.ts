@@ -136,7 +136,12 @@ function unlockAudio(): void {
 export function initAudio({ native }: { native: boolean }): void {
   if (context !== null) return;
   if (native) {
-    if (createContextIfPossible()) resumeContext();
+    if (createContextIfPossible()) {
+      resumeContext();
+      // Native shells usually allow autoplay; when resume hasn't landed yet
+      // (or fails), a later gesture can still unlock the context.
+      if (isAudioLocked()) attachUnlockListeners();
+    }
     return;
   }
   attachUnlockListeners();
@@ -155,7 +160,35 @@ export function subscribeAudioLock(listener: () => void): () => void {
   };
 }
 
-export async function playBuiltinSound(id: BuiltinSoundId, volume: number): Promise<void> {
+/** Resume (or create) the context; resolves whether it is running. */
+async function ensureRunning(): Promise<boolean> {
+  if (!createContextIfPossible()) return false;
+  const current = context;
+  if (!current) return false;
+  if (current.state !== "running") {
+    try {
+      await current.resume();
+    } catch {
+      // A resume outside a user gesture can throw; stay locked until one arrives.
+    }
+  }
+  if (context !== current) return false;
+  if (current.state === "running") detachUnlockListeners();
+  notifyAudioLock();
+  return current.state === "running";
+}
+
+/**
+ * Play a builtin sound. `resume: true` is for call sites that run inside a
+ * user gesture (the settings preview), where unlocking the context first is
+ * both allowed and required for the first audible note.
+ */
+export async function playBuiltinSound(
+  id: BuiltinSoundId,
+  volume: number,
+  options: { resume?: boolean } = {},
+): Promise<void> {
+  if (options.resume && !(await ensureRunning())) return;
   const current = context;
   if (!current || current.state !== "running") return;
   const master = current.createGain();
