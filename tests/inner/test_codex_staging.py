@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import stat
@@ -481,6 +482,129 @@ def test_remove_codex_home_keeps_marker_when_a_child_survives(
     assert remove_codex_home(home) is True
     assert not home.exists()
     assert not marker.exists()
+
+
+def _model_windows_read_only_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model Windows on POSIX: platform win32, and a file without its write bit
+    cannot be unlinked.
+    """
+    monkeypatch.setattr(codex_staging, "sys", SimpleNamespace(platform="win32"))
+    real_unlink = os.unlink
+
+    def unlink(path: str, *, dir_fd: int | None = None) -> None:
+        if not os.lstat(path, dir_fd=dir_fd).st_mode & stat.S_IWRITE:
+            raise PermissionError(errno.EACCES, "read-only file", path)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+
+
+def test_remove_codex_home_clears_read_only_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    home = _make_home(root, "git-clone")
+    write_codex_home_owner(home)
+    pack = home / ".tmp" / "plugins" / ".git" / "objects" / "pack"
+    pack.mkdir(parents=True)
+    for name in ("pack-1.pack", "pack-1.idx", "pack-1.rev"):
+        (pack / name).write_bytes(b"x")
+        (pack / name).chmod(0o444)
+    _model_windows_read_only_files(monkeypatch)
+
+    assert remove_codex_home(home) is True
+    assert not home.exists()
+    assert not _marker(home).exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory symlinks")
+def test_remove_codex_home_never_chmods_a_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_staging, "sys", SimpleNamespace(platform="win32"))
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("keep")
+    keep.chmod(0o444)
+    home = _make_home(root, "linked")
+    (home / "skills").symlink_to(outside, target_is_directory=True)
+
+    real_unlink = os.unlink
+
+    def unlink(path: str, *, dir_fd: int | None = None) -> None:
+        if stat.S_ISLNK(os.lstat(path, dir_fd=dir_fd).st_mode):
+            raise PermissionError(errno.EACCES, "read-only link", path)
+        real_unlink(path, dir_fd=dir_fd)
+
+    chmodded: list[Path] = []
+    real_chmod = os.chmod
+
+    def chmod(path: str, mode: int) -> None:
+        chmodded.append(Path(path))
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "chmod", chmod)
+
+    assert remove_codex_home(home) is False
+    assert (home / "skills").is_symlink()
+    assert chmodded == []
+    assert stat.S_IMODE(keep.stat().st_mode) == 0o444
+    assert keep.read_text() == "keep"
+
+
+def test_remove_codex_home_never_retries_off_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_staging, "sys", SimpleNamespace(platform="linux"))
+    root = tmp_path / "root"
+    root.mkdir()
+    home = _make_home(root, "git-clone")
+    pack = home / "pack" / "pack-1.pack"
+    pack.parent.mkdir()
+    pack.write_bytes(b"x")
+    pack.chmod(0o444)
+
+    real_unlink = os.unlink
+
+    def unlink(path: str, *, dir_fd: int | None = None) -> None:
+        if not os.lstat(path, dir_fd=dir_fd).st_mode & stat.S_IWRITE:
+            raise PermissionError(errno.EACCES, "read-only file", path)
+        real_unlink(path, dir_fd=dir_fd)
+
+    chmodded: list[Path] = []
+    real_chmod = os.chmod
+
+    def chmod(path: str, mode: int) -> None:
+        chmodded.append(Path(path))
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "chmod", chmod)
+
+    assert remove_codex_home(home) is False
+    assert pack.exists()
+    assert chmodded == []
+
+
+def test_skills_refresh_clears_read_only_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / f"{CODEX_SKILLS_PREFIX}session"
+    root.mkdir(mode=0o700)
+    pack = root / "cloned-skill" / ".git" / "objects" / "pack"
+    pack.mkdir(parents=True)
+    (pack / "pack-1.pack").write_bytes(b"x")
+    (pack / "pack-1.pack").chmod(0o444)
+    _model_windows_read_only_files(monkeypatch)
+
+    prepare_codex_skills_dir(root)
+
+    assert list(root.iterdir()) == []
 
 
 def test_invalid_owner_markers_read_as_unknown(tmp_path: Path) -> None:

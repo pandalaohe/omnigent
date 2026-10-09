@@ -14,6 +14,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import psutil
@@ -162,19 +163,49 @@ def _codex_home_idle_since(home: Path, cutoff: float) -> bool:
     return not walk_error
 
 
+def _rmtree_retry_read_only(func: Callable[..., object], path: str, exc: BaseException) -> None:
+    """``shutil.rmtree`` ``onexc``: clear a read-only bit and retry the removal.
+
+    Windows refuses to unlink a read-only file (a git clone's pack files are). POSIX
+    unlink ignores the file's mode, and a pathname retry there would bypass rmtree's
+    fd-based link safety, so the handler re-raises off Windows.
+    A link or junction is never chmod'ed, so no target outside the tree is
+    touched; any other failure re-raises *exc*.
+    """
+    if (
+        sys.platform != "win32"
+        or func not in (os.unlink, os.rmdir)
+        or not isinstance(exc, PermissionError)
+        or os.path.islink(path)
+        or os.path.isjunction(path)
+    ):
+        raise exc
+    os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree_retry_read_only_or_skip(
+    func: Callable[..., object], path: str, exc: BaseException
+) -> None:
+    # ``ignore_errors=True`` once the read-only retry has had its turn.
+    with contextlib.suppress(OSError):
+        _rmtree_retry_read_only(func, path, exc)
+
+
 def remove_codex_home(home: Path) -> bool:
     """Remove *home* without ever following a link out of it.
 
     ``shutil.rmtree`` never follows a symlink or junction out of the tree: it
     refuses a linked root and, since Python 3.8, unlinks Windows junctions
-    rather than entering them. The sibling owner marker is removed last, so a
-    home Windows cannot fully delete yet (a file still open in an exiting
-    process) keeps its dead-owner marker for the next pass.
+    rather than entering them. On Windows a read-only file is made writable
+    before its removal is retried; a link never is. The sibling owner marker is
+    removed last, so a home Windows cannot fully delete yet (a file still open
+    in an exiting process) keeps its dead-owner marker for the next pass.
 
     :param home: A private CODEX_HOME.
     :returns: ``True`` when the home was fully removed.
     """
-    shutil.rmtree(home, ignore_errors=True)
+    shutil.rmtree(home, onexc=_rmtree_retry_read_only_or_skip)
     if os.path.lexists(home):
         return False
     with contextlib.suppress(OSError):
@@ -256,7 +287,7 @@ def prepare_codex_skills_dir(path: Path) -> Path:
         elif child.is_symlink() or not child.is_dir():
             child.unlink()
         else:
-            shutil.rmtree(child)
+            shutil.rmtree(child, onexc=_rmtree_retry_read_only)
     return root
 
 
