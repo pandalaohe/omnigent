@@ -37,6 +37,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
+import psutil
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import IS_LINUX, resolve_cli_binary
@@ -92,6 +93,8 @@ from .codex_staging import (
     codex_home_staging_root,
     link_codex_skills_dir,
     prepare_codex_skills_dir,
+    remove_codex_home,
+    write_codex_home_owner,
 )
 from .codex_worker import (
     CodexWorkerLaunch,
@@ -3162,6 +3165,14 @@ class _CodexAppServerSession:
             hasattr(os, "getuid") and stat.S_IMODE(home_stat.st_mode) != 0o700
         ):
             raise OSError("unsafe signer CODEX_HOME")
+        try:
+            write_codex_home_owner(self._codex_home_dir)
+        except (OSError, psutil.Error) as exc:
+            logger.warning(
+                "could not record the owner of %s (%s); the orphan sweep keeps it for 7 days",
+                self._codex_home_dir,
+                exc,
+            )
         # The runner grants only this session's skills directory to its tools.
         # Keep its inode stable so cached sandbox mounts survive worker restarts.
         if self._skills_dir is None:
@@ -3708,7 +3719,7 @@ class _CodexAppServerSession:
                 current = self._codex_home_dir.lstat()
                 identity = (current.st_dev, current.st_ino)
                 if stat.S_ISDIR(current.st_mode) and identity == self._codex_home_identity:
-                    shutil.rmtree(self._codex_home_dir, ignore_errors=True)
+                    remove_codex_home(self._codex_home_dir)
             except OSError:
                 pass
             self._codex_home_dir = None

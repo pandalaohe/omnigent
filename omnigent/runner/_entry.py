@@ -1496,6 +1496,18 @@ def create_app(
         except Exception:  # noqa: BLE001 — housekeeping must never block startup
             _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
+        try:
+            from omnigent.inner.codex_staging import reap_orphaned_codex_homes
+
+            _reaped_codex_homes = reap_orphaned_codex_homes()
+            if _reaped_codex_homes:
+                _logger.info(
+                    "Reaped %d orphaned Codex home(s) from prior runs",
+                    _reaped_codex_homes,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block startup
+            _logger.debug("Codex home orphan sweep failed", exc_info=True)
+
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
     # CLI launcher and this runner process via env var.

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+import psutil
 import pytest
 
 from omnigent.errors import HarnessTransportClosedError
@@ -1909,13 +1910,60 @@ class TestCodexExecutor(unittest.TestCase):
                     assert recorded_env is not None
                     self.assertIn("CODEX_HOME", recorded_env)
                     codex_home = Path(recorded_env["CODEX_HOME"])
+                    marker = codex_home.with_name(codex_home.name + ".owner")
                     self.assertTrue(codex_home.is_dir())
+                    self.assertEqual(
+                        marker.read_text().split()[0],
+                        str(os.getpid()),
+                    )
                     self.assertTrue(codex_home.name.startswith("omnigent-codex-home-"))
                     self.assertTrue(
                         codex_home.is_relative_to(Path(tempfile.gettempdir()).resolve())
                     )
                     # Must not point at the user's real ~/.codex directory.
                     self.assertNotEqual(codex_home, Path.home() / ".codex")
+                    await session.close()
+
+                self.assertFalse(codex_home.exists())
+                self.assertFalse(marker.exists())
+
+        _run(_t())
+
+    def test_app_server_survives_owner_marker_write_failure(self):
+        """A psutil failure recording the owner must not abort session startup."""
+
+        async def _t():
+            fake_proc = _FakeProcess()
+            recorded_env: dict | None = None
+
+            async def _fake_create_subprocess_exec(*args, **kwargs):
+                nonlocal recorded_env
+                recorded_env = kwargs.get("env")
+                return fake_proc
+
+            with tempfile.TemporaryDirectory() as workspace:
+                session = _CodexAppServerSession(
+                    codex_path="/bin/echo",
+                    cwd=workspace,
+                    env={},
+                    tool_executor=None,
+                )
+                session._request = AsyncMock(return_value={"result": {}})
+
+                with (
+                    patch(
+                        "omnigent.inner.codex_executor._create_subprocess_exec",
+                        new=_fake_create_subprocess_exec,
+                    ),
+                    patch(
+                        "omnigent.inner.codex_executor.write_codex_home_owner",
+                        side_effect=psutil.AccessDenied(pid=1),
+                    ),
+                ):
+                    await session.start()
+                    assert recorded_env is not None
+                    codex_home = Path(recorded_env["CODEX_HOME"])
+                    self.assertTrue(codex_home.is_dir())
                     await session.close()
 
                 self.assertFalse(codex_home.exists())
