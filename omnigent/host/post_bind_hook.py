@@ -112,6 +112,20 @@ class PostBindHookRunner:
             env = _build_env(frame)
             return self._run(argv, frame, workspace, env)
 
+    def configured(self) -> bool:
+        """Whether the host config sets a ``host.post_bind_command``.
+
+        Only this boolean travels to the server; the command value stays on
+        the host. A malformed command counts as configured so its error
+        surfaces when the hook runs instead of hiding the setup surface.
+
+        :returns: ``True`` when the key is present with a value.
+        """
+        try:
+            return _load_command(self._config_path) is not None
+        except _CommandConfigError:
+            return True
+
     def _binding_lock(self, frame: HostPostBindHookFrame) -> threading.Lock:
         """Return the lock serializing runs for one binding key.
 

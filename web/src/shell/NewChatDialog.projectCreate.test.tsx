@@ -37,6 +37,7 @@ import type * as ToastModule from "@/components/ui/toast";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
+import type * as ProjectsApiModule from "@/lib/projectsApi";
 
 // The server-side calling-defaults resolve; the default implementation mirrors
 // the project config so these create-shape cases keep their seeded agent.
@@ -44,6 +45,16 @@ vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof CallingDefaultsApiModule>()),
   resolveCallingDefaults: vi.fn(),
   listCallingDefaultCatalogs: vi.fn(),
+}));
+// The base-branch fallback reads the project's collaboration config; stub it
+// so a project-scoped case doesn't fire an authenticatedFetch of its own.
+vi.mock("@/lib/projectsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProjectsApiModule>()),
+  getProjectCollaboration: vi.fn(async () => ({
+    repositories: [],
+    bindings: [],
+    problems: [],
+  })),
 }));
 import {
   listCallingDefaultCatalogs,

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry
+from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry, ProjectRepository
 from omnigent.server.project_placement import (
     HostRoot,
     checkout_on_host,
@@ -16,6 +16,7 @@ from omnigent.server.project_placement import (
     load_bindings,
     load_eligible_host_ids,
     load_entries,
+    resolve_new_branch_base,
     root_on_host,
 )
 from omnigent.server.routes._sessions.helpers import _place_project_session
@@ -158,6 +159,37 @@ def test_checkout_prefers_binding_then_entry() -> None:
     assert checkout_on_host([replace(binding, enabled=False)], entries, "h1") == "/entry"
     assert checkout_on_host([replace(binding, is_primary=False)], entries, "h1") == "/entry"
     assert checkout_on_host([], [], "h1") is None
+
+
+# ── New-branch base ─────────────────────────────────────────────────────
+
+
+def _repository(role: str = "related", default_branch: str = "main") -> ProjectRepository:
+    return ProjectRepository(
+        "r1",
+        "p1",
+        "repo",
+        "https://example.com/org/repo.git",
+        default_branch,
+        ".agents/project/manifest.json",
+        1,
+        1,
+        role=role,
+    )
+
+
+def test_resolve_new_branch_base_order() -> None:
+    """Explicit wins, else the code repository, else nothing."""
+    project = _project()
+    code = _repository(role="code", default_branch="release")
+    related = _repository(role="related", default_branch="coordination")
+
+    assert resolve_new_branch_base(project, [code, related], "given/base") == "given/base"
+    assert resolve_new_branch_base(project, [related, code], None) == "release"
+    assert resolve_new_branch_base(project, [related], None) is None
+    assert resolve_new_branch_base(None, [code], None) is None
+    assert resolve_new_branch_base(None, [code], "given/base") == "given/base"
+    assert resolve_new_branch_base(project, [replace(code, default_branch="")], None) is None
 
 
 # ── Launch directory and recorded worktree ──────────────────────────────

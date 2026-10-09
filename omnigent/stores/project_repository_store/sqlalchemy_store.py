@@ -19,9 +19,14 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
-from omnigent.entities import ProjectRepository
+from omnigent.entities import ProjectHostBinding, ProjectRepository
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
+    derive_primary_bindings,
+)
 from omnigent.stores.project_repository_store import ProjectRepositoryStore
+
+_ROLES = ("code", "related")
 
 
 def _to_entity(row: SqlProjectRepository) -> ProjectRepository:
@@ -43,6 +48,7 @@ def _to_entity(row: SqlProjectRepository) -> ProjectRepository:
         created_at=row.created_at,
         updated_at=row.updated_at,
         workspace_id=row.workspace_id,
+        role=row.role,
     )
 
 
@@ -99,18 +105,25 @@ class SqlAlchemyProjectRepositoryStore(ProjectRepositoryStore):
             immediate=True,
         )
 
-    def upsert(
+    def apply_repository(
         self,
         *,
         project_id: str,
         name: str,
         remote_url: str,
         default_branch: str,
+        role: str | None = None,
         context_manifest_path: str = ".agents/project/manifest.json",
-    ) -> ProjectRepository:
-        """Register a repository or revise it, bumping ``revision`` on change."""
+    ) -> tuple[ProjectRepository, list[ProjectHostBinding]]:
+        """Register a repository or revise it, then derive primary bindings."""
 
-        def write(session: Session) -> ProjectRepository:
+        if role is not None and role not in _ROLES:
+            raise OmnigentError(
+                f"repository role must be one of {', '.join(_ROLES)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        def write(session: Session) -> tuple[ProjectRepository, list[ProjectHostBinding]]:
             # Project row first, repository row second: one lock order per
             # project, so concurrent writers serialize instead of racing.
             _lock_project(session, project_id=project_id)
@@ -127,6 +140,7 @@ class SqlAlchemyProjectRepositoryStore(ProjectRepositoryStore):
                     id=uuid.uuid4().hex,
                     project_id=project_id,
                     name=name,
+                    role=role or "related",
                     remote_url=remote_url,
                     default_branch=default_branch,
                     context_manifest_path=context_manifest_path,
@@ -136,22 +150,40 @@ class SqlAlchemyProjectRepositoryStore(ProjectRepositoryStore):
                 )
                 session.add(row)
                 session.flush()
-                return _to_entity(row)
-            if (
-                row.remote_url == remote_url
-                and row.default_branch == default_branch
-                and row.context_manifest_path == context_manifest_path
-            ):
-                return _to_entity(row)
-            row.remote_url = remote_url
-            row.default_branch = default_branch
-            row.context_manifest_path = context_manifest_path
-            row.revision += 1
-            row.updated_at = now_epoch()
+            else:
+                wanted_role = role if role is not None else row.role
+                if (
+                    row.remote_url != remote_url
+                    or row.default_branch != default_branch
+                    or row.context_manifest_path != context_manifest_path
+                    or row.role != wanted_role
+                ):
+                    row.role = wanted_role
+                    row.remote_url = remote_url
+                    row.default_branch = default_branch
+                    row.context_manifest_path = context_manifest_path
+                    row.revision += 1
+                    row.updated_at = now_epoch()
+                    session.flush()
+            if row.role == "code":
+                # Exactly one code repository: the promoted row wins, every
+                # other row of the project is demoted in the same transaction.
+                for other in session.execute(
+                    select(SqlProjectRepository)
+                    .where(SqlProjectRepository.workspace_id == current_workspace_id())
+                    .where(SqlProjectRepository.project_id == project_id)
+                    .where(SqlProjectRepository.id != row.id)
+                    .where(SqlProjectRepository.role == "code")
+                ).scalars():
+                    other.role = "related"
+                    other.revision += 1
+                    other.updated_at = now_epoch()
             session.flush()
-            return _to_entity(row)
+            changed_bindings = derive_primary_bindings(session, project_id=project_id)
+            session.flush()
+            return _to_entity(row), changed_bindings
 
-        return run_write_transaction(self._session_immediate, "upsert_repository", write)
+        return run_write_transaction(self._session_immediate, "apply_repository", write)
 
     def get(self, repository_id: str) -> ProjectRepository | None:
         """Return a registered repository by id, or ``None`` if not found."""

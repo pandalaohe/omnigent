@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
+    HostFolderFactsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHarnessStartupResultFrame,
@@ -954,6 +955,27 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostFolderFactsResultFrame):
+            facts_future = conn.pending_folder_facts.pop(frame.request_id, None)
+            if facts_future is not None and not facts_future.done():
+                facts_future.set_result(
+                    {
+                        "status": frame.status,
+                        "exists": frame.exists,
+                        "is_dir": frame.is_dir,
+                        "is_repo": frame.is_repo,
+                        "toplevel": frame.toplevel,
+                        "branch": frame.branch,
+                        "head": frame.head,
+                        "detached": frame.detached,
+                        "dirty": frame.dirty,
+                        "remotes": frame.remotes,
+                        "setup_command_configured": frame.setup_command_configured,
                         "error": frame.error,
                     }
                 )

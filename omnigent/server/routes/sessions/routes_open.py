@@ -34,6 +34,7 @@ from omnigent.server.project_placement import (
     load_bindings,
     load_eligible_host_ids,
     load_entries,
+    resolve_new_branch_base,
     root_on_host,
     same_canonical_path,
 )
@@ -332,6 +333,7 @@ def register_open_routes(
 
     host_store = getattr(app_state, "host_store", None)
     binding_store = getattr(app_state, "project_host_binding_store", None)
+    repository_store = getattr(app_state, "project_repository_store", None)
 
     async def runner_auth(request: Request, session_id: str) -> Any:
         """Require the sender to exist and its runner token to match."""
@@ -408,6 +410,18 @@ def register_open_routes(
                 "branch worktree; add one in the project settings first.",
             )
         return None
+
+    async def _new_branch_base(project: Any, explicit_base: str | None) -> str | None:
+        """Resolve the base for a new branch: explicit, else the code repo.
+
+        :param project: The session's project.
+        :param explicit_base: The caller's ``from_ref``, if any.
+        :returns: The base ref to cut from, or ``None`` for the source HEAD.
+        """
+        if explicit_base is not None or repository_store is None:
+            return explicit_base
+        repositories = await asyncio.to_thread(repository_store.list_by_project, project.id)
+        return resolve_new_branch_base(project, repositories, explicit_base)
 
     async def _bound_worktree_git(
         *, host_id: str, workspace: str, repo_path: str
@@ -486,7 +500,10 @@ def register_open_routes(
                     repo_path=root.checkout or root.workspace,
                 )
             elif body.branch is not None:
-                git = SessionGitOptions(branch_name=body.branch, base_branch=body.from_ref)
+                git = SessionGitOptions(
+                    branch_name=body.branch,
+                    base_branch=await _new_branch_base(project, body.from_ref),
+                )
             elif body.from_ref is not None:
                 git = SessionGitOptions(branch_name=f"open-{sid[:8]}", base_branch=body.from_ref)
             create_fields: dict[str, Any] = {

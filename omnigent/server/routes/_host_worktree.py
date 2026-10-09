@@ -19,6 +19,7 @@ from typing import Any
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
+    HostFolderFactsFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     encode_host_frame,
@@ -30,6 +31,11 @@ _logger = logging.getLogger(__name__)
 # Above the host's own git timeout (120 s) so the host's specific error
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
+
+# Folder facts run five short git reads with a 10 s per-command host
+# timeout; the settings dialog wants them quickly and can re-read on
+# Refresh, so the server waits only modestly longer than one read.
+_FOLDER_FACTS_TIMEOUT_S: float = 15.0
 
 
 WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256"
@@ -104,6 +110,17 @@ class WorktreeHostUnavailableError(WorktreeProxyError):
     """
 
 
+class FolderFactsUnsupportedError(WorktreeProxyError):
+    """
+    Raised when the connected host build predates ``host.folder_facts``.
+
+    The hello carries ``project_code``; without it the host would drop the
+    frame silently, so the route answers 501 "update the host" instead of
+    waiting out the timeout. Subclasses :class:`WorktreeProxyError` for the
+    same best-effort-caller reason as :class:`WorktreeHostUnavailableError`.
+    """
+
+
 @dataclass
 class CreatedWorktree:
     """
@@ -131,6 +148,8 @@ async def _await_host_worktree_result(
     request_id: str,
     frame: str,
     op: str,
+    timeout: float | None = None,
+    timeout_hint: str = (" (it may be running an older version that does not support worktrees)"),
 ) -> dict[str, object]:
     """
     Send a worktree frame and await its matching result over the tunnel.
@@ -147,11 +166,17 @@ async def _await_host_worktree_result(
     :param frame: Encoded host frame to send.
     :param op: Short label for error messages, e.g.
         ``"worktree creation"``.
+    :param timeout: Seconds to await the reply; ``None`` reads
+        :data:`_WORKTREE_TIMEOUT_S` at call time.
+    :param timeout_hint: Suffix appending the likely cause of silence;
+        the empty string omits it.
     :returns: The host's result dict (``status`` plus op-specific
         fields).
     :raises WorktreeHostUnavailableError: On connection loss or no
-        reply within :data:`_WORKTREE_TIMEOUT_S`.
+        reply within ``timeout``.
     """
+    if timeout is None:
+        timeout = _WORKTREE_TIMEOUT_S
     future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
     pending[request_id] = future
     try:
@@ -162,12 +187,11 @@ async def _await_host_worktree_result(
                 f"host '{host_conn.host_id}' connection lost during {op}"
             ) from exc
         try:
-            return await asyncio.wait_for(future, timeout=_WORKTREE_TIMEOUT_S)
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to {op} within "
-                f"{_WORKTREE_TIMEOUT_S:.0f}s (it may be running an older version "
-                "that does not support worktrees)"
+                f"{timeout:.0f}s{timeout_hint}"
             ) from exc
     finally:
         pending.pop(request_id, None)
@@ -342,6 +366,55 @@ async def list_worktrees_on_host(
     if not isinstance(worktrees, list):
         raise WorktreeProxyError("host returned an incomplete worktree list")
     return worktrees
+
+
+async def folder_facts_on_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    path: str,
+) -> dict[str, object]:
+    """
+    Send a ``host.folder_facts`` frame and await the result.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection to read the folder on.
+    :param path: Absolute folder path on the host, e.g.
+        ``"/Users/alice/myrepo"``.
+    :returns: The facts dict (``exists``, ``is_dir``, ``is_repo``,
+        ``toplevel``, ``branch``, ``head``, ``detached``, ``dirty``,
+        ``remotes``, ``setup_command_configured``, ``error``).
+    :raises FolderFactsUnsupportedError: When the host build advertises
+        no ``project_code`` capability.
+    :raises WorktreeHostUnavailableError: If the host connection drops
+        or doesn't respond within :data:`_FOLDER_FACTS_TIMEOUT_S`.
+    :raises WorktreeProxyError: If the host reports a read failure.
+    """
+    if not host_conn.hello.project_code:
+        raise FolderFactsUnsupportedError(
+            f"host '{host_conn.host_id}' does not support folder facts — "
+            "update omnigent on the host and retry"
+        )
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(HostFolderFactsFrame(request_id=request_id, path=path))
+    result = await _await_host_worktree_result(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        pending=host_conn.pending_folder_facts,
+        request_id=request_id,
+        frame=frame,
+        op="folder facts",
+        timeout=_FOLDER_FACTS_TIMEOUT_S,
+        timeout_hint="",
+    )
+    if result.get("status") != "ok":
+        raise WorktreeProxyError(
+            f"folder facts read failed: {result.get('error') or 'host reported no detail'}"
+        )
+    facts = dict(result)
+    facts.pop("status", None)
+    return facts
 
 
 def match_worktree_branch(

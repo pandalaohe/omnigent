@@ -205,20 +205,61 @@ async def test_entries_are_owner_scoped(
         assert response.json()["error"]["message"] == "Project not found"
 
 
-async def test_entry_put_offline_host_409_and_nothing_stored(
+async def test_entry_put_offline_host_stores_unchecked(
     entries_client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A registered but disconnected host refuses the entry; no row lands."""
+    """A registered but disconnected host stores the typed path unchecked."""
     project_id = await _make_project(entries_client)
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(_HOST_OFFLINE, "offline-box", "local")
     hosts.set_offline(_HOST_OFFLINE)
     response = await entries_client.put(
         f"/v1/projects/{project_id}/entries/{_HOST_OFFLINE}",
-        json={"workspace": "/data/work"},
+        json={"workspace": "/data/work/"},
     )
-    assert response.status_code == 409, response.text
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["workspace"] == "/data/work"
+    assert body["checked"] is False
+    assert "post_bind" not in body
+    listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
+    assert listed.json() == {
+        "entries": [
+            {
+                "host_id": _HOST_OFFLINE,
+                "workspace": "/data/work",
+                "updated_at": None,
+            }
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "/opt/work/.omnigent//worktrees/task",
+        "/opt/work/.omnigent/x/../worktrees/task",
+        "/opt/work/.omnigent/./worktrees/task",
+        "//server/share/.omnigent\\.\\worktrees/task",
+        "C:\\work\\.omnigent\\.\\worktrees\\task",
+    ],
+)
+async def test_entry_put_offline_host_string_checks(
+    entries_client: httpx.AsyncClient,
+    db_uri: str,
+    workspace: str,
+) -> None:
+    """Offline entry saves still refuse a relative path or a worktree area."""
+    project_id = await _make_project(entries_client)
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_OFFLINE, "offline-box", "local")
+    hosts.set_offline(_HOST_OFFLINE)
+    response = await entries_client.put(
+        f"/v1/projects/{project_id}/entries/{_HOST_OFFLINE}",
+        json={"workspace": workspace},
+    )
+    assert response.status_code == 400, response.text
     listed = await entries_client.get(f"/v1/projects/{project_id}/entries")
     assert listed.json() == {"entries": []}
 

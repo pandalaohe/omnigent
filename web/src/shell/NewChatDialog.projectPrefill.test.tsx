@@ -33,6 +33,7 @@ import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
+import type * as ProjectsApiModule from "@/lib/projectsApi";
 
 // The calling-defaults chain is a server read; each case controls what it
 // resolves. The default implementation mirrors the old web-side config seeds
@@ -41,6 +42,12 @@ vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof CallingDefaultsApiModule>()),
   resolveCallingDefaults: vi.fn(),
   listCallingDefaultCatalogs: vi.fn(),
+}));
+// The collaboration read behind the base-branch fallback; cases that care set
+// a code repository, the default is a project with none.
+vi.mock("@/lib/projectsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProjectsApiModule>()),
+  getProjectCollaboration: vi.fn(),
 }));
 import {
   listCallingDefaultCatalogs,
@@ -51,7 +58,7 @@ import {
 import { readCallingLast } from "@/lib/callingDefaults";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -59,7 +66,8 @@ import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import type { ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
+import type { ProjectCollaboration, ProjectConfig, ProjectHostRoots } from "@/lib/projectsApi";
+import { getProjectCollaboration } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -343,7 +351,10 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
   fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
     target: { value: "hello" },
   });
-  fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+  // A project base may be held until the collaboration read settles.
+  const submit = screen.getByTestId("new-chat-landing-submit");
+  await waitFor(() => expect(submit).toBeEnabled());
+  fireEvent.click(submit);
   await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalled());
   const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
   return JSON.parse(init.body as string) as Record<string, unknown>;
@@ -395,6 +406,12 @@ beforeEach(() => {
     } as ReturnType<typeof useProjectHostRoots>;
   });
   vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([]);
+  vi.mocked(getProjectCollaboration).mockReset();
+  vi.mocked(getProjectCollaboration).mockResolvedValue({
+    repositories: [],
+    bindings: [],
+    problems: [],
+  });
   mockResolveFromConfig();
 });
 
@@ -1219,6 +1236,204 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
+  });
+});
+
+// The base-branch field seed order: project `base_branch` → the project's code
+// repository default branch (Code settings) → the user-global default → blank.
+describe("NewChatLandingScreen base-branch seed order", () => {
+  const GLOBAL_BASE_KEY = "omnigent:default-base-branch";
+
+  function collaborationWith(defaultBranch: string): ProjectCollaboration {
+    return {
+      repositories: [
+        {
+          id: "r_web",
+          project_id: "proj_alpha",
+          name: "web",
+          role: "code",
+          remote_url: "https://git.example.test/team/web.git",
+          default_branch: defaultBranch,
+          context_manifest_path: "",
+          revision: 1,
+          created_at: 1,
+          updated_at: null,
+        },
+      ],
+      bindings: [],
+      problems: [],
+    };
+  }
+
+  function setProjectCodeRepository(defaultBranch: string): void {
+    vi.mocked(getProjectCollaboration).mockResolvedValue(collaborationWith(defaultBranch));
+  }
+
+  /** Wait for the worktree opt-in's auto-seeded branch, then open the menu. */
+  async function openBaseBranchField(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-branch-chip").textContent).toMatch(
+        /^worktree-[0-9a-f]{8}$/,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+  }
+
+  it("prefers the project's stored base_branch", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      use_worktree: true,
+      base_branch: "develop",
+    });
+    setProjectCodeRepository("release");
+    renderLanding();
+    await openBaseBranchField();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("develop"),
+    );
+  });
+
+  it("falls back to the code repository's default branch", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    setProjectCodeRepository("release");
+    renderLanding();
+    await openBaseBranchField();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("release"),
+    );
+  });
+
+  it("falls back to the user-global default when the project has no code repository", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    renderLanding();
+    await openBaseBranchField();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("main"),
+    );
+  });
+
+  it("leaves the base branch blank when nothing supplies a default", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    renderLanding();
+    await openBaseBranchField();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue(""),
+    );
+  });
+
+  it("holds submit until the collaboration read settles, then seeds its branch", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    let resolveCollaboration!: (value: ProjectCollaboration) => void;
+    vi.mocked(getProjectCollaboration).mockReturnValue(
+      new Promise((resolve) => {
+        resolveCollaboration = resolve;
+      }),
+    );
+    renderLanding();
+    await openBaseBranchField();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+
+    // The untouched base shows the global fallback, but Submit is held.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("main"),
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.pointerMove(screen.getByTestId("new-chat-landing-submit").parentElement!, {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "Loading project defaults…",
+    );
+
+    await act(async () => {
+      resolveCollaboration(collaborationWith("release"));
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("release"),
+    );
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+  });
+
+  it("falls through to the user-global default when the collaboration read fails", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    vi.mocked(getProjectCollaboration).mockRejectedValue(new Error("offline"));
+    renderLanding();
+    await openBaseBranchField();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("main"),
+    );
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+  });
+
+  it("keeps a base edit made before the collaboration read settles", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    let resolveCollaboration!: (value: ProjectCollaboration) => void;
+    vi.mocked(getProjectCollaboration).mockReturnValue(
+      new Promise((resolve) => {
+        resolveCollaboration = resolve;
+      }),
+    );
+    renderLanding();
+    await openBaseBranchField();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("main"),
+    );
+
+    // An explicit edit does not wait on the read.
+    fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+      target: { value: "feature" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+
+    await act(async () => {
+      resolveCollaboration(collaborationWith("release"));
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("feature"),
+    );
+  });
+
+  it("keeps a cleared base made before the collaboration read settles", async () => {
+    localStorage.setItem(GLOBAL_BASE_KEY, "main");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: true });
+    let resolveCollaboration!: (value: ProjectCollaboration) => void;
+    vi.mocked(getProjectCollaboration).mockReturnValue(
+      new Promise((resolve) => {
+        resolveCollaboration = resolve;
+      }),
+    );
+    renderLanding();
+    await openBaseBranchField();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("main"),
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+      target: { value: "" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+
+    await act(async () => {
+      resolveCollaboration(collaborationWith("release"));
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue(""),
+    );
   });
 });
 

@@ -12428,6 +12428,16 @@ async def _create_session_from_existing_agent(
                 getattr(request.app.state, "user_preferences_store", None),
                 user_id or RESERVED_USER_LOCAL,
             )
+            # A new branch with no explicit base forks from the project's
+            # code repository when it has one; a child without its own
+            # project inherits the parent project's.
+            worktree_project = parent_project
+            if project_resolution.project_id is not None and project_store is not None:
+                worktree_project = await asyncio.to_thread(
+                    project_store.get,
+                    project_resolution.project_id,
+                    user_id=user_id,
+                )
             created_worktree = await _create_session_worktree(
                 host_id=body.host_id,
                 source_repo=source_repo,
@@ -12435,6 +12445,7 @@ async def _create_session_from_existing_agent(
                 request=request,
                 entry=project_resolution.worktree_entry,
                 path_template=path_template,
+                project=worktree_project,
             )
             # The host's path is canonicalised before any comparison or
             # persistence; rollback keeps the raw path it returned.

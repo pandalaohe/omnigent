@@ -53,6 +53,7 @@ from omnigent.entities import (
     ErrorData,
     MessageData,
     NewConversationItem,
+    Project,
     SlashCommandData,
     StoredFile,
     synthesize_conversation_title,
@@ -10199,6 +10200,7 @@ async def _create_session_worktree(
     request: Request,
     entry: str | None = None,
     path_template: str | None = None,
+    project: Project | None = None,
 ) -> CreatedWorktree:
     """
     Create a git worktree on the host for a new session branch.
@@ -10220,6 +10222,8 @@ async def _create_session_worktree(
         ``None``. Only fills the template's ``{entry}`` token.
     :param path_template: The owner's worktree location template, or
         ``None`` for the upstream sibling layout.
+    :param project: The session's project; a new branch with no explicit
+        base forks from its code repository's default branch.
     :returns: The worktree root for rollback, the relocated ``workspace``,
         and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
@@ -10229,6 +10233,7 @@ async def _create_session_worktree(
         is configured.
     """
     from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+    from omnigent.server.project_placement import resolve_new_branch_base
     from omnigent.server.routes._host_worktree import (
         WorktreeHostUnavailableError,
         WorktreeProxyError,
@@ -10244,6 +10249,16 @@ async def _create_session_worktree(
         validate_branch_name(git.branch_name)
     except WorktreeError as exc:
         raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+    if project is not None and git.base_branch is None and not git.existing_branch:
+        repository_store = getattr(request.app.state, "project_repository_store", None)
+        repositories = (
+            await asyncio.to_thread(repository_store.list_by_project, project.id)
+            if repository_store is not None
+            else []
+        )
+        resolved_base = resolve_new_branch_base(project, repositories, None)
+        if resolved_base is not None:
+            git = git.model_copy(update={"base_branch": resolved_base})
 
     host_conn = _require_host_conn_for_worktree(host_id, request)
     host_registry = request.app.state.host_registry

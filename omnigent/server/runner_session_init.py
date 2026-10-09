@@ -15,17 +15,21 @@ from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode
 from omnigent.runner.session_init_protocol import (
+    ProjectCodeLocation,
     RunnerArchiveState,
     build_runner_session_init_payload,
     runner_archive_state,
 )
 from omnigent.runtime import current_global_instructions_text
+from omnigent.server.project_placement import project_code_locations
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import ConversationStore
     from omnigent.stores.file_store import FileStore
+    from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
+    from omnigent.stores.project_repository_store import ProjectRepositoryStore
 
 
 async def conversation_archive_lineage(
@@ -119,6 +123,8 @@ class RunnerSessionInitializer:
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
+        project_repository_store: ProjectRepositoryStore | None = None,
+        project_host_binding_store: ProjectHostBindingStore | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
@@ -127,6 +133,8 @@ class RunnerSessionInitializer:
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._agent_store = agent_store
+        self._project_repository_store = project_repository_store
+        self._project_host_binding_store = project_host_binding_store
         self._tasks: dict[
             _SessionInitKey,
             asyncio.Task[httpx.Response],
@@ -155,6 +163,42 @@ class RunnerSessionInitializer:
         if self._peer_messaging_resolver is None:
             return self._peer_messaging_enabled
         return await asyncio.to_thread(self._peer_messaging_resolver, conversation)
+
+    async def resolve_project_code(
+        self, conversation: Conversation
+    ) -> list[ProjectCodeLocation] | None:
+        """Resolve this host's code locations for the init snapshot.
+
+        Reads the project's repositories and bindings in a worker thread.
+        A store failure reads as "no repositories registered": the session
+        must start even when the collaboration stores are unavailable.
+
+        :param conversation: The session being initialized.
+        :returns: The ordered locations, or ``None`` when none apply.
+        """
+        if (
+            self._project_repository_store is None
+            or self._project_host_binding_store is None
+            or not conversation.project_id
+        ):
+            return None
+        try:
+            repositories, bindings = await asyncio.gather(
+                asyncio.to_thread(
+                    self._project_repository_store.list_by_project, conversation.project_id
+                ),
+                asyncio.to_thread(
+                    self._project_host_binding_store.list_by_project, conversation.project_id
+                ),
+            )
+        except Exception:  # noqa: BLE001 — a store failure must not block the start
+            _logger.warning(
+                "Could not load project code locations for session %s",
+                conversation.id,
+                exc_info=True,
+            )
+            return None
+        return project_code_locations(repositories, bindings, conversation.host_id)
 
     def generation_for(self, runner_id: str, runner_client: httpx.AsyncClient) -> int:
         """Identify the current tunnel, or the client for embedded transports."""
@@ -334,6 +378,7 @@ class RunnerSessionInitializer:
             # registration would let a second caller start its own init.
             async with store_slots or nullcontext():
                 global_instructions = await asyncio.to_thread(current_global_instructions_text)
+                project_code = await self.resolve_project_code(conversation)
             payload = build_runner_session_init_payload(
                 conversation,
                 server_version=self._server_version,
@@ -341,6 +386,7 @@ class RunnerSessionInitializer:
                 archive_states=archive_states,
                 peer_messaging_enabled=peer,
                 global_instructions=global_instructions,
+                project_code=project_code,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
             )

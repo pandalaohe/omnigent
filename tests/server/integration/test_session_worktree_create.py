@@ -46,6 +46,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_repository_store.sqlalchemy_store import (
+    SqlAlchemyProjectRepositoryStore,
+)
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
@@ -474,6 +477,51 @@ async def test_create_with_project_entry_sends_it_to_host(
     # No primary binding is registered, so the entry itself is the source.
     assert frame.repo_path == _ENTRY
     assert frame.branch_name == "feature/login"
+
+
+@pytest.mark.parametrize(
+    ("base_branch", "expected_base"),
+    [(None, "release"), ("topic/base", "topic/base")],
+)
+async def test_create_project_new_branch_base_falls_back_to_code_repository(
+    app: FastAPI,
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    base_branch: str | None,
+    expected_base: str,
+) -> None:
+    """A project new branch forks from its code repo default; an explicit base wins."""
+    cap = register_worktree_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Code project", None)
+    repositories = SqlAlchemyProjectRepositoryStore(db_uri)
+    repositories.apply_repository(
+        project_id=_PROJECT_ID,
+        name="root",
+        remote_url="https://git.example.test/x.git",
+        default_branch="release",
+        role="code",
+    )
+    app.state.project_repository_store = repositories
+    app.state.project_host_binding_store = _ProjectDirs(entries=[(_HOST_ID, _ENTRY)])
+    agent = await create_test_agent(client, name="wt-code-base-agent")
+
+    git: dict[str, Any] = {"branch_name": "feature/x"}
+    if base_branch is not None:
+        git["base_branch"] = base_branch
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "project_id": _PROJECT_ID,
+            "host_id": _HOST_ID,
+            "workspace": _ENTRY,
+            "git": git,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].base_branch == expected_base
 
 
 async def test_create_with_invalid_base_branch_fails_400(

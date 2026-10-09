@@ -66,8 +66,20 @@ def _init_body(
     workspace: str | None = None,
     worktree: str | None = None,
     peer_messaging_enabled: bool = False,
+    project_code: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Session-init POST body carrying *global_instructions* in the snapshot."""
+    snapshot: dict[str, Any] = {
+        "created_at": 1234,
+        "updated_at": 1234,
+        "workspace": workspace,
+        "worktree": worktree,
+        "labels": {},
+        "global_instructions": global_instructions,
+        "peer_messaging_enabled": peer_messaging_enabled,
+    }
+    if project_code is not None:
+        snapshot["project_code"] = project_code
     return {
         "session_id": session_id,
         "agent_id": agent_id,
@@ -77,15 +89,7 @@ def _init_body(
             "session_id": session_id,
             "agent_id": agent_id,
             "sub_agent_name": None,
-            "snapshot": {
-                "created_at": 1234,
-                "updated_at": 1234,
-                "workspace": workspace,
-                "worktree": worktree,
-                "labels": {},
-                "global_instructions": global_instructions,
-                "peer_messaging_enabled": peer_messaging_enabled,
-            },
+            "snapshot": snapshot,
         },
     }
 
@@ -99,6 +103,7 @@ async def _init_session(
     workspace: str | None = None,
     worktree: str | None = None,
     peer_messaging_enabled: bool = False,
+    project_code: list[dict[str, Any]] | None = None,
 ) -> None:
     init = await client.post(
         "/v1/sessions",
@@ -109,6 +114,7 @@ async def _init_session(
             workspace=workspace,
             worktree=worktree,
             peer_messaging_enabled=peer_messaging_enabled,
+            project_code=project_code,
         ),
     )
     assert init.status_code == 201, init.text
@@ -213,8 +219,14 @@ def _spy_on_startup_extras(
         *,
         workspace: str | None,
         worktree: str | None,
+        project_code: list[Any] | None = None,
     ) -> str | None:
-        value = real_extras(global_instructions, workspace=workspace, worktree=worktree)
+        value = real_extras(
+            global_instructions,
+            workspace=workspace,
+            worktree=worktree,
+            project_code=project_code,
+        )
         recorded.append(value)
         return value
 
@@ -302,3 +314,90 @@ async def test_peer_grant_composes_only_for_a_peer_enabled_session() -> None:
     assert peer_composed.endswith(f"GLOBAL-MARKER\n\n{PEER_SESSION_GRANT}")
     assert PEER_SESSION_GRANT not in plain_composed
     assert plain_composed.endswith("GLOBAL-MARKER")
+
+
+_CODE_LOCATION: dict[str, Any] = {
+    "name": "omnigent",
+    "role": "code",
+    "folder": "/opt/work/omnigent/fork/topic",
+    "remote_url": "https://git.example.test/org/omnigent.git",
+    "default_branch": "local/host-custom",
+}
+_OTHER_CODE_LOCATION: dict[str, Any] = {
+    "name": "coordination",
+    "role": "related",
+    "folder": "/opt/work/omnigent",
+    "remote_url": "git@git.example.test:org/coordination.git",
+    "default_branch": "main",
+}
+_CODE_BLOCK = (
+    "This project's code on this host:\n"
+    '- omnigent (the code you change): "/opt/work/omnigent/fork/topic" — git '
+    '"https://git.example.test/org/omnigent.git", default branch "local/host-custom"'
+)
+
+
+@pytest.mark.asyncio
+async def test_turn_composes_the_project_code_block_before_the_global_text() -> None:
+    """The snapshot's project code rides the composed turn text, before global."""
+    app, harness_client = _build_turn_app()
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "GLOBAL-MARKER",
+            project_code=[_CODE_LOCATION],
+        )
+        composed = await _turn_instructions(client, harness_client, session_id)
+
+    assert _CODE_BLOCK in composed
+    assert composed.index(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION) < composed.index(_CODE_BLOCK)
+    assert composed.index(_CODE_BLOCK) < composed.index("GLOBAL-MARKER")
+
+
+@pytest.mark.asyncio
+async def test_reinit_keeps_the_first_project_code_list() -> None:
+    """A re-init with a different list keeps the first one for that session."""
+    app, harness_client = _build_turn_app()
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "GLOBAL-MARKER",
+            project_code=[_CODE_LOCATION],
+        )
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "GLOBAL-MARKER",
+            project_code=[_OTHER_CODE_LOCATION],
+        )
+        composed = await _turn_instructions(client, harness_client, session_id)
+
+    assert _CODE_BLOCK in composed
+    assert "coordination" not in composed
+
+
+@pytest.mark.asyncio
+async def test_first_init_without_project_code_keeps_it_absent_on_reinit() -> None:
+    """A session that started with nothing is not told later: first value wins."""
+    app, harness_client = _build_turn_app()
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(client, session_id, agent_id, "GLOBAL-MARKER")
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "GLOBAL-MARKER",
+            project_code=[_CODE_LOCATION],
+        )
+        composed = await _turn_instructions(client, harness_client, session_id)
+
+    assert "This project's code on this host:" not in composed
+    assert composed.endswith("GLOBAL-MARKER")
