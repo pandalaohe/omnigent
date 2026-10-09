@@ -121,13 +121,18 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("sidebar Poll vs collapse containers", () => {
-  it("plain cycle skips rows in the collapsed Pinned section", async () => {
+  it("plain cycle skips rows hidden by a collapsed Pinned section and folder", async () => {
+    // A pinned session now also renders in its folder, so it is only truly
+    // hidden while both the Pinned section and its folder are collapsed.
     localStorage.setItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY, JSON.stringify(["Pinned"]));
-    pinnedRef.current = [conversation("hidden-pin", { updated_at: 3 })];
+    projectsRef.current = [{ id: "p1", name: "Proj" }];
+    pinnedRef.current = [
+      conversation("hidden-pin", { updated_at: 3, labels: { omni_project: "Proj" } }),
+    ];
     mockConversations([
       conversation("active", { updated_at: 1 }),
       conversation("visible", { updated_at: 2 }),
-      conversation("hidden-pin", { updated_at: 3 }),
+      conversation("hidden-pin", { updated_at: 3, labels: { omni_project: "Proj" } }),
     ]);
     renderAt("/c/active");
 

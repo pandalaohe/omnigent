@@ -59,6 +59,9 @@ type HeaderDrag = ReturnType<typeof useSortable>;
 export interface SidebarLayoutContextValue {
   layout: SidebarLayout;
   saveLayout: SaveSidebarLayout;
+  /** Pin (server) plus the favorites ref, and the inverse; set by the list. */
+  addFavorite?: (conversationId: string) => void;
+  removeFavorite?: (conversationId: string) => void;
 }
 
 /** Null outside the sidebar list, where sections are not editable. */

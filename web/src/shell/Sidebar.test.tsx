@@ -505,13 +505,18 @@ describe("Sidebar session list", () => {
     });
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Work" }));
-    const pinned = screen.getByText("pinned-session");
+    // A pinned session now also renders in Sessions, so scope the identity
+    // checks to the Pinned section's copy.
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    const pinned = within(pinnedSection).getByText("pinned-session");
     const filed = screen.getByText("filed-session");
     const filter = screen.getByTestId("session-filter");
 
     selectSessionFilter(view);
 
-    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(within(screen.getByText("Pinned").closest("section")!).getByText("pinned-session")).toBe(
+      pinned,
+    );
     expect(screen.getByText("filed-session")).toBe(filed);
     expect(screen.getByTestId("session-filter")).toBe(filter);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
@@ -523,7 +528,9 @@ describe("Sidebar session list", () => {
       expect(retry).toHaveBeenCalledOnce();
     }
     selectSessionFilter("mine");
-    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(within(screen.getByText("Pinned").closest("section")!).getByText("pinned-session")).toBe(
+      pinned,
+    );
     expect(screen.getByText("filed-session")).toBe(filed);
   });
 
@@ -2821,7 +2828,7 @@ describe("Sidebar project sections", () => {
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
   });
 
-  it("moves a pinned project session out into the global Pinned section", () => {
+  it("keeps a pinned project session in its folder and the global Pinned section", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_plain", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2831,16 +2838,15 @@ describe("Sidebar project sections", () => {
     seedPins(["conv_pinned"]);
     renderSidebar();
 
-    // Pinned takes precedence over Project: the pinned session leaves the
-    // project and renders in the flat global Pinned section.
+    // The pinned session shows in the flat global Pinned section...
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("conv_pinned")).toBeInTheDocument();
 
-    // The project folder keeps only its non-pinned session.
+    // ...and stays in its project folder too.
     fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
-    expect(within(projectSection).queryByText("conv_pinned")).toBeNull();
+    expect(within(projectSection).getByText("conv_pinned")).toBeInTheDocument();
   });
 
   it("does not render a project section when useProjects returns nothing", () => {
