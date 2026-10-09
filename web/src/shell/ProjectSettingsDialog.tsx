@@ -3,14 +3,20 @@
 // the new-chat composer pre-fill host / working directory / agent and the
 // isolated-worktree default when starting a session in the project.
 //
-// "Session defaults" is a Hosts block: a per-host list (directory + default
-// agent / model / effort) with a detail pane at >= md and a single-open
-// accordion below, plus an "All hosts" row carrying the legacy
-// `config.agent_id` / `config.model` fallback. Per-host sets live in
-// `config.calling_defaults`, shape-validated server-side; the resolution chain
-// that consumes them is server-side. The All-hosts agent picker reuses the
-// composer's component, and the working directory reuses its filesystem
-// browser (inline, so it scrolls inside the modal).
+// A first-class project shows two tabs: "Session defaults" (host / per-host
+// agent / model / effort / worktree) and "Code" (the project's repositories
+// and folders, whose actions save immediately). A label-only folder has no
+// project row yet, so it keeps the single form below — its Save creates the
+// project and writes the directories it collected.
+//
+// "Session defaults" is a Hosts block: a per-host list (default agent / model
+// / effort) with a detail pane at >= md and a single-open accordion below,
+// plus an "All hosts" row carrying the legacy `config.agent_id` /
+// `config.model` fallback. Per-host sets live in `config.calling_defaults`,
+// shape-validated server-side; the resolution chain that consumes them is
+// server-side. The All-hosts agent picker reuses the composer's component;
+// the label-only Directory field reuses its filesystem browser (inline, so it
+// scrolls inside the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
@@ -49,7 +55,7 @@ import {
   syncCallingDefaults,
   type CallingDefaultsCatalogRow,
 } from "@/lib/callingDefaultsApi";
-import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
@@ -64,6 +70,7 @@ import {
 import {
   createProject,
   deleteProjectEntry,
+  getProjectCollaboration,
   listProjectEntries,
   putProjectEntry,
   type PostBindResult,
@@ -75,7 +82,7 @@ import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { ProjectCollaborationSection } from "./ProjectCollaborationSection";
+import { ProjectCodeSection } from "./ProjectCodeSection";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
@@ -143,9 +150,10 @@ interface HostRowDraft extends DirectoryRow {
 }
 
 /**
- * Seed the directory rows from the project's stored entries. A project with
- * no entry yet falls back to the config's `workspace` when it names a
- * concrete default host — Save then promotes that row into a real entry.
+ * Seed the directory rows from the project's stored entries. With no entry
+ * yet, the config's legacy `workspace` stands in when it names a concrete
+ * default host: for a label-only folder Save promotes that row into an entry,
+ * while a real project only shows it and keeps the stored value on Save.
  */
 function seedDirectoryRows(entries: ProjectHostEntry[], config: ProjectConfig): DirectoryRow[] {
   if (entries.length > 0) {
@@ -354,13 +362,6 @@ const WARNING_HOOK_STATUSES = new Set(["failed", "timed_out", "unreachable"]);
 
 function hookStatusLabel(status: string): string {
   return status === "timed_out" ? "timed out" : status;
-}
-
-/** The last post-bind outcome for one row, and where it came from. */
-interface EntryHookOutcome {
-  result: PostBindResult;
-  /** Save surfaces only warnings; a per-row run shows any status. */
-  source: "save" | "run";
 }
 
 const SYNC_ALL_KEY = ["calling-defaults", "sync-all"] as const;
@@ -586,9 +587,24 @@ export function ProjectSettingsDialog({
   });
   const info = useServerInfo();
   const isCompact = useIsMobileViewport();
-  // Collaboration config lives outside this form (its actions apply
-  // immediately, never through Save) and only for a first-class project.
-  const showCollaboration = projectId !== null && isFeatureEnabled(info, "project_assignments");
+  // A first-class project gets the two-tab layout; a label-only folder is
+  // still created by this dialog's Save, so it keeps the single settings form.
+  const isRealProject = projectId !== null;
+  const labelOnly = projectId === null;
+  // Shared with the Code section (same query key): the code repository's
+  // default branch feeds the base-branch hint.
+  const { data: collaboration } = useQuery({
+    queryKey: ["project-collaboration", projectId],
+    queryFn: () => getProjectCollaboration(projectId as string),
+    enabled: open && projectId !== null,
+    retry: false,
+  });
+  const codeRepository =
+    collaboration?.repositories.find((repository) => repository.role === "code") ?? null;
+  const baseBranchHint =
+    codeRepository && codeRepository.default_branch !== ""
+      ? `Blank: the code repository's default branch (${codeRepository.default_branch}), else the current branch.`
+      : "Branch new worktrees fork from; blank uses the current branch";
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
@@ -618,13 +634,11 @@ export function ProjectSettingsDialog({
   // the same alert as `updateConfig.error`.
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  // Post-bind outcome per host from the last Save (warnings only) or the
-  // per-row run (any status), so the row can show it under its path.
-  const [entryHookOutcomes, setEntryHookOutcomes] = useState<ReadonlyMap<string, EntryHookOutcome>>(
+  // Post-bind outcome per host from the last Save, so the row can show a
+  // warning under its path.
+  const [entryHookOutcomes, setEntryHookOutcomes] = useState<ReadonlyMap<string, PostBindResult>>(
     () => new Map(),
   );
-  // The row whose "Run post-bind command" is in flight, if any.
-  const [runningPostBindHostId, setRunningPostBindHostId] = useState<string | null>(null);
   // The entry writes already persisted (host id → path), seeded from the
   // fetched rows and advanced as each write succeeds. Save derives its PUT /
   // DELETE plan from this baseline, not from the server rows, so a retry
@@ -632,6 +646,9 @@ export function ProjectSettingsDialog({
   // not) sends only what is still pending instead of repeating a DELETE that
   // now 404s.
   const [savedEntries, setSavedEntries] = useState<ReadonlyMap<string, string>>(() => new Map());
+  // The dialog open (or project) whose drafts have been seeded, so a later
+  // entries refetch (a Code-tab folder change) can't overwrite edited drafts.
+  const seededKeyRef = useRef<string | null>(null);
   // Worktree default for the project. The toggle seeds from the project's
   // stored value when set, else from the user-global "always use a worktree"
   // default (Settings › Git). On save it stays "inherit" (stores nothing) while
@@ -687,7 +704,9 @@ export function ProjectSettingsDialog({
       // Outcomes are dialog-session state; a refetch must not wipe a warning
       // the user still needs to see.
       setEntryHookOutcomes(new Map());
-      setRunningPostBindHostId(null);
+    } else {
+      // A close re-arms the one-time seed for the next opening.
+      seededKeyRef.current = null;
     }
   }, [open]);
 
@@ -732,9 +751,14 @@ export function ProjectSettingsDialog({
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed || entriesLoadFailed) return;
-    // Wait for the entry rows, or the config-fallback row would be seeded and
-    // then immediately replaced by the fetched rows.
-    if (entriesLoading) return;
+    // Wait for the config and the entry rows, or the config-fallback row would
+    // be seeded and then immediately replaced by the fetched rows.
+    if (isLoading || entriesLoading) return;
+    // Seed once per opening (or project): a Code-tab folder change refetches
+    // entries, and re-seeding then would discard unsaved Session-default edits.
+    const seedKey = projectId ?? "__label_only__";
+    if (seededKeyRef.current === seedKey) return;
+    seededKeyRef.current = seedKey;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     const rows = seedHostRows(entries, c);
@@ -749,7 +773,7 @@ export function ProjectSettingsDialog({
     setOtherHarnessOpenFor(null);
     setEntriesError(null);
     setSaveError(null);
-  }, [open, stored, loadFailed, entriesLoadFailed, entriesLoading, entries]);
+  }, [open, projectId, stored, isLoading, loadFailed, entriesLoadFailed, entriesLoading, entries]);
 
   // Entry sync derived from the persisted baseline + draft rows: PUTs for
   // rows whose path changed (or that are new), DELETEs for persisted rows the
@@ -845,32 +869,6 @@ export function ProjectSettingsDialog({
     );
   };
 
-  // Re-run the host's post-bind command for a persisted row by re-PUTting the
-  // SAVED path (never the draft), and show whatever status comes back.
-  const runPostBindCommand = async (rowHostId: string) => {
-    const id = projectId;
-    const savedPath = savedEntries.get(rowHostId);
-    if (id === null || savedPath === undefined) return;
-    setEntriesError(null);
-    setRunningPostBindHostId(rowHostId);
-    try {
-      const written = await putProjectEntry(id, rowHostId, savedPath);
-      const postBind = written.post_bind;
-      setEntryHookOutcomes((current) => {
-        const next = new Map(current);
-        if (postBind) next.set(rowHostId, { result: postBind, source: "run" });
-        else next.delete(rowHostId);
-        return next;
-      });
-      void queryClient.invalidateQueries({ queryKey: ["project-host-roots", id] });
-      void queryClient.invalidateQueries({ queryKey: ["project-collaboration", id] });
-    } catch (error) {
-      setEntriesError({ hostId: rowHostId, message: errorMessage(error) });
-    } finally {
-      setRunningPostBindHostId(null);
-    }
-  };
-
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
@@ -881,12 +879,18 @@ export function ProjectSettingsDialog({
     const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
-    // The stored workspace is only a single-host mirror for upstream readers:
-    // the default host's row when it has one, else nothing. Placement reads the
-    // entries once the project has any, so this can never route a session to a
-    // directory the dialog didn't save.
-    if (defaultHostRowPath) config.workspace = defaultHostRowPath;
-    else delete config.workspace;
+    // The stored workspace is only a single-host mirror for upstream readers.
+    // For a real project it follows the default host's saved project folder
+    // when one exists; otherwise the stored value is kept, because this form
+    // no longer edits folders (the Code tab does). For a label-only folder the
+    // default host's row is the draft that Save is about to turn into an entry.
+    if (labelOnly) {
+      if (defaultHostRowPath) config.workspace = defaultHostRowPath;
+      else delete config.workspace;
+    } else {
+      const defaultEntry = entries.find((entry) => entry.host_id === hostId);
+      if (defaultEntry) config.workspace = defaultEntry.workspace;
+    }
     if (agentId) config.agent_id = agentId;
     else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
@@ -936,53 +940,57 @@ export function ProjectSettingsDialog({
           return;
         }
       }
+      // Entry writes belong to the label-only path, where Save is what creates
+      // the project. A real project's folders are edited in the Code tab.
       // PUT changed rows, DELETE removed rows, sequentially: the first failure
       // stops the sequence, its server message lands on that row, the dialog
       // stays open and no config is written. Sequential by design — the next
       // write must not start after a failure. Each success advances the
       // baseline so a retry only sends what is still pending.
-      for (const row of changedRows) {
-        const path = row.path.trim();
-        let written: ProjectHostEntry & { post_bind?: PostBindResult };
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          written = await putProjectEntry(id, row.hostId, path);
-        } catch (error) {
-          // Select the row so its detail (where the message renders) is on
-          // screen; the user may have been editing another host.
-          setSelectedRowId(row.hostId);
-          setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
-          return;
-        }
-        entryWriteCommitted = true;
-        setSavedEntries((current) => new Map(current).set(row.hostId, path));
-        const postBind = written.post_bind;
-        if (postBind && WARNING_HOOK_STATUSES.has(postBind.status)) hookWarningSeen = true;
-        setEntryHookOutcomes((current) => {
-          const next = new Map(current);
-          if (postBind) next.set(row.hostId, { result: postBind, source: "save" });
-          else next.delete(row.hostId);
-          return next;
-        });
-      }
-      for (const removedHostId of removedHostIds) {
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          await deleteProjectEntry(id, removedHostId);
-        } catch (error) {
-          // Already gone (a committed earlier attempt, or another tab):
-          // the goal state holds, so the save continues.
-          if (!(error instanceof ApiError && error.status === 404)) {
-            setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
+      if (labelOnly) {
+        for (const row of changedRows) {
+          const path = row.path.trim();
+          let written: ProjectHostEntry & { post_bind?: PostBindResult };
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            written = await putProjectEntry(id, row.hostId, path);
+          } catch (error) {
+            // Select the row so its detail (where the message renders) is on
+            // screen; the user may have been editing another host.
+            setSelectedRowId(row.hostId);
+            setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
             return;
           }
+          entryWriteCommitted = true;
+          setSavedEntries((current) => new Map(current).set(row.hostId, path));
+          const postBind = written.post_bind;
+          if (postBind && WARNING_HOOK_STATUSES.has(postBind.status)) hookWarningSeen = true;
+          setEntryHookOutcomes((current) => {
+            const next = new Map(current);
+            if (postBind) next.set(row.hostId, postBind);
+            else next.delete(row.hostId);
+            return next;
+          });
         }
-        entryWriteCommitted = true;
-        setSavedEntries((current) => {
-          const next = new Map(current);
-          next.delete(removedHostId);
-          return next;
-        });
+        for (const removedHostId of removedHostIds) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await deleteProjectEntry(id, removedHostId);
+          } catch (error) {
+            // Already gone (a committed earlier attempt, or another tab):
+            // the goal state holds, so the save continues.
+            if (!(error instanceof ApiError && error.status === 404)) {
+              setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
+              return;
+            }
+          }
+          entryWriteCommitted = true;
+          setSavedEntries((current) => {
+            const next = new Map(current);
+            next.delete(removedHostId);
+            return next;
+          });
+        }
       }
       try {
         await updateConfig.mutateAsync({ id, name: projectName, config });
@@ -994,8 +1002,8 @@ export function ProjectSettingsDialog({
       if (!hookWarningSeen) onOpenChange(false);
     } finally {
       if (entryWriteCommitted && id !== null) {
-        // Partial progress included: the Collaboration tab reads host-roots
-        // for the entry default, and the entries refetch would reseed drafts.
+        // Partial progress included: the folder readers (Code tab / host
+        // roots) must see rows this Save already wrote.
         void queryClient.invalidateQueries({ queryKey: ["project-host-roots", id] });
         void queryClient.invalidateQueries({ queryKey: ["project-collaboration", id] });
       }
@@ -1154,57 +1162,29 @@ export function ProjectSettingsDialog({
             disabled={disabled}
           />
         )}
-        {savedEntries.has(row.hostId) && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-auto self-start p-0 text-muted-foreground text-sm hover:bg-transparent"
-            data-testid={`project-settings-entry-run-post-bind-${row.hostId}`}
-            onClick={() => void runPostBindCommand(row.hostId)}
-            disabled={disabled || runningPostBindHostId !== null}
-          >
-            Run post-bind command
-          </Button>
-        )}
       </div>
     );
   };
 
   const renderEntryOutcome = (row: HostRowDraft) => {
     const rowOutcome = entryHookOutcomes.get(row.hostId);
-    const rowOutcomeWarning = rowOutcome
-      ? WARNING_HOOK_STATUSES.has(rowOutcome.result.status)
-      : false;
-    const showOutcome =
-      rowOutcome !== undefined && (rowOutcome.source === "run" || rowOutcomeWarning);
+    const rowOutcomeWarning = rowOutcome ? WARNING_HOOK_STATUSES.has(rowOutcome.status) : false;
     const rowError = entriesError?.hostId === row.hostId ? entriesError : null;
-    if (!showOutcome && !rowError) return null;
+    if (!rowOutcomeWarning && !rowError) return null;
     return (
       <>
-        {showOutcome && rowOutcome && (
+        {rowOutcomeWarning && rowOutcome && (
           <div
-            className={
-              rowOutcomeWarning ? "text-destructive text-ui" : "text-ui text-muted-foreground"
-            }
+            className="text-destructive text-ui"
             role="status"
             data-testid={`project-settings-entry-post-bind-${row.hostId}`}
           >
-            {rowOutcome.result.status === "ok" ? (
-              "Post-bind command succeeded"
-            ) : (
-              <>
-                {rowOutcomeWarning ? "Directory saved; " : ""}post-bind command{" "}
-                {hookStatusLabel(rowOutcome.result.status)}
-                {rowOutcome.result.error ? `: ${rowOutcome.result.error}` : ""}
-                {typeof rowOutcome.result.exit_code === "number"
-                  ? ` (exit code ${rowOutcome.result.exit_code})`
-                  : ""}
-                {rowOutcome.result.output ? (
-                  <pre className="mt-1 whitespace-pre-wrap">{rowOutcome.result.output}</pre>
-                ) : null}
-              </>
-            )}
+            Directory saved; post-bind command {hookStatusLabel(rowOutcome.status)}
+            {rowOutcome.error ? `: ${rowOutcome.error}` : ""}
+            {typeof rowOutcome.exit_code === "number" ? ` (exit code ${rowOutcome.exit_code})` : ""}
+            {rowOutcome.output ? (
+              <pre className="mt-1 whitespace-pre-wrap">{rowOutcome.output}</pre>
+            ) : null}
           </div>
         )}
         {rowError && (
@@ -1426,9 +1406,11 @@ export function ProjectSettingsDialog({
         className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
         data-testid={`project-settings-host-detail-${row.hostId}`}
       >
-        <Field label="Directory" hint="Where new sessions open on this host">
-          {renderDirectoryField(row)}
-        </Field>
+        {labelOnly && (
+          <Field label="Directory" hint="Where new sessions open on this host">
+            {renderDirectoryField(row)}
+          </Field>
+        )}
         <Field label="Agent" hint="Default agent / harness for new sessions on this host">
           {renderAgentSelect(row)}
         </Field>
@@ -1687,9 +1669,9 @@ export function ProjectSettingsDialog({
         <DialogHeader className="shrink-0 border-b px-5 pt-5 sm:px-6 sm:pt-6">
           <DialogTitle>Project settings</DialogTitle>
           <DialogDescription>
-            Defaults and collaboration for <b>{projectName}</b>.
+            Defaults and code locations for <b>{projectName}</b>.
           </DialogDescription>
-          {showCollaboration && (
+          {isRealProject && (
             <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
               <TabsList variant="line" className="mt-3 -mb-px w-full justify-start gap-4 px-0">
                 <TabsTrigger
@@ -1701,12 +1683,12 @@ export function ProjectSettingsDialog({
                   Session defaults
                 </TabsTrigger>
                 <TabsTrigger
-                  value="collaboration"
-                  id={`${tabsId}-collaboration-tab`}
-                  aria-controls={`${tabsId}-collaboration-panel`}
+                  value="code"
+                  id={`${tabsId}-code-tab`}
+                  aria-controls={`${tabsId}-code-panel`}
                   className="flex-none px-2 pb-3"
                 >
-                  Collaboration
+                  Code
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -1714,9 +1696,9 @@ export function ProjectSettingsDialog({
         </DialogHeader>
         <form
           id="project-settings-defaults-form"
-          role={showCollaboration ? "tabpanel" : undefined}
-          aria-labelledby={showCollaboration ? `${tabsId}-defaults-tab` : undefined}
-          tabIndex={showCollaboration ? 0 : undefined}
+          role={isRealProject ? "tabpanel" : undefined}
+          aria-labelledby={isRealProject ? `${tabsId}-defaults-tab` : undefined}
+          tabIndex={isRealProject ? 0 : undefined}
           onSubmit={onSubmit}
           hidden={activeTab !== "defaults"}
           className={
@@ -1859,11 +1841,7 @@ export function ProjectSettingsDialog({
           </Field>
 
           {useWorktree && (
-            <Field
-              label="Base branch"
-              hint="Branch new worktrees fork from; blank uses the current branch"
-              htmlFor="project-settings-base-branch"
-            >
+            <Field label="Base branch" hint={baseBranchHint} htmlFor="project-settings-base-branch">
               <input
                 id="project-settings-base-branch"
                 data-testid="project-settings-base-branch"
@@ -1902,16 +1880,16 @@ export function ProjectSettingsDialog({
             </p>
           )}
         </form>
-        {showCollaboration && projectId !== null && (
+        {projectId !== null && (
           <div
-            id={`${tabsId}-collaboration-panel`}
+            id={`${tabsId}-code-panel`}
             role="tabpanel"
-            aria-labelledby={`${tabsId}-collaboration-tab`}
+            aria-labelledby={`${tabsId}-code-tab`}
             tabIndex={0}
-            hidden={activeTab !== "collaboration"}
+            hidden={activeTab !== "code"}
             className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6"
           >
-            <ProjectCollaborationSection projectId={projectId} />
+            <ProjectCodeSection projectId={projectId} />
           </div>
         )}
         <DialogFooter className="m-0 shrink-0 rounded-none border-t bg-popover px-5 py-4 sm:px-6 sm:py-4">
