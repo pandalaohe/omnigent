@@ -18,6 +18,7 @@ const {
   socketStatusListeners,
   socketFrameListeners,
   socketConnectedRef,
+  socketHasSnapshotRef,
   socketHelloMock,
   socketActivityMock,
   claimFetchMock,
@@ -47,6 +48,7 @@ const {
     socketStatusListeners: new Set<() => void>(),
     socketFrameListeners: new Set<(frame: { type: string; [key: string]: unknown }) => void>(),
     socketConnectedRef: { current: false },
+    socketHasSnapshotRef: { current: false },
     socketHelloMock: vi.fn(),
     socketActivityMock: vi.fn(),
     claimFetchMock: vi.fn(),
@@ -91,6 +93,7 @@ vi.mock("@/hooks/useUnseenConversations", () => ({
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
     isConnected: () => socketConnectedRef.current,
+    hasSnapshot: () => socketHasSnapshotRef.current,
     subscribeStatus: (listener: () => void) => {
       socketStatusListeners.add(listener);
       return () => socketStatusListeners.delete(listener);
@@ -193,6 +196,7 @@ describe("useSoundAlerts", () => {
     socketStatusListeners.clear();
     socketFrameListeners.clear();
     socketConnectedRef.current = false;
+    socketHasSnapshotRef.current = false;
     socketHelloMock.mockClear();
     socketActivityMock.mockClear();
     claimFetchMock.mockReset();
@@ -556,6 +560,40 @@ describe("useSoundAlerts", () => {
 
     expect(claimFetchMock).toHaveBeenCalledTimes(1);
     expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
+  });
+
+  it("detects an edge when the snapshot already arrived before mount", () => {
+    // The socket starts above AppShell's Suspense boundary, so its snapshot
+    // can land before this hook subscribes; no snapshot frame is ever sent to
+    // this listener, yet detection must still be live.
+    socketConnectedRef.current = true;
+    socketHasSnapshotRef.current = true;
+    setConversations([conv("conv_a", { pending_elicitations_count: 0 })]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+
+    act(() => {
+      setConversations([conv("conv_a", { pending_elicitations_count: 1, updated_at: 200 })]);
+      rerender();
+    });
+
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
+  });
+
+  it("claims an existing awaiting row once on the mount rebaseline", () => {
+    socketConnectedRef.current = true;
+    socketHasSnapshotRef.current = true;
+    setConversations([conv("conv_a", { pending_elicitations_count: 1 })]);
+    const { rerender } = renderHook(() => useSoundAlerts());
+
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+    expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "needs_response" });
+
+    // The rebaseline is one-shot; a later render is not a new baseline.
+    act(() => {
+      rerender();
+    });
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("plays a sound_alert frame delivered to this connection", () => {

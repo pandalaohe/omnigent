@@ -117,10 +117,13 @@ export function useSoundAlerts(activeConversationId?: string): void {
   const previousRows = useRef<Map<string, RowSoundState> | null>(null);
   const latestRows = useRef<Map<string, RowSoundState>>(new Map());
   const settleTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const rebaselinePending = useRef(false);
-  // Starts true: the initial page load counts as a connect, so nothing is
-  // detected until the first snapshot arrives and re-baselines.
-  const awaitingSnapshot = useRef(true);
+  const rebaselinePending = useRef(sessionUpdatesSocket.hasSnapshot());
+  // If the socket already delivered this connection's snapshot before this
+  // hook mounted (it starts above AppShell's Suspense boundary), start live:
+  // the first recompute re-baselines on the current rows and re-claims
+  // still-pending prompts, exactly like the snapshot-frame path. Otherwise
+  // nothing is detected until the first snapshot arrives and re-baselines.
+  const awaitingSnapshot = useRef(!rebaselinePending.current);
   const [recomputeTick, setRecomputeTick] = useState(0);
   // Re-announce to the server when the browser's audio unlocks, so a tab that
   // couldn't ring yet starts being chosen once the user interacts.

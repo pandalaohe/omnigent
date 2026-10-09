@@ -127,6 +127,49 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
 // the scheduled reconnect timer has fired regardless of the random jitter.
 const RECONNECT_CEILING_MS = 5_001;
 
+describe("sessionUpdatesSocket snapshot tracking", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    sessionUpdatesSocket.stop();
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("reports a snapshot only for the current connection", () => {
+    sessionUpdatesSocket.start();
+    const first = latestWs();
+    first.open();
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    // A diff frame is not the connect snapshot.
+    first.emit({ type: "changed", items: [] });
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    first.emit({ type: "snapshot", items: [] });
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(true);
+
+    // A drop clears it; the next connection starts fresh and must wait for
+    // its own snapshot rather than inheriting the previous one.
+    first.close();
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+    const second = latestWs();
+    expect(second).not.toBe(first);
+    second.open();
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    second.emit({ type: "snapshot", items: [] });
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(true);
+  });
+});
+
 describe("nextPushedSession", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];

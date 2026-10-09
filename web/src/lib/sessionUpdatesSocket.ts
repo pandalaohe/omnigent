@@ -123,6 +123,7 @@ class SessionUpdatesSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+  private snapshotDelivered = false;
 
   /** Open the connection (idempotent). */
   start(): void {
@@ -161,6 +162,20 @@ class SessionUpdatesSocket {
    */
   isConnected(): boolean {
     return this.connected;
+  }
+
+  /**
+   * Whether the current connection has delivered its connect snapshot.
+   *
+   * A consumer that mounts after the stream has started (for example behind a
+   * Suspense boundary) uses this to start live instead of waiting for a
+   * snapshot frame that already passed. The snapshot is only pushed on
+   * (re)connect, so an unchanged watch-set never re-sends one.
+   *
+   * @returns `true` while connected and after this connection's snapshot.
+   */
+  hasSnapshot(): boolean {
+    return this.connected && this.snapshotDelivered;
   }
 
   /**
@@ -247,6 +262,7 @@ class SessionUpdatesSocket {
     this.ws = ws;
     ws.onopen = () => {
       this.failedAttempts = 0;
+      this.snapshotDelivered = false;
       this.setConnected(true);
       // Start the silence watchdog: from here we expect at least a
       // heartbeat within the window or we treat the link as dead.
@@ -263,6 +279,7 @@ class SessionUpdatesSocket {
     };
     ws.onclose = () => {
       this.ws = null;
+      this.snapshotDelivered = false;
       this.clearWatchdog();
       this.setConnected(false);
       if (this.started) this.scheduleReconnect();
@@ -336,6 +353,7 @@ class SessionUpdatesSocket {
     } catch {
       return;
     }
+    if (frame.type === "snapshot") this.snapshotDelivered = true;
     for (const listener of this.listeners) listener(frame);
   }
 }
