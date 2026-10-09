@@ -2106,7 +2106,11 @@ class SqlProjectRepository(OmnigentBase):
         to ``projects.id``). No DB foreign key (Rule R032); cleanup on
         project deletion is application-owned.
     :param name: Stable identity; unique per project.
-    :param remote_url: The shared remote. Carries no credentials.
+    :param role: ``"code"`` for the repository the project's agents change,
+        ``"related"`` for the rest. At most one code repository per project,
+        enforced by the store.
+    :param remote_url: The shared remote. Carries no credentials; may be
+        empty when no git location is registered.
     :param default_branch: The repository's default branch name.
     :param context_manifest_path: Repo-relative path of the project-context
         manifest, e.g. ``".agents/project/manifest.json"``.
@@ -2130,6 +2134,9 @@ class SqlProjectRepository(OmnigentBase):
     # Relates to projects.id. No DB foreign key (Rule R032); cascade is app-owned.
     project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
+    role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="related", server_default="related"
+    )
     remote_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     default_branch: Mapped[str] = mapped_column(String(255), nullable=False)
     context_manifest_path: Mapped[str] = mapped_column(

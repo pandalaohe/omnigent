@@ -71,6 +71,7 @@ from omnigent.server.project_placement import (
     checkout_on_host,
     load_bindings,
     load_entries,
+    resolve_new_branch_base,
     same_canonical_path,
 )
 from omnigent.server.routes._auth_helpers import require_user
@@ -1391,6 +1392,7 @@ def create_hosts_router(
         entry: str | None = None
         checkout: str | None = None
         binding_store = getattr(request.app.state, "project_host_binding_store", None)
+        repository_store = getattr(request.app.state, "project_repository_store", None)
         if target.conv.project_id is not None and binding_store is not None:
             entries = await load_entries(binding_store, target.conv.project_id)
             entry = next((row.workspace for row in entries if row.host_id == host_id), None)
@@ -1547,6 +1549,33 @@ def create_hosts_router(
                                 )
                             except WorkspaceValidationError as exc:
                                 raise HTTPException(status_code=400, detail=exc.message) from exc
+                    # A new branch with no explicit base forks from the
+                    # project's code repository when it has one; existing
+                    # branches and explicit bases are passed through.
+                    base_branch = body.git.base_branch
+                    if (
+                        base_branch is None
+                        and not body.git.existing_branch
+                        and target.conv.project_id is not None
+                        and repository_store is not None
+                    ):
+                        project_store_ref = getattr(request.app.state, "project_store", None)
+                        project = (
+                            await asyncio.to_thread(
+                                project_store_ref.get,
+                                target.conv.project_id,
+                                user_id=user_id,
+                            )
+                            if project_store_ref is not None
+                            else None
+                        )
+                        base_branch = resolve_new_branch_base(
+                            project,
+                            await asyncio.to_thread(
+                                repository_store.list_by_project, target.conv.project_id
+                            ),
+                            None,
+                        )
                     try:
                         # The owner's worktree location template rides the
                         # frame; unset keeps the upstream sibling layout.
@@ -1560,7 +1589,7 @@ def create_hosts_router(
                             host_conn=conn,
                             repo_path=source_repo,
                             branch_name=body.git.branch_name,
-                            base_branch=body.git.base_branch,
+                            base_branch=base_branch,
                             existing_branch=body.git.existing_branch,
                             entry=entry,
                             path_template=path_template,

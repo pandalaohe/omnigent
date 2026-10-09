@@ -21,7 +21,9 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.project_collaboration import (
     _DEFAULT_MANIFEST_PATH,
-    _canonical_binding_workspace,
+    _is_managed_worktree_path,
+    _record_setup_outcome,
+    _resolve_stored_workspace,
     run_post_bind_request,
 )
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
@@ -34,33 +36,13 @@ class EntryPutRequest(BaseModel):
     """Request body for ``PUT /v1/projects/{project_id}/entries/{host_id}``.
 
     :param workspace: Absolute path on the host. Validated live via
-        ``host.stat``; the canonical path the host returns is stored.
+        ``host.stat``; the canonical path the host returns is stored. An
+        offline host stores the typed path after string checks.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     workspace: str
-
-
-def _is_managed_worktree_path(path: str) -> bool:
-    """Whether *path* lies inside an Omnigent-managed worktree area.
-
-    Assignment release and session cleanup remove those directories, so an
-    entry there could later be matched by a removal that never intended it.
-    Components compare case-insensitively: Windows paths are, and the
-    removal that owns those directories resolves case-insensitively too.
-
-    :param path: Canonical path returned by the host.
-    :returns: ``True`` for a ``.worktrees`` component or an
-        ``.omnigent/worktrees`` pair, on either path separator, in any case.
-    """
-    components = [component.lower() for component in path.replace("\\", "/").split("/")]
-    if ".worktrees" in components:
-        return True
-    return any(
-        components[index] == ".omnigent" and components[index + 1] == "worktrees"
-        for index in range(len(components) - 1)
-    )
 
 
 def _entry_to_response(entry: ProjectHostEntry) -> dict[str, Any]:
@@ -135,17 +117,19 @@ def create_project_entries_router(
         """Validate and store a host's entry directory.
 
         The typed path is validated live on the host; the canonical path the
-        host returns is what gets stored, never the typed one.
+        host returns is what gets stored, never the typed one. An offline
+        host stores the typed path unchecked (``checked: false``) and skips
+        the post-bind hook.
 
         :param request: The incoming request, used to identify the user.
         :param project_id: The project the entry belongs to.
         :param host_id: The host the directory lives on.
         :param body: Workspace path on the host.
-        :returns: The inserted or updated entry plus the ``post_bind``
-            outcome object.
+        :returns: The inserted or updated entry plus ``checked`` and, for an
+            online host, the ``post_bind`` outcome object.
         :raises OmnigentError: 401 if unauthenticated, 404 if the project is
             not found / not owned, 400 for the sandbox host, a bad path or a
-            path inside a worktree folder, 409 when the host is offline.
+            path inside a worktree folder.
         """
         user_id = require_user(request, auth_provider)
         await _require_owned_project(project_id, user_id)
@@ -154,14 +138,15 @@ def create_project_entries_router(
                 "the sandbox host has no project directory",
                 code=ErrorCode.INVALID_INPUT,
             )
-        canonical, _host_name = await _canonical_binding_workspace(
+        workspace, _host_name, checked = await _resolve_stored_workspace(
             user_id=user_id,
             host_id=host_id,
             workspace=body.workspace,
+            kind="project",
             host_store=host_store,
             host_registry=host_registry,
         )
-        if _is_managed_worktree_path(canonical):
+        if checked and _is_managed_worktree_path(workspace):
             raise OmnigentError(
                 "a project directory cannot be inside a worktree folder "
                 "(.worktrees or .omnigent/worktrees)",
@@ -171,11 +156,14 @@ def create_project_entries_router(
             binding_store.put_entry,
             project_id,
             host_id,
-            canonical,
+            workspace,
         )
+        response = {**_entry_to_response(entry), "checked": checked}
+        if not checked:
+            return response
         # The entry is stored before the hook runs and is never refused by
         # it; revision 0 keeps repeated entry runs from being superseded.
-        assert host_registry is not None  # guaranteed by _canonical_binding_workspace
+        assert host_registry is not None  # guaranteed by _resolve_stored_workspace
         post_bind = await run_post_bind_request(
             host_registry=host_registry,
             host_id=host_id,
@@ -189,7 +177,15 @@ def create_project_entries_router(
             context_manifest_path=_DEFAULT_MANIFEST_PATH,
             trigger="entry",
         )
-        return {**_entry_to_response(entry), "post_bind": post_bind}
+        _record_setup_outcome(
+            project_id=project_id,
+            host_id=host_id,
+            kind="entry",
+            name=None,
+            result=post_bind,
+        )
+        response["post_bind"] = post_bind
+        return response
 
     @router.delete(
         "/projects/{project_id}/entries/{host_id}", status_code=status.HTTP_204_NO_CONTENT

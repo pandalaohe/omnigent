@@ -11,14 +11,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from omnigent.entities import ProjectRepository
+from omnigent.entities import ProjectHostBinding, ProjectRepository
 
 
 class ProjectRepositoryStore(ABC):
     """
     Abstract base for project-repository persistence.
 
-    Manages the lifecycle of registered repositories (upsert / get / list /
+    Manages the lifecycle of registered repositories (apply / get / list /
     delete). Reads and writes are scoped by the ambient workspace; rows carry
     no owner of their own — ownership is the project's.
     """
@@ -33,31 +33,41 @@ class ProjectRepositoryStore(ABC):
         self.storage_location = storage_location
 
     @abstractmethod
-    def upsert(
+    def apply_repository(
         self,
         *,
         project_id: str,
         name: str,
         remote_url: str,
         default_branch: str,
+        role: str | None = None,
         context_manifest_path: str = ".agents/project/manifest.json",
-    ) -> ProjectRepository:
+    ) -> tuple[ProjectRepository, list[ProjectHostBinding]]:
         """
-        Register a repository or revise its registration.
+        Register a repository or revise its registration, then derive primaries.
 
         Looks up the row by ``(project_id, name)``. A missing row is
-        inserted at ``revision`` 1; an existing row whose fields differ is
-        updated and bumped to ``revision + 1``; an identical row is returned
-        unchanged (no bump).
+        inserted at ``revision`` 1 with ``role`` defaulting to ``"related"``;
+        an existing row whose fields differ is updated and bumped to
+        ``revision + 1``; an identical row is returned unchanged (no bump).
+        ``role=None`` keeps the current role. A ``"code"`` role demotes every
+        other repository of the project to ``"related"`` (bumping their
+        revisions) and re-derives, per host, which binding of the code
+        repository is primary.
 
         :param project_id: The project to register the repository on.
         :param name: Stable identity used by assignments; unique per project.
-        :param remote_url: The shared remote. Carries no credentials.
+        :param remote_url: The shared remote. Carries no credentials; may be
+            empty.
         :param default_branch: The repository's default branch name.
+        :param role: ``"code"`` or ``"related"``; ``None`` keeps the stored
+            role (``"related"`` on create).
         :param context_manifest_path: Repo-relative path of the
             project-context manifest.
-        :returns: The inserted or updated :class:`ProjectRepository`.
-        :raises OmnigentError: ``NOT_FOUND`` when ``project_id`` is unknown.
+        :returns: The inserted or updated :class:`ProjectRepository` and the
+            bindings whose derived ``is_primary`` changed.
+        :raises OmnigentError: ``NOT_FOUND`` when ``project_id`` is unknown;
+            ``INVALID_INPUT`` for a role outside the two allowed values.
         """
         ...
 

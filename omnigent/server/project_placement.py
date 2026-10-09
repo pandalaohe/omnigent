@@ -9,7 +9,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-from omnigent.entities import Project, ProjectHostBinding, ProjectHostEntry
+from omnigent.entities import (
+    Project,
+    ProjectHostBinding,
+    ProjectHostEntry,
+    ProjectRepository,
+)
 from omnigent.server.routes._workspace_validation import (
     _is_subpath_of,
     _is_windows_absolute_path,
@@ -172,6 +177,33 @@ def host_roots(
         for host_id in sorted(host_ids)
         if (root := root_on_host(project, bindings, host_id)) is not None
     ]
+
+
+def resolve_new_branch_base(
+    project: Project | None,
+    repositories: list[ProjectRepository],
+    explicit_base: str | None,
+) -> str | None:
+    """Pick the base for a new branch cut without an explicit one.
+
+    An explicit base always wins (blank was already normalised to ``None``
+    by the caller). Otherwise a project create forks from its code
+    repository's default branch; no project or no code repository leaves the
+    base unset, which keeps the source HEAD behaviour.
+
+    :param project: The session's project, or ``None`` outside a project.
+    :param repositories: That project's registered repositories.
+    :param explicit_base: The caller-supplied base ref, if any.
+    :returns: The base ref to cut from, or ``None`` for the source HEAD.
+    """
+    if explicit_base:
+        return explicit_base
+    if project is None:
+        return None
+    for repository in repositories:
+        if repository.role == "code" and repository.default_branch:
+            return repository.default_branch
+    return None
 
 
 def same_canonical_path(first: str, second: str) -> bool:

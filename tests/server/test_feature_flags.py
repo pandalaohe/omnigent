@@ -26,9 +26,21 @@ def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "harness_settings_ui": True,
-        "project_assignments": False,
+        # Deprecated no-op: always true for old clients that gate the tab on it.
+        "project_assignments": True,
         "session_peer_messaging": False,
     }
+
+
+def test_project_assignments_is_accepted_as_a_deprecated_no_op() -> None:
+    """The name still resolves, reports true, and names its removal release."""
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "project_assignments"})
+
+    assert flags.frontend_dict()["project_assignments"] is True
+    definition = next(
+        item for item in FEATURE_DEFINITIONS if item.feature is Feature.PROJECT_ASSIGNMENTS
+    )
+    assert "0.17.0" in definition.description
 
 
 @pytest.mark.parametrize(

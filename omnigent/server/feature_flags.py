@@ -74,7 +74,11 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     ),
     FeatureDefinition(
         feature=Feature.PROJECT_ASSIGNMENTS,
-        description="Cross-host project collaboration: project repositories and host bindings",
+        description=(
+            "Deprecated no-op (removal target 0.17.0): project repositories and "
+            "host bindings are always on; accepted so OMNIGENT_FEATURES keeps "
+            "resolving and old web clients keep showing their tab"
+        ),
         owner="server",
         review_by_release="0.16.0",
     ),
@@ -102,9 +106,17 @@ class FeatureFlags:
         return feature in self.enabled_features
 
     def frontend_dict(self) -> dict[str, bool]:
-        """Return every frontend-visible feature and its resolved value."""
+        """Return every frontend-visible feature and its resolved value.
+
+        ``project_assignments`` always reports true: the routes are ungated,
+        so a web client from before the change must keep showing its tab.
+        """
         return {
-            definition.feature.value: self.enabled(definition.feature)
+            definition.feature.value: (
+                True
+                if definition.feature is Feature.PROJECT_ASSIGNMENTS
+                else self.enabled(definition.feature)
+            )
             for definition in FEATURE_DEFINITIONS
             if definition.frontend_visible
         }

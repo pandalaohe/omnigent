@@ -478,7 +478,7 @@
           },
           "is_primary": {
             "default": false,
-            "description": "Whether this is the host's primary binding.",
+            "description": "Deprecated and ignored (removal target 0.17.0): the primary binding is derived from the project's code repository.",
             "title": "Is Primary",
             "type": "boolean"
           },
@@ -488,7 +488,7 @@
             "type": "string"
           },
           "workspace": {
-            "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored.",
+            "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored. An offline host stores the typed path after string checks.",
             "title": "Workspace",
             "type": "string"
           }
@@ -2877,7 +2877,7 @@
         "description": "Request body for `PUT /v1/projects/{project_id}/entries/{host_id}`.",
         "properties": {
           "workspace": {
-            "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored.",
+            "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored. An offline host stores the typed path after string checks.",
             "title": "Workspace",
             "type": "string"
           }
@@ -6061,9 +6061,21 @@
             "type": "string"
           },
           "remote_url": {
-            "description": "The shared remote. Must be non-empty and carry no credentials.",
+            "description": "The shared remote; may be empty when no git location is registered. A non-empty URL must carry no credentials and no query or fragment.",
             "title": "Remote Url",
             "type": "string"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"code\"` or `\"related\"`; omitted keeps the stored role (`\"related\"` on create).",
+            "title": "Role"
           }
         },
         "required": [
@@ -14664,7 +14676,7 @@
     },
     "/v1/projects/{project_id}/collaboration": {
       "get": {
-        "description": "Return the project's collaboration config plus validation status.\n\n**Returns:** `{repositories, bindings, problems}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "description": "Return the project's collaboration config plus validation status.\n\n**Returns:** `{repositories, bindings, problems, setup_outcomes}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
         "operationId": "get_collaboration_v1_projects__project_id__collaboration_get",
         "parameters": [
           {
@@ -14801,7 +14813,7 @@
         ]
       },
       "put": {
-        "description": "Validate and store a host's entry directory.\n\nThe typed path is validated live on the host; the canonical path the\nhost returns is what gets stored, never the typed one.\n\n**Parameters**\n\n- `body` \u2014 Workspace path on the host.\n\n**Returns:** The inserted or updated entry plus the `post_bind` outcome object.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 for the sandbox host, a bad path or a path inside a worktree folder, 409 when the host is offline.",
+        "description": "Validate and store a host's entry directory.\n\nThe typed path is validated live on the host; the canonical path the\nhost returns is what gets stored, never the typed one. An offline\nhost stores the typed path unchecked (`checked: false`) and skips\nthe post-bind hook.\n\n**Parameters**\n\n- `body` \u2014 Workspace path on the host.\n\n**Returns:** The inserted or updated entry plus `checked` and, for an online host, the `post_bind` outcome object.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 for the sandbox host, a bad path or a path inside a worktree folder.",
         "operationId": "put_project_entry_v1_projects__project_id__entries__host_id__put",
         "parameters": [
           {
@@ -14913,7 +14925,7 @@
     },
     "/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}": {
       "delete": {
-        "description": "Delete a host binding.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_host_binding.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned.",
+        "description": "Delete a host binding.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_host_binding.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned.",
         "operationId": "delete_binding_v1_projects__project_id__hosts__host_id__bindings__name__delete",
         "parameters": [
           {
@@ -14977,7 +14989,7 @@
         ]
       },
       "put": {
-        "description": "Validate and store a host binding, stamping `path_verified_at`.\n\nThe typed path is validated live on the host; the canonical path\nthe host returns is what gets stored, never the typed one.\n\n**Parameters**\n\n- `body` \u2014 Workspace, repository name and binding flags.\n\n**Returns:** The inserted or updated binding plus the `post_bind` outcome object.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 on a bad name, unknown repository or bad path, 409 when the host is offline or a second primary is requested for the host.",
+        "description": "Validate and store a host binding, deriving the host's primary.\n\nThe typed path is validated live on the host; the canonical path\nthe host returns is what gets stored, never the typed one. An\noffline host stores the typed path unchecked (`checked: false`)\nand skips the post-bind hook.\n\n**Parameters**\n\n- `body` \u2014 Workspace, repository name and enabled flag. The deprecated `is_primary` input is ignored.\n\n**Returns:** The inserted or updated binding plus `checked` and, for an online host, the `post_bind` outcome object.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 on a bad name, unknown repository or bad path.",
         "operationId": "put_binding_v1_projects__project_id__hosts__host_id__bindings__name__put",
         "parameters": [
           {
@@ -15053,7 +15065,7 @@
     },
     "/v1/projects/{project_id}/hosts/{host_id}/bindings/{name}/verify": {
       "post": {
-        "description": "Re-run host validation for the stored binding path.\n\nOn success refreshes `path_verified_at` (and the stored workspace\nwhen the canonical path moved, bumping `revision` only then). On\nfailure the row is left unchanged and the validation error is\nreturned.\n\n**Returns:** The refreshed binding plus the `post_bind` outcome object.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned, 409 when the host is offline or the binding changed during verification, 400 when the stored path no longer validates.",
+        "description": "Re-run host validation for the stored binding path.\n\nOn success refreshes `path_verified_at` (and the stored workspace\nwhen the canonical path moved, bumping `revision` only then). On\nfailure the row is left unchanged and the validation error is\nreturned.\n\n**Returns:** The refreshed binding plus the `post_bind` outcome object.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or binding is not found / not owned, 409 when the host is offline or the binding changed during verification, 400 when the stored path no longer validates.",
         "operationId": "verify_binding_v1_projects__project_id__hosts__host_id__bindings__name__verify_post",
         "parameters": [
           {
@@ -15119,7 +15131,7 @@
     },
     "/v1/projects/{project_id}/repositories/{name}": {
       "delete": {
-        "description": "Delete a registered repository.\n\nRefused while any binding of the project still references it.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_repository.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or repository is not found / not owned, 409 when a binding still references the repository.",
+        "description": "Delete a registered repository.\n\nRefused while any binding of the project still references it.\n\n**Returns:** `{\"id\": ..., \"object\": \"project_repository.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project or repository is not found / not owned, 409 when a binding still references the repository.",
         "operationId": "delete_repository_v1_projects__project_id__repositories__name__delete",
         "parameters": [
           {
@@ -15173,7 +15185,7 @@
         ]
       },
       "put": {
-        "description": "Register a repository or revise its registration.\n\n**Parameters**\n\n- `body` \u2014 Remote, default branch and optional manifest path.\n\n**Returns:** The inserted or updated repository.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled.\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 on a bad name, missing or credentialed remote, or bad manifest path.",
+        "description": "Register a repository or revise its registration.\n\n**Parameters**\n\n- `body` \u2014 Remote, default branch, role and optional manifest path.\n\n**Returns:** The inserted or updated repository.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if the project is not found / not owned, 400 on a bad name, credentialed or query-carrying remote, bad role, or bad manifest path.",
         "operationId": "put_repository_v1_projects__project_id__repositories__name__put",
         "parameters": [
           {
