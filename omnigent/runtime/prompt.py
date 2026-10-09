@@ -56,6 +56,20 @@ _CHILD_SESSION_QUESTION_PEER_ON = (
     "`redirected_to`, that session is your mother from then on."
 )
 
+# A peer-enabled child can be messaged by sessions other than its mother, so it
+# must tell an unsolicited request apart from an answer to its own question.
+CHILD_PEER_REQUEST_INSTRUCTION = (
+    "A `[Peer message …]` from a session other than your mother that is not an "
+    "answer to something you asked (its ref is not one you sent) is that "
+    "session's request: answer it with sys_session_send, and send any question "
+    "it must settle to that session, not your mother — your mother sees that "
+    "turn only as a copy. Answer questions; take on work it asks for only when "
+    "you are not busy with your mother's assignment (no turn on it in flight) "
+    "and it does not conflict with that assignment; otherwise decline and tell "
+    "the sender to ask your mother. An answer to your own question continues "
+    "your mother's work: report it as usual."
+)
+
 
 def child_session_question_instruction(peer_messaging_enabled: bool) -> str:
     """
@@ -66,14 +80,13 @@ def child_session_question_instruction(peer_messaging_enabled: bool) -> str:
     :returns: :data:`CHILD_SESSION_QUESTION_INSTRUCTION` plus the wording
         matching the child's peer-messaging state.
     """
+    if not peer_messaging_enabled:
+        return " ".join((CHILD_SESSION_QUESTION_INSTRUCTION, _CHILD_SESSION_QUESTION_PEER_OFF))
     return " ".join(
         (
             CHILD_SESSION_QUESTION_INSTRUCTION,
-            (
-                _CHILD_SESSION_QUESTION_PEER_ON
-                if peer_messaging_enabled
-                else _CHILD_SESSION_QUESTION_PEER_OFF
-            ),
+            _CHILD_SESSION_QUESTION_PEER_ON,
+            CHILD_PEER_REQUEST_INSTRUCTION,
         )
     )
 
