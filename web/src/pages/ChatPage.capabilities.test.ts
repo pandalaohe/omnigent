@@ -34,7 +34,8 @@ describe("permission controls", () => {
     expect(shouldShowCodexApprovalModeControl(codex)).toBe(true);
     expect(shouldShowPermissionModeControl(codex)).toBe(false);
     expect(sdkPermissionOptions(codex.harness)?.map((mode) => mode.value)).toEqual([
-      "default",
+      "ask-for-approval",
+      "approve-for-me",
       "full-access",
       "read-only",
     ]);

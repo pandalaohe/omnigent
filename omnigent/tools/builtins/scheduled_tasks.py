@@ -108,8 +108,8 @@ class SysScheduledTaskCreateTool(Tool):
                             "description": (
                                 "Optional permission mode for Claude Code or Claude SDK "
                                 "('default', 'auto', 'acceptEdits', 'plan', 'dontAsk', "
-                                "'bypassPermissions'), or Codex SDK ('default', "
-                                "'full-access', 'read-only'). "
+                                "'bypassPermissions'), or Codex SDK ('ask-for-approval', "
+                                "'approve-for-me', 'full-access', 'read-only'). "
                                 "Runs are unattended, so a prompting mode "
                                 "stalls waiting for approval — prefer an auto-running mode. "
                                 "Omit for the agent default."
@@ -245,8 +245,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": (
                                 "New permission mode for Claude Code or Claude SDK "
                                 "('default', 'auto', 'acceptEdits', 'plan', 'dontAsk', "
-                                "'bypassPermissions'), or Codex SDK ('default', "
-                                "'full-access', 'read-only')."
+                                "'bypassPermissions'), or Codex SDK ('ask-for-approval', "
+                                "'approve-for-me', 'full-access', 'read-only')."
                             ),
                         },
                         "max_cost_usd": {

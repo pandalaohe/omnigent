@@ -1192,8 +1192,8 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Default" }));
     fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
     expect(await screen.findByRole("option", { name: "Agent default" })).toBeInTheDocument();
-    expect(await screen.findByRole("option", { name: "Default" })).toBeInTheDocument();
-    fireEvent.click(await screen.findByRole("option", { name: "Read only" }));
+    expect(await screen.findByRole("option", { name: "Ask for approval" })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("option", { name: "Read Only" }));
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -1215,6 +1215,21 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     );
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("gpt-5.5");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("xHigh");
+  });
+
+  it("shows legacy Codex default as Ask for approval and omits untouched permission on update", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_codex", permissionMode: "default" })}
+      />,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Ask for approval");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("permissionMode");
   });
 
   it("uses pinned host Codex SDK model rows and their effort levels", async () => {

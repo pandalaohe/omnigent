@@ -11275,7 +11275,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
 
   it.each([
     ["Claude SDK", "claude-sdk", "Auto", "permission_mode", "auto"],
-    ["Codex", "codex", "Default", "approval_mode", "default"],
+    ["Codex", "codex", "Ask for approval", "approval_mode", "ask-for-approval"],
   ])("shows and sends the %s permission default", async (label, harness, chip, field, mode) => {
     mockSdkModels();
     authenticatedFetchMock.mockResolvedValue({
@@ -11292,12 +11292,16 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       `Permission mode: ${chip}`,
     );
     openPermissions();
-    expect(screen.getByTestId("new-chat-landing-permission-option-default")).toBeVisible();
     if (harness === "claude-sdk") {
+      expect(screen.getByTestId("new-chat-landing-permission-option-default")).toBeVisible();
       expect(
         screen.getByTestId("new-chat-landing-permission-option-bypassPermissions"),
       ).toBeVisible();
     } else {
+      expect(
+        screen.getByTestId("new-chat-landing-permission-option-ask-for-approval"),
+      ).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-permission-option-approve-for-me")).toBeVisible();
       expect(screen.getByTestId("new-chat-landing-permission-option-read-only")).toBeVisible();
     }
     closeMenu();
@@ -11321,7 +11325,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     pickSelectOption("new-chat-landing-config-harness", "Codex");
     saveConfig();
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Default",
+      "Permission mode: Ask for approval",
     );
     pickPermissionOption("read-only");
     openAgentConfig("ag_debby");

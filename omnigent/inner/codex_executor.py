@@ -4097,9 +4097,16 @@ class _CodexAppServerSession:
             turn_params["effort"] = reasoning_effort
             turn_params["summary"] = "detailed"
         if approval_mode is not None:
-            approval_policy, sandbox_type = CODEX_SDK_TURN_POLICIES[approval_mode]
-            turn_params["approvalPolicy"] = approval_policy
-            turn_params["sandboxPolicy"] = {"type": sandbox_type}
+            policy = CODEX_SDK_TURN_POLICIES.get(approval_mode)
+            if policy is None:
+                logger.warning(
+                    "Unknown Codex SDK approval mode %r; leaving turn defaults", approval_mode
+                )
+            else:
+                approval_policy, approvals_reviewer, sandbox_type = policy
+                turn_params["approvalPolicy"] = approval_policy
+                turn_params["approvalsReviewer"] = approvals_reviewer
+                turn_params["sandboxPolicy"] = {"type": sandbox_type}
         start_response = await self._request(
             "turn/start",
             turn_params,

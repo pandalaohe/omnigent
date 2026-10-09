@@ -2578,8 +2578,9 @@ class UpdateSessionRequest(BaseModel):
         reach the mode surfaces as an error. The confirmed mode is stored on the
         read-back label only (Codex owns the durable approval state), so it is
         not written to ``terminal_launch_args``. Omitted leaves unchanged.
-        Codex SDK sessions accept ``"default"``, ``"full-access"``, and
-        ``"read-only"``, applied from the next turn.
+        Codex SDK sessions accept ``"ask-for-approval"``,
+        ``"approve-for-me"``, ``"full-access"``, and ``"read-only"``
+        (legacy ``"default"`` still accepted), applied from the next turn.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
