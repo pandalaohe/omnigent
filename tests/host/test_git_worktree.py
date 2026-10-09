@@ -21,6 +21,7 @@ from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
     list_worktrees,
+    read_folder_facts,
     remove_worktree,
     validate_branch_name,
     validate_worktree_path_template,
@@ -136,13 +137,16 @@ def _isolated_git_ignores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     """Keep the developer's global and system git config out of every test.
 
     A global ignore such as ``/.worktrees/`` would otherwise decide
-    whether the exclude tests see a line written.
+    whether the exclude tests see a line written. The ceiling keeps git's
+    repo discovery from finding the checkout that hosts the pytest tmp
+    directory, which would turn "not a repository" tests into repo hits.
     """
     empty = tmp_path / "empty-gitconfig"
     empty.write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
 
 
 @pytest.fixture()
@@ -1180,3 +1184,114 @@ def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
         create_worktree(repo_path=str(source), branch_name="new")
     assert _branch_exists(git_repo, "new") is rollback_fails
     assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)
+
+
+def test_read_folder_facts_clean_repo(git_repo: Path) -> None:
+    """A clean checkout reports git's own branch, HEAD and work-tree root."""
+    facts = read_folder_facts(str(git_repo))
+    assert facts.exists is True
+    assert facts.is_dir is True
+    assert facts.is_repo is True
+    assert facts.toplevel == _rev_parse(git_repo, "--show-toplevel")
+    assert facts.branch == "main"
+    assert facts.head == _rev_parse(git_repo, "HEAD")
+    assert facts.detached is False
+    assert facts.dirty is False
+    assert facts.remotes == []
+    assert facts.error is None
+
+
+def test_read_folder_facts_dirty_repo(git_repo: Path) -> None:
+    """An untracked file marks the folder dirty."""
+    (git_repo / "new-file.txt").write_text("x")
+    facts = read_folder_facts(str(git_repo))
+    assert facts.dirty is True
+    assert facts.error is None
+
+
+def test_read_folder_facts_detached_head(git_repo: Path) -> None:
+    """A detached HEAD reports no branch and ``detached`` true."""
+    _git(git_repo, "checkout", "--detach", "HEAD")
+    facts = read_folder_facts(str(git_repo))
+    assert facts.is_repo is True
+    assert facts.branch is None
+    assert facts.head == _rev_parse(git_repo, "HEAD")
+    assert facts.detached is True
+
+
+def test_read_folder_facts_redacts_remote_credentials(git_repo: Path) -> None:
+    """Remote URLs leave the host helper credential-free."""
+    _git(
+        git_repo,
+        "remote",
+        "add",
+        "origin",
+        "https://user:token@git.example.test/x.git?private_token=t#f",
+    )
+    facts = read_folder_facts(str(git_repo))
+    assert facts.remotes == [{"name": "origin", "url": "https://git.example.test/x.git"}]
+
+
+def test_read_folder_facts_not_a_repo(tmp_path: Path) -> None:
+    """A plain directory is a field value, not an exception."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    facts = read_folder_facts(str(plain))
+    assert facts.exists is True
+    assert facts.is_dir is True
+    assert facts.is_repo is False
+    assert facts.branch is None
+    assert facts.head is None
+    assert facts.dirty is None
+    assert facts.error is not None and "not a git repository" in facts.error
+
+
+def test_read_folder_facts_missing_path(tmp_path: Path) -> None:
+    """A missing path reports exists=false with error text."""
+    facts = read_folder_facts(str(tmp_path / "missing"))
+    assert facts.exists is False
+    assert facts.is_dir is False
+    assert facts.is_repo is False
+    assert facts.error is not None and "does not exist" in facts.error
+
+
+def test_read_folder_facts_file_path(tmp_path: Path) -> None:
+    """A file is not a directory and not a repo."""
+    file_path = tmp_path / "a-file.txt"
+    file_path.write_text("x")
+    facts = read_folder_facts(str(file_path))
+    assert facts.exists is True
+    assert facts.is_dir is False
+    assert facts.is_repo is False
+    assert facts.error is not None and "not a directory" in facts.error
+
+
+def test_read_folder_facts_bare_repo(tmp_path: Path) -> None:
+    """A bare repository has no work tree to read."""
+    bare = (tmp_path / "bare.git").resolve()
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    facts = read_folder_facts(str(bare))
+    assert facts.exists is True
+    assert facts.is_dir is True
+    assert facts.is_repo is False
+    assert facts.error is not None
+
+
+def test_read_folder_facts_status_timeout_leaves_dirty_unknown(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out status read reports dirty=None instead of a guess."""
+    real_run = git_worktree_module._run_git
+
+    def timeout_status(
+        args: list[str], *, cwd: str, timeout: float = 10.0
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "status":
+            raise WorktreeError("git command timed out after 10s")
+        return real_run(args, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", timeout_status)
+    facts = read_folder_facts(str(git_repo))
+    assert facts.is_repo is True
+    assert facts.dirty is None
+    assert facts.error is not None and "timed out" in facts.error

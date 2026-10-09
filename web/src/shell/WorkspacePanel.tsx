@@ -26,6 +26,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -762,6 +763,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
+  /** Reports whether the rail is showing a browser tab or an opened file, so the shell can size it. */
+  onWideContentChange?: (wide: boolean) => void;
 }
 
 /**
@@ -827,6 +830,7 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
+  onWideContentChange,
 }: WorkspacePanelProps) {
   const browsers = useBrowserTabs(conversationId);
   const closeBrowserTab = async (tabId: string) => {
@@ -842,6 +846,14 @@ function WorkspacePanelImpl({
     browsers.selected !== null &&
     selectedFilePath === null &&
     selectedTerminalKey === null;
+  const showsWideContent =
+    !pending &&
+    !(selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey)) &&
+    (selectedFilePath !== null || (browserSelected && showBrowserTab));
+  // A layout effect so the shell resizes before paint.
+  useLayoutEffect(() => {
+    onWideContentChange?.(showsWideContent);
+  }, [onWideContentChange, showsWideContent]);
   const addBrowser = () => {
     browsers.add();
     onRightRailTabChange("browser");

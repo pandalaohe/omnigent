@@ -7,8 +7,9 @@
 // `omnigent/server/routes/sessions.py` for the wire protocol.
 //
 // This module owns only the transport (connect, reconnect, send watch-set,
-// dispatch frames). SessionUpdatesProvider wires the parsed frames into the
-// TanStack Query cache and derives the watch-set from it.
+// device hello/activity, dispatch frames). SessionUpdatesProvider wires the
+// parsed frames into the TanStack Query cache and derives the watch-set from
+// it.
 //
 // Identity rides the transport exactly like the terminal-attach WebSocket:
 // the browser cannot set `X-Forwarded-Email` on a WebSocket handshake, so we
@@ -28,7 +29,20 @@ export type SessionUpdatesFrame =
   | { type: "hosts_changed" }
   | { type: "projects_changed" }
   | { type: "system_status_changed" }
+  | {
+      type: "sound_alert";
+      alert_id: string;
+      session_id: string;
+      level: "done" | "error" | "needs_response";
+    }
   | { type: "heartbeat" };
+
+/** Device announcement sent so the server can pick a ringer connection. */
+export interface SoundAlertHello {
+  device_id: string;
+  device_label: string;
+  can_ring: boolean;
+}
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;
 
@@ -100,6 +114,8 @@ class SessionUpdatesSocket {
   private ws: WebSocket | null = null;
   private watched: string[] = [];
   private watchedKey = "";
+  private hello: SoundAlertHello | null = null;
+  private helloKey = "";
   private readonly listeners = new Set<FrameListener>();
   private readonly statusListeners = new Set<() => void>();
   private connected = false;
@@ -107,6 +123,7 @@ class SessionUpdatesSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+  private snapshotDelivered = false;
 
   /** Open the connection (idempotent). */
   start(): void {
@@ -148,6 +165,20 @@ class SessionUpdatesSocket {
   }
 
   /**
+   * Whether the current connection has delivered its connect snapshot.
+   *
+   * A consumer that mounts after the stream has started (for example behind a
+   * Suspense boundary) uses this to start live instead of waiting for a
+   * snapshot frame that already passed. The snapshot is only pushed on
+   * (re)connect, so an unchanged watch-set never re-sends one.
+   *
+   * @returns `true` while connected and after this connection's snapshot.
+   */
+  hasSnapshot(): boolean {
+    return this.connected && this.snapshotDelivered;
+  }
+
+  /**
    * Subscribe to connection-state changes (for ``useSyncExternalStore``).
    *
    * @param listener - Called whenever {@link isConnected} flips.
@@ -180,6 +211,33 @@ class SessionUpdatesSocket {
   }
 
   /**
+   * Announce this connection as a sound-alert ringer for the user.
+   *
+   * Stored and sent immediately when the socket is open; every (re)open
+   * re-sends it before the watch frame, so a connection the server might
+   * pick for an alert is never anonymous. A no-op when unchanged.
+   *
+   * @param hello - Device identity and whether this device may ring.
+   */
+  setHello(hello: SoundAlertHello): void {
+    const key = `${hello.device_id}\u0000${hello.device_label}\u0000${hello.can_ring}`;
+    if (key === this.helloKey) return;
+    this.helloKey = key;
+    this.hello = { ...hello };
+    if (this.ws?.readyState === WebSocket.OPEN) this.sendHello();
+  }
+
+  /**
+   * Tell the server the user just interacted with this device, so the alert
+   * picker prefers it. A no-op while the socket is closed.
+   */
+  sendActivity(): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "activity" }));
+    }
+  }
+
+  /**
    * Subscribe to parsed server frames.
    *
    * @param listener - Called for every frame received.
@@ -204,10 +262,15 @@ class SessionUpdatesSocket {
     this.ws = ws;
     ws.onopen = () => {
       this.failedAttempts = 0;
+      this.snapshotDelivered = false;
       this.setConnected(true);
       // Start the silence watchdog: from here we expect at least a
       // heartbeat within the window or we treat the link as dead.
       this.armWatchdog();
+      // Hello before watch: the server records this device before the first
+      // snapshot, so an alert claimed immediately after connect can already
+      // pick this connection.
+      this.sendHello();
       this.sendWatch();
     };
     ws.onmessage = (event) => this.handleMessage(event);
@@ -216,6 +279,7 @@ class SessionUpdatesSocket {
     };
     ws.onclose = () => {
       this.ws = null;
+      this.snapshotDelivered = false;
       this.clearWatchdog();
       this.setConnected(false);
       if (this.started) this.scheduleReconnect();
@@ -272,6 +336,12 @@ class SessionUpdatesSocket {
     }
   }
 
+  private sendHello(): void {
+    if (this.hello !== null && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "hello", ...this.hello }));
+    }
+  }
+
   private handleMessage(event: MessageEvent): void {
     // Any inbound message — even a heartbeat or one we can't parse — proves
     // the link is alive, so push the silence deadline out.
@@ -283,6 +353,7 @@ class SessionUpdatesSocket {
     } catch {
       return;
     }
+    if (frame.type === "snapshot") this.snapshotDelivered = true;
     for (const listener of this.listeners) listener(frame);
   }
 }

@@ -133,6 +133,7 @@ import { KeepWarmSettings } from "@/components/KeepWarmSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { SessionCollabSettings } from "@/components/SessionCollabSettings";
+import { SoundAlertSettings } from "@/components/SoundAlertSettings";
 import {
   MobileSessionTitleSetting,
   SessionNavigationSettings,
@@ -238,8 +239,10 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import {
+  readWidenWorkspaceForContent,
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
+  writeWidenWorkspaceForContent,
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
@@ -1125,6 +1128,33 @@ function WorkspaceTabDefaultControl() {
   );
 }
 
+/** Toggle for using a separate rail width while Workspace shows browser/file content. */
+function WidenWorkspaceForContentControl() {
+  const [value, setValue] = useState(() => readWidenWorkspaceForContent());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeWidenWorkspaceForContent(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Widen Workspace for browser and files"
+        labelId={labelId}
+        description="While Workspace shows a browser tab or an open file, it uses its own width, taken from the chat column. Drag it once to set that width; other tabs keep your usual width."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="widen-workspace-for-content-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.widen_workspace_for_content"
+      />
+    </div>
+  );
+}
+
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
@@ -1389,6 +1419,8 @@ function AppearanceSection() {
 
     writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
 
+    writeWidenWorkspaceForContent(true);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     writeSessionNavigationPreferences({
@@ -1528,6 +1560,9 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabDefaultControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <WidenWorkspaceForContentControl />
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
@@ -2280,6 +2315,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Approvals & Questions" testId="settings-group-approvals">
           <ApprovalTimeoutSettings />
+        </SettingsGroup>
+        <SettingsGroup title="Sound alerts" testId="settings-group-sound-alerts">
+          <SoundAlertSettings />
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />

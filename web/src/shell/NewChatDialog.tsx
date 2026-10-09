@@ -345,6 +345,7 @@ import {
   PROJECT_LABEL_KEY,
 } from "@/hooks/useConversations";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
+import { getProjectCollaboration } from "@/lib/projectsApi";
 import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { CLIENT_CREATE_TOKEN_LABEL, newTempConversation } from "@/lib/tempConversationId";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -2356,6 +2357,14 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
+  // Same query key as the Code settings section, so both read one cached
+  // collaboration snapshot. Only a real project has a code repository.
+  const { data: projectCollaboration, isPending: projectCollaborationPending } = useQuery({
+    queryKey: ["project-collaboration", configProjectId],
+    queryFn: () => getProjectCollaboration(configProjectId as string),
+    enabled: configProjectId !== null,
+    retry: false,
+  });
   const {
     data: projectHostRoots,
     isLoading: projectHostRootsLoading,
@@ -3223,9 +3232,12 @@ export function NewChatLandingScreen() {
     return name;
   }, []);
   // The project's stored default base branch (Project settings), trimmed. Wins
-  // over the user-global default (Settings › Git); an unset project default
-  // falls through to the global one, then to blank (fork from current branch).
+  // over the code repository's default branch (Code settings), then over the
+  // user-global default (Settings › Git); unset values fall through the chain.
   const projectBaseBranch = storedProjectConfig?.base_branch?.trim() || null;
+  const projectCodeRepository =
+    projectCollaboration?.repositories.find((repository) => repository.role === "code") ?? null;
+  const projectCodeDefaultBranch = projectCodeRepository?.default_branch?.trim() || null;
 
   // The path the once-per-host auto-seed WOULD land on: the most-recent path,
   // else the derived home. Exposed as a memo so we can probe its repo for
@@ -4860,6 +4872,18 @@ export function NewChatLandingScreen() {
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree =
     workspaceIsGit && branchName.trim() !== "" && !startInExistingWorktree;
+  // While a real project's collaboration read is in flight, an untouched base
+  // would seed from the user-global default and Submit would send it
+  // explicitly — forking from the wrong branch before the code repository's
+  // default branch is known. Hold Submit until that read settles; an explicit
+  // edit (including a cleared field) is never held, and an error falls through
+  // the seed chain to the user-global default, then blank.
+  const projectBaseBranchPending =
+    configProjectId !== null &&
+    projectBaseBranch === null &&
+    shouldCreateWorktree &&
+    !baseBranchEdited &&
+    projectCollaborationPending;
   const { state: composerContextState, setState: setComposerContextState } = useComposerContext({
     workingDirectoryGitState: workspaceIsNonGit ? "not_git" : workspaceIsGit ? "git" : "unknown",
   });
@@ -4899,9 +4923,9 @@ export function NewChatLandingScreen() {
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
   // away) re-arms the auto-fill, so naming a branch again starts fresh from the
-  // current default. The project's stored default (Project settings) wins over
-  // the user-global one (Settings › Git); an unset project default falls
-  // through to the global one, then to blank (fork from current branch).
+  // current default. The project's stored default (Project settings) wins, then
+  // the project's code repository default branch (Code settings), then the
+  // user-global one (Settings › Git), then blank (fork from current branch).
   useEffect(() => {
     if (!shouldCreateWorktree) {
       if (worktreeVerificationPending && branchName.trim() !== "") return;
@@ -4911,7 +4935,9 @@ export function NewChatLandingScreen() {
       return;
     }
     if (!baseBranchEdited) {
-      _setBaseBranch(projectBaseBranch ?? readDefaultBaseBranch() ?? "");
+      _setBaseBranch(
+        projectBaseBranch ?? projectCodeDefaultBranch ?? readDefaultBaseBranch() ?? "",
+      );
     }
   }, [
     shouldCreateWorktree,
@@ -4919,6 +4945,7 @@ export function NewChatLandingScreen() {
     branchName,
     baseBranchEdited,
     projectBaseBranch,
+    projectCodeDefaultBranch,
   ]);
   // Existing worktrees stay visible while a new branch name is drafted. The
   // two actions are deliberately separate: radio selection binds an existing
@@ -5411,6 +5438,7 @@ export function NewChatLandingScreen() {
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
     projectLocationError === null &&
+    !projectBaseBranchPending &&
     selectedAgent != null &&
     // A library agent runs from its uploaded bundle, which needs a connected
     // computer; a managed sandbox cannot launch it.
@@ -5426,29 +5454,31 @@ export function NewChatLandingScreen() {
     ? null
     : projectLocationError !== null
       ? projectLocationError
-      : pendingSkillCompletion
-        ? "Loading skills…"
-        : pickerLoading || workspaceLoading
-          ? "Loading session configuration…"
-          : pickerSelectionError || sandboxCatalogError
-            ? (pickerSelectionError ?? sandboxCatalogError)
-            : sandboxSelected && sandboxRepoOverCap
-              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                  maxSandboxRepos === 1 ? "repository" : "repositories"
-                } — remove the extras`
-              : sandboxSelected && !sandboxRepoValid
-                ? "Please enter a valid repository URL"
-                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                  ? "Selected host is unavailable. Reconnect it or choose another host."
-                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                    ? "Please choose a host and working directory"
-                    : configuredAgentUnavailable && selectedAgent == null
-                      ? "This project's configured agent is unavailable — pick an agent to continue"
-                      : sandboxSelected && effectiveAgentId?.startsWith("ca_")
-                        ? "Custom agents require a connected computer"
-                        : message.trim().length === 0 && files.length === 0
-                          ? "Enter a message to get started"
-                          : null;
+      : projectBaseBranchPending
+        ? "Loading project defaults…"
+        : pendingSkillCompletion
+          ? "Loading skills…"
+          : pickerLoading || workspaceLoading
+            ? "Loading session configuration…"
+            : pickerSelectionError || sandboxCatalogError
+              ? (pickerSelectionError ?? sandboxCatalogError)
+              : sandboxSelected && sandboxRepoOverCap
+                ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                    maxSandboxRepos === 1 ? "repository" : "repositories"
+                  } — remove the extras`
+                : sandboxSelected && !sandboxRepoValid
+                  ? "Please enter a valid repository URL"
+                  : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                    ? "Selected host is unavailable. Reconnect it or choose another host."
+                    : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                      ? "Please choose a host and working directory"
+                      : configuredAgentUnavailable && selectedAgent == null
+                        ? "This project's configured agent is unavailable — pick an agent to continue"
+                        : sandboxSelected && effectiveAgentId?.startsWith("ca_")
+                          ? "Custom agents require a connected computer"
+                          : message.trim().length === 0 && files.length === 0
+                            ? "Enter a message to get started"
+                            : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =

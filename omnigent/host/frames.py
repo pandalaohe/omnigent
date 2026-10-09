@@ -160,6 +160,8 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    FOLDER_FACTS = "host.folder_facts"
+    FOLDER_FACTS_RESULT = "host.folder_facts_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -236,6 +238,10 @@ class HostHelloFrame:
         scoping for session workspaces.
     :param post_bind_hook: Whether this host build runs the post-bind hook
         after a project binding is stored.
+    :param project_code: Whether this host build serves ``host.folder_facts``
+        (live git facts for a project or repository folder). ``False`` from an
+        older host, so the server answers ``unsupported`` instead of waiting
+        out a timeout.
     :param capabilities: Optional build-capability tokens this host advertises
         (see ``HOST_CAPABILITIES`` / ``CAP_*``). Empty from an older host that
         predates a given capability, so the server treats absence as "not
@@ -255,6 +261,7 @@ class HostHelloFrame:
     codex_rate_limits: _JsonObject | None = None
     filesystem_roots: bool = False
     post_bind_hook: bool = False
+    project_code: bool = False
     capabilities: list[str] = field(default_factory=list)
 
 
@@ -879,6 +886,65 @@ class HostListWorktreesResultFrame:
     request_id: str
     status: str
     worktrees: list[_JsonObject] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostFolderFactsFrame:
+    """Server → host: read live git facts for a folder.
+
+    Backs ``GET /v1/hosts/{id}/folder-facts``, used by the project settings
+    Code tab to show a folder's branch / HEAD / dirty state, its remotes and
+    whether the host has a setup command configured. Read-only.
+
+    :param request_id: Correlates the result, e.g. ``"req_ff_1"``.
+    :param path: Absolute folder path on the host, e.g.
+        ``"/Users/alice/myrepo"``.
+    """
+
+    request_id: str
+    path: str
+
+
+@dataclass
+class HostFolderFactsResultFrame:
+    """Host → server: outcome of a folder-facts read.
+
+    A missing path, a file, a non-repo folder and a bare repository are
+    ``status`` ``"ok"`` with the facts' fields set; ``"failed"`` is
+    reserved for an unexpected error while reading.
+
+    :param request_id: Correlates to the :class:`HostFolderFactsFrame`,
+        e.g. ``"req_ff_1"``.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param exists: Whether the path exists on the host.
+    :param is_dir: Whether the path is a directory.
+    :param is_repo: Whether the folder lies in a non-bare git work tree.
+    :param toplevel: Work-tree root, e.g. ``"/Users/alice/myrepo"``.
+    :param branch: Checked-out branch, ``None`` when detached or unborn.
+    :param head: Full HEAD commit sha, or ``None`` when unresolvable.
+    :param detached: Whether HEAD points at a commit, not a branch.
+    :param dirty: ``True`` when ``git status`` lists any change, ``False``
+        when clean, ``None`` when the status read timed out (unknown).
+    :param remotes: Fetch remotes as ``{"name", "url"}`` dicts in
+        ``git remote -v`` order, URLs credential-free; ``None`` on failure.
+    :param setup_command_configured: Whether the host's ``post_bind_command``
+        is set. Only this boolean leaves the host, never the command.
+    :param error: Human-readable reason when facts are incomplete.
+    """
+
+    request_id: str
+    status: str
+    exists: bool = False
+    is_dir: bool = False
+    is_repo: bool = False
+    toplevel: str | None = None
+    branch: str | None = None
+    head: str | None = None
+    detached: bool = False
+    dirty: bool | None = None
+    remotes: list[dict[str, str]] | None = None
+    setup_command_configured: bool = False
     error: str | None = None
 
 
@@ -1525,6 +1591,8 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostFolderFactsFrame
+    | HostFolderFactsResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
@@ -1615,6 +1683,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "codex_rate_limits": frame.codex_rate_limits,
                 "filesystem_roots": frame.filesystem_roots,
                 "post_bind_hook": frame.post_bind_hook,
+                "project_code": frame.project_code,
                 "capabilities": list(frame.capabilities),
             }
         )
@@ -1831,6 +1900,33 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "worktrees": frame.worktrees,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostFolderFactsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FOLDER_FACTS.value,
+                "request_id": frame.request_id,
+                "path": frame.path,
+            }
+        )
+    if isinstance(frame, HostFolderFactsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FOLDER_FACTS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "exists": frame.exists,
+                "is_dir": frame.is_dir,
+                "is_repo": frame.is_repo,
+                "toplevel": frame.toplevel,
+                "branch": frame.branch,
+                "head": frame.head,
+                "detached": frame.detached,
+                "dirty": frame.dirty,
+                "remotes": frame.remotes,
+                "setup_command_configured": frame.setup_command_configured,
                 "error": frame.error,
             }
         )
@@ -2476,6 +2572,10 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.FOLDER_FACTS:
+            return _decode_folder_facts(msg)
+        case HostFrameKind.FOLDER_FACTS_RESULT:
+            return _decode_folder_facts_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -2611,6 +2711,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         post_bind_hook=(
             _required_bool(msg, "post_bind_hook") if "post_bind_hook" in msg else False
         ),
+        project_code=_required_bool(msg, "project_code") if "project_code" in msg else False,
         capabilities=_optional_str_list(msg, "capabilities"),
     )
 
@@ -2956,6 +3057,55 @@ def _decode_list_worktrees_result(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         worktrees=raw,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_folder_facts(msg: _JsonObject) -> HostFolderFactsFrame:
+    """Decode a host.folder_facts request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.folder_facts frame.
+    """
+    return HostFolderFactsFrame(
+        request_id=_required_str(msg, "request_id"),
+        path=_required_str(msg, "path"),
+    )
+
+
+def _decode_folder_facts_result(msg: _JsonObject) -> HostFolderFactsResultFrame:
+    """Decode a host.folder_facts_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.folder_facts_result frame.
+    """
+    raw = msg.get("remotes")
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise ValueError("frame field must be a list or null: 'remotes'")
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError("each entry in 'remotes' must be a JSON object")
+    dirty = msg.get("dirty")
+    if dirty is not None and not isinstance(dirty, bool):
+        raise ValueError("frame field must be a bool or null: 'dirty'")
+    return HostFolderFactsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        exists=_required_bool(msg, "exists") if "exists" in msg else False,
+        is_dir=_required_bool(msg, "is_dir") if "is_dir" in msg else False,
+        is_repo=_required_bool(msg, "is_repo") if "is_repo" in msg else False,
+        toplevel=_optional_nullable_str(msg, "toplevel"),
+        branch=_optional_nullable_str(msg, "branch"),
+        head=_optional_nullable_str(msg, "head"),
+        detached=_required_bool(msg, "detached") if "detached" in msg else False,
+        dirty=dirty,
+        remotes=raw,
+        setup_command_configured=(
+            _required_bool(msg, "setup_command_configured")
+            if "setup_command_configured" in msg
+            else False
+        ),
         error=_optional_nullable_str(msg, "error"),
     )
 

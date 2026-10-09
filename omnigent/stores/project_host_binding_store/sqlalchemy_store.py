@@ -22,10 +22,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.stores.project_host_binding_store import (
-    DuplicatePrimaryBindingError,
-    ProjectHostBindingStore,
-)
+from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 
 
 def _to_entity(row: SqlProjectHostBinding) -> ProjectHostBinding:
@@ -93,6 +90,63 @@ def _lock_project(session: Session, *, project_id: str) -> None:
         raise OmnigentError(f"project {project_id} not found", code=ErrorCode.NOT_FOUND)
 
 
+def derive_primary_bindings(session: Session, *, project_id: str) -> list[ProjectHostBinding]:
+    """Re-derive every host's primary binding from the project's code repository.
+
+    Per host, candidates are the enabled bindings of the project's code
+    repository; the one already primary wins, else the oldest (``created_at``,
+    then ``id``). The target is set primary and the host's other bindings are
+    cleared, bumping ``revision`` and ``updated_at`` on every changed row. No
+    code repository, or no enabled candidate on a host, leaves that host with
+    no primary. The caller must hold the project row lock and the same
+    transaction: derivation is authoritative and never rejects a state it
+    transitions through.
+
+    :param session: The active SQLAlchemy session.
+    :param project_id: The project whose bindings are re-derived.
+    :returns: The changed bindings as entities, or an empty list.
+    """
+    code_repository_id = session.execute(
+        select(SqlProjectRepository.id)
+        .where(SqlProjectRepository.workspace_id == current_workspace_id())
+        .where(SqlProjectRepository.project_id == project_id)
+        .where(SqlProjectRepository.role == "code")
+        .order_by(asc(SqlProjectRepository.created_at), asc(SqlProjectRepository.id))
+        .limit(1)
+    ).scalar_one_or_none()
+    rows = (
+        session.execute(
+            select(SqlProjectHostBinding)
+            .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
+            .where(SqlProjectHostBinding.project_id == project_id)
+            .order_by(asc(SqlProjectHostBinding.created_at), asc(SqlProjectHostBinding.id))
+            .execution_options(populate_existing=True)
+        )
+        .scalars()
+        .all()
+    )
+    by_host: dict[str, list[SqlProjectHostBinding]] = {}
+    for row in rows:
+        by_host.setdefault(row.host_id, []).append(row)
+    changed: list[ProjectHostBinding] = []
+    now = now_epoch()
+    for host_rows in by_host.values():
+        candidates = [
+            row for row in host_rows if row.enabled and row.repository_id == code_repository_id
+        ]
+        target = next((row for row in candidates if row.is_primary), None)
+        if target is None and candidates:
+            target = candidates[0]
+        for row in host_rows:
+            wanted = row is target
+            if row.is_primary != wanted:
+                row.is_primary = wanted
+                row.revision += 1
+                row.updated_at = now
+                changed.append(_to_entity(row))
+    return changed
+
+
 class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
     """
     SQLAlchemy-backed implementation of :class:`ProjectHostBindingStore`.
@@ -124,38 +178,7 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             immediate=True,
         )
 
-    def _other_primary(
-        self,
-        session: Session,
-        *,
-        project_id: str,
-        host_id: str,
-        exclude_id: str | None,
-    ) -> bool:
-        """Return whether another primary binding exists for ``(project, host)``.
-
-        The sole enforcement point for the one-primary invariant: there is
-        no partial unique index behind it, so callers must hold the owning
-        project row lock (see ``upsert``) to serialize concurrent writers.
-
-        :param session: The active SQLAlchemy session.
-        :param project_id: The project scope.
-        :param host_id: The host scope.
-        :param exclude_id: A binding id to exclude (the row being updated).
-        :returns: ``True`` if a different primary binding already exists.
-        """
-        stmt = (
-            select(SqlProjectHostBinding.id)
-            .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
-            .where(SqlProjectHostBinding.project_id == project_id)
-            .where(SqlProjectHostBinding.host_id == host_id)
-            .where(SqlProjectHostBinding.is_primary.is_(True))
-        )
-        if exclude_id is not None:
-            stmt = stmt.where(SqlProjectHostBinding.id != exclude_id)
-        return session.execute(stmt).first() is not None
-
-    def upsert(
+    def apply_binding(
         self,
         *,
         project_id: str,
@@ -163,16 +186,16 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
         name: str,
         repository_id: str,
         workspace: str,
-        is_primary: bool = False,
         enabled: bool = True,
-        path_verified_at: int | None = None,
+        verified: bool = True,
     ) -> ProjectHostBinding:
-        """Register a binding or revise it, bumping ``revision`` on change.
+        """Register a binding or revise it, then derive the host's primary.
 
-        A requested primary is rejected when another binding is already
-        primary for the ``(project, host)`` pair; the existing primary is
-        never silently cleared. A lone verification-timestamp refresh
-        stamps ``path_verified_at`` without bumping ``revision``.
+        The row's stored ``is_primary`` is kept and the client never sets it;
+        after the write, one transaction re-derives every host's primary from
+        the project's code repository (see :func:`derive_primary_bindings`).
+        ``verified=True`` stamps ``path_verified_at``; ``verified=False``
+        stores it null, clearing a stale stamp from an earlier verified save.
         """
 
         def write(session: Session) -> ProjectHostBinding:
@@ -200,59 +223,47 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
                 .where(SqlProjectHostBinding.name == name)
             )
             row = session.execute(stmt).scalars().first()
+            now = now_epoch()
             if row is None:
-                if is_primary and self._other_primary(
-                    session, project_id=project_id, host_id=host_id, exclude_id=None
-                ):
-                    raise DuplicatePrimaryBindingError(project_id, host_id)
-                now = now_epoch()
                 row = SqlProjectHostBinding(
                     id=uuid.uuid4().hex,
                     project_id=project_id,
                     host_id=host_id,
                     name=name,
-                    is_primary=is_primary,
+                    is_primary=False,
                     repository_id=repository_id,
                     workspace=workspace,
                     enabled=enabled,
                     revision=1,
-                    path_verified_at=path_verified_at,
+                    path_verified_at=now if verified else None,
                     created_at=now,
                     updated_at=None,
                 )
                 session.add(row)
                 session.flush()
-                return _to_entity(row)
-            if (
-                is_primary
-                and not row.is_primary
-                and self._other_primary(
-                    session, project_id=project_id, host_id=host_id, exclude_id=row.id
+            else:
+                core_same = (
+                    row.repository_id == repository_id
+                    and row.workspace == workspace
+                    and row.enabled == enabled
                 )
-            ):
-                raise DuplicatePrimaryBindingError(project_id, host_id)
-            core_same = (
-                row.is_primary == is_primary
-                and row.repository_id == repository_id
-                and row.workspace == workspace
-                and row.enabled == enabled
-            )
-            verified_same = path_verified_at is None or row.path_verified_at == path_verified_at
-            if core_same and verified_same:
-                return _to_entity(row)
-            if not core_same:
-                row.is_primary = is_primary
-                row.repository_id = repository_id
-                row.workspace = workspace
-                row.enabled = enabled
-                row.revision += 1
-            if path_verified_at is not None:
-                row.path_verified_at = path_verified_at
-            row.updated_at = now_epoch()
+                if not core_same:
+                    row.repository_id = repository_id
+                    row.workspace = workspace
+                    row.enabled = enabled
+                    row.revision += 1
+                    row.updated_at = now
+                if verified:
+                    row.path_verified_at = now
+                    row.updated_at = now
+                else:
+                    row.path_verified_at = None
+                session.flush()
+            derive_primary_bindings(session, project_id=project_id)
             session.flush()
             return _to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "upsert_binding", write)
+        return run_write_transaction(self._session_immediate, "apply_binding", write)
 
     def record_verification(
         self,
@@ -343,15 +354,25 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
-    def delete(self, binding_id: str) -> bool:
-        """Delete a binding. Idempotent; ``False`` if not found."""
+    def delete_binding(self, project_id: str, host_id: str, name: str) -> bool:
+        """Delete a binding and re-derive the host's primary. Idempotent."""
 
         def write(session: Session) -> bool:
-            row = session.get(SqlProjectHostBinding, (current_workspace_id(), binding_id))
+            stmt = (
+                select(SqlProjectHostBinding)
+                .where(SqlProjectHostBinding.workspace_id == current_workspace_id())
+                .where(SqlProjectHostBinding.project_id == project_id)
+                .where(SqlProjectHostBinding.host_id == host_id)
+                .where(SqlProjectHostBinding.name == name)
+            )
+            row = session.execute(stmt).scalars().first()
             if row is None:
                 return False
-            _lock_project(session, project_id=row.project_id)
+            _lock_project(session, project_id=project_id)
             session.delete(row)
+            session.flush()
+            derive_primary_bindings(session, project_id=project_id)
+            session.flush()
             return True
 
         return run_write_transaction(self._session_immediate, "delete_binding", write)

@@ -658,3 +658,54 @@ describe("dialog-hosted design popup", () => {
     assert.equal(picker.payloads("select").length, 2);
   });
 });
+
+describe("Trusted Types pages", () => {
+  it("arms, selects, and submits while string HTML sinks reject assignment", (t) => {
+    const originals = [];
+    let win;
+    // Registered before createPicker's own teardown so the sinks are restored
+    // before its window.close() — JSDOM's close itself assigns body markup.
+    t.after(() => {
+      for (const [prop, original] of originals) {
+        if (typeof original === "function") win.Element.prototype[prop] = original;
+        else Object.defineProperty(win.Element.prototype, prop, original);
+      }
+    });
+    const picker = createPicker(t, MODAL_FORM, (window) => {
+      win = window;
+      for (const prop of ["innerHTML", "outerHTML"]) {
+        originals.push([prop, Object.getOwnPropertyDescriptor(win.Element.prototype, prop)]);
+        Object.defineProperty(win.Element.prototype, prop, {
+          ...originals.at(-1)[1],
+          set() {
+            throw new win.TypeError("This document requires 'TrustedHTML' assignment.");
+          },
+        });
+      }
+      originals.push(["insertAdjacentHTML", win.Element.prototype.insertAdjacentHTML]);
+      win.Element.prototype.insertAdjacentHTML = function () {
+        throw new win.TypeError("This document requires 'TrustedHTML' assignment.");
+      };
+    });
+
+    for (const id of ["__omni-popup-input", "__omni-popup-send", "__omni-popup-close"]) {
+      assert.ok(picker.popup.contains(picker.get(id)), `${id} must be armed inside the popup`);
+    }
+    assert.equal(picker.get("__omni-popup-close").textContent, "\u00d7");
+
+    picker.select();
+    assert.equal(picker.payloads("select")[0].id, "#period");
+
+    picker.clock.tick(30);
+    picker.input.value = "Make the label clearer";
+    assert.equal(picker.key(picker.input, "Enter").defaultPrevented, true);
+    const submissions = picker.payloads("prompt_submit");
+    assert.equal(submissions.length, 1);
+    assert.equal(submissions[0].prompt, "Make the label clearer");
+
+    const source = buildDesignModeScript("x");
+    for (const sink of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"]) {
+      assert.ok(!source.includes(sink), `generated script must not use ${sink}`);
+    }
+  });
+});

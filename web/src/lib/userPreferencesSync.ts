@@ -13,7 +13,8 @@ export type UserPreferenceNamespace =
   | "host_colors"
   | "keep_warm"
   | "runner_log_warnings"
-  | "sidebar_layout";
+  | "sidebar_layout"
+  | "sound_alerts";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -93,6 +94,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     sidebar_layout: {
       storageKey: "omnigent:sidebar-layout",
       eventName: "omnigent:sidebar-layout-changed",
+    },
+    sound_alerts: {
+      storageKey: "omnigent:sound-alerts",
+      eventName: "omnigent:sound-alerts-changed",
     },
   };
 

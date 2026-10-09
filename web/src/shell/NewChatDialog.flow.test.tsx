@@ -36,6 +36,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as CustomAgentsApiModule from "@/lib/customAgentsApi";
 import type * as CallingDefaultsApiModule from "@/lib/callingDefaultsApi";
+import type * as ProjectsApiModule from "@/lib/projectsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 // The calling-defaults chain is a server read; an empty resolution keeps these
@@ -51,6 +52,16 @@ vi.mock("@/lib/callingDefaultsApi", async (importOriginal) => ({
     problems: [],
   })),
   listCallingDefaultCatalogs: vi.fn(async () => []),
+}));
+// The base-branch fallback reads the project's collaboration config; stub it
+// so a project-scoped case doesn't fire an authenticatedFetch of its own.
+vi.mock("@/lib/projectsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProjectsApiModule>()),
+  getProjectCollaboration: vi.fn(async () => ({
+    repositories: [],
+    bindings: [],
+    problems: [],
+  })),
 }));
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";

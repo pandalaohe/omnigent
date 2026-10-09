@@ -47,6 +47,9 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
     SqlAlchemyProjectHostBindingStore,
 )
+from omnigent.stores.project_repository_store.sqlalchemy_store import (
+    SqlAlchemyProjectRepositoryStore,
+)
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
@@ -117,6 +120,8 @@ def open_env(db_uri: str) -> dict[str, Any]:
     app.state.host_store = host_store
     bindings_store = SqlAlchemyProjectHostBindingStore(db_uri)
     app.state.project_host_binding_store = bindings_store
+    repository_store = SqlAlchemyProjectRepositoryStore(db_uri)
+    app.state.project_repository_store = repository_store
     app.state.host_registry = host_registry
 
     @app.exception_handler(OmnigentError)
@@ -179,6 +184,7 @@ def open_env(db_uri: str) -> dict[str, Any]:
         "host_store": host_store,
         "host_registry": host_registry,
         "bindings_store": bindings_store,
+        "repository_store": repository_store,
         "conversations": conversations,
         "permissions": permissions,
         "peer": proxy,
@@ -1016,6 +1022,59 @@ async def test_branch_alone_cuts_a_new_branch_worktree(
     assert git.branch_name == "task/fix"
     assert git.base_branch is None
     assert git.existing_worktree is False
+
+
+@pytest.mark.asyncio
+async def test_branch_alone_uses_the_code_repository_default_base(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new branch with no from_ref forks from the code repo's default branch."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    env["repository_store"].apply_repository(
+        project_id=env["project"].id,
+        name="root",
+        remote_url="https://example.com/org/repo.git",
+        default_branch="release",
+        role="code",
+    )
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(client, env["sender"].id, env["sender_token"], branch="task/fix")
+    assert data["state"] == "opened"
+    git = captured["body"].git
+    assert git is not None
+    assert git.branch_name == "task/fix"
+    assert git.base_branch == "release"
+
+
+@pytest.mark.asyncio
+async def test_branch_with_from_ref_beats_the_code_repository_base(
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit from_ref wins over the code repository default branch."""
+    env = open_env
+    env["bindings_store"].put_entry(env["project"].id, HOST_ID, "/repo")
+    env["repository_store"].apply_repository(
+        project_id=env["project"].id,
+        name="root",
+        remote_url="https://example.com/org/repo.git",
+        default_branch="release",
+        role="code",
+    )
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        data = await _post(
+            client,
+            env["sender"].id,
+            env["sender_token"],
+            branch="task/fix",
+            from_ref="topic/base",
+        )
+    assert data["state"] == "opened"
+    git = captured["body"].git
+    assert git is not None
+    assert git.base_branch == "topic/base"
 
 
 @pytest.mark.asyncio

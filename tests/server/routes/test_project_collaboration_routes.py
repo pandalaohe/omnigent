@@ -1,8 +1,8 @@
 """Tests for the project-collaboration config routes.
 
-The collaboration router is mounted only when ``create_app`` receives the
-project store plus both config stores, and every route 404s unless
-``Feature.PROJECT_ASSIGNMENTS`` is enabled. Binding PUT/verify validate
+The collaboration router is mounted when ``create_app`` receives the
+project store plus both config stores; the former ``project_assignments``
+flag is a deprecated no-op and gates nothing. Binding PUT/verify validate
 the path live on the host over the tunnel, so those tests connect a fake
 host that answers ``host.stat`` frames (the ``test_hosts_worktrees.py``
 pattern) against the full app.
@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,7 @@ _HOST_A = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
 _HOST_B = "b1b2c3d4e5f60718293a4b5c6d7e8f02"
 _HOST_OFFLINE = "c1b2c3d4e5f60718293a4b5c6d7e8f03"
 _HOST_HOOKED = "d1b2c3d4e5f60718293a4b5c6d7e8f04"
+_HOST_CODED = "e1b2c3d4e5f60718293a4b5c6d7e8f05"
 
 
 def _as_user(user: str) -> dict[str, str]:
@@ -81,7 +83,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
     }
 
 
-def _hello_text(name: str, *, post_bind_hook: bool = False) -> str:
+def _hello_text(name: str, *, post_bind_hook: bool = False, project_code: bool = False) -> str:
     """Encode a hello frame for tests."""
     return encode_host_frame(
         HostHelloFrame(
@@ -89,6 +91,7 @@ def _hello_text(name: str, *, post_bind_hook: bool = False) -> str:
             frame_protocol_version=1,
             name=name,
             post_bind_hook=post_bind_hook,
+            project_code=project_code,
         )
     )
 
@@ -182,7 +185,12 @@ async def _make_project(
 
 
 async def _connect_fake_host(
-    app: FastAPI, host_id: str, name: str, *, post_bind_hook: bool = False
+    app: FastAPI,
+    host_id: str,
+    name: str,
+    *,
+    post_bind_hook: bool = False,
+    project_code: bool = False,
 ) -> ApplicationCommunicator:
     """Open a tunnel and complete the hello handshake."""
     comm = ApplicationCommunicator(app, _websocket_scope(f"/v1/hosts/{host_id}/tunnel"))
@@ -190,7 +198,10 @@ async def _connect_fake_host(
     accepted = await comm.receive_output(timeout=5.0)
     assert accepted["type"] == "websocket.accept"
     await comm.send_input(
-        {"type": "websocket.receive", "text": _hello_text(name, post_bind_hook=post_bind_hook)}
+        {
+            "type": "websocket.receive",
+            "text": _hello_text(name, post_bind_hook=post_bind_hook, project_code=project_code),
+        }
     )
     registry = app.state.host_registry
     for _ in range(500):
@@ -325,54 +336,42 @@ async def _register_repo(
     project_id: str,
     name: str = "root",
     remote_url: str = "https://example.com/org/repo.git",
+    *,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Register a repository via the route and return its body."""
+    body: dict[str, Any] = {"remote_url": remote_url, "default_branch": "main"}
+    if role is not None:
+        body["role"] = role
     resp = await client.put(
         f"/v1/projects/{project_id}/repositories/{name}",
-        json={"remote_url": remote_url, "default_branch": "main"},
+        json=body,
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
 
 
-# ── Flag gate ─────────────────────────────────────────────
+# ── The flag is a deprecated no-op ────────────────────────
 
 
-async def test_flag_disabled_every_route_404(
+async def test_flag_off_routes_still_serve(disabled_client: httpx.AsyncClient) -> None:
+    """With the flag off the whole configuration surface still serves."""
+    project_id = await _make_project(disabled_client)
+    registered = await _register_repo(disabled_client, project_id)
+    assert registered["name"] == "root"
+    config = await disabled_client.get(f"/v1/projects/{project_id}/collaboration")
+    assert config.status_code == 200, config.text
+    deleted = await disabled_client.delete(f"/v1/projects/{project_id}/repositories/root")
+    assert deleted.status_code == 200, deleted.text
+
+
+async def test_flag_off_malformed_body_is_validated(
     disabled_client: httpx.AsyncClient,
 ) -> None:
-    """With the flag off, the whole configuration surface is dark."""
-    pid, hid = "0" * 32, "1" * 32
-    routes = [
-        ("GET", f"/v1/projects/{pid}/collaboration", None),
-        (
-            "PUT",
-            f"/v1/projects/{pid}/repositories/root",
-            {"remote_url": "https://example.com/r.git", "default_branch": "main"},
-        ),
-        ("DELETE", f"/v1/projects/{pid}/repositories/root", None),
-        (
-            "PUT",
-            f"/v1/projects/{pid}/hosts/{hid}/bindings/primary",
-            {"workspace": "/tmp/x", "repository_name": "root"},
-        ),
-        ("DELETE", f"/v1/projects/{pid}/hosts/{hid}/bindings/primary", None),
-        ("POST", f"/v1/projects/{pid}/hosts/{hid}/bindings/primary/verify", None),
-    ]
-    for method, path, body in routes:
-        resp = await disabled_client.request(method, path, json=body)
-        assert resp.status_code == 404, f"{method} {path}: {resp.status_code}"
-
-
-async def test_flag_disabled_malformed_body_still_404(
-    disabled_client: httpx.AsyncClient,
-) -> None:
-    """With the flag off, the gate runs before body validation rejects."""
-    pid, hid = "0" * 32, "1" * 32
-    resp = await disabled_client.put(f"/v1/projects/{pid}/repositories/root", json={})
-    assert resp.status_code == 404, resp.text
-    resp = await disabled_client.put(f"/v1/projects/{pid}/hosts/{hid}/bindings/primary", json={})
-    assert resp.status_code == 404, resp.text
+    """With the flag off, body validation runs like any other route."""
+    project_id = await _make_project(disabled_client)
+    resp = await disabled_client.put(f"/v1/projects/{project_id}/repositories/root", json={})
+    assert resp.status_code == 422, resp.text
 
 
 # ── Ownership ─────────────────────────────────────────────
@@ -434,18 +433,16 @@ def _insert_dangling_binding(
 async def test_get_returns_config_and_problems(
     collab_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """GET returns the rows and flagged problems with offending ids."""
+    """GET returns the rows, the role, and dangling references only."""
     project_id = await _make_project(collab_client)
-    repo = await _register_repo(collab_client, project_id)
+    repo = await _register_repo(collab_client, project_id, role="code")
     bindings = SqlAlchemyProjectHostBindingStore(db_uri)
-    # An enabled non-primary binding with no primary on its host.
-    lonely = bindings.upsert(
+    lonely = bindings.apply_binding(
         project_id=project_id,
         host_id=_HOST_A,
         name="extra",
         repository_id=repo["id"],
         workspace="/data/extra",
-        is_primary=False,
         enabled=True,
     )
     # A binding pointing at a repository that was never registered.
@@ -458,15 +455,15 @@ async def test_get_returns_config_and_problems(
     assert "enabled" not in body
     assert "revision" not in body
     assert [r["name"] for r in body["repositories"]] == ["root"]
+    assert body["repositories"][0]["role"] == "code"
     assert {b["name"] for b in body["bindings"]} == {"extra", "primary"}
+    assert body["setup_outcomes"] == []
     problems = body["problems"]
-    missing = [p for p in problems if p["code"] == "missing_primary"]
-    assert len(missing) == 1 and missing[0]["host_id"] == _HOST_A
-    dangling_problems = [p for p in problems if p["code"] == "dangling_repository"]
-    assert len(dangling_problems) == 1
-    assert dangling_problems[0]["binding_id"] == dangling_id
-    assert dangling_problems[0]["repository_id"] == "f" * 32
-    assert lonely.id  # the flagged host's binding exists
+    # No code repository is not a problem; only dangling references are.
+    assert [p["code"] for p in problems] == ["dangling_repository"]
+    assert problems[0]["binding_id"] == dangling_id
+    assert problems[0]["repository_id"] == "f" * 32
+    assert lonely.is_primary is True  # the lonely host's code binding derived primary
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=1)
@@ -501,18 +498,64 @@ async def test_binding_put_needs_no_project_switch(
 # ── Repository validation ─────────────────────────────────
 
 
-async def test_repository_put_empty_remote_400_names_remote(
+async def test_repository_put_empty_remote_accepted(
     collab_client: httpx.AsyncClient,
 ) -> None:
-    """A repository without a remote cannot join, and the error says which."""
+    """A repository with no git location stores an empty remote."""
     project_id = await _make_project(collab_client)
     resp = await collab_client.put(
         f"/v1/projects/{project_id}/repositories/root",
         json={"remote_url": "   ", "default_branch": "main"},
     )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["remote_url"] == ""
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://example.com/org/repo.git?private_token=SECRETMARK",
+        "https://example.com/org/repo.git#SECRETMARK",
+        "ssh://git@example.com/org/repo.git?x=SECRETMARK",
+    ],
+)
+async def test_repository_put_query_or_fragment_400_without_echo(
+    collab_client: httpx.AsyncClient, remote_url: str
+) -> None:
+    """A query or fragment can carry a typed token, so it is refused unread."""
+    project_id = await _make_project(collab_client)
+    resp = await collab_client.put(
+        f"/v1/projects/{project_id}/repositories/root",
+        json={"remote_url": remote_url, "default_branch": "main"},
+    )
     assert resp.status_code == 400, resp.text
     message = resp.json()["error"]["message"]
-    assert "root" in message and "remote" in message
+    assert "must not contain a query or fragment" in message
+    assert "SECRETMARK" not in message
+    assert remote_url not in message
+
+
+async def test_repository_put_role_round_trip(
+    collab_client: httpx.AsyncClient,
+) -> None:
+    """A typed role is stored; an omitted role keeps the current one."""
+    project_id = await _make_project(collab_client)
+    created = await _register_repo(collab_client, project_id, role="code")
+    assert created["role"] == "code"
+    again = await _register_repo(collab_client, project_id)
+    assert again["role"] == "code"
+    related = await _register_repo(collab_client, project_id, role="related")
+    assert related["role"] == "related"
+
+
+async def test_repository_put_bad_role_400(collab_client: httpx.AsyncClient) -> None:
+    """A role outside code/related is refused."""
+    project_id = await _make_project(collab_client)
+    resp = await collab_client.put(
+        f"/v1/projects/{project_id}/repositories/root",
+        json={"remote_url": "https://example.com/r.git", "default_branch": "main", "role": "x"},
+    )
+    assert resp.status_code == 400, resp.text
 
 
 async def test_repository_put_credentialed_url_400(
@@ -840,8 +883,10 @@ async def test_binding_put_stores_canonical_path(
     assert body["path_verified_at"] is not None
 
 
-async def test_binding_put_offline_host_409(collab_client: httpx.AsyncClient, db_uri: str) -> None:
-    """A registered but disconnected host fails with a 409-class error."""
+async def test_binding_put_offline_host_stores_unchecked(
+    collab_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A disconnected host stores the typed path with ``checked: false``."""
     project_id = await _make_project(collab_client)
     await _register_repo(collab_client, project_id)
     hosts = HostStore(db_uri)
@@ -852,13 +897,53 @@ async def test_binding_put_offline_host_409(collab_client: httpx.AsyncClient, db
     resp = await collab_client.put(
         f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/bindings/primary",
         json={
-            "workspace": "/data/work",
+            "workspace": "/data/work/",
             "repository_name": "root",
             "is_primary": True,
             "enabled": True,
         },
     )
-    assert resp.status_code == 409
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["workspace"] == "/data/work"
+    assert body["path_verified_at"] is None
+    assert body["checked"] is False
+    assert "post_bind" not in body
+
+    online = await collab_client.put(
+        f"/v1/projects/{project_id}/repositories/root",
+        json={
+            "remote_url": "https://example.com/org/repo.git",
+            "default_branch": "main",
+        },
+    )
+    assert online.status_code == 200, online.text
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "/opt/work/.omnigent//worktrees/task",
+        "/opt/work/.omnigent/x/../worktrees/task",
+        "/opt/work/.omnigent/./worktrees/task",
+        "//server/share/.omnigent\\.\\worktrees/task",
+        "C:\\work\\.omnigent\\.\\worktrees\\task",
+    ],
+)
+async def test_binding_put_offline_host_string_checks(
+    collab_client: httpx.AsyncClient, db_uri: str, workspace: str
+) -> None:
+    """Offline saves still refuse a relative path or a managed worktree area."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_OFFLINE, "offline-box", "local")
+    hosts.set_offline(_HOST_OFFLINE)
+    resp = await collab_client.put(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/bindings/primary",
+        json={"workspace": workspace, "repository_name": "root"},
+    )
+    assert resp.status_code == 400, resp.text
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=1)
@@ -881,26 +966,21 @@ async def test_binding_put_unknown_repository_400(
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=1)
-async def test_binding_second_primary_same_host_409_other_host_allowed(
+async def test_binding_second_primary_same_host_derived_other_host_allowed(
     collab_client: httpx.AsyncClient,
     live_host: dict[str, Any],
     db_uri: str,
 ) -> None:
-    """One primary per (project, host); another host may have its own."""
+    """Client ``is_primary`` is ignored; each host derives its own primary."""
     project_id = await _make_project(collab_client)
-    await _register_repo(collab_client, project_id)
-    live_host["replies"]["/data/a"] = {
-        "status": "ok",
-        "exists": True,
-        "type": "directory",
-        "canonical_path": "/data/a",
-    }
-    live_host["replies"]["/data/b"] = {
-        "status": "ok",
-        "exists": True,
-        "type": "directory",
-        "canonical_path": "/data/b",
-    }
+    await _register_repo(collab_client, project_id, role="code")
+    for path in ("/data/a", "/data/b"):
+        live_host["replies"][path] = {
+            "status": "ok",
+            "exists": True,
+            "type": "directory",
+            "canonical_path": path,
+        }
     host_id = live_host["host_id"]
     first = await collab_client.put(
         f"/v1/projects/{project_id}/hosts/{host_id}/bindings/primary",
@@ -921,7 +1001,11 @@ async def test_binding_second_primary_same_host_409_other_host_allowed(
             "enabled": True,
         },
     )
-    assert second.status_code == 409
+    assert second.status_code == 200, second.text
+    # The first (oldest) enabled binding stays primary; the newest put does
+    # not take over despite its is_primary=true input.
+    assert first.json()["is_primary"] is True
+    assert second.json()["is_primary"] is False
     # A primary on another host is a different scope and succeeds. The
     # second host row is registered directly and served by a tunneled
     # connection opened inline below.
@@ -950,6 +1034,7 @@ async def test_binding_second_primary_same_host_409_other_host_allowed(
             },
         )
         assert other.status_code == 200, other.text
+        assert other.json()["is_primary"] is True
     finally:
         await _stop_fake_host(comm_b, drain_b)
 
@@ -974,6 +1059,11 @@ async def test_verify_success_refreshes_timestamp(
     ticks = itertools.count(start=1_700_000_000, step=10)
     monkeypatch.setattr(
         "omnigent.server.routes.project_collaboration.now_epoch",
+        lambda: next(ticks),
+    )
+    # The store stamps the PUT's verification with its own clock.
+    monkeypatch.setattr(
+        "omnigent.stores.project_host_binding_store.sqlalchemy_store.now_epoch",
         lambda: next(ticks),
     )
     created = await collab_client.put(
@@ -1132,7 +1222,10 @@ async def test_binding_put_post_bind_runs_for_disabled_binding(
     assert frame.binding_id == body["id"]
     assert frame.repository_name == "root"
     assert frame.workspace == "/data/work"
-    assert frame.is_primary is True
+    # The derived flag, not the ignored client input: a disabled row is never
+    # primary.
+    assert body["is_primary"] is False
+    assert frame.is_primary is False
     assert frame.context_manifest_path == ".agents/project/manifest.json"
     assert frame.trigger == "binding"
 
@@ -1234,6 +1327,118 @@ async def test_verify_post_bind_reruns_with_stored_revision(
     assert frames[1].binding_name == "primary"
 
 
+async def test_repository_role_code_demotes_the_previous_code(
+    collab_client: httpx.AsyncClient,
+) -> None:
+    """Marking B code demotes A in the same request, exactly one stays code."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id, name="a", role="code")
+    await _register_repo(collab_client, project_id, name="b", role="code")
+    config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
+    roles = {repository["name"]: repository["role"] for repository in config["repositories"]}
+    assert roles == {"a": "related", "b": "code"}
+
+
+async def test_setup_outcomes_are_returned_by_get(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """The last post-bind result per target rides GET /collaboration."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["replies"]["primary"] = {
+        "status": "ok",
+        "exit_code": 0,
+        "output": "joined",
+    }
+    created = await _put_binding(collab_client, hooked_host["host_id"], project_id)
+    assert created.status_code == 200, created.text
+
+    config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
+    outcomes = config["setup_outcomes"]
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome["host_id"] == hooked_host["host_id"]
+    assert outcome["kind"] == "binding"
+    assert outcome["target"] == "primary"
+    assert outcome["status"] == "ok"
+    assert outcome["exit_code"] == 0
+    assert outcome["output"] == "joined"
+    assert outcome["error"] is None
+    assert datetime.fromisoformat(outcome["at"]).tzinfo is not None
+
+
+async def test_entry_and_binding_named_entry_have_distinct_outcomes(
+    collab_client: httpx.AsyncClient,
+    hooked_host: dict[str, Any],
+) -> None:
+    """A binding named ``entry`` and the project entry never overwrite each other."""
+    project_id = await _make_project(collab_client)
+    await _register_repo(collab_client, project_id)
+    hooked_host["replies"]["/data/work"] = {
+        "status": "ok",
+        "exists": True,
+        "type": "directory",
+        "canonical_path": "/data/work",
+    }
+    hooked_host["hooks"]["replies"]["entry"] = {
+        "status": "ok",
+        "exit_code": 0,
+        "output": "binding-ran",
+    }
+    hooked_host["hooks"]["replies"][""] = {
+        "status": "ok",
+        "exit_code": 0,
+        "output": "entry-ran",
+    }
+    binding = await _put_binding(collab_client, hooked_host["host_id"], project_id, name="entry")
+    assert binding.status_code == 200, binding.text
+    entry = await collab_client.put(
+        f"/v1/projects/{project_id}/entries/{hooked_host['host_id']}",
+        json={"workspace": "/data/work"},
+    )
+    assert entry.status_code == 200, entry.text
+
+    config = (await collab_client.get(f"/v1/projects/{project_id}/collaboration")).json()
+    outcomes = config["setup_outcomes"]
+    assert len(outcomes) == 2
+    assert {(o["kind"], o["target"], o["output"]) for o in outcomes} == {
+        ("binding", "entry", "binding-ran"),
+        ("entry", None, "entry-ran"),
+    }
+
+
+def test_setup_outcomes_are_workspace_isolated() -> None:
+    """Identical outcome keys in two workspaces never collide or leak."""
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.server.routes.project_collaboration import (
+        _record_setup_outcome,
+        _setup_outcomes_for_project,
+    )
+
+    target = {
+        "project_id": "workspace-isolation-project",
+        "host_id": _HOST_A,
+        "kind": "binding",
+        "name": "primary",
+    }
+    with workspace_scope(1):
+        _record_setup_outcome(**target, result={"status": "ok", "output": "ws-1"})
+    with workspace_scope(2):
+        _record_setup_outcome(**target, result={"status": "ok", "output": "ws-2"})
+        read_2 = [o["output"] for o in _setup_outcomes_for_project(target["project_id"])]
+        assert read_2 == ["ws-2"]
+    with workspace_scope(1):
+        read_1 = [o["output"] for o in _setup_outcomes_for_project(target["project_id"])]
+        assert read_1 == ["ws-1"]
+
+
 async def test_binding_delete_sends_no_post_bind_frame(
     collab_client: httpx.AsyncClient,
     hooked_host: dict[str, Any],
@@ -1258,3 +1463,176 @@ async def test_binding_delete_sends_no_post_bind_frame(
     assert deleted.status_code == 200, deleted.text
     await asyncio.sleep(0.05)
     assert len(hooked_host["hooks"]["seen"]) == 1
+
+
+# ── Agent code note preview ───────────────────────────────
+
+
+async def test_agent_code_note_preview_for_capable_host(
+    collab_client: httpx.AsyncClient,
+    collab_app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A connected host with the capability is told the text it will deliver."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(
+        collab_client,
+        project_id,
+        name="omnigent",
+        remote_url="https://git.example.test/org/omnigent.git",
+        role="code",
+    )
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=_HOST_CODED,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent/fork/topic",
+    )
+    comm = await _connect_fake_host(collab_app, _HOST_CODED, "fake-coded", project_code=True)
+    drain = _start_stat_drain(comm, {})
+    try:
+        resp = await collab_client.get(
+            f"/v1/projects/{project_id}/hosts/{_HOST_CODED}/agent-code-note"
+        )
+    finally:
+        await _stop_fake_host(comm, drain)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "object": "agent_code_note",
+        "text": (
+            "This project's code on this host:\n"
+            '- omnigent (the code you change): "/opt/work/omnigent/fork/topic" — git '
+            '"https://git.example.test/org/omnigent.git", default branch "main"'
+        ),
+        "delivered": True,
+        "reason": None,
+    }
+
+
+async def test_agent_code_note_preview_for_offline_host_keeps_text(
+    collab_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An offline host still shows the built text, flagged undeliverable."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(collab_client, project_id, name="omnigent", role="code")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_OFFLINE, "offline-box", "local")
+    hosts.set_offline(_HOST_OFFLINE)
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=_HOST_OFFLINE,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent",
+    )
+
+    resp = await collab_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/agent-code-note"
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_offline"
+    assert body["text"] is not None
+    assert '"/opt/work/omnigent"' in body["text"]
+
+
+async def test_agent_code_note_preview_for_stale_online_host(
+    collab_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A fresh online row with no tunnel reports offline instead of 400."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(collab_client, project_id, name="omnigent", role="code")
+    # Unclean disconnect: the row is still fresh-online, but this replica
+    # holds no tunnel, so the preview must fall back to host_offline.
+    HostStore(db_uri).upsert_on_connect(_HOST_OFFLINE, "stale-box", "local")
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=_HOST_OFFLINE,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent",
+    )
+
+    resp = await collab_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/agent-code-note"
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_offline"
+
+
+async def test_agent_code_note_preview_reports_update_needed(
+    collab_client: httpx.AsyncClient,
+    db_uri: str,
+    live_host: dict[str, Any],
+) -> None:
+    """A connected host without the capability is flagged for update."""
+    project_id = await _make_project(collab_client)
+    repository = await _register_repo(collab_client, project_id, name="omnigent", role="code")
+    host_id = live_host["host_id"]
+    SqlAlchemyProjectHostBindingStore(db_uri).apply_binding(
+        project_id=project_id,
+        host_id=host_id,
+        name="primary",
+        repository_id=repository["id"],
+        workspace="/opt/work/omnigent",
+    )
+
+    resp = await collab_client.get(f"/v1/projects/{project_id}/hosts/{host_id}/agent-code-note")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_update_needed"
+    assert body["text"] is not None
+
+
+async def test_agent_code_note_preview_not_owned_404(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """One user can never preview the note of another user's project."""
+    bob_project = await _make_project(multi_user_client, "Bob note", headers=_as_user(BOB))
+    resp = await multi_user_client.get(
+        f"/v1/projects/{bob_project}/hosts/{_HOST_A}/agent-code-note",
+        headers=_as_user(ALICE),
+    )
+    assert resp.status_code == 404
+
+
+async def test_agent_code_note_preview_for_foreign_host_403(
+    multi_user_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """One user can never probe another user's host through the preview."""
+    project_id = await _make_project(multi_user_client, "Alice note", headers=_as_user(ALICE))
+    HostStore(db_uri).upsert_on_connect(_HOST_B, "bob-box", BOB)
+    resp = await multi_user_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_B}/agent-code-note",
+        headers=_as_user(ALICE),
+    )
+    assert resp.status_code == 403
+
+
+async def test_agent_code_note_preview_for_own_offline_host(
+    multi_user_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An owned offline host still previews its text, flagged undeliverable."""
+    project_id = await _make_project(multi_user_client, "Alice note", headers=_as_user(ALICE))
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_OFFLINE, "alice-box", ALICE)
+    hosts.set_offline(_HOST_OFFLINE)
+    resp = await multi_user_client.get(
+        f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/agent-code-note",
+        headers=_as_user(ALICE),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivered"] is False
+    assert body["reason"] == "host_offline"

@@ -111,6 +111,11 @@ const {
 } = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+const {
+  legacyNotificationSound,
+  listSystemSounds,
+  resolveSystemSound,
+} = require("./system_sounds");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -3132,55 +3137,40 @@ function signalForeground() {
 // suppressed by macOS, so to make the alert audible in BOTH the foreground and
 // the background we play a system sound ourselves with `afplay` and mute the
 // toast's built-in sound (see the notify handler). The chosen sound and the
-// on/off switch live in the native Notifications menu, persisted in settings
-// (`notification_sound_enabled`, `notification_sound_name`).
+// on/off switch persist in settings (`notification_sound_enabled`,
+// `notification_sound_name`); the web app folds them into its own device
+// preferences once, and the notify path keeps reading the saved value so an
+// older web app stays audible.
 // ---------------------------------------------------------------------------
 
-const SYSTEM_SOUNDS_DIR = "/System/Library/Sounds";
 // A pleasant default that ships on every macOS. Used when nothing is saved or
 // the saved name no longer resolves to a file.
 const DEFAULT_NOTIFICATION_SOUND = "Glass";
-// Fallback list if the system sounds dir can't be read (matches stock macOS).
-const FALLBACK_SYSTEM_SOUNDS = [
-  "Basso",
-  "Blow",
-  "Bottle",
-  "Frog",
-  "Funk",
-  "Glass",
-  "Hero",
-  "Morse",
-  "Ping",
-  "Pop",
-  "Purr",
-  "Sosumi",
-  "Submarine",
-  "Tink",
-];
+
+/** Dependencies for the pure system_sounds module. */
+function systemSoundDeps() {
+  return {
+    platform: process.platform,
+    readdirSync: (dir) => fs.readdirSync(dir),
+    env: process.env,
+  };
+}
 
 /**
- * The macOS built-in notification sounds, by name (no extension), sorted.
- * Reads `/System/Library/Sounds` so the list tracks the OS; falls back to the
+ * The built-in notification sounds, by name (no extension), sorted. Reads the
+ * OS sounds directory so the list tracks the machine; macOS falls back to the
  * stock set if the directory can't be read.
  *
  * @returns {string[]} e.g. `["Basso", "Blow", ... "Tink"]`.
  */
 function systemSoundNames() {
-  try {
-    const names = fs
-      .readdirSync(SYSTEM_SOUNDS_DIR)
-      .filter((f) => f.endsWith(".aiff"))
-      .map((f) => f.replace(/\.aiff$/, ""));
-    return names.length > 0 ? names.sort() : FALLBACK_SYSTEM_SOUNDS;
-  } catch {
-    return FALLBACK_SYSTEM_SOUNDS;
-  }
+  return listSystemSounds(systemSoundDeps());
 }
 
 /**
  * Whether the notification sound is enabled. Opt-in: OFF unless the user has
- * explicitly turned it on via the Notifications menu, so a fresh install stays
- * silent until the user asks for sound.
+ * explicitly turned it on, so a fresh install stays silent until the user asks
+ * for sound.
  */
 function notificationSoundEnabled() {
   return loadSettings().notification_sound_enabled === true;
@@ -3202,18 +3192,21 @@ function currentNotificationSoundName() {
 }
 
 /**
- * Play a macOS system sound by name via `afplay`, fire-and-forget. No-op off
- * macOS (afplay is macOS-only). Used both for live notifications and for the
- * menu's pick-to-preview.
+ * Play a system sound by name via `afplay`, fire-and-forget. No-op off macOS
+ * (afplay is macOS-only). Used for live notifications and for the renderer's
+ * pick-to-preview over the system-sounds IPC.
  *
  * @param {string} name A name from `systemSoundNames()`, e.g. `"Glass"`.
+ * @param {number} [volume] 0..1; omitted → afplay's own default.
  */
-function playSystemSound(name) {
+function playSystemSound(name, volume) {
   if (process.platform !== "darwin") return;
-  const file = path.join(SYSTEM_SOUNDS_DIR, `${name}.aiff`);
+  const file = resolveSystemSound(name, systemSoundDeps());
+  if (!file) return;
+  const args = typeof volume === "number" ? ["-v", String(volume), file] : [file];
   try {
     // Detached + unref'd so a slow play never holds up app quit.
-    const child = execFile("afplay", [file], (err) => {
+    const child = execFile("afplay", args, (err) => {
       if (err) console.warn("[omnigent] afplay failed:", err.message);
     });
     child.unref();
@@ -3232,6 +3225,11 @@ function playSystemSound(name) {
 const SOUND_THROTTLE_MS = 3000;
 /** @type {Map<string, number>} last play time (ms) keyed by session/target. */
 const lastSoundAtByKey = new Map();
+
+// True while the web layer's own sound alerts are live. The notify path then
+// plays no sound of its own (and keeps OS toasts silent) so one event doesn't
+// sound twice. Set by `omnigent:sound-alerts-active`.
+let soundAlertsActive = false;
 
 /**
  * Whether enough time has passed to sound again for `key`. Records "now" and
@@ -3456,43 +3454,6 @@ function buildMenu() {
         ],
       },
     ];
-
-    // macOS notification-sound settings: an on/off switch plus a picker of
-    // system sounds. Selections persist in settings.json and are read live by
-    // the notify handler, so a change applies to the next notification without
-    // a relaunch. macOS-only because playback uses `afplay`.
-    if (isMac) {
-      /** @type {Electron.MenuItemConstructorOptions[]} */
-      const soundChoices = systemSoundNames().map((name) => ({
-        id: `notification_sound_${name}`,
-        label: name,
-        type: "radio",
-        checked: currentNotificationSoundName() === name,
-        click: () => {
-          const settings = loadSettings();
-          settings.notification_sound_name = name;
-          saveSettings(settings);
-          // Pick-to-preview: play the choice immediately so the user hears it,
-          // even when the sound is currently toggled off.
-          playSystemSound(name);
-        },
-      }));
-      debugSubmenu.push(
-        { type: "separator" },
-        {
-          id: "notification_sound_enabled",
-          label: "Play Notification Sound",
-          type: "checkbox",
-          checked: notificationSoundEnabled(),
-          click: (item) => {
-            const settings = loadSettings();
-            settings.notification_sound_enabled = item.checked;
-            saveSettings(settings);
-          },
-        },
-        { label: "Sound", submenu: soundChoices },
-      );
-    }
 
     debugSubmenu.push({ type: "separator" }, { role: "toggleDevTools" });
 
@@ -4332,13 +4293,14 @@ function registerIpc() {
     // frontmost app's OWN notification sound, so we mute the toast there and
     // play it explicitly, which also keeps the cue consistent when backgrounded
     // (no double sound). Off macOS, let the OS play its default sound, gated on
-    // the same enable switch.
+    // the same enable switch. When the web layer's own alert sounds are live,
+    // this path stays silent so one turn-end doesn't sound twice.
     const isMac = process.platform === "darwin";
     const soundOn = notificationSoundEnabled();
     const notification = new Notification({
       title,
       body: String(params?.body ?? ""),
-      silent: isMac ? true : !soundOn,
+      silent: isMac ? true : !soundOn || soundAlertsActive,
     });
     // In-app path the SPA wants opened on click (e.g. "/c/conv_abc"). Captured
     // here so the click handler can tell the renderer where to route.
@@ -4369,10 +4331,55 @@ function registerIpc() {
     // system sound. macOS muted the toast's own sound above, so this is the one
     // and only sound. Throttled per session so a chunked/flapping response
     // sounds once, not once per intermediate notification.
-    if (isMac && soundOn && shouldPlayNotificationSound(navigatePath || title)) {
+    if (
+      isMac &&
+      !soundAlertsActive &&
+      soundOn &&
+      shouldPlayNotificationSound(navigatePath || title)
+    ) {
       playSystemSound(currentNotificationSoundName());
     }
     return true;
+  });
+
+  // Built-in OS sound names for the alert settings UI, sorted.
+  ipcMain.handle("omnigent:system-sounds:list", (event) => {
+    if (!isPinnedOriginSender(event)) return [];
+    return listSystemSounds(systemSoundDeps());
+  });
+
+  // Play one built-in sound on request. macOS plays it via afplay (Chromium
+  // can't decode AIFF) and reports played; Windows returns the WAV bytes for
+  // the renderer to decode and play through its own gain; elsewhere nothing
+  // plays. An unknown name (including traversal) resolves to null.
+  ipcMain.handle("omnigent:system-sounds:play", (event, name, volume) => {
+    if (!isPinnedOriginSender(event)) return { played: false };
+    const file = resolveSystemSound(name, systemSoundDeps());
+    if (!file) return { played: false };
+    const requested = typeof volume === "number" && Number.isFinite(volume) ? volume : 1;
+    const gain = Math.min(Math.max(requested, 0), 1);
+    if (process.platform === "darwin") {
+      playSystemSound(name, gain);
+      return { played: true };
+    }
+    if (process.platform === "win32") {
+      return { bytes: new Uint8Array(fs.readFileSync(file)) };
+    }
+    return { played: false };
+  });
+
+  // The web layer's alert sounds are live: stop the notify path's own sound so
+  // a turn-end doesn't sound twice.
+  ipcMain.on("omnigent:sound-alerts-active", (event, active) => {
+    if (!isPinnedOriginSender(event)) return;
+    soundAlertsActive = active === true;
+  });
+
+  // The old Notification-menu sound setting, read once by the web layer to
+  // migrate it into device-local alert preferences.
+  ipcMain.handle("omnigent:legacy-notification-sound", (event) => {
+    if (!isPinnedOriginSender(event)) return { enabled: null, name: null };
+    return legacyNotificationSound(loadSettings());
   });
 
   // -------------------------------------------------------------------------

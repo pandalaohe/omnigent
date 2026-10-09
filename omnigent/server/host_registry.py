@@ -186,6 +186,24 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
 
 
+def _fail_pending_folder_facts(conn: HostConnection) -> None:
+    """Settle folder-facts reads at once when their host goes away.
+
+    The route maps ``WorktreeHostUnavailableError`` to 409; without this the
+    request only learns of the drop by waiting out its 15 s timeout.
+    """
+    from omnigent.server.routes._host_worktree import WorktreeHostUnavailableError
+
+    while conn.pending_folder_facts:
+        _request_id, future = conn.pending_folder_facts.popitem()
+        if not future.done():
+            future.set_exception(
+                WorktreeHostUnavailableError(
+                    f"host '{conn.host_id}' connection lost during folder facts"
+                )
+            )
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -350,6 +368,15 @@ class HostConnection:
         in-flight ``host.remove_worktree`` requests. Resolved when
         the host sends ``host.remove_worktree_result``. Values
         carry ``status`` and ``error``.
+    :param pending_list_worktrees: Per-``request_id`` futures for in-flight
+        ``host.list_worktrees`` requests. Resolved when the host sends
+        ``host.list_worktrees_result``. Values carry the result fields
+        (``status``, ``worktrees``, ``error``).
+    :param pending_folder_facts: Per-``request_id`` futures for in-flight
+        ``host.folder_facts`` requests. Resolved when the host sends
+        ``host.folder_facts_result``. Values carry the result fields
+        (``status``, the folder's git facts, ``setup_command_configured``,
+        ``error``).
     :param pending_create_dirs: Per-``request_id`` futures for
         in-flight ``host.create_dir`` requests. Resolved when the
         host sends ``host.create_dir_result``. Values carry the
@@ -431,6 +458,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_list_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_folder_facts: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -579,6 +609,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_folder_facts(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -627,6 +658,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_folder_facts(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

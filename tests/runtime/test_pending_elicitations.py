@@ -260,6 +260,48 @@ def test_counts_for_handles_empty_input() -> None:
     assert counts == {}
 
 
+def test_latest_ids_for_returns_newest_id_per_session() -> None:
+    """
+    The batch lookup returns the most recently inserted id per session.
+
+    The sidebar's ``pending_elicitation_key`` hashes this id, so a new
+    prompt must yield the new id while an unrelated republish of an
+    older one leaves it put.
+    """
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_1"))
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_2"))
+    pending_elicitations.record_publish("conv_b", _elicit_event("elicit_3"))
+
+    assert pending_elicitations.latest_ids_for(["conv_a", "conv_b", "conv_c"]) == {
+        "conv_a": "elicit_2",
+        "conv_b": "elicit_3",
+    }
+
+
+def test_latest_ids_for_omits_sessions_without_prompts() -> None:
+    """
+    Sessions with no outstanding prompt are absent from the mapping.
+
+    An empty map (not an empty-string value) is what tells the caller to
+    emit a null key rather than hash a phantom id.
+    """
+    assert pending_elicitations.latest_ids_for(["conv_a"]) == {}
+
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_1"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    assert pending_elicitations.latest_ids_for(["conv_a"]) == {}
+
+
+def test_latest_ids_for_tracks_resolve_of_the_newest_id() -> None:
+    """Resolving the newest id falls back to the next one still pending."""
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_1"))
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_2"))
+    pending_elicitations.resolve("conv_a", "elicit_2")
+
+    assert pending_elicitations.latest_ids_for(["conv_a"]) == {"conv_a": "elicit_1"}
+
+
 def test_conversations_are_independent() -> None:
     """
     An elicitation on one conversation does not affect another.

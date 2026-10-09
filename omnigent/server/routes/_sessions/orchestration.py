@@ -2288,6 +2288,8 @@ def _build_session_list_item(
     user_is_admin: bool,
     permissions_enabled: bool,
     pending_count: int,
+    child_pending_count: int = 0,
+    pending_key: str | None = None,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
     activity_unverified_child_ids: set[str] | None = None,
@@ -2329,6 +2331,14 @@ def _build_session_list_item(
         wired; gates owner/level population to mirror ``list_sessions``.
     :param pending_count: Number of outstanding elicitations for this
         conversation, from ``pending_elicitations.counts_for()``.
+    :param child_pending_count: Number of outstanding elicitations on
+        this conversation's live direct children, summed per child with
+        the same persisted-row fallback as ``pending_count`` and
+        filtered to live child runners by the caller.
+    :param pending_key: Opaque key identifying this row's outstanding
+        prompts (own plus counted live children), from
+        :func:`_pending_elicitation_key`. ``None`` when none are
+        indexed.
     :param child_session_ids: Direct sub-agent children for this
         conversation, as returned by
         ``conversation_store.list_child_conversation_ids_by_parent()``.
@@ -2434,6 +2444,8 @@ def _build_session_list_item(
             if conv.runner_id is not None
             else pending_count
         ),
+        child_pending_elicitations_count=child_pending_count,
+        pending_elicitation_key=pending_key,
         workspace=conv.workspace,
         worktree=conv.worktree,
         git_branch=conv.git_branch,
@@ -12428,6 +12440,16 @@ async def _create_session_from_existing_agent(
                 getattr(request.app.state, "user_preferences_store", None),
                 user_id or RESERVED_USER_LOCAL,
             )
+            # A new branch with no explicit base forks from the project's
+            # code repository when it has one; a child without its own
+            # project inherits the parent project's.
+            worktree_project = parent_project
+            if project_resolution.project_id is not None and project_store is not None:
+                worktree_project = await asyncio.to_thread(
+                    project_store.get,
+                    project_resolution.project_id,
+                    user_id=user_id,
+                )
             created_worktree = await _create_session_worktree(
                 host_id=body.host_id,
                 source_repo=source_repo,
@@ -12435,6 +12457,7 @@ async def _create_session_from_existing_agent(
                 request=request,
                 entry=project_resolution.worktree_entry,
                 path_template=path_template,
+                project=worktree_project,
             )
             # The host's path is canonicalised before any comparison or
             # persistence; rollback keeps the raw path it returned.

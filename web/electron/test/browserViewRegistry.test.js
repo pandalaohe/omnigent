@@ -778,3 +778,144 @@ describe("browserViewRegistry — overlay suppression (#3980)", () => {
     assert.equal(ctx.visibility.length, 0, "nothing to toggle with no active view");
   });
 });
+
+// A stub view that records device-emulation calls and the order of bounds /
+// emulation events, and lets a test fire webContents lifecycle events.
+function makeEmulationRegistry() {
+  const makeStubView = () => {
+    const handlers = new Map();
+    const emulation = { enables: [], disables: 0, events: [] };
+    return {
+      emulation,
+      fire(event) {
+        const fn = handlers.get(event);
+        if (fn) fn();
+      },
+      setBounds(bounds) {
+        emulation.events.push({ type: "setBounds", width: bounds.width, height: bounds.height });
+      },
+      setVisible() {},
+      webContents: {
+        loadURL() {},
+        close() {},
+        removeListener() {},
+        on(event, fn) {
+          handlers.set(event, fn);
+        },
+        setWindowOpenHandler() {},
+        isDestroyed: () => false,
+        enableDeviceEmulation(opts) {
+          emulation.enables.push(opts);
+          emulation.events.push({ type: "enable" });
+        },
+        disableDeviceEmulation() {
+          emulation.disables += 1;
+          emulation.events.push({ type: "disable" });
+        },
+      },
+    };
+  };
+  const registry = createBrowserViewRegistry({
+    WebContentsViewCtor: () => makeStubView(),
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost() {},
+    detachFromHost() {},
+    sendToRenderer() {},
+    getHostZoomFactor: () => 1,
+  });
+  return { registry };
+}
+
+describe("browserViewRegistry — hidden-view layout via device emulation", () => {
+  it("leaves a detached view unemulated until its first commit, then lays it out at the fallback size", () => {
+    const { registry } = makeEmulationRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const view = registry.get("conv_1").view;
+    assert.deepEqual(view.emulation.enables, [], "no emulation before the first did-navigate");
+    view.fire("did-navigate");
+    assert.equal(view.emulation.enables.length, 1);
+    assert.deepEqual(view.emulation.enables[0].viewSize, { width: 1280, height: 800 });
+  });
+
+  it("never emulates a never-navigated entry when it is detached or swapped away", () => {
+    const { registry } = makeEmulationRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.openOrNavigate("conv_2", "https://example.com");
+    const one = registry.get("conv_1").view;
+    const two = registry.get("conv_2").view;
+
+    registry.setActive("conv_1");
+    registry.setActive(null);
+    assert.equal(
+      one.emulation.enables.length,
+      0,
+      "setActive(null) on an uncommitted view is a no-op",
+    );
+
+    registry.setActive("conv_1");
+    registry.setActive("conv_2");
+    assert.equal(one.emulation.enables.length, 0, "swapping away an uncommitted view is a no-op");
+    assert.equal(two.emulation.enables.length, 0);
+  });
+
+  it("emulates a hidden view at its last on-screen size and disables before showing it again", () => {
+    const { registry } = makeEmulationRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.openOrNavigate("conv_2", "https://example.com");
+    const one = registry.get("conv_1").view;
+    registry.setActive("conv_1");
+    one.fire("did-navigate");
+    registry.get("conv_1").boundsController.setRendererBounds({
+      x: 10,
+      y: 20,
+      width: 640,
+      height: 480,
+      devicePixelRatio: 1,
+    });
+    assert.equal(one.emulation.enables.length, 0, "an active view needs no emulation");
+
+    registry.setActive("conv_2");
+    assert.equal(one.emulation.enables.length, 1);
+    assert.deepEqual(one.emulation.enables[0].viewSize, { width: 640, height: 480 });
+
+    one.emulation.events.length = 0;
+    registry.setActive("conv_1");
+    assert.deepEqual(
+      one.emulation.events.map((e) => e.type),
+      ["disable", "setBounds"],
+      "re-activation disables emulation before the bounds resync",
+    );
+
+    registry.openOrNavigate("conv_3", "https://example.com");
+    const three = registry.get("conv_3").view;
+    three.fire("did-navigate");
+    assert.equal(three.emulation.enables.length, 1);
+    assert.deepEqual(three.emulation.enables[0].viewSize, { width: 640, height: 480 });
+  });
+
+  it("stops emulating after a renderer crash until the next commit", () => {
+    const { registry } = makeEmulationRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const one = registry.get("conv_1").view;
+    one.fire("did-navigate");
+    assert.equal(one.emulation.enables.length, 1);
+
+    one.fire("render-process-gone");
+    registry.setActive("conv_1");
+    registry.setActive(null);
+    assert.equal(one.emulation.enables.length, 1, "no re-enable while uncommitted");
+    assert.equal(one.emulation.disables, 0, "no disable call after the renderer died");
+
+    one.fire("did-navigate");
+    assert.equal(one.emulation.enables.length, 2);
+  });
+
+  it("does not emulate a view that commits while it is the active one", () => {
+    const { registry } = makeEmulationRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.setActive("conv_1");
+    const one = registry.get("conv_1").view;
+    one.fire("did-navigate");
+    assert.equal(one.emulation.enables.length, 0);
+  });
+});

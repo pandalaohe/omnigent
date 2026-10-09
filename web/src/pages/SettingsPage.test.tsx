@@ -17,6 +17,7 @@ import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
+import { readWidenWorkspaceForContent } from "@/lib/workspacePanelPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
@@ -732,6 +733,19 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
   });
 
+  it("widens the Workspace rail for content by default and persists a toggle off", () => {
+    renderPage("/settings/appearance");
+
+    const toggle = screen.getByTestId("widen-workspace-for-content-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(readWidenWorkspaceForContent()).toBe(true);
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(readWidenWorkspaceForContent()).toBe(false);
+  });
+
   it("seeds the default Workspace tab from storage", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     renderPage("/settings/appearance");
@@ -945,6 +959,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    fireEvent.click(screen.getByTestId("widen-workspace-for-content-toggle"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -1008,6 +1023,10 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
       "aria-checked",
       "false",
+    );
+    expect(screen.getByTestId("widen-workspace-for-content-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
     );
   });
 

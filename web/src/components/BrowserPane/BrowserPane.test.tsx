@@ -304,6 +304,105 @@ describe("BrowserPane design-mode toggle", () => {
     unmount();
     expect(bridge.browserDisableDesignMode).toHaveBeenCalledTimes(2);
   });
+
+  /** Render the pane with a live view so the design-mode toggle is enabled. */
+  async function renderDesignModePane(
+    conversationId: string,
+    overrides: Record<string, unknown> = {},
+  ) {
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
+    const bridge = installBridge({
+      onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
+        fireCreated = cb;
+        return () => {};
+      }),
+      ...overrides,
+    });
+    render(<BrowserPane conversationId={conversationId} />);
+    await screen.findByRole("textbox", { name: /address bar/i });
+    fireCreated?.({ conversationId });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /enter design mode/i })).not.toBeDisabled();
+    });
+    return bridge;
+  }
+
+  it("reverts the toggle and reports when enabling design mode fails", async () => {
+    const bridge = await renderDesignModePane("conv_dm4", {
+      browserEnableDesignMode: vi.fn().mockResolvedValue({ ok: false, error: "x" }),
+    });
+
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Design mode couldn't start on this page.",
+    );
+    expect(screen.getByRole("button", { name: /enter design mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    // A second attempt clears the alert and succeeds.
+    bridge.browserEnableDesignMode.mockResolvedValue({ ok: true });
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(screen.getByRole("button", { name: /exit design mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("reverts the toggle when enabling design mode rejects", async () => {
+    await renderDesignModePane("conv_dm5", {
+      browserEnableDesignMode: vi.fn().mockRejectedValue(new Error("executeJavaScript failed")),
+    });
+
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Design mode couldn't start on this page.",
+    );
+    expect(screen.getByRole("button", { name: /enter design mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("keeps a newer enable when an older enable fails late", async () => {
+    let resolveFirstEnable: ((r: { ok: boolean }) => void) | undefined;
+    const browserEnableDesignMode = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ ok: boolean }>((resolve) => {
+            resolveFirstEnable = resolve;
+          }),
+      )
+      .mockResolvedValue({ ok: true });
+    await renderDesignModePane("conv_dm6", { browserEnableDesignMode });
+
+    // Enter (enable A pending) → exit → enter (enable B resolves ok).
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    await waitFor(() => expect(browserEnableDesignMode).toHaveBeenCalledTimes(1));
+    screen.getByRole("button", { name: /exit design mode/i }).click();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /enter design mode/i })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      ),
+    );
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    await waitFor(() => expect(browserEnableDesignMode).toHaveBeenCalledTimes(2));
+
+    // A's late failure must not turn off B's active picker.
+    await act(async () => {
+      resolveFirstEnable?.({ ok: false });
+    });
+
+    expect(screen.getByRole("button", { name: /exit design mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {

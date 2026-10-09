@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
@@ -154,6 +155,33 @@ def _seed_session(
     permission_store.ensure_user(owner)
     permission_store.grant(owner, conv.id, LEVEL_OWNER)
     return conv.id
+
+
+def _seed_child_with_pending(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+    parent_id: str,
+    *,
+    pending: int,
+) -> str:
+    """Create a runner-bound direct child row with ``pending`` persisted
+    pending elicitations and return its id."""
+    conversation_store = stores[0]
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=parent_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    assert conversation_store.set_runner_id(child.id, "rnr_child")
+    conversation_store.set_pending_elicitation_count(child.id, pending)
+    return child.id
+
+
+def _list_row(app: FastAPI, session_id: str, *, owner: str = ALICE) -> dict:
+    """Return one row of ``GET /v1/sessions`` keyed by id."""
+    resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": owner})
+    assert resp.status_code == 200
+    return {item["id"]: item for item in resp.json()["data"]}[session_id]
 
 
 def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[str, object]:
@@ -293,6 +321,175 @@ def test_child_busy_rollup_flows_through_updates_stream(
     finally:
         sessions_routes._session_status_cache.pop(parent_id, None)
         sessions_routes._session_status_cache.pop(child.id, None)
+
+
+def test_child_pending_elicitations_counts_on_list_and_stream(app: FastAPI, stores) -> None:
+    """A parked prompt on a live direct child badges the parent row.
+
+    Children have no sidebar row of their own, so the parent item carries
+    the child's pending count for the "needs response" pill. Both read
+    paths the sidebar uses — the GET page builder and the WS snapshot —
+    must agree.
+    """
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    _seed_child_with_pending(stores, parent_id, pending=1)
+
+    resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    assert resp.status_code == 200
+    row = {item["id"]: item for item in resp.json()["data"]}[parent_id]
+    assert row["child_pending_elicitations_count"] == 1
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        assert items[parent_id]["child_pending_elicitations_count"] == 1
+
+
+def test_child_pending_elicitations_drop_when_child_runner_offline(
+    app: FastAPI, stores, liveness_state: dict[str, SessionLiveness]
+) -> None:
+    """An offline child runner's parked prompt stops badging the parent.
+
+    The prompt died with the runner (the same rule that zeroes a
+    session's own count), so both read paths must read 0.
+    """
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child_id = _seed_child_with_pending(stores, parent_id, pending=1)
+    liveness_state[child_id] = SessionLiveness(runner_online=False, host_online=None)
+
+    resp = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    assert resp.status_code == 200
+    row = {item["id"]: item for item in resp.json()["data"]}[parent_id]
+    assert row["child_pending_elicitations_count"] == 0
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        assert items[parent_id]["child_pending_elicitations_count"] == 0
+
+
+def test_child_pending_elicitations_survive_parent_runner_offline(
+    app: FastAPI, stores, liveness_state: dict[str, SessionLiveness]
+) -> None:
+    """A parent whose runner is offline keeps its live child's pending count.
+
+    ``_apply_liveness_to_items`` zeroes the parent's own count once its
+    runner is gone, but the child's runner is a different tunnel — the
+    child count must survive so a live sub-agent's parked prompt still
+    lights the parent's pill.
+    """
+    conversation_store = stores[0]
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    assert conversation_store.set_runner_id(parent_id, "rnr_parent")
+    conversation_store.set_pending_elicitation_count(parent_id, 2)
+    _seed_child_with_pending(stores, parent_id, pending=1)
+    liveness_state[parent_id] = SessionLiveness(runner_online=False, host_online=None)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        assert items[parent_id]["pending_elicitations_count"] == 0
+        assert items[parent_id]["child_pending_elicitations_count"] == 1
+
+
+def test_child_pending_elicitations_clear_after_resolve(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """Clearing the child's pending count pushes a changed frame with 0.
+
+    The resolve path decrements the persisted count; the next rescan must
+    diff the parent row's child count so the pill clears without a poll.
+    """
+    conversation_store = stores[0]
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child_id = _seed_child_with_pending(stores, parent_id, pending=1)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        assert items[parent_id]["child_pending_elicitations_count"] == 1
+
+        conversation_store.set_pending_elicitation_count(child_id, 0)
+        changed = _recv_until(ws, {"changed"})
+        changed_items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+        assert changed_items[parent_id]["child_pending_elicitations_count"] == 0
+
+
+def test_pending_elicitation_key_absent_with_nothing_pending(app: FastAPI, stores) -> None:
+    """A row with no outstanding prompts carries no prompt key."""
+    session_id = _seed_session(stores, owner=ALICE, title="quiet")
+
+    assert _list_row(app, session_id).get("pending_elicitation_key") is None
+
+
+def test_pending_elicitation_key_set_after_own_prompt(app: FastAPI, stores) -> None:
+    """Recording an own prompt sets the key to a hash of its id."""
+    session_id = _seed_session(stores, owner=ALICE, title="prompted")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_1"},
+    )
+
+    assert _list_row(app, session_id)["pending_elicitation_key"] == "40deb586a95d9d1a"
+
+
+def test_pending_elicitation_key_stable_across_unrelated_change(app: FastAPI, stores) -> None:
+    """An unrelated title change leaves a still-pending prompt's key alone."""
+    conversation_store = stores[0]
+    session_id = _seed_session(stores, owner=ALICE, title="prompted")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_1"},
+    )
+    before = _list_row(app, session_id)["pending_elicitation_key"]
+
+    conversation_store.update_conversation_with_changes(session_id, title="renamed")
+
+    assert _list_row(app, session_id)["pending_elicitation_key"] == before
+
+
+def test_pending_elicitation_key_changes_across_prompt_cycles(app: FastAPI, stores) -> None:
+    """Resolve then a fresh prompt yields a different key at the same count."""
+    session_id = _seed_session(stores, owner=ALICE, title="cycles")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_1"},
+    )
+    first = _list_row(app, session_id)["pending_elicitation_key"]
+
+    pending_elicitations.resolve(session_id, "elic_1")
+    pending_elicitations.record_publish(
+        session_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_2"},
+    )
+    second = _list_row(app, session_id)["pending_elicitation_key"]
+
+    assert first == "40deb586a95d9d1a"
+    assert second == "00d5a66639eb7857"
+
+
+def test_pending_elicitation_key_includes_live_child_prompt(app: FastAPI, stores) -> None:
+    """A parked prompt on a live child sets the parent row's key."""
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child_id = _seed_child_with_pending(stores, parent_id, pending=0)
+    pending_elicitations.record_publish(
+        child_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elic_child"},
+    )
+
+    assert _list_row(app, parent_id)["pending_elicitation_key"] == "4f03a3a1b74e0f0d"
 
 
 def test_background_shell_count_flows_through_updates_stream(

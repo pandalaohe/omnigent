@@ -1,8 +1,9 @@
 """Tests for collaboration config and the repository/binding stores.
 
-Covers repository upsert (revision bump on change only), binding upsert
-(the one-primary invariant per ``(project, host)``), and the per-host
-project entries (upsert / list / delete / existence guard).
+Covers repository upsert (revision bump on change only, role demotion),
+binding writes (``is_primary`` derived from the project's code repository,
+never client-set), and the per-host project entries (upsert / list / delete /
+existence guard).
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ import uuid
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.stores.project_host_binding_store import DuplicatePrimaryBindingError
 from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
     SqlAlchemyProjectHostBindingStore,
 )
@@ -58,14 +58,18 @@ def _create_repo(
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_id: str,
     name: str = "root",
+    *,
+    role: str | None = None,
 ) -> str:
     """Register a repository and return its id (bindings must name a real one)."""
-    return repository_store.upsert(
+    repository, _changed = repository_store.apply_repository(
         project_id=project_id,
         name=name,
         remote_url="git@github.com:example/repo.git",
         default_branch="main",
-    ).id
+        role=role,
+    )
+    return repository.id
 
 
 # ── repositories ────────────────────────────────────────────────────────
@@ -75,18 +79,20 @@ def test_repository_upsert_inserts_at_revision_1(
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_store: SqlAlchemyProjectStore,
 ) -> None:
-    """A new registration starts at revision 1."""
+    """A new registration starts at revision 1 and role related."""
     _create_project(project_store)
-    repo = repository_store.upsert(
+    repo, changed = repository_store.apply_repository(
         project_id=_uid("proj"),
         name="root",
         remote_url="git@github.com:example/repo.git",
         default_branch="main",
     )
     assert repo.revision == 1
+    assert repo.role == "related"
     assert repo.context_manifest_path == ".agents/project/manifest.json"
     assert repo.created_at > 0
     assert repo.updated_at is None
+    assert changed == []
 
 
 def test_repository_upsert_identical_is_noop(
@@ -95,13 +101,13 @@ def test_repository_upsert_identical_is_noop(
 ) -> None:
     """Re-registering unchanged values returns the row without a bump."""
     _create_project(project_store)
-    first = repository_store.upsert(
+    first, _ = repository_store.apply_repository(
         project_id=_uid("proj"),
         name="root",
         remote_url="git@github.com:example/repo.git",
         default_branch="main",
     )
-    second = repository_store.upsert(
+    second, _ = repository_store.apply_repository(
         project_id=_uid("proj"),
         name="root",
         remote_url="git@github.com:example/repo.git",
@@ -118,13 +124,13 @@ def test_repository_upsert_change_bumps_revision(
 ) -> None:
     """A changed field bumps the revision and stamps ``updated_at``."""
     _create_project(project_store)
-    repository_store.upsert(
+    repository_store.apply_repository(
         project_id=_uid("proj"),
         name="root",
         remote_url="git@github.com:example/repo.git",
         default_branch="main",
     )
-    updated = repository_store.upsert(
+    updated, _ = repository_store.apply_repository(
         project_id=_uid("proj"),
         name="root",
         remote_url="git@github.com:example/other.git",
@@ -141,7 +147,7 @@ def test_repository_get_list_delete(
 ) -> None:
     """``get`` / ``get_by_name`` / ``list_by_project`` / ``delete`` round-trip."""
     _create_project(project_store)
-    repo = repository_store.upsert(
+    repo, _ = repository_store.apply_repository(
         project_id=_uid("proj"),
         name="root",
         remote_url="u",
@@ -158,31 +164,208 @@ def test_repository_get_list_delete(
     assert repository_store.get(repo.id) is None
 
 
-# ── bindings ────────────────────────────────────────────────────────────
-
-
-def test_binding_upsert_inserts_at_revision_1(
-    binding_store: SqlAlchemyProjectHostBindingStore,
+def test_repository_role_empty_remote_accepted(
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_store: SqlAlchemyProjectStore,
 ) -> None:
-    """A new binding starts at revision 1, non-primary by default."""
+    """A repository with no git location stores an empty remote."""
+    _create_project(project_store)
+    repo, _ = repository_store.apply_repository(
+        project_id=_uid("proj"),
+        name="root",
+        remote_url="",
+        default_branch="main",
+    )
+    assert repo.remote_url == ""
+
+
+def test_repository_apply_unknown_role_rejected(
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """A role outside code/related is refused and writes nothing."""
+    project_id = _create_project(project_store)
+    with pytest.raises(OmnigentError) as exc:
+        repository_store.apply_repository(
+            project_id=project_id,
+            name="root",
+            remote_url="u",
+            default_branch="main",
+            role="primary",
+        )
+    assert exc.value.code == ErrorCode.INVALID_INPUT
+    assert repository_store.list_by_project(project_id) == []
+
+
+def test_marking_code_demotes_the_other_repository(
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Exactly one code repository: the newly marked one wins."""
+    project_id = _create_project(project_store)
+    first = _create_repo(repository_store, project_id, "a", role="code")
+    second = _create_repo(repository_store, project_id, "b")
+    assert repository_store.get(first).role == "code"
+
+    marked, _ = repository_store.apply_repository(
+        project_id=project_id,
+        name="b",
+        remote_url="git@github.com:example/repo.git",
+        default_branch="main",
+        role="code",
+    )
+    assert marked.role == "code"
+    demoted = repository_store.get(first)
+    assert demoted is not None
+    assert demoted.role == "related"
+    assert demoted.revision == 2
+    assert demoted.updated_at is not None
+    assert repository_store.get(second).role == "code"
+
+
+def test_repeated_role_writes_end_consistent(
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Serialized role flips leave one code repository and its host primaries."""
+    project_id = _create_project(project_store)
+    host_id = _uid("host-a")
+    a = _create_repo(repository_store, project_id, "a")
+    b = _create_repo(repository_store, project_id, "b")
+    bindings = {
+        repo_id: binding_store.apply_binding(
+            project_id=project_id,
+            host_id=host_id,
+            name=repo_id,
+            repository_id=repo_id,
+            workspace=f"/opt/work/{repo_id}",
+        )
+        for repo_id in (a, b)
+    }
+
+    for name in ("a", "b", "a"):
+        repository_store.apply_repository(
+            project_id=project_id,
+            name=name,
+            remote_url="git@github.com:example/repo.git",
+            default_branch="main",
+            role="code",
+        )
+
+    roles = {repo.name: repo.role for repo in repository_store.list_by_project(project_id)}
+    assert roles == {"a": "code", "b": "related"}
+    assert binding_store.get(bindings[a].id).is_primary is True
+    assert binding_store.get(bindings[b].id).is_primary is False
+
+
+def test_repository_apply_derives_primary_bindings(
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Marking code promotes that repository's enabled binding."""
     project_id = _create_project(project_store)
     repo_id = _create_repo(repository_store, project_id)
-    binding = binding_store.upsert(
+    binding = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
-        workspace="/Users/dev/work/p",
+        workspace="/w",
+    )
+    assert binding.is_primary is False
+
+    marked, changed = repository_store.apply_repository(
+        project_id=project_id,
+        name="root",
+        remote_url="git@github.com:example/repo.git",
+        default_branch="main",
+        role="code",
+    )
+    assert marked.role == "code"
+    assert [row.id for row in changed] == [binding.id]
+    promoted = binding_store.get(binding.id)
+    assert promoted is not None
+    assert promoted.is_primary is True
+    assert promoted.revision == 2
+    assert changed[0].revision == 2
+
+
+# ── bindings ────────────────────────────────────────────────────────────
+
+
+def test_binding_apply_inserts_at_revision_1_never_primary(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Without a code repository no binding is primary."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id)
+    binding = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/opt/work/p",
     )
     assert binding.revision == 1
     assert binding.is_primary is False
     assert binding.enabled is True
+    assert binding.path_verified_at is not None
+
+
+def test_binding_apply_unverified_keeps_null_timestamp(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """An offline save stores the path with no verification stamp."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id)
+    binding = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/opt/work/typed/",
+        verified=False,
+    )
+    assert binding.workspace == "/opt/work/typed/"
     assert binding.path_verified_at is None
 
 
-def test_binding_upsert_change_bumps_revision(
+def test_binding_apply_unverified_clears_a_stale_verification(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """An offline edit of a verified binding drops the old timestamp."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id)
+    verified = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/opt/work/a",
+    )
+    assert verified.path_verified_at is not None
+    offline = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/opt/work/b",
+        verified=False,
+    )
+    assert offline.workspace == "/opt/work/b"
+    assert offline.path_verified_at is None
+    assert binding_store.get(verified.id).path_verified_at is None
+
+
+def test_binding_apply_change_bumps_revision(
     binding_store: SqlAlchemyProjectHostBindingStore,
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_store: SqlAlchemyProjectStore,
@@ -190,116 +373,158 @@ def test_binding_upsert_change_bumps_revision(
     """A changed path bumps the revision."""
     project_id = _create_project(project_store)
     repo_id = _create_repo(repository_store, project_id)
-    binding_store.upsert(
+    binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
-        workspace="/Users/dev/work/p",
+        workspace="/opt/work/p",
     )
-    updated = binding_store.upsert(
+    updated = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
-        workspace="/Users/dev/work/p2",
+        workspace="/opt/work/p2",
     )
     assert updated.revision == 2
-    assert updated.workspace == "/Users/dev/work/p2"
+    assert updated.workspace == "/opt/work/p2"
     assert updated.updated_at is not None
 
 
-def test_second_primary_on_same_host_rejected(
+def test_binding_code_repository_enabled_binding_is_primary(
     binding_store: SqlAlchemyProjectHostBindingStore,
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_store: SqlAlchemyProjectStore,
 ) -> None:
-    """A second primary for one ``(project, host)`` is rejected; the old stays."""
+    """One enabled code-repository binding per host becomes primary."""
     project_id = _create_project(project_store)
-    repo_id = _create_repo(repository_store, project_id)
-    first = binding_store.upsert(
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    binding = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
         workspace="/w1",
-        is_primary=True,
     )
-    with pytest.raises(DuplicatePrimaryBindingError):
-        binding_store.upsert(
-            project_id=project_id,
-            host_id=_uid("host-a"),
-            name="other",
-            repository_id=repo_id,
-            workspace="/w2",
-            is_primary=True,
-        )
-    # The existing primary is untouched — never silently cleared.
-    assert binding_store.get(first.id) is not None
-    assert binding_store.get(first.id).is_primary is True
-    assert [
-        b.name for b in binding_store.list_by_host(project_id=_uid("proj"), host_id=_uid("host-a"))
-    ] == ["primary"]
+    assert binding.is_primary is True
 
 
-def test_promoting_to_second_primary_rejected(
+def test_binding_second_enabled_duplicate_keeps_the_older_primary(
     binding_store: SqlAlchemyProjectHostBindingStore,
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_store: SqlAlchemyProjectStore,
 ) -> None:
-    """Flipping a non-primary row to primary while one exists is rejected."""
+    """The oldest enabled candidate stays primary; a newer one stays clear."""
     project_id = _create_project(project_store)
-    repo_id = _create_repo(repository_store, project_id)
-    binding_store.upsert(
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    first = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
         workspace="/w1",
-        is_primary=True,
     )
-    second = binding_store.upsert(
+    second = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
-        name="other",
+        name="extra",
         repository_id=repo_id,
         workspace="/w2",
     )
-    with pytest.raises(DuplicatePrimaryBindingError):
-        binding_store.upsert(
-            project_id=project_id,
-            host_id=_uid("host-a"),
-            name="other",
-            repository_id=repo_id,
-            workspace="/w2",
-            is_primary=True,
-        )
-    assert binding_store.get(second.id).revision == 1
+    assert binding_store.get(first.id).is_primary is True
+    assert binding_store.get(second.id).is_primary is False
 
 
-def test_primary_on_different_host_allowed(
+def test_disabled_older_duplicate_keeps_the_enabled_one_primary(
     binding_store: SqlAlchemyProjectHostBindingStore,
     repository_store: SqlAlchemyProjectRepositoryStore,
     project_store: SqlAlchemyProjectStore,
 ) -> None:
-    """Each host holds its own primary — the invariant is per ``(project, host)``."""
+    """A disabled candidate never displaces the enabled one."""
     project_id = _create_project(project_store)
-    repo_id = _create_repo(repository_store, project_id)
-    a = binding_store.upsert(
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    disabled = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="old",
+        repository_id=repo_id,
+        workspace="/w1",
+        enabled=False,
+    )
+    enabled = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
-        workspace=r"C:\work\p",
-        is_primary=True,
+        workspace="/w2",
     )
-    b = binding_store.upsert(
+    assert binding_store.get(enabled.id).is_primary is True
+    assert binding_store.get(disabled.id).is_primary is False
+
+    # Any later write re-derives from the candidates: the enabled row stays.
+    binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="old",
+        repository_id=repo_id,
+        workspace="/w1-moved",
+        enabled=False,
+    )
+    assert binding_store.get(enabled.id).is_primary is True
+    assert binding_store.get(disabled.id).is_primary is False
+
+
+def test_disabling_the_primary_clears_it(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """With no enabled candidate the host has no primary."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    host_id = _uid("host-a")
+    binding = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=host_id,
+        name="primary",
+        repository_id=repo_id,
+        workspace="/w1",
+    )
+    assert binding.is_primary is True
+
+    disabled = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=host_id,
+        name="primary",
+        repository_id=repo_id,
+        workspace="/w1",
+        enabled=False,
+    )
+    assert disabled.is_primary is False
+
+
+def test_primary_is_derived_per_host(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Each host holds its own primary — the rule is per ``(project, host)``."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    a = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/w-a",
+    )
+    b = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-b"),
         name="primary",
         repository_id=repo_id,
-        workspace="/Users/dev/work/p",
-        is_primary=True,
+        workspace="/w-b",
     )
     assert a.is_primary is True
     assert b.is_primary is True
@@ -314,9 +539,10 @@ def test_binding_get_list_delete(
     """``get`` / ``list_by_project`` / ``list_by_host`` / ``delete`` round-trip."""
     project_id = _create_project(project_store)
     repo_id = _create_repo(repository_store, project_id)
-    binding = binding_store.upsert(
+    host_id = _uid("host-a")
+    binding = binding_store.apply_binding(
         project_id=project_id,
-        host_id=_uid("host-a"),
+        host_id=host_id,
         name="primary",
         repository_id=repo_id,
         workspace="/w",
@@ -324,12 +550,74 @@ def test_binding_get_list_delete(
     assert binding_store.get(binding.id) == binding
     assert binding_store.get(_uid("nope")) is None
     assert [b.id for b in binding_store.list_by_project(project_id)] == [binding.id]
-    assert [
-        b.id for b in binding_store.list_by_host(project_id=project_id, host_id=_uid("host-a"))
-    ] == [binding.id]
+    assert [b.id for b in binding_store.list_by_host(project_id=project_id, host_id=host_id)] == [
+        binding.id
+    ]
     assert binding_store.list_by_host(project_id=project_id, host_id=_uid("host-b")) == []
-    assert binding_store.delete(binding.id) is True
-    assert binding_store.delete(binding.id) is False
+    assert binding_store.delete_binding(project_id, host_id, "primary") is True
+    assert binding_store.delete_binding(project_id, host_id, "primary") is False
+
+
+def test_delete_binding_re_derives_the_next_primary(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Removing the primary promotes the remaining enabled candidate."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    host_id = _uid("host-a")
+    first = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=host_id,
+        name="primary",
+        repository_id=repo_id,
+        workspace="/w1",
+    )
+    second = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=host_id,
+        name="extra",
+        repository_id=repo_id,
+        workspace="/w2",
+    )
+    assert first.is_primary is True
+
+    assert binding_store.delete_binding(project_id, host_id, "primary") is True
+    promoted = binding_store.get(second.id)
+    assert promoted is not None
+    assert promoted.is_primary is True
+    assert promoted.revision == 2
+
+
+def test_demoting_the_code_repository_clears_primaries(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """A project that loses its only repository has no primary left."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id, role="code")
+    binding = binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/w",
+    )
+    assert binding.is_primary is True
+    # The store refuses deleting a referenced repository; a repository change
+    # to related is the reachable path and clears the primary.
+    repository_store.apply_repository(
+        project_id=project_id,
+        name="root",
+        remote_url="git@github.com:example/repo.git",
+        default_branch="main",
+        role="related",
+    )
+    cleared = binding_store.get(binding.id)
+    assert cleared is not None
+    assert cleared.is_primary is False
 
 
 # ── missing project ───────────────────────────────────────────────────
@@ -341,7 +629,7 @@ def test_repository_upsert_missing_project_raises_not_found(
     """Upserting on an unknown project raises ``NOT_FOUND`` and writes no row."""
     missing = _uid("missing-proj")
     with pytest.raises(OmnigentError) as exc:
-        repository_store.upsert(
+        repository_store.apply_repository(
             project_id=missing,
             name="root",
             remote_url="u",
@@ -359,7 +647,7 @@ def test_binding_upsert_missing_project_raises_not_found(
     """Upserting on an unknown project raises ``NOT_FOUND`` and writes no row."""
     missing = _uid("missing-proj")
     with pytest.raises(OmnigentError) as exc:
-        binding_store.upsert(
+        binding_store.apply_binding(
             project_id=missing,
             host_id=_uid("host-a"),
             name="primary",
@@ -378,7 +666,7 @@ def test_repository_delete_missing_project_raises_not_found(
 ) -> None:
     """Deleting a row whose project is gone raises ``NOT_FOUND``, not ``False``."""
     project_id = _create_project(project_store)
-    repo = repository_store.upsert(
+    repo, _ = repository_store.apply_repository(
         project_id=project_id,
         name="root",
         remote_url="u",
@@ -399,16 +687,17 @@ def test_binding_delete_missing_project_raises_not_found(
     """Deleting a row whose project is gone raises ``NOT_FOUND``, not ``False``."""
     project_id = _create_project(project_store)
     repo_id = _create_repo(repository_store, project_id)
-    binding = binding_store.upsert(
+    host_id = _uid("host-a")
+    binding_store.apply_binding(
         project_id=project_id,
-        host_id=_uid("host-a"),
+        host_id=host_id,
         name="primary",
         repository_id=repo_id,
         workspace="/w",
     )
     assert project_store.delete(project_id, user_id="alice@example.com") is True
     with pytest.raises(OmnigentError) as exc:
-        binding_store.delete(binding.id)
+        binding_store.delete_binding(project_id, host_id, "primary")
     assert exc.value.code == ErrorCode.NOT_FOUND
     assert project_id in exc.value.message
 
@@ -425,13 +714,12 @@ def _create_verified_binding(
     """Create a project, repository and verified binding; return all three ids."""
     project_id = _create_project(project_store, seed)
     repo_id = _create_repo(repository_store, project_id)
-    binding = binding_store.upsert(
+    binding = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
         workspace="/w",
-        path_verified_at=100,
     )
     return project_id, repo_id, binding
 
@@ -446,14 +734,13 @@ def test_record_verification_concurrent_disable_returns_none(
         binding_store, repository_store, project_store
     )
     stale_revision = binding.revision
-    binding_store.upsert(
+    disabled = binding_store.apply_binding(
         project_id=project_id,
         host_id=_uid("host-a"),
         name="primary",
         repository_id=repo_id,
         workspace="/w",
         enabled=False,
-        path_verified_at=100,
     )
     assert (
         binding_store.record_verification(
@@ -468,7 +755,7 @@ def test_record_verification_concurrent_disable_returns_none(
     assert after is not None
     assert after.enabled is False
     assert after.revision == stale_revision + 1
-    assert after.path_verified_at == 100
+    assert after.path_verified_at == disabled.path_verified_at
 
 
 def test_record_verification_after_delete_returns_none(
@@ -481,7 +768,7 @@ def test_record_verification_after_delete_returns_none(
         binding_store, repository_store, project_store
     )
     stale_revision = binding.revision
-    assert binding_store.delete(binding.id) is True
+    assert binding_store.delete_binding(project_id, _uid("host-a"), "primary") is True
     assert (
         binding_store.record_verification(
             binding.id,
@@ -577,7 +864,7 @@ def test_binding_upsert_unknown_repository_rejected(
     project_id = _create_project(project_store)
     missing = _uid("missing-repo")
     with pytest.raises(OmnigentError) as exc:
-        binding_store.upsert(
+        binding_store.apply_binding(
             project_id=project_id,
             host_id=_uid("host-a"),
             name="primary",
@@ -599,7 +886,7 @@ def test_binding_upsert_deleted_repository_rejected(
     repo_id = _create_repo(repository_store, project_id)
     assert repository_store.delete(repo_id) is True
     with pytest.raises(OmnigentError) as exc:
-        binding_store.upsert(
+        binding_store.apply_binding(
             project_id=project_id,
             host_id=_uid("host-a"),
             name="primary",
@@ -621,7 +908,7 @@ def test_binding_upsert_foreign_repository_rejected(
     other_id = _create_project(project_store, "other", name="Q")
     foreign_repo_id = _create_repo(repository_store, other_id)
     with pytest.raises(OmnigentError) as exc:
-        binding_store.upsert(
+        binding_store.apply_binding(
             project_id=project_id,
             host_id=_uid("host-a"),
             name="primary",
@@ -631,6 +918,25 @@ def test_binding_upsert_foreign_repository_rejected(
     assert exc.value.code == ErrorCode.INVALID_INPUT
     assert foreign_repo_id in exc.value.message
     assert binding_store.list_by_project(project_id) == []
+
+
+def test_repository_delete_after_binding_removal_succeeds(
+    binding_store: SqlAlchemyProjectHostBindingStore,
+    repository_store: SqlAlchemyProjectRepositoryStore,
+    project_store: SqlAlchemyProjectStore,
+) -> None:
+    """Deleting the last binding unblocks the repository delete."""
+    project_id = _create_project(project_store)
+    repo_id = _create_repo(repository_store, project_id)
+    binding_store.apply_binding(
+        project_id=project_id,
+        host_id=_uid("host-a"),
+        name="primary",
+        repository_id=repo_id,
+        workspace="/w",
+    )
+    assert binding_store.delete_binding(project_id, _uid("host-a"), "primary") is True
+    assert repository_store.delete(repo_id) is True
 
 
 # ── entries ─────────────────────────────────────────────────────────────

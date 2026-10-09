@@ -271,6 +271,7 @@ async def test_create_session_without_title_returns_none(
     [
         ("claude-sdk", "permission_mode", "plan", "omnigent.claude_sdk.permission_mode"),
         ("codex", "approval_mode", "read-only", "omnigent.codex_sdk.approval_mode"),
+        ("codex", "approval_mode", "approve-for-me", "omnigent.codex_sdk.approval_mode"),
     ],
 )
 async def test_create_sdk_permission_label(

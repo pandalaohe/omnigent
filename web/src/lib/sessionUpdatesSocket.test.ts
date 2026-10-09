@@ -20,6 +20,7 @@ class FakeWebSocket {
   onerror: (() => void) | null = null;
   onclose: (() => void) | null = null;
   closeCount = 0;
+  readonly sent: string[] = [];
   readonly url: string;
 
   constructor(url: string) {
@@ -29,8 +30,8 @@ class FakeWebSocket {
     FakeWebSocket.instances.push(this);
   }
 
-  send(): void {
-    // The watch-set send is irrelevant to the watchdog; ignore it.
+  send(data: string): void {
+    this.sent.push(data);
   }
 
   close(): void {
@@ -126,6 +127,49 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
 // the scheduled reconnect timer has fired regardless of the random jitter.
 const RECONNECT_CEILING_MS = 5_001;
 
+describe("sessionUpdatesSocket snapshot tracking", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    sessionUpdatesSocket.stop();
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("reports a snapshot only for the current connection", () => {
+    sessionUpdatesSocket.start();
+    const first = latestWs();
+    first.open();
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    // A diff frame is not the connect snapshot.
+    first.emit({ type: "changed", items: [] });
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    first.emit({ type: "snapshot", items: [] });
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(true);
+
+    // A drop clears it; the next connection starts fresh and must wait for
+    // its own snapshot rather than inheriting the previous one.
+    first.close();
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+    const second = latestWs();
+    expect(second).not.toBe(first);
+    second.open();
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(false);
+
+    second.emit({ type: "snapshot", items: [] });
+    expect(sessionUpdatesSocket.hasSnapshot()).toBe(true);
+  });
+});
+
 describe("nextPushedSession", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
@@ -167,5 +211,87 @@ describe("nextPushedSession", () => {
     // already committed to the authoritative id would be handed a second one.
     latestWs().emit({ type: "changed", items: [{ id: "conv_late" }] });
     await expect(mine).resolves.toBeNull();
+  });
+});
+
+/** Frame types of the raw JSON strings a fake socket sent, in order. */
+function sentTypes(ws: FakeWebSocket): string[] {
+  return ws.sent.map((raw) => (JSON.parse(raw) as { type: string }).type);
+}
+
+describe("sessionUpdatesSocket device hello and activity", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    sessionUpdatesSocket.stop();
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("sends hello before the watch frame on open", () => {
+    sessionUpdatesSocket.setHello({
+      device_id: "dev_hello",
+      device_label: "Test device",
+      can_ring: true,
+    });
+    sessionUpdatesSocket.start();
+    const ws = latestWs();
+    ws.open();
+
+    // Hello first: the server must know this device before the watch-set
+    // snapshot can trigger anything that claims an alert.
+    expect(sentTypes(ws)).toEqual(["hello", "watch"]);
+    expect(JSON.parse(ws.sent[0])).toEqual({
+      type: "hello",
+      device_id: "dev_hello",
+      device_label: "Test device",
+      can_ring: true,
+    });
+  });
+
+  it("re-sends hello after a reconnect", () => {
+    sessionUpdatesSocket.setHello({
+      device_id: "dev_reconnect",
+      device_label: "Test device",
+      can_ring: false,
+    });
+    sessionUpdatesSocket.start();
+    const first = latestWs();
+    first.open();
+
+    // A server-side drop drives the normal reconnect path.
+    first.close();
+    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+    const second = latestWs();
+    second.open();
+
+    expect(second).not.toBe(first);
+    expect(sentTypes(second)).toEqual(["hello", "watch"]);
+    expect(JSON.parse(second.sent[0])).toMatchObject({
+      type: "hello",
+      device_id: "dev_reconnect",
+    });
+  });
+
+  it("sendActivity is a no-op while closed and sends once open", () => {
+    sessionUpdatesSocket.sendActivity();
+    expect(FakeWebSocket.instances).toEqual([]);
+
+    sessionUpdatesSocket.setHello({
+      device_id: "dev_activity",
+      device_label: "Test device",
+      can_ring: true,
+    });
+    sessionUpdatesSocket.start();
+    const ws = latestWs();
+    ws.open();
+    sessionUpdatesSocket.sendActivity();
+
+    expect(sentTypes(ws)).toEqual(["hello", "watch", "activity"]);
   });
 });

@@ -1512,6 +1512,7 @@ async def _auto_create_opencode_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    global_instructions: str | None = None,
 ) -> SessionResourceView:
     """
     Auto-create an OpenCode terminal for an opencode-native session.
@@ -1532,6 +1533,8 @@ async def _auto_create_opencode_terminal(
         relay for this session's bridge dir (the nested
         ``_ensure_comment_relay_started``). ``None`` skips wiring the Omnigent
         MCP relay (tests / no server).
+    :param global_instructions: The session's server-held global instructions
+        text, or ``None``/blank when none is set.
     :returns: The created terminal resource view.
     """
     from omnigent.harnesses.opencode_native.app_server import (
@@ -1547,6 +1550,7 @@ async def _auto_create_opencode_terminal(
         write_bridge_state,
         write_opencode_policy_plugin,
         write_relay_bridge_config,
+        write_session_instructions,
     )
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -1731,6 +1735,21 @@ async def _auto_create_opencode_terminal(
             policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
+
+    # A config ``instructions`` entry that is an absolute file path reaches every
+    # turn (web or TUI-typed); a per-message ``system`` field reaches only the
+    # message that carries it. Always write — ``None`` removes a stale file from
+    # an earlier launch, since the bridge dir survives relaunches.
+    session_instructions_file = write_session_instructions(
+        bridge_dir,
+        _opencode_session_instructions(agent_spec, global_instructions=global_instructions),
+    )
+    if session_instructions_file is not None:
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+        existing_instructions = config.get("instructions")
+        config["instructions"] = (
+            [*existing_instructions] if isinstance(existing_instructions, list) else []
+        ) + [str(session_instructions_file)]
 
     # Merge the user's global provider definitions (e.g. OpenAI-compatible
     # endpoints with custom base URLs) into the synthesized config so the
@@ -7354,6 +7373,34 @@ def _native_startup_instructions_from_spec(
     return native_startup_instructions(spec, global_instructions=global_instructions)
 
 
+def _opencode_session_instructions(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    *,
+    global_instructions: str | None = None,
+) -> str | None:
+    """Compose the session text OpenCode's config ``instructions`` file carries.
+
+    Must return exactly the text the runner's per-turn path composes for a turn
+    without per-request instructions, so the executor can compare by equality
+    and skip re-sending the same text as a per-message ``system`` field.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :param global_instructions: The session's server-held global instructions
+        text, or ``None``/blank when none is set.
+    :returns: The composed session text, or ``None`` when there is none.
+    """
+    from omnigent.runtime.prompt import build_instructions_nullable, native_startup_instructions
+
+    global_framework = (
+        [global_instructions] if global_instructions and global_instructions.strip() else []
+    )
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return native_startup_instructions(None, global_instructions=global_instructions)
+    return build_instructions_nullable(spec, None, [], framework_instructions=global_framework)
+
+
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
     """
     Read the cursor-agent model id to launch the native TUI with, from a spec.
@@ -9804,6 +9851,7 @@ async def _launch_opencode(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        global_instructions=ctx.global_instructions,
     )
 
 

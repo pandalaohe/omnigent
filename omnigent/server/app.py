@@ -1707,6 +1707,8 @@ def create_app(
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
+        project_repository_store=project_repository_store,
+        project_host_binding_store=project_host_binding_store,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -2158,6 +2160,8 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.project_host_binding_store = project_host_binding_store
+    app.state.project_repository_store = project_repository_store
+    app.state.project_store = project_store
     # The create-time calling-defaults resolver reads these four stores off
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
@@ -3960,10 +3964,10 @@ def create_app(
             prefix="/v1",
             tags=["calling_defaults"],
         )
-    # Cross-host collaboration configuration (enable switch, registered
-    # repositories, per-host bindings). Mounted only when the project store
-    # and both config stores are wired; each handler additionally gates on
-    # Feature.PROJECT_ASSIGNMENTS so the surface stays dark until opted in.
+    # Cross-host collaboration configuration (registered repositories,
+    # per-host bindings). Mounted only when the project store and both
+    # config stores are wired; the surface is always on (the former
+    # project_assignments flag is a deprecated no-op).
     if (
         project_store is not None
         and project_repository_store is not None
@@ -3977,7 +3981,6 @@ def create_app(
                 auth_provider=auth_provider,
                 host_store=host_store,
                 host_registry=host_registry,
-                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["projects"],

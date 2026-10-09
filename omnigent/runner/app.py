@@ -167,6 +167,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.resource_routes import register_resource_routes
 from omnigent.runner.session_history import _HISTORY_INPUT_ITEM_TYPES, build_session_history
 from omnigent.runner.session_init_protocol import (
+    ProjectCodeLocation,
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
@@ -1989,6 +1990,10 @@ def create_runner_app(
     # global text. Read by the launch and composition points, never from the
     # TTL'd envelope cache, so the text outlives the cache. Blank is "off".
     _session_global_instructions: dict[str, str | None] = {}
+    # session_id → the project code locations from the first init snapshot:
+    # a re-init keeps the first list, so settings changes reach only sessions
+    # initialised after the change.
+    _session_project_code: dict[str, list[ProjectCodeLocation] | None] = {}
 
     def _global_framework_instructions(value: str | None) -> list[str]:
         """The session's global text as a one-entry framework instruction list.
@@ -3053,10 +3058,12 @@ def create_runner_app(
         _session_open_enabled[session_id] = (
             snapshot.peer_messaging_enabled and snapshot.parent_session_id is None
         )
+        _session_project_code.setdefault(session_id, snapshot.project_code)
         _session_global_instructions[session_id] = session_startup_extras(
             snapshot.global_instructions,
             workspace=snapshot.workspace,
             worktree=snapshot.worktree,
+            project_code=_session_project_code.get(session_id),
         )
         # A peer-enabled session carries the reply grant, and a child session
         # also carries the quiet-result rule (D9); the per-session text channel
@@ -4565,6 +4572,7 @@ def create_runner_app(
         _session_peer_messaging_enabled.pop(session_id, None)
         _session_open_enabled.pop(session_id, None)
         _session_global_instructions.pop(session_id, None)
+        _session_project_code.pop(session_id, None)
         _session_permission_mode.pop(session_id, None)
         _session_approval_mode.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
@@ -9562,6 +9570,7 @@ def create_runner_app(
         _run_turn_bg=_run_turn_bg,
         _sdk_compact_inprogress=_sdk_compact_inprogress,
         _session_cursor_model_names=_session_cursor_model_names,
+        _session_global_instructions=_session_global_instructions,
         _session_harness_name=_session_harness_name,
         _session_histories=_session_histories,
         _session_message_buffers=_session_message_buffers,

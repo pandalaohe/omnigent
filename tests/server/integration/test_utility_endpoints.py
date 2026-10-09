@@ -93,7 +93,9 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "harness_settings_ui": True,
-        "project_assignments": False,
+        # A deprecated no-op that always reports true: old web builds gate
+        # their collaboration tab on it.
+        "project_assignments": True,
         "session_peer_messaging": False,
     }
     # Compatibility field for frontend builds predating the nested map.

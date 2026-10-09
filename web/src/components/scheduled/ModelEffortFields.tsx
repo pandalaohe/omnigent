@@ -33,7 +33,7 @@ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
-import { sdkPermissionOptions } from "@/lib/sdkPermissionModes";
+import { normalizeSdkPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import { useHostModelOptions } from "@/hooks/useHosts";
 
 /** Sentinel Select value for "no permission override" (use the agent default).
@@ -172,7 +172,11 @@ export function ModelEffortFields({
       <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
         <Label htmlFor="task-permission">Permission mode</Label>
         <Select
-          value={permissionMode === "" ? PERMISSION_SELECT_DEFAULT : permissionMode}
+          value={
+            permissionMode === ""
+              ? PERMISSION_SELECT_DEFAULT
+              : normalizeSdkPermissionMode(harness, permissionMode)
+          }
           componentId="tasks.scheduled.permission_mode"
           valueHasNoPii
           onValueChange={(v) => onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v)}

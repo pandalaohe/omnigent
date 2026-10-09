@@ -68,7 +68,11 @@ def test_custom_update_dry_run_targets_fork_channel_and_preserves_extras(
     monkeypatch.setattr(cli_module, "IS_WINDOWS", is_windows)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
+    )
 
     result = CliRunner().invoke(cli, ["host", "update", "custom", "--dry-run"])
 
@@ -78,6 +82,37 @@ def test_custom_update_dry_run_targets_fork_channel_and_preserves_extras(
     assert "#egg=omnigent[all]" in result.output
     assert "Would run:" in result.output
     assert ("uv tool install --force --reinstall" in result.output) is is_windows
+
+
+def test_custom_update_dry_run_installs_resolved_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    source = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    old = "a" * 40
+    new = "b" * 40
+    monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
+    monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [source]},
+    )
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"{new}\trefs/heads/local/host-custom\n",
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "update", "custom", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Custom source: {source}@{new}" in result.output
 
 
 def test_custom_update_restarts_supervisor_after_install_failure(
@@ -90,7 +125,11 @@ def test_custom_update_restarts_supervisor_after_install_failure(
     new = "b" * 40
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
+    )
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -153,7 +192,11 @@ def test_custom_update_verifies_commit_and_host_reconnect(
     new = "b" * 40
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
+    )
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -192,19 +235,37 @@ def test_custom_update_verifies_commit_and_host_reconnect(
 
     assert result.exit_code == 0, result.output
     assert events == ["resume", "online:host-1"]
-    assert f"Updated custom Host: {old[:9]} → {new[:9]}" in result.output
+    assert (
+        f"Updated custom Host: {old[:9]} → {new[:9]} from {cli_module._CUSTOM_HOST_VCS_URL}"
+        in result.output
+    )
     assert "omni host update custom --rollback" in result.output
 
 
 def test_custom_update_rollback_uses_saved_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     import omnigent.cli as cli_module
 
+    source = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
     current = "b" * 40
     previous = "a" * 40
     captured: list[str] = []
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=current))
     monkeypatch.setattr(cli_module, "_read_custom_host_rollback", lambda: previous, raising=False)
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [source]},
+    )
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"{'c' * 40}\trefs/heads/local/host-custom\n",
+        ),
+    )
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -218,7 +279,54 @@ def test_custom_update_rollback_uses_saved_commit(monkeypatch: pytest.MonkeyPatc
     result = CliRunner().invoke(cli, ["host", "update", "custom", "--rollback", "--dry-run"])
 
     assert result.exit_code == 0, result.output
-    assert captured == [f"git+https://github.com/pandalaohe/omnigent.git@{previous}"]
+    assert captured == [f"{source}@{previous}"]
+
+
+def test_custom_update_rollback_does_not_fall_back_to_second_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    current = "b" * 40
+    previous = "a" * 40
+    calls: list[list[str]] = []
+    drained: list[bool] = []
+    paused: list[bool] = []
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="boom")
+
+    monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
+    monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=current))
+    monkeypatch.setattr(cli_module, "_read_custom_host_rollback", lambda: previous, raising=False)
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+    monkeypatch.setattr(
+        cli_module,
+        "_drain_custom_host_sessions",
+        lambda *_a, **_k: drained.append(True),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_pause_custom_host_supervisor",
+        lambda *_a, **_k: paused.append(True),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "update", "custom", "--rollback"])
+
+    assert result.exit_code != 0
+    assert "rollback uses only the first configured source" in result.output
+    assert drained == []
+    assert paused == []
+    assert len(calls) == 2
+    assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
 
 @pytest.mark.parametrize("extra_args", [[], ["--force"]])
@@ -242,7 +350,11 @@ def test_custom_update_refuses_to_pause_when_session_query_fails(
     paused: list[bool] = []
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
+    )
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -329,6 +441,79 @@ def test_custom_update_rejects_unknown_extras(monkeypatch: pytest.MonkeyPatch) -
     assert "extras cannot be preserved safely" in result.output
 
 
+def test_custom_host_sources_default_to_fork_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
+
+    assert cli_module._custom_host_source_urls() == [cli_module._CUSTOM_HOST_VCS_URL]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "git+https://fn.example.invalid/srv/git/omnigent.git",
+        [],
+        ["git+https://fn.example.invalid/srv/git/omnigent.git", 3],
+        [""],
+        ["git@fn.example.invalid:srv/git/omnigent.git"],
+        ["git@fn.example.invalid:omnigent.git"],
+        ["/srv/git/omnigent.git"],
+        ["file:///srv/git/omnigent.git"],
+        ["git+https://fn.example.invalid/srv/git/omnigent.git@main"],
+    ],
+)
+def test_custom_host_sources_reject_invalid_config(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": value},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_effective_global_config_path",
+        lambda: Path("/srv/git/omnigent/config.yaml"),
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._custom_host_source_urls()
+
+    message = str(excinfo.value)
+    assert "custom_host_sources" in message
+    assert "/srv/git/omnigent/config.yaml" in message
+    assert "without `@<ref>`" in message
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git+ssh://git@fn.example.invalid/srv/git/omnigent.git",
+        "ssh://git@fn.example.invalid/srv/git/omnigent.git",
+        "git+https://github.com/pandalaohe/omnigent.git",
+    ],
+)
+def test_custom_host_sources_accept_repository_urls(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [url]},
+    )
+
+    assert cli_module._custom_host_source_urls() == [url]
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -338,10 +523,57 @@ def test_custom_update_rejects_unknown_extras(monkeypatch: pytest.MonkeyPatch) -
         "git@github.com:pandalaohe/omnigent.git",
     ],
 )
-def test_custom_fork_url_detection_covers_supported_spellings(url: str) -> None:
+def test_custom_fork_url_detection_covers_supported_spellings(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
     import omnigent.cli as cli_module
 
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
+
     assert cli_module._is_custom_host_vcs_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git+ssh://git@fn.example.invalid/srv/git/omnigent.git",
+        "git+ssh://****@fn.example.invalid/srv/git/omnigent.git",
+        "git+ssh://fn.example.invalid/srv/git/omnigent",
+        "git@fn.example.invalid:srv/git/omnigent.git",
+        "git+https://github.com/pandalaohe/omnigent.git",
+        "git@github.com:pandalaohe/omnigent.git",
+    ],
+)
+def test_custom_fork_url_detection_includes_configured_source(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": ["git+ssh://git@fn.example.invalid/srv/git/omnigent.git"]},
+    )
+
+    assert cli_module._is_custom_host_vcs_url(url)
+
+
+def test_custom_fork_url_detection_rejects_other_repositories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": ["git+ssh://git@fn.example.invalid/srv/git/omnigent.git"]},
+    )
+
+    assert not cli_module._is_custom_host_vcs_url(
+        "git+https://github.com/omnigent-ai/omnigent.git"
+    )
 
 
 def test_custom_host_channel_lookup_retries_after_timeout(
@@ -369,9 +601,13 @@ def test_custom_host_channel_lookup_retries_after_timeout(
             raise outcome
         return outcome
 
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
     monkeypatch.setattr(cli_module.subprocess, "run", _run)
 
-    assert cli_module._resolve_custom_host_channel_head() == sha
+    assert cli_module._resolve_custom_host_channel_head() == (
+        cli_module._CUSTOM_HOST_VCS_URL,
+        sha,
+    )
     assert len(calls) == 2
 
 
@@ -386,6 +622,7 @@ def test_custom_host_channel_lookup_reports_timeout_after_retry(
         calls.append(1)
         raise subprocess.TimeoutExpired(cmd="git ls-remote", timeout=20.0)
 
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
     monkeypatch.setattr(cli_module.subprocess, "run", _run)
 
     with pytest.raises(click.ClickException) as excinfo:
@@ -415,6 +652,7 @@ def test_custom_host_channel_lookup_reports_git_failure_and_suppresses_hint(
             ),
         )
 
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
     monkeypatch.setattr(cli_module.subprocess, "run", _run)
 
     with pytest.raises(click.ClickException) as excinfo:
@@ -438,11 +676,191 @@ def test_custom_host_channel_lookup_names_missing_git(
         calls.append(1)
         raise FileNotFoundError("git")
 
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
     monkeypatch.setattr(cli_module.subprocess, "run", _run)
 
     with pytest.raises(click.ClickException, match="`git` was not found on PATH"):
         cli_module._resolve_custom_host_channel_head()
 
+    assert len(calls) == 1
+
+
+def test_custom_host_channel_lookup_falls_back_after_failed_source(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    sha = "d" * 40
+    calls: list[list[str]] = []
+    outcomes = iter(
+        [
+            subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="boom"),
+            subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="boom"),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{sha}\trefs/heads/local/host-custom\n",
+            ),
+        ]
+    )
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return next(outcomes)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    assert cli_module._resolve_custom_host_channel_head() == (second, sha)
+    assert calls[0] == [
+        "git",
+        "ls-remote",
+        "ssh://git@fn.example.invalid/srv/git/omnigent.git",
+        "local/host-custom",
+    ]
+    assert len(calls) == 3
+    stderr = capsys.readouterr().err
+    assert first in stderr
+    assert "status 128" in stderr
+    assert "boom" in stderr
+
+
+def test_custom_host_channel_lookup_without_fallback_tries_only_first_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    calls: list[list[str]] = []
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="boom")
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._resolve_custom_host_channel_head(allow_fallback=False)
+
+    message = str(excinfo.value)
+    assert "rollback uses only the first configured source" in message
+    assert first in message
+    assert second not in message
+    assert len(calls) == 2
+    assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
+
+
+def test_custom_host_channel_lookup_falls_back_when_branch_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    sha = "e" * 40
+    calls: list[list[str]] = []
+    outcomes = iter(
+        [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=""),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{sha}\trefs/heads/local/host-custom\n",
+            ),
+        ]
+    )
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return next(outcomes)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    assert cli_module._resolve_custom_host_channel_head() == (second, sha)
+    assert len(calls) == 2
+    stderr = capsys.readouterr().err
+    assert "the source has no 'local/host-custom' branch" in stderr
+
+
+def test_custom_host_channel_lookup_lists_every_failed_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    calls: list[int] = []
+
+    def _run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="unreachable"
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._resolve_custom_host_channel_head()
+
+    message = str(excinfo.value)
+    assert first in message
+    assert second in message
+    assert "unreachable" in message
+    assert getattr(excinfo.value, SUPPRESS_RECOVERY_HINT_ATTR) is True
+    assert len(calls) == 4
+
+
+def test_custom_host_channel_lookup_stops_when_git_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    calls: list[int] = []
+
+    def _run(*_args: object, **_kwargs: object) -> object:
+        calls.append(1)
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._resolve_custom_host_channel_head()
+
+    message = str(excinfo.value)
+    assert first in message
+    assert "`git` was not found on PATH" in message
+    assert second not in message
     assert len(calls) == 1
 
 
@@ -479,7 +897,11 @@ def test_custom_update_checks_supervisor_before_draining(
     drained: list[bool] = []
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
+    )
     monkeypatch.setattr(
         cli_module,
         "_build_upgrade_suggestion",
@@ -609,7 +1031,11 @@ def test_windows_custom_update_schedules_detached_helper(
     monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
     monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=old))
-    monkeypatch.setattr(cli_module, "_resolve_custom_host_channel_head", lambda: new)
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
+    )
     monkeypatch.setattr(cli_module, "_load_existing_host_id", lambda: "host-1")
     monkeypatch.setattr(cli_module, "_drain_custom_host_sessions", lambda *_a, **_k: None)
     monkeypatch.setattr(cli_module, "_custom_host_records", lambda _host_id: [])

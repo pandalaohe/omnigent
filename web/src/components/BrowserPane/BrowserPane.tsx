@@ -134,6 +134,8 @@ export function BrowserPane({
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  const designModeAttemptRef = useRef(0);
+  const [designModeError, setDesignModeError] = useState<string | null>(null);
 
   // Track existence through create/close events and a remount probe.
   // Host attach/detach events do not change whether the retained page exists.
@@ -250,14 +252,28 @@ export function BrowserPane({
   const handleToggleDesignMode = useCallback(() => {
     const bridge = getBridge();
     if (!bridge) return;
+    const attempt = ++designModeAttemptRef.current;
+    setDesignModeError(null);
     if (designMode) {
       designModeRef.current = false;
       void bridge.browserDisableDesignMode?.(conversationId);
       setDesignMode(false);
     } else {
       designModeRef.current = true;
-      void bridge.browserEnableDesignMode?.(conversationId);
       setDesignMode(true);
+      const enable = bridge.browserEnableDesignMode?.(conversationId);
+      if (!enable) return;
+      const revertEnable = () => {
+        if (attempt !== designModeAttemptRef.current || !designModeRef.current) return;
+        designModeRef.current = false;
+        setDesignMode(false);
+        setDesignModeError("Design mode couldn't start on this page.");
+      };
+      void enable
+        .then((result) => {
+          if (result?.ok === false) revertEnable();
+        })
+        .catch(revertEnable);
     }
   }, [conversationId, designMode]);
 
@@ -496,6 +512,11 @@ export function BrowserPane({
       {navigationError && (
         <div role="alert" className="px-2 py-1 text-destructive text-xs">
           {navigationError}
+        </div>
+      )}
+      {designModeError && (
+        <div role="alert" className="px-2 py-1 text-destructive text-xs">
+          {designModeError}
         </div>
       )}
       {hasView ? (

@@ -175,6 +175,10 @@ class NativeServerHarness(Executor):
             prompt = _with_model(prompt, config.model)
         error_msg: str | None = None
         async with self._inject_lock:
+            # Resolve the session id first: the gate reads bridge state (the
+            # session instructions file), so it must be judged against the
+            # server this turn will actually reach, not a stale pre-relaunch one.
+            session_id = await self._await_session_id()
             gated_system_prompt = self._gate_system_prompt(system_prompt)
             # Cache-then-clear on every normal turn, even when None, so a
             # later instruction-free turn can't leave a stale prior value
@@ -182,7 +186,6 @@ class NativeServerHarness(Executor):
             self._last_system_prompt = gated_system_prompt
             if gated_system_prompt is not None:
                 prompt = _with_system_prompt(prompt, gated_system_prompt)
-            session_id = await self._await_session_id()
             if session_id is None:
                 error_msg = f"{self._harness_id} bridge state is missing"
             else:

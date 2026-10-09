@@ -177,6 +177,10 @@ _POLICY_HOOK_MODULE = "omnigent.harnesses.codex_native.hook"
 # gate. Held at a day so the server-side ``ask_timeout`` is the single cap,
 # mirroring claude-native's ``PermissionRequest`` hook (``timeout: 86400``).
 _POLICY_HOOK_TIMEOUT_SECONDS = 86400
+# Codex copies a handler's ``statusMessage`` into ``hook/completed``
+# ``run.statusMessage``; that is how the forwarder tells the observer's run
+# from the policy hook's.
+CODEX_TOOL_OBSERVER_STATUS_MESSAGE = "Omnigent tool observer"
 # Hook trust statuses that allow a hook to execute (see codex
 # ``hook_trust_status``). Anything else means the hook is silently
 # skipped — which for a policy gate is a fail-open we must reject.
@@ -2880,6 +2884,7 @@ def _codex_policy_hooks_settings(
     from omnigent.native.tool_observer_hook import hook_settings
 
     observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
+    observer["statusMessage"] = CODEX_TOOL_OBSERVER_STATUS_MESSAGE
     prompt_submit: list[_JsonObject] = [hook]
     if turn_routing:
         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))

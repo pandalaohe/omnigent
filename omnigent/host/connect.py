@@ -80,6 +80,8 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFolderFactsFrame,
+    HostFolderFactsResultFrame,
     HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
@@ -138,6 +140,7 @@ from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
     list_worktrees,
+    read_folder_facts,
     remove_worktree,
 )
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
@@ -3984,6 +3987,49 @@ class HostProcess:
             ],
         )
 
+    async def _handle_folder_facts(
+        self,
+        frame: HostFolderFactsFrame,
+    ) -> HostFolderFactsResultFrame:
+        """Handle a ``host.folder_facts`` request from the server.
+
+        Runs the blocking git reads in a worker thread so the tunnel loop
+        keeps servicing pings. The result carries the facts plus whether a
+        host setup command is configured — never the command itself.
+
+        :param frame: The folder-facts request frame.
+        :returns: Result frame with the facts, or ``status: "failed"`` with
+            an error message when the read crashed unexpectedly.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_list_worktrees above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                facts = await asyncio.to_thread(read_folder_facts, frame.path)
+                configured = await asyncio.to_thread(self._post_bind_hook_runner.configured)
+        except Exception as exc:
+            _logger.exception("Folder facts read crashed for %r", frame.path)
+            return HostFolderFactsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"folder facts read crashed: {exc}",
+            )
+        return HostFolderFactsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            exists=facts.exists,
+            is_dir=facts.is_dir,
+            is_repo=facts.is_repo,
+            toplevel=facts.toplevel,
+            branch=facts.branch,
+            head=facts.head,
+            detached=facts.detached,
+            dirty=facts.dirty,
+            remotes=facts.remotes,
+            setup_command_configured=configured,
+            error=facts.error,
+        )
+
     async def _handle_post_bind_hook(
         self,
         frame: HostPostBindHookFrame,
@@ -4805,6 +4851,7 @@ class HostProcess:
             codex_rate_limits=self._codex_rate_limits,
             filesystem_roots=True,
             post_bind_hook=True,
+            project_code=True,
             capabilities=list(HOST_CAPABILITIES),
         )
         try:
@@ -5305,6 +5352,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostFolderFactsFrame):
+            await ws.send(encode_host_frame(await self._handle_folder_facts(frame)))
 
         elif isinstance(frame, HostPostBindHookFrame):
             await ws.send(encode_host_frame(await self._handle_post_bind_hook(frame)))

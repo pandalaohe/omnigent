@@ -14,6 +14,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     OpenCodeNativeBridgeState,
     write_bridge_state,
+    write_session_instructions,
 )
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.inner.executor import ExecutorError, TurnComplete
@@ -274,6 +275,69 @@ async def test_enqueue_before_any_normal_turn_omits_system(
     assert await executor.enqueue_session_message("k", "steer me") is True
     prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
     assert "system" not in prompt_reqs[0][2]
+
+
+async def test_run_turn_omits_system_matching_session_instructions(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn whose system prompt equals the session file text sends no system field."""
+    _seed_state(tmp_path)
+    write_session_instructions(tmp_path, "Session text.")
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run_with_system_prompt(executor, "hello", "Session text.")
+    assert [type(e) for e in events] == [TurnComplete]
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert "system" not in prompt_reqs[0][2]
+
+
+async def test_run_turn_sends_system_when_it_differs_from_session_instructions(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different system prompt is sent whole even with a session file present."""
+    _seed_state(tmp_path)
+    write_session_instructions(tmp_path, "Session text.")
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run_with_system_prompt(executor, "hello", "Different text.")
+    assert [type(e) for e in events] == [TurnComplete]
+    assert _prompt_system_fields(fake_server) == ["Different text."]
+
+
+async def test_run_turn_gates_against_the_server_the_turn_reaches(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The omission is decided against the bridge the turn actually reaches.
+
+    A relaunch clears bridge state and rewrites the session instructions file;
+    resolving the session id first means a turn gated against the old file
+    still sends its ``system`` when the file the target server loads differs.
+    """
+    _seed_state(tmp_path)
+    write_session_instructions(tmp_path, "A")
+    executor = _executor(tmp_path, monkeypatch)
+    real_resolve = executor._resolve_session_id
+
+    async def _resolve_after_rewrite() -> str | None:
+        write_session_instructions(tmp_path, "B")
+        return await real_resolve()
+
+    executor._resolve_session_id = _resolve_after_rewrite
+
+    events = await _run_with_system_prompt(executor, "hello", "A")
+    assert [type(e) for e in events] == [TurnComplete]
+    assert _prompt_system_fields(fake_server) == ["A"]
+
+
+async def test_enqueue_after_matching_session_instructions_omits_system(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An enqueue after a session-matching turn sends no system field."""
+    _seed_state(tmp_path)
+    write_session_instructions(tmp_path, "Session text.")
+    executor = _executor(tmp_path, monkeypatch)
+    await _run_with_system_prompt(executor, "hello", "Session text.")
+    assert await executor.enqueue_session_message("k", "steer me") is True
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert "system" not in prompt_reqs[-1][2]
 
 
 async def test_enqueue_after_normal_turn_reuses_cached_system(

@@ -1,8 +1,9 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
-import type { ElicitationBlock } from "@/lib/blocks";
+import { CodeBlockSendContext } from "@/components/ai-elements/message";
+import type { AnyBlock, BlockContext, ElicitationBlock } from "@/lib/blocks";
 import { MemoryRouter } from "react-router-dom";
 import { useChatStore } from "@/store/chatStore";
 import type { Virtualizer } from "@tanstack/react-virtual";
@@ -18,9 +19,18 @@ vi.mock("@/hooks/useArcaShutdownBanner", () => ({
   useArcaShutdownBanner: () => ({ showForHost: () => false }),
 }));
 
+// Module-scope so the provider value is stable (jsx-no-constructed-context-values).
+const sendCodeBlock = vi.fn(() => true);
+
 afterEach(() => {
   cleanup();
-  useChatStore.setState({ blocks: [], conversationId: null, sessionStatus: "idle" });
+  useChatStore.setState({
+    blocks: [],
+    conversationId: null,
+    sessionStatus: "idle",
+    status: "idle",
+    backgroundTaskCount: 0,
+  });
 });
 
 const bubble: Extract<Bubble, { kind: "user" }> = {
@@ -250,6 +260,125 @@ function renderTranscript(blocks: ElicitationBlock[]) {
     </MemoryRouter>,
   );
 }
+
+function blockCtx(overrides: Partial<BlockContext> = {}): BlockContext {
+  return {
+    agent: "test",
+    depth: 0,
+    turn: 0,
+    timestamp: 0,
+    responseId: "resp_settled",
+    itemId: null,
+    ...overrides,
+  };
+}
+
+// One settled turn: a tool run then a reply ending in a fenced block. Built
+// from block shapes only so the walker derives lifecycle "completed".
+const settledTurnBlocks: AnyBlock[] = [
+  {
+    type: "user_message",
+    ctx: blockCtx({ itemId: "user-1" }),
+    content: [{ type: "input_text", text: "do it" }],
+  },
+  {
+    type: "response_start",
+    ctx: blockCtx(),
+    model: "test",
+    responseId: "resp_settled",
+    conversationId: "conv-test",
+  },
+  {
+    type: "tool_group",
+    ctx: blockCtx({ itemId: "tool-1" }),
+    executions: [
+      {
+        name: "Bash",
+        arguments: {},
+        argsSummary: "",
+        callId: "call_1",
+        agentName: "test",
+        executedBy: "server",
+        output: null,
+      },
+    ],
+    iteration: 0,
+  },
+  {
+    type: "tool_result",
+    ctx: blockCtx({ itemId: "result-1" }),
+    name: "Bash",
+    callId: "call_1",
+    agentName: "test",
+    output: "ok",
+  },
+  {
+    type: "text_done",
+    ctx: blockCtx({ itemId: "text-1" }),
+    fullText: "Reply with:\n\n```\nok\n```\n",
+    hasCodeBlocks: true,
+  },
+  {
+    type: "response_end",
+    ctx: blockCtx(),
+    status: "completed",
+    response: null,
+  },
+];
+
+function renderSettledTurn(opts: {
+  sessionStatus: "idle" | "running" | "waiting";
+  status: "idle" | "streaming";
+}) {
+  useChatStore.setState({
+    blocks: settledTurnBlocks,
+    conversationId: "conv-test",
+    sessionStatus: opts.sessionStatus,
+    status: opts.status,
+    backgroundTaskCount: 1,
+  });
+  const view = render(
+    <MemoryRouter>
+      <CodeBlockSendContext.Provider value={sendCodeBlock}>
+        <Transcript
+          hostId={null}
+          setConversationEl={vi.fn()}
+          containerEl={null}
+          scroller={null}
+          setScroller={vi.fn()}
+          sendScrollNonce={0}
+          hasMoreHistory={false}
+          loadingMoreHistory={false}
+          isMobileViewport
+          showsWorking
+          agentsError={null}
+          sandboxLaunching={false}
+          conversationId="conv-test"
+          scrollToBottomOnSessionOpen={false}
+          openedConversationIdRef={{ current: null }}
+          spacerMeasureRef={{ current: null }}
+        />
+      </CodeBlockSendContext.Provider>
+    </MemoryRouter>,
+  );
+  // Native find disables virtualization, so every bubble mounts for inspection.
+  fireEvent.keyDown(window, { key: "f", metaKey: true });
+  return view;
+}
+
+it("keeps a settled last reply settled while only background shells run", async () => {
+  renderSettledTurn({ sessionStatus: "idle", status: "idle" });
+
+  await screen.findByRole("button", { name: "Send as message" });
+  expect(screen.getByRole("button", { name: /^Worked/ })).toBeInTheDocument();
+});
+
+it("keeps the live edge on the last reply while the turn is active", async () => {
+  renderSettledTurn({ sessionStatus: "waiting", status: "idle" });
+
+  await screen.findByRole("button", { name: "Toggle word wrap" });
+  expect(screen.queryByRole("button", { name: "Send as message" })).toBeNull();
+});
 
 it("keeps the pending elicitation card after the working indicator", () => {
   renderTranscript([pendingElicitation]);

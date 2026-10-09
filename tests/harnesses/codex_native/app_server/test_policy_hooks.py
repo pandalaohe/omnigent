@@ -550,6 +550,28 @@ def test_policy_hooks_timeout_outlasts_the_hooks_request_budget() -> None:
     assert _POLICY_HOOK_TIMEOUT_SECONDS >= _EVALUATE_POLICY_TIMEOUT_S
 
 
+def test_post_tool_use_marks_the_observer_and_gives_it_its_own_timeout() -> None:
+    """
+    The PostToolUse tool observer is marked and no longer capped at 3s.
+
+    Measured on the target machine: importing the hook module costs ~3s
+    under load, so the old 3s observer budget turned every successful tool
+    call into a red "hook timed out" card. The observer must carry the
+    statusMessage marker the forwarder uses to soften its notices, and
+    enough timeout that a slow interpreter start is not a hook failure.
+    """
+    from omnigent.harnesses.codex_native.app_server import CODEX_TOOL_OBSERVER_STATUS_MESSAGE
+
+    settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
+    policy, observer = settings["hooks"]["PostToolUse"][0]["hooks"]
+    # The policy gate is first and unchanged — same timeout, no marker.
+    assert policy["timeout"] == _POLICY_HOOK_TIMEOUT_SECONDS
+    assert "statusMessage" not in policy
+    assert "observe-tool" in observer["command"]
+    assert observer["statusMessage"] == CODEX_TOOL_OBSERVER_STATUS_MESSAGE
+    assert observer["timeout"] >= 10
+
+
 def test_policy_hooks_register_user_prompt_submit() -> None:
     """The request-phase gate must be wired onto UserPromptSubmit.
 

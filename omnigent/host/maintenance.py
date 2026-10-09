@@ -755,6 +755,11 @@ class HostMaintenanceJanitor:
 
             return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
 
+        async def _reap_codex_homes() -> object:
+            from omnigent.inner.codex_staging import reap_orphaned_codex_homes
+
+            return await _run_sync_stage(reap_orphaned_codex_homes)
+
         async def _retain_runner_logs() -> object:
             live_paths = (
                 tuple(live_runner_log_paths()) if live_runner_log_paths is not None else ()
@@ -771,6 +776,7 @@ class HostMaintenanceJanitor:
                 ("codex_process_registry", _reconcile_codex_processes),
                 ("terminal_orphans", _reap_terminals),
                 ("native_bridge_orphans", _reap_native_bridge_dirs),
+                ("codex_home_orphans", _reap_codex_homes),
                 ("runner_log_retention", _retain_runner_logs),
             ),
             lock_path=data_dir().resolve() / "locks" / "host-maintenance.lock",

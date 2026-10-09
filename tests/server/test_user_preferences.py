@@ -157,6 +157,25 @@ def test_store_merges_one_namespace_and_keeps_users_isolated(db_uri: str) -> Non
         store.patch_namespace("alice@example.com", "not_allowed", {})
 
 
+def test_store_patch_namespace_round_trips_sound_alerts(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    value = {
+        "levels": {
+            "done": {"enabled": True, "sound": "chime"},
+            "error": {"enabled": False, "sound": "alert"},
+            "needs_response": {"enabled": True, "sound": "ping"},
+        },
+        "quietHours": {"enabled": True, "start": "23:00", "end": "08:00"},
+        "primaryDeviceId": None,
+        "mutedSessionIds": ["conv_a", "conv_b"],
+    }
+
+    merged = store.patch_namespace("alice@example.com", "sound_alerts", value)
+
+    assert merged["settings"]["sound_alerts"] == value
+    assert store.get("alice@example.com") == merged
+
+
 def test_store_patches_of_sibling_namespaces_merge_across_instances(db_uri: str) -> None:
     """Two stores patching different namespaces: the second envelope has both."""
     first = SqlAlchemyUserPreferencesStore(db_uri)

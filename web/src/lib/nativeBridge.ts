@@ -233,6 +233,31 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+
+  /**
+   * List this machine's built-in alert sounds (names without extension).
+   * Optional: a shell older than the sound-alert bridge lacks it, and callers
+   * then offer only the synthesized built-in sounds.
+   */
+  listSystemSounds?: () => Promise<string[]>;
+  /**
+   * Play one built-in sound at 0..1 volume. Resolves `{played}` on macOS or
+   * `{bytes}` (a WAV body) on Windows; `{played: false}` elsewhere.
+   */
+  playSystemSound?: (name: string, volume: number) => Promise<NativeSystemSoundPlayback>;
+  /** Announce whether the web app's own sound alerts are live. */
+  setSoundAlertsActive?: (active: boolean) => void;
+  /** The legacy shell notification-sound setting, for one-time migration. */
+  getLegacyNotificationSound?: () => Promise<LegacyNotificationSound | null>;
+}
+
+/** Outcome of {@link playNativeSystemSound}: played here, or bytes to decode. */
+export type NativeSystemSoundPlayback = { played: boolean } | { bytes: Uint8Array };
+
+/** The shell's old Notification-menu sound setting; null fields when unset. */
+export interface LegacyNotificationSound {
+  enabled: boolean | null;
+  name: string | null;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -640,6 +665,76 @@ export async function nativeNotify({
     // broken bridge is visible instead of silently dropping notifications.
     console.warn("[nativeBridge] native notify failed:", err);
     return false;
+  }
+}
+
+/**
+ * Names of the desktop shell's built-in alert sounds. Resolves `[]` outside
+ * Electron, under a shell too old to expose the bridge, or on any failure, so
+ * callers always get a list.
+ */
+export async function listNativeSystemSounds(): Promise<string[]> {
+  const electron = electronApi();
+  if (!electron?.listSystemSounds) return [];
+  try {
+    const names = await electron.listSystemSounds();
+    return Array.isArray(names)
+      ? names.filter((name): name is string => typeof name === "string")
+      : [];
+  } catch (err) {
+    console.warn("[nativeBridge] listSystemSounds failed:", err);
+    return [];
+  }
+}
+
+/**
+ * Ask the desktop shell to play one built-in sound at `volume`. Resolves
+ * `{played: false}` outside Electron, under an older shell, or on any failure,
+ * so the caller falls back to a synthesized built-in sound. On Windows the
+ * shell returns the WAV bytes for the renderer to decode and play.
+ */
+export async function playNativeSystemSound(
+  name: string,
+  volume: number,
+): Promise<NativeSystemSoundPlayback> {
+  const electron = electronApi();
+  if (!electron?.playSystemSound) return { played: false };
+  try {
+    return await electron.playSystemSound(name, volume);
+  } catch (err) {
+    console.warn("[nativeBridge] playSystemSound failed:", err);
+    return { played: false };
+  }
+}
+
+/**
+ * Tell the desktop shell whether the web app's own sound alerts are live, so
+ * its legacy notification sound stops doubling up. No-op outside Electron or
+ * under a shell that predates the bridge. Fire-and-forget.
+ */
+export function setNativeSoundAlertsActive(active: boolean): void {
+  const electron = electronApi();
+  if (!electron?.setSoundAlertsActive) return;
+  try {
+    electron.setSoundAlertsActive(active);
+  } catch (err) {
+    console.warn("[nativeBridge] setSoundAlertsActive failed:", err);
+  }
+}
+
+/**
+ * The shell's legacy notification-sound setting, or null outside Electron /
+ * under an older shell / on failure. Read once to migrate into device-local
+ * alert preferences.
+ */
+export async function getLegacyNativeNotificationSound(): Promise<LegacyNotificationSound | null> {
+  const electron = electronApi();
+  if (!electron?.getLegacyNotificationSound) return null;
+  try {
+    return await electron.getLegacyNotificationSound();
+  } catch (err) {
+    console.warn("[nativeBridge] getLegacyNotificationSound failed:", err);
+    return null;
   }
 }
 

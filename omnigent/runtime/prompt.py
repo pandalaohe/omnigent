@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.entities import (
     ConversationItem,
@@ -21,6 +21,9 @@ from omnigent.runtime.tool_result_replay import (
     strip_unparseable_image_output,
 )
 from omnigent.spec import AgentSpec, spec_dispatches_subagents
+
+if TYPE_CHECKING:
+    from omnigent.runner.session_init_protocol import ProjectCodeLocation
 
 PEER_SESSION_GRANT: str = (
     "Peer messages: another Omnigent session may message you; it arrives as a "
@@ -351,29 +354,68 @@ def worktree_instruction(workspace: str | None, worktree: str | None) -> str | N
     )
 
 
+def project_code_instruction(
+    locations: Sequence[ProjectCodeLocation] | None,
+) -> str | None:
+    """The block naming this host's project repositories, or ``None``.
+
+    One line per location recalls the folder the code lives in and, when a
+    remote is registered, the shared git URL; the code repository also
+    names its default branch. Folder, URL and branch are JSON-quoted so
+    punctuation or newlines cannot break out of a line. No
+    locations contribute nothing, leaving the composed text unchanged.
+
+    :param locations: This host's repositories, code repository first, or
+        ``None``/empty when the project has none on this host.
+    :returns: The composed block, or ``None`` when no line applies.
+    """
+    if not locations:
+        return None
+    lines = ["This project's code on this host:"]
+    for location in locations:
+        role_note = "the code you change" if location.role == "code" else "related code"
+        folder = json.dumps(location.folder, ensure_ascii=False)
+        line = f"- {location.name} ({role_note}): {folder}"
+        if location.remote_url:
+            remote = json.dumps(location.remote_url, ensure_ascii=False)
+            line += f" — git {remote}"
+        if location.role == "code" and location.default_branch:
+            branch = json.dumps(location.default_branch, ensure_ascii=False)
+            line += f", default branch {branch}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def session_startup_extras(
     global_instructions: str | None,
     *,
     workspace: str | None,
     worktree: str | None,
+    project_code: Sequence[ProjectCodeLocation] | None = None,
 ) -> str | None:
-    """Compose a session's startup extras: the worktree line, then global text.
+    """Compose a session's startup extras: worktree line, code, global text.
 
     The worktree line lands after the framework instructions and before the
-    server-held global text (author → framework → worktree → global), so the
-    global text stays last wherever the composed text is delivered. Blank
-    global text means "off" and contributes no empty entry.
+    project code block and the server-held global text (author → framework
+    → worktree → project code → global), so the global text stays last
+    wherever the composed text is delivered. Blank global text means "off"
+    and contributes no empty entry; no project code contributes nothing.
 
     :param global_instructions: The server-held global instructions text, or
         ``None``/blank when the admin has none set.
     :param workspace: The session's launch directory, from its init snapshot.
     :param worktree: The session's recorded git working tree, or ``None``.
-    :returns: The composed text, or ``None`` when neither part applies.
+    :param project_code: This host's project repositories from the init
+        snapshot, or ``None``/empty when the project has none here.
+    :returns: The composed text, or ``None`` when no part applies.
     """
     parts: list[str] = []
     worktree_line = worktree_instruction(workspace, worktree)
     if worktree_line:
         parts.append(worktree_line)
+    code_block = project_code_instruction(project_code)
+    if code_block:
+        parts.append(code_block)
     if global_instructions and global_instructions.strip():
         parts.append(global_instructions)
     return "\n\n".join(parts) if parts else None

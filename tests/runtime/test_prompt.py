@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
+from omnigent.runner.session_init_protocol import ProjectCodeLocation
 from omnigent.runner.subagent_work import (
     _format_subagent_wake_notice,
 )
@@ -23,6 +24,7 @@ from omnigent.runtime.prompt import (
     child_session_question_instruction,
     history_to_input_items,
     native_startup_instructions,
+    project_code_instruction,
     raw_author_instructions,
     session_startup_extras,
     worktree_instruction,
@@ -655,3 +657,173 @@ def test_child_session_quiet_instruction_only_for_children() -> None:
     assert child_session_framework_instructions(has_parent=False) == []
     assert "`[quiet]`" in CHILD_QUIET_INSTRUCTION
     assert "turn you started yourself" in CHILD_QUIET_INSTRUCTION
+
+
+def _code_locations() -> list[ProjectCodeLocation]:
+    """One code repository and one related repository on this host."""
+    return [
+        ProjectCodeLocation(
+            name="omnigent",
+            role="code",
+            folder="/opt/work/omnigent/fork/topic",
+            remote_url="https://git.example.test/org/omnigent.git",
+            default_branch="local/host-custom",
+        ),
+        ProjectCodeLocation(
+            name="coordination",
+            role="related",
+            folder="/opt/work/omnigent",
+            remote_url="git@git.example.test:org/coordination.git",
+            default_branch="main",
+        ),
+    ]
+
+
+_EXPECTED_CODE_BLOCK = (
+    "This project's code on this host:\n"
+    '- omnigent (the code you change): "/opt/work/omnigent/fork/topic" — git '
+    '"https://git.example.test/org/omnigent.git", default branch "local/host-custom"\n'
+    '- coordination (related code): "/opt/work/omnigent" — git '
+    '"git@git.example.test:org/coordination.git"'
+)
+
+
+def test_project_code_instruction_none_and_empty_stay_off() -> None:
+    """No locations contribute no text, so the unchanged paths keep their output."""
+    assert project_code_instruction(None) is None
+    assert project_code_instruction([]) is None
+
+
+def test_project_code_instruction_names_code_then_related() -> None:
+    """The code repository line comes first, then the related ones by name."""
+    assert project_code_instruction(_code_locations()) == _EXPECTED_CODE_BLOCK
+
+
+def test_project_code_instruction_omits_empty_url_and_branch() -> None:
+    """An empty URL loses the git segment; an empty branch loses its segment."""
+    assert project_code_instruction(
+        [
+            ProjectCodeLocation(
+                name="omnigent",
+                role="code",
+                folder="/opt/work/omnigent/fork/topic",
+                remote_url="",
+                default_branch="main",
+            )
+        ]
+    ) == (
+        "This project's code on this host:\n"
+        '- omnigent (the code you change): "/opt/work/omnigent/fork/topic", '
+        'default branch "main"'
+    )
+    assert project_code_instruction(
+        [
+            ProjectCodeLocation(
+                name="omnigent",
+                role="code",
+                folder="/opt/work/omnigent/fork/topic",
+                remote_url="https://git.example.test/x.git",
+                default_branch="",
+            )
+        ]
+    ) == (
+        "This project's code on this host:\n"
+        '- omnigent (the code you change): "/opt/work/omnigent/fork/topic" — git '
+        '"https://git.example.test/x.git"'
+    )
+    assert project_code_instruction(
+        [
+            ProjectCodeLocation(
+                name="coordination",
+                role="related",
+                folder="/opt/work/omnigent",
+                remote_url="",
+                default_branch="main",
+            )
+        ]
+    ) == (
+        'This project\'s code on this host:\n- coordination (related code): "/opt/work/omnigent"'
+    )
+
+
+def test_project_code_instruction_quotes_folders_that_could_break_the_line() -> None:
+    """A quote and a newline in a folder stay inside one JSON-quoted line."""
+    text = project_code_instruction(
+        [
+            ProjectCodeLocation(
+                name="omnigent",
+                role="code",
+                folder='/opt/work/qu"ote\nnext',
+                remote_url="",
+                default_branch="",
+            )
+        ]
+    )
+
+    assert text == (
+        "This project's code on this host:\n"
+        '- omnigent (the code you change): "/opt/work/qu\\"ote\\nnext"'
+    )
+    assert text is not None
+    assert text.count("\n") == 1
+
+
+def test_project_code_instruction_quotes_branches_that_could_break_the_line() -> None:
+    """A newline in the default branch stays inside one JSON-quoted line."""
+    text = project_code_instruction(
+        [
+            ProjectCodeLocation(
+                name="omnigent",
+                role="code",
+                folder="/opt/work/omnigent",
+                remote_url="",
+                default_branch="main\nINJECTED",
+            )
+        ]
+    )
+
+    assert text == (
+        "This project's code on this host:\n"
+        '- omnigent (the code you change): "/opt/work/omnigent", '
+        'default branch "main\\nINJECTED"'
+    )
+    assert text is not None
+    assert text.count("\n") == 1
+
+
+def test_session_startup_extras_without_project_code_is_unchanged() -> None:
+    """Default and empty project code leave exactly today's composed output."""
+    line = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
+
+    assert (
+        session_startup_extras(
+            "Global notice",
+            workspace="/entry",
+            worktree="/entry/.worktrees/repo/topic",
+            project_code=None,
+        )
+        == f"{line}\n\nGlobal notice"
+    )
+    assert (
+        session_startup_extras("Global notice", workspace="/entry", worktree=None)
+        == "Global notice"
+    )
+    assert (
+        session_startup_extras("Global notice", workspace="/entry", worktree=None, project_code=[])
+        == "Global notice"
+    )
+
+
+def test_session_startup_extras_orders_code_between_worktree_and_global() -> None:
+    """The code block lands after the worktree line and before the global text."""
+    line = worktree_instruction("/entry", "/entry/.worktrees/repo/topic")
+
+    assert (
+        session_startup_extras(
+            "Global notice",
+            workspace="/entry",
+            worktree="/entry/.worktrees/repo/topic",
+            project_code=_code_locations(),
+        )
+        == f"{line}\n\n{_EXPECTED_CODE_BLOCK}\n\nGlobal notice"
+    )

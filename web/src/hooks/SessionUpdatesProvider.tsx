@@ -421,6 +421,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       switch (frame.type) {
         case "heartbeat":
           return;
+        case "sound_alert":
+          // The sound-alert hook subscribes to the socket on its own; nothing
+          // in the session-list cache reacts to a delivered alert.
+          return;
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
           void queryClient.invalidateQueries({ queryKey: ["session-agent"] });

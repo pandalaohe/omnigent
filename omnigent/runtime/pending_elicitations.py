@@ -273,6 +273,32 @@ def counts_for(conversation_ids: list[str]) -> dict[str, int]:
         }
 
 
+def latest_ids_for(conversation_ids: list[str]) -> dict[str, str]:
+    """
+    Batch lookup of the most recently inserted outstanding elicitation id
+    per session.
+
+    The inner dict preserves insertion order, so its last key is the
+    newest prompt. Used to build the sidebar's opaque
+    ``pending_elicitation_key``: that key must change when a new prompt
+    appears and stay stable otherwise, which a row's ``updated_at``
+    cannot express (it does not move when a pending count changes, nor
+    for a child's prompt).
+
+    :param conversation_ids: Conversation/session ids to query,
+        e.g. ``["conv_abc123", "conv_def456"]``.
+    :returns: Mapping from each id with at least one outstanding
+        prompt to its most recently inserted elicitation id. Ids with
+        none are absent.
+    """
+    with _lock:
+        return {
+            conv_id: next(reversed(ids))
+            for conv_id in conversation_ids
+            if (ids := _pending.get(conv_id))
+        }
+
+
 def pending_session_ids() -> list[str]:
     """
     Return ids of every session with at least one outstanding elicitation.

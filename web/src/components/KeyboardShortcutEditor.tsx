@@ -18,10 +18,13 @@ import {
   deleteShortcutPlatformOverride,
   findShortcutConflicts,
   isShortcutActionEnabled,
+  macWindowsKeyPositionNotes,
   readKeyboardShortcutPreferences,
+  readMacWindowsKeyPositions,
   shortcutBindingLabels,
   shortcutChordFromEvent,
   setShortcutRecordingActive,
+  writeMacWindowsKeyPositions,
   writeShortcutPreference,
   type ShortcutActionId,
   type ShortcutChord,
@@ -120,8 +123,10 @@ export function KeyboardShortcutEditor() {
     }),
     [],
   );
-  const defaultsFor = (actionId: ShortcutActionId) =>
-    defaultShortcutBindings(actionId, defaultContext);
+  const defaultsFor = (
+    actionId: ShortcutActionId,
+    platform: ShortcutPlatform = currentShortcutPlatform(),
+  ) => defaultShortcutBindings(actionId, defaultContext, platform);
 
   const startRecording = (target: RecordingTarget) => {
     setError(null);
@@ -235,7 +240,7 @@ export function KeyboardShortcutEditor() {
       ...current,
       platformOverrides: {
         ...current.platformOverrides,
-        [platform]: current.common ?? defaultsFor(actionId),
+        [platform]: current.common ?? defaultsFor(actionId, platform),
       },
     });
     setError(null);
@@ -254,7 +259,7 @@ export function KeyboardShortcutEditor() {
       ...current,
       platformOverrides: {
         ...current.platformOverrides,
-        [platform]: defaultsFor(actionId),
+        [platform]: defaultsFor(actionId, platform),
       },
     });
     setError(null);
@@ -275,6 +280,22 @@ export function KeyboardShortcutEditor() {
         >
           {error}
         </p>
+      ) : null}
+      {currentShortcutPlatform() === "macos" ? (
+        <div className="mb-4 flex items-center gap-3 rounded-xl border border-border bg-card px-3 py-2">
+          <span className="min-w-0 flex-1">
+            <span className="block text-ui text-foreground">Use Windows key positions</span>
+            <span className="block text-xs text-muted-foreground">
+              Default shortcuts use ⌘ where Windows uses Alt, and ⌃ where Windows uses Ctrl.
+              Shortcuts you record yourself stay as recorded.
+            </span>
+          </span>
+          <Switch
+            checked={readMacWindowsKeyPositions()}
+            onCheckedChange={(checked) => writeMacWindowsKeyPositions(checked)}
+            aria-label="Use Windows key positions"
+          />
+        </div>
       ) : null}
       {GROUPS.map((group) => (
         <section key={group.id} className="mb-5 last:mb-0">
@@ -306,6 +327,13 @@ export function KeyboardShortcutEditor() {
                           {definition.note}
                         </span>
                       ) : null}
+                      {!actionPreference?.common && !platformOverrides.macos
+                        ? macWindowsKeyPositionNotes(definition.id, defaultContext).map((note) => (
+                            <span key={note} className="block text-xs text-muted-foreground">
+                              {note}
+                            </span>
+                          ))
+                        : null}
                     </span>
                     <Switch
                       checked={enabled}
@@ -371,7 +399,10 @@ export function KeyboardShortcutEditor() {
                         <ShortcutBindingButton
                           actionId={definition.id}
                           platform={platform.id}
-                          bindings={platformOverrides[platform.id] ?? defaultsFor(definition.id)}
+                          bindings={
+                            platformOverrides[platform.id] ??
+                            defaultsFor(definition.id, platform.id)
+                          }
                           recording={
                             recording?.actionId === definition.id &&
                             recording.platform === platform.id

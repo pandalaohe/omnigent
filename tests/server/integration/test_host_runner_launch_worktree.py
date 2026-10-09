@@ -54,6 +54,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_repository_store.sqlalchemy_store import (
+    SqlAlchemyProjectRepositoryStore,
+)
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import create_test_agent
 
@@ -976,6 +979,42 @@ async def test_launch_runner_sends_the_entry_even_outside_it(
     assert len(cap.create) == 1
     assert cap.create[0].repo_path == _SOURCE_REPO
     assert cap.create[0].entry == _ENTRY
+
+
+@pytest.mark.parametrize(
+    ("base_branch", "expected_base"),
+    [(None, "release"), ("topic/base", "topic/base")],
+)
+async def test_launch_runner_new_branch_base_falls_back_to_code_repository(
+    app: FastAPI,
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    base_branch: str | None,
+    expected_base: str,
+) -> None:
+    """A project launch's new branch forks from its code repo default; explicit wins."""
+    cap = register_host()
+    SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Code project", None)
+    repositories = SqlAlchemyProjectRepositoryStore(db_uri)
+    repositories.apply_repository(
+        project_id=_PROJECT_ID,
+        name="root",
+        remote_url="https://git.example.test/x.git",
+        default_branch="release",
+        role="code",
+    )
+    app.state.project_repository_store = repositories
+    session_id = await _project_session(client, db_uri)
+    git: dict[str, object] = {"branch_name": "feature/x"}
+    if base_branch is not None:
+        git["base_branch"] = base_branch
+
+    response = await _launch(client, session_id, git=git)
+
+    assert response.status_code == 200, response.text
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].base_branch == expected_base
 
 
 async def test_launch_runner_project_without_entry_on_host_is_unchanged(

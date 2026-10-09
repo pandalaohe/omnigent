@@ -23,6 +23,24 @@ class RunnerArchiveState(BaseModel):  # type: ignore[explicit-any]  # Pydantic u
     archived: bool
 
 
+class ProjectCodeLocation(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
+    """One of a host's project repositories the agent should know about.
+
+    :param name: The registered repository name.
+    :param role: ``"code"`` for the repository the agent changes,
+        ``"related"`` for the rest.
+    :param folder: The repository folder on this host.
+    :param remote_url: Credential-free remote, or ``""``.
+    :param default_branch: Default branch, or ``""``.
+    """
+
+    name: str
+    role: str
+    folder: str
+    remote_url: str
+    default_branch: str
+
+
 def runner_archive_state(conversation: Conversation) -> RunnerArchiveState:
     """Project one conversation's own archive-operation revision."""
     revision = conversation.archive_revision
@@ -59,6 +77,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     archive_states: list[RunnerArchiveState] = Field(default_factory=list)
     peer_messaging_enabled: bool = False
     global_instructions: str | None = None
+    project_code: list[ProjectCodeLocation] | None = None
     inference_config: dict[str, object] | None = None
 
 
@@ -92,10 +111,16 @@ def build_runner_session_init_payload(
     archive_states: list[RunnerArchiveState] | None = None,
     peer_messaging_enabled: bool = False,
     global_instructions: str | None = None,
+    project_code: list[ProjectCodeLocation] | None = None,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
 ) -> dict[str, object]:
-    """Build the versioned initialization fields appended to the legacy body."""
+    """Build the versioned initialization fields appended to the legacy body.
+
+    ``project_code`` appears in the payload only when supplied, so a
+    session without one keeps the payload byte-identical to before the
+    field existed.
+    """
     from omnigent.inference_config import snapshot_runtime_config
 
     if conversation.agent_id is None:
@@ -133,6 +158,7 @@ def build_runner_session_init_payload(
             archive_states=effective_archive_states,
             peer_messaging_enabled=peer_messaging_enabled,
             global_instructions=global_instructions,
+            project_code=project_code,
             inference_config=snapshot_runtime_config(conversation.inference_snapshot),
         ),
     )
@@ -140,7 +166,10 @@ def build_runner_session_init_payload(
         "session_id": conversation.id,
         "agent_id": conversation.agent_id,
         "sub_agent_name": conversation.sub_agent_name,
-        SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+        SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(
+            mode="json",
+            exclude={"snapshot": {"project_code"}} if project_code is None else None,
+        ),
     }
 
 

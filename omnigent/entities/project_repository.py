@@ -19,7 +19,10 @@ class ProjectRepository:
     :param id: UUID primary key (bare 32-char hex string, no dashes).
     :param project_id: The project this repository is registered on.
     :param name: Stable identity used by assignments, unique per project.
-    :param remote_url: The shared remote. Carries no credentials.
+    :param role: ``"code"`` for the repository the project's agents change,
+        ``"related"`` for the rest.
+    :param remote_url: The shared remote. Carries no credentials; may be
+        empty when no git location is registered.
     :param default_branch: The repository's default branch name.
     :param context_manifest_path: Repo-relative path of the project-context
         manifest, e.g. ``".agents/project/manifest.json"``.
@@ -41,3 +44,4 @@ class ProjectRepository:
     created_at: int
     updated_at: int | None = None
     workspace_id: int = 0
+    role: str = "related"

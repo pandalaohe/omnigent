@@ -17,6 +17,7 @@ import { effectiveWorktree } from "@/lib/types";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useDeadKeyShortcutGuard } from "@/hooks/useDeadKeyShortcutGuard";
 import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
@@ -27,6 +28,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { useSoundAlerts } from "@/hooks/useSoundAlerts";
 import { useSystemStatusNotifications } from "@/hooks/useSystemStatusNotifications";
 import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -43,7 +45,7 @@ import {
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
-import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onBrowserActionRequest, surfacesBrowserPane } from "@/lib/browserActionBus";
 import { onArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
@@ -239,6 +241,8 @@ export function AppShell() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
+  // Suppress the accent a dead-key chord (⌥`) leaves in the IME-editable field.
+  useDeadKeyShortcutGuard();
   // Ctrl+Shift+F moves focus into the pending question card the user is on.
   useFocusQuestionCardHotkey();
 
@@ -567,6 +571,9 @@ export function AppShell() {
   // the active conversation id, which suppresses the notification/badge for
   // the session the user is actively viewing.
   useIdleNotifications(conversationId);
+  // Play a local sound when a session newly needs the user's response; the
+  // open conversation only rings for prompts (see the ringer's viewing rule).
+  useSoundAlerts(conversationId);
   // New resource-monitor findings ride the same notification path (this hook
   // reads the sidebar's nudge-driven summary; it adds no poll).
   useSystemStatusNotifications();
@@ -931,6 +938,8 @@ export function AppShell() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
+  // The desktop rail takes its own width while WorkspacePanel reports a browser tab or an opened file.
+  const [railShowsWideContent, setRailShowsWideContent] = useState(false);
   const {
     panelWidth: inlinePanelWidth,
     handleProps: inlinePanelHandleProps,
@@ -940,6 +949,7 @@ export function AppShell() {
     inlinePanelMinWidth,
     sidebarOpen ? sidebarWidth : 0,
     rootSessionResolved,
+    !mobileViewport && railShowsWideContent,
   );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
@@ -1883,9 +1893,9 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // Auto-open a Browser soft tab on a `navigate` action — agent-issued
-  // (browser_navigate) or a chat link the user routed in-app — so the load
-  // never lands in a hidden pane, even behind an open file or shell tab.
+  // Auto-open a Browser soft tab on a `navigate` or `screenshot` action —
+  // agent-issued (browser_navigate / browser_screenshot) or a chat link the
+  // user routed in-app — so the action never lands in a hidden pane.
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
@@ -1900,7 +1910,7 @@ export function AppShell() {
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || !sourceConversationId) return;
+      if (!surfacesBrowserPane(evt.action) || !sourceConversationId) return;
       surfaceBrowserTab(sourceConversationId);
     });
     return () => {
@@ -2696,6 +2706,7 @@ export function AppShell() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
+                    onWideContentChange={setRailShowsWideContent}
                   />
                 )}
                 {(goalFrameState === "active" || goalFrameState === "paused") && (

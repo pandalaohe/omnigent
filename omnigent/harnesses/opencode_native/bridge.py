@@ -71,6 +71,9 @@ _COST_POPUP_CONFIG_FILE = "cost_popup.json"
 # Omnigent policy engine (REQUEST + TOOL_RESULT phases the reactive
 # ``permission.asked`` path can't reach).
 _POLICY_PLUGIN_FILE = "omnigent-policy.js"
+# Filename of the per-session instructions file the runner registers as an
+# absolute config ``instructions`` entry so opencode loads it every turn.
+_SESSION_INSTRUCTIONS_FILE = "session_instructions.md"
 
 # The plugin source. opencode loads it (registered by absolute path in the
 # synthesized ``opencode.json`` ``plugin`` field) and iterates the module's
@@ -218,6 +221,61 @@ def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
     return path
+
+
+def session_instructions_path(bridge_dir: Path) -> Path:
+    """
+    Return the per-session instructions file path for *bridge_dir*.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    :returns: Absolute path of the ``session_instructions.md`` file.
+    """
+    return bridge_dir / _SESSION_INSTRUCTIONS_FILE
+
+
+def write_session_instructions(bridge_dir: Path, text: str | None) -> Path | None:
+    """
+    Write (or remove) the per-session instructions file.
+
+    OpenCode loads a config ``instructions`` entry that is an absolute file
+    path into the system prompt of every turn (web or TUI), so the runner
+    writes the composed session text here and registers the path. ``None``
+    removes a stale file from an earlier launch (the bridge dir survives
+    relaunches) and returns ``None``.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    :param text: The composed instructions text, or ``None`` to remove the file.
+    :returns: The written file path (absolute), or ``None`` when removed.
+    """
+    path = session_instructions_path(bridge_dir)
+    if text is None:
+        path.unlink(missing_ok=True)
+        return None
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_SESSION_INSTRUCTIONS_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
+
+
+def read_session_instructions(bridge_dir: Path) -> str | None:
+    """
+    Read the per-session instructions file text.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    :returns: The file's text, or ``None`` when it is missing or unreadable.
+    """
+    try:
+        with open(session_instructions_path(bridge_dir), encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except (OSError, UnicodeError):
+        return None
 
 
 _STATE_VERSION = 1
