@@ -11463,6 +11463,7 @@
                 "keep_warm",
                 "worktree_location",
                 "runner_log_warnings",
+                "sidebar_layout",
                 "sound_alerts"
               ]
             },
@@ -14136,6 +14137,7 @@
                         "runner_log_warnings",
                         "session_collab",
                         "session_navigation",
+                        "sidebar_layout",
                         "sound_alerts",
                         "usage_context",
                         "worktree_location"
@@ -14220,6 +14222,7 @@
                 "keep_warm",
                 "worktree_location",
                 "runner_log_warnings",
+                "sidebar_layout",
                 "sound_alerts"
               ],
               "title": "Namespace",
@@ -14278,6 +14281,87 @@
           }
         },
         "summary": "Patch User Preferences Namespace"
+      }
+    },
+    "/v1/me/recent-sessions": {
+      "get": {
+        "description": "List the caller's sessions by their own last interaction.\n\n\"Interaction\" is a human-origin user message, approval, or\nelicitation resolve, recorded per user on the session's root as an\n`omnigent.touched.<user>` label. Results are the caller's\naccessible, non-archived, `kind=\"default\"` sessions carrying that\nlabel, newest interaction first. Powers the sidebar's Recent\nsessions section, which shows a bounded count; cursors are rejected\nbecause the order is a label value with no row position.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
+        "operationId": "list_recent_sessions_v1_me_recent_sessions_get",
+        "parameters": [
+          {
+            "description": "Maximum number of sessions to return (1-20, default 20).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Unsupported \u2014 422 when given.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Unsupported \u2014 422 when given.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Recent Sessions",
+        "tags": [
+          "sessions"
+        ]
       }
     },
     "/v1/me/sound-alerts/claim": {

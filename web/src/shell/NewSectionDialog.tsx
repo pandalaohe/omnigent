@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import type { SaveSidebarLayout } from "@/hooks/useSidebarLayout";
 import {
   insertSection,
   kindsAvailableToCreate,
@@ -63,7 +64,7 @@ export function NewSectionDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   layout: SidebarLayout;
-  saveLayout: (next: SidebarLayout) => void;
+  saveLayout: SaveSidebarLayout;
 }) {
   const initialKind = kindsAvailableToCreate(layout)[0] ?? "projects";
   const [step, setStep] = useState<1 | 2>(1);
@@ -73,9 +74,9 @@ export function NewSectionDialog({
 
   const create = () => {
     const trimmed = name.trim();
-    saveLayout(
+    saveLayout((current) =>
       insertSection(
-        layout,
+        current,
         sectionDefFor(kind, trimmed === "" ? KIND_DEFAULT_NAMES[kind] : trimmed, count),
         0,
       ),

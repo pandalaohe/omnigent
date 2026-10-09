@@ -210,15 +210,15 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
   const last = index === layout.sections.length - 1;
 
   const updateSection = (update: (current: SidebarSectionDef) => SidebarSectionDef) => {
-    saveLayout({
-      version: 1,
-      sections: layout.sections.map((candidate) =>
+    saveLayout((current) => ({
+      ...current,
+      sections: current.sections.map((candidate) =>
         candidate.id === section.id ? update(candidate) : candidate,
       ),
-    });
+    }));
   };
 
-  const remove = () => saveLayout(removeSection(layout, section.id));
+  const remove = () => saveLayout((current) => removeSection(current, section.id));
   const requestRemove = () => {
     if (section.kind === "other_projects" || section.kind === "other_sessions") {
       setRemoveOpen(true);
@@ -262,28 +262,28 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
           <DropdownMenuItem
             data-testid="move-section-up"
             disabled={first}
-            onSelect={() => saveLayout(moveSection(layout, section.id, "up"))}
+            onSelect={() => saveLayout((current) => moveSection(current, section.id, "up"))}
           >
             Move up
           </DropdownMenuItem>
           <DropdownMenuItem
             data-testid="move-section-down"
             disabled={last}
-            onSelect={() => saveLayout(moveSection(layout, section.id, "down"))}
+            onSelect={() => saveLayout((current) => moveSection(current, section.id, "down"))}
           >
             Move down
           </DropdownMenuItem>
           <DropdownMenuItem
             data-testid="move-section-top"
             disabled={first}
-            onSelect={() => saveLayout(moveSection(layout, section.id, "top"))}
+            onSelect={() => saveLayout((current) => moveSection(current, section.id, "top"))}
           >
             Move to top
           </DropdownMenuItem>
           <DropdownMenuItem
             data-testid="move-section-bottom"
             disabled={last}
-            onSelect={() => saveLayout(moveSection(layout, section.id, "bottom"))}
+            onSelect={() => saveLayout((current) => moveSection(current, section.id, "bottom"))}
           >
             Move to bottom
           </DropdownMenuItem>

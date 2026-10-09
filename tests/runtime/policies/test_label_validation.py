@@ -183,6 +183,7 @@ def test_apply_label_writes_refuses_the_touched_keys(
             "OMNIGENT.TOUCHED.alice": "0000000000009",
             "omnigent.tóuched.bob": "0000000000009",
             "omni\ufeffgent.touched.carol": "0000000000009",
+            "omnigent.t\u00f8uched.dave": "0000000000009",
             "kept": "1",
         }
     )

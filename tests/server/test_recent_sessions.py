@@ -37,6 +37,8 @@ from omnigent.spec.types import GuardrailsSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import (
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     TOUCHED_LABEL_KEY,
     is_touched_label_key,
     pinned_label_key,
@@ -365,6 +367,79 @@ async def test_user_message_touches_root_not_child(recent_route: _RecentRoute) -
     assert route.store.get_conversation(root.id).labels[key] == "0000000000001"
 
 
+@pytest.mark.parametrize("hops", [1, 5])
+async def test_side_chat_message_touches_source(recent_route: _RecentRoute, hops: int) -> None:
+    """Side-chat messages put the source session in the caller's Recent list."""
+    route = recent_route
+    source = route.store.create_conversation(agent_id=route.agent_id, title="source")
+    current = source
+    side_chat_ids = []
+    for _ in range(hops):
+        side_chat = route.store.create_conversation(title="side chat")
+        route.store.set_labels(
+            side_chat.id,
+            {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: current.id},
+        )
+        side_chat_ids.append(side_chat.id)
+        current = side_chat
+
+    resp = await route.client.post(
+        f"/v1/sessions/{current.id}/events", json=_user_message("work on it")
+    )
+    assert resp.status_code == 202, resp.text
+
+    recent = await route.client.get("/v1/me/recent-sessions?limit=1")
+    assert recent.status_code == 200, recent.text
+    assert [row["id"] for row in recent.json()["data"]] == [source.id]
+    key = touched_label_key(None)
+    source_after = route.store.get_conversation(source.id)
+    assert source_after is not None
+    assert key in source_after.labels
+    for side_chat_id in side_chat_ids:
+        side_chat_after = route.store.get_conversation(side_chat_id)
+        assert side_chat_after is not None
+        assert key not in side_chat_after.labels
+
+
+@pytest.mark.parametrize("source_kind", ["missing_label", "missing_session", "cycle", "too_deep"])
+async def test_side_chat_without_reachable_source_does_not_touch(
+    recent_route: _RecentRoute, source_kind: str
+) -> None:
+    """An unresolved side-chat source never falls back to stamping the side chat."""
+    route = recent_route
+    current = route.store.create_conversation()
+    sessions = [current]
+    if source_kind == "too_deep":
+        for _ in range(6):
+            side_chat = route.store.create_conversation()
+            route.store.set_labels(
+                side_chat.id,
+                {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: current.id},
+            )
+            sessions.append(side_chat)
+            current = side_chat
+    else:
+        labels = {SIDE_CHAT_LABEL_KEY: "1"}
+        if source_kind == "missing_session":
+            labels[SIDE_CHAT_SOURCE_LABEL_KEY] = "conv_missing"
+        elif source_kind == "cycle":
+            labels[SIDE_CHAT_SOURCE_LABEL_KEY] = current.id
+        route.store.set_labels(current.id, labels)
+
+    resp = await route.client.post(
+        f"/v1/sessions/{current.id}/events", json=_user_message("work on it")
+    )
+    assert resp.status_code == 202, resp.text
+    key = touched_label_key(None)
+    for session in sessions:
+        session_after = route.store.get_conversation(session.id)
+        assert session_after is not None
+        assert key not in session_after.labels
+    recent = await route.client.get("/v1/me/recent-sessions?limit=1")
+    assert recent.status_code == 200, recent.text
+    assert recent.json()["data"] == []
+
+
 async def test_approval_event_touches(recent_route: _RecentRoute) -> None:
     """A successful in-band approval is an interaction."""
     route = recent_route
@@ -509,6 +584,7 @@ async def test_client_cannot_seed_touched_labels(client: httpx.AsyncClient, db_u
         f"{TOUCHED_LABEL_KEY}.{BOB}",
         f"OMNIGENT.Touched.{BOB}",
         f"omni\ufeffgent.touched.{BOB}",
+        f"omnigent.t\u00f8uched.{BOB}",
     ):
         created = await client.post(
             "/v1/sessions", json={"agent_id": agent_id, "labels": {key: "0000000000001"}}

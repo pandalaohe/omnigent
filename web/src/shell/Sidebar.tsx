@@ -2046,6 +2046,7 @@ interface ConversationRowMeta {
   pinReorderCopy?: boolean;
   /** Sessions copy: still drags (to file / unfile) even when non-canonical. */
   moveCopy?: boolean;
+  dragDisabled?: boolean;
 }
 
 /** A freshly created favorites section; empty, so every pin renders in pin order. */
@@ -4398,6 +4399,7 @@ function ConversationList({
                                         instanceKey: isCanonical ? conversation.id : key,
                                         canonical: isCanonical,
                                         projectLabel: projectLabelFor(conversation),
+                                        dragDisabled: true,
                                       };
                                     }}
                                   />
@@ -5242,6 +5244,7 @@ function ConversationSection({
                     canonical={meta.canonical}
                     pinReorderCopy={meta.pinReorderCopy}
                     moveCopy={meta.moveCopy}
+                    dragDisabled={meta.dragDisabled}
                     projectLabel={meta.projectLabel}
                     isActive={conv.id === activeConversationId}
                     isPinned={pinnedConversationIds.includes(conv.id)}
@@ -5884,6 +5887,7 @@ function ConversationRowImpl({
   canonical,
   pinReorderCopy,
   moveCopy,
+  dragDisabled,
   favoriteItem,
   projectLabel,
   isActive,
@@ -5905,6 +5909,7 @@ function ConversationRowImpl({
   pinReorderCopy?: boolean;
   /** Sessions copy: still drags (to file / unfile) even when non-canonical. */
   moveCopy?: boolean;
+  dragDisabled?: boolean;
   /** Favorites row: its section and index, so it's a `fav-item` reorder target. */
   favoriteItem?: { sectionId: string; index: number };
   /** Trailing muted project name; recent copies only. */
@@ -6200,6 +6205,7 @@ function ConversationRowImpl({
       isArchived ||
       isEditing ||
       isProvisionalRow ||
+      dragDisabled ||
       (!isCanonical && !pinReorderCopy && !moveCopy),
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
@@ -7097,6 +7103,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.canonical === next.canonical &&
     prev.pinReorderCopy === next.pinReorderCopy &&
     prev.moveCopy === next.moveCopy &&
+    prev.dragDisabled === next.dragDisabled &&
     prev.favoriteItem?.sectionId === next.favoriteItem?.sectionId &&
     prev.favoriteItem?.index === next.favoriteItem?.index &&
     prev.projectLabel === next.projectLabel &&

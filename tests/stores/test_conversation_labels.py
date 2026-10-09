@@ -188,6 +188,7 @@ def test_insert_label_if_absent_first_writer_wins(
         ("omnigent.artifact_link_kéy", True),
         ("  omnigent.artifact_link_key\t", True),
         ("\ufeffomnigent.artifact_link_key", True),
+        ("omnigent.artifac\u0167_link_key", True),
         ("unrelated", False),
     ],
 )
@@ -206,6 +207,15 @@ def test_is_artifact_link_key_matches_collation_variants(key: str, expected: boo
         ("OMNIGENT.Touched.alice", True),
         ("omnigent.tóuched.alice", True),
         ("omni\ufeffgent.touched.alice", True),
+        ("\x01omnigent.touched.bob", True),
+        ("omni\u034fgent.touched.bob", True),
+        ("omnigent\ufe0f.touched.bob", True),
+        ("omni\u180bgent.touched.bob", True),
+        ("omnigent.touched\u20dd.bob", True),
+        ("omnigent.t\u00f8uched.bob", True),
+        ("omnigent.touche\u0111.bob", True),
+        ("omnigent.touc\u0127ed.bob", True),
+        ("omnigen\u0167.touched.bob", True),
         ("omnigent.touched_by", False),
         ("omnigent.touchedx.alice", False),
         ("omnigent.pinned.alice", False),
@@ -215,6 +225,21 @@ def test_is_touched_label_key_matches_collation_variants(key: str, expected: boo
     """Every spelling the key collation folds onto a touched key is reserved,
     and keys that merely share the prefix text are not."""
     assert is_touched_label_key(key) is expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "omnigent.touchedx",
+        "omnigent.toxched.bob",
+        "omnigent.pinned.bob",
+        "projekt.übersicht",
+        "日本語",
+        "omnigent.touch",
+    ],
+)
+def test_is_touched_label_key_rejects_unrelated_keys(key: str) -> None:
+    assert is_touched_label_key(key) is False
 
 
 # ── Collation-equivalent artifact key rows ─────────────

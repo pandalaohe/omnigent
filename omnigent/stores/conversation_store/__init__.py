@@ -289,21 +289,31 @@ def is_artifact_link_key(key: str) -> bool:
 
     :param key: A label key to test.
     :returns: ``True`` for :data:`ARTIFACT_LINK_KEY_LABEL` and every
-        case-, accent-, format-character or surrounding-whitespace variant of it.
+        collation look-alike.
     """
-    return _collation_plain_key(key) == ARTIFACT_LINK_KEY_LABEL
+    return _may_collate_to(key, ARTIFACT_LINK_KEY_LABEL, prefix=False)
 
 
-def _collation_plain_key(key: str) -> str:
-    # MySQL's default utf8mb4_0900_ai_ci collation matches keys case- and
-    # accent-insensitively and ignores format characters such as U+FEFF, so a
-    # variant spelling can select and overwrite the stored canonical row.
-    normalized = unicodedata.normalize("NFKD", key.strip()).casefold()
-    return "".join(
-        ch
-        for ch in normalized
-        if not unicodedata.combining(ch) and unicodedata.category(ch) != "Cf"
-    )
+def _may_collate_to(key: str, target: str, *, prefix: bool) -> bool:
+    # MySQL's accent-insensitive collation equates characters a skeleton
+    # cannot list. Over-approximating only refuses a look-alike key on a
+    # false positive.
+    positions = {0}
+    for ch in unicodedata.normalize("NFKD", key.strip()).casefold():
+        if prefix and len(target) in positions:
+            return True
+        if ch.isascii() and ch.isprintable():
+            positions = {pos + 1 for pos in positions if pos < len(target) and target[pos] == ch}
+        else:
+            positions = {
+                pos + advance
+                for pos in positions
+                for advance in range(4)
+                if pos + advance <= len(target)
+            }
+        if not positions:
+            return False
+    return len(target) in positions
 
 
 def is_touched_label_key(key: str) -> bool:
@@ -312,11 +322,11 @@ def is_touched_label_key(key: str) -> bool:
 
     :param key: A label key to test.
     :returns: ``True`` for the bare prefix, every ``omnigent.touched.<user>``
-        key, and every case-, accent-, format-character or whitespace variant
-        of them.
+        key, and every collation look-alike.
     """
-    plain = _collation_plain_key(key)
-    return plain == TOUCHED_LABEL_KEY or plain.startswith(f"{TOUCHED_LABEL_KEY}.")
+    return _may_collate_to(key, TOUCHED_LABEL_KEY, prefix=False) or _may_collate_to(
+        key, TOUCHED_LABEL_KEY + ".", prefix=True
+    )
 
 
 def is_server_secret_label_key(key: str) -> bool:

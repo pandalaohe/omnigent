@@ -353,6 +353,30 @@ describe("Sidebar sections", () => {
     expect(stored.sections.some((section) => section.id === "sec_work")).toBe(false);
   });
 
+  it("keeps a concurrent layout edit when removing a section from the menu", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
+    renderSidebar();
+
+    fireEvent.pointerDown(within(sectionOf("Work")).getByTestId("section-options"), { button: 0 });
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        ...WORK_LAYOUT,
+        sections: WORK_LAYOUT.sections.map((section) =>
+          section.id === "default-other-sessions" ? { ...section, name: "Inbox" } : section,
+        ),
+      }),
+    );
+    fireEvent.click(screen.getByTestId("remove-section"));
+
+    await waitFor(() => expect(screen.queryByText("Work")).toBeNull());
+    const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as SidebarLayout;
+    expect(stored.sections.some((section) => section.id === "sec_work")).toBe(false);
+    expect(stored.sections.find((section) => section.id === "default-other-sessions")?.name).toBe(
+      "Inbox",
+    );
+  });
+
   it("caps a section body and makes it scroll", () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
     renderSidebar();
@@ -503,7 +527,7 @@ describe("Sidebar sections", () => {
     );
   });
 
-  it("keeps the first Recent copy canonical for an unfiled session", async () => {
+  it("keeps the first Recent copy canonical without dragging for an unfiled session", async () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_LAYOUT));
     const session = conversation("s1");
     mockConversations([session]);
@@ -518,6 +542,11 @@ describe("Sidebar sections", () => {
     const sessionsRow = sectionOf("Sessions").querySelector('li[data-sidebar-session-id="s1"]');
     expect(recentRow).toHaveAttribute("data-sidebar-canonical", "true");
     expect(sessionsRow).not.toHaveAttribute("data-sidebar-canonical");
+
+    fireEvent.mouseDown(recentRow!, { button: 0, clientX: 50, clientY: 20 });
+    fireEvent.mouseMove(document, { clientX: 50, clientY: 40 });
+    expect(recentRow).not.toHaveClass("opacity-40");
+    fireEvent.mouseUp(document);
   });
 
   it("changes the recent count from the Show submenu and refetches with the new limit", async () => {

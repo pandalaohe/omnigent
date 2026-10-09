@@ -327,6 +327,8 @@ from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     PINNED_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     SUCCESSION_OPERATION_LABEL_KEYS,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -11695,17 +11697,35 @@ async def _write_touched_label(
 
     The touch orders the recent-sessions list. It is advisory bookkeeping:
     a failed write must never fail the user's message / approval / resolve,
-    so every error is logged and swallowed. Runs the store write on a
+    so every error is logged and swallowed. Runs store reads and writes on a
     worker thread; ``set_labels`` stamps only the label row, not the
     conversation's ``updated_at``.
 
     :param conversation_store: Store owning the label write.
-    :param conv: The addressed conversation; its root receives the stamp.
+    :param conv: The addressed conversation; its source's root receives the
+        stamp for a side chat, otherwise its own root does.
     :param user_id: The interacting user, or ``None`` in single-user mode.
     """
     root_id = conv.root_conversation_id or conv.id
     value = f"{int(time.time() * 1000):013d}"
     try:
+        visited = {conv.id}
+        hops = 0
+        while conv.kind == "default" and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            source_id = conv.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if not source_id or source_id in visited or hops >= 5:
+                _logger.debug("Cannot resolve side-chat touch source for session %s", conv.id)
+                return
+            source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+            if source is None:
+                _logger.debug(
+                    "Missing side-chat touch source %s for session %s", source_id, conv.id
+                )
+                return
+            visited.add(source_id)
+            hops += 1
+            conv = source
+        root_id = conv.root_conversation_id or conv.id
         await asyncio.to_thread(
             conversation_store.set_labels,
             root_id,
