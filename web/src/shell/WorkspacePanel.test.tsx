@@ -116,6 +116,7 @@ function renderWorkspace(
     resizing?: boolean;
     inert?: boolean;
     mobileSideChatsOpen?: boolean;
+    onWideContentChange?: (wide: boolean) => void;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -175,6 +176,7 @@ function renderWorkspace(
         pending={overrides.pending}
         mobileSideChatsOpen={overrides.mobileSideChatsOpen}
         onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
+        onWideContentChange={overrides.onWideContentChange}
       />
     </TooltipProvider>,
   );
@@ -530,6 +532,76 @@ describe("WorkspacePanel content area", () => {
     // The Changes tab pins the same panel to the changed-files-only flat list.
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+});
+
+describe("WorkspacePanel wide-content report", () => {
+  const term = {
+    id: "terminal_zsh_s1",
+    name: "zsh",
+    session: "u-g9qopr",
+    running: true,
+  };
+  const termKey = "terminal:terminal_zsh_s1";
+
+  it("reports true for an opened file", () => {
+    const onWideContentChange = vi.fn();
+    renderWorkspace({ selectedFilePath: "README.md", onWideContentChange });
+
+    expect(onWideContentChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("reports false for an opened file while the session is pending", () => {
+    const onWideContentChange = vi.fn();
+    renderWorkspace({ selectedFilePath: "README.md", pending: true, onWideContentChange });
+
+    expect(onWideContentChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("reports false while a present shell tab owns the content slot", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const onWideContentChange = vi.fn();
+    renderWorkspace({
+      selectedFilePath: "README.md",
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+      onWideContentChange,
+    });
+
+    expect(onWideContentChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("reports true for a selected browser tab backed by session state", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    const onWideContentChange = vi.fn();
+    renderWorkspace({
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      onWideContentChange,
+    });
+
+    expect(onWideContentChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("reports false when the browser tab is selected but no browser exists", () => {
+    const onWideContentChange = vi.fn();
+    renderWorkspace({
+      rightRailTab: "browser",
+      showBrowserTab: true,
+      onWideContentChange,
+    });
+
+    expect(onWideContentChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("reports false on the Agents tab", () => {
+    const onWideContentChange = vi.fn();
+    renderWorkspace({ rightRailTab: "subagents", onWideContentChange });
+
+    expect(onWideContentChange).toHaveBeenLastCalledWith(false);
   });
 });
 
