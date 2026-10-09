@@ -321,7 +321,7 @@ function nonceFromScripts(scripts) {
 }
 
 /** Build a registry stub around one entry keyed by conversationId. */
-function makeRegistry(conversationId, webContents) {
+function makeRegistry(conversationId, webContents, activeConversationId = null) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
@@ -330,6 +330,7 @@ function makeRegistry(conversationId, webContents) {
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
+    activeConversationId: () => activeConversationId,
     openOrNavigate: (id) => {
       const wc = makeWebContents();
       const entry = { view: { webContents: wc } };
@@ -358,10 +359,15 @@ function makeRegistry(conversationId, webContents) {
 
 /** Register the IPC surface with injectable gate + registry, and capture the
  *  events sent to a fake sender. */
-function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
+function setup({
+  pinned = true,
+  conversationId = "conv_1",
+  webContents,
+  activeConversationId = null,
+} = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
-  const registry = makeRegistry(conversationId, wc);
+  const registry = makeRegistry(conversationId, wc, activeConversationId);
   const sent = [];
   const event = { sender: { send: (channel, payload) => sent.push({ channel, payload }) } };
   registerBrowserIpc({
@@ -540,6 +546,36 @@ describe("browserIpc — devtools toggle", () => {
     assert.ok(wc.calls.includes("openDevTools:bottom"));
     await ipcMain.invoke("omnigent:open-browser-devtools", event, { conversationId: "conv_1" });
     assert.ok(wc.calls.includes("closeDevTools"));
+  });
+});
+
+describe("browserIpc — screenshot surface detection", () => {
+  it("reports noSurface when the captured image is empty", async () => {
+    const wc = makeWebContents();
+    wc.capturePage = async () => ({ isEmpty: () => true, toPNG: () => Buffer.alloc(0) });
+    const { ipcMain, event } = setup({ webContents: wc });
+    const r = await ipcMain.invoke("omnigent:browser-screenshot", event, {
+      conversationId: "conv_1",
+    });
+    assert.deepEqual(r, {
+      ok: false,
+      noSurface: true,
+      error: "browser view is not on screen; nothing to capture",
+    });
+  });
+
+  it("flags a capture failure for a non-active view as noSurface", async () => {
+    const wc = makeWebContents();
+    wc.capturePage = async () => {
+      throw new Error("view not ready");
+    };
+    const { ipcMain, event } = setup({ webContents: wc, activeConversationId: "conv_other" });
+    const r = await ipcMain.invoke("omnigent:browser-screenshot", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.noSurface, true);
+    assert.equal(r.error, "view not ready");
   });
 });
 

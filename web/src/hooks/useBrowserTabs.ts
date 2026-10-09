@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onBrowserActionRequest, surfacesBrowserPane } from "@/lib/browserActionBus";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
@@ -92,7 +92,7 @@ export function useBrowserTabs(conversationId: string) {
       }
     };
     const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
-      if (sourceConversationId === conversationId && event.action === "navigate") {
+      if (sourceConversationId === conversationId && surfacesBrowserPane(event.action)) {
         selectAgentBrowser(sourceConversationId);
       }
     });

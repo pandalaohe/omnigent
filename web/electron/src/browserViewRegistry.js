@@ -15,11 +15,17 @@
  *  - The old active entry is detached before the new one attaches. Inactive
  *    entries stay alive (JS + agent IPCs still run), just not painting; they're
  *    detached on hide and destroyed only on explicit close.
+ *  - Hidden views stay laid out through device emulation (agent reads/clicks
+ *    keep working); never emulate before the first commit — it SEGFAULTs.
  */
 
 const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
+
+// Layout size for a view that has never been on screen and has no last-known
+// pane size to inherit.
+const HIDDEN_VIEW_SIZE = { width: 1280, height: 800 };
 
 /**
  * Storage partition shared by one conversation's browser views. Without an
@@ -87,6 +93,9 @@ function createBrowserViewRegistry({
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
+  // Last bounds size applied to any active entry — the closest thing to the
+  // pane size a view created while hidden can inherit.
+  let lastPaneSize = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
@@ -140,9 +149,14 @@ function createBrowserViewRegistry({
             } catch {
               /* destroyed */
             }
+            entry.layoutSize = { width: bounds.width, height: bounds.height };
+            lastPaneSize = entry.layoutSize;
           }
         },
       }),
+      layoutReady: false,
+      emulated: false,
+      layoutSize: null,
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
@@ -164,6 +178,51 @@ function createBrowserViewRegistry({
       recentSessionSwitching: false,
     };
     return entry;
+  }
+
+  // Keep a detached view laid out so in-page reads/clicks work while hidden.
+  // Emulation is unsafe before the first commit or after a crash (SEGFAULT).
+  function syncHiddenLayout(entry) {
+    if (!entry || !entry.layoutReady) return;
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.enableDeviceEmulation !== "function") return;
+    if (wc.isDestroyed?.()) return;
+    try {
+      if (activeConversationId === entry.conversationId) {
+        if (entry.emulated) {
+          wc.disableDeviceEmulation();
+          entry.emulated = false;
+        }
+        return;
+      }
+      const size = entry.layoutSize ?? lastPaneSize ?? HIDDEN_VIEW_SIZE;
+      wc.enableDeviceEmulation({
+        screenPosition: "desktop",
+        screenSize: { width: 0, height: 0 },
+        viewPosition: { x: 0, y: 0 },
+        deviceScaleFactor: 0,
+        viewSize: { width: size.width, height: size.height },
+        scale: 1,
+      });
+      entry.emulated = true;
+    } catch {
+      /* destroyed / native call unavailable */
+    }
+  }
+
+  // A renderer crash leaves no document to emulate against; only the next
+  // main-frame commit re-arms emulation.
+  function attachHiddenLayoutTracking(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("did-navigate", () => {
+      entry.layoutReady = true;
+      syncHiddenLayout(entry);
+    });
+    wc.on("render-process-gone", () => {
+      entry.layoutReady = false;
+      entry.emulated = false;
+    });
   }
 
   function get(conversationId) {
@@ -191,6 +250,7 @@ function createBrowserViewRegistry({
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
+    attachHiddenLayoutTracking(entry);
     return { ok: true, entry, created: true };
   }
 
@@ -459,6 +519,7 @@ function createBrowserViewRegistry({
           }
         }
         activeConversationId = null;
+        if (prev) syncHiddenLayout(prev);
         sendToRenderer("browser-host-active-changed", { conversationId: null });
       }
       return { ok: true };
@@ -478,6 +539,7 @@ function createBrowserViewRegistry({
           }
         }
         activeConversationId = null;
+        if (prev) syncHiddenLayout(prev);
         sendToRenderer("browser-host-active-changed", { conversationId: null });
       }
       return { ok: false, error: "No browser view" };
@@ -487,8 +549,9 @@ function createBrowserViewRegistry({
       next.boundsController.resync();
       return { ok: true };
     }
+    let prev = null;
     if (activeConversationId !== null) {
-      const prev = entries.get(activeConversationId);
+      prev = entries.get(activeConversationId);
       if (prev) {
         cancelRecentSessionInput(prev, true);
         try {
@@ -499,11 +562,13 @@ function createBrowserViewRegistry({
       }
     }
     activeConversationId = conversationId;
+    if (prev) syncHiddenLayout(prev);
     try {
       attachToHost(next.view);
     } catch {
       /* host gone */
     }
+    syncHiddenLayout(next);
     // A view attaching while an overlay is open must stay hidden (sticky flag).
     applyActiveVisibility();
     next.boundsController.resync();
