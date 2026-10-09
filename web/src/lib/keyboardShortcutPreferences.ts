@@ -403,6 +403,8 @@ export interface ShortcutActionPreference {
 export interface KeyboardShortcutPreferences {
   version: 1;
   actions: Partial<Record<ShortcutActionId, ShortcutActionPreference>>;
+  /** macOS only: keep default shortcuts on Windows key positions. Omitted when off. */
+  macWindowsKeyPositions?: true;
 }
 
 export interface ShortcutDefaultContext {
@@ -495,7 +497,11 @@ export function readKeyboardShortcutPreferences(): KeyboardShortcutPreferences {
     if (!raw) return emptyPreferences();
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return emptyPreferences();
-    const record = parsed as { version?: unknown; actions?: unknown };
+    const record = parsed as {
+      version?: unknown;
+      actions?: unknown;
+      macWindowsKeyPositions?: unknown;
+    };
     if (record.version !== 1 || !record.actions || typeof record.actions !== "object") {
       return emptyPreferences();
     }
@@ -506,7 +512,11 @@ export function readKeyboardShortcutPreferences(): KeyboardShortcutPreferences {
       const normalized = normalizeActionPreference(candidate);
       if (normalized) actions[actionId] = normalized;
     }
-    return { version: 1, actions };
+    return {
+      version: 1,
+      actions,
+      ...(record.macWindowsKeyPositions === true ? { macWindowsKeyPositions: true as const } : {}),
+    };
   } catch {
     return emptyPreferences();
   }
@@ -515,16 +525,17 @@ export function readKeyboardShortcutPreferences(): KeyboardShortcutPreferences {
 function persistKeyboardShortcutPreferences(preferences: KeyboardShortcutPreferences): void {
   if (typeof window === "undefined") return;
   try {
-    if (Object.keys(preferences.actions).length === 0) {
-      window.localStorage.removeItem(KEYBOARD_SHORTCUTS_STORAGE_KEY);
-    } else {
+    // The macWindowsKeyPositions flag alone is a meaningful record: keeping it
+    // must not be cleared just because no action was customized.
+    const shouldStore =
+      Object.keys(preferences.actions).length > 0 || preferences.macWindowsKeyPositions === true;
+    if (shouldStore) {
       window.localStorage.setItem(KEYBOARD_SHORTCUTS_STORAGE_KEY, JSON.stringify(preferences));
+    } else {
+      window.localStorage.removeItem(KEYBOARD_SHORTCUTS_STORAGE_KEY);
     }
     window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_CHANGED_EVENT));
-    queueUserPreferencePatch(
-      "keyboard_shortcuts",
-      Object.keys(preferences.actions).length === 0 ? null : preferences,
-    );
+    queueUserPreferencePatch("keyboard_shortcuts", shouldStore ? preferences : null);
   } catch {
     // Keyboard shortcuts must retain their defaults when storage is unavailable.
   }
@@ -585,9 +596,61 @@ export function deleteShortcutPlatformOverride(
   persistKeyboardShortcutPreferences(preferences);
 }
 
-export function defaultShortcutBindings(
+export function readMacWindowsKeyPositions(): boolean {
+  return readKeyboardShortcutPreferences().macWindowsKeyPositions === true;
+}
+
+export function writeMacWindowsKeyPositions(enabled: boolean): void {
+  const preferences = readKeyboardShortcutPreferences();
+  if (enabled) {
+    preferences.macWindowsKeyPositions = true;
+  } else {
+    delete preferences.macWindowsKeyPositions;
+  }
+  persistKeyboardShortcutPreferences(preferences);
+}
+
+interface MacWindowsKeyPositionTakenKey {
+  reason: string;
+  /** True when macOS lets the user turn the system shortcut off. */
+  freeable: boolean;
+}
+
+// ⌘ chords macOS reserves system-wide; a mapped default landing on one would
+// fight the OS unless the user can free the system shortcut.
+const MAC_WINDOWS_TAKEN_KEYS: Record<string, MacWindowsKeyPositionTakenKey> = {
+  Backquote: {
+    freeable: true,
+    reason:
+      "macOS uses ⌘` to move focus to the next window. To use it here, turn off System Settings → Keyboard → Keyboard Shortcuts → Keyboard → “Move focus to next window”.",
+  },
+  KeyW: { freeable: false, reason: "⌘W closes the window or tab" },
+  KeyQ: { freeable: false, reason: "⌘Q quits the app" },
+  KeyN: { freeable: false, reason: "⌘N opens a new window" },
+  KeyT: { freeable: false, reason: "⌘T opens a new tab" },
+  KeyH: { freeable: false, reason: "⌘H hides the app" },
+  KeyM: { freeable: false, reason: "⌘M minimizes the window" },
+  Enter: { freeable: false, reason: "⌘↵ is the composer's send-all key" },
+};
+
+function macWindowsKeyPositionChord(binding: ShortcutChord): ShortcutChord {
+  const mapped: ShortcutModifier[] = binding.modifiers.map((modifier) =>
+    modifier === "primary" ? "control" : modifier === "alt" ? "meta" : modifier,
+  );
+  return {
+    code: binding.code,
+    modifiers: MODIFIER_ORDER.filter((modifier) => mapped.includes(modifier)),
+  };
+}
+
+function macWindowsTakenKey(mapped: ShortcutChord): MacWindowsKeyPositionTakenKey | undefined {
+  if (mapped.modifiers.length !== 1 || mapped.modifiers[0] !== "meta") return undefined;
+  return MAC_WINDOWS_TAKEN_KEYS[mapped.code];
+}
+
+function rawDefaultShortcutBindings(
   actionId: ShortcutActionId,
-  context: ShortcutDefaultContext = {},
+  context: ShortcutDefaultContext,
 ): ShortcutChord[] {
   if (actionId === "sendMessage" && context.submitWithModEnter) {
     return [chord("Enter", ["primary"])];
@@ -601,6 +664,41 @@ export function defaultShortcutBindings(
   return DEFAULT_SHORTCUT_DEFINITIONS[actionId].defaultBindings;
 }
 
+export function defaultShortcutBindings(
+  actionId: ShortcutActionId,
+  context: ShortcutDefaultContext = {},
+  platform = currentShortcutPlatform(),
+): ShortcutChord[] {
+  const defaults = rawDefaultShortcutBindings(actionId, context);
+  if (platform !== "macos" || !readMacWindowsKeyPositions()) return defaults;
+  return defaults.map((binding) => {
+    const mapped = macWindowsKeyPositionChord(binding);
+    const taken = macWindowsTakenKey(mapped);
+    // A taken chord macOS will not yield keeps its original binding.
+    return taken && !taken.freeable ? binding : mapped;
+  });
+}
+
+export function macWindowsKeyPositionNotes(
+  actionId: ShortcutActionId,
+  context: ShortcutDefaultContext = {},
+  platform = currentShortcutPlatform(),
+): string[] {
+  if (platform !== "macos" || !readMacWindowsKeyPositions()) return [];
+  const notes: string[] = [];
+  for (const binding of rawDefaultShortcutBindings(actionId, context)) {
+    const mapped = macWindowsKeyPositionChord(binding);
+    const taken = macWindowsTakenKey(mapped);
+    if (!taken) continue;
+    notes.push(
+      taken.freeable
+        ? taken.reason
+        : `Keeps ${shortcutBindingLabels(binding, "macos").join("")}: ${taken.reason}.`,
+    );
+  }
+  return notes;
+}
+
 export function resolveShortcutBindings(
   actionId: ShortcutActionId,
   platform = currentShortcutPlatform(),
@@ -610,7 +708,7 @@ export function resolveShortcutBindings(
   return (
     preference?.platformOverrides?.[platform] ??
     preference?.common ??
-    defaultShortcutBindings(actionId, context)
+    defaultShortcutBindings(actionId, context, platform)
   );
 }
 
