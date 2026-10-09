@@ -54,8 +54,8 @@ function alertClass(level: SoundLevel): AlertClass {
  * Whether the current local context still allows this alert to play.
  *
  * Evaluated both when an alert arrives and again when a scheduled cue
- * fires, since the device switch, quiet hours, session mute, level enablement,
- * or the viewed session may all have changed in between.
+ * fires, since the device switch, quiet hours, session mute, level
+ * enablement, or the viewed session may all have changed in between.
  */
 function passesFilters(alert: SoundAlert, context: RingerContext): boolean {
   if (!context.device.enabled) return false;
