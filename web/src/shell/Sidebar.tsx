@@ -3073,21 +3073,11 @@ function ConversationList({
       const snapshot = folderConversations.get(key);
       if (snapshot === undefined) return { group, rows: group.conversations };
       const current = new Map(group.conversations.map((c) => [c.id, c] as const));
-      // A collapsed copy unmounts and freezes its snapshot, but a sibling copy
-      // of the same folder (the owning section's, or another favorite's) still
-      // reports live rows; refresh each frozen row from that fresher copy by id.
-      const siblingPrefix = `${group.name}#`;
-      const siblings = new Map<string, Conversation>();
-      for (const [copyKey, list] of folderConversations) {
-        if (copyKey === key) continue;
-        if (copyKey !== group.name && !copyKey.startsWith(siblingPrefix)) continue;
-        for (const row of list) siblings.set(row.id, row);
-      }
       const rows: Conversation[] = [];
       const seen = new Set<string>();
       for (const row of snapshot) {
         seen.add(row.id);
-        const fresh = current.get(row.id) ?? siblings.get(row.id);
+        const fresh = current.get(row.id);
         if (fresh !== undefined) rows.push(fresh);
         else if (!windowIds.has(row.id)) rows.push(row);
       }

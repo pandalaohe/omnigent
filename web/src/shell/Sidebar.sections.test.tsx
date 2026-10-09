@@ -188,12 +188,10 @@ function LocationProbe() {
   return <div data-testid="location">{useLocation().pathname}</div>;
 }
 
-/** The sidebar with a live `/c/:id` route so the switch hotkey sees an active
-    row. `rerenderTree` re-renders in place, so a test can change a mock and
-    have the sidebar react, as a poll or refetch would. */
+/** The sidebar with a live `/c/:id` route so the switch hotkey sees an active row. */
 function renderSidebarAt(path: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const tree = () => (
+  return render(
     <QueryClientProvider client={qc}>
       <SidebarDataProvider>
         <TooltipProvider>
@@ -212,10 +210,8 @@ function renderSidebarAt(path: string) {
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
-  const view = render(tree());
-  return { rerenderTree: () => view.rerender(tree()) };
 }
 
 function recentCalls(): unknown[][] {
@@ -268,7 +264,14 @@ beforeEach(() => {
   mockConversations([conversation("plain")]);
 });
 
-afterEach(cleanup);
+afterEach(async () => {
+  cleanup();
+  // dnd-kit swallows document clicks for 50ms after a drag ends, so the next
+  // test's first click would be lost if it starts immediately.
+  await new Promise((resolve) => {
+    setTimeout(resolve, 60);
+  });
+});
 
 describe("Sidebar sections", () => {
   it("renders the default layout as today's Pinned / Projects / Sessions", () => {
@@ -2110,66 +2113,5 @@ describe("sidebar project favorites", () => {
       ),
     );
     platform.mockRestore();
-  });
-
-  it("refreshes a collapsed favorite copy's snapshot from the owning folder", async () => {
-    localStorage.setItem(
-      LAYOUT_STORAGE_KEY,
-      JSON.stringify({
-        version: 1,
-        sections: [
-          {
-            id: "sec_fav",
-            kind: "favorites",
-            name: "Favorites",
-            maxRows: null,
-            items: [{ type: "project", id: "p_beta" }],
-          },
-          { id: "sec_work", kind: "projects", name: "Work", maxRows: null, projectIds: ["p_beta"] },
-          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
-        ],
-      }),
-    );
-    localStorage.setItem(
-      "omnigent:expanded-project-sections",
-      JSON.stringify(["fav:sec_fav:Beta", "Beta"]),
-    );
-    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
-    folderRowsRef.current.set("Beta", [
-      conversation("folder-only", {
-        labels: { omni_project: "Beta" },
-        status: "idle",
-        updated_at: 1,
-      }),
-    ]);
-    // The global window never holds the folder-page-only session.
-    mockConversations([conversation("plain", { updated_at: 0 })]);
-    const { rerenderTree } = renderSidebarAt("/c/plain");
-
-    // Both copies mount; the favorite copy reports the folder-page-only row.
-    await waitFor(() =>
-      expect(within(sectionOf("Favorites")).getByText("folder-only")).toBeInTheDocument(),
-    );
-
-    // Collapsing Favorites unmounts its copy, freezing its reported snapshot.
-    fireEvent.click(within(sectionOf("Favorites")).getByRole("button", { name: "Favorites" }));
-
-    // The owning folder's page now reports the session running.
-    folderRowsRef.current.set("Beta", [
-      conversation("folder-only", {
-        labels: { omni_project: "Beta" },
-        status: "running",
-        updated_at: 2,
-      }),
-    ]);
-    rerenderTree();
-
-    // The collapsed marker follows the owning copy, not the frozen snapshot.
-    await waitFor(() =>
-      expect(within(sectionOf("Favorites")).getByTestId("session-state-badge")).toHaveAttribute(
-        "data-state",
-        "running",
-      ),
-    );
   });
 });
