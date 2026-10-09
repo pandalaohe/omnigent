@@ -12265,7 +12265,13 @@ describe("chatStore — session configuration scope", () => {
       "bypassPermissions",
       "permission_mode",
     ],
-    ["codex", "omnigent.codex_sdk.approval_mode", "default", "full-access", "approval_mode"],
+    [
+      "codex",
+      "omnigent.codex_sdk.approval_mode",
+      "ask-for-approval",
+      "full-access",
+      "approval_mode",
+    ],
   ])(
     "hydrates and PATCHes %s permissions using SDK labels",
     async (harness, label, initial, picked, field) => {

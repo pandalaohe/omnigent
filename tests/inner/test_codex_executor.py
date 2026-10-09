@@ -7025,16 +7025,21 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
 
 
 @pytest.mark.parametrize(
-    ("approval_mode", "approval_policy", "sandbox_type"),
+    ("approval_mode", "approval_policy", "approvals_reviewer", "sandbox_type"),
     [
-        (None, None, None),
-        ("default", "on-request", "workspaceWrite"),
-        ("full-access", "never", "dangerFullAccess"),
-        ("read-only", "on-request", "readOnly"),
+        (None, None, None, None),
+        ("default", "on-request", "user", "workspaceWrite"),
+        ("ask-for-approval", "on-request", "user", "workspaceWrite"),
+        ("approve-for-me", "on-request", "auto_review", "workspaceWrite"),
+        ("full-access", "never", "user", "dangerFullAccess"),
+        ("read-only", "on-request", "user", "readOnly"),
     ],
 )
 async def test_codex_turn_start_applies_approval_mode(
-    approval_mode: str | None, approval_policy: str | None, sandbox_type: str | None
+    approval_mode: str | None,
+    approval_policy: str | None,
+    approvals_reviewer: str | None,
+    sandbox_type: str | None,
 ) -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
@@ -7069,10 +7074,57 @@ async def test_codex_turn_start_applies_approval_mode(
     turn_params = session._request.await_args.args[1]
     if approval_mode is None:
         assert "approvalPolicy" not in turn_params
+        assert "approvalsReviewer" not in turn_params
         assert "sandboxPolicy" not in turn_params
     else:
         assert turn_params["approvalPolicy"] == approval_policy
+        assert turn_params["approvalsReviewer"] == approvals_reviewer
         assert turn_params["sandboxPolicy"] == {"type": sandbox_type}
+
+
+async def test_codex_turn_start_ignores_unknown_approval_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session.__dict__["_proc"] = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    async def _complete() -> None:
+        await asyncio.sleep(0.01)
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+        )
+
+    complete_task = asyncio.create_task(_complete())
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+            approval_mode="bogus",
+        )
+    ]
+    await complete_task
+    assert isinstance(events[-1], TurnComplete)
+    assert session._request.await_args is not None
+    turn_params = session._request.await_args.args[1]
+    assert "approvalPolicy" not in turn_params
+    assert "approvalsReviewer" not in turn_params
+    assert "sandboxPolicy" not in turn_params
+    assert any(
+        record.name == "omnigent.inner.codex_executor"
+        and record.levelname == "WARNING"
+        and "bogus" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize(
