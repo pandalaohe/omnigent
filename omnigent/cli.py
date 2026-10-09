@@ -673,7 +673,6 @@ _HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
 _UPGRADE_DRAIN_POLL_S = 2.0
 _CUSTOM_HOST_VCS_URL = "git+https://github.com/pandalaohe/omnigent.git"
 _CUSTOM_HOST_CHANNEL = "local/host-custom"
-_CUSTOM_HOST_CHANNEL_URL = f"{_CUSTOM_HOST_VCS_URL}@{_CUSTOM_HOST_CHANNEL}"
 _CUSTOM_HOST_RECONNECT_TIMEOUT_S = 60.0
 _CUSTOM_HOST_HELPER_START_TIMEOUT_S = 10.0
 # When reusing an existing daemon, how long to let a live-but-offline daemon
@@ -9471,22 +9470,85 @@ def _custom_host_update_paths() -> dict[str, Path]:
     }
 
 
-def _is_custom_host_vcs_url(vcs_url: str) -> bool:
-    """Recognize our fork across HTTPS, SSH URL, and scp-style spellings."""
+def _custom_host_repo_identity(vcs_url: str) -> tuple[str, str] | None:
+    """
+    Reduce a VCS URL to a ``(hostname, repository path)`` identity.
+
+    Identity ignores the ``git+`` prefix, scheme, userinfo (installers record
+    redacted ``****@host`` userinfo), and a trailing ``@<rev>``, so the same
+    repository compares equal across HTTPS, SSH URL, and scp spellings.
+
+    :param vcs_url: e.g.
+        ``"git+ssh://git@fn.example.invalid/srv/git/omnigent.git"``.
+    :returns: Casefolded host and ``.git``-stripped path, e.g.
+        ``("fn.example.invalid", "srv/git/omnigent")``; ``None`` when no
+        repository can be derived.
+    """
     from urllib.parse import urlsplit
 
     repo_url, _revision = _split_vcs_url(vcs_url)
     repo_url = repo_url.removeprefix("git+").strip()
-    folded = repo_url.casefold()
-    if folded.startswith("git@github.com:"):
-        host = "github.com"
-        path = repo_url.split(":", 1)[1]
-    else:
+    if "://" in repo_url:
         parsed = urlsplit(repo_url)
         host = (parsed.hostname or "").casefold()
         path = parsed.path
+    else:
+        host_part, separator, path = repo_url.partition(":")
+        if not separator:
+            return None
+        host = host_part.rsplit("@", 1)[-1].casefold()
     normalized_path = path.strip("/").casefold().removesuffix(".git")
-    return host == "github.com" and normalized_path == "pandalaohe/omnigent"
+    if not host or not normalized_path:
+        return None
+    return host, normalized_path
+
+
+def _custom_host_source_urls() -> list[str]:
+    """
+    Return the ordered custom Host source repositories from the user config.
+
+    :returns: The configured ``custom_host_sources`` URLs, or
+        ``[_CUSTOM_HOST_VCS_URL]`` when the key is absent, so the default
+        channel is unchanged.
+    :raises click.ClickException: When the key is present but is not a
+        non-empty list of non-empty strings.
+    """
+    config = _load_global_config()
+    if "custom_host_sources" not in config:
+        return [_CUSTOM_HOST_VCS_URL]
+    raw = config["custom_host_sources"]
+    sources: list[str] = []
+    if isinstance(raw, list):
+        for source in raw:
+            if not isinstance(source, str) or not source.strip():
+                sources = []
+                break
+            sources.append(source.strip())
+    if not sources:
+        raise click.ClickException(
+            f"Invalid `custom_host_sources` in "
+            f"{_display_path(_effective_global_config_path())}: expected a non-empty "
+            "list of non-empty repository URLs."
+        )
+    return sources
+
+
+def _is_custom_host_vcs_url(vcs_url: str) -> bool:
+    """
+    Recognize the default or a configured custom Host repository.
+
+    :param vcs_url: An installed wheel VCS URL, e.g.
+        ``"git+https://github.com/pandalaohe/omnigent.git@local/host-custom"``.
+    :returns: ``True`` when its repository identity is the default
+        :data:`_CUSTOM_HOST_VCS_URL` or any configured source.
+    """
+    identity = _custom_host_repo_identity(vcs_url)
+    if identity is None:
+        return False
+    return any(
+        _custom_host_repo_identity(source) == identity
+        for source in [_CUSTOM_HOST_VCS_URL, *_custom_host_source_urls()]
+    )
 
 
 def _valid_git_sha(value: object) -> str | None:
@@ -9503,50 +9565,74 @@ _CUSTOM_HOST_LOOKUP_TIMEOUT_S = 20.0
 _CUSTOM_HOST_LOOKUP_ATTEMPTS = 2
 
 
-def _resolve_custom_host_channel_head() -> str:
-    """Resolve the custom Host channel commit, naming why a lookup failed.
+def _resolve_custom_host_channel_head() -> tuple[str, str]:
+    """
+    Resolve the custom Host channel commit from the first reachable source.
 
-    Unlike ``_remote_git_head``, this gates an update the user asked for, so it
-    retries a transient failure and reports its cause instead of returning ``None``.
+    Sources are tried in configured order, each with its own retry loop, so an
+    unreachable primary does not block an update. A missing ``git`` binary
+    stops the search at once because no later source could be reached either.
+
+    :returns: The winning source repository URL and the exact commit, e.g.
+        ``("git+https://github.com/pandalaohe/omnigent.git", "a" * 40)``.
+    :raises click.ClickException: When every tried source fails to resolve
+        ``'local/host-custom'``.
     """
     from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 
-    repo_url, ref = _split_vcs_url(_CUSTOM_HOST_CHANNEL_URL)
-    label = ref or "HEAD"
-    failure = ""
-    for _attempt in range(_CUSTOM_HOST_LOOKUP_ATTEMPTS):
-        try:
-            result = subprocess.run(
-                ["git", "ls-remote", repo_url, label],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_CUSTOM_HOST_LOOKUP_TIMEOUT_S,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            failure = f"`git ls-remote` timed out after {_CUSTOM_HOST_LOOKUP_TIMEOUT_S:.0f}s"
-            continue
-        except FileNotFoundError:
-            failure = "`git` was not found on PATH"
+    failures: list[tuple[str, str]] = []
+    for index, source in enumerate(_custom_host_source_urls()):
+        repo_url, _ref = _split_vcs_url(source)
+        install_source = f"git+{repo_url}"
+        label = _CUSTOM_HOST_CHANNEL
+        failure = ""
+        git_missing = False
+        for _attempt in range(_CUSTOM_HOST_LOOKUP_ATTEMPTS):
+            try:
+                result = subprocess.run(
+                    ["git", "ls-remote", repo_url, label],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=_CUSTOM_HOST_LOOKUP_TIMEOUT_S,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                failure = f"`git ls-remote` timed out after {_CUSTOM_HOST_LOOKUP_TIMEOUT_S:.0f}s"
+                continue
+            except FileNotFoundError:
+                failure = "`git` was not found on PATH"
+                git_missing = True
+                break
+            except OSError as exc:
+                failure = f"`git ls-remote` could not start ({exc})"
+                break
+            if result.returncode != 0:
+                stderr = result.stderr.strip() or "(no stderr)"
+                failure = f"`git ls-remote` exited with status {result.returncode}: {stderr}"
+                continue
+            first = result.stdout.split("\n", 1)[0].strip()
+            sha = first.split("\t", 1)[0].strip() if first else ""
+            resolved = _valid_git_sha(sha)
+            if resolved is not None:
+                if index:
+                    reasons = "; ".join(f"{url} ({why})" for url, why in failures)
+                    click.echo(
+                        f"Warning: {reasons}; falling back to {install_source}, which may "
+                        f"lag behind {failures[0][0]}.",
+                        err=True,
+                    )
+                return install_source, resolved
+            failure = f"the fork has no {label!r} branch"
             break
-        except OSError as exc:
-            failure = f"`git ls-remote` could not start ({exc})"
+        failures.append((source, failure))
+        if git_missing:
             break
-        if result.returncode != 0:
-            stderr = result.stderr.strip() or "(no stderr)"
-            failure = f"`git ls-remote` exited with status {result.returncode}: {stderr}"
-            continue
-        first = result.stdout.split("\n", 1)[0].strip()
-        sha = first.split("\t", 1)[0].strip() if first else ""
-        resolved = _valid_git_sha(sha)
-        if resolved is not None:
-            return resolved
-        failure = f"the fork has no {label!r} branch"
-        break
+    details = "\n".join(f"  {url}: {why}" for url, why in failures)
     exc = click.ClickException(
-        f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from our fork: {failure}. "
+        f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from any custom Host source:\n"
+        f"{details}\n"
         "Check network/git access, then retry."
     )
     setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
@@ -10164,14 +10250,13 @@ def _host_update_custom_impl(
 
     if rollback:
         target_sha = _read_custom_host_rollback()
-        target_url = f"{_CUSTOM_HOST_VCS_URL}@{target_sha}"
+        source_url = _resolve_custom_host_channel_head()[0]
     else:
-        target_url = _CUSTOM_HOST_CHANNEL_URL
-        target_sha = _resolve_custom_host_channel_head()
+        source_url, target_sha = _resolve_custom_host_channel_head()
 
     # Resolve the moving channel once, then install that exact revision on
     # every platform. A push during uv/pipx installation must not change it.
-    target_url = f"{_CUSTOM_HOST_VCS_URL}@{target_sha}"
+    target_url = f"{source_url}@{target_sha}"
     suggestion = _build_upgrade_suggestion(
         info,
         target_vcs_url=target_url,
