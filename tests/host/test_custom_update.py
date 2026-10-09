@@ -235,7 +235,10 @@ def test_custom_update_verifies_commit_and_host_reconnect(
 
     assert result.exit_code == 0, result.output
     assert events == ["resume", "online:host-1"]
-    assert f"Updated custom Host: {old[:9]} → {new[:9]}" in result.output
+    assert (
+        f"Updated custom Host: {old[:9]} → {new[:9]} from {cli_module._CUSTOM_HOST_VCS_URL}"
+        in result.output
+    )
     assert "omni host update custom --rollback" in result.output
 
 
@@ -277,6 +280,46 @@ def test_custom_update_rollback_uses_saved_commit(monkeypatch: pytest.MonkeyPatc
 
     assert result.exit_code == 0, result.output
     assert captured == [f"{source}@{previous}"]
+
+
+def test_custom_update_rollback_does_not_fall_back_to_second_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
+    current = "b" * 40
+    previous = "a" * 40
+    calls: list[list[str]] = []
+    drained: list[bool] = []
+
+    def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="boom")
+
+    monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None, raising=False)
+    monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info(commit=current))
+    monkeypatch.setattr(cli_module, "_read_custom_host_rollback", lambda: previous, raising=False)
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [first, second]},
+    )
+    monkeypatch.setattr(cli_module.subprocess, "run", _run)
+    monkeypatch.setattr(
+        cli_module,
+        "_drain_custom_host_sessions",
+        lambda *_a, **_k: drained.append(True),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "update", "custom", "--rollback"])
+
+    assert result.exit_code != 0
+    assert "rollback uses only the first configured source" in result.output
+    assert drained == []
+    assert len(calls) == 2
+    assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
 
 @pytest.mark.parametrize("extra_args", [[], ["--force"]])
@@ -408,6 +451,11 @@ def test_custom_host_sources_default_to_fork_channel(
         [],
         ["git+https://fn.example.invalid/srv/git/omnigent.git", 3],
         [""],
+        ["git@fn.example.invalid:srv/git/omnigent.git"],
+        ["git@fn.example.invalid:omnigent.git"],
+        ["/srv/git/omnigent.git"],
+        ["file:///srv/git/omnigent.git"],
+        ["git+https://fn.example.invalid/srv/git/omnigent.git@main"],
     ],
 )
 def test_custom_host_sources_reject_invalid_config(
@@ -433,6 +481,30 @@ def test_custom_host_sources_reject_invalid_config(
     message = str(excinfo.value)
     assert "custom_host_sources" in message
     assert "/srv/git/omnigent/config.yaml" in message
+    assert "without `@<ref>`" in message
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git+ssh://git@fn.example.invalid/srv/git/omnigent.git",
+        "ssh://git@fn.example.invalid/srv/git/omnigent.git",
+        "git+https://github.com/pandalaohe/omnigent.git",
+    ],
+)
+def test_custom_host_sources_accept_repository_urls(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_global_config",
+        lambda: {"custom_host_sources": [url]},
+    )
+
+    assert cli_module._custom_host_source_urls() == [url]
 
 
 @pytest.mark.parametrize(
@@ -653,41 +725,35 @@ def test_custom_host_channel_lookup_falls_back_after_failed_source(
     assert "boom" in stderr
 
 
-def test_custom_host_channel_lookup_ignores_revision_in_configured_source(
+def test_custom_host_channel_lookup_without_fallback_tries_only_first_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import omnigent.cli as cli_module
 
-    sha = "e" * 40
+    first = "git+ssh://git@fn.example.invalid/srv/git/omnigent.git"
+    second = "git+https://github.com/pandalaohe/omnigent.git"
     calls: list[list[str]] = []
 
     def _run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        return subprocess.CompletedProcess(
-            args=argv, returncode=0, stdout=f"{sha}\trefs/heads/local/host-custom\n"
-        )
+        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="boom")
 
     monkeypatch.setattr(
         cli_module,
         "_load_global_config",
-        lambda: {
-            "custom_host_sources": ["git+https://fn.example.invalid/srv/git/omnigent.git@main"]
-        },
+        lambda: {"custom_host_sources": [first, second]},
     )
     monkeypatch.setattr(cli_module.subprocess, "run", _run)
 
-    assert cli_module._resolve_custom_host_channel_head() == (
-        "git+https://fn.example.invalid/srv/git/omnigent.git",
-        sha,
-    )
-    assert calls == [
-        [
-            "git",
-            "ls-remote",
-            "https://fn.example.invalid/srv/git/omnigent.git",
-            "local/host-custom",
-        ]
-    ]
+    with pytest.raises(click.ClickException) as excinfo:
+        cli_module._resolve_custom_host_channel_head(allow_fallback=False)
+
+    message = str(excinfo.value)
+    assert "rollback uses only the first configured source" in message
+    assert first in message
+    assert second not in message
+    assert len(calls) == 2
+    assert [call[2] for call in calls] == ["ssh://git@fn.example.invalid/srv/git/omnigent.git"] * 2
 
 
 def test_custom_host_channel_lookup_falls_back_when_branch_missing(
@@ -725,7 +791,7 @@ def test_custom_host_channel_lookup_falls_back_when_branch_missing(
     assert cli_module._resolve_custom_host_channel_head() == (second, sha)
     assert len(calls) == 2
     stderr = capsys.readouterr().err
-    assert "the fork has no 'local/host-custom' branch" in stderr
+    assert "the source has no 'local/host-custom' branch" in stderr
 
 
 def test_custom_host_channel_lookup_lists_every_failed_source(

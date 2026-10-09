@@ -9511,7 +9511,8 @@ def _custom_host_source_urls() -> list[str]:
         ``[_CUSTOM_HOST_VCS_URL]`` when the key is absent, so the default
         channel is unchanged.
     :raises click.ClickException: When the key is present but is not a
-        non-empty list of non-empty strings.
+        non-empty list of ``git+https://``/``git+ssh://`` repository URLs
+        without a pinned ref.
     """
     config = _load_global_config()
     if "custom_host_sources" not in config:
@@ -9520,15 +9521,23 @@ def _custom_host_source_urls() -> list[str]:
     sources: list[str] = []
     if isinstance(raw, list):
         for source in raw:
-            if not isinstance(source, str) or not source.strip():
+            if not isinstance(source, str):
                 sources = []
                 break
-            sources.append(source.strip())
+            entry = source.strip()
+            repo_spelling = entry.removeprefix("git+")
+            if (
+                not repo_spelling.lower().startswith(("https://", "ssh://"))
+                or _split_vcs_url(entry)[1] is not None
+            ):
+                sources = []
+                break
+            sources.append(entry)
     if not sources:
         raise click.ClickException(
             f"Invalid `custom_host_sources` in "
             f"{_display_path(_effective_global_config_path())}: expected a non-empty "
-            "list of non-empty repository URLs."
+            "list of `git+https://…` or `git+ssh://…` repository URLs without `@<ref>`."
         )
     return sources
 
@@ -9565,7 +9574,7 @@ _CUSTOM_HOST_LOOKUP_TIMEOUT_S = 20.0
 _CUSTOM_HOST_LOOKUP_ATTEMPTS = 2
 
 
-def _resolve_custom_host_channel_head() -> tuple[str, str]:
+def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[str, str]:
     """
     Resolve the custom Host channel commit from the first reachable source.
 
@@ -9573,6 +9582,9 @@ def _resolve_custom_host_channel_head() -> tuple[str, str]:
     unreachable primary does not block an update. A missing ``git`` binary
     stops the search at once because no later source could be reached either.
 
+    :param allow_fallback: When ``False``, try only the first configured
+        source. Rollback uses this because a lagging fallback may lack the
+        saved commit.
     :returns: The winning source repository URL and the exact commit, e.g.
         ``("git+https://github.com/pandalaohe/omnigent.git", "a" * 40)``.
     :raises click.ClickException: When every tried source fails to resolve
@@ -9580,8 +9592,11 @@ def _resolve_custom_host_channel_head() -> tuple[str, str]:
     """
     from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 
+    sources = _custom_host_source_urls()
+    if not allow_fallback:
+        sources = sources[:1]
     failures: list[tuple[str, str]] = []
-    for index, source in enumerate(_custom_host_source_urls()):
+    for index, source in enumerate(sources):
         repo_url, _ref = _split_vcs_url(source)
         install_source = f"git+{repo_url}"
         label = _CUSTOM_HOST_CHANNEL
@@ -9624,14 +9639,18 @@ def _resolve_custom_host_channel_head() -> tuple[str, str]:
                         err=True,
                     )
                 return install_source, resolved
-            failure = f"the fork has no {label!r} branch"
+            failure = f"the source has no {label!r} branch"
             break
         failures.append((source, failure))
         if git_missing:
             break
     details = "\n".join(f"  {url}: {why}" for url, why in failures)
+    if allow_fallback:
+        scope = "any custom Host source"
+    else:
+        scope = "the first custom Host source (rollback uses only the first configured source)"
     exc = click.ClickException(
-        f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from any custom Host source:\n"
+        f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from {scope}:\n"
         f"{details}\n"
         "Check network/git access, then retry."
     )
@@ -10250,7 +10269,7 @@ def _host_update_custom_impl(
 
     if rollback:
         target_sha = _read_custom_host_rollback()
-        source_url = _resolve_custom_host_channel_head()[0]
+        source_url = _resolve_custom_host_channel_head(allow_fallback=False)[0]
     else:
         source_url, target_sha = _resolve_custom_host_channel_head()
 
@@ -10360,7 +10379,7 @@ def _host_update_custom_impl(
             f"expected {target_sha[:9]}. The Host was restarted on the available install."
         )
     _wait_for_custom_host_online(host_id, previous_records)
-    click.echo(f"Updated custom Host: {current_sha[:9]} → {target_sha[:9]}")
+    click.echo(f"Updated custom Host: {current_sha[:9]} → {target_sha[:9]} from {source_url}")
     click.echo(f"Rollback: {cli_invocation(name='omni')} host update custom --rollback")
 
 
