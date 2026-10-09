@@ -16,6 +16,10 @@ import {
 } from "react";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  readWidenWorkspaceForContent,
+  subscribeWidenWorkspaceForContent,
+} from "@/lib/workspacePanelPreferences";
 
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.99;
@@ -35,6 +39,13 @@ function defaultWidthPx(): number {
   if (typeof window === "undefined") return DEFAULT_SSR_PX;
   const candidate = Math.round(window.innerWidth * DEFAULT_RATIO);
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
+}
+
+// First-use width for the wide (browser/file) mode: never narrower than the
+// normal width, otherwise half the space left beside the open sidebar.
+function wideDefaultWidthPx(normal: number, reservedPx: number): number {
+  if (typeof window === "undefined") return normal;
+  return Math.max(normal, Math.round((window.innerWidth - reservedPx) / 2));
 }
 
 // Width the panel may not eat into: the sidebar when it's open. Passed down
@@ -74,7 +85,16 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
 let currentSessionId: string | null = null;
 let preferredWidth: number | null = readPanelSizePreference("inlinePanelWidthPx");
 let storedWidth: number | null = preferredWidth;
+// Separate remembered width for the desktop rail while it shows a browser tab
+// or an opened file. `null` means the user has never sized that mode.
+let wideWidth: number | null = readPanelSizePreference("inlinePanelWideWidthPx");
 const listeners = new Set<() => void>();
+
+function setWideWidth(value: number | null) {
+  if (value === wideWidth) return;
+  wideWidth = value;
+  for (const l of listeners) l();
+}
 
 function persistWidth(value: number | null) {
   preferredWidth = value;
@@ -121,11 +141,16 @@ function loadSession(sessionId: string | null): void {
 export function resetWidthStoreForTesting(): void {
   currentSessionId = null;
   preferredWidth = readPanelSizePreference("inlinePanelWidthPx");
+  wideWidth = readPanelSizePreference("inlinePanelWideWidthPx");
   setStoredWidthRaw(preferredWidth);
 }
 
 function getSnapshot(): number | null {
   return storedWidth;
+}
+
+function getWideSnapshot(): number | null {
+  return wideWidth;
 }
 
 function getServerSnapshot(): number | null {
@@ -157,14 +182,24 @@ function getServerSnapshot(): number | null {
  *
  * `persistEnabled` disables manual resizing while AppShell is still resolving
  * which conversation tree owns the visible rail.
+ *
+ * `showsWideContent` is true while the rail shows a browser tab or an opened file.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
   minWidthPx = MIN_WIDTH_PX,
   reservedPx = 0,
   persistEnabled = true,
+  showsWideContent = false,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const rawWide = useSyncExternalStore(subscribe, getWideSnapshot, getServerSnapshot);
+  const widenEnabled = useSyncExternalStore(
+    subscribeWidenWorkspaceForContent,
+    readWidenWorkspaceForContent,
+    () => true,
+  );
+  const wide = showsWideContent && widenEnabled;
   // Before the one-time migration effect commits, derive this render from the
   // incoming session's legacy width so upgraded users do not see a default-
   // width flash. A device preference always wins and survives session changes.
@@ -172,9 +207,14 @@ export function useResizableInlinePanel(
   if (preferredWidth === null && sessionId !== null && sessionId !== currentSessionId) {
     effectiveRaw = readSessionWorkspaceState(sessionId).widthPx ?? null;
   }
-  // Clamped at render time only — the store keeps the user's preferred width, so
-  // a temporary squeeze (sidebar opening) is undone when the space returns.
-  const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx, reservedPx);
+  const normalWidth = effectiveRaw ?? defaultWidthPx();
+  // Clamped at render time only — the stores keep the user's preferred widths,
+  // so a temporary squeeze (sidebar opening) is undone when the space returns.
+  const resolvedWidth = clamp(
+    wide ? (rawWide ?? wideDefaultWidthPx(normalWidth, reservedPx)) : normalWidth,
+    minWidthPx,
+    reservedPx,
+  );
   // Drives the drag listeners' lifecycle: they mount only while a drag is
   // live, so there's no idle window-level mousemove handler firing during
   // ordinary page use.
@@ -192,6 +232,8 @@ export function useResizableInlinePanel(
   reservedRef.current = reservedPx;
   const persistEnabledRef = useRef(persistEnabled);
   persistEnabledRef.current = persistEnabled;
+  const wideRef = useRef(wide);
+  wideRef.current = wide;
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document. Without it, dragging
@@ -258,19 +300,33 @@ export function useResizableInlinePanel(
       const step = 20;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        setStoredWidth(
-          (prev) => clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
-          true,
-        );
+        if (wide) {
+          const next = clamp(resolvedWidth + step, minWidthRef.current, reservedRef.current);
+          setWideWidth(next);
+          writePanelSizePreference("inlinePanelWideWidthPx", next);
+        } else {
+          setStoredWidth(
+            (prev) =>
+              clamp((prev ?? resolvedWidth) + step, minWidthRef.current, reservedRef.current),
+            true,
+          );
+        }
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        setStoredWidth(
-          (prev) => clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
-          true,
-        );
+        if (wide) {
+          const next = clamp(resolvedWidth - step, minWidthRef.current, reservedRef.current);
+          setWideWidth(next);
+          writePanelSizePreference("inlinePanelWideWidthPx", next);
+        } else {
+          setStoredWidth(
+            (prev) =>
+              clamp((prev ?? resolvedWidth) - step, minWidthRef.current, reservedRef.current),
+            true,
+          );
+        }
       }
     },
-    [persistEnabled, resolvedWidth],
+    [persistEnabled, resolvedWidth, wide],
   );
 
   // Drag listeners live only while a drag is active — no idle window-level
@@ -285,7 +341,11 @@ export function useResizableInlinePanel(
     function flush() {
       frame = 0;
       if (pending === null || !persistEnabledRef.current) return;
-      setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+      if (wideRef.current) {
+        setWideWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+      } else {
+        setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
+      }
       pending = null;
     }
 
@@ -299,7 +359,13 @@ export function useResizableInlinePanel(
       flush();
       setIsDragging(false);
       removeDragOverlay();
-      if (persistEnabledRef.current) persistStoredWidth();
+      if (persistEnabledRef.current) {
+        if (wideRef.current) {
+          writePanelSizePreference("inlinePanelWideWidthPx", wideWidth);
+        } else {
+          persistStoredWidth();
+        }
+      }
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     }

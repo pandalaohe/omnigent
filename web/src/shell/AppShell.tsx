@@ -931,6 +931,15 @@ export function AppShell() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
+  // The desktop rail switches to its own width while it shows a browser tab or
+  // an opened file, matching the content precedence WorkspacePanel renders with.
+  const railShowsTerminal =
+    selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
+  const railShowsWideContent =
+    !mobileViewport &&
+    !railShowsTerminal &&
+    (selectedFilePath !== null ||
+      (rightRailTab === "browser" && selectedTerminalKey === null && supportsBrowser()));
   const {
     panelWidth: inlinePanelWidth,
     handleProps: inlinePanelHandleProps,
@@ -940,6 +949,7 @@ export function AppShell() {
     inlinePanelMinWidth,
     sidebarOpen ? sidebarWidth : 0,
     rootSessionResolved,
+    railShowsWideContent,
   );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
