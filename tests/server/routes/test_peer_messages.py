@@ -1905,6 +1905,39 @@ async def test_action_release_and_refuse_with_409(
         peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
 
 
+async def test_action_refuse_marks_notice_owed(
+    peer_client: httpx.AsyncClient, peer_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refuse CAS durably marks the record's back-notice owed."""
+    sender = peer_env["sender"]
+    receiver = peer_env["receiver"]
+    peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "hold"})
+    try:
+        sent = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages",
+            json={"sender_session_id": sender.id, "text": f"r-{uuid.uuid4().hex}"},
+            headers=_headers(ALICE, peer_env["sender_token"]),
+        )
+        peer_id = sent.json()["peer_id"]
+        sweeper = peer_env["app"].state.peer_sweeper
+
+        async def _no_notify(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(sweeper, "notify", _no_notify)
+        refused = await peer_client.post(
+            f"/v1/sessions/{receiver.id}/peer-messages/{peer_id}/action",
+            json={"action": "refuse"},
+            headers=_headers(ALICE, None),
+        )
+        assert refused.status_code == 200, refused.text
+        stored = peer_env["peer_store"].get(peer_id)
+        assert stored is not None
+        assert stored.notice_owed_at is not None
+    finally:
+        peer_env["conv_store"].set_labels(receiver.id, {"peer_inbound": "accept"})
+
+
 async def test_action_denied_without_edit(
     peer_client: httpx.AsyncClient, peer_env: dict[str, Any]
 ) -> None:

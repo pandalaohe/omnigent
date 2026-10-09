@@ -37,6 +37,9 @@ class SessionPeerMessage:
         (1 when that input was human, else the trigger's depth + 1).
     :param not_before: Earliest Unix epoch second the sweeper may deliver
         this record, or ``None`` when it may deliver immediately.
+    :param notice_owed_at: Unix epoch second the terminal record's
+        back-notice was left unposted for its sender, or ``None`` when no
+        notice is owed.
     :param workspace_id: Tenant partition key that owns this row.
     """
 
@@ -55,4 +58,5 @@ class SessionPeerMessage:
     replied_at: int | None = None
     relay_depth: int = 1
     not_before: int | None = None
+    notice_owed_at: int | None = None
     workspace_id: int = 0

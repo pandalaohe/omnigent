@@ -2689,6 +2689,9 @@ class SqlSessionPeerMessage(OmnigentBase):
         (1 when that input was human, else the trigger's depth + 1).
     :param not_before: Earliest Unix epoch second the sweeper may deliver
         this record, or ``None`` when it may deliver immediately.
+    :param notice_owed_at: Unix epoch second the terminal record's
+        back-notice was left unposted for its sender, or ``None`` when no
+        notice is owed.
     """
 
     __tablename__ = "session_peer_messages"
@@ -2722,6 +2725,7 @@ class SqlSessionPeerMessage(OmnigentBase):
         Integer, nullable=False, server_default="1", default=1
     )
     not_before: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notice_owed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # Receiver-side reads: the sweeper and the held panel.

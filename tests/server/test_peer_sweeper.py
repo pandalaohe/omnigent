@@ -11,15 +11,18 @@ import asyncio
 import dataclasses
 import threading
 import types
+import uuid
 from typing import Any, cast
 
 import pytest
 
+from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation, ConversationItem, MessageData
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.peer_message_store import PeerMessageStore
+from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 
 _APP = object()  # PeerSweeper only ever forwards this; a sentinel is enough.
 
@@ -106,6 +109,7 @@ class _FakePeerStore(PeerMessageStore):
         *,
         expires_at: int | None = None,
         relay_depth: int | None = None,
+        notice: bool = False,
     ) -> bool:
         with self._lock:
             row = self._rows.get(peer_id)
@@ -120,7 +124,28 @@ class _FakePeerStore(PeerMessageStore):
                 row.expires_at = expires_at
             if relay_depth is not None:
                 row.relay_depth = relay_depth
+            if notice:
+                row.notice_owed_at = now_epoch()
             return True
+
+    def list_notice_owed(self) -> list[SessionPeerMessage]:
+        rows = [r for r in self._rows.values() if r.notice_owed_at is not None]
+        rows.sort(key=lambda r: (r.notice_owed_at or 0, r.id))
+        return rows
+
+    def claim_notice(self, peer_id: str) -> bool:
+        with self._lock:
+            row = self._rows.get(peer_id)
+            if row is None or row.notice_owed_at is None:
+                return False
+            row.notice_owed_at = None
+            return True
+
+    def set_notice_owed(self, peer_id: str, owed_at: int) -> None:
+        with self._lock:
+            row = self._rows.get(peer_id)
+            if row is not None:
+                row.notice_owed_at = owed_at
 
     def mark_replied(self, peer_id: str, reply_peer_id: str, replied_at: int) -> bool:
         row = self._rows.get(peer_id)
@@ -678,6 +703,7 @@ async def test_uncertain_delivery_past_expiry_expires_with_notice(
 async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:
     """F6: two concurrent flush attempts for one sender post exactly once."""
     record = harness.seed_record(state="pending")
+    harness.store.set_notice_owed(record.id, harness._now)
     harness.true_state.states["sender"] = "busy"
     await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
     assert len(harness.sweeper._parked["sender"]) == 1
@@ -718,6 +744,8 @@ async def test_notices_to_busy_sender_park_and_flush_as_one_message() -> None:
     r2 = h.seed_record(
         id="peer_2", receiver_session_id="receiver2", ref="ref-2", expires_at=h._now + 10
     )
+    h.store.set_notice_owed(r1.id, h._now)
+    h.store.set_notice_owed(r2.id, h._now)
     await h.sweeper._notify_for(r1, "delivered", None, "Receiver", _APP)
     await h.sweeper._notify_for(r2, "delivered", None, "Receiver Two", _APP)
     assert h.post_event.calls == []  # sender busy — both parked, nothing posted yet
@@ -751,6 +779,7 @@ async def test_notice_post_failure_reparks_for_a_later_attempt(harness: _Harness
     """
     record = harness.seed_record(state="pending")
     sender = harness.conv_store.convs["sender"]
+    harness.store.set_notice_owed(record.id, harness._now)
     harness.post_event.raise_once_for.add("sender")
     await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
     assert harness.post_event.calls == []
@@ -769,6 +798,7 @@ async def test_true_state_exception_during_flush_reparks_for_a_later_attempt(
     a post failure. The next flush posts once."""
     record = harness.seed_record(state="pending")
     sender = harness.conv_store.convs["sender"]
+    harness.store.set_notice_owed(record.id, harness._now)
     harness.true_state.raise_once_for.add("sender")
     await harness.sweeper._notify_for(record, "delivered", None, "Receiver", _APP)
     assert harness.post_event.calls == []
@@ -790,10 +820,10 @@ async def test_flush_cancelled_during_true_state_reparks_and_reraises(
         raise asyncio.CancelledError
 
     harness.sweeper._true_state = _cancelled  # type: ignore[method-assign]
-    harness.sweeper._parked[sender.id] = ["notice-1"]
+    harness.sweeper._parked[sender.id] = [(None, "notice-1")]
     with pytest.raises(asyncio.CancelledError):
         await harness.sweeper._maybe_flush(sender, _APP)
-    assert harness.sweeper._parked[sender.id] == ["notice-1"]
+    assert harness.sweeper._parked[sender.id] == [(None, "notice-1")]
     assert record.id  # keep linters honest about the seeded row
 
 
@@ -1033,6 +1063,7 @@ async def test_older_record_from_another_sender_does_not_hold(harness: _Harness)
 async def test_notice_flushes_to_steerable_sender(harness: _Harness) -> None:
     """A parked notice posts once the sender reads steerable, not idle."""
     record = harness.seed_record(state="pending")
+    harness.store.set_notice_owed(record.id, harness._now)
     harness.true_state.states["sender"] = "steerable"
     await harness.sweeper._notify_for(record, "expired", None, "Receiver", _APP)
     assert len(harness.post_event.calls) == 1
@@ -1074,3 +1105,183 @@ async def test_reconcile_leaves_unmarked_delivering_while_receiver_running(
     harness.conv_store.convs["receiver"] = dataclasses.replace(receiver, live_status=None)
     await harness.sweeper._reconcile_startup()
     assert _row(harness.store, record.id).state == "pending"
+
+
+def _store_sweeper(
+    store: SqlAlchemyPeerMessageStore,
+    conv_store: _FakeConversationStore,
+    true_state: _TrueStateScript,
+    deliver: _DeliverScript,
+    post_event: _PostEventScript,
+    now: int = 1000,
+) -> PeerSweeper:
+    """A sweeper over the real SQL store, sharing the fakes across restarts."""
+    sweeper = PeerSweeper(
+        peer_store=store,
+        conversation_store=cast(Any, conv_store),
+        permission_store=None,
+        true_state=true_state,
+        deliver=deliver,
+        post_event_impl=post_event,
+        clock=lambda: now,
+    )
+    sweeper._app = _APP
+    return sweeper
+
+
+async def test_owed_notice_survives_restart_and_posts_exactly_once(db_uri: str) -> None:
+    """A back-notice parked before a restart replays once, then never again."""
+    store = SqlAlchemyPeerMessageStore(db_uri)
+    conv_store = _FakeConversationStore()
+    sender = _conv(uuid.uuid4().hex, title="Sender")
+    receiver = _conv(uuid.uuid4().hex, title="Receiver")
+    conv_store.convs[sender.id] = sender
+    conv_store.convs[receiver.id] = receiver
+    true_state = _TrueStateScript()
+    deliver = _DeliverScript()
+    post_event = _PostEventScript()
+    record = store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="ref-1",
+            text="hello",
+            state="pending",
+            created_at=1000,
+            expires_at=999,
+        )
+    )
+
+    true_state.states[sender.id] = "busy"
+    first = _store_sweeper(store, conv_store, true_state, deliver, post_event)
+    await first._tick()
+    assert store.get(record.id).state == "expired"  # type: ignore[union-attr]
+    assert post_event.calls == []  # parked while the sender was busy
+
+    true_state.states[sender.id] = "idle"
+    second = _store_sweeper(store, conv_store, true_state, deliver, post_event)
+    await second.start(_APP)
+    await second.shutdown()
+    assert len(post_event.calls) == 1
+    assert f"peer message {record.id}" in post_event.calls[0]["text"]
+    assert "expired" in post_event.calls[0]["text"]
+
+    third = _store_sweeper(store, conv_store, true_state, deliver, post_event)
+    await third.start(_APP)
+    await third.shutdown()
+    assert len(post_event.calls) == 1
+
+
+async def test_two_sweepers_claim_one_owed_notice_once(db_uri: str) -> None:
+    """Two sweepers holding the same owed notice post it exactly once."""
+    store = SqlAlchemyPeerMessageStore(db_uri)
+    conv_store = _FakeConversationStore()
+    sender = _conv(uuid.uuid4().hex, title="Sender")
+    conv_store.convs[sender.id] = sender
+    true_state = _TrueStateScript()
+    deliver = _DeliverScript()
+    post_event = _PostEventScript()
+    record = store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=uuid.uuid4().hex,
+            ref="ref-1",
+            text="hello",
+            state="expired",
+            created_at=1000,
+            expires_at=999,
+        )
+    )
+    store.set_notice_owed(record.id, 900)
+    line = f'[System: peer message {record.id} to session x "R" expired]'
+
+    true_state.states[sender.id] = "busy"
+    first = _store_sweeper(store, conv_store, true_state, deliver, post_event)
+    second = _store_sweeper(store, conv_store, true_state, deliver, post_event)
+    await first.notify_line(sender.id, line, peer_id=record.id)
+    await second.notify_line(sender.id, line, peer_id=record.id)
+    assert len(first._parked[sender.id]) == 1
+    assert len(second._parked[sender.id]) == 1
+
+    true_state.states[sender.id] = "idle"
+    await asyncio.gather(
+        first._maybe_flush(sender, _APP),
+        second._maybe_flush(sender, _APP),
+    )
+    assert len(post_event.calls) == 1
+    assert first._parked.get(sender.id) == []
+    assert second._parked.get(sender.id) == []
+    updated = store.get(record.id)
+    assert updated is not None
+    assert updated.notice_owed_at is None
+
+
+async def test_failed_flush_restores_owed_mark_and_reparks(db_uri: str) -> None:
+    """A post failure restores the durable mark so a later flush posts once."""
+    store = SqlAlchemyPeerMessageStore(db_uri)
+    conv_store = _FakeConversationStore()
+    sender = _conv(uuid.uuid4().hex, title="Sender")
+    conv_store.convs[sender.id] = sender
+    true_state = _TrueStateScript()
+    deliver = _DeliverScript()
+    post_event = _PostEventScript()
+    record = store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=uuid.uuid4().hex,
+            ref="ref-1",
+            text="hello",
+            state="expired",
+            created_at=1000,
+            expires_at=999,
+        )
+    )
+    store.set_notice_owed(record.id, 900)
+    line = f'[System: peer message {record.id} to session x "R" expired]'
+
+    true_state.states[sender.id] = "busy"
+    sweeper = _store_sweeper(store, conv_store, true_state, deliver, post_event)
+    await sweeper.notify_line(sender.id, line, peer_id=record.id)
+    true_state.states[sender.id] = "idle"
+    post_event.raise_once_for.add(sender.id)
+
+    await sweeper._maybe_flush(sender, _APP)
+    restored = store.get(record.id)
+    assert restored is not None
+    assert restored.notice_owed_at is not None
+    assert len(sweeper._parked[sender.id]) == 1
+
+    await sweeper._maybe_flush(sender, _APP)
+    assert len(post_event.calls) == 1
+    updated = store.get(record.id)
+    assert updated is not None
+    assert updated.notice_owed_at is None
+
+
+async def test_replay_owed_notices_posts_all_past_the_batch_limit() -> None:
+    """Startup replay parks every owed record, not only one batch page."""
+    h = _Harness()
+    h.add_conv(_conv("sender", title="Sender"))
+    h.add_conv(_conv("receiver", title="Receiver"))
+    first = h.seed_record(id="peer_replay_1", state="expired", notice_owed_at=900)
+    second = h.seed_record(id="peer_replay_2", state="expired", notice_owed_at=901)
+    sweeper = PeerSweeper(
+        peer_store=h.store,
+        conversation_store=cast(Any, h.conv_store),
+        permission_store=None,
+        true_state=h.true_state,
+        deliver=h.deliver,
+        post_event_impl=h.post_event,
+        clock=lambda: h._now,
+        batch_limit=1,
+    )
+    sweeper._app = _APP
+
+    await sweeper._replay_owed_notices()
+
+    posted = "\n".join(call["text"] for call in h.post_event.calls)
+    assert f"peer message {first.id}" in posted
+    assert f"peer message {second.id}" in posted
