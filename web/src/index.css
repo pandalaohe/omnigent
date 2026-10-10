@@ -17,6 +17,21 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Native popup menus use the browser's color scheme, including on Windows. */
+select {
+  color-scheme: light;
+}
+
+.dark select {
+  color-scheme: dark;
+}
+
+select option,
+select optgroup {
+  color: var(--popover-foreground);
+  background-color: var(--popover);
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   /* Native system UI font stack — defers to whatever the OS ships
