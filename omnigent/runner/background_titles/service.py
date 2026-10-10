@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
 
+from omnigent.entities.conversation import (
+    DEFAULT_GENERATED_TITLE_MAX_CHARS,
+    USER_SESSION_TITLE_MAX_CHARS,
+)
 from omnigent.harness_plugins import (
     BackgroundTitleGeneratorSpec,
     background_title_generators,
@@ -29,6 +34,8 @@ BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
 BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
 CUSTOM_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 64
 BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
+BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
+CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
 FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION = (
     "Unless another language is explicitly requested, write the title in the "
     "same primary language as the user's message."
@@ -50,6 +57,96 @@ _BACKGROUND_TITLE_MODELS: dict[str, str] = {
     "codex": BACKGROUND_TITLE_CODEX_ECONOMY_MODEL,
     "codex-native": BACKGROUND_TITLE_CODEX_ECONOMY_MODEL,
 }
+
+_TITLE_WRAPPERS = "'\"“”‘’"
+_TITLE_LABEL = re.compile(
+    r"(?:^|[\s.!?。！？])(?:final |suggested |session )?"
+    r"(?:__)?(?:title|标题|標題)(?:__)?\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_META_TITLE_TEXT = re.compile(
+    r"^(?:(?:i|we)\s+(?:need|should|must|will|can|would|am|are)\b.*\btitles?\b|"
+    r"(?:the\s+)?user\s+(?:is|asks?|wants?|needs?|requested)\b|"
+    r"(?:this|the)\s+(?:title|task)\s+(?:is|should|must|requires?)\b|"
+    r"(?:here|below)\s+(?:is|are)\b|"
+    r"(?:这个|這個|本)(?:标题|標題|任务|任務)|"
+    r"(?:用户|用戶|使用者)(?:问|問|想|要|希望)|"
+    r"(?:我|我们|我們)(?:需要|应该|應該|必须|必須).*(?:标题|標題))",
+    re.IGNORECASE,
+)
+
+
+def _strip_title_markdown(line: str) -> str:
+    line = re.sub(r"^\s*(?:#{1,6}\s+|>\s*|[-+*]\s+|\d+[.)]\s+)+", "", line)
+    line = re.sub(r"!?\[([^\]]+)\]\([^)]*\)", r"\1", line)
+    # Dunder identifiers remain literal after code-span backticks are removed.
+    line = re.sub(
+        r"^(?!__[A-Za-z_][A-Za-z0-9_]*__$)(\*\*|\*|__|_|~~)(?=\S)(.+?)(?<=\S)\1$",
+        r"\2",
+        line.strip(),
+    )
+    parts = re.split(r"(`+[^`]+`+)", line)
+    for index, part in enumerate(parts):
+        if index % 2:
+            parts[index] = part.strip("`")
+        else:
+            part = re.sub(
+                r"(?<![\w*])(\*\*|\*|~~)(?![*~])(?=\S)(.+?)(?<=\S)(?<![*~])\1(?![\w*~])",
+                r"\2",
+                part,
+            )
+            parts[index] = re.sub(
+                r"(?<!\w)(?!__[A-Za-z_][A-Za-z0-9_]*__(?!\w))"
+                r"(__|_)(?!_)(?=\S)(.+?)(?<=\S)\1(?![\w.])",
+                r"\2",
+                part,
+            )
+    return "".join(parts).strip()
+
+
+def normalize_background_title(
+    value: str | None,
+    *,
+    max_chars: int = BACKGROUND_TITLE_MAX_CHARS,
+    truncate_overflow: bool = False,
+) -> str | None:
+    """Extract a title from model output; reject explanations and invalid lengths."""
+    if not value:
+        return None
+    lines: list[str] = []
+    for line in value.splitlines():
+        if re.match(r"^\s*(?:`{3,}|~{3,})", line):
+            continue
+        line = _strip_title_markdown(line).strip(_TITLE_WRAPPERS + " \t")
+        if line:
+            lines.append(line)
+    if not lines:
+        return None
+    labelled = [
+        (index, label) for index, line in enumerate(lines) if (label := _TITLE_LABEL.match(line))
+    ]
+    if len(labelled) > 1:
+        return None
+    if labelled:
+        index, label = labelled[0]
+        title = lines[index][label.end() :] or (lines[index + 1] if index + 1 < len(lines) else "")
+    else:
+        title = lines[0]
+        # Inline labels are only answers when they follow identifiable model reasoning.
+        if _META_TITLE_TEXT.search(title):
+            labels = list(_TITLE_LABEL.finditer(title))
+            if not labels:
+                return None
+            title = title[labels[-1].end() :]
+    title = " ".join(_strip_title_markdown(title).strip(_TITLE_WRAPPERS).split())
+    title = re.sub(r"[.!?;:,。！？；：，]+$", "", title).strip()
+    if _META_TITLE_TEXT.search(title):
+        return None
+    if len(title) > max_chars:
+        if not truncate_overflow:
+            return None
+        title = title[: max_chars - 1].rstrip() + "…"
+    return title if len(title) >= 2 else None
 
 
 def background_title_model(harness: str) -> str | None:
@@ -175,6 +272,12 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     if not callable(generator):
         raise RuntimeError(f"background title generator {spec.generator!r} is not callable")
     typed_generator = cast(BackgroundTitleGenerator, generator)
+    has_custom_instructions = bool(_operator_title_instructions(context.additional_instructions))
+    max_chars = (
+        CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+        if has_custom_instructions
+        else BACKGROUND_TITLE_MAX_CHARS
+    )
     title_model = background_title_model(context.harness)
     if title_model is not None and context.title_model is None:
         try:
@@ -192,10 +295,16 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             )
         else:
             if title is not None:
-                return title
+                return normalize_background_title(
+                    title, max_chars=max_chars, truncate_overflow=has_custom_instructions
+                )
             _logger.info(
                 "economy title model %s unavailable on harness %s; retrying the session model",
                 title_model,
                 context.harness,
             )
-    return await typed_generator(context)
+    return normalize_background_title(
+        await typed_generator(context),
+        max_chars=max_chars,
+        truncate_overflow=has_custom_instructions,
+    )
