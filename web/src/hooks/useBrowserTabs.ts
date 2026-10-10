@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { onBrowserActionClaimed } from "@/lib/browserActionBus";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -99,9 +99,18 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 }
 
 export function useBrowserTabs(conversationId: string) {
-  const [state, setState] = useState(() => readBrowserTabsState(conversationId));
+  const [state, setState] = useState(() => ({
+    ownerId: conversationId,
+    ...readBrowserTabsState(conversationId),
+  }));
+  // A new session can render before the migration effect. Never relabel the
+  // outgoing session's tabs as belonging to the incoming one.
+  const { tabs: visibleTabs, selected: visibleSelected } = useMemo(
+    () => (state.ownerId === conversationId ? state : readBrowserTabsState(conversationId)),
+    [state, conversationId],
+  );
   useEffect(() => {
-    setState(readBrowserTabsState(conversationId));
+    setState({ ownerId: conversationId, ...readBrowserTabsState(conversationId) });
   }, [conversationId]);
 
   const update = useCallback(
@@ -111,7 +120,7 @@ export function useBrowserTabs(conversationId: string) {
         openBrowsers: next.tabs,
         selectedBrowserId: next.selected,
       });
-      setState(next);
+      setState({ ownerId: conversationId, ...next });
     },
     [conversationId],
   );
@@ -123,12 +132,12 @@ export function useBrowserTabs(conversationId: string) {
   useEffect(() => {
     const selectAgentBrowser = (sourceConversationId: string) => {
       if (sourceConversationId === conversationId) {
-        setState(openAgentBrowserTab(conversationId));
+        setState({ ownerId: conversationId, ...openAgentBrowserTab(conversationId) });
       }
     };
     const unsubscribeAction = onBrowserActionClaimed((sourceConversationId, tabId) => {
       if (sourceConversationId === conversationId) {
-        setState(selectBrowserTab(conversationId, tabId));
+        setState({ ownerId: conversationId, ...selectBrowserTab(conversationId, tabId) });
       }
     });
     const unsubscribeLink = onInAppLinkOpen(selectAgentBrowser);
@@ -140,7 +149,7 @@ export function useBrowserTabs(conversationId: string) {
 
   const add = () => {
     createBrowserTab(conversationId);
-    setState(readBrowserTabsState(conversationId));
+    setState({ ownerId: conversationId, ...readBrowserTabsState(conversationId) });
   };
 
   const close = async (tabId: string): Promise<boolean> => {
@@ -182,11 +191,12 @@ export function useBrowserTabs(conversationId: string) {
   };
 
   return {
-    ...state,
+    tabs: visibleTabs,
+    selected: visibleSelected,
     add,
     close,
     select,
-    viewId: state.selected === null ? null : browserViewId(conversationId, state.selected),
-    agentBrowser: state.selected === AGENT_BROWSER_TAB_ID,
+    viewId: visibleSelected === null ? null : browserViewId(conversationId, visibleSelected),
+    agentBrowser: visibleSelected === AGENT_BROWSER_TAB_ID,
   };
 }

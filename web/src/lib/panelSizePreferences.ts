@@ -9,8 +9,10 @@ export interface PanelSizePreferences {
   pushPanelWidthPx?: number;
   /** Width for the always-visible desktop right rail. */
   inlinePanelWidthPx?: number;
-  /** Width for the desktop right rail while it shows a browser tab or an opened file. */
+  /** Width for the desktop right rail while it shows an opened file. */
   inlinePanelWideWidthPx?: number;
+  /** User's target width when opening a browser tab in the desktop right rail. */
+  inlinePanelBrowserWidthPx?: number;
   /** Width for the always-visible desktop left sidebar (conversations). */
   sidebarWidthPx?: number;
   /** Width for the comments panel inside the file viewer. */
@@ -46,6 +48,8 @@ export function readPanelSizePreferences(): PanelSizePreferences {
       prefs.inlinePanelWidthPx = record.inlinePanelWidthPx;
     if (isValidWidth(record.inlinePanelWideWidthPx))
       prefs.inlinePanelWideWidthPx = record.inlinePanelWideWidthPx;
+    if (isValidWidth(record.inlinePanelBrowserWidthPx))
+      prefs.inlinePanelBrowserWidthPx = record.inlinePanelBrowserWidthPx;
     if (isValidWidth(record.sidebarWidthPx)) prefs.sidebarWidthPx = record.sidebarWidthPx;
     if (isValidWidth(record.commentsPanelWidthPx))
       prefs.commentsPanelWidthPx = record.commentsPanelWidthPx;

@@ -117,6 +117,12 @@ function renderWorkspace(
     inert?: boolean;
     mobileSideChatsOpen?: boolean;
     onWideContentChange?: (wide: boolean) => void;
+    onBrowserContentChange?: (browser: {
+      viewId: string | null;
+      ownerId: string;
+      viewIds: readonly string[];
+      open: boolean;
+    }) => void;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -177,6 +183,7 @@ function renderWorkspace(
         mobileSideChatsOpen={overrides.mobileSideChatsOpen}
         onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
         onWideContentChange={overrides.onWideContentChange}
+        onBrowserContentChange={overrides.onBrowserContentChange}
       />
     </TooltipProvider>,
   );
@@ -536,6 +543,68 @@ describe("WorkspacePanel content area", () => {
 });
 
 describe("WorkspacePanel wide-content report", () => {
+  it.each([true, false])("reports the selected browser identity and panel open=%s", (open) => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-one", "browser-two"],
+      selectedBrowserId: "browser-one",
+    });
+    const onBrowserContentChange = vi.fn();
+    renderWorkspace({
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      open,
+      onBrowserContentChange,
+    });
+    expect(onBrowserContentChange).toHaveBeenLastCalledWith({
+      viewId: "browser-tab:conv_ws:browser-one",
+      open,
+      ownerId: "conv_ws",
+      viewIds: ["browser-tab:conv_ws:browser-one", "browser-tab:conv_ws:browser-two"],
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Browser 2", hidden: !open }));
+    expect(onBrowserContentChange).toHaveBeenLastCalledWith({
+      viewId: "browser-tab:conv_ws:browser-two",
+      open,
+      ownerId: "conv_ws",
+      viewIds: ["browser-tab:conv_ws:browser-one", "browser-tab:conv_ws:browser-two"],
+    });
+  });
+
+  it("does not report rendered HTML files as browsers", () => {
+    const onBrowserContentChange = vi.fn();
+    renderWorkspace({ selectedFilePath: "preview.html", onBrowserContentChange });
+    expect(onBrowserContentChange).toHaveBeenLastCalledWith({
+      viewId: null,
+      open: true,
+      ownerId: "conv_ws",
+      viewIds: [],
+    });
+  });
+
+  it("reports a reserved browser view leaving the open-tab set when closed", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["agent-browser"],
+      selectedBrowserId: "agent-browser",
+    });
+    const onBrowserContentChange = vi.fn();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser", onBrowserContentChange });
+    expect(onBrowserContentChange).toHaveBeenLastCalledWith({
+      viewId: "conv_ws",
+      ownerId: "conv_ws",
+      viewIds: ["conv_ws"],
+      open: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(onBrowserContentChange).toHaveBeenLastCalledWith({
+        viewId: null,
+        ownerId: "conv_ws",
+        viewIds: [],
+        open: true,
+      }),
+    );
+  });
+
   const term = {
     id: "terminal_zsh_s1",
     name: "zsh",

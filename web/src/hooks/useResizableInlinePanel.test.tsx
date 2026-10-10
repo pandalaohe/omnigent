@@ -366,6 +366,183 @@ describe("useResizableInlinePanel browser/file width", () => {
   });
 });
 
+describe("useResizableInlinePanel browser opening", () => {
+  function renderBrowser(viewId: string | null = null, minWidth: number | undefined = undefined) {
+    return renderHook(
+      ({ id, open, maximized }) =>
+        useResizableInlinePanel(SESSION, minWidth, 280, true, id !== null, {
+          viewId: id,
+          ownerId: SESSION,
+          viewIds: ["browser-one", "browser-two"],
+          open,
+          maximized,
+        }),
+      { initialProps: { id: viewId, open: true, maximized: false } },
+    );
+  }
+
+  it.each([
+    [1920, 1024],
+    [1440, 560],
+    [1200, 432],
+  ])("sizes a new browser at %i px without shrinking the current panel", (viewport, expected) => {
+    setInnerWidth(viewport);
+    const { result, rerender } = renderBrowser();
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(expected);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBeNull();
+  });
+
+  it("leaves 600 px for chat in a medium window when the previous panel is narrower", () => {
+    setInnerWidth(1440);
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    resetWidthStoreForTesting();
+    const { result, rerender } = renderBrowser();
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(560);
+  });
+
+  it("restores each open tab's last shown width, but recomputes on panel reopening", () => {
+    setInnerWidth(1920);
+    const { result, rerender } = renderBrowser("browser-one");
+    expect(result.current.panelWidth).toBe(1024);
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1320 })));
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(result.current.panelWidth).toBe(600);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(600);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBeNull();
+
+    rerender({ id: "browser-two", open: true, maximized: false });
+    expect(nudgeWiderOnce(result)).toBe(620);
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(600);
+
+    rerender({ id: "browser-one", open: false, maximized: false });
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(620);
+  });
+
+  it("keeps manual drags free to the 480 chat floor and uses the target on the next opening", () => {
+    setInnerWidth(1440);
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    resetWidthStoreForTesting();
+    const { result, rerender } = renderBrowser("browser-one");
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 0 })));
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(result.current.panelWidth).toBe(672);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(672);
+    rerender({ id: "browser-one", open: false, maximized: false });
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(560);
+    rerender({ id: null, open: true, maximized: false });
+    rerender({ id: "browser-two", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(560);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(672);
+  });
+
+  it("records the clamped last shown width without recomputing on window resize", () => {
+    setInnerWidth(1920);
+    const { result, rerender } = renderBrowser("browser-one");
+    setInnerWidth(1440);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(result.current.panelWidth).toBe(672);
+    rerender({ id: null, open: true, maximized: false });
+    setInnerWidth(1920);
+    act(() => window.dispatchEvent(new Event("resize")));
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(672);
+  });
+
+  it("keeps the setting and full screen from changing remembered browser widths", () => {
+    setInnerWidth(1920);
+    const { result, rerender } = renderBrowser("browser-one");
+    expect(result.current.panelWidth).toBe(1024);
+    rerender({ id: "browser-one", open: true, maximized: true });
+    setInnerWidth(2000);
+    act(() => window.dispatchEvent(new Event("resize")));
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(1024);
+    act(() => writeWidenWorkspaceForContent(false));
+    expect(result.current.panelWidth).toBe(600);
+    act(() => writeWidenWorkspaceForContent(true));
+    expect(result.current.panelWidth).toBe(1024);
+  });
+
+  it("keeps the comments floor and freezes the browser destination during a drag", () => {
+    setInnerWidth(1920);
+    const { result, rerender } = renderBrowser("browser-one", 720);
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 1320 })));
+    rerender({ id: "browser-two", open: true, maximized: false });
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(720);
+    expect(result.current.panelWidth).toBe(1024);
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(720);
+  });
+
+  it("preserves both docked widths when browser tabs switch in full screen", () => {
+    setInnerWidth(1920);
+    const { result, rerender } = renderBrowser("browser-one");
+    const narrow = () =>
+      act(() =>
+        result.current.handleProps.onKeyDown({
+          key: "ArrowRight",
+          preventDefault: () => {},
+        } as React.KeyboardEvent),
+      );
+    narrow();
+    expect(result.current.panelWidth).toBe(1004);
+    rerender({ id: "browser-two", open: true, maximized: false });
+    narrow();
+    expect(result.current.panelWidth).toBe(984);
+    rerender({ id: "browser-one", open: true, maximized: false });
+    rerender({ id: "browser-one", open: true, maximized: true });
+    rerender({ id: "browser-two", open: true, maximized: true });
+    rerender({ id: "browser-one", open: true, maximized: true });
+    rerender({ id: "browser-one", open: true, maximized: false });
+    rerender({ id: "browser-two", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(984);
+  });
+
+  it("reapplies the opening rule when a closed agent browser is recreated with the same view ID", () => {
+    setInnerWidth(1440);
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    resetWidthStoreForTesting();
+    const { result, rerender } = renderHook(
+      ({ id, present }) =>
+        useResizableInlinePanel(SESSION, undefined, 280, true, id !== null, {
+          viewId: id,
+          open: true,
+          maximized: false,
+          ownerId: SESSION,
+          viewIds: present ? [SESSION] : [],
+        }),
+      { initialProps: { id: SESSION as string | null, present: true } },
+    );
+    expect(result.current.panelWidth).toBe(560);
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    act(() => window.dispatchEvent(new MouseEvent("mousemove", { clientX: 0 })));
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(result.current.panelWidth).toBe(672);
+    rerender({ id: null, present: false });
+    expect(result.current.panelWidth).toBe(420);
+    rerender({ id: SESSION, present: true });
+    expect(result.current.panelWidth).toBe(560);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(672);
+  });
+});
+
 describe("useResizableInlinePanel drag overlay", () => {
   const overlaySelector = () =>
     [...document.body.children].find(

@@ -56,6 +56,24 @@ describe("panelSizePreferences", () => {
     expect(readPanelSizePreferences()).toEqual({ inlinePanelWidthPx: 500 });
   });
 
+  it("keeps the browser target independent of file and normal widths", () => {
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    writePanelSizePreference("inlinePanelWideWidthPx", 840);
+    writePanelSizePreference("inlinePanelBrowserWidthPx", 1024);
+    expect(readPanelSizePreferences()).toEqual({
+      inlinePanelWidthPx: 420,
+      inlinePanelWideWidthPx: 840,
+      inlinePanelBrowserWidthPx: 1024,
+    });
+    writePanelSizePreference("inlinePanelBrowserWidthPx", null);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBeNull();
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ inlinePanelBrowserWidthPx: "wide", inlinePanelWidthPx: 420 }),
+    );
+    expect(readPanelSizePreferences()).toEqual({ inlinePanelWidthPx: 420 });
+  });
+
   it("ignores malformed JSON", () => {
     // Corrupt localStorage should not break app boot.
     localStorage.setItem(STORAGE_KEY, "}{not json");
