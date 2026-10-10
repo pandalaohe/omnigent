@@ -10,13 +10,15 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { readPanelSizePreference } from "@/lib/panelSizePreferences";
+import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { resetWidthStoreForTesting } from "@/hooks/useResizableInlinePanel";
 import { resetSidebarWidthStoreForTesting, useResizableSidebar } from "@/hooks/useResizableSidebar";
 import {
@@ -54,7 +56,11 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
+  useSession: vi.fn(() => ({
+    session: { id: "conv_ws", parentSessionId: null },
+    isLoading: false,
+    error: null,
+  })),
 }));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
@@ -84,6 +90,13 @@ vi.mock("./FilesPanelDrawer", () => ({
 vi.mock("./TerminalsPanel", () => ({
   TerminalsPanel: () => <div data-testid="terminals-panel" />,
 }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  supportsBrowser: () => true,
+}));
+vi.mock("@/components/BrowserPane/BrowserPane", () => ({
+  BrowserPane: () => <div data-testid="browser-pane" />,
+}));
 
 import { AppShell } from "./AppShell";
 import { useFileViewer } from "./FileViewerContext";
@@ -101,6 +114,7 @@ function setInnerWidth(px: number): void {
 
 function FileOpenProbe() {
   const openFile = useFileViewer();
+  const navigate = useNavigate();
   const { width } = useResizableSidebar();
   return (
     <>
@@ -108,6 +122,12 @@ function FileOpenProbe() {
         Open file
       </button>
       <span data-testid="sidebar-width">{width}</span>
+      <button type="button" onClick={() => navigate("/c/conv_other")}>
+        Other session
+      </button>
+      <button type="button" onClick={() => navigate("/c/conv_ws")}>
+        First session
+      </button>
     </>
   );
 }
@@ -205,6 +225,77 @@ function selectTab(name: RegExp) {
 }
 
 describe("Workspace rail content width", () => {
+  it("restores browser widths across real session navigation without pruning incoming tabs", () => {
+    setInnerWidth(1920);
+    writePanelSizePreference("sidebarWidthPx", 280);
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    resetSidebarWidthStoreForTesting();
+    resetWidthStoreForTesting();
+    writeSessionWorkspaceState("conv_ws", {
+      rightRailTab: "browser",
+      openBrowsers: ["browser-first"],
+      selectedBrowserId: "browser-first",
+    });
+    writeSessionWorkspaceState("conv_other", {
+      rightRailTab: "browser",
+      openBrowsers: ["browser-other"],
+      selectedBrowserId: "browser-other",
+    });
+    renderShell();
+    const narrow = () =>
+      fireEvent.keyDown(screen.getByRole("separator", { name: "Resize panel" }), {
+        key: "ArrowRight",
+      });
+    narrow();
+    expect(rail().style.width).toBe("1004px");
+    fireEvent.click(screen.getByRole("button", { name: "Other session" }));
+    narrow();
+    narrow();
+    expect(rail().style.width).toBe("964px");
+    fireEvent.click(screen.getByRole("button", { name: "First session" }));
+    expect(rail().style.width).toBe("1004px");
+    fireEvent.click(screen.getByRole("button", { name: "Other session" }));
+    expect(rail().style.width).toBe("964px");
+  });
+
+  it.each([
+    [1920, "1024px"],
+    [1440, "560px"],
+  ])("sizes only browser tabs at a %i px viewport with the sidebar open", (viewport, expected) => {
+    setInnerWidth(viewport);
+    writePanelSizePreference("sidebarWidthPx", 280);
+    writePanelSizePreference("inlinePanelWidthPx", 420);
+    resetSidebarWidthStoreForTesting();
+    resetWidthStoreForTesting();
+    writeSessionWorkspaceState("conv_ws", {
+      rightRailTab: "browser",
+      openBrowsers: ["browser-one", "browser-two"],
+      selectedBrowserId: "browser-one",
+    });
+    renderShell();
+    expect(rail().style.width).toBe(expected);
+    expect(screen.getByTestId("sidebar-width")).toHaveTextContent("280");
+    const handle = screen.getByRole("separator", { name: "Resize panel" });
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    const draggedWidth = viewport === 1920 ? "1004px" : "540px";
+    expect(rail().style.width).toBe(draggedWidth);
+    fireEvent.click(screen.getByRole("tab", { name: "Browser 2" }));
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    fireEvent.click(screen.getByRole("tab", { name: "Browser 1" }));
+    expect(rail().style.width).toBe(draggedWidth);
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(rail().style.width).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(rail().style.width).toBe(draggedWidth);
+    act(() => writeWidenWorkspaceForContent(false));
+    expect(rail().style.width).toBe("420px");
+    act(() => writeWidenWorkspaceForContent(true));
+    expect(rail().style.width).toBe(draggedWidth);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(rail().style.width).toBe(viewport === 1920 ? "984px" : "520px");
+  });
+
   it("widens for an opened file and returns to the normal width on another tab", () => {
     renderShell();
 
@@ -248,7 +339,7 @@ describe("Workspace rail content width", () => {
     expect(rail().style.width).toBe("600px");
   });
 
-  it("leaves the phone layout's rail width alone when a file opens", () => {
+  it("leaves the phone layout's rail width alone for browsers and files", () => {
     // Phone width: the rail is hidden and the file opens in its own drawer, so
     // the rail width (and the offsets derived from it) must not move.
     window.matchMedia = ((query: string) => ({
@@ -262,6 +353,11 @@ describe("Workspace rail content width", () => {
       dispatchEvent: () => false,
     })) as typeof window.matchMedia;
     vi.mocked(isMobileViewport).mockReturnValue(true);
+    writeSessionWorkspaceState("conv_ws", {
+      rightRailTab: "browser",
+      openBrowsers: ["browser-one"],
+      selectedBrowserId: "browser-one",
+    });
 
     renderShell();
     const phoneRail = () => screen.getByRole("complementary", { name: "Workspace", hidden: true });

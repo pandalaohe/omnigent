@@ -27,6 +27,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -56,7 +57,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
-import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
@@ -765,6 +766,13 @@ interface WorkspacePanelProps {
   onMobileSideChatsOpenChange?: (open: boolean) => void;
   /** Reports whether the rail is showing a browser tab or an opened file, so the shell can size it. */
   onWideContentChange?: (wide: boolean) => void;
+  /** Identifies the browser actually shown; opening the rail sizes it separately from files. */
+  onBrowserContentChange?: (browser: {
+    viewId: string | null;
+    ownerId: string;
+    viewIds: readonly string[];
+    open: boolean;
+  }) => void;
 }
 
 /**
@@ -831,8 +839,13 @@ function WorkspacePanelImpl({
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
   onWideContentChange,
+  onBrowserContentChange,
 }: WorkspacePanelProps) {
   const browsers = useBrowserTabs(conversationId);
+  const browserViewIds = useMemo(
+    () => browsers.tabs.map((id) => browserViewId(conversationId, id)),
+    [browsers.tabs, conversationId],
+  );
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
     if (!closed) toast.error("Couldn't close browser tab. Try again.");
@@ -850,10 +863,25 @@ function WorkspacePanelImpl({
     !pending &&
     !(selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey)) &&
     (selectedFilePath !== null || (browserSelected && showBrowserTab));
+  const sizingBrowserViewId = showsWideContent && browserSelected ? browsers.viewId : null;
   // A layout effect so the shell resizes before paint.
   useLayoutEffect(() => {
     onWideContentChange?.(showsWideContent);
-  }, [onWideContentChange, showsWideContent]);
+    onBrowserContentChange?.({
+      viewId: sizingBrowserViewId,
+      open,
+      ownerId: conversationId,
+      viewIds: browserViewIds,
+    });
+  }, [
+    onWideContentChange,
+    onBrowserContentChange,
+    showsWideContent,
+    sizingBrowserViewId,
+    open,
+    conversationId,
+    browserViewIds,
+  ]);
   const addBrowser = () => {
     browsers.add();
     onRightRailTabChange("browser");

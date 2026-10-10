@@ -8,6 +8,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useReducer,
   useRef,
@@ -15,6 +16,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import { browserViewOwnerId } from "@/hooks/useBrowserTabs";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   readWidenWorkspaceForContent,
@@ -25,6 +27,8 @@ const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.99;
 /** The center chat column never shrinks past this, whatever the rail wants. */
 const CHAT_MIN_WIDTH_PX = 480;
+const CHAT_READING_WIDTH_PX = 600;
+const BROWSER_TARGET_WIDTH_PX = 1024;
 /** Visual gap between the chat column and the rail. */
 const GAP_PX = 8;
 
@@ -41,7 +45,7 @@ function defaultWidthPx(): number {
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
 }
 
-// First-use width for the wide (browser/file) mode: never narrower than the
+// First-use width for opened files: never narrower than the
 // normal width, otherwise half the space left beside the open sidebar.
 function wideDefaultWidthPx(normal: number, reservedPx: number): number {
   if (typeof window === "undefined") return normal;
@@ -85,10 +89,16 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
 let currentSessionId: string | null = null;
 let preferredWidth: number | null = readPanelSizePreference("inlinePanelWidthPx");
 let storedWidth: number | null = preferredWidth;
-// Separate remembered width for the desktop rail while it shows a browser tab
-// or an opened file. `null` means the user has never sized that mode.
+// Separate remembered width for opened files. `null` means the user has never sized that mode.
 let wideWidth: number | null = readPanelSizePreference("inlinePanelWideWidthPx");
+let browserTarget: number | null = readPanelSizePreference("inlinePanelBrowserWidthPx");
 const listeners = new Set<() => void>();
+
+function persistBrowserTarget(value: number) {
+  browserTarget = value;
+  writePanelSizePreference("inlinePanelBrowserWidthPx", value);
+  for (const l of listeners) l();
+}
 
 function setWideWidth(value: number | null) {
   if (value === wideWidth) return;
@@ -142,6 +152,7 @@ export function resetWidthStoreForTesting(): void {
   currentSessionId = null;
   preferredWidth = readPanelSizePreference("inlinePanelWidthPx");
   wideWidth = readPanelSizePreference("inlinePanelWideWidthPx");
+  browserTarget = readPanelSizePreference("inlinePanelBrowserWidthPx");
   setStoredWidthRaw(preferredWidth);
 }
 
@@ -151,6 +162,10 @@ function getSnapshot(): number | null {
 
 function getWideSnapshot(): number | null {
   return wideWidth;
+}
+
+function getBrowserSnapshot(): number | null {
+  return browserTarget;
 }
 
 function getServerSnapshot(): number | null {
@@ -184,6 +199,7 @@ function getServerSnapshot(): number | null {
  * which conversation tree owns the visible rail.
  *
  * `showsWideContent` is true while the rail shows a browser tab or an opened file.
+ * `browser` identifies a browser tab and whether the panel is open or maximized.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
@@ -191,15 +207,31 @@ export function useResizableInlinePanel(
   reservedPx = 0,
   persistEnabled = true,
   showsWideContent = false,
+  browser: {
+    viewId: string | null;
+    ownerId: string | null;
+    viewIds: readonly string[];
+    open: boolean;
+    maximized: boolean;
+  } | null = null,
 ) {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const rawWide = useSyncExternalStore(subscribe, getWideSnapshot, getServerSnapshot);
+  const rawBrowser = useSyncExternalStore(subscribe, getBrowserSnapshot, getServerSnapshot);
   const widenEnabled = useSyncExternalStore(
     subscribeWidenWorkspaceForContent,
     readWidenWorkspaceForContent,
     () => true,
   );
   const wide = showsWideContent && widenEnabled;
+  const browserId = wide ? (browser?.viewId ?? null) : null;
+  const browserWidths = useRef(new Map<string, number>());
+  const previousBrowser = useRef<{ id: string | null; open: boolean; maximized: boolean }>({
+    id: null,
+    open: false,
+    maximized: false,
+  });
+  const previousWidth = useRef<number | null>(null);
   // Before the one-time migration effect commits, derive this render from the
   // incoming session's legacy width so upgraded users do not see a default-
   // width flash. A device preference always wins and survives session changes.
@@ -208,13 +240,27 @@ export function useResizableInlinePanel(
     effectiveRaw = readSessionWorkspaceState(sessionId).widthPx ?? null;
   }
   const normalWidth = effectiveRaw ?? defaultWidthPx();
+  let contentWidth = wide ? (rawWide ?? wideDefaultWidthPx(normalWidth, reservedPx)) : normalWidth;
+  if (browserId !== null) {
+    const savedWidth = browserWidths.current.get(browserId);
+    const opening = browser?.open && !previousBrowser.current.open;
+    if (!browser?.maximized && browser?.open && (savedWidth === undefined || opening)) {
+      const available = typeof window === "undefined" ? Infinity : window.innerWidth - reservedPx;
+      contentWidth = Math.max(
+        previousWidth.current === null
+          ? clamp(normalWidth, minWidthPx, reservedPx)
+          : opening
+            ? 0
+            : previousWidth.current,
+        Math.min(rawBrowser ?? BROWSER_TARGET_WIDTH_PX, available - CHAT_READING_WIDTH_PX),
+      );
+    } else {
+      contentWidth = savedWidth ?? previousWidth.current ?? normalWidth;
+    }
+  }
   // Clamped at render time only — the stores keep the user's preferred widths,
   // so a temporary squeeze (sidebar opening) is undone when the space returns.
-  const resolvedWidth = clamp(
-    wide ? (rawWide ?? wideDefaultWidthPx(normalWidth, reservedPx)) : normalWidth,
-    minWidthPx,
-    reservedPx,
-  );
+  const resolvedWidth = clamp(contentWidth, minWidthPx, reservedPx);
   // Drives the drag listeners' lifecycle: they mount only while a drag is
   // live, so there's no idle window-level mousemove handler firing during
   // ordinary page use.
@@ -225,6 +271,42 @@ export function useResizableInlinePanel(
   // could dip below its minimum on a shrink. This tick forces a recompute on
   // every resize regardless of whether the stored width moved.
   const [, bumpViewport] = useReducer((n: number) => n + 1, 0);
+  useLayoutEffect(() => {
+    const previous = previousBrowser.current;
+    if (
+      previous.id !== null &&
+      (previous.id !== browserId || browser?.maximized) &&
+      previous.open &&
+      !previous.maximized &&
+      previousWidth.current !== null
+    ) {
+      browserWidths.current.set(previous.id, previousWidth.current);
+    }
+    // The agent browser reuses its view ID after close. Drop only closed tabs
+    // in this session, preserving other sessions and temporarily hidden tabs.
+    if (browser?.ownerId !== null && browser?.ownerId !== undefined) {
+      for (const id of browserWidths.current.keys()) {
+        if (browserViewOwnerId(id) === browser.ownerId && !browser.viewIds.includes(id)) {
+          browserWidths.current.delete(id);
+        }
+      }
+    }
+    if (browserId !== null && browser?.open && !browser.maximized) {
+      if (!browserWidths.current.has(browserId) || !previous.open) {
+        browserWidths.current.set(browserId, contentWidth);
+      }
+    }
+    previousBrowser.current = {
+      id: browserId,
+      open: browser?.open ?? false,
+      maximized: browser?.maximized ?? false,
+    };
+    if (!browser?.maximized) previousWidth.current = resolvedWidth;
+  });
+  const setBrowserWidth = useCallback((id: string, value: number) => {
+    browserWidths.current.set(id, value);
+    bumpViewport();
+  }, []);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -235,6 +317,7 @@ export function useResizableInlinePanel(
   // Frozen at mousedown so a mode switch mid-drag (rail content changing
   // between wide and normal) can't redirect the width to the other store.
   const dragWideRef = useRef(false);
+  const dragBrowserRef = useRef<string | null>(null);
 
   // While dragging, a transparent full-window overlay sits above the panel so
   // the pointer stream keeps reaching the parent document. Without it, dragging
@@ -288,18 +371,30 @@ export function useResizableInlinePanel(
       if (!persistEnabled) return;
       e.preventDefault();
       dragWideRef.current = wide;
+      dragBrowserRef.current = browserId;
       setIsDragging(true);
       addDragOverlay();
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay, persistEnabled, wide],
+    [addDragOverlay, persistEnabled, wide, browserId],
   );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!persistEnabled) return;
       const step = 20;
+      if (browserId !== null && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        const next = clamp(
+          resolvedWidth + (e.key === "ArrowLeft" ? step : -step),
+          minWidthRef.current,
+          reservedRef.current,
+        );
+        setBrowserWidth(browserId, next);
+        persistBrowserTarget(next);
+        return;
+      }
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         if (wide) {
@@ -328,7 +423,7 @@ export function useResizableInlinePanel(
         }
       }
     },
-    [persistEnabled, resolvedWidth, wide],
+    [persistEnabled, resolvedWidth, wide, browserId, setBrowserWidth],
   );
 
   // Drag listeners live only while a drag is active — no idle window-level
@@ -343,7 +438,12 @@ export function useResizableInlinePanel(
     function flush() {
       frame = 0;
       if (pending === null || !persistEnabledRef.current) return;
-      if (dragWideRef.current) {
+      if (dragBrowserRef.current !== null) {
+        setBrowserWidth(
+          dragBrowserRef.current,
+          clamp(pending, minWidthRef.current, reservedRef.current),
+        );
+      } else if (dragWideRef.current) {
         setWideWidth(clamp(pending, minWidthRef.current, reservedRef.current));
       } else {
         setStoredWidth(clamp(pending, minWidthRef.current, reservedRef.current));
@@ -362,7 +462,10 @@ export function useResizableInlinePanel(
       setIsDragging(false);
       removeDragOverlay();
       if (persistEnabledRef.current) {
-        if (dragWideRef.current) {
+        if (dragBrowserRef.current !== null) {
+          const width = browserWidths.current.get(dragBrowserRef.current);
+          if (width !== undefined) persistBrowserTarget(width);
+        } else if (dragWideRef.current) {
           writePanelSizePreference("inlinePanelWideWidthPx", wideWidth);
         } else {
           persistStoredWidth();
@@ -384,7 +487,7 @@ export function useResizableInlinePanel(
       document.body.style.userSelect = "";
       removeDragOverlay();
     };
-  }, [isDragging, removeDragOverlay]);
+  }, [isDragging, removeDragOverlay, setBrowserWidth]);
 
   // Stable identity so consumers memoized on this prop (WorkspacePanel) don't
   // re-render on every parent render — the object only changes when its inputs do.

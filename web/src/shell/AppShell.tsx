@@ -945,6 +945,17 @@ export function AppShell() {
   }, [rootSessionId, rootSessionResolved]);
   // The desktop rail takes its own width while WorkspacePanel reports a browser tab or an opened file.
   const [railShowsWideContent, setRailShowsWideContent] = useState(false);
+  const [railBrowser, setRailBrowser] = useState<{
+    viewId: string | null;
+    open: boolean;
+    ownerId: string | null;
+    viewIds: readonly string[];
+  }>({
+    viewId: null,
+    open: rightPanelOpen,
+    ownerId: null,
+    viewIds: [],
+  });
   const {
     panelWidth: inlinePanelWidth,
     handleProps: inlinePanelHandleProps,
@@ -955,6 +966,7 @@ export function AppShell() {
     sidebarOpen ? sidebarWidth : 0,
     rootSessionResolved,
     !mobileViewport && railShowsWideContent,
+    { ...railBrowser, maximized: rightPanelMaximized },
   );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
@@ -2719,6 +2731,7 @@ export function AppShell() {
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
                     onWideContentChange={setRailShowsWideContent}
+                    onBrowserContentChange={setRailBrowser}
                   />
                 )}
                 {(goalFrameState === "active" || goalFrameState === "paused") && (
