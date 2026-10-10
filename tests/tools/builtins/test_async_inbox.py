@@ -279,6 +279,16 @@ def test_read_inbox_description_names_wake_notice(read_tool: SysReadInboxTool) -
     assert "not from a person" in desc
 
 
+def test_read_inbox_description_names_peer_copies(read_tool: SysReadInboxTool) -> None:
+    """The description identifies peer-started copies and their optional relevance."""
+    desc = read_tool.description()
+    assert "copies of a sub-agent's turn that another session started" in desc
+    assert "[System: copy" in desc
+    assert "[System: corrected copy" in desc
+    assert "not results of work you dispatched" in desc
+    assert "need no action unless they matter to your plan" in desc
+
+
 def test_sys_cancel_task_schema_keeps_task_id_contract() -> None:
     """
     Generic ``sys_cancel_task`` stays on ``task_id`` — distinct
