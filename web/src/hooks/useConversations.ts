@@ -75,6 +75,12 @@ import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
+import { childSessionsQueryKey } from "./useChildSessions";
+
+function refreshChildLists(queryClient: QueryClient, id: string, parentId?: string | null): void {
+  const parent = parentId ?? queryClient.getQueryData<Session>(["session", id])?.parentSessionId;
+  if (parent) void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parent) });
+}
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
@@ -577,6 +583,7 @@ function withRecentlyCreated(
     // beats the frozen snapshot, so a WS-confirmed title — or archive flag —
     // isn't reverted by re-injecting stale data.
     const row = findCachedConversationRow(queryClient, id) ?? snapshot;
+    if (row.parent_session_id != null) continue;
     if (row.archived && !includeArchived) continue;
     inject.push(row);
   }
@@ -1211,6 +1218,7 @@ export function useRenameConversation() {
       markConversationSeen(updated.id, updated.updated_at);
       // Reconcile with the server-confirmed title + authoritative updated_at.
       overlayTitle(updated.id, updated.title, updated.updated_at);
+      refreshChildLists(queryClient, updated.id, updated.parent_session_id);
     },
   });
 }
@@ -1315,6 +1323,7 @@ export function useArchiveConversation() {
       );
     },
     onSuccess: (updated, { archived }, context) => {
+      refreshChildLists(queryClient, updated.id, updated.parent_session_id);
       markConversationSeen(updated.id, updated.updated_at);
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
@@ -1587,6 +1596,7 @@ export function useStopAndDeleteConversation() {
       showToast(deleteFailedToast(context?.label, err), { duration: 0 });
     },
     onSuccess: (_data, { id }) => {
+      refreshChildLists(queryClient, id);
       finalizeDeletedConversations(queryClient, [id]);
       void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
     },
@@ -1802,8 +1812,13 @@ export async function undoArchiveConversations(
     const failed: string[] = [];
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
-      if (result.status === "fulfilled") markConversationSeen(ids[i], result.value.updated_at);
-      else failed.push(ids[i]);
+      if (result.status === "fulfilled") {
+        markConversationSeen(ids[i], result.value.updated_at);
+        refreshChildLists(queryClient, ids[i], result.value.parent_session_id);
+        queryClient.setQueryData<Session>(["session", ids[i]], (old) =>
+          old ? { ...old, archived: false } : old,
+        );
+      } else failed.push(ids[i]);
     }
     if (failed.length > 0) {
       // The ids that stayed archived: drop them from the keep-alive so they stop

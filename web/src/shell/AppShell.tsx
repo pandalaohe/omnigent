@@ -750,7 +750,7 @@ export function AppShell() {
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
   const actionConversation = useMemo<Conversation | null>(() => {
-    if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
+    if (!isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
     if (!activeSessionMatchesRoute || !activeSession) return null;
     return {
@@ -758,12 +758,18 @@ export function AppShell() {
       object: "conversation",
       title: activeSession.title,
       created_at: activeSession.createdAt,
-      updated_at: activeSession.createdAt,
+      updated_at: activeSession.updatedAt ?? activeSession.createdAt,
       labels: activeSession.labels ?? {},
       // The snapshot is the only archived-flag carrier here: an archived
       // session is absent from the sidebar list, so without this the header
       // menu would offer "Archive" on an already-archived session.
       archived: activeSession.archived ?? false,
+      status:
+        activeSession.status === "failed"
+          ? "failed"
+          : activeSession.status === "running" || activeSession.status === "launching"
+            ? "running"
+            : "idle",
       permission_level: activeSession.permissionLevel,
       runner_id: activeSession.runnerId ?? null,
       host_id: activeSession.hostId ?? null,
@@ -772,12 +778,11 @@ export function AppShell() {
       agent_id: activeSession.agentId,
       agent_name: activeSession.agentName,
       git_branch: activeSession.gitBranch ?? null,
+      parent_session_id: activeSession.parentSessionId,
     };
-  }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
+  }, [activeConv, activeSession, activeSessionMatchesRoute, permissionLevel]);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
-  // Stop session is not a header action — it lives in the sidebar row's
-  // kebab menu (see Sidebar's ConversationRow).
   // Only the owner can manage sharing; top-level only. Sharing a
   // sub-agent is a no-op anyway — children inherit the parent's grants via
   // the server's parent-delegation path — so we hide the affordance.
@@ -1181,6 +1186,8 @@ export function AppShell() {
     [conversationId, setSearchParams, terminalFirst],
   );
 
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
+
   // Restore the per-session workspace state when switching conversations:
   // rail open-state, selected tab, and the open file tabs. The Chat/TUI toggle
   // is restored from sessionStorage; with no per-tab choice, terminal-first
@@ -1217,6 +1224,7 @@ export function AppShell() {
     }
     const persisted = readSessionWorkspaceState(conversationId);
     const showAgents = searchParams.get("panel") === "agents";
+    const showSideChat = sideChatToOpen?.parentId === conversationId;
 
     const storageKey = `omnigent.web.panel-key:${conversationId}`;
     const stored = sessionStorage.getItem(storageKey);
@@ -1225,7 +1233,7 @@ export function AppShell() {
       agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
     const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
     setPanelInitialKeyState(
-      showAgents || requestedView === "chat"
+      showAgents || showSideChat || requestedView === "chat"
         ? null
         : requestedView === "terminal"
           ? resolveTerminalViewKey(stored, terminalKey)
@@ -1266,7 +1274,8 @@ export function AppShell() {
     const persistedFiles = persisted.openFiles ?? [];
     const nextOpenFiles =
       urlFile && !persistedFiles.includes(urlFile) ? [...persistedFiles, urlFile] : persistedFiles;
-    const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
+    const nextSelected =
+      showAgents || showSideChat ? null : (urlFile ?? persisted.selectedFilePath ?? null);
     setOpenFiles(nextOpenFiles);
     setSelectedFilePath(nextSelected);
     // The tab strip derives from the live terminal list, so there's nothing to
@@ -1294,6 +1303,11 @@ export function AppShell() {
       setSelectedTerminalKey(null);
       setSubagentsPanelOpen(isMobileViewport());
     }
+    if (showSideChat) {
+      nextTab = "sidechat";
+      setSelectedTerminalKey(null);
+      setSideChatsPanelOpen(isMobileViewport());
+    }
     setRightRailTab(nextTab);
 
     // Restore the rail open-state for this session. A deep link / reload that
@@ -1304,7 +1318,10 @@ export function AppShell() {
     // session's saved open-state.
     const commentParam = searchParams.get("comment");
     const hasWorkspaceUrlSignal =
-      showAgents || urlFile !== null || (commentParam !== null && commentParam !== "");
+      showAgents ||
+      showSideChat ||
+      urlFile !== null ||
+      (commentParam !== null && commentParam !== "");
     setRightPanelOpenImmediately(
       (persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal,
     );
@@ -1939,7 +1956,6 @@ export function AppShell() {
   // shows it — the Workspace rail, or the drawer on a phone. WorkspacePanel
   // owns opening/selecting the tab and clearing the one-shot `sideChatToOpen`
   // signal (it holds the side-chat tab state, like the browser tabs).
-  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
     // Only the parent that owns the side chat reveals it: a fork that resolves
     // after the user moved to another conversation must not surface over the

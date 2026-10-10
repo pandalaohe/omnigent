@@ -12,6 +12,69 @@ from playwright.sync_api import Page, Route, expect
 from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload
 
 
+def test_child_header_opens_its_parent_panel_over_remembered_files(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    output_path: str,
+) -> None:
+    """The child-to-parent route transition selects and reveals the child pane."""
+    chat = chat_session_contract
+    child_id = "browser-child-session"
+    child_path = f"/v1/sessions/{child_id}"
+    child = {
+        **chat._session(),
+        "id": child_id,
+        "title": "Research notes",
+        "parent_session_id": chat.session_id,
+        "kind": "sub_agent",
+    }
+    contract = chat.contract
+    contract.json(child_path, child)
+    contract.json(f"{child_path}/items", list_payload([]))
+    contract.json(f"{child_path}/agent", chat._agent())
+    contract.json(f"{child_path}/health", chat._health())
+    contract.json(f"{child_path}/child_sessions", list_payload([]))
+    contract.json(f"{child_path}/resources/terminals", list_payload([]))
+    contract.json(
+        f"{child_path}/resources/environments/default",
+        {"error": {"message": "No workspace resource"}},
+        status=404,
+    )
+    contract.json(
+        f"{child_path}/resources/github",
+        {"error": {"message": "No GitHub resource"}},
+        status=404,
+    )
+    contract.json(f"/v1/skills?session_id={child_id}", {"skills": []})
+    contract.json(f"{child_path}/owner", {"owner": None})
+    contract.json(f"{child_path}/policies", list_payload([]))
+    contract.response(f"{child_path}/read-state", method="PUT")
+    contract.sse(f"{child_path}/stream")
+    remembered_state = json.dumps(
+        [{"id": chat.session_id, "state": {"open": False, "rightRailTab": "files"}}]
+    )
+    page.add_init_script(
+        "localStorage.setItem('omnigent:session-workspace-state', "
+        + json.dumps(remembered_state)
+        + ");"
+    )
+    page.emulate_media(reduced_motion="reduce")
+    page.goto(f"{chat.base_url}/c/{child_id}")
+    page.add_style_tag(content="* { animation: none !important; transition: none !important; }")
+    actions = page.get_by_test_id("header-conversation-actions")
+    expect(actions).to_be_visible(timeout=15_000)
+    actions.click()
+    page.get_by_role("menuitem", name="Open in panel", exact=True).click()
+
+    expect(page).to_have_url(chat.url)
+    expect(page.get_by_role("tab", name="Side chat 1")).to_have_attribute("aria-selected", "true")
+    expect(page.get_by_test_id("side-chat-input")).to_be_visible(timeout=15_000)
+    page.screenshot(path=str(Path(output_path) / "child-open-in-panel.png"), animations="disabled")
+    assert child["parent_session_id"] == chat.session_id
+    assert chat.event_posts == []
+    assert chat.session_patches == []
+
+
 def test_runnerless_side_chat_sends_from_its_direct_url(
     page: Page,
     chat_session_contract: ChatSessionContract,

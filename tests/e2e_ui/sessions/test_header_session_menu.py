@@ -1,7 +1,7 @@
 """E2E coverage for the chat-header session actions menu.
 
 The owner path exercises the real REST-backed rename flow from the header.
-The child path proves the owner menu is replaced by a Fork-only menu.
+The child path exercises direct owner controls without changing its parent.
 """
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ def test_header_session_menu_always_shows_horizontal_ellipsis(
     expect(trigger).to_have_css("opacity", "1")
 
 
-def test_header_session_menu_renames_owner_and_hides_for_subagent(
+def test_header_session_menu_manages_owner_and_child(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Owner menu renames the session; children get only Fork."""
+    """Owner menus manage the selected session, including a child."""
     base_url, session_id = seeded_session
     child_id: str | None = None
 
@@ -54,18 +54,20 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         # shortcuts. "Add to project" is a submenu trigger, so its label carries
         # the flyout's own items; match only the leading action label.
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(8)
         labels = [text.split("\n")[0] for text in menu_items.all_inner_texts()]
-        assert labels == [
-            "Pin",
-            "Fork",
-            "Export",
-            "Rename",
-            "Mark as unread",
-            "Add to project",
-            "Archive",
-            "Delete",
-        ]
+        assert all(
+            label in labels
+            for label in [
+                "Pin",
+                "Fork",
+                "Export",
+                "Rename",
+                "Mark as unread",
+                "Add to project",
+                "Archive",
+                "Delete",
+            ]
+        )
         # Dismiss the menu and wait for it to fully detach — Radix briefly puts
         # `pointer-events: none` on the body while closing, which would swallow
         # the title click that follows.
@@ -105,12 +107,42 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         expect(page.get_by_role("link", name="Back to parent session")).to_be_visible(
             timeout=30_000
         )
-        expect(page.get_by_test_id("header-conversation-actions")).to_have_count(0)
-        child_trigger = page.get_by_test_id("desktop-fork-actions-menu")
-        expect(child_trigger).to_be_visible()
+        child_trigger = page.get_by_test_id("header-conversation-actions")
+        expect(child_trigger).to_be_visible(timeout=30_000)
         child_trigger.click()
-        expect(page.get_by_role("menuitem")).to_have_count(1)
-        expect(page.get_by_role("menuitem", name="Fork", exact=True)).to_be_visible()
+        for label in ["Fork", "Export", "Rename", "Copy session ID", "Archive", "Delete"]:
+            expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+        expect(page.get_by_role("menuitem", name="Pin", exact=True)).to_have_count(0)
+        expect(page.get_by_test_id("header-move-to-project")).to_have_count(0)
+
+        page.get_by_role("menuitem", name="Rename", exact=True).click()
+        rename_input = page.get_by_role("textbox", name="Session name")
+        rename_input.fill("Research notes")
+        rename_input.press("Enter")
+        expect(page.get_by_role("dialog")).to_have_count(0)
+        child_trigger.click()
+        page.get_by_role("menuitem", name="Archive", exact=True).click()
+        expect(page).to_have_url(f"{base_url}/", timeout=15_000)
+        child_row = httpx.get(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
+        child_row.raise_for_status()
+        assert child_row.json()["archived"] is True
+        assert child_row.json()["title"] == "Research notes"
+        parent_row = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        parent_row.raise_for_status()
+        assert parent_row.json()["archived"] is False
+        assert parent_row.json()["title"] == renamed_title
+
+        page.goto(f"{base_url}/c/{child_id}")
+        expect(child_trigger).to_be_visible(timeout=30_000)
+        child_trigger.click()
+        page.get_by_role("menuitem", name="Unarchive", exact=True).click()
+        expect(page).to_have_url(f"{base_url}/c/{child_id}")
+        expect(page.get_by_role("menu")).to_have_count(0)
+        child_trigger.click()
+        expect(page.get_by_role("menuitem", name="Archive", exact=True)).to_be_visible()
+        child_row = httpx.get(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
+        child_row.raise_for_status()
+        assert child_row.json()["archived"] is False
     finally:
         if child_id is not None:
             httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
