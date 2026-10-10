@@ -8,7 +8,7 @@ import {
   Loader2Icon,
 } from "lucide-react";
 
-const Toaster = ({ expand, ...props }: ToasterProps) => {
+const Toaster = ({ expand, mobileOffset, ...props }: ToasterProps) => {
   const { theme = "system" } = useTheme();
   const { toasts } = useSonner();
   const hasPersistentPrompt = toasts.some(
@@ -40,6 +40,11 @@ const Toaster = ({ expand, ...props }: ToasterProps) => {
         },
       }}
       {...props}
+      mobileOffset={
+        typeof mobileOffset === "number" || typeof mobileOffset === "string"
+          ? mobileOffset
+          : { top: "calc(var(--omnigent-safe-top) + 1rem)", ...mobileOffset }
+      }
       expand={expand || hasPersistentPrompt}
     />
   );

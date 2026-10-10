@@ -44,9 +44,11 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen } from "./NewChatDialog";
 
+const projectRoute = vi.hoisted(() => ({ search: "" }));
+
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => vi.fn(),
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [new URLSearchParams(projectRoute.search), vi.fn()],
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -85,7 +87,10 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
-  useProjects: () => ({ data: [], isLoading: false }),
+  useProjects: () => ({
+    data: projectRoute.search ? [{ id: "project_1", name: "Sample project" }] : [],
+    isLoading: false,
+  }),
   useProjectConfig: () => ({ data: undefined, isLoading: false }),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
@@ -136,6 +141,7 @@ beforeEach(() => {
     ],
   } as ReturnType<typeof useAvailableAgents>);
   setViewport(false);
+  projectRoute.search = "";
 });
 
 afterEach(() => {
@@ -144,6 +150,26 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen keyboard behaviour", () => {
+  it("reserves the in-session status tray space below the composer on a phone", () => {
+    setViewport(true);
+    renderLanding();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    const statusSpace = screen.getByTestId("new-chat-landing-status-space");
+    expect(statusSpace).toHaveClass("h-7", "md:hidden");
+    expect(statusSpace.previousElementSibling).toBe(composer.closest("form"));
+    expect(statusSpace.parentElement).toBe(screen.getByTestId("new-chat-landing-composer-surface"));
+  });
+
+  it("reserves the same status tray space when New Chat is opened in a project", () => {
+    setViewport(true);
+    projectRoute.search = "project=Sample+project";
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-project-line")).toHaveTextContent("Sample project");
+    expect(screen.getByTestId("new-chat-landing-status-space")).toHaveClass("h-7", "md:hidden");
+  });
+
   it("focuses the composer on desktop so typing can start immediately", () => {
     renderLanding();
 
