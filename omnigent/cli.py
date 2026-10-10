@@ -4605,7 +4605,7 @@ def server(
 
     from omnigent.stores.host_store import HostStore
 
-    host_store = HostStore(db_uri)
+    host_store = HostStore(db_uri, conv_db_uri)
 
     # Managed sandbox hosts (host_type="managed" sessions): parse the
     # config's `sandbox:` section up front so an operator typo stops

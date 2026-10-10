@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import threading
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import event, update
@@ -13,6 +16,13 @@ from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.db_models import SqlHost, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.routes._host_worktree import WorktreeHostUnavailableError
+from omnigent.server.routes._sessions.helpers import _remove_session_worktree_best_effort
+from omnigent.stores.conversation_store import (
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    worktree_admission_fingerprint,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
@@ -444,6 +454,135 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     assert rotated is not None
     assert rotated.default_workspace == "D:\\AIProgram\\Projects"
     assert rotated.platform == "darwin"
+
+
+def test_host_id_rotation_waits_for_old_worktree_admission_lease(
+    host_store: HostStore, db_uri: str
+) -> None:
+    old_id, new_id = uuid.uuid4().hex, uuid.uuid4().hex
+    host_store.upsert_on_connect(old_id, "rotation-lease", "alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(
+        host_id=old_id, workspace="/opt/work/sample-app/topic"
+    )
+    token = host_store.acquire_worktree_admission(old_id, required=True)
+    assert token is not None
+    try:
+        with pytest.raises(OmnigentError, match="lease is busy"):
+            host_store.upsert_on_connect(new_id, "rotation-lease", "alice@example.com")
+        assert host_store.get_host(old_id) is not None
+        assert host_store.get_host(new_id) is None
+        current = conversations.get_conversation(conv.id)
+        assert current is not None and current.host_id == old_id
+    finally:
+        assert host_store.release_cli_retention(old_id, token)
+
+
+@pytest.mark.asyncio
+async def test_host_id_rotation_rejects_unresolved_old_worktree_fence(
+    host_store: HostStore, db_uri: str
+) -> None:
+    old_id, new_id = uuid.uuid4().hex, uuid.uuid4().hex
+    root = "/opt/work/sample-app/topic"
+    host_store.upsert_on_connect(old_id, "rotation-unresolved", "alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(
+        host_id=old_id, workspace=root, git_branch="feature/topic"
+    )
+    conversations.update_conversation(conv.id, archived=True)
+    old_fence = worktree_admission_fingerprint(old_id, root)
+    registry = SimpleNamespace(get=lambda _host_id: SimpleNamespace())
+    with (
+        patch(
+            "omnigent.server.routes._host_worktree.list_worktrees_on_host",
+            AsyncMock(return_value=[{"path": root, "branch": "feature/topic", "is_main": False}]),
+        ),
+        patch(
+            "omnigent.server.routes._host_worktree.remove_worktree_on_host",
+            AsyncMock(side_effect=WorktreeHostUnavailableError("response lost")),
+        ),
+    ):
+        assert (
+            await _remove_session_worktree_best_effort(
+                host_id=old_id,
+                worktree_path=root,
+                branch="feature/topic",
+                delete_branch=False,
+                host_registry=registry,
+                reason="session-archive",
+                conversation_store=conversations,
+                exclude_conversation_id=conv.id,
+                safe_only=True,
+            )
+            is False
+        )
+
+    with pytest.raises(OmnigentError, match="unresolved"):
+        host_store.upsert_on_connect(new_id, "rotation-unresolved", "alice@example.com")
+
+    assert host_store.get_host(old_id) is not None
+    assert host_store.get_host(new_id) is None
+    current = conversations.get_conversation(conv.id)
+    assert current is not None and current.host_id == old_id
+    assert current.labels[ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY] == old_fence
+
+
+def test_host_id_rotation_after_settled_removal_preserves_old_fence(
+    host_store: HostStore, db_uri: str
+) -> None:
+    old_id, new_id = uuid.uuid4().hex, uuid.uuid4().hex
+    root = "/opt/work/sample-app/topic"
+    host_store.upsert_on_connect(old_id, "rotation-settled", "alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation(host_id=old_id, workspace=root)
+    archived = conversations.update_conversation(conv.id, archived=True)
+    assert archived is not None
+    old_fence = worktree_admission_fingerprint(old_id, root)
+    conversations.set_labels(
+        conv.id,
+        {
+            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY: old_fence,
+            ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(archived.archive_revision),
+        },
+    )
+
+    rotated = host_store.upsert_on_connect(new_id, "rotation-settled", "alice@example.com")
+
+    assert rotated.host_id == new_id
+    assert host_store.get_host(old_id) is None
+    current = conversations.get_conversation(conv.id)
+    assert current is not None and current.host_id == new_id
+    assert current.labels[ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY] == old_fence
+    with pytest.raises(OmnigentError, match="Worktree was removed"):
+        conversations.create_conversation(host_id=old_id, workspace=f"{root}/packages/app")
+
+
+def test_host_id_rotation_reads_unresolved_fence_from_split_conversation_db(
+    db_uri: str, tmp_path: Path
+) -> None:
+    old_id, new_id = uuid.uuid4().hex, uuid.uuid4().hex
+    conv_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+    host_store = HostStore(db_uri, conv_uri)
+    host_store.upsert_on_connect(old_id, "rotation-split", "alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri, conv_uri)
+    conv = conversations.create_conversation(
+        host_id=old_id, workspace="/opt/work/sample-app/topic"
+    )
+    conversations.set_labels(
+        conv.id,
+        {
+            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY: worktree_admission_fingerprint(
+                old_id, "/opt/work/sample-app/topic"
+            )
+        },
+    )
+
+    with pytest.raises(OmnigentError, match="unresolved"):
+        host_store.upsert_on_connect(new_id, "rotation-split", "alice@example.com")
+    assert host_store.get_host(old_id) is not None
+    assert host_store.get_host(new_id) is None
+    current = conversations.get_conversation(conv.id)
+    assert current is not None and current.host_id == old_id
 
 
 def test_reown_host_id_across_owner_change_preserves_conversation_binding(
