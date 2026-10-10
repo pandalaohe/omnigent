@@ -1125,6 +1125,7 @@ async def test_delete_worktree_on_an_already_archived_session_requests_the_teard
     preferences = SqlAlchemyUserPreferencesStore(db_uri)
     app.state.user_preferences_store = preferences
     app.state.archive_close_coordinator.set_archive_preferences(preferences, None)
+    preferences.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "never"})
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv_store.set_host_id(
         session_id,
@@ -1145,7 +1146,7 @@ async def test_delete_worktree_on_an_already_archived_session_requests_the_teard
         assert first.status_code == 200
         row = conv_store.get_conversation(session_id)
         assert row is not None
-        # The keep-CLI policy left the first archive with no teardown at all.
+        # The keep-CLI policy and never preference leave the first archive without teardown.
         assert row.archive_close_requested_revision is None
         teardown.assert_not_awaited()
 

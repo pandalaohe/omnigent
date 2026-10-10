@@ -38,6 +38,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.host.git_worktree import WorktreeError, validate_worktree_path_template
+from omnigent.server.auth import RESERVED_USER_LOCAL
 
 logger = logging.getLogger(__name__)
 
@@ -93,14 +94,21 @@ def _validate_worktree_archive(value: Any) -> None:
 def read_worktree_archive_mode(
     store: SqlAlchemyUserPreferencesStore | None, owner: str | None
 ) -> str:
-    if store is None or owner is None:
+    if store is None:
         return "never"
     try:
-        envelope = store.get(owner)
-        value = (envelope or {}).get("settings", {}).get(WORKTREE_ARCHIVE_NAMESPACE)
+        envelope = store.get(owner or RESERVED_USER_LOCAL)
+        if envelope is None:
+            return "delete_safe"
+        settings = envelope["settings"]
+        if not isinstance(settings, dict):
+            return "never"
+        if WORKTREE_ARCHIVE_NAMESPACE not in settings:
+            return "delete_safe"
+        value = settings[WORKTREE_ARCHIVE_NAMESPACE]
         _validate_worktree_archive(value)
         return value["mode"]
-    except (UserPreferencesValidationError, SQLAlchemyError, AttributeError, TypeError):
+    except (ValueError, SQLAlchemyError, AttributeError, TypeError, KeyError):
         return "never"
 
 
@@ -1207,8 +1215,8 @@ class SqlAlchemyUserPreferencesStore:
                 value=_encode_value(USER_PREFERENCE_VERSION),
             )
             settings, _ = _read_settings(session, user_id)
-            existing = settings.get(WORKTREE_ARCHIVE_NAMESPACE)
-            if existing is not None:
+            if WORKTREE_ARCHIVE_NAMESPACE in settings:
+                existing = settings[WORKTREE_ARCHIVE_NAMESPACE]
                 _validate_worktree_archive(existing)
                 return existing
             value = {"mode": "delete_safe" if delete_safe else "never"}

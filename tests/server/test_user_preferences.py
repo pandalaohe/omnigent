@@ -130,11 +130,17 @@ def test_store_preserves_uninitialized_vs_initialized_defaults(db_uri: str) -> N
 
 def test_worktree_archive_preference_validates_and_migrates_once(db_uri: str) -> None:
     store = SqlAlchemyUserPreferencesStore(db_uri)
-    assert read_worktree_archive_mode(store, "alice@example.com") == "never"
+    assert read_worktree_archive_mode(store, "alice@example.com") == "delete_safe"
+    assert read_worktree_archive_mode(store, None) == "delete_safe"
+    assert read_worktree_archive_mode(None, "alice@example.com") == "never"
+    store.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "never"})
+    assert read_worktree_archive_mode(store, None) == "never"
+    store.patch_namespace("bob@example.com", "usage_context", {"visible": True})
+    assert read_worktree_archive_mode(store, "bob@example.com") == "delete_safe"
     assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "delete_safe"}
     assert store.migrate_worktree_archive("alice@example.com", False) == {"mode": "delete_safe"}
     assert read_worktree_archive_mode(store, "alice@example.com") == "delete_safe"
-    assert read_worktree_archive_mode(store, "bob@example.com") == "never"
+    assert read_worktree_archive_mode(store, "bob@example.com") == "delete_safe"
     with pytest.raises(UserPreferencesValidationError):
         store.patch_namespace("alice@example.com", "worktree_archive", {"mode": "force"})
     with pytest.raises(UserPreferencesValidationError):
@@ -144,6 +150,30 @@ def test_worktree_archive_preference_validates_and_migrates_once(db_uri: str) ->
     with workspace_scope(101):
         assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "delete_safe"}
     assert read_worktree_archive_mode(store, "alice@example.com") == "never"
+
+
+def test_worktree_archive_reader_keeps_invalid_data_and_read_errors_safe(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.add(
+            SqlPreference(
+                workspace_id=current_workspace_id(),
+                user_id="corrupt@example.com",
+                key="settings.worktree_archive",
+                value="null",
+            )
+        )
+        session.commit()
+    assert read_worktree_archive_mode(store, "corrupt@example.com") == "never"
+    with pytest.raises(UserPreferencesValidationError):
+        store.migrate_worktree_archive("corrupt@example.com", True)
+    assert read_worktree_archive_mode(store, "corrupt@example.com") == "never"
+
+    class _RaisingStore:
+        def get(self, user_id: str) -> None:
+            raise OperationalError("select", {}, Exception("database unavailable"))
+
+    assert read_worktree_archive_mode(_RaisingStore(), "alice@example.com") == "never"
 
 
 @pytest.mark.asyncio

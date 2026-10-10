@@ -589,7 +589,7 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
     db_uri: str,
     archive_mode: str | None,
 ) -> None:
-    """Safe cleanup waits for the whole tree; never/default retain the worktree."""
+    """Safe cleanup waits for the whole tree; only never retains the worktree."""
     from omnigent.server.routes import sessions as sessions_facade
     from omnigent.server.routes._sessions import common as _sessions_common
     from omnigent.server.session_collab import collab_owner_for
@@ -629,14 +629,14 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         intent_store=intents,
         scan_interval_seconds=3600,
     )
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
     if archive_mode is not None:
-        preferences = SqlAlchemyUserPreferencesStore(db_uri)
         preferences.patch_namespace(
             collab_owner_for(archived, conversations, None),
             "worktree_archive",
             {"mode": archive_mode},
         )
-        coordinator.set_archive_preferences(preferences, None)
+    coordinator.set_archive_preferences(preferences, None)
     remove = AsyncMock(return_value=True)
     stop_runner = AsyncMock(return_value="acked")
     try:
@@ -658,7 +658,7 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         for conversation in (root, child):
             _sessions_common._intentional_stop_sessions.pop(conversation.id, None)
 
-    if archive_mode == "delete_safe":
+    if archive_mode != "never":
         remove.assert_awaited_once()
         kwargs = remove.await_args.kwargs
         assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/root"
