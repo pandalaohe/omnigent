@@ -584,6 +584,257 @@ def register_core_routes(
             task.add_done_callback(clear_finished)
         return {"models": await asyncio.shield(task)}
 
+    @router.get("/sessions/{session_id}/worktree-status")
+    async def worktree_status(
+        session_id: str, request: Request, refresh: bool = False
+    ) -> dict[str, Any]:
+        """Return filename-only Git state for this session and its descendants."""
+        from omnigent.host.frames import CAP_WORKTREE_SAFE_ARCHIVE
+        from omnigent.server.routes._host_worktree import (
+            WORKTREE_ROOT_LABEL_KEY,
+            list_worktrees_on_host,
+            recorded_worktree_root,
+            worktree_root_fingerprint,
+        )
+        from omnigent.server.routes._sessions.orchestration import (
+            _collect_descendant_conversation_ids,
+        )
+        from omnigent.server.routes._workspace_validation import _is_subpath_of
+        from omnigent.stores.conversation_store import ARCHIVE_REMOVED_WORKTREE_LABEL_KEY
+
+        del refresh  # Every request reads the host afresh; no stale state cache.
+        user_id = _require_user(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        root = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if root is None:
+            raise _session_not_found()
+        descendants = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        rows = [root]
+        for child_id in descendants:
+            child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
+            if child is not None:
+                rows.append(child)
+        registry = getattr(request.app.state, "host_registry", None)
+        bindings = getattr(request.app.state, "project_host_binding_store", None)
+        semaphore = asyncio.Semaphore(4)
+        row_semaphore = asyncio.Semaphore(8)
+
+        async def one(conv: Conversation) -> dict[str, Any]:
+            if (
+                conv.id != session_id
+                and permission_store is not None
+                and not await asyncio.to_thread(
+                    check_session_access,
+                    user_id,
+                    conv.id,
+                    LEVEL_READ,
+                    permission_store,
+                    conversation_store,
+                )
+            ):
+                return {
+                    "state": "unknown",
+                    "reason": "descendant access unavailable",
+                    "path": None,
+                    "branch": None,
+                    "merged": None,
+                    "merge_target": None,
+                    "files": [],
+                }
+            path = conv.worktree or conv.workspace
+            owns_workspace = permission_store is None or await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                conv.id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+            can_read_files = (
+                owns_workspace
+                or conv.share_workspace_files
+                or (
+                    permission_store is not None
+                    and await asyncio.to_thread(
+                        check_session_access,
+                        user_id,
+                        conv.id,
+                        LEVEL_EDIT,
+                        permission_store,
+                        conversation_store,
+                    )
+                )
+            )
+            result: dict[str, Any] = {
+                "state": "none",
+                "reason": "no bound worktree",
+                "path": None,
+                "branch": None,
+                "merged": None,
+                "merge_target": None,
+                "files": [],
+            }
+            if not conv.host_id or not path:
+                return result
+            result.update(path=path if owns_workspace else None, branch=conv.git_branch)
+            if conv.archived and conv.labels.get(ARCHIVE_REMOVED_WORKTREE_LABEL_KEY) == str(
+                conv.archive_revision
+            ):
+                result.update(state="removed", reason="removed on archive")
+                return result
+            cleanup_root = recorded_worktree_root(path, conv.labels.get(WORKTREE_ROOT_LABEL_KEY))
+            if cleanup_root is None:
+                result.update(state="protected", reason="recorded worktree binding changed")
+                return result
+            if bindings is not None and await asyncio.to_thread(
+                bindings.entry_at_or_under, conv.host_id, cleanup_root
+            ):
+                result.update(state="protected", reason="project entry")
+                return result
+            if await asyncio.to_thread(
+                conversation_store.has_other_live_session_in_workspace,
+                host_id=conv.host_id,
+                workspace=cleanup_root,
+                exclude_conversation_id=conv.id,
+                include_subdirectories=True,
+                include_unclosed_archived=True,
+            ):
+                result.update(state="shared", reason="another live session uses this worktree")
+                return result
+            if (
+                conv.archived
+                and conv.runner_id is not None
+                and conv.archive_close_completed_revision != conv.archive_revision
+            ):
+                result.update(state="protected", reason="archived runner may still use worktree")
+                return result
+            conn = registry.get(conv.host_id) if registry is not None else None
+            if conn is None or CAP_WORKTREE_SAFE_ARCHIVE not in conn.hello.capabilities:
+                result.update(state="unknown", reason="host unavailable or status unsupported")
+                return result
+            assert registry is not None
+            try:
+                async with semaphore:
+                    trees = await list_worktrees_on_host(
+                        host_registry=registry,
+                        host_conn=conn,
+                        repo_path=cleanup_root,
+                        for_cleanup=True,
+                        for_status=True,
+                    )
+            except Exception:
+                result.update(state="unknown", reason="host Git state unavailable")
+                return result
+            expected = conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+            if expected is None and conv.git_branch is not None:
+                expected = worktree_root_fingerprint(path)
+            matches = [
+                tree
+                for tree in trees
+                if isinstance(tree.get("path"), str)
+                and _is_subpath_of(path, tree["path"])
+                and (expected is None or worktree_root_fingerprint(tree["path"]) == expected)
+            ]
+            match = max(matches, key=lambda tree: len(tree["path"])) if matches else None
+            if match is None:
+                result.update(state="unknown", reason="worktree missing without removal receipt")
+            elif (
+                match.get("is_main")
+                or match.get("detached")
+                or (conv.git_branch is not None and match.get("branch") != conv.git_branch)
+            ):
+                result.update(state="protected", reason="main checkout or branch binding changed")
+            elif match.get("status_error") or not isinstance(match.get("files"), list):
+                result.update(state="unknown", reason="Git status unavailable")
+            else:
+                files = match["files"]
+                result.update(
+                    state="dirty"
+                    if files
+                    else "protected"
+                    if conv.git_branch is None
+                    else "clean",
+                    reason=(
+                        "uncommitted files"
+                        if files
+                        else "branch binding unrecorded"
+                        if conv.git_branch is None
+                        else "clean worktree"
+                    ),
+                    branch=match.get("branch") if conv.git_branch is None else conv.git_branch,
+                    files=files if can_read_files else [],
+                    merged=match.get("merged") if isinstance(match.get("merged"), bool) else None,
+                    merge_target=match.get("merge_target")
+                    if isinstance(match.get("merge_target"), str)
+                    else None,
+                )
+            return result
+
+        async def limited_one(conv: Conversation) -> dict[str, Any]:
+            async with row_semaphore:
+                try:
+                    return await one(conv)
+                except Exception:
+                    return {
+                        "state": "unknown",
+                        "reason": "worktree state unavailable",
+                        "path": None,
+                        "branch": None,
+                        "merged": None,
+                        "merge_target": None,
+                        "files": [],
+                    }
+
+        states = await asyncio.gather(*(limited_one(row) for row in rows))
+        blockers = [
+            {
+                "session_id": row.id,
+                "title": (
+                    "Restricted session"
+                    if state["reason"] == "descendant access unavailable"
+                    else row.title or "Untitled session"
+                ),
+                "state": state["state"],
+                "reason": state["reason"],
+            }
+            for row, state in zip(rows, states, strict=True)
+            if state["state"] in {"dirty", "unknown", "protected", "shared"}
+        ]
+        aggregate = next(
+            (
+                state["state"]
+                for priority in ("dirty", "unknown", "protected", "shared")
+                for state in states
+                if state["state"] == priority
+            ),
+            None,
+        )
+        if aggregate is None:
+            aggregate = (
+                "clean"
+                if any(s["state"] == "clean" for s in states)
+                else "removed"
+                if any(s["state"] == "removed" for s in states)
+                else "none"
+            )
+        return {
+            "own": states[0],
+            "aggregate": {
+                "state": aggregate,
+                "reason": (
+                    "descendant worktree needs attention"
+                    if blockers
+                    else "all pending worktrees clean"
+                    if aggregate == "clean"
+                    else "no pending worktree"
+                ),
+            },
+            "blockers": blockers,
+            "session_count": len(rows),
+        }
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -3272,7 +3523,7 @@ def register_core_routes(
         """Apply the PATCH that :func:`update_session` documents."""
         began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
-        if body.delete_worktree and body.archived is not True:
+        if (body.delete_worktree or body.keep_worktree) and body.archived is not True:
             raise OmnigentError(
                 "delete_worktree is only valid with archived=true",
                 code=ErrorCode.INVALID_INPUT,
@@ -3888,16 +4139,23 @@ def register_core_routes(
                             and policy_host.cli_retention_policy is not None
                         ):
                             close_on_archive = policy_host.cli_retention_policy.close_on_archive
-            if body.delete_worktree:
-                # An explicit delete forces this archive's teardown for the one
-                # archive: the CLI cannot keep running in a removed worktree.
+        safe_archive_cleanup = False
+        if (
+            body.archived is True
+            and (not conv.archived or body.delete_worktree)
+            and not body.keep_worktree
+            and conv.git_branch
+        ):
+            from omnigent.server.user_preferences_store import read_worktree_archive_mode
+
+            mode = await asyncio.to_thread(
+                read_worktree_archive_mode,
+                getattr(request.app.state, "user_preferences_store", None),
+                _get_session_owner_id(session_id, permission_store) or RESERVED_USER_LOCAL,
+            )
+            if mode == "delete_safe":
                 close_on_archive = True
-        elif body.archived is True and body.delete_worktree:
-            # A delete on an already-archived session still owes a teardown
-            # for its current revision (the CLI cannot keep running in a
-            # worktree about to be removed), so it forces the close too; a
-            # plain re-archive without it stays a no-op.
-            close_on_archive = True
+                safe_archive_cleanup = True
 
         live_model_change = not body.silent and (model_override is not None or clear_model)
         wake_for_model_change = (
@@ -3920,7 +4178,10 @@ def register_core_routes(
             {"archive_stop_when_idle": True} if archive_stop_when_idle else {}
         )
         delete_worktree_kwargs: dict[str, Any] = (
-            {"delete_worktree": True} if body.delete_worktree else {}
+            {"delete_worktree": True} if safe_archive_cleanup else {}
+        )
+        keep_worktree_kwargs: dict[str, Any] = (
+            {"keep_worktree": True} if body.keep_worktree else {}
         )
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
@@ -3944,6 +4205,7 @@ def register_core_routes(
             close_cli_on_archive=close_on_archive,
             **archive_stop_when_idle_kwargs,
             **delete_worktree_kwargs,
+            **keep_worktree_kwargs,
         )
         if update_result is None:
             raise _session_not_found()
@@ -4003,7 +4265,7 @@ def register_core_routes(
                     runner_router,
                     getattr(request.app.state, "host_registry", None),
                     getattr(request.app.state, "archive_close_coordinator", None),
-                    delete_worktree=body.delete_worktree,
+                    delete_worktree=safe_archive_cleanup,
                     project_host_binding_store=getattr(
                         request.app.state, "project_host_binding_store", None
                     ),

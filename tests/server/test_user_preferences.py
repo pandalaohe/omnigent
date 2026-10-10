@@ -46,6 +46,7 @@ from omnigent.server.user_preferences_store import (
     read_approval_timeout,
     read_collab_settings,
     read_keep_warm_settings,
+    read_worktree_archive_mode,
     read_worktree_path_template,
     touch_runner_log_warning_dismissals,
     validate_preferences_envelope,
@@ -125,6 +126,58 @@ def test_store_preserves_uninitialized_vs_initialized_defaults(db_uri: str) -> N
     # initialized account with stale localStorage from another device.
     stale = {"version": 1, "settings": {"usage_context": {"visible": False}}}
     assert store.initialize("alice@example.com", stale) == empty
+
+
+def test_worktree_archive_preference_validates_and_migrates_once(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    assert read_worktree_archive_mode(store, "alice@example.com") == "never"
+    assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "delete_safe"}
+    assert store.migrate_worktree_archive("alice@example.com", False) == {"mode": "delete_safe"}
+    assert read_worktree_archive_mode(store, "alice@example.com") == "delete_safe"
+    assert read_worktree_archive_mode(store, "bob@example.com") == "never"
+    with pytest.raises(UserPreferencesValidationError):
+        store.patch_namespace("alice@example.com", "worktree_archive", {"mode": "force"})
+    with pytest.raises(UserPreferencesValidationError):
+        store.patch_namespace("alice@example.com", "worktree_archive", {"extra": True})
+    store.patch_namespace("alice@example.com", "worktree_archive", {"mode": "never"})
+    assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "never"}
+    with workspace_scope(101):
+        assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "delete_safe"}
+    assert read_worktree_archive_mode(store, "alice@example.com") == "never"
+
+
+@pytest.mark.asyncio
+async def test_worktree_archive_preference_api_is_scoped_and_first_value_wins(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            "/v1/me/preferences/worktree_archive/migrate",
+            headers={"x-test-user": "alice@example.com"},
+            json={"delete_safe": True},
+        )
+        assert first.status_code == 200
+        assert first.json() == {"mode": "delete_safe"}
+        second = await client.post(
+            "/v1/me/preferences/worktree_archive/migrate",
+            headers={"x-test-user": "alice@example.com"},
+            json={"delete_safe": False},
+        )
+        assert second.json() == {"mode": "delete_safe"}
+        other = await client.post(
+            "/v1/me/preferences/worktree_archive/migrate",
+            headers={"x-test-user": "bob@example.com"},
+            json={"delete_safe": False},
+        )
+        assert other.json() == {"mode": "never"}
+        invalid = await client.patch(
+            "/v1/me/preferences/worktree_archive",
+            headers={"x-test-user": "alice@example.com"},
+            json={"value": {"mode": "force"}},
+        )
+        assert invalid.status_code == 422
 
 
 def test_store_merges_one_namespace_and_keeps_users_isolated(db_uri: str) -> None:

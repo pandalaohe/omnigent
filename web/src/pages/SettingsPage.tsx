@@ -270,10 +270,7 @@ import {
   fetchWorktreePathTemplate,
   saveWorktreePathTemplate,
 } from "@/lib/worktreeLocationPreference";
-import {
-  readDeleteWorktreesOnArchive,
-  writeDeleteWorktreesOnArchive,
-} from "@/lib/archiveWorktreePreferences";
+import { useArchiveWorktreePreference } from "@/lib/archiveWorktreePreferences";
 import {
   archivedAtSeconds,
   readRetentionDays,
@@ -1701,7 +1698,7 @@ function AppearanceSection() {
 /** Git behavior settings. */
 function GitSection() {
   const info = useServerInfo();
-  const archiveWorktreeCleanup = info !== "loading" && info.archive_worktree_cleanup === true;
+  const archiveWorktreeCleanup = info !== "loading" && info.worktree_status === true;
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <SettingsGroup title="Worktrees" testId="settings-group-worktrees">
@@ -1934,35 +1931,39 @@ function AlwaysUseWorktreeControl() {
   );
 }
 
-/**
- * Remove a session's git worktree when it's archived. Off until chosen; while
- * unset, the first archive of a worktree session asks instead.
- */
 function DeleteWorktreesOnArchiveControl() {
-  const [value, setValue] = useState(() => readDeleteWorktreesOnArchive() === true);
+  const { preference, save } = useArchiveWorktreePreference();
   const labelId = useId();
-  const toggle = useCallback((next: boolean) => {
-    setValue(next);
-    writeDeleteWorktreesOnArchive(next);
-  }, []);
+  const disabled = preference.isPending || preference.isError || save.isPending;
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Delete worktrees for archived sessions"
-        labelId={labelId}
-        className="flex-1"
-        description="Remove a session's git worktree directory, including uncommitted changes, when you archive it. The branch is kept."
-        descriptionClassName="text-ui"
-      />
-      <Switch
-        aria-labelledby={labelId}
-        checked={value}
-        onCheckedChange={toggle}
-        data-testid="settings-delete-worktrees-on-archive-toggle"
-        className="mt-0.5 shrink-0"
-        componentId="settings.git.delete_worktrees_on_archive"
-      />
-    </div>
+    <fieldset disabled={disabled} aria-describedby={`${labelId}-help`} className="space-y-2">
+      <legend className="text-ui font-medium">Worktrees on archive</legend>
+      <p id={`${labelId}-help`} className="text-ui text-muted-foreground">
+        Safe worktrees have no uncommitted or untracked files and are not used by another live
+        session. Branches are always kept.
+      </p>
+      {(["delete_safe", "never"] as const).map((mode) => (
+        <label key={mode} className="flex items-center gap-2 text-ui">
+          <input
+            type="radio"
+            name={labelId}
+            value={mode}
+            checked={preference.data === mode}
+            onChange={() => save.mutate(mode)}
+            className="accent-primary"
+          />
+          {mode === "delete_safe" ? "Delete safe worktrees on archive" : "Never delete"}
+        </label>
+      ))}
+      <p className="text-sm text-muted-foreground">
+        Unsafe worktrees are kept. With safe deletion enabled, archiving them shows a warning first.
+      </p>
+      {(preference.error || save.error) && (
+        <p role="alert" className="text-sm text-destructive">
+          {(preference.error || save.error)?.message}
+        </p>
+      )}
+    </fieldset>
   );
 }
 

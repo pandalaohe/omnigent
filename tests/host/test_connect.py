@@ -62,6 +62,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -72,6 +73,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostPostBindHookFrame,
     HostPostBindHookResultFrame,
+    HostRemoveWorktreeFrame,
     HostResourceSamplingFrame,
     HostResourceSnapshotFrame,
     HostRunnerExitedFrame,
@@ -2973,6 +2975,117 @@ async def test_cancelled_readiness_probe_keeps_orphan_reaper_paused(
             break
         await asyncio.sleep(0.01)
     assert host._owned_subprocess_ops == 0
+    assert host._host_subprocess_tasks == set()
+
+
+async def test_cancelled_worktree_status_keeps_orphan_reaper_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.host.git_worktree import WorktreeInfo
+
+    host = _make_host_process()
+    path = "/opt/work/sample-app/tree"
+    status_started = threading.Event()
+    status_release = threading.Event()
+
+    monkeypatch.setattr(
+        "omnigent.host.connect.list_worktrees",
+        lambda **_kwargs: [
+            WorktreeInfo(path=path, branch="feature/test", is_main=False, detached=False)
+        ],
+    )
+
+    def _blocked_status(_path: str) -> dict[str, object]:
+        status_started.set()
+        if not status_release.wait(timeout=2.0):
+            raise AssertionError("status worker was not released")
+        return {"files": [], "merged": None, "merge_target": None}
+
+    monkeypatch.setattr("omnigent.host.connect.read_worktree_status", _blocked_status)
+    task = asyncio.create_task(
+        host._handle_list_worktrees(
+            HostListWorktreesFrame(request_id="status", repo_path=path, for_status=True)
+        )
+    )
+    try:
+        assert await asyncio.to_thread(status_started.wait, 1.0)
+        assert host._owned_subprocess_ops == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert host._owned_subprocess_ops == 1
+        assert len(host._host_subprocess_tasks) == 1
+    finally:
+        status_release.set()
+    for _ in range(100):
+        if host._owned_subprocess_ops == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert host._owned_subprocess_ops == 0
+    assert host._host_subprocess_tasks == set()
+
+
+async def test_cancelled_remove_keeps_later_worktree_list_behind_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.host.git_worktree import WorktreeInfo
+
+    host = _make_host_process()
+    path = "/opt/work/sample-app/tree"
+    remove_started = threading.Event()
+    release_remove = threading.Event()
+    list_called = threading.Event()
+    tree_exists = True
+
+    def blocked_remove(**_kwargs: object) -> None:
+        nonlocal tree_exists
+        remove_started.set()
+        if not release_remove.wait(timeout=2.0):
+            raise AssertionError("remove worker was not released")
+        tree_exists = False
+
+    def listed(**_kwargs: object) -> list[WorktreeInfo]:
+        list_called.set()
+        return (
+            [WorktreeInfo(path=path, branch="feature/test", is_main=False, detached=False)]
+            if tree_exists
+            else []
+        )
+
+    monkeypatch.setattr("omnigent.host.connect.remove_worktree", blocked_remove)
+    monkeypatch.setattr("omnigent.host.connect.list_worktrees", listed)
+    removal = asyncio.create_task(
+        host._handle_remove_worktree(
+            HostRemoveWorktreeFrame(
+                request_id="remove",
+                worktree_path=path,
+                branch="feature/test",
+                delete_branch=False,
+                safe_only=True,
+            )
+        )
+    )
+    try:
+        assert await asyncio.to_thread(remove_started.wait, 1.0)
+        removal.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await removal
+        listing = asyncio.create_task(
+            host._handle_list_worktrees(HostListWorktreesFrame(request_id="list", repo_path=path))
+        )
+        await asyncio.sleep(0.05)
+        assert not list_called.is_set()
+        assert host._owned_subprocess_ops == 2
+    finally:
+        release_remove.set()
+    result = await asyncio.wait_for(listing, 2.0)
+    assert result.status == "ok"
+    assert result.worktrees == []
+    assert list_called.is_set()
+    for _ in range(100):
+        if not host._host_subprocess_tasks:
+            break
+        await asyncio.sleep(0.01)
     assert host._host_subprocess_tasks == set()
 
 

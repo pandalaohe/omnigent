@@ -214,6 +214,8 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /** Live worktree status and server-side safe archive policy are supported. */
+  worktree_status?: boolean;
   /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
@@ -322,6 +324,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   dictation_punctuation_available: false,
   archive_worktree_cleanup: false,
+  worktree_status: false,
   branding: null,
 };
 
@@ -425,6 +428,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           dictation_punctuation_available: data.dictation_punctuation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          worktree_status: data.worktree_status === true,
           agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
           attachment_limits: parseAttachmentLimits(data.attachment_limits),

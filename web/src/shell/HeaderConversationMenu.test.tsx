@@ -31,6 +31,8 @@ const mocks = vi.hoisted(() => ({
   rename: vi.fn(),
   moveToProject: vi.fn(),
   archive: vi.fn(),
+  archivePreference: vi.fn(),
+  worktreeStatus: vi.fn(),
   deleteConversation: vi.fn(),
   stopSession: vi.fn(),
   runnerOnline: undefined as boolean | undefined,
@@ -47,6 +49,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
+vi.mock("@/lib/archiveWorktreePreferences", () => ({
+  fetchArchiveWorktreePreference: mocks.archivePreference,
+}));
+vi.mock("@/hooks/useWorktreeStatus", () => ({ fetchSessionWorktreeStatus: mocks.worktreeStatus }));
 
 // The post-archive confirmation is upstream's Undo pill, driven by module state
 // plus the app-level Toaster. Its own rendering is covered by
@@ -153,7 +159,7 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
   const queryClient = new QueryClient();
   return (
     <QueryClientProvider client={queryClient}>
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, worktree_status: true }}>
         <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
           <HeaderConversationMenu
             conversation={CONVERSATION}
@@ -189,6 +195,15 @@ beforeEach(() => {
   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
   mocks.deleteComments = [];
   vi.clearAllMocks();
+  mocks.archivePreference.mockResolvedValue("never");
+  mocks.worktreeStatus.mockResolvedValue({
+    own: {
+      state: "dirty",
+      reason: "Untracked file",
+      path: "/opt/work/project/task",
+      files: [{ status: "??", path: "draft.txt" }],
+    },
+  });
 });
 
 afterEach(cleanup);
@@ -324,10 +339,27 @@ describe("HeaderConversationMenu", () => {
       expect(mocks.archive).toHaveBeenCalledWith({
         id: "conv_child",
         archived: true,
-        deleteWorktree: false,
+        keepWorktree: false,
       }),
     );
     expect(mocks.archive).not.toHaveBeenCalledWith(expect.objectContaining({ id: "conv_parent" }));
+  });
+  it("cancels an archive preflight when the selected session changes", async () => {
+    let resolvePreference!: (mode: string) => void;
+    mocks.archivePreference.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolvePreference = resolve;
+      }),
+    );
+    const view = renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
+    resolvePreference("never");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Conversation actions" })).toBeInTheDocument(),
+    );
+    expect(mocks.archive).not.toHaveBeenCalled();
   });
 
   it("mutes sounds for the child alone", () => {
@@ -468,17 +500,18 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("runs archive and delete actions for the active session", async () => {
+    mocks.archivePreference.mockResolvedValue("delete_safe");
     const view = renderMenu();
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // A worktree session asks whether to delete the worktree first.
+    // The warning names the unsafe tree before archiving it without deletion.
     expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Archive only" }));
     expect(mocks.archive).toHaveBeenCalledWith({
       id: "conv-1",
       archived: true,
-      deleteWorktree: true,
+      keepWorktree: true,
     });
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
@@ -527,16 +560,17 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("archives from the distinctly labelled mobile action, then returns home", async () => {
+    mocks.archivePreference.mockResolvedValue("delete_safe");
     mocks.isMobile = true;
     renderMenu();
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive this session" }));
     expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "No, archive only" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Archive only" }));
     expect(mocks.archive).toHaveBeenCalledWith({
       id: "conv-1",
       archived: true,
-      deleteWorktree: false,
+      keepWorktree: true,
     });
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");

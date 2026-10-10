@@ -144,6 +144,7 @@ class _Prefs:
     def __init__(self, keep_warm: dict[str, Any] | None = None) -> None:
         self.keep_warm = keep_warm
         self.collab: dict[str, Any] | None = None
+        self.archive: dict[str, Any] | None = None
         self.patches: list[tuple[str, str, dict[str, Any]]] = []
         self.gate: threading.Event | None = None
         self.entered: threading.Event | None = None
@@ -158,6 +159,8 @@ class _Prefs:
             settings["keep_warm"] = self.keep_warm
         if self.collab is not None:
             settings["session_collab"] = self.collab
+        if self.archive is not None:
+            settings["worktree_archive"] = self.archive
         return {"settings": settings} if settings else None
 
     def patch_namespace(self, owner: str, namespace: str, value: dict[str, Any]) -> None:
@@ -3045,9 +3048,33 @@ async def test_host_offline_past_threshold_archives_the_child(harness: _Harness)
     assert conv is not None
     assert conv.labels[ARCHIVE_REASON_LABEL] == "host_offline"
     assert conv.labels[ARCHIVED_BY_LABEL] == "keep_warm"
+    assert conv.archive_close_requested_revision is None
     assert (child.id, None) in harness.published
     # The mother is a top-level row: never touched by the pass.
     assert _archived(harness, parent.id) is False
+
+
+async def test_host_offline_archive_requests_cleanup_only_under_delete_safe(
+    harness: _Harness,
+) -> None:
+    parent = _parent(
+        harness, host_id=_HOST_ID, workspace="/opt/work/sample-app", live_status="idle"
+    )
+    child = _child(harness, parent.id, live_status="idle")
+    harness.store.set_host_id(
+        child.id, _HOST_ID, workspace="/opt/work/sample-app/child", git_branch="feature/child"
+    )
+    coordinator = SimpleNamespace(trigger=lambda session_id: triggered.append(session_id))
+    triggered: list[str] = []
+    harness.sweeper._app.state.archive_close_coordinator = coordinator
+    _wire_host(harness, _HOST_ID, status="offline", updated_at=harness.now - (4 * 3600 + 60))
+
+    harness.prefs.archive = {"mode": "delete_safe"}
+    await _tick_archive_pass(harness)
+    row = harness.store.get_conversation(child.id)
+    assert row is not None
+    assert row.archive_close_requested_revision == row.archive_revision
+    assert triggered == [child.id]
 
 
 async def test_host_offline_archive_stamps_provenance_before_the_archive_flag(

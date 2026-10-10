@@ -59,6 +59,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "host_colors",
         "keep_warm",
         "worktree_location",
+        "worktree_archive",
         "runner_log_warnings",
         "sidebar_layout",
         "sound_alerts",
@@ -74,6 +75,33 @@ _SETTINGS_KEY_PREFIX = "settings."
 _ENVELOPE_VERSION_KEY = f"{_SETTINGS_KEY_PREFIX}version"
 
 PreferencesEnvelope: TypeAlias = dict[str, Any]
+
+WORKTREE_ARCHIVE_NAMESPACE = "worktree_archive"
+
+
+def _validate_worktree_archive(value: Any) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"mode"}
+        or value["mode"] not in ("delete_safe", "never")
+    ):
+        raise UserPreferencesValidationError(
+            "worktree_archive must contain mode delete_safe or never"
+        )
+
+
+def read_worktree_archive_mode(
+    store: SqlAlchemyUserPreferencesStore | None, owner: str | None
+) -> str:
+    if store is None or owner is None:
+        return "never"
+    try:
+        envelope = store.get(owner)
+        value = (envelope or {}).get("settings", {}).get(WORKTREE_ARCHIVE_NAMESPACE)
+        _validate_worktree_archive(value)
+        return value["mode"]
+    except (UserPreferencesValidationError, SQLAlchemyError, AttributeError, TypeError):
+        return "never"
 
 
 class UserPreferencesValidationError(ValueError):
@@ -855,6 +883,8 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         )
     for value in settings.values():
         _validate_json(value)
+    if WORKTREE_ARCHIVE_NAMESPACE in settings:
+        _validate_worktree_archive(settings[WORKTREE_ARCHIVE_NAMESPACE])
 
     copied: PreferencesEnvelope = {
         "version": USER_PREFERENCE_VERSION,
@@ -1104,6 +1134,8 @@ class SqlAlchemyUserPreferencesStore:
             _validate_json(value)
             if namespace == WORKTREE_LOCATION_NAMESPACE:
                 _validate_worktree_location(value)
+            if namespace == WORKTREE_ARCHIVE_NAMESPACE:
+                _validate_worktree_archive(value)
 
         def write(session: Session) -> PreferencesEnvelope:
             _require_user_row(session, user_id, create_if_missing)
@@ -1122,7 +1154,11 @@ class SqlAlchemyUserPreferencesStore:
                 settings.pop(namespace, None)
             else:
                 existing = settings.get(namespace)
-                if isinstance(existing, dict) and isinstance(value, dict):
+                if (
+                    namespace != WORKTREE_ARCHIVE_NAMESPACE
+                    and isinstance(existing, dict)
+                    and isinstance(value, dict)
+                ):
                     if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
                         settings[namespace] = _merge_runner_log_warnings(existing, value)
                     else:
@@ -1154,3 +1190,34 @@ class SqlAlchemyUserPreferencesStore:
         return run_write_transaction(
             self._write_session, "patch_user_preferences_namespace", write
         )
+
+    def migrate_worktree_archive(
+        self, user_id: str, delete_safe: bool, *, create_if_missing: bool = True
+    ) -> dict[str, str]:
+        """Initialize the archive namespace once under the preference write lock."""
+        if type(delete_safe) is not bool:
+            raise UserPreferencesValidationError("delete_safe must be a boolean")
+
+        def write(session: Session) -> dict[str, str]:
+            _require_user_row(session, user_id, create_if_missing)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_ENVELOPE_VERSION_KEY,
+                value=_encode_value(USER_PREFERENCE_VERSION),
+            )
+            settings, _ = _read_settings(session, user_id)
+            existing = settings.get(WORKTREE_ARCHIVE_NAMESPACE)
+            if existing is not None:
+                _validate_worktree_archive(existing)
+                return existing
+            value = {"mode": "delete_safe" if delete_safe else "never"}
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_settings_key(WORKTREE_ARCHIVE_NAMESPACE),
+                value=_encode_value(value),
+            )
+            return value
+
+        return run_write_transaction(self._write_session, "migrate_worktree_archive", write)

@@ -15,6 +15,8 @@ from omnigent.server.cli_release_store import CliReleaseIntent, CliReleaseIntent
 from omnigent.stores.conversation_store import (
     ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S,
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
 )
 from omnigent.stores.host_store import host_is_live
 
@@ -55,6 +57,33 @@ class ArchiveCloseCoordinator:
         self._scan_task: asyncio.Task[None] | None = None
         self._host_lock_provider: Any = None
         self._project_host_binding_store: Any = None
+        self._preferences_store: Any = None
+        self._permission_store: Any = None
+
+    def set_archive_preferences(self, preferences_store: Any, permission_store: Any) -> None:
+        self._preferences_store = preferences_store
+        self._permission_store = permission_store
+
+    async def should_cleanup_on_archive(self, conv: Any) -> bool:
+        if not conv.git_branch or not conv.host_id or not (conv.worktree or conv.workspace):
+            return False
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_worktree_archive_mode
+
+        owner = await asyncio.to_thread(
+            collab_owner_for, conv, self._conversation_store, self._permission_store
+        )
+        return (
+            await asyncio.to_thread(read_worktree_archive_mode, self._preferences_store, owner)
+            == "delete_safe"
+        )
+
+    async def cleanup_archived_without_close(self, session_id: str, revision: int) -> None:
+        """Succession preserves a bound runner whose working directory is unproven."""
+        row = await asyncio.to_thread(self._conversation_store.get_conversation, session_id)
+        if row is None or row.runner_id is not None:
+            return
+        await self._remove_archived_worktree(session_id, revision)
 
     def set_host_lock_provider(self, provider: Any) -> None:
         """Share the online Host policy/release linearization lock."""
@@ -684,7 +713,7 @@ class ArchiveCloseCoordinator:
     async def _remove_archived_worktree(self, root_id: str, revision: int) -> None:
         """Remove an archived root's worktree once the tree's teardown ran.
 
-        The delete is recorded as a revision-keyed label by the archive PATCH,
+        The cleanup decision is recorded as a revision-keyed label at archive,
         so it survives a restart or another replica executing the intent. Runs
         after every target's stop, through MOD-xho04's ``cleanup_worktree`` so
         a project entry is never removed; best-effort, like the direct path.
@@ -694,20 +723,36 @@ class ArchiveCloseCoordinator:
         )
 
         root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
-        if (
-            root is None
-            or not root.archived
-            or root.archive_revision != revision
-            or root.labels.get(ARCHIVE_DELETE_WORKTREE_LABEL_KEY) != str(revision)
-        ):
+        if root is None or not root.archived or root.archive_revision != revision:
             return
-        await remove_archived_worktree_best_effort(
+        if root.labels.get(ARCHIVE_DELETE_WORKTREE_LABEL_KEY) != str(revision):
+            return
+        if root.labels.get(ARCHIVE_KEEP_WORKTREE_LABEL_KEY) == str(revision):
+            return
+        from omnigent.server.session_collab import collab_owner_for
+        from omnigent.server.user_preferences_store import read_worktree_archive_mode
+
+        owner = await asyncio.to_thread(
+            collab_owner_for, root, self._conversation_store, self._permission_store
+        )
+        mode = await asyncio.to_thread(read_worktree_archive_mode, self._preferences_store, owner)
+        if mode != "delete_safe":
+            return
+        removed = await remove_archived_worktree_best_effort(
             root,
             host_registry=self._host_registry,
             project_host_binding_store=self._project_host_binding_store,
             conversation_store=self._conversation_store,
             exclude_conversation_id=root_id,
         )
+        if removed:
+            current = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
+            if current is not None and current.archived and current.archive_revision == revision:
+                await asyncio.to_thread(
+                    self._conversation_store.set_labels,
+                    root_id,
+                    {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(revision)},
+                )
 
     async def _execute_idle_intent_locked(
         self,

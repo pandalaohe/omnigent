@@ -4527,7 +4527,7 @@ def server(
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     project_repository_store = SqlAlchemyProjectRepositoryStore(db_uri)
-    project_host_binding_store = SqlAlchemyProjectHostBindingStore(db_uri)
+    project_host_binding_store = SqlAlchemyProjectHostBindingStore(db_uri, conv_db_uri)
     peer_message_store = SqlAlchemyPeerMessageStore(db_uri)
     user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
     host_model_catalog_cache_store = HostModelCatalogCacheStore(db_uri)
@@ -4605,7 +4605,7 @@ def server(
 
     from omnigent.stores.host_store import HostStore
 
-    host_store = HostStore(db_uri)
+    host_store = HostStore(db_uri, conv_db_uri)
 
     # Managed sandbox hosts (host_type="managed" sessions): parse the
     # config's `sandbox:` section up front so an operator typo stops

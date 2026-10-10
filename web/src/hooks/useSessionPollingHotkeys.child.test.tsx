@@ -41,6 +41,19 @@ beforeEach(() => {
 });
 
 describe("archive shortcut on a child", () => {
+  it("keeps the route when the archive safety warning is cancelled", async () => {
+    const onArchive = vi.fn().mockResolvedValue(false);
+    renderHook(() =>
+      useSessionPollingHotkeys({
+        activeId: "child",
+        getConversations: async () => [parent],
+        onArchive,
+      }),
+    );
+    await act(async () => window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT)));
+    await waitFor(() => expect(onArchive).toHaveBeenCalledOnce());
+    expect(navigate).not.toHaveBeenCalled();
+  });
   it("archives only the selected child missing from the sidebar", async () => {
     const onArchive = vi.fn().mockResolvedValue(undefined);
     renderHook(() =>

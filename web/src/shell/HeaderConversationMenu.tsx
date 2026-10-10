@@ -156,7 +156,7 @@ export function HeaderConversationMenu({
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt(conversation.id);
   const deleteConversation = useStopAndDeleteConversation();
   const stopSession = useStopSession();
   const { account: soundAccount } = useSoundAlertPreferences();
@@ -321,12 +321,13 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) => {
-      void archiveNow(deleteWorktreeIds.has(conversation.id));
+    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds) => {
+      void archiveNow(keepWorktreeIds.has(conversation.id));
     });
   };
 
-  const archiveNow = async (deleteWorktree: boolean) => {
+  const archiveNow = async (keepWorktree: boolean) => {
+    if (!mountedRef.current || currentConversationIdRef.current !== conversation.id) return;
     if (archiveRequestRef.current || archive.isPending) return;
     archiveRequestRef.current = true;
     setArchivePending(true);
@@ -334,7 +335,7 @@ export function HeaderConversationMenu({
     const requestedLocation = location;
 
     try {
-      await archive.mutateAsync({ id: requestedConversationId, archived: true, deleteWorktree });
+      await archive.mutateAsync({ id: requestedConversationId, archived: true, keepWorktree });
     } catch {
       // useArchiveConversation owns the error toast and optimistic-cache
       // rollback. Staying on this route makes the restored session usable.

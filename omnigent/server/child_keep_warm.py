@@ -1114,11 +1114,20 @@ class ChildKeepWarmSweeper:
             },
         )
         try:
+            from omnigent.server.user_preferences_store import read_worktree_archive_mode
+
+            archive_mode = await asyncio.to_thread(
+                read_worktree_archive_mode,
+                getattr(getattr(self._app, "state", None), "user_preferences_store", None),
+                owner,
+            )
+            close_for_cleanup = archive_mode == "delete_safe" and bool(conv.git_branch)
             updated = await asyncio.to_thread(
                 store.update_conversation,
                 conv.id,
                 archived=True,
-                close_cli_on_archive=False,
+                close_cli_on_archive=close_for_cleanup,
+                delete_worktree=close_for_cleanup,
             )
         except Exception:
             await _clear_provenance()
@@ -1126,6 +1135,12 @@ class ChildKeepWarmSweeper:
         if updated is None:
             await _clear_provenance()
             return False
+        if close_for_cleanup:
+            coordinator = getattr(
+                getattr(self._app, "state", None), "archive_close_coordinator", None
+            )
+            if coordinator is not None:
+                coordinator.trigger(conv.id)
         if conv.parent_conversation_id is not None:
             _publish_child_status_to_parent(conv.id, None)
         _prune_session_read_state(conv.id)

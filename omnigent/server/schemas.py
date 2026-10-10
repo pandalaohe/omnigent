@@ -90,6 +90,7 @@ UserPreferenceNamespace = Literal[
     "host_colors",
     "keep_warm",
     "worktree_location",
+    "worktree_archive",
     "runner_log_warnings",
     "sidebar_layout",
     "sound_alerts",
@@ -2641,15 +2642,14 @@ class UpdateSessionRequest(BaseModel):
     :param archive_locked: Protect an archived session from bulk deletion.
         ``True`` locks it, ``False`` unlocks it, and ``None`` leaves the
         current lock unchanged. Owner-only.
-    :param delete_worktree: With ``archived=True``, also remove the
-        session's server-created git worktree directory once the archive
-        teardown runs (after the Undo grace). On an already-archived session
-        it requests a delete-only teardown of the current archive revision,
-        whose Undo grace counts from that archive, not from this request.
-        The branch is kept. It forces the CLI teardown for that
-        archive even on a host policy that keeps CLIs on archive, so the
-        worktree is never removed under a running CLI. Ignored for sessions
-        with no worktree; rejected (400) without ``archived=True``.
+    :param delete_worktree: Legacy archive request flag. Deletion still
+        requires the owner's ``worktree_archive`` preference to be
+        ``delete_safe`` and the host's safe cleanup checks. Rejected (400)
+        without ``archived=True``.
+    :param keep_worktree: Explicitly preserve this archive revision's bound
+        worktree even when the owner's preference is ``delete_safe`` and the
+        directory becomes clean after the caller's warning. Requires
+        ``archived=True``.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2685,6 +2685,7 @@ class UpdateSessionRequest(BaseModel):
     archived: bool | None = None
     archive_locked: bool | None = None
     delete_worktree: bool = False
+    keep_worktree: bool = False
     project_id: str | None = None
     silent: bool = False
     stop_when_idle: bool = False

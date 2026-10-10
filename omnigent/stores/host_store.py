@@ -15,6 +15,8 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
+import time
 from dataclasses import dataclass
 from typing import cast
 
@@ -27,6 +29,7 @@ from sqlalchemy.orm import Session
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.account_authority import require_active_account, session_account_owner_query
 from omnigent.db.db_models import (
+    SqlConversationLabel,
     SqlConversationMetadata,
     SqlHost,
     SqlSessionPermission,
@@ -34,6 +37,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
 from omnigent.db.utils import (
+    get_or_create_conversation_engine,
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
@@ -41,6 +45,10 @@ from omnigent.db.utils import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.stores.conversation_store import (
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+)
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -262,14 +270,28 @@ class HostStore:
         ``"sqlite:///hosts.db"``.
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """
         Initialize the host store.
 
         :param storage_location: SQLAlchemy database URI, e.g.
             ``"sqlite:///hosts.db"``.
+        :param conversation_storage_location: Optional separate conversation
+            database URI holding archive worktree fence labels.
         """
         self._engine: Engine = get_or_create_engine(storage_location)
+        conv_uri = conversation_storage_location or storage_location
+        self._conv_engine = (
+            self._engine
+            if conv_uri == storage_location
+            else get_or_create_conversation_engine(conv_uri)
+        )
+        self._conv_session = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.host_store",
+        )
         self._session = make_named_managed_session_maker(
             self._engine,
             query_name_prefix="omnigent.host_store",
@@ -286,6 +308,45 @@ class HostStore:
             query_name_prefix="omnigent.host_store",
             immediate=True,
         )
+
+    def _rotation_bound_ids(self, old_host_id: str) -> set[str]:
+        with self._session("host_rotation_bound_conversations") as session:
+            return set(
+                session.execute(
+                    select(SqlConversationMetadata.id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == old_host_id,
+                    )
+                ).scalars()
+            )
+
+    def _require_rotation_fence_settled(self, bound_ids: set[str]) -> None:
+        if not bound_ids:
+            return
+        labels_by_id: dict[str, set[str]] = {}
+        with self._conv_session("host_rotation_worktree_fences") as session:
+            for conversation_id, key in session.execute(
+                select(SqlConversationLabel.conversation_id, SqlConversationLabel.key).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(bound_ids),
+                    SqlConversationLabel.key.in_(
+                        (
+                            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                            ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+                        )
+                    ),
+                )
+            ):
+                labels_by_id.setdefault(conversation_id, set()).add(key)
+        if any(
+            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in labels
+            and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in labels
+            for labels in labels_by_id.values()
+        ):
+            raise OmnigentError(
+                "Host identity rotation is blocked by unresolved worktree removal",
+                code=ErrorCode.CONFLICT,
+            )
 
     def upsert_on_connect(
         self,
@@ -347,6 +408,20 @@ class HostStore:
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
+        rotation_source_id: str | None = None
+        if managed_token is None:
+            with self._session("host_rotation_source") as session:
+                if session.get(SqlHost, (current_workspace_id(), host_id)) is None:
+                    rotation_source_id = session.execute(
+                        select(SqlHost.host_id).where(
+                            SqlHost.workspace_id == current_workspace_id(),
+                            SqlHost.user_id == user_id,
+                            SqlHost.name == name,
+                            SqlHost.deleted_at.is_(None),
+                        )
+                    ).scalar_one_or_none()
+        rotation_bound_ids: set[str] = set()
+        rotation_token: str | None = None
 
         def write(session: Session) -> Host:
             generation = require_active_account(session, user_id)
@@ -434,6 +509,11 @@ class HostStore:
                 )
             ).scalar_one_or_none()
             if existing_by_name is not None:
+                if existing_by_name.host_id != rotation_source_id:
+                    raise OmnigentError(
+                        "Host identity changed during rotation; retry registration",
+                        code=ErrorCode.CONFLICT,
+                    )
                 # Same (user_id, name), different host_id: identity rotation.
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
@@ -445,6 +525,7 @@ class HostStore:
                     now,
                     harnesses_json,
                     platform,
+                    expected_bound_ids=rotation_bound_ids,
                 )
                 return _row_to_host(row)
 
@@ -467,7 +548,15 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-        return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        try:
+            if rotation_source_id is not None:
+                rotation_token = self.acquire_worktree_admission(rotation_source_id, required=True)
+                rotation_bound_ids = self._rotation_bound_ids(rotation_source_id)
+                self._require_rotation_fence_settled(rotation_bound_ids)
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        finally:
+            if rotation_source_id is not None and rotation_token is not None:
+                self.release_cli_retention(rotation_source_id, rotation_token)
 
     @staticmethod
     def _rotate_host_id(
@@ -477,6 +566,8 @@ class HostStore:
         now: int,
         harnesses_json: str | None,
         platform: str | None,
+        *,
+        expected_bound_ids: set[str],
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -498,6 +589,8 @@ class HostStore:
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
         :param platform: Platform reported with the reconnecting hello.
+        :param expected_bound_ids: Session ids checked for unresolved removal
+            under the old host's admission lease.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -523,6 +616,11 @@ class HostStore:
                 )
             ).scalars()
         )
+        if set(bound_ids) != expected_bound_ids:
+            raise OmnigentError(
+                "Host bindings changed during rotation; retry registration",
+                code=ErrorCode.CONFLICT,
+            )
         if bound_ids:
             session.execute(
                 update(SqlConversationMetadata)
@@ -578,6 +676,41 @@ class HostStore:
             session.flush()
 
         return new_row
+
+    def acquire_worktree_admission(
+        self,
+        host_id: str,
+        *,
+        required: bool = False,
+        wait_timeout_s: float = 0.0,
+    ) -> str | None:
+        """Claim the durable Host lease shared by binding writes and safe cleanup.
+
+        A missing Host row is allowed for legacy/store-only session creation,
+        but safe deletion requires the row: without it there is no durable
+        cross-replica fence.
+        """
+        if self.get_host(host_id) is None:
+            if required:
+                raise OmnigentError(
+                    "Host admission lease is unavailable",
+                    code=ErrorCode.CONFLICT,
+                )
+            return None
+        token = secrets.token_hex(16)
+        deadline = time.monotonic() + wait_timeout_s
+        while True:
+            now = int(time.time())
+            if self.claim_cli_retention(
+                host_id, token, claimed_at=now, stale_before=now - 15 * 60
+            ):
+                return token
+            if time.monotonic() >= deadline:
+                raise OmnigentError(
+                    "Host admission lease is busy; retry the session operation",
+                    code=ErrorCode.CONFLICT,
+                )
+            time.sleep(0.05)
 
     def claim_cli_retention(
         self,

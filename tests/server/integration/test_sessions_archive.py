@@ -17,6 +17,7 @@ import dataclasses
 import gzip
 import io
 import tarfile
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -24,12 +25,20 @@ import pytest
 
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.server.archive_close import ArchiveCloseCoordinator
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.cli_release_store import CliReleaseIntentStore
 from omnigent.server.routes import sessions as _sessions_facade
+from omnigent.server.routes._host_worktree import (
+    WORKTREE_ROOT_LABEL_KEY,
+    worktree_root_fingerprint,
+)
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -774,6 +783,227 @@ async def test_delete_worktree_requires_archive(
     assert resp.status_code == 400
 
 
+async def test_worktree_status_includes_archived_child_and_requires_a_removal_receipt(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent = await create_test_session(client, name="status-parent")
+    assert (await client.get("/v1/info")).json()["worktree_status"] is True
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="Past child",
+        parent_conversation_id=parent["id"],
+        host_id="0123456789abcdef0123456789abcdef",
+        workspace="/opt/work/sample-app/tree",
+        git_branch="feature/status",
+    )
+    store.update_conversation(child.id, archived=True)
+    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
+    with patch(
+        "omnigent.server.routes._host_worktree.list_worktrees_on_host",
+        AsyncMock(return_value=[]),
+    ):
+        response = await client.get(
+            f"/v1/sessions/{parent['id']}/worktree-status", params={"refresh": "true"}
+        )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["session_count"] == 2
+    assert payload["aggregate"]["state"] == "unknown"
+    assert payload["blockers"][0]["session_id"] == child.id
+    assert payload["blockers"][0]["state"] == "unknown"
+
+    store.set_labels(child.id, {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: "1"})
+    removed = await client.get(f"/v1/sessions/{child.id}/worktree-status")
+    assert removed.status_code == 200
+    assert removed.json()["own"]["state"] == "removed"
+    assert removed.json()["aggregate"]["state"] == "removed"
+
+
+async def test_keep_worktree_archive_override_survives_delete_safe_preference(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="archive-keep-override")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        session["id"],
+        "0123456789abcdef0123456789abcdef",
+        workspace="/opt/work/sample-app/keep",
+        git_branch="feature/keep",
+    )
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    app.state.archive_close_coordinator.set_archive_preferences(preferences, None)
+    preferences.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "delete_safe"})
+    remove = AsyncMock(return_value=True)
+    with patch(
+        "omnigent.server.routes._sessions.helpers.remove_archived_worktree_best_effort", remove
+    ):
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"archived": True, "keep_worktree": True},
+        )
+        await _drain_detached_stops()
+    assert response.status_code == 200
+    row = store.get_conversation(session["id"])
+    assert row is not None
+    assert row.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(row.archive_revision)
+    remove.assert_not_awaited()
+
+
+async def test_never_preference_preserves_worktree_despite_legacy_delete_request(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="archive-never")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        session["id"],
+        "0123456789abcdef0123456789abcdef",
+        workspace="/opt/work/sample-app/never",
+        git_branch="feature/never",
+    )
+    remove = AsyncMock(return_value=True)
+    with patch(
+        "omnigent.server.routes._sessions.helpers.remove_archived_worktree_best_effort", remove
+    ):
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"archived": True, "delete_worktree": True},
+        )
+        await _drain_detached_stops()
+    assert response.status_code == 200
+    row = store.get_conversation(session["id"])
+    assert row is not None
+    assert ARCHIVE_DELETE_WORKTREE_LABEL_KEY not in row.labels
+    remove.assert_not_awaited()
+
+
+async def test_worktree_status_aggregate_prioritizes_dirty_over_unknown(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent = await create_test_session(client, name="status-priority")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "0123456789abcdef0123456789abcdef"
+    dirty = store.create_conversation(
+        kind="sub_agent",
+        title="dirty child",
+        parent_conversation_id=parent["id"],
+        host_id=host_id,
+        workspace="/opt/work/sample-app/dirty",
+        git_branch="feature/dirty",
+    )
+    unknown = store.create_conversation(
+        kind="sub_agent",
+        title="unknown child",
+        parent_conversation_id=parent["id"],
+        host_id=host_id,
+        workspace="/opt/work/sample-app/unknown",
+        git_branch="feature/unknown",
+    )
+    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
+
+    async def list_for_path(**kwargs):
+        if kwargs["repo_path"].endswith("/dirty"):
+            return [
+                {
+                    "path": kwargs["repo_path"],
+                    "branch": "feature/dirty",
+                    "is_main": False,
+                    "detached": False,
+                    "files": [{"path": "draft.txt", "status": "??"}],
+                }
+            ]
+        return []
+
+    with patch("omnigent.server.routes._host_worktree.list_worktrees_on_host", list_for_path):
+        response = await client.get(f"/v1/sessions/{parent['id']}/worktree-status")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["aggregate"]["state"] == "dirty"
+    assert {item["session_id"]: item["state"] for item in payload["blockers"]} == {
+        dirty.id: "dirty",
+        unknown.id: "unknown",
+    }
+
+
+async def test_worktree_status_protects_sibling_project_entry_under_recorded_root(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="status-project-root")
+    store = SqlAlchemyConversationStore(db_uri)
+    root = "/opt/work/sample-app/topic"
+    host_id = "0123456789abcdef0123456789abcdef"
+    store.set_host_id(
+        session["id"],
+        host_id,
+        workspace=f"{root}/packages/app",
+        git_branch="feature/topic",
+        worktree=f"{root}/packages/app",
+    )
+    store.set_labels(session["id"], {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)})
+    app.state.project_host_binding_store = SimpleNamespace(
+        entry_at_or_under=lambda _host, path: path == root
+    )
+    response = await client.get(f"/v1/sessions/{session['id']}/worktree-status")
+    assert response.status_code == 200
+    assert response.json()["own"]["state"] == "protected"
+
+
+async def test_worktree_status_without_recorded_branch_uses_live_linked_binding(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="status-unrecorded-branch")
+    store = SqlAlchemyConversationStore(db_uri)
+    root = "/opt/work/sample-app/topic"
+    host_id = "0123456789abcdef0123456789abcdef"
+    store.set_host_id(session["id"], host_id, workspace=f"{root}/packages/app", worktree=root)
+    store.set_labels(session["id"], {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)})
+    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
+    with patch(
+        "omnigent.server.routes._host_worktree.list_worktrees_on_host",
+        AsyncMock(
+            return_value=[
+                {
+                    "path": root,
+                    "branch": "feature/topic",
+                    "is_main": False,
+                    "detached": False,
+                    "files": [],
+                }
+            ]
+        ),
+    ):
+        response = await client.get(f"/v1/sessions/{session['id']}/worktree-status")
+    assert response.status_code == 200
+    assert response.json()["own"]["state"] == "protected"
+    assert response.json()["own"]["branch"] == "feature/topic"
+
+
+async def test_worktree_status_protects_archived_runner_before_release(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="status-runner-held")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        session["id"],
+        "0123456789abcdef0123456789abcdef",
+        workspace="/opt/work/sample-app/topic",
+        git_branch="feature/topic",
+    )
+    store.set_runner_id(session["id"], "b1b2c3d4e5f61234567890abcdef0123")
+    store.update_conversation(session["id"], archived=True, close_cli_on_archive=False)
+    list_host = AsyncMock()
+    with patch("omnigent.server.routes._host_worktree.list_worktrees_on_host", list_host):
+        response = await client.get(f"/v1/sessions/{session['id']}/worktree-status")
+    assert response.status_code == 200
+    assert response.json()["own"]["state"] == "protected"
+    assert response.json()["own"]["reason"] == "archived runner may still use worktree"
+    list_host.assert_not_awaited()
+
+
 @pytest.mark.parametrize("delete_worktree", [True, False])
 async def test_archive_stop_removes_worktree_when_requested(
     client: httpx.AsyncClient,
@@ -846,6 +1076,10 @@ async def test_delete_worktree_forces_the_teardown_on_a_keep_cli_host(
     session_id = session["id"]
     host_id = "8a2b3c4d5e6f1234567890abcdef0123"
     _keep_cli_host(app, db_uri, host_id)
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    app.state.archive_close_coordinator.set_archive_preferences(preferences, None)
+    preferences.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "delete_safe"})
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv_store.set_host_id(
         session_id,
@@ -888,6 +1122,9 @@ async def test_delete_worktree_on_an_already_archived_session_requests_the_teard
     session_id = session["id"]
     host_id = "9a2b3c4d5e6f1234567890abcdef0123"
     _keep_cli_host(app, db_uri, host_id)
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    app.state.archive_close_coordinator.set_archive_preferences(preferences, None)
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv_store.set_host_id(
         session_id,
@@ -911,6 +1148,10 @@ async def test_delete_worktree_on_an_already_archived_session_requests_the_teard
         # The keep-CLI policy left the first archive with no teardown at all.
         assert row.archive_close_requested_revision is None
         teardown.assert_not_awaited()
+
+        preferences.patch_namespace(
+            RESERVED_USER_LOCAL, "worktree_archive", {"mode": "delete_safe"}
+        )
 
         second = await client.patch(
             f"/v1/sessions/{session_id}",

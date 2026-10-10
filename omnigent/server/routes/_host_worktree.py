@@ -110,6 +110,10 @@ class WorktreeHostUnavailableError(WorktreeProxyError):
     """
 
 
+class WorktreeHostRefusalError(WorktreeProxyError):
+    """The host replied that Git refused removal; no directory was removed."""
+
+
 class FolderFactsUnsupportedError(WorktreeProxyError):
     """
     Raised when the connected host build predates ``host.folder_facts``.
@@ -277,6 +281,7 @@ async def remove_worktree_on_host(
     worktree_path: str,
     branch: str | None,
     delete_branch: bool,
+    safe_only: bool = False,
 ) -> None:
     """
     Send a ``host.remove_worktree`` frame and await the result.
@@ -295,6 +300,11 @@ async def remove_worktree_on_host(
         or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
     :raises WorktreeProxyError: If the host reports a removal failure.
     """
+    if safe_only:
+        from omnigent.host.frames import CAP_WORKTREE_SAFE_ARCHIVE
+
+        if CAP_WORKTREE_SAFE_ARCHIVE not in host_conn.hello.capabilities:
+            raise WorktreeProxyError("host does not support safe archive removal")
     request_id = secrets.token_hex(8)
     frame = encode_host_frame(
         HostRemoveWorktreeFrame(
@@ -302,6 +312,7 @@ async def remove_worktree_on_host(
             worktree_path=worktree_path,
             branch=branch,
             delete_branch=delete_branch,
+            safe_only=safe_only,
         )
     )
     result = await _await_host_worktree_result(
@@ -313,7 +324,7 @@ async def remove_worktree_on_host(
         op="worktree removal",
     )
     if result.get("status") != "ok":
-        raise WorktreeProxyError(
+        raise WorktreeHostRefusalError(
             f"worktree removal failed: {result.get('error') or 'host reported no detail'}"
         )
 
@@ -324,6 +335,7 @@ async def list_worktrees_on_host(
     host_conn: HostConnection,
     repo_path: str,
     for_cleanup: bool = False,
+    for_status: bool = False,
 ) -> list[dict[str, object]]:
     """
     Send a ``host.list_worktrees`` frame and await the result.
@@ -348,6 +360,7 @@ async def list_worktrees_on_host(
             request_id=request_id,
             repo_path=repo_path,
             for_cleanup=for_cleanup,
+            for_status=for_status,
         )
     )
     result = await _await_host_worktree_result(
@@ -357,6 +370,7 @@ async def list_worktrees_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree listing",
+        timeout=15.0 if for_status else _WORKTREE_TIMEOUT_S,
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -366,6 +380,71 @@ async def list_worktrees_on_host(
     if not isinstance(worktrees, list):
         raise WorktreeProxyError("host returned an incomplete worktree list")
     return worktrees
+
+
+_worktree_admission_refresh_tasks: set[asyncio.Task[bool]] = set()
+
+
+async def refresh_worktree_admission_fence(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    conversation_store: Any,
+    host_id: str,
+    workspace: str,
+    branch: str | None,
+) -> bool:
+    """Revalidate a recreated linked tree before clearing an old removal fence."""
+    from omnigent.server.routes._workspace_validation import _is_subpath_of
+
+    check = getattr(conversation_store, "_worktree_admission_fenced", None)
+    clear = getattr(conversation_store, "clear_verified_worktree_admission_fence", None)
+    host_store = getattr(conversation_store, "_host_binding_store", None)
+    if not callable(check) or not callable(clear) or host_store is None:
+        return False
+    if not await asyncio.to_thread(check, host_id, workspace):
+        return False
+
+    async def _under_lease() -> bool:
+        token = await asyncio.to_thread(
+            host_store.acquire_worktree_admission,
+            host_id,
+            required=True,
+            wait_timeout_s=15.0,
+        )
+        try:
+            trees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                repo_path=workspace,
+                for_cleanup=True,
+            )
+            matches = [
+                tree["path"]
+                for tree in trees
+                if isinstance(tree.get("path"), str)
+                and _is_subpath_of(workspace, tree["path"])
+                and not tree.get("is_main", True)
+                and not tree.get("detached", True)
+                and (branch is None or tree.get("branch") == branch)
+            ]
+            if not matches:
+                raise WorktreeProxyError("worktree binding changed after archive cleanup")
+            await asyncio.to_thread(clear, host_id, max(matches, key=len))
+            return True
+        finally:
+            await asyncio.to_thread(host_store.release_cli_retention, host_id, token)
+
+    task = asyncio.create_task(_under_lease())
+    _worktree_admission_refresh_tasks.add(task)
+
+    def _finish(completed: asyncio.Task[bool]) -> None:
+        _worktree_admission_refresh_tasks.discard(completed)
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(_finish)
+    return await asyncio.shield(task)
 
 
 async def folder_facts_on_host(

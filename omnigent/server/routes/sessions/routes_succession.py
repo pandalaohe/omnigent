@@ -263,6 +263,7 @@ def register_succession_routes(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            archive_cleanup=getattr(request.app.state, "archive_close_coordinator", None),
         )
         return {
             "status": "done" if receipt.phase == "done" else "pending",

@@ -53,6 +53,7 @@ import {
 } from "@/components/ui/dialog";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { RailAgentBadge, childAgentDisplay, useChildAgentBadge } from "@/components/RailAgentBadge";
+import { WorktreeStatusMark } from "@/components/WorktreeStatusMark";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -977,6 +978,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
                 />
               </span>
               <RailAgentBadge child={child} />
+              <WorktreeStatusMark sessionId={rootSessionId} />
               <span className="min-w-0 truncate text-base font-semibold">{label}</span>
             </div>
             {preview && (
@@ -1175,6 +1177,7 @@ function SubagentRow({
                       )}
                     </span>
                     {showBadge && <RailAgentBadge child={child} />}
+                    <WorktreeStatusMark sessionId={child.id} />
                     <span className="min-w-0 flex-1 truncate text-sm font-medium">{primary}</span>
                     {child.routed_model ? (
                       // Model the intelligent router picked for this sub-agent — the
@@ -1298,13 +1301,14 @@ function PastChildRow({
                 <RoleIcon className="size-3.5 shrink-0 text-muted-foreground" />
               )}
               <RailAgentBadge child={child} />
+              <WorktreeStatusMark sessionId={child.id} />
               <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
               <span className="flex-1" />
               {archivedLabel && (
                 <span className="shrink-0 text-[11px] text-muted-foreground">{archivedLabel}</span>
               )}
             </div>
-            {/* Aligned with the title: 14px icon + 4px gap, plus the 20px badge + 4px gap when configured. */}
+            {/* Align placement with the identity column, independent of an optional status mark. */}
             <p
               className={cn(
                 "truncate text-xs text-muted-foreground",

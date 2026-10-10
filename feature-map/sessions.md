@@ -19,6 +19,15 @@ the header menu), and each place is a separate entry point.
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
+- `archive-worktree-safety`: the server preference chooses safe deletion or
+  never deletion. Archive checks only the selected session's bound worktree.
+  Dirty, unknown, protected and shared trees remain; branches remain. The UI
+  lists unsafe files and offers Archive only as the default.
+- `worktree-marks`: asymmetric tree icons precede session names in the sidebar,
+  Agents tree and current header. Green means clean, orange means dirty,
+  dashed means unknown, a trunk bar means protected/shared, and an outline
+  means confirmed removed. Mothers aggregate every descendant, including Past;
+  hover names blockers. Merge state is information, not a deletion gate.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -145,6 +154,16 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_paginates`
+- **`archive-worktree-safety`, settings and UI marks:**
+  `tests/e2e_ui/sessions/test_worktree_safe_archive_ui.py` drives real preference
+  and archive requests with injected host-status responses for dark/light
+  sidebar, header, Agents/Past rows and blocking-child hover coverage. Actual
+  Git safety/removal is checked by `tests/host/test_git_worktree.py`; server
+  archive, tool and keep-warm policy by
+  `tests/server/integration/test_sessions_archive.py` and
+  `tests/server/test_child_keep_warm.py`; rotation by
+  `tests/server/test_session_succession.py`. Browser status injection is not
+  proof of a real host round trip.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
@@ -296,6 +315,11 @@ plain `uv run pytest`, which starts a private server for the test.
   that the undo toast restores the session.
 - The header menu of an archived session must offer Unarchive, not Archive.
   Open an archived session directly to see it.
+- Safe worktree deletion also applies to tool archive, keep-warm auto archive
+  and session rotation. The host checks cleanliness again before removing a
+  linked worktree without force. Missing folders stay unknown unless a matching
+  successful-removal receipt exists. Old hosts without safe removal keep trees.
+  The old browser archive preference migrates once; an existing server choice wins.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
