@@ -15,12 +15,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.harnesses.claude_native.bridge import (
-    BRIDGE_ID_LABEL_KEY,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
-    read_bridge_id,
     read_claude_session_id,
     read_claude_status_model,
     read_permission_hook_config,
@@ -156,7 +154,7 @@ def _never_connected_errors() -> tuple[type[Exception], ...]:
 # suits typical proxies. Floored at 0 (a negative would make every sever a
 # held poll, disabling flap detection).
 _PERMISSION_HELD_POLL_FLOOR_S = max(0.0, _env_float("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", 10.0))
-# Fail-fast budget for the synchronous ``/clear`` and ``/fork`` session
+# Fail-fast budget for the synchronous ``/fork`` session
 # rotations that run inside the SessionStart hook to gate Claude's
 # welcome banner. Unlike the permission long-poll these are quick
 # request/reply calls, so they must NOT inherit the day-long permission
@@ -226,11 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         # SessionEnd is diagnostic evidence, not a status or transcript change.
         return 0
     _annotate_resume_session_context(bridge_dir, payload)
-    if payload.get("hook_event_name") == "SessionStart" and payload.get("source") == "clear":
-        rotated_session_id = _rotate_session_on_clear(bridge_dir)
-        if rotated_session_id:
-            payload["omnigent_clear_rotated_to"] = rotated_session_id
-    elif _is_claude_branch_session_start(payload):
+    # /clear is rotated only by the forwarder, after this event is durable.
+    if _is_claude_branch_session_start(payload):
         payload["omnigent_fork_detected"] = True
         rotated_session_id = _rotate_session_on_fork(bridge_dir)
         if rotated_session_id:
@@ -361,63 +356,6 @@ def _payload_transcript_has_recent_branch_command(
         time.sleep(_FORK_TRANSCRIPT_POLL_S)
 
 
-def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
-    """
-    Rotate Omnigent sessions synchronously for a Claude ``/clear`` SessionStart.
-
-    The SessionStart hook output is what Claude renders as the welcome
-    banner. Rotating here lets the banner point at the new Omnigent session
-    before Claude prints it. Failures return ``None`` so the background
-    forwarder can still perform the rotation from the recorded hook event.
-
-    :param bridge_dir: Native Claude bridge directory.
-    :returns: New Omnigent session id, e.g. ``"conv_new"``, or ``None`` when
-        rotation could not be completed from the hook.
-    """
-    old_session_id = read_active_session_id(bridge_dir)
-    if not old_session_id:
-        return None
-    config = read_permission_hook_config(bridge_dir)
-    ap_server_url = config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        return None
-    raw_headers = config.get("ap_auth_headers")
-    headers = (
-        {str(key): str(value) for key, value in raw_headers.items()}
-        if isinstance(raw_headers, dict)
-        else {}
-    )
-    import httpx
-
-    # Route the whole rotation sequence (GET old, POST /v1/sessions or /fork,
-    # PATCH new, DELETE old) to the replica holding this host's tunnel: a managed
-    # create/fork notifies the host inline over its pod-local tunnel, so an
-    # off-replica request can't reach it. This hook client carries no
-    # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
-    # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
-    # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
-    try:
-        with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
-        ) as client:
-            new_session_id = _create_clear_replacement_session(
-                client,
-                ap_server_url.rstrip("/"),
-                old_session_id,
-                bridge_dir,
-            )
-    except httpx.HTTPError as exc:
-        print(f"omnigent claude clear hook: Omnigent rotation failed: {exc}", file=sys.stderr)
-        return None
-    except RuntimeError as exc:
-        print(f"omnigent claude clear hook: rotation failed: {exc}", file=sys.stderr)
-        return None
-    return new_session_id
-
-
 def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     """
     Fork Omnigent sessions synchronously for a Claude ``/fork``/``/branch``.
@@ -473,101 +411,6 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     except RuntimeError as exc:
         print(f"omnigent claude fork hook: fork failed: {exc}", file=sys.stderr)
         return None
-    return new_session_id
-
-
-def _create_clear_replacement_session(
-    client: httpx.Client,
-    ap_server_url: str,
-    old_session_id: str,
-    bridge_dir: Path,
-) -> str:
-    """
-    Create and activate the fresh Omnigent session for ``/clear``.
-
-    :param client: Sync Omnigent HTTP client.
-    :param ap_server_url: Omnigent server base URL without a trailing slash,
-        e.g. ``"http://127.0.0.1:8787"``.
-    :param old_session_id: Session being rotated away from, e.g.
-        ``"conv_old"``.
-    :param bridge_dir: Native Claude bridge directory.
-    :returns: New Omnigent session id, e.g. ``"conv_new"``.
-    :raises httpx.HTTPError: If Omnigent rejects session creation,
-        new-session binding, or terminal transfer.
-    :raises RuntimeError: If Omnigent returns malformed session data.
-    """
-    old_resp = client.get(f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}")
-    old_resp.raise_for_status()
-    old = old_resp.json()
-    if not isinstance(old, dict):
-        raise RuntimeError(f"session {old_session_id!r} snapshot was not an object")
-    agent_id = old.get("agent_id")
-    if not isinstance(agent_id, str) or not agent_id:
-        raise RuntimeError(f"session {old_session_id!r} has no agent_id")
-    runner_id = old.get("runner_id")
-    raw_labels = old.get("labels")
-    labels = (
-        {str(key): str(value) for key, value in raw_labels.items()}
-        if isinstance(raw_labels, dict)
-        else {}
-    )
-    labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
-
-    create_resp = client.post(
-        f"{ap_server_url}/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "labels": labels,
-        },
-    )
-    create_resp.raise_for_status()
-    created = create_resp.json()
-    if not isinstance(created, dict):
-        raise RuntimeError("clear replacement session response was not an object")
-    new_session_id = created.get("id")
-    if not isinstance(new_session_id, str) or not new_session_id:
-        raise RuntimeError("clear replacement session response did not include id")
-
-    if isinstance(runner_id, str) and runner_id:
-        bind_resp = client.patch(
-            f"{ap_server_url}/v1/sessions/{url_component(new_session_id)}",
-            json={"runner_id": runner_id},
-        )
-        bind_resp.raise_for_status()
-
-    from omnigent.entities.session_resources import terminal_resource_id
-
-    terminal_id = terminal_resource_id("claude", "main")
-    transfer_resp = client.post(
-        (
-            f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}"
-            f"/resources/terminals/{url_component(terminal_id)}/transfer"
-        ),
-        json={"target_session_id": new_session_id},
-    )
-    transfer_resp.raise_for_status()
-
-    write_active_session_id(bridge_dir, new_session_id)
-    clear_resp = client.patch(
-        f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
-        json={
-            "runner_id": "",
-            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
-            # so its later resume gets its own isolated dir instead of the new
-            # session's live one (which would double-mirror the transcript and
-            # trip the executor guard). Mirrors the async forwarder rotation;
-            # ``_auto_create_claude_terminal`` recognises this marker.
-            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
-        },
-    )
-    if clear_resp.status_code >= 400:
-        print(
-            (
-                "omnigent claude clear hook: failed to clear old runner binding: "
-                f"{clear_resp.status_code} {clear_resp.text}"
-            ),
-            file=sys.stderr,
-        )
     return new_session_id
 
 

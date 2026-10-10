@@ -521,6 +521,9 @@ class HookForwardState:
     event_cursor: int
     byte_offset: int | None = None
     cursor_fingerprint: str | None = None
+    pending_clear_old_id: str | None = None
+    pending_clear_new_id: str | None = None
+    pending_clear_transferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -1487,6 +1490,8 @@ async def forward_claude_transcript_to_session(
                             start_at_end=start_at_end,
                             session_id=current_session_id,
                         )
+                    hook_state = _read_hook_state(bridge_dir) or hook_state
+                    clear_source_id = hook_state.pending_clear_old_id or session_id
                     rotation = await _maybe_rotate_session_on_clear(
                         client=client,
                         session_id=current_session_id,
@@ -1501,7 +1506,7 @@ async def forward_claude_transcript_to_session(
                         # /clear starts one (a /fork keeps the old session alive).
                         await post_session_succession(
                             client,
-                            old_session_id=session_id,
+                            old_session_id=clear_source_id,
                             new_session_id=rotation,
                         )
                         # Tell the superseded (old) conversation it was cleared:
@@ -1516,7 +1521,7 @@ async def forward_claude_transcript_to_session(
                         # runs.
                         await _post_clear_supersession(
                             client,
-                            old_session_id=session_id,
+                            old_session_id=clear_source_id,
                             new_session_id=rotation,
                             agent_name=agent_name,
                         )
@@ -4847,27 +4852,23 @@ async def _maybe_rotate_session_on_clear(
         ),
         None,
     )
-    if clear_record is None:
+    state = _read_hook_state(bridge_dir) or state
+    if clear_record is None and state.pending_clear_new_id is None:
         return None
 
-    # Consume this clear hook EXACTLY ONCE. If the rotation raises partway
-    # (e.g. the terminal transfer returns 400 because the target already owns a
-    # terminal), we must still advance the cursor: otherwise the forwarder's
-    # next poll re-reads the same clear record and re-rotates — creating a fresh
-    # replacement session every poll, unbounded. A single /clear rotates at most
-    # once; a failed rotation is logged and skipped (the old session simply
-    # keeps running) rather than retried forever.
+    # Consume successful rotations and confirmed rejection once. Unknown
+    # ownership keeps the same candidate checkpoint for a later retry.
     durable = HookForwardState(
-        event_cursor=clear_record.event_cursor,
-        byte_offset=clear_record.byte_offset,
+        event_cursor=clear_record.event_cursor if clear_record is not None else state.event_cursor,
+        byte_offset=clear_record.byte_offset if clear_record is not None else state.byte_offset,
         cursor_fingerprint=_jsonl_cursor_fingerprint(
             bridge_dir / _HOOKS_FILE,
-            clear_record.byte_offset,
+            clear_record.byte_offset if clear_record is not None else state.byte_offset or 0,
         ),
     )
     new_session_id: str | None = None
     try:
-        if clear_record.clear_rotated_to:
+        if clear_record is not None and clear_record.clear_rotated_to:
             new_session_id = clear_record.clear_rotated_to
         else:
             new_session_id = await _create_clear_replacement_session(
@@ -4878,6 +4879,10 @@ async def _maybe_rotate_session_on_clear(
     except asyncio.CancelledError:
         raise
     except Exception:
+        pending = _read_hook_state(bridge_dir)
+        if pending is not None and pending.pending_clear_new_id:
+            # Retry the same candidate; unknown ownership is not rejection.
+            raise
         _logger.exception(
             "Claude /clear rotation failed; consuming the clear hook to avoid a "
             "re-rotation loop. old_session=%s",
@@ -4941,6 +4946,8 @@ async def _create_clear_replacement_session(
         best-effort after the bridge has rotated.
     :raises RuntimeError: If the old session snapshot is malformed.
     """
+    checkpoint = _read_hook_state(bridge_dir) or HookForwardState(event_cursor=0)
+    old_session_id = checkpoint.pending_clear_old_id or old_session_id
     old = await _fetch_session_snapshot(client, old_session_id)
     agent_id = old.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id:
@@ -4952,73 +4959,153 @@ async def _create_clear_replacement_session(
         if isinstance(raw_labels, dict)
         else {}
     )
-    labels.setdefault(BRIDGE_ID_LABEL_KEY, read_bridge_id(bridge_dir) or old_session_id)
+    labels[BRIDGE_ID_LABEL_KEY] = read_bridge_id(bridge_dir) or old_session_id
 
-    create_body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
+    create_body: dict[str, object] = {
+        "agent_id": agent_id,
+        "labels": labels,
+        "workspace": old.get("workspace"),
+        "git": None,
+    }
     project_id = old.get("project_id")
     if isinstance(project_id, str):
-        create_body.update({"project_id": project_id, "workspace": None, "git": None})
-    create_resp = await client.post("/v1/sessions", json=create_body)
-    if isinstance(project_id, str) and create_resp.status_code == 404:
-        error = create_resp.json().get("error")
-        if isinstance(error, dict) and error.get("code") == "not_found":
-            _logger.info(
-                "Project %s was removed before clear replacement; retrying unfiled", project_id
+        create_body["project_id"] = project_id
+    new_session_id = checkpoint.pending_clear_new_id
+    if new_session_id is not None and not checkpoint.pending_clear_transferred:
+        candidate = await _fetch_session_snapshot(client, new_session_id)
+        candidate_labels = candidate.get("labels")
+        if (
+            candidate.get("archived")
+            and isinstance(candidate_labels, dict)
+            and candidate_labels.get(BRIDGE_ID_LABEL_KEY) == f"{new_session_id}-cleared"
+        ):
+            await _write_hook_state_async(
+                bridge_dir,
+                replace(checkpoint, pending_clear_old_id=None, pending_clear_new_id=None),
             )
-            create_body.pop("project_id")
-            create_body.pop("workspace")
-            create_body.pop("git")
-            create_resp = await client.post("/v1/sessions", json=create_body)
-    create_resp.raise_for_status()
-    created = _parse_json_response(create_resp, context="clear-replacement session create")
-    new_session_id = created.get("id")
-    if not isinstance(new_session_id, str) or not new_session_id:
-        raise RuntimeError("clear replacement session response did not include id")
-
-    if isinstance(runner_id, str) and runner_id:
-        bind_resp = await client.patch(
-            f"/v1/sessions/{url_component(new_session_id)}",
-            json={"runner_id": runner_id},
+            raise RuntimeError("clear replacement was already rejected and archived")
+    if new_session_id is None:
+        create_resp = await client.post("/v1/sessions", json=create_body)
+        if isinstance(project_id, str) and create_resp.status_code == 404:
+            error = create_resp.json().get("error")
+            if isinstance(error, dict) and error.get("code") == "not_found":
+                _logger.info(
+                    "Project %s was removed before clear replacement; retrying unfiled", project_id
+                )
+                create_body.pop("project_id")
+                create_resp = await client.post("/v1/sessions", json=create_body)
+        create_resp.raise_for_status()
+        created = _parse_json_response(create_resp, context="clear-replacement session create")
+        new_session_id = created.get("id")
+        if not isinstance(new_session_id, str) or not new_session_id:
+            raise RuntimeError("clear replacement session response did not include id")
+        await _write_hook_state_async(
+            bridge_dir,
+            replace(
+                checkpoint,
+                pending_clear_old_id=old_session_id,
+                pending_clear_new_id=new_session_id,
+            ),
         )
-        bind_resp.raise_for_status()
 
     terminal_id = terminal_resource_id("claude", "main")
-    transfer_resp = await client.post(
-        (
-            f"/v1/sessions/{url_component(old_session_id)}"
-            f"/resources/terminals/{url_component(terminal_id)}/transfer"
-        ),
-        json={"target_session_id": new_session_id},
-    )
-    transfer_resp.raise_for_status()
 
-    write_active_session_id(bridge_dir, new_session_id)
-    clear_resp = await client.patch(
-        f"/v1/sessions/{url_component(old_session_id)}",
-        json={
-            "runner_id": "",
-            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id.
-            # The new session keeps the original bridge id (set above) and owns
-            # the live terminal/pane in D(original); the old session must NOT
-            # share that dir, or resuming it (host wake-on-message /
-            # ``omnigent claude --resume``) would put a second forwarder on the
-            # live transcript (duplicate items) and trip the executor's
-            # "no longer active after /clear" guard. ``_auto_create_claude_terminal``
-            # recognises this exact marker and cold-resumes the old session in
-            # its own isolated D("{id}-cleared"); the executor spawn_env resolves
-            # the same label, so both agree.
-            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
-        },
+    async def owners() -> tuple[bool, bool]:
+        present = []
+        for owner in (old_session_id, new_session_id):
+            response = await client.get(
+                f"/v1/sessions/{url_component(owner)}/resources/terminals/{url_component(terminal_id)}"
+            )
+            if response.status_code not in (200, 404):
+                response.raise_for_status()
+            present.append(response.status_code == 200)
+        return present[0], present[1]
+
+    transferred = checkpoint.pending_clear_transferred
+    try:
+        if checkpoint.pending_clear_new_id and not transferred:
+            source_present, target_present = await owners()
+            transferred = target_present and not source_present
+        if isinstance(runner_id, str) and runner_id:
+            bind_resp = await client.patch(
+                f"/v1/sessions/{url_component(new_session_id)}",
+                json={"runner_id": runner_id},
+            )
+            bind_resp.raise_for_status()
+        if not transferred:
+            transfer_resp = await client.post(
+                (
+                    f"/v1/sessions/{url_component(old_session_id)}"
+                    f"/resources/terminals/{url_component(terminal_id)}/transfer"
+                ),
+                json={"target_session_id": new_session_id},
+            )
+            transfer_resp.raise_for_status()
+    except httpx.HTTPError:
+        source_present, target_present = await owners()
+        if source_present or not target_present:
+            if target_present:
+                close_resp = await client.delete(
+                    f"/v1/sessions/{url_component(new_session_id)}/resources/"
+                    f"terminals/{url_component(terminal_id)}"
+                )
+                if close_resp.status_code != 404:
+                    close_resp.raise_for_status()
+            cleanup_resp = await client.patch(
+                f"/v1/sessions/{url_component(new_session_id)}",
+                json={
+                    "archived": True,
+                    "runner_id": "",
+                    "labels": {BRIDGE_ID_LABEL_KEY: f"{new_session_id}-cleared"},
+                },
+            )
+            cleanup_resp.raise_for_status()
+            await _write_hook_state_async(
+                bridge_dir,
+                replace(checkpoint, pending_clear_old_id=None, pending_clear_new_id=None),
+            )
+            raise
+
+    await _write_hook_state_async(
+        bridge_dir,
+        replace(
+            checkpoint,
+            pending_clear_old_id=old_session_id,
+            pending_clear_new_id=new_session_id,
+            pending_clear_transferred=True,
+        ),
     )
-    if clear_resp.status_code >= 400:
+    write_active_session_id(bridge_dir, new_session_id)
+    try:
+        clear_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}",
+            json={
+                "runner_id": "",
+                # Resuming the superseded session must not share the successor's
+                # live pane and transcript.
+                "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+            },
+        )
+        clear_resp.raise_for_status()
+    except httpx.HTTPError:
         _logger.warning(
             "Failed to clear old claude-native runner binding after /clear; "
-            "old_session=%s new_session=%s status=%s body=%s",
+            "old_session=%s new_session=%s",
             old_session_id,
             new_session_id,
-            clear_resp.status_code,
-            clear_resp.text,
             extra={"session_id": old_session_id},
+            exc_info=True,
+        )
+    from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+    # User clears retire even childless sessions; requested handover retains
+    # its existing empty-set behaviour.
+    if ROTATE_REQUESTED_LABEL_KEY not in labels:
+        await post_session_succession(
+            client,
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+            allow_empty=True,
         )
     return new_session_id
 
@@ -5432,7 +5519,8 @@ def reset_transcript_forward_state(bridge_dir: Path, *, reset_hooks: bool = True
         _FORWARDER_STATE_FILE,
         "transcript_forwarder.pause.json",
     ]
-    if reset_hooks:
+    pending = _read_hook_state(bridge_dir)
+    if reset_hooks and not (pending is not None and pending.pending_clear_new_id):
         filenames.append(_HOOK_STATE_FILE)
     for filename in filenames:
         with contextlib.suppress(FileNotFoundError):
@@ -7221,6 +7309,9 @@ def _validated_hook_state(
         event_cursor=0,
         byte_offset=0,
         cursor_fingerprint=_jsonl_cursor_fingerprint(hooks_path, 0),
+        pending_clear_old_id=state.pending_clear_old_id,
+        pending_clear_new_id=state.pending_clear_new_id,
+        pending_clear_transferred=state.pending_clear_transferred,
     )
 
 
@@ -8609,6 +8700,13 @@ def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
         event_cursor=event_cursor,
         byte_offset=byte_offset,
         cursor_fingerprint=cursor_fingerprint,
+        pending_clear_old_id=raw.get("pending_clear_old_id")
+        if isinstance(raw.get("pending_clear_old_id"), str)
+        else None,
+        pending_clear_new_id=raw.get("pending_clear_new_id")
+        if isinstance(raw.get("pending_clear_new_id"), str)
+        else None,
+        pending_clear_transferred=raw.get("pending_clear_transferred") is True,
     )
 
 
@@ -8629,6 +8727,10 @@ def _write_hook_state(bridge_dir: Path, state: HookForwardState) -> None:
         payload["byte_offset"] = state.byte_offset
     if state.cursor_fingerprint is not None:
         payload["cursor_fingerprint"] = state.cursor_fingerprint
+    if state.pending_clear_old_id and state.pending_clear_new_id:
+        payload["pending_clear_old_id"] = state.pending_clear_old_id
+        payload["pending_clear_new_id"] = state.pending_clear_new_id
+        payload["pending_clear_transferred"] = state.pending_clear_transferred
     _write_json_atomic(bridge_dir / _HOOK_STATE_FILE, payload)
 
 

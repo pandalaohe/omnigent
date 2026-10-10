@@ -268,6 +268,7 @@ async def post_session_succession(
     *,
     old_session_id: str,
     new_session_id: str,
+    allow_empty: bool = False,
 ) -> None:
     """
     Ask the server to move a rotated-away session's live children to its successor.
@@ -280,12 +281,15 @@ async def post_session_succession(
     :param client: Omnigent HTTP client.
     :param old_session_id: Rotated-away session id, e.g. ``"conv_old"``.
     :param new_session_id: Replacement session id, e.g. ``"conv_new"``.
+    :param allow_empty: Retire the old session even without live children.
     :returns: None.
     """
     if old_session_id == new_session_id:
         return
     url = f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}/succession"
-    payload = {"target_session_id": new_session_id}
+    payload: dict[str, object] = {"target_session_id": new_session_id}
+    if allow_empty:
+        payload["allow_empty"] = True
     for attempt in range(1, _SUCCESSION_MAX_ATTEMPTS + 1):
         try:
             response = await client.post(
