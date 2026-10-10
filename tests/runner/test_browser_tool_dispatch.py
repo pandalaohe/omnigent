@@ -30,6 +30,7 @@ from omnigent.runner.tool_dispatch import (
     strip_browser_tool_schemas,
 )
 from omnigent.spec.types import AgentSpec
+from omnigent.tools.builtins.browser import BROWSER_TOOL_CLASSES
 
 # ── Helpers ──────────────────────────────────────────────────────
 
@@ -83,6 +84,19 @@ class _ErrorClient:
 
 
 # ── _execute_browser_tool ────────────────────────────────────────
+
+
+def test_browser_schemas_offer_session_tab_targets() -> None:
+    """Every browser action can name a tab; only navigate may create one."""
+    schemas = {
+        tool.name(): tool().get_schema()["function"]["parameters"] for tool in BROWSER_TOOL_CLASSES
+    }
+    for parameters in schemas.values():
+        assert parameters["properties"]["tab_id"]["type"] == "string"
+        assert parameters["additionalProperties"] is False
+    assert schemas["browser_navigate"]["properties"]["new_tab"]["type"] == "boolean"
+    for name in ("browser_snapshot", "browser_click", "browser_type", "browser_screenshot"):
+        assert "new_tab" not in schemas[name]["properties"]
 
 
 @pytest.mark.asyncio

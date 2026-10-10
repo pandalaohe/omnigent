@@ -52,7 +52,9 @@ class BrowserNavigateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Open or navigate the Omnigent desktop app's embedded "
-            "browser pane to a URL. Auto-opens the pane if it isn't "
+            "browser pane to a URL. Reuses this session's selected tab "
+            "unless tab_id targets another open tab or new_tab opens one. "
+            "Auto-opens the pane if it isn't "
             "open yet. Requires the Omnigent desktop window to be "
             "running — fails cleanly otherwise. After a load settles, "
             "call browser_snapshot to inspect what's on the page."
@@ -77,6 +79,17 @@ class BrowserNavigateTool(Tool):
                             "type": "string",
                             "description": "The URL to open or navigate to.",
                         },
+                        "tab_id": {
+                            "type": "string",
+                            "description": (
+                                "An open tab_id from this session's browser_snapshot; "
+                                "omit to use the user's selected browser tab."
+                            ),
+                        },
+                        "new_tab": {
+                            "type": "boolean",
+                            "description": "Open a new tab; cannot be combined with tab_id.",
+                        },
                     },
                     "required": ["url"],
                     "additionalProperties": False,
@@ -97,8 +110,10 @@ class BrowserSnapshotTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Capture an accessibility-tree snapshot of the embedded "
-            "browser. Returns a snapshot_id plus the current URL, "
+            "Capture an accessibility-tree snapshot of an open tab in this "
+            "session. Returns its tab_id and this session's tabs "
+            "(tab_id, title, URL, selected), including on a page error. "
+            "A loaded page also returns a snapshot_id, current URL, "
             "document.title, and a YAML-shaped tree of every "
             "interactive / text-bearing / landmark element on the "
             "page, each tagged with [ref=N]. Hand the refs (along with "
@@ -123,7 +138,15 @@ class BrowserSnapshotTool(Tool):
                 "description": BrowserSnapshotTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "tab_id": {
+                            "type": "string",
+                            "description": (
+                                "An open tab_id from this session's browser_snapshot; "
+                                "omit to use the user's selected browser tab."
+                            ),
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },
@@ -150,7 +173,7 @@ class BrowserClickTool(Tool):
             "error instead of a generic stale-ref message. CSS "
             "`selector` is accepted as a fallback when you already know "
             "a stable selector. Exactly one of `ref` or `selector` "
-            "must be provided."
+            "must be provided. tab_id optionally targets another tab in this session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -179,8 +202,8 @@ class BrowserClickTool(Tool):
                         "snapshot_id": {
                             "type": "string",
                             "description": (
-                                "The snapshot_id the ref came from, so a "
-                                "stale ref is rejected with a precise error."
+                                "Required with ref: the snapshot_id the ref came "
+                                "from, so stale or cross-tab refs are rejected."
                             ),
                         },
                         "selector": {
@@ -189,6 +212,13 @@ class BrowserClickTool(Tool):
                                 "CSS selector fallback when you already "
                                 "know a stable selector. Provide either "
                                 "ref or selector, not both."
+                            ),
+                        },
+                        "tab_id": {
+                            "type": "string",
+                            "description": (
+                                "An open tab_id from this session's browser_snapshot; "
+                                "omit to use the user's selected browser tab."
                             ),
                         },
                     },
@@ -212,11 +242,11 @@ class BrowserTypeTool(Tool):
         return (
             "Focus an input element and type text into it. Identify the "
             "input with `ref` (preferred — integer id from "
-            "browser_snapshot, pair with `snapshot_id` for precise "
+            "browser_snapshot, pair with required `snapshot_id` for precise "
             "stale-ref errors) or `selector` (CSS, fallback). "
             "Dispatches `input` + `change` events using the native "
             "value setter so React/Vue/etc. controlled inputs see the "
-            "value."
+            "value. tab_id optionally targets another tab in this session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -245,8 +275,8 @@ class BrowserTypeTool(Tool):
                         "snapshot_id": {
                             "type": "string",
                             "description": (
-                                "The snapshot_id the ref came from, so a "
-                                "stale ref is rejected with a precise error."
+                                "Required with ref: the snapshot_id the ref came "
+                                "from, so stale or cross-tab refs are rejected."
                             ),
                         },
                         "selector": {
@@ -255,6 +285,13 @@ class BrowserTypeTool(Tool):
                                 "CSS selector fallback when you already "
                                 "know a stable selector. Provide either "
                                 "ref or selector, not both."
+                            ),
+                        },
+                        "tab_id": {
+                            "type": "string",
+                            "description": (
+                                "An open tab_id from this session's browser_snapshot; "
+                                "omit to use the user's selected browser tab."
                             ),
                         },
                         "text": {
@@ -287,7 +324,8 @@ class BrowserScreenshotTool(Tool):
             "browser_snapshot for picking elements to act on, since "
             "screenshots can't carry ref ids and you can't click a "
             "pixel location. Use this when you need to verify what "
-            "something looks like, not to plan an interaction."
+            "something looks like, not to plan an interaction. tab_id "
+            "optionally targets another open tab in this session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -304,7 +342,15 @@ class BrowserScreenshotTool(Tool):
                 "description": BrowserScreenshotTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "tab_id": {
+                            "type": "string",
+                            "description": (
+                                "An open tab_id from this session's browser_snapshot; "
+                                "omit to use the user's selected browser tab."
+                            ),
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },

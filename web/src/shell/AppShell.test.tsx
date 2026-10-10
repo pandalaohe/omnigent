@@ -24,6 +24,7 @@ import {
 } from "react-router-dom";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { emitArtifactOpenRequest } from "@/lib/artifactOpenBus";
+import { emitBrowserActionClaimed, emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -2791,6 +2792,101 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("surfaces only a claimed browser action for the active session", async () => {
+    const bridge = { kind: "electron", browserOpenOrNavigate: vi.fn(), setBadgeCount: vi.fn() };
+    vi.stubGlobal("omnigentDesktop", bridge);
+    writeSessionWorkspaceState("conv_browser_claim", {
+      open: false,
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+      openBrowsers: ["tab-one"],
+      selectedBrowserId: "tab-one",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_browser_claim", permission_level: null }]);
+    try {
+      renderShell("/c/conv_browser_claim");
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      vi.stubGlobal("omnigentDesktop", undefined);
+      act(() =>
+        emitBrowserActionRequest(
+          {
+            type: "browser_action_request",
+            actionId: "loser",
+            action: "navigate",
+            args: { url: "https://example.com" },
+          },
+          "conv_browser_claim",
+        ),
+      );
+      act(() => emitBrowserActionClaimed("other-session", "tab-one"));
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      expect(readSessionWorkspaceState("conv_browser_claim").selectedFilePath).toBe("README.md");
+      vi.stubGlobal("omnigentDesktop", bridge);
+      act(() => emitBrowserActionClaimed("conv_browser_claim", "tab-one"));
+      expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      await waitFor(() =>
+        expect(readSessionWorkspaceState("conv_browser_claim").selectedFilePath).toBeNull(),
+      );
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("clears the selected terminal when surfacing a claimed browser target", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+    });
+    writeSessionWorkspaceState("conv_browser_terminal_claim", {
+      open: true,
+      openTerminals: ["terminal:terminal_main"],
+      selectedTerminalKey: "terminal:terminal_main",
+      openBrowsers: ["tab-one"],
+      selectedBrowserId: "tab-one",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    mockConversations([{ id: "conv_browser_terminal_claim", permission_level: null }]);
+    try {
+      renderShell("/c/conv_browser_terminal_claim");
+      expect(readSessionWorkspaceState("conv_browser_terminal_claim").selectedTerminalKey).toBe(
+        "terminal:terminal_main",
+      );
+      act(() => emitBrowserActionClaimed("conv_browser_terminal_claim", "tab-one"));
+      expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      await waitFor(() =>
+        expect(
+          readSessionWorkspaceState("conv_browser_terminal_claim").selectedTerminalKey,
+        ).toBeNull(),
+      );
+      expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
     } finally {
       cleanup();
       vi.unstubAllGlobals();

@@ -9,7 +9,11 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import {
+  emitBrowserActionClaimed,
+  onBrowserActionRequest,
+  surfacesBrowserPane,
+} from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
@@ -17,6 +21,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import {
+  AGENT_BROWSER_TAB_ID,
+  browserViewId,
+  createBrowserTab,
+  isBrowserTabClosing,
+  openAgentBrowserTab,
+  readBrowserTabsState,
+  selectBrowserTab,
+  validBrowserTabId,
+} from "./useBrowserTabs";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -35,6 +49,11 @@ interface BrowserDesktopBridge {
     conversationId: string,
     js: string,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
+  browserHasView?: (viewId: string) => Promise<{
+    exists: boolean;
+    url?: string;
+    title?: string;
+  }>;
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -195,7 +214,7 @@ const SNAPSHOT_JS = `(() => {
 /** Build the "find element" preamble for an action that accepts EITHER ref OR
  *  selector. Sets `el` in the in-page scope; throws on miss.
  *
- *  When `snapshot_id` is provided (recommended), the resolver validates it
+ *  The resolver validates `snapshot_id`
  *  matches `window.__omni_snapshot_id__` BEFORE looking up the ref — gives the
  *  agent a precise "snapshot superseded" error instead of a generic "ref is
  *  stale". */
@@ -223,12 +242,94 @@ function findElJs(args: Record<string, unknown>): string {
   );
 }
 
+interface BrowserTarget {
+  tabId: string;
+  viewId: string;
+  kind: "open" | "new" | "reserved" | "legacy";
+}
+
+/** Resolve a tool target only from this session's persisted tab IDs. */
+function resolveBrowserTarget(
+  conversationId: string,
+  action: string,
+  args: Record<string, unknown>,
+): BrowserTarget | ActionResult {
+  const requested = args.tab_id;
+  const newTab = args.new_tab;
+  if (newTab !== undefined && (action !== "navigate" || typeof newTab !== "boolean")) {
+    return { ok: false, error: "new_tab is only valid for browser_navigate" };
+  }
+  if (requested !== undefined && newTab === true) {
+    return { ok: false, error: "tab_id and new_tab cannot be used together" };
+  }
+  const state = readBrowserTabsState(conversationId);
+  let target: BrowserTarget;
+  if (requested !== undefined) {
+    if (
+      typeof requested !== "string" ||
+      !validBrowserTabId(requested) ||
+      !state.tabs.includes(requested)
+    ) {
+      return { ok: false, error: "tab_id is not an open tab in this session" };
+    }
+    target = { tabId: requested, viewId: browserViewId(conversationId, requested), kind: "open" };
+  } else if (newTab === true) {
+    const tabId = crypto.randomUUID();
+    target = { tabId, viewId: browserViewId(conversationId, tabId), kind: "new" };
+  } else if (state.selected) {
+    target = {
+      tabId: state.selected,
+      viewId: browserViewId(conversationId, state.selected),
+      kind: "open",
+    };
+  } else {
+    // Older shells can still have a reserved session view without a saved soft tab.
+    target = {
+      tabId: AGENT_BROWSER_TAB_ID,
+      viewId: conversationId,
+      kind: action === "navigate" ? "reserved" : "legacy",
+    };
+  }
+  if (isBrowserTabClosing(conversationId, target.tabId)) {
+    return { ok: false, error: "tab_id is closing in this session" };
+  }
+  return target;
+}
+
+async function tabMetadata(
+  conversationId: string,
+  desktop: BrowserDesktopBridge,
+  target: BrowserTarget,
+  pageExists = false,
+): Promise<{ tab_id: string; title: string; url: string; selected: boolean }[]> {
+  const state = readBrowserTabsState(conversationId);
+  const tabIds =
+    pageExists && !state.tabs.includes(target.tabId) ? [...state.tabs, target.tabId] : state.tabs;
+  return Promise.all(
+    tabIds.map(async (tabId) => {
+      let metadata: { exists: boolean; url?: string; title?: string } | undefined;
+      try {
+        metadata = await desktop.browserHasView?.(browserViewId(conversationId, tabId));
+      } catch {
+        // A metadata lookup must not discard an otherwise valid page snapshot.
+      }
+      return {
+        tab_id: tabId,
+        title: metadata?.exists ? (metadata.title ?? "") : "",
+        url: metadata?.exists ? (metadata.url ?? "") : "",
+        selected: state.selected === tabId || (state.selected === null && tabId === target.tabId),
+      };
+    }),
+  );
+}
+
 /** Execute one claimed action against the conversation's WebContentsView.
  *  `conversationId` targets the right view; `desktop` is the (feature-detected)
  *  bridge. Returns a normalized `ActionResult` — never throws (the outer catch
  *  converts any in-page/IPC error to `{ok:false, error}`). */
 async function dispatch(
   conversationId: string,
+  target: BrowserTarget,
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
@@ -244,13 +345,13 @@ async function dispatch(
         }
         // force: honor the explicit agent nav even on same-URL. agent: mark it
         // model-issued so the registry applies the scheme/host allowlist (Risk).
-        const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
+        const r = await desktop.browserOpenOrNavigate(target.viewId, url, undefined, {
           force: true,
           agent: true,
           ...(sourceHostId ? { sourceHostId } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
-        return { ok: true, data: { final_url: url } };
+        return { ok: true, data: { final_url: url, tab_id: target.tabId } };
       }
       case "screenshot": {
         const screenshot = desktop.browserScreenshot;
@@ -259,13 +360,13 @@ async function dispatch(
         }
         const deadline = Date.now() + SCREENSHOT_SURFACE_TIMEOUT_MS;
         const capture = async (): Promise<ActionResult> => {
-          const r = await screenshot(conversationId);
+          const r = await screenshot(target.viewId);
           const noSurface =
             (!r?.ok && !!r?.noSurface) ||
             (!!r?.ok && (!r.dataUrl || r.dataUrl === EMPTY_SCREENSHOT_DATA_URL));
           if (!noSurface) {
             if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
-            return { ok: true, data_url: r.dataUrl };
+            return { ok: true, data_url: r.dataUrl, data: { tab_id: target.tabId } };
           }
           if (Date.now() >= deadline) return { ok: false, error: SCREENSHOT_PANE_HIDDEN_ERROR };
           await new Promise<void>((resolve) => {
@@ -279,17 +380,41 @@ async function dispatch(
         if (!desktop.browserExecute) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        const r = await desktop.browserExecute(conversationId, SNAPSHOT_JS);
-        if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
+        const snapshotFailure = async (error: string): Promise<ActionResult> => ({
+          ok: false,
+          error,
+          data: {
+            tab_id: target.tabId,
+            tabs: await tabMetadata(conversationId, desktop, target),
+          },
+        });
+        const r = await desktop.browserExecute(target.viewId, SNAPSHOT_JS);
+        if (!r?.ok) return snapshotFailure(r?.error ?? "snapshot failed");
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
-          if (typeof parsed.error === "string") return { ok: false, error: parsed.error };
-          return { ok: true, data: parsed };
+          if (typeof parsed.error === "string") return snapshotFailure(parsed.error);
+          return {
+            ok: true,
+            data: {
+              ...parsed,
+              tab_id: target.tabId,
+              tabs: await tabMetadata(conversationId, desktop, target, true),
+            },
+          };
         } catch (e) {
-          return { ok: false, error: `snapshot parse failed: ${(e as Error).message}` };
+          return snapshotFailure(`snapshot parse failed: ${(e as Error).message}`);
         }
       }
       case "click": {
+        if (
+          typeof args.ref === "number" &&
+          (typeof args.snapshot_id !== "string" || !args.snapshot_id)
+        ) {
+          return {
+            ok: false,
+            error: "snapshot_id is required with ref; call browser_snapshot again",
+          };
+        }
         if (!desktop.browserExecute) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
@@ -297,11 +422,20 @@ async function dispatch(
           `(() => { ${findElJs(args)} ` +
           `el.scrollIntoView({ block: 'center', inline: 'center' }); ` +
           `el.click(); return 'ok'; })()`;
-        const r = await desktop.browserExecute(conversationId, js);
+        const r = await desktop.browserExecute(target.viewId, js);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         return { ok: true };
       }
       case "type": {
+        if (
+          typeof args.ref === "number" &&
+          (typeof args.snapshot_id !== "string" || !args.snapshot_id)
+        ) {
+          return {
+            ok: false,
+            error: "snapshot_id is required with ref; call browser_snapshot again",
+          };
+        }
         if (!desktop.browserExecute) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
@@ -314,7 +448,7 @@ async function dispatch(
           `el.dispatchEvent(new Event('input', { bubbles: true })); ` +
           `el.dispatchEvent(new Event('change', { bubbles: true })); ` +
           `return 'ok'; })()`;
-        const r = await desktop.browserExecute(conversationId, js);
+        const r = await desktop.browserExecute(target.viewId, js);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
         return { ok: true };
       }
@@ -397,6 +531,32 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
+      if (cancelled) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "browser relay context changed",
+        });
+        return;
+      }
+      if (evt.action === "navigate" && !String(evt.args.url ?? "")) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "url is required",
+        });
+        return;
+      }
+      if (evt.action === "navigate" && !desktop.browserOpenOrNavigate) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "this desktop shell does not support the browser pane",
+        });
+        return;
+      }
+      const target = resolveBrowserTarget(sourceConversationId, evt.action, evt.args);
+      if ("ok" in target) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, target);
+        return;
+      }
       let sourceHostId: string | null = null;
       if (evt.action === "navigate") {
         try {
@@ -425,9 +585,71 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           // Unknown provenance stays denied for localhost; public browsing still works.
         }
       }
-      const result = cancelled
-        ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);
+      if (cancelled) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "browser relay context changed",
+        });
+        return;
+      }
+      if (isBrowserTabClosing(sourceConversationId, target.tabId)) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "tab_id is closing in this session",
+        });
+        return;
+      }
+      if (
+        target.kind === "open" &&
+        !readBrowserTabsState(sourceConversationId).tabs.includes(target.tabId)
+      ) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "tab_id is no longer open in this session",
+        });
+        return;
+      }
+      if (target.kind === "new") createBrowserTab(sourceConversationId, target.tabId);
+      if (target.kind === "reserved") openAgentBrowserTab(sourceConversationId);
+      if (evt.action === "screenshot" && target.kind === "legacy") {
+        try {
+          const existing = await desktop.browserHasView?.(target.viewId);
+          if (
+            !cancelled &&
+            !isBrowserTabClosing(sourceConversationId, target.tabId) &&
+            (!desktop.browserHasView || existing?.exists)
+          )
+            openAgentBrowserTab(sourceConversationId);
+        } catch {
+          // Capture still reports the native error if its view disappeared.
+        }
+      }
+      if (cancelled) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "browser relay context changed",
+        });
+        return;
+      }
+      if (isBrowserTabClosing(sourceConversationId, target.tabId)) {
+        await postResult(sourceConversationId, evt.actionId, claimToken, {
+          ok: false,
+          error: "tab_id is closing in this session",
+        });
+        return;
+      }
+      if (surfacesBrowserPane(evt.action)) {
+        selectBrowserTab(sourceConversationId, target.tabId);
+        emitBrowserActionClaimed(sourceConversationId, target.tabId);
+      }
+      const result = await dispatch(
+        sourceConversationId,
+        target,
+        evt.action,
+        evt.args,
+        desktop,
+        sourceHostId,
+      );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
