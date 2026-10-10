@@ -20,27 +20,12 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import attribution_user, get_user_id
 from omnigent.server.routes.default_policies import _require_admin
 from omnigent.stores.global_instructions_store import (
-    GLOBAL_INSTRUCTIONS_MAX_CHARS,
     GlobalInstructionRevision,
     GlobalInstructionsStore,
 )
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
-
-
-class _GlobalInstructionsTooLong(OmnigentError):
-    """Over-cap saves are rejected as unprocessable (422).
-
-    The cap is a body-validation rule, and this API reserves 422 for
-    body-validation rejections — the schema-validation handler attributes
-    its 422s as ``invalid_input``. ``invalid_input`` alone maps to 400,
-    so the status is overridden here rather than adding a code.
-    """
-
-    @property
-    def http_status(self) -> int:
-        return 422
 
 
 class _SaveGlobalInstructionsRequest(BaseModel):
@@ -61,7 +46,7 @@ def _to_response(revision: GlobalInstructionRevision | None) -> dict[str, Any]:
         "revision_id": revision.id if revision is not None else None,
         "updated_at": revision.created_at if revision is not None else None,
         "updated_by": revision.created_by if revision is not None else None,
-        "max_chars": GLOBAL_INSTRUCTIONS_MAX_CHARS,
+        "max_chars": None,
     }
 
 
@@ -125,25 +110,17 @@ def create_global_instructions_router(
     ) -> dict[str, Any]:
         """Save a new revision and return the live text.
 
-        Requires admin privileges in multi-user mode. Over-cap text is
-        rejected outright — never truncated, nothing written. Empty text
-        is a valid save and turns injection off from the next session
-        initialization.
+        Requires admin privileges in multi-user mode. Text is saved intact
+        without a product size cap. Empty text turns injection off from
+        the next session initialization.
 
         :param request: The incoming request, used to extract the user
             identity.
         :param body: The full replacement text.
         :returns: The same shape as :func:`get_global_instructions`.
-        :raises OmnigentError: 401/403 if the user lacks admin
-            privileges, or 422 when the text exceeds the cap.
+        :raises OmnigentError: 401/403 if the user lacks admin privileges.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
-        if len(body.text) > GLOBAL_INSTRUCTIONS_MAX_CHARS:
-            raise _GlobalInstructionsTooLong(
-                f"Global instructions are limited to "
-                f"{GLOBAL_INSTRUCTIONS_MAX_CHARS} characters; got {len(body.text)}",
-                code=ErrorCode.INVALID_INPUT,
-            )
         revision = await asyncio.to_thread(
             store.save,
             body.text,

@@ -7,7 +7,7 @@ export interface GlobalInstructions {
   revision_id: string | null;
   updated_at: number | null;
   updated_by: string | null;
-  max_chars: number;
+  max_chars: null;
 }
 
 /** One saved revision of the global instructions text. */

@@ -3637,6 +3637,49 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     assert options.stderr is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_large_system_prompt_file_survives_connect_and_is_cleaned(fail):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    text = "全🙂" * 32_768 + "\nlast instruction"
+    staged = []
+
+    class Client(_SDKClient):
+        async def connect(self):
+            prompt_path = Path(self.options.extra_args["system-prompt-file"])
+            staged.append(prompt_path)
+            assert prompt_path.read_text(encoding="utf-8") == text
+            if os.name != "nt":
+                assert prompt_path.stat().st_mode & 0o777 == 0o600
+            # The preset emits no inline prompt, including on older SDKs.
+            assert self.options.system_prompt == {"type": "preset", "preset": "claude_code"}
+            if fail:
+                raise OSError("synthetic launch failure")
+
+    executor = ClaudeSDKExecutor()
+    options = SimpleNamespace(system_prompt=text, extra_args={"no-session-persistence": None})
+    sdk = SimpleNamespace(ClaudeSDKClient=Client)
+    try:
+        if fail:
+            with pytest.raises(
+                RuntimeError, match="Claude SDK connect failed: synthetic launch failure"
+            ):
+                await executor._get_or_create_client(
+                    sdk, session_key="large-prompt", options=options, model=None
+                )
+        else:
+            await executor._get_or_create_client(
+                sdk, session_key="large-prompt", options=options, model=None
+            )
+        assert len(staged) == 1
+        assert not staged[0].exists()
+        assert options.system_prompt == text
+        assert options.extra_args == {"no-session-persistence": None}
+    finally:
+        await executor.close()
+
+
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
     """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
     against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd

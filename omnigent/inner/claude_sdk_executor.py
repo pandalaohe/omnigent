@@ -2008,6 +2008,8 @@ class ClaudeSDKExecutor(Executor):
 
             options.stderr = _tee_stderr
             client = sdk.ClaudeSDKClient(options)
+            original_prompt = getattr(options, "system_prompt", None)
+            original_extra_args = getattr(options, "extra_args", {})
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2035,6 +2037,25 @@ class ClaudeSDKExecutor(Executor):
                 # whatever it inherited.
                 sdk_env = getattr(options, "env", None)
                 with ExitStack() as env_stack:
+                    if (
+                        isinstance(original_prompt, str)
+                        and len(original_prompt.encode("utf-8")) >= 64 * 1024
+                    ):
+                        # The CLI reads this at connect; retire it on success or failure.
+                        with tempfile.NamedTemporaryFile(
+                            "w", encoding="utf-8", newline="", delete=False
+                        ) as prompt_file:
+                            env_stack.callback(
+                                pathlib.Path(prompt_file.name).unlink, missing_ok=True
+                            )
+                            prompt_file.write(original_prompt)
+                        # Close before the CLI opens it, including on Windows.
+                        # A preset without append emits no inline prompt, including on older SDKs.
+                        options.system_prompt = {"type": "preset", "preset": "claude_code"}
+                        options.extra_args = {
+                            **original_extra_args,
+                            "system-prompt-file": prompt_file.name,
+                        }
                     env_stack.enter_context(_unset_env_var("CLAUDECODE"))
                     env_stack.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
                     if isinstance(sdk_env, dict) and "CLAUDE_CODE_USE_GATEWAY" in sdk_env:
@@ -2078,6 +2099,9 @@ class ClaudeSDKExecutor(Executor):
                 # directly to the original callback and ``connect_stderr``
                 # can be GC'd instead of growing for the session lifetime.
                 options.stderr = original_stderr
+                if isinstance(original_prompt, str):
+                    options.system_prompt = original_prompt
+                    options.extra_args = original_extra_args
             current_task: asyncio.Task[None] | None = cast(
                 "asyncio.Task[None] | None", asyncio.current_task()
             )

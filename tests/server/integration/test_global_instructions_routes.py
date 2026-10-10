@@ -21,7 +21,6 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.global_instructions_store import GLOBAL_INSTRUCTIONS_MAX_CHARS
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
     SqlAlchemyGlobalInstructionsStore,
 )
@@ -138,14 +137,14 @@ def _make_user(db_uri: str, email: str, *, is_admin: bool) -> None:
 # ── Save and read ─────────────────────────────────────────────────────────────
 
 
-async def test_admin_saves_text_at_cap(
+async def test_admin_saves_large_text_intact(
     auth_client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """PUT at exactly the cap saves, and GET returns the same text."""
+    """Large instructions have no product cap and round-trip intact."""
     _make_user(db_uri, "admin@example.com", is_admin=True)
     headers = _headers("admin@example.com")
-    text = "x" * GLOBAL_INSTRUCTIONS_MAX_CHARS
+    text = "全🙂" * 32_768 + "\nlast instruction"
 
     resp = await auth_client.put(
         "/v1/global-instructions",
@@ -155,7 +154,7 @@ async def test_admin_saves_text_at_cap(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["text"] == text
-    assert body["max_chars"] == GLOBAL_INSTRUCTIONS_MAX_CHARS
+    assert body["max_chars"] is None
     assert body["revision_id"] is not None
     assert body["updated_at"] is not None
     assert body["updated_by"] == "admin@example.com"
@@ -165,12 +164,12 @@ async def test_admin_saves_text_at_cap(
     assert get_resp.json() == body
 
 
-async def test_over_cap_rejected_without_writing(
+async def test_large_save_keeps_full_revision(
     auth_client: httpx.AsyncClient,
     db_uri: str,
     store: SqlAlchemyGlobalInstructionsStore,
 ) -> None:
-    """PUT over the cap returns 422 naming limit and length; nothing is written."""
+    """A save above the former cap adds a full revision and replaces the live text."""
     _make_user(db_uri, "admin@example.com", is_admin=True)
     headers = _headers("admin@example.com")
     await auth_client.put(
@@ -181,18 +180,17 @@ async def test_over_cap_rejected_without_writing(
     revisions_before = store.list_revisions()
     assert len(revisions_before) == 1
 
+    text = "x" * 8001
     resp = await auth_client.put(
         "/v1/global-instructions",
-        json={"text": "x" * (GLOBAL_INSTRUCTIONS_MAX_CHARS + 1)},
+        json={"text": text},
         headers=headers,
     )
-    assert resp.status_code == 422
-    message = resp.json()["error"]["message"]
-    assert str(GLOBAL_INSTRUCTIONS_MAX_CHARS) in message
-    assert str(GLOBAL_INSTRUCTIONS_MAX_CHARS + 1) in message
-    assert store.list_revisions() == revisions_before
+    assert resp.status_code == 200, resp.text
+    assert len(store.list_revisions()) == 2
+    assert {revision.text for revision in store.list_revisions()} == {"keep", text}
     current = await auth_client.get("/v1/global-instructions", headers=headers)
-    assert current.json()["text"] == "keep"
+    assert current.json()["text"] == text
 
 
 async def test_empty_save_is_accepted(
