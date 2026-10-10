@@ -11026,6 +11026,29 @@ def _format_async_task_item(payload: _JsonObject) -> str:
     return f"[System: task {handle_id} {status} — {tool}: {output}]"
 
 
+def _format_peer_copy(payload: _JsonObject) -> str:
+    """Render an informational copy of a sub-agent's peer-started turn."""
+    sender_id = _optional_string(payload.get("sender_session_id")) or ""
+    sender_title = _optional_string(payload.get("sender_title")) or ""
+    sender_origin = _optional_string(payload.get("sender_origin")) or ""
+    agent = _optional_string(payload.get("agent")) or ""
+    title = _optional_string(payload.get("title")) or ""
+    child_id = _optional_string(payload.get("child_session_id")) or ""
+    excerpt = _optional_string(payload.get("excerpt")) or ""
+    status = _optional_string(payload.get("status")) or ""
+    output = _optional_string(payload.get("output")) or ""
+    kind = "corrected copy" if payload.get("correction") is True else "copy"
+    return (
+        f"[System: {kind}, not a result of work you dispatched — session {sender_id} "
+        f"{json.dumps(sender_title, ensure_ascii=False)} "
+        f"({json.dumps(sender_origin, ensure_ascii=False)}) "
+        f"messaged your sub-agent {agent}:{title} "
+        f"({child_id}): {json.dumps(excerpt, ensure_ascii=False)}. "
+        f"Its turn ended {status}: {json.dumps(output, ensure_ascii=False)}. "
+        f"Full text: sys_session_get_history {child_id}.]"
+    )
+
+
 def _subagent_child_id(payload: _JsonObject) -> str | None:
     """
     Extract the child session id from a sub-agent inbox payload.
@@ -11271,20 +11294,18 @@ async def _drain_inbox(
     """
     Non-blocking drain of the per-session inbox queue.
 
-    Returns formatted completion payloads or "Inbox is empty."
+    Returns formatted completion payloads and peer copies, or the empty sentinel.
 
     :param inbox: The session's asyncio.Queue, or ``None`` if
         no queue has been created yet.
     :param server_client: HTTP client pointed at Omnigent server.
     :param conversation_id: Parent session id, e.g.
         ``"conv_parent123"``.
-    :returns: Formatted string of completed tasks.
+    :returns: Formatted string of completed tasks and peer copies.
     """
-    if inbox is None or inbox.empty():
-        return "Inbox is empty — no completed tasks."
     items: list[str] = []
     retry_payloads: list[_JsonObject] = []
-    while not inbox.empty():
+    while inbox is not None and not inbox.empty():
         try:
             payload = inbox.get_nowait()
         except asyncio.QueueEmpty:
@@ -11311,8 +11332,16 @@ async def _drain_inbox(
             retry_payloads.append(payload)
         else:
             await _cleanup_drained_subagent_work(evaluation.payload, server_client=server_client)
-    for payload in retry_payloads:
-        inbox.put_nowait(payload)
+    if inbox is not None:
+        for payload in retry_payloads:
+            inbox.put_nowait(payload)
+    if conversation_id:
+        from omnigent.runner.subagent_work import pop_peer_copies
+
+        copies, dropped = pop_peer_copies(conversation_id)
+        items.extend(_format_peer_copy(copy) for copy in copies)
+        if dropped > 0:
+            items.append(f"[System: {dropped} older copies were dropped unread.]")
     return "\n\n".join(items) if items else "Inbox is empty — no completed tasks."
 
 

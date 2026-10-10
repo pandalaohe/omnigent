@@ -204,6 +204,44 @@ def test_find_sent_matches_ref_or_id_within_window(store: SqlAlchemyPeerMessageS
     assert store.find_sent(sender, receiver, "missing", 0) is None
 
 
+def test_find_sent_oldest_returns_earliest_match(store: SqlAlchemyPeerMessageStore) -> None:
+    """``oldest=True`` returns the pair's earliest match; default the newest."""
+    sender, receiver = _uid("fo-sender"), _uid("fo-receiver")
+    earlier = store.create(
+        _record(
+            "fo1",
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            ref="corr-fo",
+            created_at=100,
+        )
+    )
+    later = store.create(
+        _record(
+            "fo2",
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            ref="corr-fo",
+            created_at=200,
+        )
+    )
+    assert store.find_sent(sender, receiver, "corr-fo", 0, oldest=True).id == earlier.id  # type: ignore[union-attr]
+    assert store.find_sent(sender, receiver, "corr-fo", 0).id == later.id  # type: ignore[union-attr]
+
+
+def test_find_replied_by_returns_the_linked_record(store: SqlAlchemyPeerMessageStore) -> None:
+    """``find_replied_by`` is the exact inverse of ``mark_replied``."""
+    original = store.create(_record("frb"))
+    reply = store.create(_record("frb-reply"))
+    assert store.find_replied_by(reply.id) is None
+    assert store.mark_replied(original.id, reply.id, replied_at=10) is True
+    linked = store.find_replied_by(reply.id)
+    assert linked is not None
+    assert linked.id == original.id
+    assert store.find_replied_by(_uid("frb-unknown")) is None
+    assert store.find_replied_by("not-a-uuid") is None
+
+
 def test_count_for_ref(store: SqlAlchemyPeerMessageStore) -> None:
     """``count_for_ref`` counts exactly the records carrying the ref."""
     ref = "corr-1"

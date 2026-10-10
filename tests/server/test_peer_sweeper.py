@@ -199,6 +199,9 @@ class _FakePeerStore(PeerMessageStore):
         candidates.sort(key=lambda r: (r.created_at, r.id), reverse=True)
         return candidates[0] if candidates else None
 
+    def find_replied_by(self, reply_peer_id: str) -> SessionPeerMessage | None:
+        return next((r for r in self._rows.values() if r.reply_peer_id == reply_peer_id), None)
+
     def count_for_ref(self, ref: str) -> int:
         return sum(1 for r in self._rows.values() if r.ref == ref)
 
@@ -245,10 +248,14 @@ class _TrueStateScript:
         self.states: dict[str, str] = {}
         self.sequences: dict[str, list[str]] = {}
         self.calls: list[str] = []
+        self.receiver_args: list[bool] = []
         self.raise_once_for: set[str] = set()
 
-    async def __call__(self, conv: Conversation) -> tuple[str, bool | None]:
+    async def __call__(
+        self, conv: Conversation, *, receiver: bool = False
+    ) -> tuple[str, bool | None]:
         self.calls.append(conv.id)
+        self.receiver_args.append(receiver)
         # A real checkpoint, not just an `async def` with no internal
         # await — lets two "concurrent" callers (asyncio.gather) actually
         # interleave instead of one running to completion uninterrupted,
@@ -258,9 +265,11 @@ class _TrueStateScript:
             self.raise_once_for.discard(conv.id)
             raise RuntimeError("simulated true_state read failure")
         seq = self.sequences.get(conv.id)
-        if seq:
-            return seq.pop(0), True
-        return self.states.get(conv.id, "idle"), True
+        state = seq.pop(0) if seq else self.states.get(conv.id, "idle")
+        # Mirror routes_peer._true_state(receiver=True): a child is never steered.
+        if receiver and conv.parent_conversation_id is not None and state == "steerable":
+            state = "busy"
+        return state, True
 
 
 class _DeliverScript:
@@ -988,6 +997,49 @@ async def test_steerable_receiver_delivers(harness: _Harness) -> None:
     await harness.sweeper._tick()
     assert _row(harness.store, record.id).state == "delivered"
     assert len(harness.deliver.calls) == 1
+    assert harness.post_event.calls == []
+
+
+async def test_steerable_child_receiver_stays_queued(harness: _Harness) -> None:
+    """A busy steerable child receiver is never steered: it stays queued."""
+    child = dataclasses.replace(
+        harness.add_conv(_conv("child", title="Child")), parent_conversation_id="parent"
+    )
+    harness.conv_store.convs["child"] = child
+    record = harness.seed_record(receiver_session_id="child", state="queued")
+    harness.true_state.states["child"] = "steerable"
+    await harness.sweeper._tick()
+    assert [
+        receiver
+        for session_id, receiver in zip(
+            harness.true_state.calls, harness.true_state.receiver_args, strict=True
+        )
+        if session_id == "child"
+    ] == [True]
+
+    assert _row(harness.store, record.id).state == "queued"
+    assert harness.deliver.calls == []
+    assert harness.post_event.calls == []
+
+
+async def test_steerable_child_receiver_recheck_stays_queued(harness: _Harness) -> None:
+    """A child becoming steerable after the claim reverts to its queued state."""
+    child = dataclasses.replace(
+        harness.add_conv(_conv("child", title="Child")), parent_conversation_id="parent"
+    )
+    harness.conv_store.convs["child"] = child
+    record = harness.seed_record(receiver_session_id="child", state="queued")
+    harness.true_state.sequences["child"] = ["idle", "steerable"]
+    await harness.sweeper._tick()
+    assert [
+        receiver
+        for session_id, receiver in zip(
+            harness.true_state.calls, harness.true_state.receiver_args, strict=True
+        )
+        if session_id == "child"
+    ] == [True, True]
+    assert _row(harness.store, record.id).state == "queued"
+    assert harness.deliver.calls == []
     assert harness.post_event.calls == []
 
 

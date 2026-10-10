@@ -159,6 +159,7 @@ from omnigent.server.child_keep_warm import (
     warm_state_for_labels,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -452,6 +453,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
@@ -11048,6 +11050,9 @@ def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    *,
+    peer_message_store: PeerMessageStore | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -11067,22 +11072,37 @@ def configure_subagent_block_notifier(
     :param runner_router: Router used by the wake to reach the parent's
         bound runner. ``None`` in in-process setups.
     :param agent_store: Lets each wake name the parent agent's current bundle.
+    :param peer_message_store: Durable peer store; with the peer feature on,
+        the notifier routes a foreign-started turn's notices to its sender.
+    :param feature_flags: Resolved feature snapshot; ``None`` resolves here.
     :returns: A callable that uninstalls the observer and cancels any
         in-flight wake futures. Call from the lifespan teardown.
     """
     from omnigent.runtime import pending_elicitations as _pending_elicitations
     from omnigent.runtime.subagent_block_notifier import SubagentBlockNotifier
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+    from omnigent.server.routes.sessions.peer_child_turn import (
+        foreign_turn_sender as _foreign_turn_sender,
+    )
 
     loop = asyncio.get_running_loop()
+
+    foreign_turn_sender: Callable[[Conversation], str | None] | None = None
+    flags = feature_flags if feature_flags is not None else resolve_feature_flags()
+    if flags.enabled(Feature.SESSION_PEER_MESSAGING) and peer_message_store is not None:
+
+        def foreign_turn_sender(child: Conversation) -> str | None:
+            """Resolve the peer sender of the child's active foreign turn."""
+            return _foreign_turn_sender(conversation_store, peer_message_store, child)
 
     async def _wake_dispatch(parent_id: str, child: Conversation, notice: str) -> bool:
         """
         Deliver one wake notice (the notifier's injected dispatch).
 
-        :param parent_id: Parent session id.
+        :param parent_id: Recipient session id.
         :param child: The blocked child :class:`Conversation`.
         :param notice: Pre-formatted ``[System: …]`` text.
-        :returns: ``True`` when the notice reached the parent's runner,
+        :returns: ``True`` when the notice reached the recipient's runner,
             ``False`` when it could not be delivered (so the notifier
             releases the debounce and a re-publish can retry).
         """
@@ -11099,6 +11119,7 @@ def configure_subagent_block_notifier(
         conversation_store=conversation_store,
         wake_dispatch=_wake_dispatch,
         loop=loop,
+        foreign_turn_sender=foreign_turn_sender,
     )
     _pending_elicitations.set_elicitation_observer(notifier.observe)
 

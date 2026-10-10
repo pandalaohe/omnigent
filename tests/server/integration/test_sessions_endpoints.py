@@ -5817,6 +5817,23 @@ async def test_get_session_items_window_404_for_unknown_anchor(
     assert resp.status_code == 404
 
 
+async def test_get_session_items_window_missing_anchor_returns_stale_cursor(
+    client: httpx.AsyncClient,
+) -> None:
+    """A valid but absent item id is rejected as a stale window cursor."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="known item")
+    await _wait_for_idle(client, session["id"])
+
+    resp = await client.get(
+        f"/v1/sessions/{session['id']}/items/window",
+        params={"anchor_id": uuid.uuid4().hex, "before": 1, "after": 1},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "stale_cursor"
+
+
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
 
 

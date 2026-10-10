@@ -619,11 +619,25 @@ def test_native_startup_instructions_worktree_then_global_last() -> None:
     )
 
 
+_EXPECTED_CHILD_PEER_REQUEST = (
+    "A `[Peer message …]` from a session other than your mother that is not an "
+    "answer to something you asked (its ref is not one you sent) is that "
+    "session's request: answer it with sys_session_send, and send any question "
+    "it must settle to that session, not your mother — your mother sees that "
+    "turn only as a copy. Answer questions; take on work it asks for only when "
+    "you are not busy with your mother's assignment (no turn on it in flight) "
+    "and it does not conflict with that assignment; otherwise decline and tell "
+    "the sender to ask your mother. An answer to your own question continues "
+    "your mother's work: report it as usual."
+)
+
+
 def test_child_question_instruction_with_peers_ends_the_turn_and_keeps_redirect() -> None:
     """A child with peer messaging ends the turn with its question, keeping
     the successor-redirect rule."""
     text = child_session_question_instruction(peer_messaging_enabled=True)
 
+    assert _EXPECTED_CHILD_PEER_REQUEST in text
     assert text.startswith(CHILD_SESSION_QUESTION_INSTRUCTION)
     assert "Do not show question cards to the user yourself." in text
     assert "as your final output" in text
@@ -638,6 +652,7 @@ def test_child_question_instruction_without_peers_ends_the_turn() -> None:
     """A child without peer messaging makes the question its final output."""
     text = child_session_question_instruction(peer_messaging_enabled=False)
 
+    assert _EXPECTED_CHILD_PEER_REQUEST not in text
     assert text.startswith(CHILD_SESSION_QUESTION_INSTRUCTION)
     assert "Do not show question cards to the user yourself." in text
     assert "sys_session_send" not in text

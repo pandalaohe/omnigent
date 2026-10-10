@@ -299,7 +299,10 @@ class SysReadInboxTool(Tool):
             "string. It is also the expected response to the runtime's "
             f"sub-agent wake notice `{SUBAGENT_WAKE_NOTICE_SHAPE}`, which "
             "Omnigent posts into your session when a dispatched child "
-            "finishes; that notice comes from the runtime, not from a person."
+            "finishes; that notice comes from the runtime, not from a person. "
+            "The drain may also return copies of a sub-agent's turn that another session started "
+            "(lines beginning `[System: copy` or `[System: corrected copy`); they are not results "
+            "of work you dispatched and need no action unless they matter to your plan."
         )
 
     def get_schema(self) -> dict[str, Any]:

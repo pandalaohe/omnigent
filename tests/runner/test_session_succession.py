@@ -60,6 +60,9 @@ def _clean_succession_state() -> Iterator[None]:
         dict(subagent_work._succeeded_parents),
         {new_id: list(items) for new_id, items in subagent_work._held_successions.items()},
         {session: dict(timers) for session, timers in runner_app._session_timers.items()},
+        {parent: list(copies) for parent, copies in subagent_work._peer_copies.items()},
+        dict(subagent_work._peer_copy_dropped),
+        {parent: dict(seen) for parent, seen in subagent_work._peer_copy_seen.items()},
     )
     runner_app._subagent_work_by_child.clear()
     runner_app._subagent_work_by_parent.clear()
@@ -71,6 +74,9 @@ def _clean_succession_state() -> Iterator[None]:
     subagent_work._succeeded_parents.clear()
     subagent_work._held_successions.clear()
     runner_app._session_timers.clear()
+    subagent_work._peer_copies.clear()
+    subagent_work._peer_copy_dropped.clear()
+    subagent_work._peer_copy_seen.clear()
     try:
         yield
     finally:
@@ -94,6 +100,12 @@ def _clean_succession_state() -> Iterator[None]:
         subagent_work._held_successions.update(saved[8])
         runner_app._session_timers.clear()
         runner_app._session_timers.update(saved[9])
+        subagent_work._peer_copies.clear()
+        subagent_work._peer_copies.update(saved[10])
+        subagent_work._peer_copy_dropped.clear()
+        subagent_work._peer_copy_dropped.update(saved[11])
+        subagent_work._peer_copy_seen.clear()
+        subagent_work._peer_copy_seen.update(saved[12])
 
 
 def _build_runner() -> tuple[FastAPI, _RecordingServerClient]:

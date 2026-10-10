@@ -90,6 +90,9 @@ _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH = "superseded_dispatch"
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
+# Pins an undrained mother result across peer turns: "<work_id>:<status>:<item_id>".
+# Restart recovery uses its outcome and item instead of the newer peer result.
+SUBAGENT_RESULT_ITEM_LABEL_KEY = "omnigent.subagent.result_item"
 
 
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
@@ -158,6 +161,9 @@ class _SubagentWorkEntry:
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
+    :param recovered: Whether recovery rebuilt this entry for a turn the
+        mother did not dispatch. Such an entry never reads as a mother
+        dispatch, so a peer turn it is parented to is still kept as a copy.
     """
 
     parent_session_id: str
@@ -181,6 +187,7 @@ class _SubagentWorkEntry:
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
     launch_timed_out: bool = False
+    recovered: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,6 +239,22 @@ _subagent_retained_state_parents: dict[str, str] = {}
 # scans that both pass the registry check and queue one result twice.
 _subagent_recovery_done: set[str] = set()
 _subagent_recovery_locks: dict[str, asyncio.Lock] = {}
+
+# Peer-turn copies: a settled child turn that answered a peer message from a
+# session other than its mother. Kept on the mother's runner as silent copies —
+# never a sub-agent result and never a wake — that a later inbox drain renders.
+# In-memory only: unread copies vanish on a restart (the mother's own undrained
+# result survives through the result-item label).
+_peer_copies: dict[str, list[_JsonObject]] = {}
+# Copies dropped by the cap since the last pop, per parent.
+_peer_copy_dropped: dict[str, int] = {}
+# (child, result key) -> status of copies already popped, per parent, bounded so
+# a correction after a read is recognised without unbounded memory.
+_peer_copy_seen: dict[str, dict[tuple[str, str], str]] = {}
+
+_PEER_COPY_MAX_UNREAD = 20
+_PEER_COPY_SEEN_MAX = 100
+_PEER_COPY_OUTPUT_MAX_CHARS = 600
 
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
@@ -330,6 +353,7 @@ def register_subagent_work(
     placement_label: str | None = None,
     registered_by: str | None = None,
     flow_neutral: bool = False,
+    recovered: bool = False,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -362,6 +386,8 @@ def register_subagent_work(
         parent's running flow. Recovery registers turns the mother did not
         dispatch this way, so an undispatched result is held only when the
         child already belonged to the flow.
+    :param recovered: When ``True``, the entry is rebuilt for a turn the
+        mother did not dispatch; see :attr:`_SubagentWorkEntry.recovered`.
     :returns: The registered work entry.
     """
     parent_session_id = _resolve_succeeded_parent(parent_session_id)
@@ -394,6 +420,7 @@ def register_subagent_work(
         placement_label=placement_label,
         delivered_result_key=previous_result_key,
         registered_by=registered_by,
+        recovered=recovered,
     )
     _drained_delivered_subagent_results.pop(child_session_id, None)
     if registered_by is not None:
@@ -421,6 +448,133 @@ def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     :returns: The work entry, or ``None`` if the child is not tracked.
     """
     return _subagent_work_by_child.get(child_session_id)
+
+
+def record_peer_copy(
+    parent_session_id: str,
+    child_session_id: str,
+    key: str,
+    payload: _JsonObject,
+) -> None:
+    """
+    Record or amend one silent peer-turn copy for a parent.
+
+    Copies are keyed by ``(child, key)`` where ``key`` is the peer turn's result
+    item id. An unread copy with the same key is amended in place to the new
+    status/output; a replay with an unchanged status is a no-op; a copy already
+    popped whose status has since changed is appended again as a correction. At
+    most :data:`_PEER_COPY_MAX_UNREAD` unread copies are kept per parent, the
+    oldest dropped first and counted for the next drain.
+
+    :param parent_session_id: The mother session that receives the copy.
+    :param child_session_id: The child that answered the peer, e.g.
+        ``"conv_child456"``.
+    :param key: The peer turn's result item id.
+    :param payload: The fully built copy payload.
+    :returns: None.
+    """
+    parent_session_id = _resolve_succeeded_parent(parent_session_id)
+    identity = (child_session_id, key)
+    status = payload.get("status")
+    copies = _peer_copies.setdefault(parent_session_id, [])
+    for existing in copies:
+        if (existing.get("child_session_id"), existing.get("result_item_id")) == identity:
+            if existing.get("status") == status:
+                return
+            existing["status"] = status
+            existing["output"] = payload.get("output")
+            return
+    seen = _peer_copy_seen.get(parent_session_id)
+    if seen is not None and identity in seen:
+        if seen[identity] == status:
+            return
+        payload = {**payload, "correction": True}
+    copies.append(payload)
+    if len(copies) > _PEER_COPY_MAX_UNREAD:
+        copies.pop(0)
+        _peer_copy_dropped[parent_session_id] = _peer_copy_dropped.get(parent_session_id, 0) + 1
+
+
+def pop_peer_copies(parent_session_id: str) -> tuple[list[_JsonObject], int]:
+    """
+    Drain a parent's unread peer copies oldest first.
+
+    Pops the copies and the count dropped by the cap since the previous pop,
+    remembering each popped copy's status (bounded) so a later status change is
+    recorded as a correction.
+
+    :param parent_session_id: The mother session, e.g. ``"conv_parent123"``.
+    :returns: ``(copies, dropped)`` — the unread copies oldest first and the
+        number of copies dropped by the cap since the last pop.
+    """
+    copies = _peer_copies.pop(parent_session_id, [])
+    dropped = _peer_copy_dropped.pop(parent_session_id, 0)
+    if copies:
+        seen = _peer_copy_seen.setdefault(parent_session_id, {})
+        for copy in copies:
+            child_id = copy.get("child_session_id")
+            result_key = copy.get("result_item_id")
+            copy_status = copy.get("status")
+            if not isinstance(child_id, str) or not isinstance(result_key, str):
+                continue
+            identity = (child_id, result_key)
+            seen.pop(identity, None)
+            seen[identity] = copy_status if isinstance(copy_status, str) else ""
+        while len(seen) > _PEER_COPY_SEEN_MAX:
+            seen.pop(next(iter(seen)))
+    return copies, dropped
+
+
+def move_peer_copies(old_parent_id: str, new_parent_id: str) -> None:
+    """
+    Move a retired parent's peer-copy state onto its successor.
+
+    A successor may already hold copies. The retired parent's copies are older,
+    so identities keep their earliest position with the successor's newer
+    payload. The cap drops from the front and drop counts add. Successor seen
+    identities keep their newer status and move last before trimming.
+
+    :param old_parent_id: The retired parent session, e.g. ``"conv_old123"``.
+    :param new_parent_id: Its successor, e.g. ``"conv_new456"``.
+    :returns: None.
+    """
+    old_copies = _peer_copies.pop(old_parent_id, None)
+    if old_copies:
+        combined = list(
+            {
+                (copy.get("child_session_id"), copy.get("result_item_id")): copy
+                for copy in old_copies + _peer_copies.get(new_parent_id, [])
+            }.values()
+        )
+        overflow = len(combined) - _PEER_COPY_MAX_UNREAD
+        if overflow > 0:
+            combined = combined[overflow:]
+            _peer_copy_dropped[new_parent_id] = _peer_copy_dropped.get(new_parent_id, 0) + overflow
+        _peer_copies[new_parent_id] = combined
+    old_dropped = _peer_copy_dropped.pop(old_parent_id, None)
+    if old_dropped:
+        _peer_copy_dropped[new_parent_id] = _peer_copy_dropped.get(new_parent_id, 0) + old_dropped
+    old_seen = _peer_copy_seen.pop(old_parent_id, None)
+    if old_seen:
+        merged = old_seen
+        for identity, status in _peer_copy_seen.get(new_parent_id, {}).items():
+            merged.pop(identity, None)
+            merged[identity] = status
+        while len(merged) > _PEER_COPY_SEEN_MAX:
+            merged.pop(next(iter(merged)))
+        _peer_copy_seen[new_parent_id] = merged
+
+
+def clear_peer_copies(session_id: str) -> None:
+    """
+    Drop a deleted session's peer-copy state.
+
+    :param session_id: Session id being deleted, e.g. ``"conv_parent123"``.
+    :returns: None.
+    """
+    _peer_copies.pop(session_id, None)
+    _peer_copy_dropped.pop(session_id, None)
+    _peer_copy_seen.pop(session_id, None)
 
 
 def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -458,10 +612,9 @@ def unregister_subagent_work(
     :param work_id: Optional dispatch id guard. When provided, the
         current registry entry is removed only if it still belongs to
         that dispatch.
-    :param remember_drained_delivery: Whether to remember a delivered
-        entry as drained so duplicate terminal status reports for the
-        same result are acknowledged as already delivered while a later
-        turn's result still delivers.
+    :param remember_drained_delivery: Whether to retain a delivered entry's
+        result key, or the prior drained key carried by a recovered non-terminal
+        placeholder, so replayed results remain acknowledged as drained.
     :returns: None.
     """
     entry = _subagent_work_by_child.get(child_session_id)
@@ -469,7 +622,14 @@ def unregister_subagent_work(
         return
     if work_id is not None and entry.work_id != work_id:
         return
-    if remember_drained_delivery and entry.delivered:
+    if remember_drained_delivery and (
+        entry.delivered
+        or (
+            entry.recovered
+            and entry.status not in _SUBAGENT_TERMINAL_STATUSES
+            and entry.delivered_result_key is not None
+        )
+    ):
         _drained_delivered_subagent_results[child_session_id] = entry.delivered_result_key
         _subagent_retained_state_parents[child_session_id] = entry.parent_session_id
     _subagent_work_by_child.pop(child_session_id, None)
@@ -515,6 +675,7 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
         _subagent_retained_state_parents.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
+    clear_peer_copies(session_id)
 
 
 def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
@@ -571,6 +732,37 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
         return None
     return dispatch_id
+
+
+def _stamped_result_item_id(
+    labels: Mapping[str, object], dispatch_id: str
+) -> tuple[str, str] | None:
+    """
+    Return the terminal status and item id a peer-copy restart label pins.
+
+    The label reads ``"<work_id>:<status>:<item_id>"`` and only applies to the
+    undelivered dispatch. Malformed labels and non-terminal statuses are inert.
+
+    :param labels: Child session labels, e.g.
+        ``{"omnigent.subagent.result_item": "subagent_a1b2:cancelled:item_c3d4"}``.
+    :param dispatch_id: The undelivered dispatch id, e.g. ``"subagent_a1b2"``.
+    :returns: The pinned ``(status, item_id)``, or ``None`` for an inert label.
+    """
+    raw = labels.get(SUBAGENT_RESULT_ITEM_LABEL_KEY)
+    if not isinstance(raw, str):
+        return None
+    parts = raw.split(":", 2)
+    if len(parts) != 3:
+        return None
+    work_id, status, item_id = parts
+    if (
+        work_id != dispatch_id
+        or status not in _SUBAGENT_TERMINAL_STATUSES
+        or not item_id
+        or ":" in item_id
+    ):
+        return None
+    return status, item_id
 
 
 class _SubagentRecoveryReadError(Exception):
@@ -662,6 +854,56 @@ async def _fetch_latest_assistant_item(
         params["after"] = page["last_id"]
 
 
+async def _fetch_item_text_by_id(
+    server_client: httpx.AsyncClient, session_id: str, item_id: str
+) -> str | None:
+    """
+    Return the joined text of the assistant item with *item_id*, or ``None``.
+
+    Reads the bounded item window around the anchor instead of paging the whole
+    transcript. A 404, a 400 stale cursor, or a non-assistant item reads as
+    ``None`` so recovery skips only that child instead of using a newer item.
+
+    :param server_client: HTTP client connected to the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_child456"``.
+    :param item_id: The server item id to find, e.g. ``"item_c3d4"``.
+    :returns: The joined text blocks of the item, or ``None`` when it is not
+        found or carries no assistant text.
+    :raises _SubagentRecoveryReadError: When a window read returns a non-200
+        other than 404 or 400 with error code ``stale_cursor``.
+    """
+    response = await server_client.get(
+        f"/v1/sessions/{session_id}/items/window",
+        params={"anchor_id": item_id, "before": "1", "after": "1"},
+        timeout=10.0,
+    )
+    if response.status_code == 404:
+        return None
+    if response.status_code == 400:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and error.get("code") == "stale_cursor":
+            return None
+    if response.status_code != 200:
+        raise _SubagentRecoveryReadError(
+            f"/v1/sessions/{session_id}/items/window returned {response.status_code}"
+        )
+    for item in response.json().get("data", []):
+        if item.get("id") != item_id:
+            continue
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            return None
+        return "\n".join(
+            block["text"]
+            for block in item.get("content", [])
+            if block.get("type") in {"output_text", "text"} and block.get("text")
+        )
+    return None
+
+
 async def _recover_subagent_results_from_server(
     *,
     server_client: httpx.AsyncClient,
@@ -675,7 +917,8 @@ async def _recover_subagent_results_from_server(
     parent's ``sys_read_inbox`` drain writes that id back as the delivered
     id. A terminal child whose two ids differ was never drained, so its
     result is rebuilt from the child transcript and queued again under the
-    same dispatch id, letting the eventual drain close the loop.
+    same dispatch id, letting the eventual drain close the loop. A peer-copy
+    label pins the mother's terminal status and result item across later turns.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session whose inbox was recreated, e.g.
@@ -703,12 +946,31 @@ async def _recover_subagent_results_from_server(
         ):
             continue
         labels = child.get("labels")
-        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        label_map = labels if isinstance(labels, dict) else {}
+        dispatch_id = undelivered_subagent_dispatch_id(label_map)
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
         result_key: str | None = None
-        if status == "failed":
+        recover_status = status
+        # A pin preserves the mother's outcome across later peer turns.
+        # A missing item skips only this child instead of using a newer answer.
+        stamped_result = _stamped_result_item_id(label_map, dispatch_id)
+        if stamped_result is not None:
+            recover_status, stamped_id = stamped_result
+            text = await _fetch_item_text_by_id(server_client, child_id, stamped_id)
+            if text is None:
+                _logger.warning(
+                    "Recovery result-item label names a missing item for child=%s "
+                    "dispatch=%s item=%s; skipping.",
+                    child_id,
+                    dispatch_id,
+                    stamped_id,
+                )
+                continue
+            result_key, output = stamped_id, text
+            interrupted = False
+        elif status == "failed":
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
@@ -743,7 +1005,7 @@ async def _recover_subagent_results_from_server(
             entry.status = "waiting"
             continue
         ack = mark_subagent_work_terminal(
-            child_id, status=status, output=output, result_key=result_key
+            child_id, status=recover_status, output=output, result_key=result_key
         )
         if ack.delivered_now:
             schedule_wake(entry)

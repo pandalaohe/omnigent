@@ -347,8 +347,10 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
         receiver_session_id: str,
         ref_or_id: str,
         created_after: int,
+        *,
+        oldest: bool = False,
     ) -> SessionPeerMessage | None:
-        """Return the pair's newest matching record, or ``None``."""
+        """Return the pair's newest matching record, or the earliest when ``oldest``."""
         # A correlation id is arbitrary text; comparing it against the
         # Uuid16 ``id`` column would fail at bind time unless it is a valid
         # id, so that half of the OR is added only when it can match.
@@ -359,6 +361,11 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             pass
         else:
             matches.append(SqlSessionPeerMessage.id == ref_or_id)
+        order = (
+            (asc(SqlSessionPeerMessage.created_at), asc(SqlSessionPeerMessage.id))
+            if oldest
+            else (desc(SqlSessionPeerMessage.created_at), desc(SqlSessionPeerMessage.id))
+        )
         with self._session("find_sent_peer_message") as session:
             row = (
                 session.execute(
@@ -368,10 +375,30 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                     .where(SqlSessionPeerMessage.receiver_session_id == receiver_session_id)
                     .where(or_(*matches))
                     .where(SqlSessionPeerMessage.created_at >= created_after)
-                    .order_by(
-                        desc(SqlSessionPeerMessage.created_at),
-                        desc(SqlSessionPeerMessage.id),
-                    )
+                    .order_by(*order)
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                return None
+            return _record_to_entity(row)
+
+    def find_replied_by(self, reply_peer_id: str) -> SessionPeerMessage | None:
+        """Return the record linked to *reply_peer_id*, or ``None``."""
+        # ``reply_peer_id`` is a Uuid16 column; a value that cannot be an id
+        # would fail at bind time, so refuse it up front.
+        try:
+            uuid_to_bytes(reply_peer_id)
+        except ValueError:
+            return None
+        with self._session("find_replied_by_peer_message") as session:
+            row = (
+                session.execute(
+                    select(SqlSessionPeerMessage)
+                    .where(SqlSessionPeerMessage.workspace_id == current_workspace_id())
+                    .where(SqlSessionPeerMessage.reply_peer_id == reply_peer_id)
                     .limit(1)
                 )
                 .scalars()

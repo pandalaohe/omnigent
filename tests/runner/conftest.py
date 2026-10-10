@@ -143,6 +143,9 @@ def _clean_subagent_registry() -> Iterator[None]:
         dict(subagent_work._subagent_recovery_locks),
         dict(subagent_work._subagent_work_origins),
         dict(subagent_work._subagent_retained_state_parents),
+        {k: list(v) for k, v in subagent_work._peer_copies.items()},
+        dict(subagent_work._peer_copy_dropped),
+        {k: dict(v) for k, v in subagent_work._peer_copy_seen.items()},
     )
     subagent_work._subagent_work_by_child.clear()
     subagent_work._subagent_work_by_parent.clear()
@@ -152,6 +155,9 @@ def _clean_subagent_registry() -> Iterator[None]:
     subagent_work._subagent_recovery_locks.clear()
     subagent_work._subagent_work_origins.clear()
     subagent_work._subagent_retained_state_parents.clear()
+    subagent_work._peer_copies.clear()
+    subagent_work._peer_copy_dropped.clear()
+    subagent_work._peer_copy_seen.clear()
     try:
         yield
     finally:
@@ -171,6 +177,12 @@ def _clean_subagent_registry() -> Iterator[None]:
         subagent_work._subagent_work_origins.update(saved[6])
         subagent_work._subagent_retained_state_parents.clear()
         subagent_work._subagent_retained_state_parents.update(saved[7])
+        subagent_work._peer_copies.clear()
+        subagent_work._peer_copies.update(saved[8])
+        subagent_work._peer_copy_dropped.clear()
+        subagent_work._peer_copy_dropped.update(saved[9])
+        subagent_work._peer_copy_seen.clear()
+        subagent_work._peer_copy_seen.update(saved[10])
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

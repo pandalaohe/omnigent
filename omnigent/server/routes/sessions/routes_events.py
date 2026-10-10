@@ -93,7 +93,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
-from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.native_subagent_watchdog import (
     NativeSubagentWatchdog,
@@ -1344,6 +1344,7 @@ def register_events_routes(
             return None
         return successor_id
 
+    from omnigent.server.routes.sessions.peer_child_turn import classify_child_turn
     from omnigent.server.routes.sessions.routes_peer import (
         _SUCCESSOR_MAX_HOPS,
         register_peer_routes,
@@ -2941,6 +2942,39 @@ def register_events_routes(
                         cost_usd=None,
                     )
                 )
+            # A caller cannot forge turn attribution: strip any incoming
+            # ``peer_turn`` from the edge data before classification, then set
+            # it only from the server's own classifier hit.
+            data.pop("peer_turn", None)
+            # Attribute a dispatched child's settling turn to a peer sender so
+            # the parent's runner can keep a silent copy instead of a result.
+            # Stateless and best-effort: any error, including one before the
+            # classifier runs, leaves the edge on today's delivery path.
+            if (
+                conv.parent_conversation_id is not None
+                and conv.kind == "sub_agent"
+                and peer_message_store is not None
+                and status in {"idle", "completed", "failed", "stopped", "killed"}
+            ):
+                flags = feature_flags if feature_flags is not None else resolve_feature_flags()
+                if flags.enabled(Feature.SESSION_PEER_MESSAGING):
+                    try:
+                        peer_turn = await asyncio.to_thread(
+                            classify_child_turn,
+                            conversation_store,
+                            peer_message_store,
+                            conv,
+                            data.get("output"),
+                        )
+                    except Exception:
+                        _logger.warning(
+                            "Peer turn classification dispatch failed (%s)",
+                            session_id,
+                            exc_info=True,
+                        )
+                        peer_turn = None
+                    if peer_turn is not None:
+                        data["peer_turn"] = peer_turn.as_dict()
             forward_body = body.model_dump()
             forward_body["data"] = data
             # A cross-host member child's own runner has no parent inbox: the

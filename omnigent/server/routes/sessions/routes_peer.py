@@ -43,6 +43,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.server.child_session_recovery import is_parent_owned_subagent
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id,
@@ -103,6 +104,10 @@ _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 # codex-native excluded: a refused steer drops the input; approval steer unverified.
 _STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native"})
 
+# A dispatched child runs its own terminal turn, so a peer message reaches it;
+# other native harnesses are mirrors or SDK children without a result key.
+_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
+
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
 _PEER_INBOUND_REFUSE = "refuse"
@@ -122,8 +127,8 @@ _WS_COLLAPSE_RE = re.compile(r"\s+")
 # Stored transcripts still carry the older envelopes, matched by the legacy
 # pattern (DOTALL: a correlation id may contain newlines).
 _PEER_ENVELOPE_HEADER_RE = re.compile(
-    r'\A\[Peer message from session [0-9a-f]{32} msg=([0-9a-f]{32}) "[^"]*" '
-    r"\(.*?\) ref=.*?\]\n\n",
+    r"\A\[Peer message from session (?P<sender>[0-9a-f]{32}) msg=(?P<msg>[0-9a-f]{32}) "
+    r'"(?P<title>[^"]*)" \((?P<origin>.*?)\) ref=(?P<ref>.*?)\]\n\n',
     re.DOTALL,
 )
 _LEGACY_PEER_ENVELOPE_HEADER_RE = re.compile(
@@ -136,8 +141,9 @@ _LEGACY_PEER_ENVELOPE_HEADER_RE = re.compile(
 def _peer_envelope_msg_id(text: str) -> str | None:
     """Return the record id an envelope header carries, current or legacy."""
     match = _PEER_ENVELOPE_HEADER_RE.match(text)
-    if match is None:
-        match = _LEGACY_PEER_ENVELOPE_HEADER_RE.match(text)
+    if match is not None:
+        return match.group("msg")
+    match = _LEGACY_PEER_ENVELOPE_HEADER_RE.match(text)
     return match.group(1) if match is not None else None
 
 
@@ -389,6 +395,66 @@ def _is_steerable_harness(conv: Conversation) -> bool:
     except OmnigentError:
         return False
     return harness in _STEERABLE_NATIVE_HARNESSES
+
+
+def _peer_reachable_child(conv: Conversation) -> bool:
+    """Whether a child session may receive peer messages.
+
+    A dispatched Claude Code / Codex child runs its own terminal turn on the
+    envelope. Native mirrors route input through their parent's runtime, and
+    SDK / other harnesses have no result key, so both stay refused. A read
+    error refuses rather than admitting an unreachable child.
+
+    :param conv: The receiver row.
+    :returns: ``True`` when the child is a reachable native terminal session.
+    """
+    try:
+        if conv.kind != "sub_agent" or is_parent_owned_subagent(conv):
+            return False
+        return _native_terminal_runtime(conv)[2] in _PEER_REACHABLE_NATIVE_HARNESSES
+    except Exception:
+        return False
+
+
+def peer_thread_origin_is_receiver(
+    peer_store: PeerMessageStore, record: SessionPeerMessage
+) -> bool:
+    """Whether the thread *record* belongs to was started by its receiver.
+
+    The thread key is the record's explicit ``correlation_id``; else the ref
+    of the receiver→sender record linked to this record by ``reply_peer_id``
+    (the link :func:`_mark_reply_locked` wrote at admission, found by an
+    exact lookup on that id); else the record opens its own thread and the
+    answer is ``False``. The origin is the earliest record in either
+    direction whose ``ref`` or ``id`` equals the key, found with an exact
+    unbounded lookup. When only one direction matches, that direction is the
+    origin. On a ``created_at`` tie the receiver's record wins.
+
+    :param peer_store: Durable record store.
+    :param record: The record whose thread is classified.
+    :returns: ``True`` when the origin record was sent by
+        ``record.receiver_session_id``.
+    """
+    receiver_id = record.receiver_session_id
+    sender_id = record.sender_session_id
+    key = record.correlation_id
+    if not key:
+        linked = peer_store.find_replied_by(record.id)
+        if (
+            linked is None
+            or linked.sender_session_id != receiver_id
+            or linked.receiver_session_id != sender_id
+        ):
+            return False
+        key = linked.ref
+
+    c_first = peer_store.find_sent(receiver_id, sender_id, key, 0, oldest=True)
+    if c_first is None:
+        return False
+    s_first = peer_store.find_sent(sender_id, receiver_id, key, 0, oldest=True)
+    if s_first is None:
+        return True
+    return c_first.created_at <= s_first.created_at
 
 
 @dataclass(frozen=True)
@@ -910,7 +976,9 @@ def register_peer_routes(
         del correlation_id
         return secrets.token_hex(16)
 
-    async def _true_state(conv: Conversation) -> tuple[str, bool | None]:
+    async def _true_state(
+        conv: Conversation, *, receiver: bool = False
+    ) -> tuple[str, bool | None]:
         """Return a session's true state and runner_online (D6/D7 table).
 
         ``state`` is one of ``offline`` / ``not_ready`` / ``busy`` /
@@ -918,6 +986,10 @@ def register_peer_routes(
         per call; an SDK session is always ready. Shared by the send route
         (receiver) and the sweeper (receiver readiness, sender notice
         idle-gate) so both apply the exact same gate.
+
+        ``receiver=True`` is passed at the receiver call sites: a peer
+        message is never steered into a child's running turn, so a busy
+        child reads ``busy`` instead of ``steerable`` and the send queues.
 
         A dead runner on a live host is *relaunchable*, not offline: the
         events path relaunches it and initializes the terminal itself, so
@@ -991,7 +1063,12 @@ def register_peer_routes(
                     # Read the count off the row this busy verdict came from.
                     row = fresh
         if busy:
-            if native and terminal_ready and _is_steerable_harness(conv):
+            if (
+                not (receiver and conv.parent_conversation_id is not None)
+                and native
+                and terminal_ready
+                and _is_steerable_harness(conv)
+            ):
                 if not _has_blocking_elicitation(row, pending_elicitations.snapshot_for(conv.id)):
                     return "steerable", runner_online
             return "busy", runner_online
@@ -1289,7 +1366,9 @@ def register_peer_routes(
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
-        if receiver.parent_conversation_id is not None:
+        if receiver.parent_conversation_id is not None and not await asyncio.to_thread(
+            _peer_reachable_child, receiver
+        ):
             return {
                 "disposition": "refused",
                 "reason": "is_subagent",
@@ -1480,7 +1559,7 @@ def register_peer_routes(
                     response["reply_to"] = reply_to
                 return response
             if terminal_verdict is None:
-                receiver_state, runner_online = await _true_state(receiver)
+                receiver_state, runner_online = await _true_state(receiver, receiver=True)
                 if receiver_state in ("offline", "not_ready"):
                     reason = receiver_state
                     if effective_wait == 0 and deferred_until is None:
@@ -1575,7 +1654,7 @@ def register_peer_routes(
             # must not be interrupted mid-turn; a busy claude-native receiver
             # with a genuinely running turn reads back steerable and is
             # steered to its next tool boundary.
-            recheck_state, _recheck_runner_online = await _true_state(receiver)
+            recheck_state, _recheck_runner_online = await _true_state(receiver, receiver=True)
             if recheck_state == "busy":
                 await asyncio.to_thread(
                     peer_message_store.transition,

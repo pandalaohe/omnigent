@@ -1314,6 +1314,7 @@ def _rekey_subagent_work_for_succession(
             tool=meta.tool,
             session_name=meta.session_name,
         )
+    _subagent_work.move_peer_copies(old_parent_id, new_parent_id)
 
 
 def _side_chat_text_from_content(content: object) -> str:
@@ -6482,6 +6483,129 @@ def create_runner_app(
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
 
+    def _peer_copy_payload(
+        peer_turn: dict[str, object],
+        *,
+        child_session_id: str,
+        status: str,
+        result_key: str | None,
+        output: str | None,
+    ) -> _JsonObject:
+        """Build the silent-copy payload the mother's inbox drain renders."""
+        entry = get_subagent_work(child_session_id)
+        if entry is not None:
+            agent, title = entry.agent, entry.title
+        else:
+            name = _session_sub_agent_names.get(child_session_id)
+            agent = title = name or child_session_id
+        payload: _JsonObject = {
+            "type": "peer_copy",
+            "child_session_id": child_session_id,
+            "agent": agent,
+            "title": title,
+            "status": status,
+            "result_key": result_key,
+            "output": (output or "")[: _subagent_work._PEER_COPY_OUTPUT_MAX_CHARS],
+        }
+        for field in (
+            "parent_session_id",
+            "peer_id",
+            "result_item_id",
+            "ref",
+            "sender_session_id",
+            "sender_title",
+            "sender_origin",
+            "excerpt",
+        ):
+            value = peer_turn.get(field)
+            if isinstance(value, str):
+                payload[field] = value
+        return payload
+
+    def _stamp_peer_copy_result_item_soon(
+        child_session_id: str, work_id: str, status: str, result_key: str
+    ) -> None:
+        """Best-effort pin an undrained mother result's terminal status and item.
+
+        A peer copy can arrive while the mother's own delivered result is still
+        undrained; without this label a restart would recover the child's newer
+        self-started turn instead of that result.
+        """
+        from omnigent.runner.tool_dispatch import _patch_subagent_label
+
+        async def _stamp() -> None:
+            error = await _patch_subagent_label(
+                server_client,
+                child_session_id,
+                _subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY,
+                f"{work_id}:{status}:{result_key}",
+            )
+            if error is not None:
+                _logger.warning(
+                    "Failed to stamp peer-copy result item for child=%s: %s",
+                    child_session_id,
+                    error,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(_stamp())
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    def _record_peer_turn_copy(
+        child_session_id: str,
+        peer_turn: object,
+        *,
+        status: str,
+        result_key: str | None,
+        output: str | None,
+    ) -> None:
+        """Record a silent copy, pinning the undrained mother's outcome if needed."""
+        if not isinstance(peer_turn, dict):
+            return
+        parent_id = peer_turn.get("parent_session_id")
+        key = peer_turn.get("result_item_id")
+        if not isinstance(parent_id, str) or not isinstance(key, str):
+            return
+        # Quiet turns still settle the restart pin and recovered placeholder.
+        if not _subagent_work._is_quiet_output(output):
+            _subagent_work.record_peer_copy(
+                parent_id,
+                child_session_id,
+                key,
+                _peer_copy_payload(
+                    peer_turn,
+                    child_session_id=child_session_id,
+                    status=status,
+                    result_key=result_key,
+                    output=output,
+                ),
+            )
+        entry = get_subagent_work(child_session_id)
+        if (
+            entry is not None
+            and not entry.recovered
+            and entry.delivered
+            and entry.delivered_result_key is not None
+            and child_session_id not in _subagent_work._drained_delivered_subagent_results
+        ):
+            _stamp_peer_copy_result_item_soon(
+                child_session_id, entry.work_id, entry.status, entry.delivered_result_key
+            )
+        if (
+            entry is not None
+            and entry.recovered
+            and entry.status not in _SUBAGENT_TERMINAL_STATUSES
+        ):
+            # A bare idle's placeholder would otherwise be reaped as a failure.
+            # Its prior drained result must stay acknowledged after removal.
+            _subagent_work.unregister_subagent_work(
+                child_session_id, work_id=entry.work_id, remember_drained_delivery=True
+            )
+
     _subagent_recovery = build_subagent_recovery(
         app,
         _background_tasks=_background_tasks,
@@ -8667,20 +8791,43 @@ def create_runner_app(
             status = data.get("status") if isinstance(data, dict) else None
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
+            peer_turn = data.get("peer_turn") if isinstance(data, dict) else None
+            turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
+            # A peer turn is a child turn the server attributed to a peer message
+            # from a session other than this child's mother. It is kept as a
+            # silent copy on the mother's runner only when the child has no
+            # mother-owned open entry — none, a terminal one, or a recovered one.
+            # The decision is taken here, before any await: the server attributed
+            # the turn from the child's transcript, so a mother dispatch
+            # registered during the awaits that follow belongs to a later turn
+            # and keeps its own open entry.
+            _peer_entry = get_subagent_work(conversation_id)
+            peer_copy = (
+                isinstance(peer_turn, dict)
+                and status in ("idle", "completed", "failed", "stopped", "killed")
+                and (
+                    _peer_entry is None
+                    or _peer_entry.status in _SUBAGENT_TERMINAL_STATUSES
+                    or _peer_entry.recovered
+                )
+            )
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             result_key: str | None = None
             terminal_status = None
+
             if status in ("idle", "failed"):
                 recovered_entry = get_subagent_work(conversation_id)
                 turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
                 if turn_outcome in ("completed", "cancelled", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
                     terminal_status = turn_outcome
-                    if turn_outcome == "cancelled" and recovered_entry is not None:
-                        recovered_entry.cancellation_confirmed = True
+                    if not peer_copy:
+                        recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                        if turn_outcome == "cancelled" and recovered_entry is not None:
+                            recovered_entry.cancellation_confirmed = True
                 elif (
-                    status == "idle"
+                    not peer_copy
+                    and status == "idle"
                     and recovered_entry is not None
                     and recovered_entry.status == "cancelled"
                     and recovered_entry.cancellation_confirmed
@@ -8759,6 +8906,35 @@ def create_runner_app(
                     # would deliver it twice.
                     return Response(status_code=204)
                 result_key = await _result_key(server_client, conversation_id, output=output)
+                if peer_copy:
+                    # A peer turn is a silent copy on the mother's runner: no
+                    # inbox item, no wake, no work entry and no member settle.
+                    # The interrupt resolution below never runs for it: a pending
+                    # interrupt belongs to the mother's dispatch, not the peer
+                    # turn.
+                    if (
+                        status == "idle"
+                        and terminal_status is None
+                        and turn_completed is not True
+                        and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
+                    ):
+                        # A bare idle the forwarder would later confirm proves
+                        # nothing; leave it for the confirmed completion edge.
+                        return Response(status_code=204)
+                    if isinstance(terminal_status, str):
+                        copy_status = terminal_status
+                    elif status == "idle":
+                        copy_status = "completed"
+                    else:
+                        copy_status = str(status)
+                    _record_peer_turn_copy(
+                        conversation_id,
+                        peer_turn,
+                        status=copy_status,
+                        result_key=result_key,
+                        output=output,
+                    )
+                    return Response(status_code=204)
                 current_entry = get_subagent_work(conversation_id)
                 undispatched = (
                     current_entry is None or current_entry.status in _SUBAGENT_TERMINAL_STATUSES
@@ -8775,7 +8951,6 @@ def create_runner_app(
                 recovered_entry = await _ensure_subagent_work_entry(
                     conversation_id, result_key=result_key
                 )
-            turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
             if status == "idle" and terminal_status is None and turn_completed is not True:

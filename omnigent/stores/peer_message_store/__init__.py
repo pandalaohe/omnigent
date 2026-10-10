@@ -229,9 +229,11 @@ class PeerMessageStore(ABC):
         receiver_session_id: str,
         ref_or_id: str,
         created_after: int,
+        *,
+        oldest: bool = False,
     ) -> SessionPeerMessage | None:
         """
-        Return the newest sender→receiver record matching *ref_or_id*.
+        Return a sender→receiver record matching *ref_or_id*.
 
         Used by the reply exemption: a refusing session's own thread is
         identified by a record it sent to the replier whose ``ref`` or
@@ -242,8 +244,27 @@ class PeerMessageStore(ABC):
         :param receiver_session_id: The replier session (original receiver).
         :param ref_or_id: Correlation id to match against ``ref`` or ``id``.
         :param created_after: Inclusive lower bound on ``created_at``.
-        :returns: The newest matching :class:`SessionPeerMessage`, or
-            ``None``.
+        :param oldest: When ``True``, return the pair's earliest match
+            instead of the newest.
+        :returns: The newest matching :class:`SessionPeerMessage`, or the
+            earliest when ``oldest`` is set, or ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def find_replied_by(self, reply_peer_id: str) -> SessionPeerMessage | None:
+        """
+        Return the record a reply id was linked to, or ``None``.
+
+        A reply links to at most one record: :meth:`mark_replied` writes
+        the reply's id into the original record's ``reply_peer_id``, so
+        this is the exact inverse of that link. The lookup is unbounded —
+        the linked record is found no matter how many newer records exist.
+
+        :param reply_peer_id: The reply record's id.
+        :returns: The :class:`SessionPeerMessage` whose ``reply_peer_id``
+            equals *reply_peer_id*, or ``None`` when no record links to it
+            or the value cannot be an id.
         """
         ...
 
