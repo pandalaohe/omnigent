@@ -36,14 +36,25 @@ export async function fetchArchiveWorktreePreference(): Promise<ArchiveWorktreeM
   if (!response.ok) throw new Error(`Loading archive preferences failed (${response.status})`);
   const body = await response.json();
   if (generation !== getOmnigentHostGeneration()) throw new Error("Server connection changed");
-  const stored = body?.preferences?.settings?.worktree_archive;
+  const preferences = body?.preferences;
+  if (
+    preferences !== null &&
+    (typeof preferences !== "object" ||
+      Array.isArray(preferences) ||
+      preferences.settings === null ||
+      typeof preferences.settings !== "object" ||
+      Array.isArray(preferences.settings))
+  ) {
+    return "never";
+  }
+  const stored = preferences?.settings?.worktree_archive;
   const mode = parseMode(stored?.mode);
-  if (stored != null) {
+  if (stored !== undefined) {
     if (generation === getOmnigentHostGeneration()) clearLegacyChoice();
     return mode ?? "never";
   }
   const legacy = legacyChoice();
-  if (legacy === null) return "never";
+  if (legacy === null) return "delete_safe";
   if (generation !== getOmnigentHostGeneration()) throw new Error("Server connection changed");
   const migrated = await authenticatedFetch("/v1/me/preferences/worktree_archive/migrate", {
     method: "POST",
