@@ -7,11 +7,6 @@ Omnigent-started session's instructions.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Final
-
-# Hard ceiling for one revision's text. The route rejects longer saves
-# outright (never truncates); the store itself stays cap-agnostic.
-GLOBAL_INSTRUCTIONS_MAX_CHARS: Final[int] = 8000
 
 
 @dataclass(frozen=True)

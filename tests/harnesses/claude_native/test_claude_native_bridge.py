@@ -4437,6 +4437,24 @@ def test_augment_claude_args_appends_caller_system_prompt(
     assert args[index + 1] == framework_instruction
 
 
+def test_augment_claude_args_delivers_large_prompt_through_private_file(tmp_path: Path) -> None:
+    text = "全🙂" * 32_768 + "\nlast instruction"
+    args = augment_claude_args(
+        (), bridge_dir=tmp_path, python_executable="/venv/bin/python", append_system_prompt=text
+    )
+
+    assert "--append-system-prompt" not in args
+    prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
+    assert prompt_path.read_text(encoding="utf-8") == text
+    if os.name != "nt":
+        assert prompt_path.stat().st_mode & 0o777 == 0o600
+    assert text not in args
+
+    # Relaunching without these instructions retires the staged text.
+    augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+    assert not prompt_path.exists()
+
+
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
     """Framework preapproval extends rather than replaces the user's allowlist."""
     args = augment_claude_args(

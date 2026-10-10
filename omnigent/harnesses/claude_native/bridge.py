@@ -2765,9 +2765,8 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+    :param append_system_prompt: Composed startup instructions, appended
+        through Claude Code's native prompt flag or a private file.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param disallowed_tools: Optional Claude tool names to merge into
@@ -2812,8 +2811,15 @@ def augment_claude_args(
             str(settings_path),
         ]
     )
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+    prompt_path = bridge_dir / "startup-instructions.txt"
+    # Large argv strings fail at exec on Linux; files preserve the full text.
+    if append_system_prompt and len(append_system_prompt.encode("utf-8")) >= 64 * 1024:
+        _write_text_file(prompt_path, append_system_prompt)
+        args.extend(["--append-system-prompt-file", str(prompt_path)])
+    else:
+        prompt_path.unlink(missing_ok=True)
+        if append_system_prompt:
+            args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -10809,19 +10815,25 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
+    _write_text_file(path, json.dumps(payload, separators=(",", ":")))
+
+
+def _write_text_file(path: Path, text: str) -> None:
+    """Atomically write UTF-8 text with owner-only permissions."""
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
+            newline="",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
             delete=False,
         ) as handle:
             tmp_path = Path(handle.name)
-            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)

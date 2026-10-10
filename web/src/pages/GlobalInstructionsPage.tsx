@@ -74,9 +74,7 @@ export function GlobalInstructionsPage() {
     );
   }
 
-  const maxChars = data?.max_chars ?? 0;
   const draftLength = [...draft].length;
-  const overCap = data !== undefined && draftLength > maxChars;
   const unchanged = data !== undefined && draft === data.text;
   const savedAtMs = data?.updated_at != null ? data.updated_at * 1000 : null;
   const revisionList = revisions.data ?? [];
@@ -95,18 +93,11 @@ export function GlobalInstructionsPage() {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           aria-label="Global instructions"
-          aria-invalid={overCap}
           className="min-h-64 font-mono text-sm"
         />
         <div className="flex items-center justify-between gap-4">
           <div className="flex flex-col gap-1">
-            <span
-              className={
-                overCap ? "text-sm font-medium text-destructive" : "text-sm text-muted-foreground"
-              }
-            >
-              {draftLength} / {maxChars}
-            </span>
+            <span className="text-sm text-muted-foreground">{draftLength} characters</span>
             {savedAtMs !== null ? (
               <span className="text-sm text-muted-foreground">
                 Last saved {absoluteTime(savedAtMs)}
@@ -120,7 +111,7 @@ export function GlobalInstructionsPage() {
             <Button
               onClick={() => save.mutate(draft)}
               loading={save.isPending}
-              disabled={data === undefined || overCap || unchanged || save.isPending}
+              disabled={data === undefined || unchanged || save.isPending}
             >
               <SaveIcon /> Save
             </Button>
@@ -131,15 +122,6 @@ export function GlobalInstructionsPage() {
           Changes apply to sessions started after saving — running sessions keep the text they
           started with — and the text is visible to every agent and user on this server.
         </p>
-
-        {overCap && (
-          <div
-            role="alert"
-            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-          >
-            Over the {maxChars}-character limit by {draftLength - maxChars} characters.
-          </div>
-        )}
 
         {isLoadError && (
           <div

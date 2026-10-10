@@ -1,5 +1,5 @@
 // Tests for the admin GlobalInstructionsPage (server-held global instructions:
-// live text, over-cap guard, revision restore).
+// live text, large saves, revision restore).
 //
 // Browser e2e is impractical (admin/accounts-gated), so the surface is pinned
 // here by mocking the mode-agnostic identity probe (resolveIdentity /
@@ -46,7 +46,7 @@ function current(overrides: Partial<Record<string, unknown>> = {}) {
     revision_id: null,
     updated_at: null,
     updated_by: null,
-    max_chars: 8000,
+    max_chars: null,
     ...overrides,
   };
 }
@@ -114,8 +114,7 @@ afterEach(() => {
 });
 
 describe("GlobalInstructionsPage", () => {
-  it("marks the counter over-cap and disables Save past max_chars", async () => {
-    setCurrent(current({ max_chars: 10 }));
+  it("saves a large draft with a standalone length counter", async () => {
     renderPage();
 
     const editor = await screen.findByLabelText("Global instructions");
@@ -124,14 +123,13 @@ describe("GlobalInstructionsPage", () => {
     // Unchanged draft → nothing to save.
     expect(save).toBeDisabled();
 
-    fireEvent.change(editor, { target: { value: "12345678901" } });
-    expect(screen.getByText("11 / 10")).toHaveClass("text-destructive");
-    expect(save).toBeDisabled();
-
-    // Back under the cap with a real edit → Save is available again.
-    fireEvent.change(editor, { target: { value: "12345" } });
-    expect(screen.getByText("5 / 10")).not.toHaveClass("text-destructive");
+    const text = "x".repeat(65536);
+    fireEvent.change(editor, { target: { value: text } });
+    expect(screen.getByText("65536 characters")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(save).toBeEnabled();
+    fireEvent.click(save);
+    expect(saveMutate).toHaveBeenCalledWith(text);
   });
 
   it("keeps edits typed while a save is pending when the query resolves with the old text", async () => {
@@ -158,15 +156,14 @@ describe("GlobalInstructionsPage", () => {
     expect(screen.getByRole("button", { name: /Save/ })).toBeEnabled();
   });
 
-  it("counts code points, so emoji at the cap are not over-cap", async () => {
-    setCurrent(current({ max_chars: 2 }));
+  it("counts Unicode code points", async () => {
     renderPage();
 
     const editor = await screen.findByLabelText("Global instructions");
-    // Two emoji: four UTF-16 units but two code points — exactly at the cap.
+    // Two emoji: four UTF-16 units but two code points.
     fireEvent.change(editor, { target: { value: "😀😀" } });
 
-    expect(screen.getByText("2 / 2")).not.toHaveClass("text-destructive");
+    expect(screen.getByText("2 characters")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Save/ })).toBeEnabled();
   });
