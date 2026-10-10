@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import LabelDef
-from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
+from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL, TOUCHED_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -153,4 +153,42 @@ def test_apply_label_writes_refuses_the_artifact_link_key(
     stored = conversation_store.get_conversation(conv.id)
     assert stored is not None
     assert ARTIFACT_LINK_KEY_LABEL not in stored.labels
+    assert stored.labels == {"kept": "1"}
+
+
+def test_apply_label_writes_refuses_the_touched_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A policy cannot forge per-user last-interaction times.
+
+    ``omnigent.touched.<user>`` orders each user's Recent sessions; a policy
+    write would surface the session as recently used for users who never
+    touched it. The bare prefix key, suffixed keys and case / accent variants
+    the label collation treats as equal are all dropped; other keys still land.
+    """
+    conv = conversation_store.create_conversation()
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        conversation_store=conversation_store,
+    )
+
+    engine.apply_label_writes(
+        {
+            "omnigent.touched.other": "0000000000009",
+            TOUCHED_LABEL_KEY: "forged",
+            "OMNIGENT.TOUCHED.alice": "0000000000009",
+            "omnigent.tóuched.bob": "0000000000009",
+            "omni\ufeffgent.touched.carol": "0000000000009",
+            "omnigent.t\u00f8uched.dave": "0000000000009",
+            "kept": "1",
+        }
+    )
+
+    assert engine.labels == {"kept": "1"}
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
     assert stored.labels == {"kept": "1"}

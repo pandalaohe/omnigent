@@ -41,6 +41,8 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
+    _has_runner_tunnel_authority,
+    _write_touched_label,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
@@ -68,6 +70,7 @@ def register_elicitations_routes(
     runner_router: RunnerRouter | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    runner_tunnel_tokens: frozenset[str] | None = None,
 ) -> None:
     """Register the elicitations routes on router."""
 
@@ -133,6 +136,10 @@ def register_elicitations_routes(
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        # A human answer counts as the caller's last interaction; a runner's
+        # own resolve does not.
+        if not _has_runner_tunnel_authority(request, conv, runner_tunnel_tokens):
+            await _write_touched_label(conversation_store, conv, user_id)
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

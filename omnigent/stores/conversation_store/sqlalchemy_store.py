@@ -31,7 +31,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -115,6 +115,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
+    TOUCHED_LABEL_KEY,
     ArchiveCloseClaimResult,
     ArchivedConversationFacets,
     ArchiveLockWriteResult,
@@ -3957,6 +3958,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned_owner: str | None = None,
         title: str | None = None,
         exclude_labels: Mapping[str, Sequence[str]] | None = None,
+        touched_label_key: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -4035,6 +4037,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` or empty disables the filter. Lets callers hide a
             category of children (e.g. harness sub-agent mirrors) without
             the store knowing what the label means.
+        :param touched_label_key: When set, restrict to conversations
+            carrying this label key (the caller's per-user
+            ``omnigent.touched.<user>`` key) and order by that label's value
+            — the epoch-ms last-interaction time — descending, with the
+            store's standard tiebreaker. ``None`` disables the filter.
+            Cannot be combined with ``after`` / ``before`` (the cursor is
+            defined on the ``sort_by`` column, not the label value), which
+            raises ``ValueError``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -4042,6 +4052,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         if search_scope not in {"all", "title", "content"}:
             raise ValueError(f"invalid search_scope: {search_scope!r}")
+        if touched_label_key is not None and (after or before):
+            raise ValueError("touched_label_key cannot be combined with after/before")
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
@@ -4438,6 +4450,23 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
+            touched_sort_col: ColumnElement[Any] | None = None
+            if touched_label_key is not None:
+                # Recent sessions: inner-join the caller's own per-user touch
+                # row (same workspace scope as the pin filter) and order by its
+                # value. The value is epoch-ms zero-padded to 13 digits, so the
+                # string ordering is the time ordering; the alias keeps the
+                # joined row distinct from the label reads below.
+                touched_label = aliased(SqlConversationLabel)
+                stmt = stmt.join(
+                    touched_label,
+                    and_(
+                        touched_label.workspace_id == current_workspace_id(),
+                        touched_label.conversation_id == SqlConversation.id,
+                        touched_label.key == touched_label_key,
+                    ),
+                )
+                touched_sort_col = cast(ColumnElement[Any], touched_label.value)
             for exclude_key, exclude_values in (exclude_labels or {}).items():
                 # Labels are colocated on the AP DB, so an inline anti-join
                 # drops labelled conversations without a cross-DB prefetch.
@@ -4470,10 +4499,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     tiebreaker_col=self._tiebreaker_col,
                     forward=False,
                 )
-            stmt = stmt.order_by(
-                sort_fn(sort_col),
-                sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
-            ).limit(limit + 1)
+            if touched_sort_col is not None:
+                stmt = stmt.order_by(
+                    desc(touched_sort_col),
+                    sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker
+                )
+            else:
+                stmt = stmt.order_by(
+                    sort_fn(sort_col),
+                    sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
+                )
+            stmt = stmt.limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
@@ -6962,13 +6998,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # that combination reflects lost metadata, not a chat-only
             # session. Other workspace-less sources resume in-process like
             # a brand-new chat session.
-            # Per-user pin keys (``omnigent.pinned.<user>``) and per-repo sandbox
+            # Per-user pin keys (``omnigent.pinned.<user>``), per-user touch
+            # keys (``omnigent.touched.<user>``) and per-repo sandbox
             # labels (``omnigent.sandbox.repo.<index>``) are dynamic-suffix, so
             # they're never in the exact-match drop sets — drop them by prefix
             # instead. A fork is a NEW conversation; inheriting the source's pins
             # would show the clone as pinned for the forker AND carry every other
-            # user's pin key along as dead data, and inheriting the repo labels
-            # would re-clone the source's repos even into a fork asked for empty.
+            # user's pin key along as dead data, inheriting the source's touches
+            # would surface the clone as recently used for users who never used
+            # it, and inheriting the repo labels would re-clone the source's
+            # repos even into a fork asked for empty.
             source_labels = _fetch_labels(session, source_conversation_id)
             fork_labels = {
                 key: value
@@ -6980,6 +7019,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     | dropped_label_keys
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
+                and not key.startswith(f"{TOUCHED_LABEL_KEY}.")
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None

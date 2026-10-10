@@ -39,6 +39,7 @@ from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
     ConversationItem,
+    PagedList,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -271,6 +272,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
+    touched_label_key,
 )
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
@@ -399,6 +401,19 @@ async def _restore_refused_settings(
 def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     """Return whether Codex timed out before confirming a settings update it may still apply."""
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
+
+
+class _RecentCursorUnsupported(OmnigentError):
+    """Recent sessions are ordered by a label value, so a cursor cannot apply.
+
+    Rejected as unprocessable (422) — this API books query-validation
+    rejections as ``invalid_input`` on the schema path, while ``invalid_input``
+    alone maps to 400.
+    """
+
+    @property
+    def http_status(self) -> int:
+        return 422
 
 
 class SoundAlertClaimRequest(BaseModel):
@@ -1806,6 +1821,203 @@ def register_core_routes(
             "branch": resolved.branch,
         }
 
+    async def _session_list_page(
+        request: Request,
+        page: PagedList[Conversation],
+        *,
+        user_id: str | None,
+        include_preview: bool,
+    ) -> PaginatedList:
+        """
+        Decorate one store page into sidebar session rows.
+
+        Shared by ``GET /v1/sessions`` and ``GET /v1/me/recent-sessions`` so
+        both render identical rows and both run the orphaned-running
+        reconciliation; only the store query differs.
+
+        :param request: The incoming request (app state for cold-after marks).
+        :param page: The store's conversation page to decorate.
+        :param user_id: Caller identity for permission checks and rows.
+        :param include_preview: When ``True``, batch-fetch last-message previews.
+        :returns: The serialized :class:`PaginatedList` response body.
+        """
+        # Side chats surface only as Workspace-rail tabs, so drop any
+        # side-chat-labeled fork from the sidebar list (it is still a normal
+        # session, just not listed as a top-level one here).
+        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+        # list_conversations may return rows with agent_id=None for
+        # legacy conversations; skip them before building the batch IDs.
+        conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
+        if not conv_ids:
+            return PaginatedList(
+                data=[],
+                first_id=page.first_id,
+                last_id=page.last_id,
+                has_more=page.has_more,
+            )
+        # Batch-fetch permissions and agent names concurrently.
+        # The tasks table has been removed — status comes exclusively from
+        # the relay-fed ``_session_status_cache``.
+        unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
+        agent_template_ids = await asyncio.to_thread(
+            agent_store.get_template_ids, unique_agent_ids
+        )
+        perms_by_conv: dict[str, list[SessionPermission]]
+        if permission_store is not None:
+            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
+                asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
+                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+                asyncio.to_thread(
+                    conversation_store.list_child_conversation_ids_by_parent,
+                    conv_ids,
+                ),
+            )
+            user_is_admin = (
+                await asyncio.to_thread(permission_store.is_admin, user_id)
+                if user_id is not None
+                else False
+            )
+        else:
+            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
+                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+                asyncio.to_thread(
+                    conversation_store.list_child_conversation_ids_by_parent,
+                    conv_ids,
+                ),
+            )
+            perms_by_conv = {}
+            user_is_admin = False
+        # In-memory lookup — no I/O, so batching avoids re-acquiring
+        # the index's lock per row but otherwise has no DB cost.
+        pending_counts = pending_elicitations.counts_for(conv_ids)
+        own_pending_ids = pending_elicitations.latest_ids_for(conv_ids)
+        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        # Preview excerpts ride one batched message read capped by the page
+        # size; per-row ``list_items`` would be N+1 traffic. The child rail
+        # already shares this pattern via
+        # ``_child_session_summaries_from_conversations``.
+        previews_by_conv: dict[str, str | None] = {}
+        if include_preview:
+            previews_by_conv = await _message_previews_for(
+                [conv.id for conv in page.data if conv.agent_id is not None]
+            )
+        # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
+        # A session whose persisted live_status is still running/waiting but
+        # whose runner is confirmed gone — a replica that restarted and
+        # outlived its runner, a crashed host, a graceful disconnect
+        # mid-turn — would otherwise read "running" forever: no executor is
+        # left to emit the terminal edge that clears it. Settle that exact
+        # subset here so the sidebar (and every other reader) stops showing a
+        # turn that isn't happening. The list still does NOT compute liveness
+        # for the general case (see the note below the item build): the probe
+        # is bounded to a tiny suspect set so the common path pays nothing.
+        #
+        # Suspect = a row that (a) still says running/waiting, (b) has a bound
+        # runner, (c) has NO live entry in this replica's status cache — i.e.
+        # its "running" came from the cross-replica DB mirror, not a runner
+        # this replica is actively relaying — and (d) has a stale/absent
+        # runner_last_seen heartbeat. The freshness check reads the stamp
+        # already carried on the list row (no extra query): a runner up on
+        # another replica keeps it fresh, so such a session is filtered out
+        # here and never reaches the probe. Only stamp-stale candidates fall
+        # through to liveness_lookup, which additionally rules out a runner
+        # whose tunnel is live on THIS replica before we settle.
+        if liveness_lookup is not None:
+            orphan_suspects = [
+                conv
+                for conv in page.data
+                if conv.agent_id is not None
+                and conv.runner_id is not None
+                and conv.live_status in ("running", "waiting")
+                and _session_status_cache.get(conv.id) is None
+                and not runner_seen_is_fresh(conv.runner_last_seen)
+                and (
+                    permission_store is None
+                    or _permission_level_from_grants(
+                        user_id,
+                        perms_by_conv.get(conv.id, []),
+                        user_is_admin,
+                    )
+                    == LEVEL_OWNER
+                )
+            ]
+            if orphan_suspects:
+                orphan_liveness = await asyncio.to_thread(
+                    liveness_lookup, [conv.id for conv in orphan_suspects]
+                )
+                for conv in orphan_suspects:
+                    result = orphan_liveness.get(conv.id)
+                    # runner_online is False only once the runner is gone from
+                    # every replica (no tunnel anywhere AND runner_last_seen
+                    # stale past the TTL), so this fires for a genuinely
+                    # orphaned runner, never one mid-reconnect within grace.
+                    if result is not None and not result.runner_online:
+                        await asyncio.to_thread(
+                            reconcile_orphaned_running_status,
+                            conv.id,
+                            conversation_store,
+                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        )
+        # Build items after reconciliation so each settled row reads its new
+        # status straight from the (now-updated) cache.
+        all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
+        child_rows = (
+            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            if all_child_ids
+            else {}
+        )
+        activity_unverified_child_ids = {
+            child_id
+            for child_id, child in child_rows.items()
+            if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
+        }
+        child_pending = await _child_pending_elicitations_by_parent(
+            child_ids_by_parent,
+            child_rows,
+            liveness_lookup,
+        )
+        keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, page.data)
+        cold_after_by_session = await _cold_after_by_session_for(page.data, request.app.state)
+        items: list[SessionListItem] = [
+            _build_session_list_item(
+                conv,
+                agent_names_by_id=agent_names_by_id,
+                agent_template_ids=agent_template_ids,
+                grants=perms_by_conv.get(conv.id, []),
+                user_id=user_id,
+                user_is_admin=user_is_admin,
+                permissions_enabled=permission_store is not None,
+                pending_count=pending_counts.get(conv.id, 0),
+                child_pending_count=child_pending.counts.get(conv.id, 0),
+                pending_key=_pending_elicitation_key(
+                    own_pending_ids.get(conv.id),
+                    child_pending.latest_ids_by_parent.get(conv.id, []),
+                ),
+                child_session_ids=child_ids_by_parent[conv.id],
+                comments_fingerprint=comments_fingerprints.get(conv.id),
+                activity_unverified_child_ids=activity_unverified_child_ids,
+                last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
+                keep_warm_families=keep_warm_families,
+                cold_after_by_session=cold_after_by_session,
+            )
+            for conv in page.data
+            if conv.agent_id is not None
+        ]
+        # Apart from the bounded orphan-suspect probe above, the list does not
+        # compute per-item liveness
+        # (runner_online / host_online). No list consumer reads it: the
+        # sidebar no longer surfaces connection state, and the only live
+        # consumer — the open-session view — sources liveness from the
+        # single-session snapshot, the WS stream, and the /health poll, not
+        # from list rows. Skipping it here removes the session-connectivity
+        # and hosts-table queries from every GET /v1/sessions.
+        return PaginatedList(
+            data=[item.model_dump(exclude_none=True) for item in items],
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+        )
+
     # ── GET /sessions ───────────────────────────────────────────
 
     @router.get(
@@ -2010,182 +2222,62 @@ def register_core_routes(
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
         )
-        # Side chats surface only as Workspace-rail tabs, so drop any
-        # side-chat-labeled fork from the sidebar list (it is still a normal
-        # session, just not listed as a top-level one here).
-        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
-        # list_conversations may return rows with agent_id=None for
-        # legacy conversations; skip them before building the batch IDs.
-        conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
-        if not conv_ids:
-            return PaginatedList(
-                data=[],
-                first_id=page.first_id,
-                last_id=page.last_id,
-                has_more=page.has_more,
-            )
-        # Batch-fetch permissions and agent names concurrently.
-        # The tasks table has been removed — status comes exclusively from
-        # the relay-fed ``_session_status_cache``.
-        unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
-        agent_template_ids = await asyncio.to_thread(
-            agent_store.get_template_ids, unique_agent_ids
+        return await _session_list_page(
+            request, page, user_id=user_id, include_preview=include_preview
         )
-        perms_by_conv: dict[str, list[SessionPermission]]
-        if permission_store is not None:
-            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
+
+    # ── GET /me/recent-sessions ─────────────────────────────────
+
+    @router.get(
+        "/me/recent-sessions",
+        response_model=None,
+        responses={200: {"model": SessionList}},
+    )
+    async def list_recent_sessions(
+        request: Request,
+        limit: int = Query(default=20, ge=1, le=20),
+        after: str | None = Query(default=None),
+        before: str | None = Query(default=None),
+    ) -> PaginatedList:
+        """
+        List the caller's sessions by their own last interaction.
+
+        "Interaction" is a human-origin user message, approval, or
+        elicitation resolve, recorded per user on the session's root as an
+        ``omnigent.touched.<user>`` label. Results are the caller's
+        accessible, non-archived, ``kind="default"`` sessions carrying that
+        label, newest interaction first. Powers the sidebar's Recent
+        sessions section, which shows a bounded count; cursors are rejected
+        because the order is a label value with no row position.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param limit: Maximum number of sessions to return (1-20,
+            default 20).
+        :param after: Unsupported — 422 when given.
+        :param before: Unsupported — 422 when given.
+        :returns: A :class:`PaginatedList` of :class:`SessionListItem`.
+        """
+        # require_user, not get_user_id: ``accessible_by=None`` means "no ACL
+        # filter", so an unauthenticated request must fail closed with 401
+        # (user_id stays None only when auth is disabled entirely).
+        user_id = _require_user(request, auth_provider)
+        if after is not None or before is not None:
+            raise _RecentCursorUnsupported(
+                "recent sessions are ordered by last interaction and do not support cursors",
+                code=ErrorCode.INVALID_INPUT,
             )
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-        else:
-            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            perms_by_conv = {}
-            user_is_admin = False
-        # In-memory lookup — no I/O, so batching avoids re-acquiring
-        # the index's lock per row but otherwise has no DB cost.
-        pending_counts = pending_elicitations.counts_for(conv_ids)
-        own_pending_ids = pending_elicitations.latest_ids_for(conv_ids)
-        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
-        # Preview excerpts ride one batched message read capped by the page
-        # size; per-row ``list_items`` would be N+1 traffic. The child rail
-        # already shares this pattern via
-        # ``_child_session_summaries_from_conversations``.
-        previews_by_conv: dict[str, str | None] = {}
-        if include_preview:
-            previews_by_conv = await _message_previews_for(
-                [conv.id for conv in page.data if conv.agent_id is not None]
-            )
-        # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
-        # A session whose persisted live_status is still running/waiting but
-        # whose runner is confirmed gone — a replica that restarted and
-        # outlived its runner, a crashed host, a graceful disconnect
-        # mid-turn — would otherwise read "running" forever: no executor is
-        # left to emit the terminal edge that clears it. Settle that exact
-        # subset here so the sidebar (and every other reader) stops showing a
-        # turn that isn't happening. The list still does NOT compute liveness
-        # for the general case (see the note below the item build): the probe
-        # is bounded to a tiny suspect set so the common path pays nothing.
-        #
-        # Suspect = a row that (a) still says running/waiting, (b) has a bound
-        # runner, (c) has NO live entry in this replica's status cache — i.e.
-        # its "running" came from the cross-replica DB mirror, not a runner
-        # this replica is actively relaying — and (d) has a stale/absent
-        # runner_last_seen heartbeat. The freshness check reads the stamp
-        # already carried on the list row (no extra query): a runner up on
-        # another replica keeps it fresh, so such a session is filtered out
-        # here and never reaches the probe. Only stamp-stale candidates fall
-        # through to liveness_lookup, which additionally rules out a runner
-        # whose tunnel is live on THIS replica before we settle.
-        if liveness_lookup is not None:
-            orphan_suspects = [
-                conv
-                for conv in page.data
-                if conv.agent_id is not None
-                and conv.runner_id is not None
-                and conv.live_status in ("running", "waiting")
-                and _session_status_cache.get(conv.id) is None
-                and not runner_seen_is_fresh(conv.runner_last_seen)
-                and (
-                    permission_store is None
-                    or _permission_level_from_grants(
-                        user_id,
-                        perms_by_conv.get(conv.id, []),
-                        user_is_admin,
-                    )
-                    == LEVEL_OWNER
-                )
-            ]
-            if orphan_suspects:
-                orphan_liveness = await asyncio.to_thread(
-                    liveness_lookup, [conv.id for conv in orphan_suspects]
-                )
-                for conv in orphan_suspects:
-                    result = orphan_liveness.get(conv.id)
-                    # runner_online is False only once the runner is gone from
-                    # every replica (no tunnel anywhere AND runner_last_seen
-                    # stale past the TTL), so this fires for a genuinely
-                    # orphaned runner, never one mid-reconnect within grace.
-                    if result is not None and not result.runner_online:
-                        await asyncio.to_thread(
-                            reconcile_orphaned_running_status,
-                            conv.id,
-                            conversation_store,
-                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
-                        )
-        # Build items after reconciliation so each settled row reads its new
-        # status straight from the (now-updated) cache.
-        all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
-        child_rows = (
-            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
-            if all_child_ids
-            else {}
+        page = await asyncio.to_thread(
+            conversation_store.list_conversations,
+            limit=limit,
+            accessible_by=user_id,
+            has_agent_id=True,
+            kind="default",
+            include_archived=False,
+            # Touches are per-user: order by the caller's own key, exactly as
+            # the pin filter uses the caller's own pin key.
+            touched_label_key=touched_label_key(user_id),
         )
-        activity_unverified_child_ids = {
-            child_id
-            for child_id, child in child_rows.items()
-            if child.labels.get(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY) == "true"
-        }
-        child_pending = await _child_pending_elicitations_by_parent(
-            child_ids_by_parent,
-            child_rows,
-            liveness_lookup,
-        )
-        keep_warm_families = await asyncio.to_thread(_keep_warm_families_for, page.data)
-        cold_after_by_session = await _cold_after_by_session_for(page.data, request.app.state)
-        items: list[SessionListItem] = [
-            _build_session_list_item(
-                conv,
-                agent_names_by_id=agent_names_by_id,
-                agent_template_ids=agent_template_ids,
-                grants=perms_by_conv.get(conv.id, []),
-                user_id=user_id,
-                user_is_admin=user_is_admin,
-                permissions_enabled=permission_store is not None,
-                pending_count=pending_counts.get(conv.id, 0),
-                child_pending_count=child_pending.counts.get(conv.id, 0),
-                pending_key=_pending_elicitation_key(
-                    own_pending_ids.get(conv.id),
-                    child_pending.latest_ids_by_parent.get(conv.id, []),
-                ),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
-                activity_unverified_child_ids=activity_unverified_child_ids,
-                last_message_preview=(previews_by_conv.get(conv.id) if include_preview else None),
-                keep_warm_families=keep_warm_families,
-                cold_after_by_session=cold_after_by_session,
-            )
-            for conv in page.data
-            if conv.agent_id is not None
-        ]
-        # Apart from the bounded orphan-suspect probe above, the list does not
-        # compute per-item liveness
-        # (runner_online / host_online). No list consumer reads it: the
-        # sidebar no longer surfaces connection state, and the only live
-        # consumer — the open-session view — sources liveness from the
-        # single-session snapshot, the WS stream, and the /health poll, not
-        # from list rows. Skipping it here removes the session-connectivity
-        # and hosts-table queries from every GET /v1/sessions.
-        return PaginatedList(
-            data=[item.model_dump(exclude_none=True) for item in items],
-            first_id=page.first_id,
-            last_id=page.last_id,
-            has_more=page.has_more,
-        )
+        return await _session_list_page(request, page, user_id=user_id, include_preview=False)
 
     def _keep_warm_families_for(
         convs: list[Conversation],

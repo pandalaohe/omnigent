@@ -162,18 +162,33 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
-# Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
+# Single-user / no-auth sentinel for per-user label-key suffixes, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
-_PINNED_LABEL_LOCAL_USER = "local"
+_PER_USER_LABEL_LOCAL_USER = "local"
 
-# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
-# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
-# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
-# could overflow the key column — Postgres errors, MySQL silently truncates (and
-# two long ids could then collide on the truncated key). To stay safe while
-# keeping the common case (emails) human-readable in the DB, ids that don't fit
-# are replaced with a fixed-width hash suffix.
-_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+
+def _per_user_label_suffix(user_id: str | None, prefix: str) -> str:
+    """
+    The user suffix for a per-user label key, safe for the key column width.
+
+    ``conversation_labels.key`` is ``String(128)``. User ids are
+    ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
+    could overflow the key column — Postgres errors, MySQL silently truncates
+    (and two long ids could then collide on the truncated key). Normal ids are
+    used verbatim for DB readability; an id that does not fit under *prefix*
+    is replaced with a fixed-width hash suffix.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :param prefix: The bare label key the suffix is appended to, e.g.
+        ``"omnigent.pinned"``.
+    :returns: The suffix (the id, or its hash when the id is too long).
+    """
+    suffix = user_id if user_id is not None else _PER_USER_LABEL_LOCAL_USER
+    if len(suffix) > 128 - len(prefix) - 1:  # minus the "." joiner
+        # 64 hex chars — well within the budget and collision-safe.
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return suffix
 
 
 def pinned_label_key(user_id: str | None) -> str:
@@ -191,11 +206,34 @@ def pinned_label_key(user_id: str | None) -> str:
     :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
         the id is too long).
     """
-    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
-    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
-        # 64 hex chars — well within the budget and collision-safe.
-        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
-    return f"{PINNED_LABEL_KEY}.{suffix}"
+    return f"{PINNED_LABEL_KEY}.{_per_user_label_suffix(user_id, PINNED_LABEL_KEY)}"
+
+
+# Reserved label-key PREFIX recording when a user last interacted with a
+# session — the "Recent sessions" sidebar section's order. Like pins it is
+# PER-USER (``omnigent.touched.<user_id>``, same suffix rule), and the value is
+# the interaction time in epoch milliseconds, zero-padded to 13 digits so
+# string order is time order. The server writes it on the session's ROOT for
+# human-origin user messages, approvals and elicitation resolves; it never
+# leaves the server (``drop_server_secret_labels``) and a fork never copies it.
+TOUCHED_LABEL_KEY = "omnigent.touched"
+
+
+def touched_label_key(user_id: str | None) -> str:
+    """
+    The per-user touched-label key for ``user_id``.
+
+    Deterministic in ``user_id`` (the write path and the recent-sessions
+    filter derive the key the same way, so they always match). Uses the same
+    suffix rule as :func:`pinned_label_key`: normal ids verbatim, an id too
+    long to fit the ``String(128)`` key column replaced with a fixed-width
+    ``sha256`` suffix.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.touched.<suffix>"``.
+    """
+    return f"{TOUCHED_LABEL_KEY}.{_per_user_label_suffix(user_id, TOUCHED_LABEL_KEY)}"
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -251,14 +289,57 @@ def is_artifact_link_key(key: str) -> bool:
 
     :param key: A label key to test.
     :returns: ``True`` for :data:`ARTIFACT_LINK_KEY_LABEL` and every
-        case-, accent- or surrounding-whitespace variant of it.
+        collation look-alike.
     """
-    # MySQL's default utf8mb4_0900_ai_ci collation matches keys case- and
-    # accent-insensitively, so a variant spelling can select and overwrite the
-    # stored canonical row; normalize before comparing to catch every collision.
-    normalized = unicodedata.normalize("NFKD", key.strip()).casefold()
-    plain = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    return plain == ARTIFACT_LINK_KEY_LABEL
+    return _may_collate_to(key, ARTIFACT_LINK_KEY_LABEL, prefix=False)
+
+
+def _may_collate_to(key: str, target: str, *, prefix: bool) -> bool:
+    # MySQL's accent-insensitive collation equates characters a skeleton
+    # cannot list. Over-approximating only refuses a look-alike key on a
+    # false positive.
+    positions = {0}
+    for ch in unicodedata.normalize("NFKD", key.strip()).casefold():
+        if prefix and len(target) in positions:
+            return True
+        if ch.isascii() and ch.isprintable():
+            positions = {pos + 1 for pos in positions if pos < len(target) and target[pos] == ch}
+        else:
+            positions = {
+                pos + advance
+                for pos in positions
+                for advance in range(4)
+                if pos + advance <= len(target)
+            }
+        if not positions:
+            return False
+    return len(target) in positions
+
+
+def is_touched_label_key(key: str) -> bool:
+    """
+    Return whether ``key`` belongs to the per-user ``omnigent.touched`` family.
+
+    :param key: A label key to test.
+    :returns: ``True`` for the bare prefix, every ``omnigent.touched.<user>``
+        key, and every collation look-alike.
+    """
+    return _may_collate_to(key, TOUCHED_LABEL_KEY, prefix=False) or _may_collate_to(
+        key, TOUCHED_LABEL_KEY + ".", prefix=True
+    )
+
+
+def is_server_secret_label_key(key: str) -> bool:
+    """
+    Return whether ``key`` is a server-owned label that must not leave the server.
+
+    The reserved set is the artifact-link secret plus the per-user
+    ``omnigent.touched.<user>`` interaction times (bare prefix and suffixed).
+
+    :param key: A label key to test.
+    :returns: ``True`` for every server-secret key.
+    """
+    return is_artifact_link_key(key) or is_touched_label_key(key)
 
 
 def drop_server_secret_labels(labels: dict[str, str]) -> dict[str, str]:
@@ -268,12 +349,13 @@ def drop_server_secret_labels(labels: dict[str, str]) -> dict[str, str]:
     ``ARTIFACT_LINK_KEY_LABEL`` is the per-session secret that signs artifact
     capability URLs: any holder of the value can forge links for the session,
     so it must never leave the server — not in a session payload, a label
-    response, a runner init snapshot, or a policy's label view.
+    response, a runner init snapshot, or a policy's label view. Per-user
+    ``omnigent.touched.<user>`` interaction times are private the same way.
 
     :param labels: The stored conversation labels.
     :returns: A copy with every server-secret key removed.
     """
-    return {key: value for key, value in labels.items() if not is_artifact_link_key(key)}
+    return {key: value for key, value in labels.items() if not is_server_secret_label_key(key)}
 
 
 # Labels that must NOT cross into a new session context — deliberately
@@ -1002,6 +1084,7 @@ class ConversationStore(ABC):
         pinned_owner: str | None = None,
         title: str | None = None,
         exclude_labels: Mapping[str, Sequence[str]] | None = None,
+        touched_label_key: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1125,12 +1208,22 @@ class ConversationStore(ABC):
             ``None`` or empty disables the filter. Lets callers hide a
             category of children (e.g. harness sub-agent mirrors) without
             the store knowing what the label means.
+        :param touched_label_key: When set, restrict to conversations
+            carrying this label key (the caller's per-user
+            ``omnigent.touched.<user>`` key) and order by that label's value
+            — the epoch-ms last-interaction time — descending, with the
+            store's standard tiebreaker. ``None`` disables the filter.
+            Cannot be combined with ``after`` / ``before`` (the cursor is
+            defined on the ``sort_by`` column, not the label value), which
+            raises ``ValueError``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
             conversation no longer exists (e.g. deleted between two page
             fetches) — its sort position is unknowable, and an empty page
             would be indistinguishable from a completed enumeration.
+        :raises ValueError: If ``touched_label_key`` is set together with
+            ``after`` or ``before``.
         """
         ...
 

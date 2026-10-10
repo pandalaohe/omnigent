@@ -101,6 +101,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
+    RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
 from omnigent.runner.launch_failure import classify_native_turn_error
@@ -326,11 +327,15 @@ from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     PINNED_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     SUCCESSION_OPERATION_LABEL_KEYS,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     drop_server_secret_labels,
     is_artifact_link_key,
+    is_touched_label_key,
+    touched_label_key,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
@@ -11255,6 +11260,17 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{PINNED_LABEL_KEY!r} key to pin for yourself",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Last-interaction times are server-written per user; a client key would
+    # forge another user's recent-session order. No canonical key exists.
+    touched_key = next(
+        (k for k in labels if is_touched_label_key(k)),
+        None,
+    )
+    if touched_key is not None:
+        raise OmnigentError(
+            f"label {touched_key!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Sandbox lifecycle labels are written only by server internals and re-read
     # across a relaunch to rebuild the runner Pod (e.g. the repository it
     # re-clones). A client seed here would forge that reconstruction state, so
@@ -11641,6 +11657,89 @@ def _require_cost_control_label_authority(
         "bound runner may write them",
         code=ErrorCode.FORBIDDEN,
     )
+
+
+def _has_runner_tunnel_authority(
+    request: Request,
+    conv: Conversation,
+    runner_tunnel_tokens: frozenset[str] | None,
+) -> bool:
+    """
+    Whether a request proves runner origin for the given conversation.
+
+    The proof is the tunnel binding token: an allow-listed token, or one
+    whose token-derived runner id matches the conversation's bound runner
+    (the tunnel route's trust model). Used to keep server-derived label
+    writes out of runner-originated requests.
+
+    :param request: The inbound request carrying the tunnel header.
+    :param conv: The conversation the request addresses.
+    :param runner_tunnel_tokens: The server's tunnel-token allow-list, or
+        ``None`` when not configured.
+    :returns: ``True`` when the request carries acceptable runner proof.
+    """
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not token:
+        return False
+    if runner_tunnel_tokens is not None and token in runner_tunnel_tokens:
+        return True
+    runner_id = getattr(conv, "runner_id", None)
+    return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
+
+
+async def _write_touched_label(
+    conversation_store: ConversationStore,
+    conv: Conversation,
+    user_id: str | None,
+) -> None:
+    """
+    Best-effort stamp of ``user_id``'s last interaction on the root session.
+
+    The touch orders the recent-sessions list. It is advisory bookkeeping:
+    a failed write must never fail the user's message / approval / resolve,
+    so every error is logged and swallowed. Runs store reads and writes on a
+    worker thread; ``set_labels`` stamps only the label row, not the
+    conversation's ``updated_at``.
+
+    :param conversation_store: Store owning the label write.
+    :param conv: The addressed conversation; root and side-chat source links
+        identify the root session that receives the stamp.
+    :param user_id: The interacting user, or ``None`` in single-user mode.
+    """
+    root_id = conv.root_conversation_id or conv.id
+    value = f"{int(time.time() * 1000):013d}"
+    try:
+        visited = {conv.id}
+        hops = 0
+        while True:
+            if conv.root_conversation_id and conv.root_conversation_id != conv.id:
+                next_id = conv.root_conversation_id
+            elif conv.kind == "default" and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+                next_id = conv.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            else:
+                root_id = conv.id
+                break
+            if not next_id or next_id in visited or hops >= 5:
+                _logger.debug("Cannot resolve touch target for session %s", conv.id)
+                return
+            target = await asyncio.to_thread(conversation_store.get_conversation, next_id)
+            if target is None:
+                _logger.debug("Missing touch target %s for session %s", next_id, conv.id)
+                return
+            visited.add(next_id)
+            hops += 1
+            conv = target
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            root_id,
+            {touched_label_key(user_id): value},
+        )
+    except Exception:  # noqa: BLE001 - best-effort label write never fails the request
+        _logger.warning(
+            "Failed to record last-interaction touch for session %s",
+            root_id,
+            exc_info=True,
+        )
 
 
 def _persist_stored_session_bundle(
@@ -13423,6 +13522,7 @@ __all__ = [
     "_handle_advise_models_mcp",
     "_handle_external_session_todos",
     "_handle_mcp_tools_list",
+    "_has_runner_tunnel_authority",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
     "_inherited_placement",
@@ -13583,6 +13683,7 @@ __all__ = [
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
+    "_write_touched_label",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
     "cleanup_worktree",

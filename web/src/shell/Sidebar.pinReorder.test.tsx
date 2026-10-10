@@ -64,7 +64,10 @@ function rowCenter(id: string) {
 }
 
 async function dropOnto(sourceId: string, targetId: string, { expectTarget = true } = {}) {
-  const source = screen.getByRole("link", { name: sourceId }).closest("li")!;
+  // A pinned source also renders in Sessions now; drag its canonical copy.
+  const source = document.querySelector<HTMLElement>(
+    `li[data-sidebar-session-id="${sourceId}"][data-sidebar-canonical="true"]`,
+  )!;
   const start = rowCenter(sourceId);
   const target = rowCenter(targetId);
   fireEvent.mouseDown(source, { button: 0, ...start });
@@ -194,7 +197,12 @@ describe("dropping an unpinned session onto a pinned row", () => {
 });
 
 describe("unpinning from a sidebar row", () => {
-  const row = (id: string) => screen.getByRole("link", { name: id }).closest("li")!;
+  // A pinned session also renders in Sessions, so target the canonical Pinned
+  // copy explicitly.
+  const row = (id: string) =>
+    document.querySelector<HTMLElement>(
+      `li[data-sidebar-session-id="${id}"][data-sidebar-canonical="true"]`,
+    )!;
 
   // Sonner keeps toasts in module state across mounts.
   afterEach(() => {

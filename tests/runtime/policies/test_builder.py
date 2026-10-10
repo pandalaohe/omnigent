@@ -423,6 +423,38 @@ guardrails:
     assert ARTIFACT_LINK_KEY_LABEL not in conv_refetched.labels
 
 
+def test_build_never_seeds_touched_keys(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Bundle definitions for per-user interaction labels, in any spelling the
+    label collation folds together, are dropped before seeding."""
+    agent_dir = _write_spec(
+        tmp_path,
+        """
+spec_version: 1
+name: touched-label
+guardrails:
+  labels:
+    integrity: "1"
+    omnigent.touched.alice: "9999999999999"
+    OMNIGENT.TOUCHED.bob: "9999999999999"
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+
+    assert engine.labels == {"integrity": "1"}
+    conv_refetched = conversation_store.get_conversation(conv.id)
+    assert conv_refetched is not None
+    assert conv_refetched.labels == {"integrity": "1"}
+
+
 def test_build_skips_labels_without_initial(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,

@@ -496,7 +496,7 @@ export function clearSessionTombstones(): void {
 /**
  * Apply optimistic delete/archive state to a freshly fetched page.
  */
-function applySessionTombstones(
+export function applySessionTombstones(
   page: ConversationsPage,
   dropArchiving = false,
   originalPage = page,
@@ -1328,6 +1328,7 @@ export function useArchiveConversation() {
       // the DB directly, so refetching them can't resurrect the archived row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
       // Archive membership just changed, so the archived-view picker's option
       // set may have gained/lost a project.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_CONVERSATIONS_KEY });
@@ -1587,6 +1588,7 @@ export function useStopAndDeleteConversation() {
     },
     onSuccess: (_data, { id }) => {
       finalizeDeletedConversations(queryClient, [id]);
+      void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
     },
   });
 }

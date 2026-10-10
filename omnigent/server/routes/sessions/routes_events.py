@@ -193,6 +193,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _get_runner_client_for_resource_access,
     _handle_external_session_todos,
+    _has_runner_tunnel_authority,
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
@@ -238,6 +239,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner,
     _stream_live_events,
     _wait_for_runner_client,
+    _write_touched_label,
     cleanup_worktree,
     effective_host_id,
     reconcile_orphaned_running_status,
@@ -1031,6 +1033,27 @@ _RUNNER_EVENT_TYPES = frozenset(
 )
 
 
+def _event_touches_recent(
+    event: SessionEventInput,
+    ack: dict[str, bool | str | None] | None,
+) -> bool:
+    """
+    Whether a processed event records the caller's last interaction.
+
+    Only human-origin user messages and successful approvals / elicitation
+    resolves count. A policy-denied message returns an ack with
+    ``denied=True`` and is not an interaction.
+
+    :param event: The submitted event.
+    :param ack: The acknowledgement the event was processed into, or
+        ``None`` when the event was persisted through the batch path.
+    :returns: ``True`` when the event should stamp the recent-session label.
+    """
+    if event.type == "message" and event.data.get("role", "user") == "user":
+        return not (ack or {}).get("denied")
+    return event.type == _APPROVAL_TYPE
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -1092,13 +1115,7 @@ def register_events_routes(
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
-        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-        if not token:
-            return False
-        if runner_tunnel_tokens is not None and token in runner_tunnel_tokens:
-            return True
-        runner_id = getattr(conv, "runner_id", None)
-        return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
+        return _has_runner_tunnel_authority(request, conv, runner_tunnel_tokens)
 
     async def _authorized_conversation(
         request: Request | _RunnerEventContext,
@@ -1129,6 +1146,30 @@ def register_events_routes(
             raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
         return user_id, conv
 
+    async def _record_touch(
+        request: Request,
+        session_id: str,
+        user_id: str | None,
+    ) -> None:
+        """
+        Stamp the caller's last interaction on the session's root.
+
+        Human-origin only: a request carrying runner tunnel authority must not
+        stamp. Best-effort — the label is advisory, so a lookup or write
+        failure is logged and never fails the user's request.
+        """
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None or _has_runner_created_by_authority(request, conv):
+                return
+            await _write_touched_label(conversation_store, conv, user_id)
+        except Exception:
+            _logger.warning(
+                "Failed to resolve session %s for last-interaction touch",
+                session_id,
+                exc_info=True,
+            )
+
     @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -1153,7 +1194,13 @@ def register_events_routes(
         the error response does not include acknowledgements from earlier
         entries. Messages count as in flight for the whole request, including
         runner launch.
+
+        A successful human user message or approval also stamps the caller's
+        last-interaction label on the session's root (once per request); the
+        runner, peer, and sweeper paths reach :func:`_post_event_impl`
+        directly and never stamp.
         """
+        user_id = _get_user_id(request, auth_provider)
         with contextlib.ExitStack() as in_flight:
             if isinstance(body, list):
                 if not body:
@@ -1172,34 +1219,44 @@ def register_events_routes(
                 # authorized once and appended in one store call; every other entry
                 # keeps the per-entry path, in order.
                 acks: list[dict[str, bool | str | None]] = []
-                for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
-                    if not batchable:
-                        for event in run:
-                            acks.append(
-                                await _post_event_impl(
+                touched = False
+                try:
+                    for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
+                        if not batchable:
+                            for event in run:
+                                ack = await _post_event_impl(
                                     request,
                                     session_id,
                                     event,
                                     in_flight=in_flight if event.type == "message" else None,
                                 )
-                            )
-                        continue
-                    await _authorized_conversation(request, session_id)
-                    add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
-                    persisted = await _persist_external_conversation_items(
-                        session_id, list(run), conversation_store
-                    )
-                    acks.extend(
-                        {"queued": False, "item_id": item_id, "replayed": replayed}
-                        for item_id, replayed in persisted
-                    )
+                                acks.append(ack)
+                                touched = touched or _event_touches_recent(event, ack)
+                            continue
+                        await _authorized_conversation(request, session_id)
+                        add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
+                        persisted = await _persist_external_conversation_items(
+                            session_id, list(run), conversation_store
+                        )
+                        acks.extend(
+                            {"queued": False, "item_id": item_id, "replayed": replayed}
+                            for item_id, replayed in persisted
+                        )
+                finally:
+                    # A later entry's failure must not lose an earlier entry's
+                    # touch; the original exception still propagates.
+                    if touched:
+                        await _record_touch(request, session_id, user_id)
                 return acks
-            return await _post_event_impl(
+            ack = await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type == "message" else None,
             )
+            if _event_touches_recent(body, ack):
+                await _record_touch(request, session_id, user_id)
+            return ack
 
     router.include_router(event_router)
 

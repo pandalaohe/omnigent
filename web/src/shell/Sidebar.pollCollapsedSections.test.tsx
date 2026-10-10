@@ -121,13 +121,18 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("sidebar Poll vs collapse containers", () => {
-  it("plain cycle skips rows in the collapsed Pinned section", async () => {
+  it("plain cycle skips rows hidden by a collapsed Pinned section and folder", async () => {
+    // A pinned session now also renders in its folder, so it is only truly
+    // hidden while both the Pinned section and its folder are collapsed.
     localStorage.setItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY, JSON.stringify(["Pinned"]));
-    pinnedRef.current = [conversation("hidden-pin", { updated_at: 3 })];
+    projectsRef.current = [{ id: "p1", name: "Proj" }];
+    pinnedRef.current = [
+      conversation("hidden-pin", { updated_at: 3, labels: { omni_project: "Proj" } }),
+    ];
     mockConversations([
       conversation("active", { updated_at: 1 }),
       conversation("visible", { updated_at: 2 }),
-      conversation("hidden-pin", { updated_at: 3 }),
+      conversation("hidden-pin", { updated_at: 3, labels: { omni_project: "Proj" } }),
     ]);
     renderAt("/c/active");
 
@@ -245,6 +250,35 @@ describe("sidebar Poll vs the sidebar's own rows", () => {
     renderAt("/c/active");
 
     await pressPollAndExpect("/c/tail");
+  });
+
+  it("polls a favorite copy's own folder row when only that copy is expanded", async () => {
+    localStorage.setItem(
+      "omnigent:sidebar-layout",
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p1" }],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["fav:sec_fav:Proj"]),
+    );
+    projectsRef.current = [{ id: "p1", name: "Proj" }];
+    folderRowsRef.current.set("Proj", [conversation("folder-only", { updated_at: 3 })]);
+    mockConversations([conversation("active", { updated_at: 1 })]);
+    renderAt("/c/active");
+
+    await pressPollAndExpect("/c/folder-only");
   });
 
   it("still jumps to a collapsed folder's own row when it is unread", async () => {

@@ -1,7 +1,7 @@
 // Unit tests for the conversation-mutation HTTP helpers, plus the
 // query-invalidation contract of the stop mutation hook.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1142,9 +1142,11 @@ describe("useStopAndDeleteConversation cache eviction", () => {
 
   it("removes the deleted row from every cached list variant in place", async () => {
     const { queryClient, rendered } = seedAndDelete();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
     rendered.result.current.mutate({ id: "conv_x" });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["recent-sessions"] });
 
     for (const includeArchived of [false, true]) {
       const data = queryClient.getQueryData<ConversationsInfiniteData>([
@@ -3532,6 +3534,39 @@ describe("useArchiveConversation", () => {
     // back into the sidebar until the index caught up.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("refetches a recent-only row after archiving settles", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "recent_only",
+        object: "conversation",
+        title: "Recent",
+        created_at: 0,
+        updated_at: 10,
+        labels: {},
+        archived: true,
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const recentKey = ["recent-sessions", 5];
+    queryClient.setQueryData(recentKey, [conversation({ id: "recent_only" })]);
+    const refetchRecent = vi.fn().mockResolvedValue([]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const recent = renderHook(
+      () => useQuery({ queryKey: recentKey, queryFn: refetchRecent, staleTime: Infinity }),
+      { wrapper },
+    );
+    const archive = renderHook(() => useArchiveConversation(), { wrapper });
+
+    archive.result.current.mutate({ id: "recent_only", archived: true });
+    await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
+    await waitFor(() => expect(recent.result.current.data).toEqual([]));
+
+    expect(refetchRecent).toHaveBeenCalledTimes(1);
   });
 
   it("updates the session snapshot after unarchiving succeeds", async () => {

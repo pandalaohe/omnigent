@@ -14,7 +14,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // union of the server set and the legacy localStorage key.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -141,7 +141,8 @@ describe("localStorage → server pin migration gate", () => {
     renderSidebar();
 
     expect(screen.getByText("Pinned")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /chat_1/ })).toBeInTheDocument();
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinnedSection).getByRole("link", { name: /chat_1/ })).toBeInTheDocument();
   });
 
   it("migrates legacy pins and clears the legacy key against a new server", async () => {

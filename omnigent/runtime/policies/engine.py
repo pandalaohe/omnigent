@@ -29,11 +29,10 @@ from omnigent.spec.types import (
     StateUpdateAction,
 )
 from omnigent.stores.conversation_store import (
-    ARTIFACT_LINK_KEY_LABEL,
     ConversationStore,
     DailyCostState,
     drop_server_secret_labels,
-    is_artifact_link_key,
+    is_server_secret_label_key,
 )
 
 _logger = logging.getLogger(__name__)
@@ -526,9 +525,9 @@ class PolicyEngine:
         parity — "unschema'd labels set freely"). The engine
         applies the filtered dict in a single UPSERT through
         the store so either every surviving write lands or
-        none do. A write for the server-reserved artifact-link
-        key is dropped with a warning — no policy may seed or
-        rotate the artifact-link secret.
+        none do. A write for any server-secret key — the
+        artifact-link secret or a per-user ``omnigent.touched.*``
+        label — is dropped with a warning naming the key.
 
         :param set_labels: Mapping of label key to new value.
             No-op on empty dict. Writes update both the hot
@@ -537,10 +536,11 @@ class PolicyEngine:
         """
         if not set_labels:
             return
-        if any(is_artifact_link_key(key) for key in set_labels):
+        reserved_keys = [key for key in set_labels if is_server_secret_label_key(key)]
+        if reserved_keys:
             _logger.warning(
-                "Dropping policy label write for server-reserved key %r (conversation %s)",
-                ARTIFACT_LINK_KEY_LABEL,
+                "Dropping policy label write for server-reserved key(s) %s (conversation %s)",
+                ", ".join(repr(key) for key in reserved_keys),
                 self._conversation_id,
             )
             set_labels = drop_server_secret_labels(set_labels)

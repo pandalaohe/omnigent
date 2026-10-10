@@ -409,7 +409,8 @@ describe("quick pin/unpin hover button", () => {
     const pinnedHeader = screen.getByText("Pinned");
     const pinnedSection = pinnedHeader.closest("section")!;
     expect(within(pinnedSection).getByText("My Session")).toBeInTheDocument();
-    expect(screen.getByTestId("quick-pin-conversation")).toHaveAttribute(
+    // The row also stays in Sessions, so scope the unpin control to Pinned.
+    expect(within(pinnedSection).getByTestId("quick-pin-conversation")).toHaveAttribute(
       "aria-label",
       "Unpin conversation",
     );
@@ -419,7 +420,7 @@ describe("quick pin/unpin hover button", () => {
     expect(mocks.pinnedStore.ids).toContain("conv_1");
 
     // Clicking again unpins: the Pinned section disappears.
-    fireEvent.click(screen.getByTestId("quick-pin-conversation"));
+    fireEvent.click(within(pinnedSection).getByTestId("quick-pin-conversation"));
     expect(screen.queryByText("Pinned")).toBeNull();
   });
 
@@ -799,6 +800,13 @@ describe("pinned row project flyout", () => {
   // hover flyout restores that cue: title + project icon (the project's chosen
   // emoji, or a folder fallback) + project name. It opens on focus/hover — fire
   // focus on the row link and await the portal.
+  //
+  // A pinned, unfiled row now also renders in Sessions, so scope every query to
+  // the Pinned section's copy.
+  const pinnedRow = () =>
+    within(screen.getByText("Pinned").closest("section")!).getByRole("link", {
+      name: /My Session/,
+    });
 
   it("shows the project name in the flyout for a pinned, project-owned row", async () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
@@ -816,7 +824,7 @@ describe("pinned row project flyout", () => {
 
     // Focus opens the HoverCard (onFocus is one of its open triggers); the
     // content is portalled, so query the whole document after the open delay.
-    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.focus(pinnedRow());
     const flyout = await screen.findByTestId("pinned-project-flyout");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     const flyoutTitle = within(flyout).getByText("My Session");
@@ -842,7 +850,7 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.focus(pinnedRow());
     const flyout = await screen.findByTestId("pinned-project-flyout");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     // The emoji renders via ProjectRowIcon (data-testid project-icon), replacing
@@ -861,7 +869,7 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.focus(pinnedRow());
     const flyout = await screen.findByTestId("pinned-project-flyout");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
     // No emoji span; the project line leads with the folder svg fallback.
@@ -878,7 +886,7 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    const row = screen.getByRole("link", { name: /My Session/ });
+    const row = pinnedRow();
     expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
     fireEvent.focus(row);
     expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
@@ -895,7 +903,7 @@ describe("pinned row project flyout", () => {
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
-    const row = screen.getByRole("link", { name: /My Session/ });
+    const row = pinnedRow();
     // No hover-card trigger is mounted, and the native title tooltip is kept.
     expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
     expect(row).toHaveAttribute("title", "My Session");

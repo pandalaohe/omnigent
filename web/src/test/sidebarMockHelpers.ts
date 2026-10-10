@@ -25,6 +25,7 @@ export function conversationHooksMock() {
     useReorderPinnedConversations: () => ({ mutate: vi.fn() }),
     setConversationPinned: vi.fn(() => Promise.resolve({})),
     PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
+    PIN_WRITE_MUTATION_KEY: ["pin-write"],
     useRenameConversation: () => ({ mutate: vi.fn() }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     useArchiveConversation: () => ({ mutate: vi.fn() }),
@@ -49,6 +50,7 @@ export function conversationHooksMock() {
     useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     fetchProjectSessionIds: () => Promise.resolve([]),
     PROJECT_LABEL_KEY,
+    applySessionTombstones: (page: unknown) => page,
   };
 }
 

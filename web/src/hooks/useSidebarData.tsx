@@ -55,17 +55,24 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   );
   const pinned = usePinnedConversations(pinsIncludeShared, config.pinCap);
   const [folders, setFolders] = useState<Map<string, Conversation[]>>(() => new Map());
-  const registerFolder = useCallback((name: string, rows: Conversation[] | null) => {
-    setFolders((previous) => {
-      if (rows === null && !previous.has(name)) return previous;
-      if (rows !== null && replaceEqualDeep(previous.get(name), rows) === previous.get(name))
-        return previous;
-      const next = new Map(previous);
-      if (rows === null) next.delete(name);
-      else next.set(name, rows);
-      return next;
-    });
-  }, []);
+  // Keyed by name + the folder copy's instance key so a second copy of the same
+  // project (a favorites copy) registers and unregisters its own rows without
+  // disturbing the section copy's entry.
+  const registerFolder = useCallback(
+    (name: string, rows: Conversation[] | null, instanceKey: string = name) => {
+      const key = `${name}#${instanceKey}`;
+      setFolders((previous) => {
+        if (rows === null && !previous.has(key)) return previous;
+        if (rows !== null && replaceEqualDeep(previous.get(key), rows) === previous.get(key))
+          return previous;
+        const next = new Map(previous);
+        if (rows === null) next.delete(key);
+        else next.set(key, rows);
+        return next;
+      });
+    },
+    [],
+  );
   const mineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
   const sharedRows = useMemo(
     () => (sharedActive ? (shared.data?.pages.flatMap((p) => p.data) ?? []) : []),
