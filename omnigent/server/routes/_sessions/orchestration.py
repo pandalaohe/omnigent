@@ -627,35 +627,15 @@ def _launch_args_set_permission(args: list[str] | None, harness: str | None) -> 
     """Whether launch args explicitly choose a harness's permission stance."""
     args = args or []
     if harness in {"codex", "codex-native"}:
-        flags = {
-            "-a",
-            "--ask-for-approval",
-            "-s",
-            "--sandbox",
-            "--approve-for-me",
-            "--not-so-yolo",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--yolo",
-        }
-        config_keys = {
-            "approval_policy",
-            "sandbox_mode",
-            "approvals_reviewer",
-            "default_permissions",
-        }
-        for index, arg in enumerate(args):
-            if arg.split("=", 1)[0] in flags:
-                return True
-            config = None
-            if arg in {"-c", "--config"} and index + 1 < len(args):
-                config = args[index + 1]
-            elif arg.startswith("--config="):
-                config = arg.removeprefix("--config=")
-            elif arg.startswith("-c"):
-                config = arg[2:]
-            if config is not None and config.split("=", 1)[0].strip() in config_keys:
-                return True
-    elif harness in {"claude-native", "claude-sdk"}:
+        from omnigent.harnesses.codex_native.launch_args import codex_launch_args_set_permission
+
+        try:
+            return codex_launch_args_set_permission(args)
+        except ValueError:
+            # Unparseable Codex args (e.g. a bad ``--profile``): leave them alone
+            # and let the launch report them rather than layering a default on top.
+            return True
+    if harness in {"claude-native", "claude-sdk"}:
         return any(
             arg.split("=", 1)[0]
             in {

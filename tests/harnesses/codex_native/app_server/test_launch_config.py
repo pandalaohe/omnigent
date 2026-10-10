@@ -821,6 +821,35 @@ def test_pin_codex_service_tier_top_level(
 
 
 @pytest.mark.parametrize(
+    "original",
+    [
+        # A quoted key is the real key; it must not gain a duplicate.
+        '"service_tier" = "priority"\nmodel = "gpt-5.4"\n\n'
+        '[projects."/opt/work/app"]\ntrust_level = "trusted"\n',
+        # A ``service_tier = ...`` line inside a root multiline string is text.
+        'developer_instructions = """\nservice_tier = "x"\n"""\n\n'
+        '[projects."/opt/work/app"]\ntrust_level = "trusted"\n',
+    ],
+    ids=["quoted-key", "multiline-string"],
+)
+def test_pin_codex_service_tier_edits_the_root_key(tmp_path: Path, original: str) -> None:
+    from omnigent.harnesses.codex_native.app_server import _pin_codex_config_service_tier
+
+    config = tmp_path / "config.toml"
+    config.write_text(original)
+    _pin_codex_config_service_tier(tmp_path, "fast")
+    rendered = config.read_text()
+    before = tomllib.loads(original)
+    parsed = tomllib.loads(rendered)
+    assert parsed["service_tier"] == "fast"
+    assert {key: value for key, value in parsed.items() if key != "service_tier"} == {
+        key: value for key, value in before.items() if key != "service_tier"
+    }
+    # The key sits at the document root, ahead of every table.
+    assert rendered.index("service_tier") < rendered.index("[projects")
+
+
+@pytest.mark.parametrize(
     "speed,expected", [(None, "priority"), ("fast", "fast"), ("standard", "default")]
 )
 async def test_start_pins_session_service_tier_only_in_private_config(

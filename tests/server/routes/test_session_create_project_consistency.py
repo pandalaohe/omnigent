@@ -1242,6 +1242,12 @@ async def test_explicit_permission_and_speed_win_over_defaults(
                 ["--not-so-yolo"],
                 ["--dangerously-bypass-approvals-and-sandbox"],
                 ["--yolo"],
+                ["-sread-only"],
+                ["-aon-request"],
+                ["-c=approval_policy=never"],
+                ["-capproval_policy=never"],
+                ["--config=sandbox_mode=read-only"],
+                ["--profile", "strict"],
                 *[
                     ["-c", f"{key}=value"]
                     for key in [
@@ -1270,6 +1276,21 @@ async def test_permission_default_recognizes_explicit_launch_args(
 
     assert _launch_args_set_permission(args, harness)
     assert not _launch_args_set_permission(["--model", "test-model"], harness)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--", "--yolo", "-sread-only"],
+        ["-m", "--yolo"],
+        ["-c", 'developer_instructions="-sread-only --yolo"'],
+        ["-c=model=gpt-5.4", "--add-dir", "/opt/work/extra"],
+    ],
+)
+async def test_permission_default_ignores_option_values_and_prompt(args: list[str]) -> None:
+    from omnigent.server.routes._sessions.orchestration import _launch_args_set_permission
+
+    assert not _launch_args_set_permission(args, "codex-native")
 
 
 async def test_native_permission_default_respects_launch_arg_count_bounds(

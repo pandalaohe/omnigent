@@ -13,6 +13,8 @@ from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
+    codex_launch_args_set_permission,
+    codex_permission_stance,
     materialize_codex_config_profile,
     redact_codex_launch_args,
 )
@@ -112,6 +114,48 @@ def test_options_do_not_parse_values_or_prompt() -> None:
     args = ("-c", 'developer_instructions="--yolo -sread-only"', "--", "-pstrict", "--yolo")
     assert canonical_codex_launch_args(args) == list(args)
     assert codex_config_profile(args) is None
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        ((), False),
+        (("--model", "gpt-5.4", "-c", "model_reasoning_effort=high"), False),
+        (("-sread-only",), True),
+        (("-aon-request",), True),
+        (("-s", "read-only"), True),
+        (("--ask-for-approval=never",), True),
+        (("-c=approval_policy=never",), True),
+        (("-capproval_policy=never",), True),
+        (("--config=sandbox_mode=read-only",), True),
+        (("-c", 'approvals_reviewer="user"'), True),
+        (("-c", 'default_permissions=":workspace"'), True),
+        (("--approve-for-me",), True),
+        (("--not-so-yolo",), True),
+        (("--yolo",), True),
+        (("--dangerously-bypass-approvals-and-sandbox",), True),
+        (("--profile", "strict"), True),
+        # Option values and the prompt after ``--`` are not options.
+        (("-c", 'developer_instructions="--yolo -sread-only"'), False),
+        (("-m", "gpt-5.4", "--", "-a", "never", "--yolo"), False),
+    ],
+)
+def test_codex_launch_args_set_permission(args: tuple[str, ...], expected: bool) -> None:
+    assert codex_launch_args_set_permission(args) is expected
+
+
+def test_codex_permission_stance_parts_and_legacy_full_access() -> None:
+    full_access = ("-c", 'default_permissions=":danger-full-access"')
+    stance = codex_permission_stance(full_access)
+    assert (stance.permission_profile, stance.full_access_profile) == (True, True)
+    assert not (stance.approval_policy or stance.sandbox or stance.reviewer)
+    # The last permission profile decides whether it is the legacy full access one.
+    stance = codex_permission_stance((*full_access, "-c", 'default_permissions=":workspace"'))
+    assert (stance.permission_profile, stance.full_access_profile) == (True, False)
+    stance = codex_permission_stance(("-sread-only", "--approve-for-me", "-aon-request"))
+    assert (stance.sandbox, stance.reviewer, stance.approval_policy) == (True, True, True)
+    with pytest.raises(ValueError):
+        codex_permission_stance(("--profile", "../other"))
 
 
 @pytest.mark.parametrize("profile", ["../other", "/tmp/other", "", "two/parts"])

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import is_harness_availability
 from omnigent.session_default_modes import (
     PERMISSION_DEFAULT_VALUES,
@@ -198,6 +199,10 @@ def resolve_calling(
     legacy project ``model`` applies only when the effective agent equals the
     legacy ``agent_id``, matching today's project prefill. A projectless
     caller passes ``project_config=None`` and gets the master layers only.
+    ``speed`` and ``permission`` are looked up under the canonical harness the
+    create launches (an alias override is canonicalised; an explicit null /
+    blank override falls back to the agent's harness), while ``model`` and
+    ``effort`` keep the override as given.
 
     :param explicit: Request values keyed ``agent_id`` / ``harness_override``
         / ``model_override`` / ``reasoning_effort``.
@@ -223,10 +228,19 @@ def resolve_calling(
 
     if "harness_override" in explicit_fields:
         harness = _explicit(explicit.get("harness_override"))
+        # Speed / permission follow the harness the create launches: the
+        # canonical override, or the agent's own harness when the override is
+        # explicitly null / blank.
+        if harness is not None:
+            mode_harness = canonicalize_harness(harness) or harness
+        else:
+            mode_harness = agent_harness(agent_id) if agent_id is not None else None
     elif agent_id is not None:
         harness = agent_harness(agent_id)
+        mode_harness = harness
     else:
         harness = None
+        mode_harness = None
 
     model, model_source = _resolve_model(
         explicit,
@@ -245,16 +259,16 @@ def resolve_calling(
         project_config,
         master,
         host_id,
-        harness,
-        SPEED_TIER_VALUES if harness in SPEED_TIER_HARNESSES else frozenset(),
+        mode_harness,
+        SPEED_TIER_VALUES if mode_harness in SPEED_TIER_HARNESSES else frozenset(),
     )
     permission, permission_source = _resolve_harness_setting(
         "permission",
         project_config,
         master,
         host_id,
-        harness,
-        PERMISSION_DEFAULT_VALUES.get(harness or "", frozenset()),
+        mode_harness,
+        PERMISSION_DEFAULT_VALUES.get(mode_harness or "", frozenset()),
     )
     return CallingResolution(
         agent_id=agent_id,

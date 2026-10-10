@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -236,6 +237,113 @@ def without_codex_config_profile(args: Sequence[str]) -> list[str]:
         if arg in {"--profile", "-p"} and canonical[index + 1] == profile:
             return [*canonical[:index], *canonical[index + 2 :]]
     return canonical
+
+
+def codex_config_string(raw_value: str) -> str:
+    """Read a ``-c key=value`` value as a string, tolerating Codex's unquoted form."""
+    try:
+        value = tomlkit.parse(f"value = {raw_value}")["value"]
+    except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
+        value = raw_value.strip().strip('"').strip("'")
+    return value if isinstance(value, str) else ""
+
+
+@dataclass(frozen=True)
+class CodexPermissionStance:
+    """Which parts of the permission stance Codex launch args choose explicitly.
+
+    :param approval_policy: An approval policy or a full bypass is chosen
+        (``-a``, ``approval_policy``, ``--dangerously-bypass-approvals-and-sandbox``).
+    :param sandbox: A sandbox is chosen (``-s``, ``sandbox_mode``).
+    :param reviewer: A reviewer is chosen (``--approve-for-me``,
+        ``approvals_reviewer``).
+    :param permission_profile: A permission or config profile is chosen
+        (``default_permissions``, ``--profile``).
+    :param full_access_profile: The last ``default_permissions`` is the legacy
+        ``":danger-full-access"`` profile.
+    """
+
+    approval_policy: bool
+    sandbox: bool
+    reviewer: bool
+    permission_profile: bool
+    full_access_profile: bool
+
+    @property
+    def explicit(self) -> bool:
+        """Whether any part of the stance is chosen."""
+        return self.approval_policy or self.sandbox or self.reviewer or self.permission_profile
+
+
+def codex_permission_stance(args: Sequence[str]) -> CodexPermissionStance:
+    """Scan Codex launch args for the permission stance they choose.
+
+    Reads the canonical form (aliases and attached short values such as
+    ``-sread-only`` expanded), stops at a ``--`` prompt separator and consumes
+    ``-c`` / ``--config`` assignments, so it sees exactly what Codex would.
+
+    :param args: Codex pass-through launch args, e.g.
+        ``["-aon-request", "-c", 'sandbox_mode="read-only"']``.
+    :returns: The explicit stance parts.
+    :raises ValueError: when the args hold an invalid ``--profile`` selector.
+    """
+    canonical = canonical_codex_launch_args(args)
+    full_access_profile = False
+    permission_profile = codex_config_profile(canonical) is not None
+    reviewer = False
+    sandbox = False
+    approval_policy = "--dangerously-bypass-approvals-and-sandbox" in canonical
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        assignment: str | None = None
+        if arg == "--approve-for-me":
+            reviewer = True
+        elif arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+            approval_policy = True
+        elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
+            sandbox = True
+        elif arg in {"--config", "-c"} and index + 1 < len(canonical):
+            index += 1
+            assignment = canonical[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            key = key.strip()
+            if key == "approval_policy":
+                approval_policy = True
+            elif key == "sandbox_mode":
+                sandbox = True
+            elif key == "approvals_reviewer":
+                reviewer = True
+            elif key == "default_permissions":
+                permission_profile = True
+                full_access_profile = codex_config_string(raw_value) == ":danger-full-access"
+        index += 1
+    return CodexPermissionStance(
+        approval_policy=approval_policy,
+        sandbox=sandbox,
+        reviewer=reviewer,
+        permission_profile=permission_profile,
+        full_access_profile=full_access_profile,
+    )
+
+
+def codex_launch_args_set_permission(args: Sequence[str]) -> bool:
+    """Whether Codex launch args explicitly choose a permission stance.
+
+    True for an approval policy, sandbox, reviewer, permission or config
+    profile, bypass flag or ``--approve-for-me`` (see
+    :func:`codex_permission_stance`).
+
+    :param args: Codex pass-through launch args, e.g. ``["-sread-only"]``.
+    :returns: Whether any stance part is chosen.
+    :raises ValueError: when the args hold an invalid ``--profile`` selector.
+    """
+    return codex_permission_stance(args).explicit
 
 
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:

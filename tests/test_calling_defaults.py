@@ -534,6 +534,44 @@ def test_session_modes_resolve_independently_and_filter_harness_vocabulary() -> 
     assert result.sources["permission"] == "master_native"
 
 
+def test_session_modes_use_the_canonical_override_harness() -> None:
+    """An alias override finds the entry stored under the canonical harness."""
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk", "harness_override": "claude"},
+        explicit_fields={"agent_id", "harness_override"},
+        master={"HDS": {"claude-sdk": {"permission": "plan", "model": "sonnet"}}},
+    )
+    assert result.harness == "claude"
+    assert result.permission == "plan"
+    assert result.sources["permission"] == "master"
+    # Model / effort resolution still keys on the raw override.
+    assert result.model is None
+
+
+@pytest.mark.parametrize("override", [None, ""])
+def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
+    override: str | None,
+) -> None:
+    """An explicit null / blank override launches the agent's own harness."""
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk", "harness_override": override},
+        explicit_fields={"agent_id", "harness_override"},
+        master={"HDS": {"codex": {"speed": "fast", "permission": "read-only", "model": "gpt"}}},
+    )
+    assert (result.speed, result.permission) == ("fast", "read-only")
+    assert (result.sources["speed"], result.sources["permission"]) == ("master", "master")
+    # The pre-existing model lookup is untouched: no harness, no model default.
+    assert result.harness is None
+    assert result.model is None
+    # No agent and no override leaves the modes unresolved.
+    result = _resolve(
+        explicit={"harness_override": override},
+        explicit_fields={"harness_override"},
+        master={"HDS": {"codex": {"speed": "fast"}}},
+    )
+    assert result.speed is None
+
+
 @pytest.mark.parametrize(
     "harness,field,value",
     [

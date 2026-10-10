@@ -55,6 +55,8 @@ from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
+    codex_config_string,
+    codex_permission_stance,
     materialize_codex_config_profile,
     read_codex_mcp_servers,
     reject_reserved_codex_transport_args,
@@ -426,19 +428,11 @@ def _pin_codex_config_service_tier(codex_home: Path, speed: str) -> None:
     config_path = codex_home / "config.toml"
     _materialize_config_symlink(config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    lines = existing.splitlines()
-    pin_line = f"service_tier = {json.dumps(tier)}"
-    replaced = False
-    for index, line in enumerate(lines):
-        if line.lstrip().startswith("["):
-            break
-        if re.match(r"^\s*service_tier\s*=", line):
-            lines[index] = pin_line
-            replaced = True
-            break
-    if not replaced:
-        lines.insert(0, pin_line)
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    # A root key; tomlkit keeps it ahead of every table and leaves quoted keys
+    # and multiline strings alone.
+    document["service_tier"] = tier
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
 def _materialize_config_symlink(config_path: Path) -> None:
@@ -4497,62 +4491,12 @@ def normalize_codex_permission_launch_args(
       Any explicit approval/sandbox/reviewer/profile choice wins untouched.
     """
     args = canonical_codex_launch_args(terminal_launch_args or ())
-    full_access = False
-    has_permission_profile = codex_config_profile(args) is not None
-    has_reviewer = False
-    has_sandbox = False
-    has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
-    explicit_bypass = has_approval_policy
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            break
-        assignment: str | None = None
-        if arg == "--approve-for-me":
-            has_reviewer = True
-        elif arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
-            has_approval_policy = True
-        elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
-            has_sandbox = True
-        elif arg in {"--config", "-c"} and index + 1 < len(args):
-            index += 1
-            assignment = args[index]
-        elif arg.startswith(("--config=", "-c=")):
-            assignment = arg.split("=", 1)[1]
-        if assignment is not None:
-            key, _, raw_value = assignment.partition("=")
-            key = key.strip()
-            if key == "approval_policy":
-                has_approval_policy = True
-            elif key == "sandbox_mode":
-                has_sandbox = True
-            elif key == "approvals_reviewer":
-                has_reviewer = True
-            elif key == "default_permissions":
-                has_permission_profile = True
-                full_access = _codex_config_string(raw_value) == ":danger-full-access"
-        index += 1
-    if full_access and not has_approval_policy:
+    stance = codex_permission_stance(args)
+    if stance.full_access_profile and not stance.approval_policy:
         args.extend(["-c", 'approval_policy="never"'])
-        has_approval_policy = True
-    if not (
-        explicit_bypass
-        or has_approval_policy
-        or has_sandbox
-        or has_reviewer
-        or has_permission_profile
-    ):
+    elif not stance.explicit:
         args.extend(["-c", 'approvals_reviewer="auto_review"'])
     return args
-
-
-def _codex_config_string(raw_value: str) -> str:
-    try:
-        value = tomlkit.parse(f"value = {raw_value}")["value"]
-    except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
-        value = raw_value.strip().strip('"').strip("'")
-    return value if isinstance(value, str) else ""
 
 
 def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
@@ -4611,7 +4555,7 @@ def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str
     key = key.strip()
     field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key)
     if field is not None:
-        value = _codex_config_string(raw_value)
+        value = codex_config_string(raw_value)
         if not value:
             return False
         params[field] = value
