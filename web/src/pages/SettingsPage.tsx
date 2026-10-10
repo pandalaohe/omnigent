@@ -31,6 +31,7 @@
  */
 
 import { AgentsSettings } from "@/components/AgentsSettings";
+import { HelpTip } from "@/components/HelpTip";
 import {
   type ComponentType,
   lazy,
@@ -264,7 +265,7 @@ import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
-import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { useAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   fetchWorktreePathTemplate,
   saveWorktreePathTemplate,
@@ -1903,21 +1904,24 @@ function GithubIntegrationControl() {
  * this only decides the default for workspaces a project hasn't set a choice on.
  */
 function AlwaysUseWorktreeControl() {
-  const [value, setValue] = useState(() => readAlwaysUseWorktree());
+  const value = useAlwaysUseWorktree();
   const labelId = useId();
   const toggle = useCallback((next: boolean) => {
-    setValue(next);
     writeAlwaysUseWorktree(next);
   }, []);
   return (
     <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Always use a random worktree"
-        labelId={labelId}
-        className="flex-1"
-        description="Start new sessions in a fresh randomly-named git worktree in any git workspace. A project's own Random worktree setting overrides this."
-        descriptionClassName="text-ui"
-      />
+      <div className="flex flex-1 items-center gap-2">
+        <span id={labelId} className="text-ui font-medium">
+          Always use a random worktree
+        </span>
+        <HelpTip label="About the default random worktree">
+          Sessions opened from New Chat start in a separate Git checkout with a random branch name.
+          A project can override this default. Sessions opened by agents or tools keep following
+          their parent&apos;s folder unless a folder or worktree is specified. This preference is
+          saved for your account across devices.
+        </HelpTip>
+      </div>
       <Switch
         aria-labelledby={labelId}
         checked={value}

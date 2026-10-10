@@ -15,6 +15,7 @@ import { MOBILE_ASSISTANT_STORAGE_KEY } from "./mobileAssistantPreferences";
 import { SESSION_NAVIGATION_STORAGE_KEY } from "./sessionNavigationPreferences";
 import { USAGE_CONTEXT_STORAGE_KEY } from "./usageContextPreferences";
 import { syncAllUserPreferencesFromLocal } from "./userPreferencesSync";
+import { WORKTREE_DEFAULTS_STORAGE_KEY } from "./worktreeDefaultPreferences";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -31,6 +32,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
+  WORKTREE_DEFAULTS_STORAGE_KEY,
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   CONTEXT_INDICATOR_STORAGE_KEY,
@@ -72,6 +74,11 @@ export function collectSettings(): ExportedSettings | null {
   const settings: Record<string, string> = {};
   try {
     for (const key of EXPORTABLE_KEYS) {
+      if (
+        key === "omnigent:always-use-worktree" &&
+        window.localStorage.getItem(WORKTREE_DEFAULTS_STORAGE_KEY) !== null
+      )
+        continue;
       const value = window.localStorage.getItem(key);
       if (value !== null) settings[key] = value;
     }
@@ -151,6 +158,20 @@ export function applyImportedSettings(imported: ExportedSettings): number {
       count++;
     } catch {
       // Swallow individual write failures.
+    }
+  }
+  const legacyWorktree = imported.settings["omnigent:always-use-worktree"];
+  if (legacyWorktree !== undefined) {
+    try {
+      if (imported.settings[WORKTREE_DEFAULTS_STORAGE_KEY] === undefined) {
+        window.localStorage.setItem(
+          WORKTREE_DEFAULTS_STORAGE_KEY,
+          JSON.stringify({ alwaysUseWorktree: legacyWorktree === "true" }),
+        );
+      }
+      window.localStorage.removeItem("omnigent:always-use-worktree");
+    } catch {
+      // Treat migration like the individual best-effort writes above.
     }
   }
   // The browser's native `storage` event does not fire in the same tab that

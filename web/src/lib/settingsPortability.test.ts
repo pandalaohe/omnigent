@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "./contextIndicatorPreferences";
 import { AGENT_BADGE_STORAGE_KEY } from "./agentBadgePreferences";
@@ -9,8 +9,67 @@ import {
   SESSION_NAVIGATION_STORAGE_KEY,
 } from "./sessionNavigationPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
+import {
+  readAlwaysUseWorktree,
+  writeAlwaysUseWorktree,
+  WORKTREE_DEFAULTS_STORAGE_KEY,
+} from "./worktreeDefaultPreferences";
+import {
+  initializeUserPreferencesSync,
+  resetUserPreferencesSyncForTests,
+} from "./userPreferencesSync";
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  resetUserPreferencesSyncForTests();
+});
+afterEach(() => {
+  resetUserPreferencesSyncForTests();
+  vi.useRealTimers();
+});
+
+describe("worktree default portability", () => {
+  it("exports and restores the account preference and clears it with a baseline", () => {
+    writeAlwaysUseWorktree(true);
+    const exported = collectSettings()!;
+    expect(exported.settings[WORKTREE_DEFAULTS_STORAGE_KEY]).toBe(
+      JSON.stringify({ alwaysUseWorktree: true }),
+    );
+    applyImportedSettings({ version: 1, settings: {} });
+    expect(readAlwaysUseWorktree()).toBe(false);
+    applyImportedSettings(exported);
+    expect(readAlwaysUseWorktree()).toBe(true);
+  });
+
+  it("translates old backups before patching the server", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { worktree_defaults: { alwaysUseWorktree: false } } },
+      fetcher,
+    );
+    applyImportedSettings({ version: 1, settings: { "omnigent:always-use-worktree": "true" } });
+    expect(readAlwaysUseWorktree()).toBe(true);
+    expect(localStorage.getItem("omnigent:always-use-worktree")).toBeNull();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences/worktree_defaults",
+      expect.objectContaining({ body: JSON.stringify({ value: { alwaysUseWorktree: true } }) }),
+    );
+  });
+
+  it("prefers the current value in a backup carrying both keys", () => {
+    applyImportedSettings({
+      version: 1,
+      settings: {
+        "omnigent:always-use-worktree": "true",
+        [WORKTREE_DEFAULTS_STORAGE_KEY]: JSON.stringify({ alwaysUseWorktree: false }),
+      },
+    });
+    expect(readAlwaysUseWorktree()).toBe(false);
+    expect(localStorage.getItem("omnigent:always-use-worktree")).toBeNull();
+  });
+});
 
 describe("composer shortcut portability", () => {
   it("exports, imports, and clears the device-local preference", () => {

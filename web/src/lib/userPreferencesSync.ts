@@ -14,7 +14,8 @@ export type UserPreferenceNamespace =
   | "keep_warm"
   | "runner_log_warnings"
   | "sidebar_layout"
-  | "sound_alerts";
+  | "sound_alerts"
+  | "worktree_defaults";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -98,6 +99,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     sound_alerts: {
       storageKey: "omnigent:sound-alerts",
       eventName: "omnigent:sound-alerts-changed",
+    },
+    worktree_defaults: {
+      storageKey: "omnigent:worktree-defaults",
+      eventName: "omnigent:worktree-defaults-changed",
     },
   };
 
@@ -379,6 +384,12 @@ function downgradeToDeviceOnlyScope(): void {
   const previousScope = window.localStorage.getItem(USER_PREFERENCES_SCOPE_KEY);
   if (previousScope !== null && previousScope !== preferenceScope) {
     hydrateServerEnvelope({ version: 1, settings: {} });
+    window.localStorage.removeItem("omnigent:always-use-worktree");
+  } else if (
+    localNamespaceValue("worktree_defaults") === null &&
+    window.localStorage.getItem("omnigent:always-use-worktree") === "true"
+  ) {
+    applyNamespace("worktree_defaults", { alwaysUseWorktree: true });
   }
   window.localStorage.setItem(USER_PREFERENCES_SCOPE_KEY, preferenceScope);
 }
@@ -422,6 +433,25 @@ export async function initializeUserPreferencesSync(
   }
   serverSupportsPreferences = true;
   installRefreshListeners();
+  // Carry the old device-only opt-in once, within its existing account/server
+  // scope. A server value wins; a scope switch must never import another user.
+  const legacyWorktree = window.localStorage.getItem("omnigent:always-use-worktree");
+  if (legacyWorktree !== null) {
+    const previousScope = window.localStorage.getItem(USER_PREFERENCES_SCOPE_KEY);
+    if (
+      legacyWorktree === "true" &&
+      (previousScope === null || previousScope === dirtyOwnerKey()) &&
+      (!isEnvelope(serverValue) || serverValue.settings.worktree_defaults === undefined)
+    ) {
+      const value = localNamespaceValue("worktree_defaults") ?? { alwaysUseWorktree: true };
+      applyNamespace("worktree_defaults", value);
+      if (isEnvelope(serverValue)) markDirty("worktree_defaults", value);
+    }
+    // An unsuccessful first PUT must leave the migration available to retry.
+    if (serverValue !== null || (previousScope !== null && previousScope !== dirtyOwnerKey())) {
+      window.localStorage.removeItem("omnigent:always-use-worktree");
+    }
+  }
   if (serverValue === null) {
     const generation = syncGeneration;
     try {
@@ -453,6 +483,7 @@ export async function initializeUserPreferencesSync(
         // Hydrate the winning server envelope immediately instead of waiting
         // for a reload while showing stale device settings.
         if (isEnvelope(persisted)) {
+          window.localStorage.removeItem("omnigent:always-use-worktree");
           hydrateServerEnvelope(persisted);
         }
       }

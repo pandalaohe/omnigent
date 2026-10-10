@@ -11488,7 +11488,8 @@
                 "worktree_location",
                 "runner_log_warnings",
                 "sidebar_layout",
-                "sound_alerts"
+                "sound_alerts",
+                "worktree_defaults"
               ]
             },
             "title": "Settings",
@@ -14164,6 +14165,7 @@
                         "sidebar_layout",
                         "sound_alerts",
                         "usage_context",
+                        "worktree_defaults",
                         "worktree_location"
                       ]
                     },
@@ -14247,7 +14249,8 @@
                 "worktree_location",
                 "runner_log_warnings",
                 "sidebar_layout",
-                "sound_alerts"
+                "sound_alerts",
+                "worktree_defaults"
               ],
               "title": "Namespace",
               "type": "string"

@@ -18,19 +18,24 @@ describe("worktreeDefaultPreferences", () => {
     expect(readAlwaysUseWorktree()).toBe(true);
   });
 
-  it("clears the key when written off (absence is off)", () => {
+  it("stores an explicit opt-out for other devices", () => {
     writeAlwaysUseWorktree(true);
     writeAlwaysUseWorktree(false);
     expect(readAlwaysUseWorktree()).toBe(false);
-    expect(localStorage.getItem("omnigent:always-use-worktree")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("omnigent:worktree-defaults") ?? "null")).toEqual({
+      alwaysUseWorktree: false,
+    });
   });
 
-  it("only the literal 'true' reads as on (defensive against hand edits)", () => {
+  it("only a boolean true reads as on", () => {
     // A stale or hand-edited value that isn't exactly "true" must not enable it.
-    localStorage.setItem("omnigent:always-use-worktree", "1");
+    localStorage.setItem(
+      "omnigent:worktree-defaults",
+      JSON.stringify({ alwaysUseWorktree: "true" }),
+    );
     expect(readAlwaysUseWorktree()).toBe(false);
 
-    localStorage.setItem("omnigent:always-use-worktree", "true");
+    localStorage.setItem("omnigent:worktree-defaults", JSON.stringify({ alwaysUseWorktree: true }));
     expect(readAlwaysUseWorktree()).toBe(true);
   });
 

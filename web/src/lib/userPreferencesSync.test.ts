@@ -15,6 +15,7 @@ import {
 } from "./approvalTimeoutPreferences";
 import { patchHostColor, readHostColorPreferences } from "./hostColorPreferences";
 import { KEEP_WARM_STORAGE_KEY, writeKeepWarmPreferences } from "./keepWarmPreferences";
+import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "./worktreeDefaultPreferences";
 
 beforeEach(() => {
   localStorage.clear();
@@ -23,6 +24,99 @@ beforeEach(() => {
 });
 
 describe("user preference synchronization", () => {
+  it("retains a legacy worktree opt-in on an older server until migration", async () => {
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    await initializeUserPreferencesSync(undefined, vi.fn(), "alice");
+    expect(readAlwaysUseWorktree()).toBe(true);
+    expect(localStorage.getItem("omnigent:always-use-worktree")).toBe("true");
+  });
+
+  it("clears the prior owner's legacy worktree opt-in on an older-server switch", async () => {
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    localStorage.setItem("omnigent:user-preferences-owner", "server-a:alice");
+    await initializeUserPreferencesSync(undefined, vi.fn(), "bob", "server-a");
+    expect(readAlwaysUseWorktree()).toBe(false);
+    expect(localStorage.getItem("omnigent:always-use-worktree")).toBeNull();
+  });
+  it("retries migration after a first initialization failure", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    await initializeUserPreferencesSync(
+      null,
+      vi.fn().mockResolvedValue(new Response(null, { status: 503 })),
+      "alice",
+    );
+    expect(localStorage.getItem("omnigent:always-use-worktree")).toBe("true");
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(readAlwaysUseWorktree()).toBe(true);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences/worktree_defaults",
+      expect.objectContaining({ body: JSON.stringify({ value: { alwaysUseWorktree: true } }) }),
+    );
+  });
+  it("migrates a legacy worktree opt-in once even for an existing server envelope", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    expect(readAlwaysUseWorktree()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences/worktree_defaults",
+      expect.objectContaining({ body: JSON.stringify({ value: { alwaysUseWorktree: true } }) }),
+    );
+    expect(localStorage.getItem("omnigent:always-use-worktree")).toBeNull();
+    fetcher.mockClear();
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: {
+          worktree_defaults: { alwaysUseWorktree: false },
+        },
+      },
+      fetcher,
+      "alice",
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(readAlwaysUseWorktree()).toBe(false);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("uses the server worktree choice and syncs an explicit opt-out", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: {
+          worktree_defaults: { alwaysUseWorktree: true },
+        },
+      },
+      fetcher,
+      "alice",
+    );
+    expect(readAlwaysUseWorktree()).toBe(true);
+    writeAlwaysUseWorktree(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/v1/me/preferences/worktree_defaults",
+      expect.objectContaining({ body: JSON.stringify({ value: { alwaysUseWorktree: false } }) }),
+    );
+  });
+
+  it("does not migrate a previous account's device-only worktree opt-in", async () => {
+    vi.useFakeTimers();
+    localStorage.setItem("omnigent:user-preferences-owner", "__default__:alice");
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    const fetcher = vi.fn();
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "bob");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(readAlwaysUseWorktree()).toBe(false);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
   it("does nothing when an older Server omits the preferences field", async () => {
     localStorage.setItem("omnigent:context-indicator-mode", "compact");
     const fetcher = vi.fn();

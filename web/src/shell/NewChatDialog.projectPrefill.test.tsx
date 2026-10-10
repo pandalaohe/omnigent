@@ -73,6 +73,10 @@ import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
+import {
+  initializeUserPreferencesSync,
+  resetUserPreferencesSyncForTests,
+} from "@/lib/userPreferencesSync";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 const navigateMock = vi.fn();
@@ -1111,9 +1115,28 @@ describe("NewChatLandingScreen project prefill", () => {
 // worktree. Precedence: a project's explicit `use_worktree` (true OR false)
 // wins; an unset project falls through to this global default. These cases pin
 // the full global × project matrix.
-const ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree";
+const ALWAYS_WORKTREE_KEY = "omnigent:worktree-defaults";
 
 describe("NewChatLandingScreen global always-use-worktree default", () => {
+  it("uses a server default hydrated after the composer opens", async () => {
+    searchParams = new URLSearchParams("");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
+    renderLanding();
+    await waitFor(() => expect(branchLabel()).toBe("None"));
+    await act(async () => {
+      await initializeUserPreferencesSync(
+        {
+          version: 1,
+          settings: {
+            worktree_defaults: { alwaysUseWorktree: true },
+          },
+        },
+        vi.fn(),
+      );
+    });
+    await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
+    resetUserPreferencesSyncForTests();
+  });
   // The compact header exposes the visible branch/request label separately
   // from its state-specific accessible description.
   function branchLabel(): string {
@@ -1125,7 +1148,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     // global default alone drives the worktree seed.
     searchParams = new URLSearchParams("");
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
-    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, JSON.stringify({ alwaysUseWorktree: true }));
     renderLanding();
 
     await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
@@ -1151,7 +1174,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
   it("applies the global default to a project whose config leaves use_worktree unset", async () => {
     // Project config sets host/workspace but no worktree preference → falls
     // through to the global default (on).
-    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, JSON.stringify({ alwaysUseWorktree: true }));
     setProjectConfig({ host_id: "host_1", workspace: REPO });
     renderLanding();
 
@@ -1167,7 +1190,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
   it("lets a project's explicit opt-out win over the global default (global on, project false)", async () => {
     // A project that stored `use_worktree: false` overrides the global on — no
     // worktree despite the global default.
-    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, JSON.stringify({ alwaysUseWorktree: true }));
     setProjectConfig({ host_id: "host_1", workspace: REPO, use_worktree: false });
     renderLanding();
 
@@ -1201,7 +1224,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     // The global default only applies to git repos — RECENT_WORKSPACE is not a
     // git repo (no is_main worktree), so nothing is seeded.
     searchParams = new URLSearchParams("");
-    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, JSON.stringify({ alwaysUseWorktree: true }));
     // RECENT_WORKSPACE (the default recent) is not the git REPO.
     renderLanding();
 
@@ -1220,7 +1243,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     // default is off; it should retract to a plain launch on the next mount.
     searchParams = new URLSearchParams("");
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
-    localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
+    localStorage.setItem(ALWAYS_WORKTREE_KEY, JSON.stringify({ alwaysUseWorktree: true }));
 
     const first = renderLanding();
     await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));

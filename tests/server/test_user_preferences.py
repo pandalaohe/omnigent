@@ -1299,6 +1299,32 @@ async def test_preferences_api_accepts_the_approval_timeout_namespace(
 
 
 @pytest.mark.asyncio
+async def test_preferences_api_syncs_worktree_defaults_per_user(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """The worktree default survives a device reload and stays user-scoped."""
+    app = _preferences_app(db_uri, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"x-test-user": "alice@example.test"}
+        for enabled in (True, False):
+            patched = await client.patch(
+                "/v1/me/preferences/worktree_defaults",
+                headers=headers,
+                json={"value": {"alwaysUseWorktree": enabled}},
+            )
+            assert patched.status_code == 200, patched.text
+            loaded = await client.get("/v1/me", headers=headers)
+            assert loaded.json()["preferences"]["settings"]["worktree_defaults"] == {
+                "alwaysUseWorktree": enabled
+            }
+        other = await client.get("/v1/me", headers={"x-test-user": "bob@example.test"})
+        assert other.json()["preferences"] is None
+
+
+@pytest.mark.asyncio
 async def test_preferences_api_accepts_the_host_colors_namespace(
     db_uri: str,
     runtime_init: None,

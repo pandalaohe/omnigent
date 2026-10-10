@@ -16,6 +16,7 @@ const HOVER_CLOSE_DELAY_MS = 150;
 export function HelpTip({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
+  const pointerFocusRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -45,6 +46,21 @@ export function HelpTip({ label, children }: { label: string; children: ReactNod
           type="button"
           aria-label={label}
           className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
+          onPointerDown={() => {
+            pointerFocusRef.current = true;
+          }}
+          onFocus={() => {
+            cancelClose();
+            if (pointerFocusRef.current) {
+              pointerFocusRef.current = false;
+              return;
+            }
+            setOpen(true);
+          }}
+          onBlur={() => {
+            pointerFocusRef.current = false;
+            scheduleClose();
+          }}
           onPointerEnter={(event) => {
             if (event.pointerType !== "mouse") return;
             cancelClose();
@@ -61,6 +77,8 @@ export function HelpTip({ label, children }: { label: string; children: ReactNod
       <PopoverContent
         side="top"
         className="w-64 text-xs"
+        onOpenAutoFocus={(event) => event.preventDefault()}
+        onCloseAutoFocus={(event) => event.preventDefault()}
         onPointerEnter={(event) => {
           if (event.pointerType !== "mouse") return;
           cancelClose();

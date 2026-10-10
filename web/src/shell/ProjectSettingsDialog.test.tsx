@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   createProject,
   deleteProjectEntry,
@@ -228,6 +229,21 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ProjectSettingsDialog", () => {
+  it("keeps inheritance when the account default refreshes during editing", async () => {
+    writeAlwaysUseWorktree(false);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    act(() => writeAlwaysUseWorktree(true));
+    expect(screen.getByTestId("project-settings-worktree")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+    writeAlwaysUseWorktree(false);
+  });
+
   it("seeds fields from the project's stored config", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",

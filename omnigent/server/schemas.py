@@ -93,6 +93,7 @@ UserPreferenceNamespace = Literal[
     "runner_log_warnings",
     "sidebar_layout",
     "sound_alerts",
+    "worktree_defaults",
 ]
 
 

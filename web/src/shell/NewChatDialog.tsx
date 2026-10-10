@@ -203,7 +203,7 @@ import {
 } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { useAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   type LastSandboxRepo,
   readLastSandboxRepos,
@@ -5092,12 +5092,13 @@ export function NewChatLandingScreen() {
     _setPickedModel((current) => (current === "" ? cachedPreviewModel : current));
   }, [cachedPreviewModel]);
 
+  const alwaysUseWorktree = useAlwaysUseWorktree();
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
   // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
+    if ((prefillConfig?.useWorktree ?? alwaysUseWorktree) !== true) return;
     if (sandboxSelected || selectedHostId === null || workspaceValue === "") return;
     if (branchName !== "" || activeWorktree !== null) return;
     if (worktreeSeededForRef.current === workspaceValue) return;
@@ -5120,6 +5121,7 @@ export function NewChatLandingScreen() {
     hostWorktreesArePlaceholder,
     workspaceIsGit,
     generateBranchName,
+    alwaysUseWorktree,
   ]);
 
   // Retract our own auto-seeded branch when the effective default is now off
@@ -5127,12 +5129,12 @@ export function NewChatLandingScreen() {
   // default off in Settings. Only clears while the field still holds OUR seed.
   useEffect(() => {
     if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    if ((prefillConfig?.useWorktree ?? alwaysUseWorktree) === true) return;
     setBranchName("");
     setAutoSeededBranch("");
     // Re-arm the seed guard so flipping the default back on can seed again.
     worktreeSeededForRef.current = null;
-  }, [prefillConfig, branchName, autoSeededBranch]);
+  }, [prefillConfig, branchName, autoSeededBranch, alwaysUseWorktree]);
 
   // Sandbox repo inputs are valid when empty (empty workspace) or when every
   // selected repo's URL passes the shape check. A half-typed URL in the paste

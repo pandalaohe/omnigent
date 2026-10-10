@@ -24,6 +24,7 @@ import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import { Button } from "@/components/ui/button";
 import {
@@ -82,7 +83,7 @@ import {
 import { ApiError } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { useAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { ProjectCodeSection } from "./ProjectCodeSection";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -116,8 +117,11 @@ function Field({
       }
     >
       <label htmlFor={htmlFor} className="flex min-w-0 flex-col pt-1.5">
-        <span className="font-medium text-ui">{label}</span>
-        {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
+        <span className="font-medium text-ui">
+          {label}
+          {hint && switchRow && <HelpTip label={`About ${label.toLowerCase()}`}>{hint}</HelpTip>}
+        </span>
+        {hint && !switchRow && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
       <div className="min-w-0 w-full">{children}</div>
     </div>
@@ -658,12 +662,10 @@ export function ProjectSettingsDialog({
   // The dialog open (or project) whose drafts have been seeded, so a later
   // entries refetch (a Code-tab folder change) can't overwrite edited drafts.
   const seededKeyRef = useRef<string | null>(null);
-  // Worktree default for the project. The toggle seeds from the project's
-  // stored value when set, else from the user-global "always use a worktree"
-  // default (Settings › Git). On save it stays "inherit" (stores nothing) while
-  // it matches the global default, and stores an explicit true/false only to
-  // override it — so a project can force a worktree on or opt out of a global on.
-  const [useWorktree, setUseWorktree] = useState(false);
+  // Undefined keeps inheritance live while the account default refreshes.
+  const alwaysUseWorktree = useAlwaysUseWorktree();
+  const [worktreeOverride, setWorktreeOverride] = useState<boolean | undefined>();
+  const useWorktree = worktreeOverride ?? alwaysUseWorktree;
   // Base branch a new worktree forks from; blank stores no default (falls
   // through to the user-global default in Settings › Git). Only meaningful
   // alongside the worktree default, but kept independent so it survives toggling.
@@ -774,7 +776,7 @@ export function ProjectSettingsDialog({
     setHostRows(rows);
     setSelectedRowId(rows[0]?.hostId ?? ALL_HOSTS);
     setSavedEntries(new Map(entries.map((entry) => [entry.host_id, entry.workspace])));
-    setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
+    setWorktreeOverride(c.use_worktree);
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
@@ -902,10 +904,7 @@ export function ProjectSettingsDialog({
     }
     if (agentId) config.agent_id = agentId;
     else delete config.agent_id;
-    // Store the worktree choice only when it overrides the user-global default;
-    // while it matches, leave the key unset so the project keeps inheriting
-    // (and an all-default dialog still clears to {}).
-    if (useWorktree !== readAlwaysUseWorktree()) config.use_worktree = useWorktree;
+    if (worktreeOverride !== undefined) config.use_worktree = worktreeOverride;
     else delete config.use_worktree;
     // A base branch only forks a worktree, so it's only meaningful when the
     // worktree default is on — drop it otherwise so it can't linger as a stale,
@@ -1883,13 +1882,15 @@ export function ProjectSettingsDialog({
           <Field
             switchRow
             label="Random worktree"
-            hint="Start each new session in a fresh randomly-named git worktree (vs. directly in the workspace). Overrides the global default in Settings › Git."
+            hint="Sessions opened from New Chat start in a separate Git checkout of the project, with a random branch name. They branch from the base branch below, the code repository's default branch, Settings › Git's base branch, or the checkout's current HEAD, in that order. Sessions opened by agents or tools keep following their parent's folder unless a folder or worktree is specified. Overrides the default in Settings › Git."
           >
             <div className="flex justify-end">
               <Switch
                 data-testid="project-settings-worktree"
                 checked={useWorktree}
-                onCheckedChange={setUseWorktree}
+                onCheckedChange={(value) =>
+                  setWorktreeOverride(value === alwaysUseWorktree ? undefined : value)
+                }
                 disabled={isLoading}
               />
             </div>

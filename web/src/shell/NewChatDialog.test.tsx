@@ -4051,7 +4051,11 @@ describe("NewChatLandingScreen", () => {
     }
 
     async function selectNewWorktree(autoSeeded = false) {
-      if (autoSeeded) localStorage.setItem("omnigent:always-use-worktree", "true");
+      if (autoSeeded)
+        localStorage.setItem(
+          "omnigent:worktree-defaults",
+          JSON.stringify({ alwaysUseWorktree: true }),
+        );
       renderLanding();
       const worktree = screen.getByTestId("new-chat-landing-branch-chip");
       await waitFor(() =>

@@ -1,60 +1,54 @@
-"""E2E: Settings → Git "Always use a random worktree" default.
-
-The toggle (``AlwaysUseWorktreeControl`` on ``pages/SettingsPage.tsx``) is a
-Switch under Settings → Git. Turning it on writes
-``localStorage["omnigent:always-use-worktree"] = "true"``; turning it off
-removes the key (absence = off). The composer reads this when it settles a git
-workspace and, when on, seeds a fresh worktree branch — see the composer-side
-behavior in ``web/src/shell/NewChatDialog.projectPrefill.test.tsx``.
-
-This file covers just the control: default off, persists on, clears on off, and
-survives a reload. No LLM turn is needed.
-"""
+"""E2E: the New Chat worktree default persists on the server across reloads."""
 
 from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
-STORAGE_KEY = "omnigent:always-use-worktree"
+STORAGE_KEY = "omnigent:worktree-defaults"
 
 
-def _stored(page: Page) -> str | None:
-    """The persisted default, or None when unset (off)."""
-    return page.evaluate(f"() => window.localStorage.getItem('{STORAGE_KEY}')")
-
-
-def _open_git_settings(page: Page, base_url: str) -> None:
-    """Navigate to Settings → Git and wait for the worktree toggle."""
-    page.goto(f"{base_url}/settings/git")
-    expect(page.get_by_test_id("settings-always-use-worktree-toggle")).to_be_visible(
-        timeout=30_000
-    )
+def _server_default(page: Page, base_url: str) -> bool | None:
+    response = page.request.get(f"{base_url}/v1/me")
+    assert response.ok
+    preferences = response.json().get("preferences") or {}
+    return preferences.get("settings", {}).get("worktree_defaults", {}).get("alwaysUseWorktree")
 
 
 def test_always_use_worktree_defaults_off_persists_and_clears(
     page: Page, live_server: str
 ) -> None:
-    """Off by default; toggling on persists and toggling off clears the key."""
-    base_url = live_server
-    _open_git_settings(page, base_url)
+    page.goto(f"{live_server}/settings/git")
     toggle = page.get_by_test_id("settings-always-use-worktree-toggle")
+    expect(toggle).to_have_attribute("aria-checked", "false", timeout=30_000)
+    assert _server_default(page, live_server) in (None, False)
 
-    # Fresh context → the toggle is off and nothing is stored.
-    expect(toggle).to_have_attribute("aria-checked", "false")
-    assert _stored(page) is None, "a fresh load should store no worktree default"
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith("/v1/me/preferences/worktree_defaults")
+            and response.request.method == "PATCH"
+        )
+    ) as saved:
+        toggle.click()
+    assert saved.value.ok
+    assert _server_default(page, live_server) is True
 
-    # Turn it on → persists as the literal "true".
-    toggle.click()
-    expect(toggle).to_have_attribute("aria-checked", "true")
-    assert _stored(page) == "true"
-
-    # A reload keeps it on (seeded from storage).
+    # Remove the local cache so reloading must hydrate the server's value.
+    page.evaluate("key => localStorage.removeItem(key)", STORAGE_KEY)
     page.reload()
     toggle = page.get_by_test_id("settings-always-use-worktree-toggle")
     expect(toggle).to_have_attribute("aria-checked", "true", timeout=30_000)
-    assert _stored(page) == "true", "the worktree default did not survive a reload"
 
-    # Turn it off → the key is removed (absence is the off state).
-    toggle.click()
-    expect(toggle).to_have_attribute("aria-checked", "false")
-    assert _stored(page) is None, "turning the default off should clear the storage key"
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith("/v1/me/preferences/worktree_defaults")
+            and response.request.method == "PATCH"
+        )
+    ) as saved:
+        toggle.click()
+    assert saved.value.ok
+    assert _server_default(page, live_server) is False
+    page.evaluate("key => localStorage.removeItem(key)", STORAGE_KEY)
+    page.reload()
+    expect(page.get_by_test_id("settings-always-use-worktree-toggle")).to_have_attribute(
+        "aria-checked", "false", timeout=30_000
+    )
