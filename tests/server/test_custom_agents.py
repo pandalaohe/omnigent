@@ -234,6 +234,59 @@ async def test_create_multi_member_projection(
 
 
 @pytest.mark.asyncio
+async def test_member_speed_round_trips_into_saved_execution_config(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    app, artifacts, _agents, _conversations, _permissions = make_app(db_uri, tmp_path)
+    lead = roster_member(
+        "custom-reviewer",
+        lead=True,
+        harness="codex",
+        model="gpt-6-sol",
+        description="Lead reviewer",
+    )
+    lead["speed"] = "ultrafast"
+    worker = roster_member(
+        "researcher",
+        harness="claude-sdk",
+        model="claude-opus",
+        description="Research support",
+    )
+    worker["speed"] = "fast"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        created = await client.post(
+            "/v1/custom-agents",
+            headers={"x-test-user": "alice"},
+            files={"bundle": ("agent.tar.gz", joint_bundle())},
+        )
+        assert created.status_code == 201, created.text
+        row = created.json()
+        patched = await client.patch(
+            f"/v1/custom-agents/{row['id']}",
+            headers={"x-test-user": "alice"},
+            json={"version": row["version"], "members": [lead, worker]},
+        )
+    assert patched.status_code == 200, patched.text
+    saved = patched.json()
+    assert [member["speed"] for member in saved["members"]] == ["ultrafast", "fast"]
+    location = CustomAgentsStore(db_uri).get("alice", row["id"])["bundle_location"]
+    archive = artifacts.get(location)
+    configs = members(archive)
+    assert (
+        yaml.safe_load(configs["config.yaml"][0])["executor"]["config"]["service_tier"]
+        == "ultrafast"
+    )
+    assert (
+        yaml.safe_load(configs["agents/researcher/config.yaml"][0])["executor"]["config"][
+            "service_tier"
+        ]
+        == "fast"
+    )
+
+
+@pytest.mark.asyncio
 async def test_list_returns_stored_members_without_artifact_read(
     db_uri: str, tmp_path: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

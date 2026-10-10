@@ -120,6 +120,7 @@ async def test_create_forwards_cost_cap() -> None:
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
                 "agent_id": "ag_1",
                 "max_cost_usd": 2.5,
+                "speed": "ultrafast",
             }
         ),
         server_client=client,
@@ -127,6 +128,7 @@ async def test_create_forwards_cost_cap() -> None:
     )
     _, _, body = client.calls[0]
     assert body["max_cost_usd"] == 2.5
+    assert body["speed"] == "ultrafast"
 
 
 @pytest.mark.asyncio
@@ -177,12 +179,13 @@ async def test_update_forwards_agent_switch_and_cost_cap() -> None:
                 "scheduled_task_id": _TASK_ID,
                 "agent_id": "ag_pi",
                 "max_cost_usd": 2.5,
+                "speed": "standard",
             }
         ),
         server_client=client,
     )
     _, _, body = client.calls[0]
-    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
+    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5, "speed": "standard"}
 
 
 @pytest.mark.asyncio

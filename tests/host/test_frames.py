@@ -589,12 +589,15 @@ def test_model_options_frames_round_trip() -> None:
     """Pre-launch model catalogs survive both directions of the host tunnel."""
     request = decode_host_frame(
         encode_host_frame(
-            HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+            HostModelOptionsFrame(
+                request_id="req_models", harness="claude-native", refresh="force"
+            ),
         )
     )
     assert request == HostModelOptionsFrame(
         request_id="req_models",
         harness="claude-native",
+        refresh="force",
     )
 
     result = decode_host_frame(
@@ -3046,6 +3049,7 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
             is_repo=True,
             toplevel="/opt/work/omnigent/fork/myrepo",
             branch="main",
+            default_branch="main",
             head="a" * 40,
             detached=False,
             dirty=True,

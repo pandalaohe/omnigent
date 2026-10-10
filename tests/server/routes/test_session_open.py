@@ -775,8 +775,7 @@ async def test_plain_open_body_lets_project_calling_defaults_fill(
         "effort": "high",
         "permission": "plan" if harness == "claude-native" else "approve-for-me",
     }
-    if harness == "codex-native":
-        modes["speed"] = "fast"
+    modes["speed"] = "fast"
     config = dict(env["project"].config)
     config["calling_defaults"] = {HOST_ID: {"harnesses": {native_agent.harness: modes}}}
     env["projects"].update(env["project"].id, user_id=ALICE, config=config)

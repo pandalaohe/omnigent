@@ -33,7 +33,11 @@ import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
-import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
+import {
+  isNativeCodingAgent,
+  nativeAgentHasCapability,
+  nativeCodingAgentForAvailableAgent,
+} from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
@@ -115,6 +119,7 @@ export function CreateScheduledTaskDialog({
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
+  const [pickedSpeed, setPickedSpeed] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
   // Saved library Agents join the picker as in New Chat. A session row backed by
@@ -190,6 +195,7 @@ export function CreateScheduledTaskDialog({
     const backToOriginal = isEdit && agent.id === editingTask?.agentId;
     setPickedModel(backToOriginal ? (editingTask?.modelOverride ?? "") : "");
     setPickedEffort(backToOriginal ? (editingTask?.reasoningEffort ?? "") : "");
+    setPickedSpeed(backToOriginal ? (editingTask?.speed ?? "") : "");
     setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
   }
 
@@ -202,11 +208,14 @@ export function CreateScheduledTaskDialog({
   // the picker hides still gates on its real capabilities.
   const modelEffortAgent = agents?.find((a) => a.id === effectiveAgentId);
   const nativePermissionMode = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
-  const modelEffortHarness: "claude-native" | "claude-sdk" | "codex" | null = nativePermissionMode
-    ? "claude-native"
-    : modelEffortAgent?.harness === "claude-sdk" || modelEffortAgent?.harness === "codex"
-      ? modelEffortAgent.harness
-      : null;
+  const modelEffortHarness: "claude-native" | "claude-sdk" | "codex" | "codex-native" | null =
+    nativePermissionMode
+      ? "claude-native"
+      : nativeCodingAgentForAvailableAgent(modelEffortAgent)?.harness === "codex-native"
+        ? "codex-native"
+        : modelEffortAgent?.harness === "claude-sdk" || modelEffortAgent?.harness === "codex"
+          ? modelEffortAgent.harness
+          : null;
   const showModelEffort = modelEffortHarness !== null;
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -290,6 +299,7 @@ export function CreateScheduledTaskDialog({
         // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
+        setPickedSpeed(editingTask.speed ?? "");
         setPickedPermission(editingTask.permissionMode ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
@@ -304,6 +314,7 @@ export function CreateScheduledTaskDialog({
         setPickedAgentId(null);
         setPickedModel("");
         setPickedEffort("");
+        setPickedSpeed("");
         setPickedPermission("");
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
@@ -366,6 +377,7 @@ export function CreateScheduledTaskDialog({
     setPickedAgentId(null);
     setPickedModel("");
     setPickedEffort("");
+    setPickedSpeed("");
     setPickedPermission("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
@@ -420,12 +432,14 @@ export function CreateScheduledTaskDialog({
         const overrides: {
           modelOverride?: string | null;
           reasoningEffort?: string | null;
+          speed?: string | null;
           permissionMode?: string | null;
         } = {};
         if (showModelEffort) {
           if (agentChanged) {
             if (pickedModel !== "") overrides.modelOverride = pickedModel;
             if (pickedEffort !== "") overrides.reasoningEffort = pickedEffort;
+            if (pickedSpeed !== "") overrides.speed = pickedSpeed;
             if (pickedPermission !== "") overrides.permissionMode = pickedPermission;
           } else {
             if (pickedModel !== (editingTask.modelOverride ?? "")) {
@@ -433,6 +447,9 @@ export function CreateScheduledTaskDialog({
             }
             if (pickedEffort !== (editingTask.reasoningEffort ?? "")) {
               overrides.reasoningEffort = pickedEffort === "" ? null : pickedEffort;
+            }
+            if (pickedSpeed !== (editingTask.speed ?? "")) {
+              overrides.speed = pickedSpeed === "" ? null : pickedSpeed;
             }
             if (pickedPermission !== (editingTask.permissionMode ?? "")) {
               overrides.permissionMode = pickedPermission === "" ? null : pickedPermission;
@@ -461,6 +478,7 @@ export function CreateScheduledTaskDialog({
           // the create uses the agent's configured defaults.
           ...(showModelEffort && pickedModel !== "" ? { modelOverride: pickedModel } : {}),
           ...(showModelEffort && pickedEffort !== "" ? { reasoningEffort: pickedEffort } : {}),
+          ...(showModelEffort && pickedSpeed !== "" ? { speed: pickedSpeed } : {}),
           ...(showModelEffort && pickedPermission !== ""
             ? { permissionMode: pickedPermission }
             : {}),
@@ -607,10 +625,12 @@ export function CreateScheduledTaskDialog({
                 harness={modelEffortHarness}
                 model={pickedModel}
                 effort={pickedEffort}
+                speed={pickedSpeed}
                 permissionMode={pickedPermission}
                 hostId={hostId}
                 onModelChange={setPickedModel}
                 onEffortChange={setPickedEffort}
+                onSpeedChange={setPickedSpeed}
                 onPermissionModeChange={setPickedPermission}
                 onSelectOpenChange={handleSelectOpenChange}
               />

@@ -93,6 +93,7 @@ UserPreferenceNamespace = Literal[
     "runner_log_warnings",
     "sidebar_layout",
     "sound_alerts",
+    "worktree_defaults",
 ]
 
 
@@ -1248,7 +1249,7 @@ class CreateResponseRequest(BaseModel):
     reasoning: dict[str, str] | None = None
     permission_mode: str | None = None
     approval_mode: str | None = None
-    service_tier: Literal["standard", "fast"] | None = None
+    service_tier: str | None = None
     # Per-request LLM model override (distinct from ``model``, which
     # carries the agent name). See class docstring for semantics.
     model_override: str | None = None
@@ -2675,6 +2676,7 @@ class UpdateSessionRequest(BaseModel):
     collaboration_mode: str | None = None
     permission_mode: str | None = None
     approval_mode: str | None = None
+    speed_tier: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     share_workspace_files: bool | None = None
@@ -3733,6 +3735,14 @@ class SessionReasoningEffortEvent(_SSEEventBase):
     type: Literal["session.reasoning_effort"]
     conversation_id: str
     reasoning_effort: str | None = None
+
+
+class SessionSpeedTierEvent(_SSEEventBase):
+    """The effective speed of a running session after a confirmed change."""
+
+    type: Literal["session.speed_tier"]
+    conversation_id: str
+    speed_tier: str
 
 
 class SessionCollaborationModeEvent(_SSEEventBase):
@@ -5247,6 +5257,7 @@ ServerStreamEvent = Annotated[
     | SessionModelEvent
     | SessionTitleEvent
     | SessionReasoningEffortEvent
+    | SessionSpeedTierEvent
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
     | SessionCodexApprovalModeEvent

@@ -9,6 +9,8 @@ import { useHostModelOptions, type Host } from "@/hooks/useHosts";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
+import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { reconcileSpeed } from "@/lib/speedTiers";
 
 /** Menu key for the "Default" (null) row in the Model and Effort submenus. */
 const DEFAULT_ROW_KEY = "__default__";
@@ -18,11 +20,12 @@ export interface AgentMemberValue {
   harness: string;
   model: string | null;
   effort: string | null;
+  speed?: string | null;
   /** The member's saved host; null = the session's selected host. */
   hostId: string | null;
 }
 
-type Section = "host" | "harness" | "model" | "effort";
+type Section = "host" | "harness" | "model" | "effort" | "speed";
 
 /**
  * Compact per-member runtime trigger: harness icon, model, and effort in one
@@ -35,6 +38,7 @@ export function AgentMemberTrigger({
   harness,
   model,
   effort,
+  speed = null,
   harnessOptions,
   hostId,
   sessionHostId,
@@ -45,6 +49,7 @@ export function AgentMemberTrigger({
   harness: string;
   model: string | null;
   effort: string | null;
+  speed?: string | null;
   /** `{id, label}` rows for the Harness submenu, in menu order. */
   harnessOptions: readonly { id: string; label: string }[];
   /** The member's saved host; null = the session host (the catalog fallback). */
@@ -96,6 +101,10 @@ export function AgentMemberTrigger({
     return options;
   }, [rows, harness, model]);
   const effortLevels = effortLevelsFor(harness, rows, model);
+  const speedOptions = sessionDefaultModeOptions(harness, "speed", rows, model);
+  const speedLabel =
+    speed &&
+    (speedOptions.find((option) => option.value === speed)?.label ?? `Unavailable (${speed})`);
   const harnessLabel = harnessOptions.find((option) => option.id === harness)?.label ?? harness;
   const modelLabel =
     model === null
@@ -110,19 +119,36 @@ export function AgentMemberTrigger({
       : (memberHost?.name ?? hostId) + (memberHost?.status === "offline" ? " (offline)" : "");
 
   const selectHarness = (id: string) => {
-    if (id !== harness) onChange({ harness: id, model: null, effort: null, hostId });
+    if (id !== harness)
+      onChange({
+        harness: id,
+        model: null,
+        effort: null,
+        ...(speed !== null ? { speed: null } : {}),
+        hostId,
+      });
   };
   const selectModel = (nextModel: string | null) =>
     onChange({
       harness,
       model: nextModel,
       effort: reconcileEffortOnModelChange(harness, rows, nextModel, effort),
+      ...(speed !== null ? { speed: reconcileSpeed(speed, rows, nextModel) } : {}),
       hostId,
     });
   const selectEffort = (nextEffort: string | null) =>
-    onChange({ harness, model, effort: nextEffort, hostId });
+    onChange({ harness, model, effort: nextEffort, ...(speed !== null ? { speed } : {}), hostId });
+  const selectSpeed = (nextSpeed: string | null) =>
+    onChange({ harness, model, effort, speed: nextSpeed, hostId });
   const selectHost = (nextHostId: string | null) => {
-    if (nextHostId !== hostId) onChange({ harness, model, effort, hostId: nextHostId });
+    if (nextHostId !== hostId)
+      onChange({
+        harness,
+        model,
+        effort,
+        ...(speed !== null ? { speed: null } : {}),
+        hostId: nextHostId,
+      });
   };
   const commitModelDraft = () => {
     const trimmed = modelDraft.trim();
@@ -150,9 +176,9 @@ export function AgentMemberTrigger({
       }}
       configOpen={section !== null}
       trigger={{
-        label: [harnessLabel, modelLabel, effortLabel].filter(Boolean).join(" · "),
+        label: [harnessLabel, modelLabel, effortLabel, speedLabel].filter(Boolean).join(" · "),
         model: modelLabel,
-        effort: effortLabel,
+        effort: [effortLabel, speedLabel].filter(Boolean).join(" · ") || undefined,
         icon: <ComposerAgentIcon agent={{ name: "", harness }} sdkMarkClassName="size-[15px]" />,
         testIdPrefix: "agent-member",
         disabled,
@@ -313,6 +339,40 @@ export function AgentMemberTrigger({
                 })),
               ],
             }}
+          />
+        </HarnessPickerConfigRow>
+      )}
+      {speedOptions.length > 0 && (
+        <HarnessPickerConfigRow
+          label="Speed"
+          value={speed === null ? "Default" : (speedLabel ?? speed)}
+          testId="agent-member-speed"
+          configTestId="agent-member-speed-menu"
+          {...submenuProps("speed")}
+        >
+          <ComposerConfigSections
+            extra={[
+              {
+                testId: "agent-member-speeds",
+                header: "Speed",
+                choices: [
+                  {
+                    key: DEFAULT_ROW_KEY,
+                    label: "Default",
+                    checked: speed === null,
+                    onSelect: () => selectSpeed(null),
+                    testId: "agent-member-speed-default",
+                  },
+                  ...speedOptions.map((option) => ({
+                    key: option.value,
+                    label: option.label,
+                    checked: option.value === speed,
+                    onSelect: () => selectSpeed(option.value),
+                    testId: `agent-member-speed-${option.value}`,
+                  })),
+                ],
+              },
+            ]}
           />
         </HarnessPickerConfigRow>
       )}

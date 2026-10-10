@@ -340,6 +340,27 @@ async def test_create_persists_permission_mode(
     assert got.json()["permission_mode"] == "acceptEdits"
 
 
+async def test_scheduled_speed_round_trips_and_clears(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(speed="fast"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    assert created.json()["speed"] == "fast"
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["speed"] == "fast"
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"speed": None}, headers=_headers()
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["speed"] is None
+
+
 @pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
 async def test_create_rejects_invalid_permission_mode(
     auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
@@ -397,6 +418,38 @@ async def test_permission_mode_matches_scheduled_agent_harness(
         assert resp.json()["reasoning_effort"] == "high"
     else:
         assert harness is not None and harness in resp.text
+
+
+@pytest.mark.parametrize("permission_mode", ["approve-for-me", "read-only"])
+async def test_codex_native_permission_round_trips_on_create_and_edit(
+    auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
+) -> None:
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            permission_mode=permission_mode,
+        ),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    task_id = response.json()["id"]
+    assert response.json()["permission_mode"] == permission_mode
+
+    other_mode = "read-only" if permission_mode == "approve-for-me" else "approve-for-me"
+    edited = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"permission_mode": other_mode},
+        headers=_headers(),
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["permission_mode"] == other_mode
+    stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["permission_mode"] == other_mode
 
 
 async def test_create_rejects_relative_workspace(

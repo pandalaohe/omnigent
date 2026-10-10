@@ -151,6 +151,7 @@ export function CreateAgentDialog({
   const [harness, setHarness] = useState(DEFAULT_HARNESS);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
+  const [speed, setSpeed] = useState<string | null>(null);
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -207,6 +208,7 @@ export function CreateAgentDialog({
         harness,
         model,
         reasoningEffort: effort ?? undefined,
+        speed: speed ?? undefined,
         mcpServers: toMCPInputs(mcpEntries),
       });
       reset();
@@ -299,12 +301,13 @@ export function CreateAgentDialog({
           {/* Harness / model / effort of the lead member (the bundle root). */}
           <div className="flex flex-col gap-1.5">
             <span className="text-sm font-medium text-muted-foreground">
-              Harness, model, effort
+              Harness, model, effort, speed
             </span>
             <AgentMemberTrigger
               harness={harness}
               model={model}
               effort={effort}
+              speed={speed}
               harnessOptions={harnessOptions}
               hostId={null}
               sessionHostId={hostId}
@@ -319,6 +322,7 @@ export function CreateAgentDialog({
                 setHarness(next.harness);
                 setModel(next.model);
                 setEffort(next.effort);
+                setSpeed(next.speed ?? null);
               }}
               disabled={saving}
             />

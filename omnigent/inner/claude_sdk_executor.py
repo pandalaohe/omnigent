@@ -60,6 +60,7 @@ from omnigent.models.claude_model_vocabulary import (
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.session_default_modes import CLAUDE_FAST_MODE_SETTINGS
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1258,12 +1259,13 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
 
 
 def _claude_settings_payload(
-    api_key_helper: str | None, model_overrides: dict[str, str]
+    api_key_helper: str | None, model_overrides: dict[str, str], *, fast_mode: bool | None = None
 ) -> str | None:
     """Serialize the invocation-local settings Claude Code launches with.
 
     :param api_key_helper: The gateway ``apiKeyHelper`` command, or ``None``.
     :param model_overrides: Canonical-to-served model id rewrites.
+    :param fast_mode: Session speed override; ``None`` preserves Claude's default.
     :returns: Compact JSON for ``ClaudeAgentOptions.settings``, or ``None``
         when there is nothing to configure.
     """
@@ -1272,6 +1274,8 @@ def _claude_settings_payload(
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
         settings["modelOverrides"] = model_overrides
+    if fast_mode is not None:
+        settings["fastMode"] = fast_mode
     return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
@@ -3086,7 +3090,11 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
-        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        settings_payload = _claude_settings_payload(
+            api_key_helper,
+            model_overrides,
+            fast_mode=CLAUDE_FAST_MODE_SETTINGS.get(cfg.service_tier or ""),
+        )
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []

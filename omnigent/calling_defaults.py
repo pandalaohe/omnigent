@@ -23,8 +23,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import is_harness_availability
 from omnigent.session_default_modes import (
     PERMISSION_DEFAULT_VALUES,
-    SPEED_TIER_HARNESSES,
-    SPEED_TIER_VALUES,
+    valid_speed_tier,
 )
 from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness
 
@@ -205,7 +204,7 @@ def resolve_calling(
     ``effort`` keep the override as given.
 
     :param explicit: Request values keyed ``agent_id`` / ``harness_override``
-        / ``model_override`` / ``reasoning_effort``.
+        / ``model_override`` / ``reasoning_effort`` / ``speed``.
     :param explicit_fields: Request fields the caller actually supplied
         (``model_fields_set`` semantics).
     :param project_config: The project's opaque config, or ``None``.
@@ -254,14 +253,15 @@ def resolve_calling(
     effort, effort_source = _resolve_effort(
         explicit, explicit_fields, project_config, master, host_id, harness
     )
-    speed, speed_source = _resolve_harness_setting(
-        "speed",
-        project_config,
-        master,
-        host_id,
-        mode_harness,
-        SPEED_TIER_VALUES if mode_harness in SPEED_TIER_HARNESSES else frozenset(),
-    )
+    if "speed" in explicit_fields:
+        speed = _explicit(explicit.get("speed"))
+        if speed is not None and not valid_speed_tier(speed, mode_harness):
+            raise OmnigentError("invalid explicit speed for harness", code=ErrorCode.INVALID_INPUT)
+        speed_source = "explicit"
+    else:
+        speed, speed_source = _resolve_harness_setting(
+            "speed", project_config, master, host_id, mode_harness
+        )
     permission, permission_source = _resolve_harness_setting(
         "permission",
         project_config,
@@ -364,7 +364,10 @@ def _resolve_harness_setting(
         )
     for entry, source in entries:
         value = _setting(entry.get(field)) if entry is not None else None
-        if value is not None and (values is None or value in values):
+        if value is not None and (
+            (field == "speed" and valid_speed_tier(value, harness))
+            or (field != "speed" and (values is None or value in values))
+        ):
             return value, source
     return None, "none"
 
@@ -453,6 +456,7 @@ def check_offered(
     harness: str,
     model: str | None,
     effort: str | None,
+    speed: str | None = None,
     catalog: dict | None,
     sources: dict[str, str],
     host_id: str,
@@ -506,6 +510,39 @@ def check_offered(
                     "effort", effort, effort_source, harness, host_id, project_name, catalog
                 )
             )
+    speed_source = sources.get("speed", "none")
+    if speed is not None and speed_source not in _EXPLICIT_SOURCES:
+        if harness in {"codex", "codex-native"}:
+            row = next(
+                (
+                    row
+                    for row in rows
+                    if model is not None and (row.get("id") == model or row.get("model") == model)
+                ),
+                None,
+            )
+            if row is None and model is None:
+                row = next((row for row in rows if row.get("isDefault") is True), None)
+            if row is not None:
+                tiers = row.get("serviceTiers")
+                offered = {"standard"}
+                if isinstance(tiers, list):
+                    offered.update(
+                        tier["id"]
+                        for tier in tiers
+                        if isinstance(tier, Mapping) and isinstance(tier.get("id"), str)
+                    )
+                default_tier = row.get("defaultServiceTier")
+                if isinstance(default_tier, str) and valid_speed_tier(default_tier, harness):
+                    offered.add(default_tier)
+                if speed == "fast" and "priority" in offered:
+                    offered.add("fast")
+                if speed not in offered:
+                    problems.append(
+                        _offered_problem(
+                            "speed", speed, speed_source, harness, host_id, project_name, catalog
+                        )
+                    )
     return problems
 
 
@@ -606,6 +643,7 @@ def check_calling_defaults(
             harness=resolution.harness or "",
             model=resolution.model,
             effort=resolution.effort,
+            speed=resolution.speed,
             catalog=catalog,
             sources=sources,
             host_id=host_id,
@@ -687,18 +725,17 @@ def validate_project_calling_defaults(value: object) -> dict:
                     if not isinstance(effort, str) or effort not in EFFORT_VALUES:
                         raise _invalid(f"{base}.effort must be one of {sorted(EFFORT_VALUES)}")
                     clean_entry["effort"] = effort
-                for field, values in (
-                    (
-                        "speed",
-                        SPEED_TIER_VALUES if harness in SPEED_TIER_HARNESSES else frozenset(),
-                    ),
-                    ("permission", PERMISSION_DEFAULT_VALUES.get(harness, frozenset())),
-                ):
-                    if field in entry:
-                        value = entry[field]
-                        if not isinstance(value, str) or value not in values:
-                            raise _invalid(f"{base}.{field} must be one of {sorted(values)}")
-                        clean_entry[field] = value
+                if "speed" in entry:
+                    speed = entry["speed"]
+                    if not valid_speed_tier(speed, harness):
+                        raise _invalid(f"{base}.speed is not supported by {harness}")
+                    clean_entry["speed"] = speed
+                if "permission" in entry:
+                    permission = entry["permission"]
+                    values = PERMISSION_DEFAULT_VALUES.get(harness, frozenset())
+                    if not isinstance(permission, str) or permission not in values:
+                        raise _invalid(f"{base}.permission must be one of {sorted(values)}")
+                    clean_entry["permission"] = permission
                 clean_harnesses[harness] = clean_entry
             clean["harnesses"] = clean_harnesses
         validated[host_id] = clean

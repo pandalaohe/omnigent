@@ -19,11 +19,14 @@ import {
 } from "./callingDefaultsApi";
 import { readCallingLast, type CallingLastHostEntry } from "./callingDefaults";
 import { effortLevelsFor } from "./modelEffortOptions";
+import { reconcileSpeed } from "./speedTiers";
 
 export interface CallingSeedTouched {
   agent: boolean;
   model: boolean;
   effort: boolean;
+  speed?: boolean;
+  permission?: boolean;
 }
 
 /** The composer's current picks; "" means "no override". */
@@ -31,12 +34,17 @@ export interface CallingSeedCurrent {
   agentId: string | null;
   model: string;
   effort: string;
+  speed?: string;
+  permission?: string;
 }
 
 export interface CallingSeed {
   agentId: string | null;
+  harness: string | null;
   model: string | null;
   effort: string | null;
+  speed?: string | null;
+  permission?: string | null;
   problems: CallingDefaultsProblem[];
   notices: string[];
 }
@@ -48,6 +56,10 @@ export interface CallingSeedInput {
   hostLabel: string;
   current: CallingSeedCurrent;
   touched: CallingSeedTouched;
+  /** Plain New Chat keeps its remembered agent while resolving master defaults for it. */
+  preserveAgent?: boolean;
+  /** An explicit SDK brain chosen for this same Agent. */
+  harnessOverride?: string | null;
   /** Owner's carry-over switch; off = resolve only. */
   carryEnabled: boolean;
   /** Last-used entry for this project × host, when carry-over is on. */
@@ -122,7 +134,9 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
   const notices: string[] = [];
 
   let agentId: string | null;
-  if (touched.agent && current.agentId !== null) {
+  if (input.preserveAgent && current.agentId !== null) {
+    agentId = current.agentId;
+  } else if (touched.agent && current.agentId !== null) {
     if (input.isAgentUsable(current.agentId)) {
       agentId = current.agentId;
     } else {
@@ -144,8 +158,17 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
   }
 
   let resolution: CallingDefaultsResolution = base;
-  if (agentId !== null && agentId !== base.agent_id) {
-    resolution = await resolveCallingDefaults({ projectId, hostId, agentId });
+  const harnessOverride = agentId === current.agentId ? input.harnessOverride : null;
+  if (
+    agentId !== null &&
+    (agentId !== base.agent_id || (harnessOverride && harnessOverride !== base.harness))
+  ) {
+    resolution = await resolveCallingDefaults({
+      projectId,
+      hostId,
+      agentId,
+      ...(harnessOverride ? { harness: harnessOverride } : {}),
+    });
   }
   // The switch gates carry-over; a remembered entry is only a preference while
   // the toggle is on, even when it names the resolved default.
@@ -155,9 +178,18 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
       : undefined;
   const carryModel = carriedEntry?.model ?? null;
   const carryEffort = carriedEntry?.effort ?? null;
+  const carrySpeed = carriedEntry?.speed ?? null;
 
   let catalog: CallingDefaultsCatalogRow | undefined;
-  if (touched.model || touched.effort || carryModel !== null || carryEffort !== null) {
+  if (
+    touched.model ||
+    touched.effort ||
+    touched.speed ||
+    carryModel !== null ||
+    carryEffort !== null ||
+    carrySpeed !== null ||
+    (input.preserveAgent && (current.model !== "" || current.effort !== ""))
+  ) {
     let rows: CallingDefaultsCatalogRow[];
     try {
       rows = await listCallingDefaultCatalogs();
@@ -173,7 +205,7 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
 
   let model: string | null;
   let modelFromResolution = false;
-  if (touched.model) {
+  if (touched.model || (input.preserveAgent && current.model !== "")) {
     if (current.model === "" || isModelOffered(catalog, current.model)) {
       model = current.model === "" ? null : current.model;
     } else {
@@ -190,7 +222,7 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
 
   let effort: string | null;
   let effortFromResolution = false;
-  if (touched.effort) {
+  if (touched.effort || (input.preserveAgent && current.effort !== "")) {
     if (
       current.effort === "" ||
       isEffortOffered(catalog, resolution.harness, model, current.effort)
@@ -211,6 +243,29 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
     effortFromResolution = true;
   }
 
+  const speedRows = catalog?.models ?? [];
+  const offered = (candidate: string | null | undefined) =>
+    candidate == null || speedRows.length === 0
+      ? (candidate ?? null)
+      : reconcileSpeed(candidate, speedRows, model);
+  const speed = touched.speed
+    ? current.speed === ""
+      ? null
+      : (offered(current.speed) ?? offered(resolution.speed))
+    : (offered(carrySpeed) ?? offered(resolution.speed));
+  if (
+    touched.speed &&
+    current.speed &&
+    speed !== (current.speed === "priority" ? "fast" : current.speed)
+  ) {
+    notices.push(
+      `Speed "${current.speed}" is not available on ${hostLabel}; using ${quoted(speed)}.`,
+    );
+  }
+  const permission = touched.permission
+    ? current.permission || null
+    : (resolution.permission ?? null);
+
   const problems = (resolution.problems ?? []).filter(
     (problem) =>
       (problem.field !== "model" || modelFromResolution) &&
@@ -221,5 +276,14 @@ export async function resolveCallingSeed(input: CallingSeedInput): Promise<Calli
       !(problem.field === "agent" && (agentId?.startsWith("ca_") ?? false)),
   );
 
-  return { agentId, model, effort, problems, notices };
+  return {
+    agentId,
+    harness: resolution.harness,
+    model,
+    effort,
+    speed,
+    permission,
+    problems,
+    notices,
+  };
 }

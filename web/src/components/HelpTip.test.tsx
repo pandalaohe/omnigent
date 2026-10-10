@@ -9,6 +9,15 @@ afterEach(() => {
 });
 
 describe("HelpTip", () => {
+  it("shows the explanation on keyboard focus without moving focus", () => {
+    render(<HelpTip label="About the folder">Sessions open here.</HelpTip>);
+    const trigger = screen.getByRole("button", { name: "About the folder" });
+    act(() => trigger.focus());
+    expect(screen.getByText("Sessions open here.")).toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    fireEvent.keyDown(trigger, { key: "Escape", code: "Escape" });
+    expect(screen.queryByText("Sessions open here.")).not.toBeInTheDocument();
+  });
   it("shows the hint on click and hides it on Escape", async () => {
     render(<HelpTip label="About relay depth">Held until you release it.</HelpTip>);
 

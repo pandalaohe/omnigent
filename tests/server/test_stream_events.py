@@ -28,6 +28,7 @@ from omnigent.server.schemas import (
     ServerStreamEvent,
     SessionCreatedEvent,
     SessionModelOptionsEvent,
+    SessionSpeedTierEvent,
     SessionStatusEvent,
     is_known_event,
 )
@@ -299,6 +300,15 @@ def test_session_model_options_event_round_trips_through_union() -> None:
     # clients would never be told to refetch the cache-warmed snapshot.
     assert isinstance(parsed, SessionModelOptionsEvent)
     assert parsed.conversation_id == "conv_abc"
+
+
+def test_session_speed_tier_event_round_trips_through_union() -> None:
+    event = SessionSpeedTierEvent(
+        type="session.speed_tier", conversation_id="conv_abc", speed_tier="ultrafast"
+    )
+    parsed = _ADAPTER.validate_python(event.model_dump())
+    assert isinstance(parsed, SessionSpeedTierEvent)
+    assert parsed.speed_tier == "ultrafast"
 
 
 def test_session_created_event_basic_fields() -> None:

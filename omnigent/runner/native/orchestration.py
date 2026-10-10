@@ -92,6 +92,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.session_default_modes import CLAUDE_FAST_MODE_SETTINGS, SPEED_TIER_LABEL_KEY
 from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -1382,7 +1383,7 @@ async def _codex_native_launch_config(
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
-    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, SPEED_TIER_VALUES
+    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 
     bypass_sandbox = False
     service_tier = None
@@ -1397,7 +1398,7 @@ async def _codex_native_launch_config(
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
         speed = labels.get(SPEED_TIER_LABEL_KEY)
-        if isinstance(speed, str) and speed in SPEED_TIER_VALUES:
+        if valid_speed_tier(speed, "codex-native"):
             service_tier = speed
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
@@ -8187,6 +8188,7 @@ class _ClaudeSessionLaunchMetadata:
     """Persisted values consumed by Claude terminal launch."""
 
     reasoning_effort: str | None = None
+    speed_tier: str | None = None
     model_override: str | None = None
     terminal_launch_args: list[str] | None = None
     external_session_id: str | None = None
@@ -8232,6 +8234,7 @@ def _claude_launch_metadata_from_envelope(
         auto_harness=routing_class.auto_harness,
         turn_routing=routing_class.turn_routing,
         reasoning_effort=snapshot.reasoning_effort,
+        speed_tier=snapshot.labels.get(SPEED_TIER_LABEL_KEY),
         model_override=snapshot.model_override,
         terminal_launch_args=snapshot.terminal_launch_args,
         external_session_id=snapshot.external_session_id,
@@ -8275,6 +8278,7 @@ async def _load_legacy_claude_launch_metadata(
     external_session_id = snapshot.get("external_session_id")
     labels = snapshot.get("labels")
     labels = labels if isinstance(labels, dict) else {}
+    speed_tier = labels.get(SPEED_TIER_LABEL_KEY)
     fork_source = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
     cost_control_mode = snapshot.get("cost_control_mode_override")
     harness_override = snapshot.get("harness_override")
@@ -8288,6 +8292,7 @@ async def _load_legacy_claude_launch_metadata(
         auto_harness=routing_class.auto_harness,
         turn_routing=routing_class.turn_routing,
         reasoning_effort=effort if isinstance(effort, str) and effort else None,
+        speed_tier=speed_tier if isinstance(speed_tier, str) else None,
         model_override=(
             model_override if isinstance(model_override, str) and model_override else None
         ),
@@ -9130,6 +9135,7 @@ async def _auto_create_claude_terminal(
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
+        fast_mode=CLAUDE_FAST_MODE_SETTINGS.get(launch_metadata.speed_tier or ""),
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x

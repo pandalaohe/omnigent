@@ -7084,7 +7084,8 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
     ],
 )
 @pytest.mark.parametrize(
-    "service_tier,expected_tier", [(None, None), ("fast", "priority"), ("standard", "default")]
+    "service_tier,expected_tier",
+    [(None, None), ("fast", "priority"), ("standard", "default"), ("ultrafast", "ultrafast")],
 )
 async def test_codex_turn_start_applies_approval_mode(
     approval_mode: str | None,

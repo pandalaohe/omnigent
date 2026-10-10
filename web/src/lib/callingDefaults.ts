@@ -182,6 +182,7 @@ export interface CallingLastAgentEntry {
   harness: string;
   model?: string;
   effort?: string;
+  speed?: string;
   /** Unix epoch seconds when the entry was recorded. */
   at: number;
 }
@@ -200,7 +201,7 @@ export interface CallingLast {
 
 function sanitizeAgentEntry(value: unknown): CallingLastAgentEntry | null {
   if (!isRecord(value)) return null;
-  const { harness, model, effort, at } = value;
+  const { harness, model, effort, speed, at } = value;
   if (typeof harness !== "string" || !harness) return null;
   const entry: CallingLastAgentEntry = {
     harness,
@@ -208,6 +209,7 @@ function sanitizeAgentEntry(value: unknown): CallingLastAgentEntry | null {
   };
   if (typeof model === "string" && model && !isClearValue(model)) entry.model = model;
   if (typeof effort === "string" && effort && !isClearValue(effort)) entry.effort = effort;
+  if (typeof speed === "string" && speed && !isClearValue(speed)) entry.speed = speed;
   return entry;
 }
 
@@ -265,7 +267,7 @@ export function recordCallingLast(
   projectId: string,
   hostId: string,
   agentId: string,
-  value: { harness: string; model?: string | null; effort?: string | null },
+  value: { harness: string; model?: string | null; effort?: string | null; speed?: string | null },
 ): void {
   const harness = typeof value.harness === "string" ? value.harness.trim() : "";
   if (!projectId || !hostId || !agentId || !harness) return;
@@ -282,6 +284,9 @@ export function recordCallingLast(
   }
   if (typeof value.effort === "string" && value.effort && !isClearValue(value.effort)) {
     agentEntry.effort = value.effort;
+  }
+  if (typeof value.speed === "string" && value.speed && !isClearValue(value.speed)) {
+    agentEntry.speed = value.speed;
   }
   const nextHost: CallingLastHostEntry = {
     last_agent_id: agentId,

@@ -237,7 +237,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, SPEED_TIER_VALUES
+from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 from omnigent.spec.skill_sources import resolve_session_skills, session_skill_roots
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -3103,7 +3103,7 @@ def create_runner_app(
         if approval_mode := snapshot.labels.get(CODEX_SDK_APPROVAL_MODE_LABEL_KEY):
             _session_approval_mode[session_id] = approval_mode
         service_tier = snapshot.labels.get(SPEED_TIER_LABEL_KEY)
-        if isinstance(service_tier, str) and service_tier in SPEED_TIER_VALUES:
+        if isinstance(service_tier, str) and valid_speed_tier(service_tier, "codex"):
             _session_service_tier[session_id] = service_tier
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
         return _SessionInitContext(envelope=envelope)
@@ -7098,7 +7098,9 @@ def create_runner_app(
             harness_body["permission_mode"] = permission_mode
         if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
             harness_body["approval_mode"] = approval_mode
-        if harness_name == "codex" and (service_tier := _session_service_tier.get(conv)):
+        if harness_name in {"codex", "claude-sdk"} and (
+            service_tier := _session_service_tier.get(conv)
+        ):
             harness_body["service_tier"] = service_tier
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
@@ -8951,6 +8953,31 @@ def create_runner_app(
                     effort,
                 )
             return Response(status_code=204)
+
+        if body_type == "speed_tier_change":
+            from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
+
+            harness = _session_harness_name(conversation_id)
+            speed = body.get("speed_tier") if isinstance(body, dict) else None
+            if harness not in {"codex", "codex-native"}:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Live speed changes require a Codex session",
+                    },
+                )
+            if not isinstance(speed, str) or not valid_speed_tier(speed, harness):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "Unsupported speed tier"},
+                )
+            if harness == "codex-native":
+                return await _handle_codex_native_settings_update(
+                    conversation_id, {"serviceTier": codex_service_tier(speed)}
+                )
+            _session_service_tier[conversation_id] = speed
+            return JSONResponse(content={"speed_tier": speed})
 
         if body_type == "model_change":
             harness = _session_harness_name(conversation_id)

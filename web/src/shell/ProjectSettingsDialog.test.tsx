@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   createProject,
   deleteProjectEntry,
@@ -228,6 +229,67 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ProjectSettingsDialog", () => {
+  it("keeps inheritance when the account default refreshes during editing", async () => {
+    writeAlwaysUseWorktree(false);
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    act(() => writeAlwaysUseWorktree(true));
+    expect(screen.getByTestId("project-settings-worktree")).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+    writeAlwaysUseWorktree(false);
+  });
+
+  it("shows a Code-page configuration save failure visibly", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    updateMock.mockRejectedValue(new Error("Could not save settings"));
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Code" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not save settings");
+  });
+  it("saves a real project's entry before updating its default-host mirror", async () => {
+    hostsMock.mockReturnValue({ data: [SERVER] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
+    renderDialog();
+    const folder = await screen.findByTestId("project-settings-entry-path-h3");
+    fireEvent.change(folder, { target: { value: "/opt/work/omnigent/fork/wt" } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        host_id: "h3",
+        workspace: "/opt/work/omnigent/fork/wt",
+      }),
+    );
+    expect(putEntryMock).toHaveBeenCalledWith("p_1", "h3", "/opt/work/omnigent/fork/wt");
+    expect(putEntryMock.mock.invocationCallOrder[0]).toBeLessThan(
+      updateMock.mock.invocationCallOrder[0]!,
+    );
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed real-project entry save open without updating defaults", async () => {
+    hostsMock.mockReturnValue({ data: [SERVER] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
+    putEntryMock.mockRejectedValue(new Error("folder is not available"));
+    const onOpenChange = vi.fn();
+    renderDialog("p_1", onOpenChange);
+    const folder = await screen.findByTestId("project-settings-entry-path-h3");
+    fireEvent.change(folder, { target: { value: "/opt/work/omnigent/fork/wt" } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    expect(await screen.findByTestId("project-settings-entry-error-h3")).toHaveTextContent(
+      "folder is not available",
+    );
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
   it("seeds fields from the project's stored config", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
@@ -380,8 +442,7 @@ describe("ProjectSettingsDialog", () => {
         false,
       ),
     );
-    // The legacy config workspace shows as the row's folder, and Save mirrors
-    // it back — without writing an entry (folders belong to the Code tab).
+    // The legacy workspace is promoted to an entry and kept in the mirror.
     expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/repo");
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
@@ -391,7 +452,7 @@ describe("ProjectSettingsDialog", () => {
         agent_id: "ag_1",
       }),
     );
-    expect(putEntryMock).not.toHaveBeenCalled();
+    expect(putEntryMock).toHaveBeenCalledWith("p_1", "h1", "/repo");
     expect(deleteEntryMock).not.toHaveBeenCalled();
   });
 
@@ -424,15 +485,14 @@ describe("ProjectSettingsDialog", () => {
       expect(screen.getByTestId("project-settings-entry-h1")).toHaveTextContent("/legacy/repo"),
     );
     fireEvent.click(screen.getByTestId("project-settings-save"));
-    // No entry exists, so Save keeps the stored workspace instead of deleting
-    // it, and writes no entry (the Code tab owns folders).
+    // Save promotes the legacy workspace to the default host's entry.
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
         host_id: "h1",
         workspace: "/legacy/repo",
       }),
     );
-    expect(putEntryMock).not.toHaveBeenCalled();
+    expect(putEntryMock).toHaveBeenCalledWith("p_1", "h1", "/legacy/repo");
     expect(deleteEntryMock).not.toHaveBeenCalled();
   });
 
@@ -508,13 +568,12 @@ describe("ProjectSettingsDialog", () => {
       expect(screen.getByTestId("project-settings-entry-post-bind-h3")).toHaveTextContent(warning),
     );
 
-    // The parent re-renders with the promoted id, so `labelOnly` turns false.
-    // The retained warning must survive, and no Directory field may reappear.
+    // Promotion retains both the warning and the editable entry folder.
     rerenderProject("p_new");
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-entry-post-bind-h3")).toHaveTextContent(warning),
     );
-    expect(screen.queryByTestId("project-settings-entry-path-h3")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-entry-path-h3")).toBeInTheDocument();
     expect(screen.queryByTestId("project-settings-entry-browse-h3")).not.toBeInTheDocument();
   });
 
@@ -724,11 +783,7 @@ describe("ProjectSettingsDialog", () => {
 
     // The synced rows are applied once the field's hint leaves the empty /
     // refreshing states.
-    await waitFor(() =>
-      expect(
-        screen.getByText("Default model for new sessions with this agent"),
-      ).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeEnabled());
     resolveList([catalogRow("h1", "claude-native", [{ id: "opus", displayName: "Opus" }])]);
 
     fireEvent.click(screen.getByTestId("project-settings-model"));
@@ -764,11 +819,7 @@ describe("ProjectSettingsDialog", () => {
     listCatalogsMock.mockResolvedValue(catalogRows);
     syncCatalogsMock.mockResolvedValue(catalogRows);
     renderDialog();
-    await waitFor(() =>
-      expect(
-        screen.getByText("Default model for new sessions with this agent"),
-      ).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeEnabled());
 
     fireEvent.click(screen.getByTestId("project-settings-model"));
     await waitFor(() =>
@@ -807,9 +858,7 @@ describe("ProjectSettingsDialog", () => {
     });
     renderDialog();
     await waitFor(() =>
-      expect(
-        screen.getByText("Not offered by every host — pick another model or set it per host below"),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("not offered"),
     );
     expect(screen.getByTestId("project-settings-model")).toHaveTextContent(
       "opus (not offered by every host)",
@@ -832,11 +881,7 @@ describe("ProjectSettingsDialog", () => {
       config: { agent_id: "ag_claude", model: "opus" },
     });
     renderDialog();
-    await waitFor(() =>
-      expect(
-        screen.getByText("Default model for new sessions with this agent"),
-      ).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeEnabled());
     expect(screen.getByTestId("project-settings-model")).toHaveTextContent("opus");
     expect(screen.getByTestId("project-settings-model")).not.toHaveTextContent("not offered");
   });
@@ -856,11 +901,7 @@ describe("ProjectSettingsDialog", () => {
       config: { agent_id: "ag_claude", model: "claude-opus-5-5" },
     });
     renderDialog();
-    await waitFor(() =>
-      expect(
-        screen.getByText("Default model for new sessions with this agent"),
-      ).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("project-settings-model")).toBeEnabled());
     expect(screen.getByTestId("project-settings-model")).toHaveTextContent("claude-opus-5-5");
     expect(screen.getByTestId("project-settings-model")).not.toHaveTextContent("not offered");
   });
@@ -1001,6 +1042,7 @@ describe("ProjectSettingsDialog", () => {
         }),
     );
     renderDialog();
+    fireEvent.click(await screen.findByRole("button", { name: "About model" }));
     expect(await screen.findByText("Refreshing models…")).toBeInTheDocument();
 
     resolveSync([
@@ -1036,7 +1078,7 @@ describe("ProjectSettingsDialog", () => {
       "data-project-id",
       "p_1",
     );
-    expect(screen.queryByTestId("project-settings-save")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-save")).toBeInTheDocument();
   });
 
   it("hints the code repository's default branch for the base branch", async () => {
@@ -1067,12 +1109,42 @@ describe("ProjectSettingsDialog", () => {
     );
 
     fireEvent.click(screen.getByTestId("project-settings-worktree"));
-    expect(
-      await screen.findByText(
-        "Blank: the code repository's default branch (release), else the current branch.",
-      ),
-    ).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Code" }), { button: 0 });
+    fireEvent.click(screen.getByRole("button", { name: "About base branch" }));
+    expect(await screen.findByText(/default branch \(release\)/)).toBeInTheDocument();
   });
+
+  it.each(["pointer", "keyboard"] as const)(
+    "keeps the selected tab and visible panel aligned when switching to Code by %s",
+    async (input) => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+
+      const defaultsTab = screen.getByRole("tab", { name: "Session defaults" });
+      const codeTab = screen.getByRole("tab", { name: "Code" });
+      const defaultsPanel = document.getElementById(defaultsTab.getAttribute("aria-controls")!)!;
+      const codePanel = document.getElementById(codeTab.getAttribute("aria-controls")!)!;
+      expect(defaultsTab).toHaveAttribute("aria-selected", "true");
+      expect(codeTab).toHaveAttribute("aria-selected", "false");
+      expect(defaultsPanel).toBeVisible();
+      expect(codePanel).not.toBeVisible();
+
+      if (input === "pointer") {
+        fireEvent.mouseDown(codeTab, { button: 0, ctrlKey: false });
+      } else {
+        act(() => defaultsTab.focus());
+        fireEvent.keyDown(defaultsTab, { key: "ArrowRight" });
+        await waitFor(() => expect(codeTab).toHaveFocus());
+      }
+      expect(codeTab).toHaveAttribute("aria-selected", "true");
+      expect(defaultsTab).toHaveAttribute("aria-selected", "false");
+      expect(codeTab).toHaveAttribute("data-state", "active");
+      expect(defaultsTab).toHaveAttribute("data-state", "inactive");
+      expect(codePanel).toBeVisible();
+      expect(defaultsPanel).not.toBeVisible();
+    },
+  );
 
   it("connects each tab to its labelled panel", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
@@ -1099,8 +1171,8 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-worktree"));
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Code" }), { button: 0 });
     await waitFor(() => expect(screen.getByTestId("project-code-section")).toBeInTheDocument());
-    expect(screen.queryByTestId("project-settings-save")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-save")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Session defaults" }), { button: 0 });
     expect(screen.getByTestId("project-settings-save")).toBeInTheDocument();
     expect(screen.getByTestId("project-settings-worktree")).toHaveAttribute(
@@ -1275,6 +1347,13 @@ describe("ProjectSettingsDialog", () => {
   });
 
   it("saves speed and permission in the selected and other harness rows", async () => {
+    const codexRows = [
+      catalogRow("h1", "codex", [
+        { id: "gpt-a", isDefault: true, serviceTiers: [{ id: "priority", name: "Fast" }] },
+      ]),
+    ];
+    listCatalogsMock.mockResolvedValue(codexRows);
+    syncCatalogsMock.mockResolvedValue(codexRows);
     availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/project")]);
     getProjectMock.mockResolvedValue({
@@ -1286,7 +1365,8 @@ describe("ProjectSettingsDialog", () => {
             agent_id: "ag_codex_sdk",
             harnesses: {
               codex: { speed: "standard", permission: "read-only" },
-              "claude-native": { permission: "plan" },
+              "claude-native": { speed: "standard", permission: "plan" },
+              "claude-sdk": { speed: "fast" },
             },
           },
         },
@@ -1297,14 +1377,19 @@ describe("ProjectSettingsDialog", () => {
       "Standard",
     );
     expect(screen.getByTestId("project-settings-host-permission-h1")).toHaveTextContent(
-      "Read only",
+      "Read Only",
     );
     await pickOption("project-settings-host-speed-h1", "Fast");
     await pickOption("project-settings-host-permission-h1", "Approve for me");
     fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
     expect(
-      screen.queryByTestId("project-settings-host-other-speed-h1-claude-native"),
-    ).not.toBeInTheDocument();
+      screen.getByTestId("project-settings-host-other-speed-h1-claude-native"),
+    ).toHaveTextContent("Standard");
+    expect(screen.getByTestId("project-settings-host-other-speed-h1-claude-sdk")).toHaveTextContent(
+      "Fast",
+    );
+    await pickOption("project-settings-host-other-speed-h1-claude-native", "Fast");
+    await pickOption("project-settings-host-other-speed-h1-claude-sdk", "Standard");
     await pickOption("project-settings-host-other-permission-h1-claude-native", "Auto");
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
@@ -1314,7 +1399,8 @@ describe("ProjectSettingsDialog", () => {
             agent_id: "ag_codex_sdk",
             harnesses: {
               codex: { speed: "fast", permission: "approve-for-me" },
-              "claude-native": { permission: "auto" },
+              "claude-native": { speed: "fast", permission: "auto" },
+              "claude-sdk": { speed: "standard" },
             },
           },
         },
@@ -1345,7 +1431,13 @@ describe("ProjectSettingsDialog", () => {
       },
     });
     const catalogRows = [
-      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+      catalogRow("h1", "codex", [
+        {
+          id: "gpt-6-sol",
+          displayName: "GPT-6-Sol",
+          serviceTiers: [{ id: "priority", name: "Fast" }],
+        },
+      ]),
     ];
     listCatalogsMock.mockResolvedValue(catalogRows);
     // The dialog's open-time full sync replaces the listed rows, so it must
@@ -1495,8 +1587,8 @@ describe("ProjectSettingsDialog", () => {
         calling_defaults: { h1: { agent_id: "ag_claude" } },
       }),
     );
-    // The folder is the Code tab's to remove; this form only drops the set.
-    expect(deleteEntryMock).not.toHaveBeenCalled();
+    // Removing a host drops both its entry and its defaults.
+    expect(deleteEntryMock).toHaveBeenCalledWith("p_1", "h2");
     expect(putEntryMock).not.toHaveBeenCalled();
   });
 
@@ -1642,33 +1734,24 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("explains the real-project hosts list and points to the Code tab", async () => {
-    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+  it("leads a project without an entry to its selected host's folder", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
     renderDialog();
-
-    await screen.findByTestId("project-settings-directories-empty");
-    expect(screen.getByText("Agent, model and effort to use on each host.")).toBeInTheDocument();
-    expect(screen.getByTestId("project-settings-directories-empty")).toHaveTextContent(
-      "No host defaults yet. Folders are set in the Code tab.",
-    );
-    expect(screen.getByTestId("project-settings-add-host")).toHaveTextContent("Add host defaults");
-
-    const codeTab = screen.getByRole("tab", { name: "Code" });
-    expect(codeTab).toHaveAttribute("aria-selected", "false");
-    fireEvent.click(screen.getByTestId("project-settings-open-code-tab"));
-    expect(codeTab).toHaveAttribute("aria-selected", "true");
+    const detail = await screen.findByTestId("project-settings-host-detail-h1");
+    expect(detail.firstElementChild).toHaveTextContent("Entry folder");
+    expect(screen.getByTestId("project-settings-entry-browse-h1")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "About entry folder" }));
+    expect(screen.getByText(/Each host has its own path/)).toBeInTheDocument();
   });
 
-  it("keeps the directory wording for a label-only folder", async () => {
+  it("offers a host before creating a label-only project's entry", async () => {
     renderDialog(null);
-
-    expect(screen.getByText("Per-host directories and session defaults")).toBeInTheDocument();
     expect(screen.getByTestId("project-settings-directories-empty")).toHaveTextContent(
-      "No project directory yet",
+      "Select a host to set its entry folder",
     );
   });
 
-  it("omits the no-directory line for a real project row without a folder", async () => {
+  it("shows a missing entry in a real project row", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -1677,7 +1760,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
 
     await screen.findByTestId("project-settings-entry-h1");
-    expect(screen.queryByTestId("project-settings-host-path-h1")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-host-path-h1")).toHaveTextContent("No directory");
   });
 
   it("explains the all-hosts fallback in plain words", async () => {
@@ -1686,6 +1769,7 @@ describe("ProjectSettingsDialog", () => {
 
     await screen.findByTestId("project-settings-all-hosts");
     fireEvent.click(screen.getByTestId("project-settings-all-hosts"));
+    fireEvent.click(screen.getByRole("button", { name: "About all-host defaults" }));
     expect(screen.getByText("Used for hosts without their own defaults.")).toBeInTheDocument();
   });
 });

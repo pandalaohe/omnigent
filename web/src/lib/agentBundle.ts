@@ -33,6 +33,8 @@ export interface AgentBundleInput {
   model: string;
   /** Default reasoning effort under `executor:`, e.g. "high"; omitted when unset. */
   reasoningEffort?: string;
+  /** Optional service-tier preset for the lead member. */
+  speed?: string;
   /** MCP server declarations to include as inline tools entries. */
   mcpServers?: MCPServerInput[];
 }
@@ -61,6 +63,7 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   }
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
+  if (input.speed) lines.push(`    service_tier: ${yamlQuote(input.speed)}`);
   lines.push("");
 
   lines.push("tools:");

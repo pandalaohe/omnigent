@@ -35,6 +35,21 @@ const pickerAgentSchema = agentSchema.extend({
   display_name: z.string(),
   description: z.string().nullable(),
   skills: z.array(z.object({ name: z.string(), description: z.string() })),
+  members: z
+    .array(
+      z.object({
+        name: z.string(),
+        description: z.string().nullable(),
+        harness: z.string(),
+        model: z.string().nullable(),
+        reasoning_effort: z.string().nullable(),
+        speed: z.string().nullable().optional(),
+        lead: z.boolean(),
+        host_id: z.string().nullable().optional(),
+      }),
+    )
+    .nullable()
+    .optional(),
   builtin: z.boolean().optional(),
   acpHarness: z.boolean().optional(),
   // Agent-library template this session-derived row came from. Cached so a
@@ -52,6 +67,8 @@ const modelOptionSchema = z.object({
   supportedReasoningEfforts: z
     .array(z.object({ reasoningEffort: z.string(), description: z.string().optional() }))
     .optional(),
+  serviceTiers: z.array(z.object({ id: z.string(), name: z.string() })).optional(),
+  defaultServiceTier: z.string().nullable().optional(),
   source: z
     .object({
       kind: z.string(),

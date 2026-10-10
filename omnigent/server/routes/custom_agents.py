@@ -60,6 +60,7 @@ class AgentMember(BaseModel):
     harness: str = Field(min_length=1, max_length=128)
     model: str | None = Field(default=None, max_length=512)
     reasoning_effort: str | None = None
+    speed: str | None = None
     lead: bool
     host_id: str | None = Field(default=None, max_length=256)
 

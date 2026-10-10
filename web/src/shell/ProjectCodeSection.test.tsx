@@ -126,6 +126,7 @@ function okFacts(overrides: Partial<HostFolderFacts> = {}): HostFolderFacts {
     is_repo: true,
     toplevel: "/opt/work/omnigent/fork/web",
     branch: "main",
+    default_branch: "main",
     head: "abc1234def5678901234",
     detached: false,
     dirty: false,
@@ -195,6 +196,26 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ProjectCodeSection", () => {
+  it("offers a separate offline checkout only after choosing another folder", async () => {
+    hostsMock.data = hostsMock.data.map((host) => ({ ...host, status: "offline" }));
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent/fork/web")]);
+    getFactsMock.mockResolvedValue({ state: "offline" });
+    putBindingMock.mockResolvedValue(binding());
+    renderSection();
+    const choose = await screen.findByTestId("project-code-binding-browse-h1-web");
+    expect(screen.queryByTestId("project-code-binding-path-h1-web")).not.toBeInTheDocument();
+    fireEvent.click(choose);
+    const folder = screen.getByTestId("project-code-binding-path-h1-web");
+    fireEvent.change(folder, { target: { value: "/opt/work/omnigent/fork/other" } });
+    fireEvent.click(screen.getByTestId("project-code-binding-save-h1-web"));
+    await waitFor(() =>
+      expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "web", {
+        workspace: "/opt/work/omnigent/fork/other",
+        repository_name: "web",
+      }),
+    );
+  });
   it("moves the code mark with one role update", async () => {
     const web = repo();
     const api = repo({
@@ -238,13 +259,13 @@ describe("ProjectCodeSection", () => {
     await chooseFolder();
 
     await waitFor(() => expect(screen.getByTestId("project-code-add-name")).toHaveValue("web"));
-    expect(screen.getByTestId("project-code-add-branch")).toHaveValue("feature/code");
+    expect(screen.getByTestId("project-code-add-branch")).toHaveValue("main");
     fireEvent.click(screen.getByTestId("project-code-add-submit"));
 
     await waitFor(() => expect(putBindingMock).toHaveBeenCalled());
     expect(putRepoMock).toHaveBeenCalledWith("p_1", "web", {
       remote_url: "https://git.example.test/acme/web.git",
-      default_branch: "feature/code",
+      default_branch: "main",
       role: "code",
     });
     expect(putBindingMock).toHaveBeenCalledWith("p_1", "h1", "web", {
@@ -316,9 +337,6 @@ describe("ProjectCodeSection", () => {
     expect(screen.getByTestId("project-code-no-code-repo")).toHaveTextContent(
       "No code repository yet",
     );
-    expect(screen.getByTestId("project-code-no-code-repo")).toHaveTextContent(
-      "Mark one repository as Code we change; on hosts where it has a folder, new worktrees come from it and agents are told it is the code to change.",
-    );
 
     cleanup();
     getMock.mockResolvedValue(collaboration({ repositories: [repo({ role: "code" })] }));
@@ -327,26 +345,15 @@ describe("ProjectCodeSection", () => {
     expect(screen.queryByTestId("project-code-no-code-repo")).not.toBeInTheDocument();
   });
 
-  it("labels a project folder save as unchecked when the host is offline", async () => {
-    getMock.mockResolvedValue(collaboration());
-    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent")]);
-    putEntryMock.mockResolvedValue({
-      ...entry("h1", "/opt/work/omnigent/fork/wt"),
-      checked: false,
-    });
+  it("keeps entry folders read-only on the details page", async () => {
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent/fork/wt")]);
     renderSection();
-
-    await screen.findByTestId("project-code-entry-browse-h1");
-    fireEvent.click(screen.getByTestId("project-code-entry-browse-h1"));
-    fireEvent.click(screen.getByText("Choose folder"));
-
-    await waitFor(() =>
-      expect(putEntryMock).toHaveBeenCalledWith("p_1", "h1", "/opt/work/omnigent/fork/wt"),
-    );
-    await screen.findByTestId("project-code-unchecked-h1-project");
-    expect(screen.getByTestId("project-code-unchecked-h1-project")).toHaveTextContent(
-      "Saved without checking — host offline",
-    );
+    await screen.findByTestId("project-code-entry-h1");
+    expect(screen.queryByTestId("project-code-entry-browse-h1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-code-entry-path-h1")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "About the entry folder on Laptop" }));
+    expect(screen.getByText(/Set or change it on the Session defaults page/)).toBeInTheDocument();
+    expect(putEntryMock).not.toHaveBeenCalled();
   });
 
   it("marks a repository folder that equals the project folder", async () => {
@@ -356,7 +363,7 @@ describe("ProjectCodeSection", () => {
 
     await screen.findByTestId("project-code-binding-same-h1-web");
     expect(screen.getByTestId("project-code-binding-same-h1-web")).toHaveTextContent(
-      "Same as the project folder",
+      "Same as entry folder",
     );
   });
 
@@ -468,6 +475,7 @@ describe("ProjectCodeSection", () => {
     });
     renderSection();
 
+    fireEvent.click(await screen.findByRole("button", { name: "About session folders on Laptop" }));
     await screen.findByTestId("project-code-root-h1");
     expect(screen.getByTestId("project-code-root-h1")).toHaveTextContent(
       "New sessions open in: /opt/work/omnigent",
@@ -483,6 +491,11 @@ describe("ProjectCodeSection", () => {
     );
     expect(screen.queryByTestId("project-code-root-h2")).not.toBeInTheDocument();
 
+    fireEvent.keyDown(screen.getByTestId("project-code-root-h1"), {
+      key: "Escape",
+      code: "Escape",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "About session folders on Tower" }));
     await screen.findByTestId("project-code-root-h3");
     expect(screen.getByTestId("project-code-root-h3")).toHaveTextContent(
       "New sessions open in: /opt/work/omnigent/legacy (from the project's single-folder setting)",
@@ -519,16 +532,16 @@ describe("ProjectCodeSection", () => {
     renderSection();
 
     await screen.findByTestId("project-code-binding-facts-h1-web-setup");
-    expect(
-      screen.getByText(
-        "A command this host runs after a folder is saved (configured on the host).",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId("project-code-binding-facts-h1-web-setup")).toHaveTextContent(
+      "Configured on host",
+    );
     const outcome = screen.getByTestId("project-code-binding-facts-h1-web-setup-outcome");
     expect(outcome).toHaveTextContent("Last run: ok");
     expect(outcome).toHaveTextContent("2026-10-09 12:34 UTC");
     expect(screen.getByTestId("project-code-binding-facts-h1-web-run-again")).toBeInTheDocument();
-    expect(screen.queryByTestId("project-code-entry-facts-h1-setup")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-code-entry-facts-h1-setup")).toHaveTextContent(
+      "Not configured",
+    );
   });
 
   it("shows the agent preview with the delivered notes", async () => {
@@ -540,13 +553,14 @@ describe("ProjectCodeSection", () => {
     });
     renderSection();
 
+    fireEvent.click(await screen.findByRole("button", { name: "What agents receive on h1" }));
     await screen.findByTestId("project-code-agent-note-update-h1");
     expect(screen.getByTestId("project-code-agent-note-update-h1")).toHaveTextContent(
       "This host needs an update before agents receive this",
     );
-    expect(screen.getByTestId("project-code-agent-note-h1")).toHaveTextContent(
-      "This project's code on this host:",
-    );
+    expect(
+      screen.getByTestId("project-code-agent-note-update-h1").parentElement!,
+    ).toHaveTextContent("This project's code on this host:");
     expect(screen.getByText("OpenCode sessions do not receive this yet")).toBeInTheDocument();
 
     cleanup();
@@ -556,43 +570,25 @@ describe("ProjectCodeSection", () => {
       reason: "host_offline",
     });
     renderSection();
+    fireEvent.click(await screen.findByRole("button", { name: "What agents receive on h1" }));
     await screen.findByTestId("project-code-agent-note-offline-h1");
     expect(screen.getByTestId("project-code-agent-note-offline-h1")).toHaveTextContent(
       "Host offline — shown from saved settings",
     );
   });
 
-  it("opens one picker and retargets it after a project folder edit", async () => {
-    getMock.mockResolvedValue(collaboration());
-    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent")]);
-    putEntryMock.mockResolvedValue({
-      ...entry("h1", "/opt/work/omnigent/fork/wt"),
-      checked: true,
-    });
+  it("keeps one picker when moving from a repository binding to adding a repository", async () => {
+    getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
+    putBindingMock.mockResolvedValue(binding());
     renderSection();
-
-    await screen.findByTestId("project-code-entry-browse-h1");
-    fireEvent.click(screen.getByTestId("project-code-entry-browse-h1"));
+    fireEvent.click(await screen.findByTestId("project-code-binding-browse-h1-web"));
     expect(screen.getAllByText("Choose folder")).toHaveLength(1);
     fireEvent.click(screen.getByText("Choose folder"));
-    await waitFor(() =>
-      expect(putEntryMock).toHaveBeenCalledWith("p_1", "h1", "/opt/work/omnigent/fork/wt"),
-    );
-
+    await waitFor(() => expect(putBindingMock).toHaveBeenCalled());
     await openAddForm();
-    fireEvent.click(screen.getByTestId("project-code-add-browse"));
-    expect(screen.getAllByText("Choose folder")).toHaveLength(1);
-    fireEvent.click(screen.getByText("Choose folder"));
-
-    await waitFor(() =>
-      expect(screen.getByTestId("project-code-add-folder")).toHaveValue(
-        "/opt/work/omnigent/fork/wt",
-      ),
-    );
-    await waitFor(() =>
-      expect(getFactsMock).toHaveBeenCalledWith("h1", "/opt/work/omnigent/fork/wt"),
-    );
-    expect(putEntryMock).toHaveBeenCalledTimes(1);
+    await chooseFolder();
+    expect(screen.getByTestId("project-code-add-folder")).toHaveValue("/opt/work/omnigent/fork/wt");
+    expect(putEntryMock).not.toHaveBeenCalled();
   });
 
   it("edits a legacy binding under its own name while keeping its repository", async () => {
@@ -630,6 +626,8 @@ describe("ProjectCodeSection", () => {
     });
     fireEvent.click(screen.getByTestId("project-code-add-submit"));
 
+    fireEvent.change(screen.getByTestId("project-code-add-branch"), { target: { value: "main" } });
+    fireEvent.click(screen.getByTestId("project-code-add-submit"));
     expect(await screen.findByTestId("project-code-add-error")).toHaveTextContent(
       "A repository named web already exists",
     );
@@ -680,7 +678,8 @@ describe("ProjectCodeSection", () => {
       resolveSecond({
         state: "ok",
         facts: okFacts({
-          branch: "second",
+          branch: "feature/second",
+          default_branch: "second",
           remotes: [{ name: "origin", url: "https://git.example.test/acme/second.git" }],
         }),
       });
@@ -692,7 +691,8 @@ describe("ProjectCodeSection", () => {
       resolveFirst({
         state: "ok",
         facts: okFacts({
-          branch: "first",
+          branch: "feature/first",
+          default_branch: "first",
           remotes: [{ name: "origin", url: "https://git.example.test/acme/first.git" }],
         }),
       });
@@ -719,7 +719,8 @@ describe("ProjectCodeSection", () => {
     getFactsMock.mockResolvedValue({
       state: "ok",
       facts: okFacts({
-        branch: "release",
+        branch: "feature/settings",
+        default_branch: "release",
         remotes: [{ name: "upstream", url: "https://git.example.test/acme/tools.git" }],
       }),
     });
@@ -749,17 +750,8 @@ describe("ProjectCodeSection", () => {
     putBindingMock.mockResolvedValue(binding({ checked: false }));
     renderSection();
 
-    const entryInput = await screen.findByTestId("project-code-entry-path-h1");
-    expect(screen.getByTestId("project-code-entry-browse-h1")).toBeDisabled();
-    fireEvent.change(entryInput, { target: { value: "/opt/work/omnigent/new" } });
-    fireEvent.click(screen.getByTestId("project-code-entry-save-h1"));
-    await waitFor(() =>
-      expect(putEntryMock).toHaveBeenCalledWith("p_1", "h1", "/opt/work/omnigent/new"),
-    );
-    await screen.findByTestId("project-code-unchecked-h1-project");
-    expect(screen.getByTestId("project-code-unchecked-h1-project")).toHaveTextContent(
-      "Saved without checking — host offline",
-    );
+    await screen.findByTestId("project-code-entry-h1");
+    expect(screen.queryByTestId("project-code-entry-path-h1")).not.toBeInTheDocument();
 
     const bindingInput = screen.getByTestId("project-code-binding-path-h1-web");
     expect(screen.getByTestId("project-code-binding-browse-h1-web")).toBeDisabled();
@@ -933,11 +925,13 @@ describe("ProjectCodeSection", () => {
       facts:
         path === "/opt/work/first"
           ? okFacts({
-              branch: "first",
+              branch: "feature/first",
+              default_branch: "first",
               remotes: [{ name: "origin", url: "https://git.example.test/acme/first.git" }],
             })
           : okFacts({
-              branch: "second",
+              branch: "feature/second",
+              default_branch: "second",
               remotes: [{ name: "upstream", url: "https://git.example.test/acme/second.git" }],
             }),
     }));
@@ -957,47 +951,14 @@ describe("ProjectCodeSection", () => {
     expect(screen.getByTestId("project-code-add-branch")).toHaveValue("second");
   });
 
-  it("explains each code control with a true sentence", async () => {
+  it("keeps repository explanations behind keyboard-accessible help", async () => {
     getMock.mockResolvedValue(collaboration({ repositories: [repo()], bindings: [binding()] }));
-    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/omnigent")]);
-    getHostRootsMock.mockResolvedValue({
-      roots: [
-        {
-          host_id: "h1",
-          workspace: "/opt/work/omnigent",
-          source: "entry",
-          checkout: "/opt/work/omnigent/fork/web",
-        },
-      ],
-      default_host_id: "h1",
-      default_host_reason: "single_root",
-    });
     renderSection();
-
-    await screen.findByTestId("project-code-repo-web");
-    expect(screen.getByText(/The code this project works with/)).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Code we change: on hosts where it has a folder, new worktrees come from it and agents are told it is the code to change. Related code: on hosts where it has a folder, agents are told where it is, for reference.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("New worktrees branch from this when no base branch is given."),
-    ).toBeInTheDocument();
-    expect(screen.getByText("Where new sessions on this host start.")).toBeInTheDocument();
-    expect(
-      screen.getByText("Where this repository is checked out on this host."),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Sessions open in the project folder. If the project has no project folder on any host, sessions open in the code repository's folder. New worktrees come from the code repository's folder when this host has one.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Changes reach new sessions only. After a runner restart, resumed sessions receive the current repository information in their agent instructions.",
-      ),
-    ).toBeInTheDocument();
+    const trigger = await screen.findByRole("button", { name: "About the role of web" });
+    expect(screen.queryByText(/Code we change: on hosts/)).not.toBeInTheDocument();
+    act(() => trigger.focus());
+    expect(screen.getByText(/Code we change: on hosts/)).toBeInTheDocument();
+    expect(trigger).toHaveFocus();
   });
 
   it("says a related repository's default branch is unused", async () => {
@@ -1005,22 +966,23 @@ describe("ProjectCodeSection", () => {
     renderSection();
 
     await screen.findByTestId("project-code-repo-web");
+    fireEvent.click(screen.getByRole("button", { name: "About the default branch of web" }));
     expect(screen.getByText("Kept for reference; sessions do not use it.")).toBeInTheDocument();
   });
 
-  it("explains the add-form remote and name fields", async () => {
-    getMock.mockResolvedValue(collaboration());
+  it("requires an explicit main branch when the host cannot report one", async () => {
+    getFactsMock.mockResolvedValue({
+      state: "ok",
+      facts: okFacts({ branch: "feature/settings", default_branch: null }),
+    });
     renderSection();
-
     await openAddForm();
     await chooseFolder();
-    await screen.findByTestId("project-code-add-name");
-    expect(
-      screen.getByText("Which of the folder's remotes identifies this repository."),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("A short name for this repository (letters, digits, . _ -)."),
-    ).toBeInTheDocument();
+    const branch = await screen.findByTestId("project-code-add-branch");
+    expect(branch).toHaveValue("");
+    expect(screen.getByTestId("project-code-add-submit")).toBeDisabled();
+    fireEvent.change(branch, { target: { value: "trunk" } });
+    expect(screen.getByTestId("project-code-add-submit")).toBeEnabled();
   });
 
   it("shows a repository folder that equals the project folder only once", async () => {
@@ -1030,7 +992,7 @@ describe("ProjectCodeSection", () => {
 
     await screen.findByTestId("project-code-binding-same-h1-web");
     expect(screen.getByTestId("project-code-binding-same-h1-web")).toHaveTextContent(
-      "Same as the project folder",
+      "Same as entry folder",
     );
     expect(screen.getAllByText("/opt/work/omnigent/fork/web")).toHaveLength(1);
   });

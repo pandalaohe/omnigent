@@ -162,6 +162,22 @@ describe("createScheduledTask", () => {
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe("/home/me/repo");
   });
+
+  it("roundtrips an advertised speed override", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, speed: "ultrafast" }));
+    const created = await createScheduledTask({
+      name: "n",
+      prompt: "p",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      speed: "ultrafast",
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).speed).toBe("ultrafast");
+    expect(created.speed).toBe("ultrafast");
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, speed: null }));
+    await updateScheduledTask("st_1", { speed: null });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ speed: null });
+  });
 });
 
 describe("updateScheduledTask", () => {

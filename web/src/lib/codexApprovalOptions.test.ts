@@ -11,10 +11,11 @@ import {
 } from "@/lib/nativeHarnessModes";
 
 describe("codexCreateApprovalOptions", () => {
-  it("includes the bypass entry as the 4th create-time option", () => {
+  it("includes all four Codex presets and a separate launch-only bypass", () => {
     const values = codexCreateApprovalOptions().map((o) => o.value);
     expect(values).toEqual([
-      "default",
+      "ask-for-approval",
+      "approve-for-me",
       "full-access",
       "read-only",
       CODEX_NATIVE_BYPASS_APPROVAL_VALUE,

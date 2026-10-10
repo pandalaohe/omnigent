@@ -3,6 +3,7 @@ import {
   ChevronDownIcon,
   FolderIcon,
   GitForkIcon,
+  GaugeIcon,
   HandIcon,
   LaptopIcon,
   Loader2Icon,
@@ -25,6 +26,8 @@ import {
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
   useCollapsedWorkspaceLabels,
 } from "./ChatComposer";
+
+const NO_DISABLED_OPTIONS: readonly string[] = [];
 
 /**
  * The workspace tray docked above the composer card. A tray nests inside the
@@ -138,6 +141,7 @@ export function ComposerPermissionPicker({
   harness,
   selectedValue,
   options,
+  disabledOptions = NO_DISABLED_OPTIONS,
   disabled = false,
   iconOnly = false,
   loading = false,
@@ -150,6 +154,7 @@ export function ComposerPermissionPicker({
   harness?: string | null;
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
+  disabledOptions?: readonly string[];
   disabled?: boolean;
   /** Hide the visible value; it stays in the accessible name. */
   iconOnly?: boolean;
@@ -204,8 +209,67 @@ export function ComposerPermissionPicker({
               value={option.value}
               data-testid={`${testIdPrefix}-permission-option-${option.value}`}
               data-permission-concept={permissionModeConcept(harness, option.value)}
+              disabled={disabledOptions.includes(option.value)}
+              title={
+                disabledOptions.includes(option.value)
+                  ? "Start a new Read Only session to use this mode"
+                  : undefined
+              }
               className="whitespace-normal break-words"
             >
+              {option.label}
+              {disabledOptions.includes(option.value) && (
+                <span className="ml-1 text-xs text-muted-foreground">Start a new session</span>
+              )}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Compact tier picker; the same gauge identifies every advertised speed. */
+export function ComposerSpeedPicker({
+  value,
+  options,
+  onSelect,
+  disabled = false,
+  testIdPrefix = "composer",
+}: {
+  value: string;
+  options: readonly { value: string; label: string }[];
+  onSelect: (value: string) => void;
+  disabled?: boolean;
+  testIdPrefix?: string;
+}) {
+  const label = options.find((option) => option.value === value)?.label ?? "Standard";
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild disabled={disabled}>
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label={`Speed: ${label}`}
+          title={`Speed: ${label}`}
+          data-testid={`${testIdPrefix}-speed-trigger`}
+          className="flex h-8 min-w-0 items-center gap-1 rounded-lg px-2 text-foreground hover:bg-muted/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50 md:h-7"
+        >
+          <GaugeIcon className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="truncate text-ui">{label}</span>
+          <ChevronDownIcon className="size-3 shrink-0 opacity-60" aria-hidden="true" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" data-testid={`${testIdPrefix}-speed-menu`}>
+        <div className="px-2 py-1 text-xs text-muted-foreground">Speed</div>
+        <DropdownMenuRadioGroup value={value} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              data-testid={`${testIdPrefix}-speed-option-${option.value}`}
+            >
+              <GaugeIcon className="size-3.5" aria-hidden="true" />
               {option.label}
             </DropdownMenuRadioItem>
           ))}

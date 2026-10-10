@@ -114,6 +114,17 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "speed": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed"
           }
         },
         "required": [
@@ -6890,6 +6901,7 @@
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
+            "session.speed_tier": "#/components/schemas/SessionSpeedTierEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
@@ -6919,6 +6931,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionSpeedTierEvent"
           },
           {
             "$ref": "#/components/schemas/SessionCollaborationModeEvent"
@@ -9646,6 +9661,44 @@
         "title": "SessionSearchMatch",
         "type": "object"
       },
+      "SessionSpeedTierEvent": {
+        "description": "The effective speed of a running session after a confirmed change.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "speed_tier": {
+            "title": "Speed Tier",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.speed_tier",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "speed_tier"
+        ],
+        "title": "SessionSpeedTierEvent",
+        "type": "object"
+      },
       "SessionStatusEvent": {
         "description": "Session lifecycle status transition.\n\nEmitted by the runtime / session route handler at every\ntransition between `launching` / `running` / `waiting` /\n`idle` / `failed`. Wire shape is\nFLAT (not enveloped): `{\"type\": \"session.status\", \"conversation_id\": \"...\", \"status\": \"...\", \"sequence_number\": null}`.\n\nThe `waiting` value is emitted by the runtime's parent agent\nloop when it parks on the `async_work_complete` drain\n(`_drain_async_completions(block_for_one=True)` in\n`omnigent/runtime/workflow.py`) \u2014 i.e. while the parent\nturn is suspended waiting for background tools or sub-agents\nto complete. Per the session-rearchitecture spec \u00a73\n(\"Event types and direction\"), `waiting` is the\nsession-status companion of the spec's `turn.waiting`\ntransient \u2014 clients should render the session as actively\nblocked-on-async-work, distinct from `running`. When the\ndrain wakes (a child completed), the runtime emits a follow-up\n`running` to resume.",
         "properties": {
@@ -11173,6 +11226,17 @@
             "title": "Silent",
             "type": "boolean"
           },
+          "speed_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed Tier"
+          },
           "stop_when_idle": {
             "default": false,
             "description": "Only meaningful alongside `archived: true`. When `True` the archive teardown, after the undo window, also waits (bounded) until the session tree leaves the running state. The server also applies it on its own to any archive whose target has a parent or at least one child, so a whole tree finishes its admitted turns; the tool still sends it for the caller or an ancestor, whose turn would otherwise be cut. Default `False` keeps the timing of a parentless, childless archive.",
@@ -11488,7 +11552,8 @@
                 "worktree_location",
                 "runner_log_warnings",
                 "sidebar_layout",
-                "sound_alerts"
+                "sound_alerts",
+                "worktree_defaults"
               ]
             },
             "title": "Settings",
@@ -13556,6 +13621,26 @@
               "title": "Harness",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "auto",
+                    "force"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Refresh"
+            }
           }
         ],
         "responses": {
@@ -14164,6 +14249,7 @@
                         "sidebar_layout",
                         "sound_alerts",
                         "usage_context",
+                        "worktree_defaults",
                         "worktree_location"
                       ]
                     },
@@ -14247,7 +14333,8 @@
                 "worktree_location",
                 "runner_log_warnings",
                 "sidebar_layout",
-                "sound_alerts"
+                "sound_alerts",
+                "worktree_defaults"
               ],
               "title": "Namespace",
               "type": "string"
@@ -18250,6 +18337,76 @@
           }
         },
         "summary": "Get Session Member Worktree",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/model-options": {
+      "get": {
+        "operationId": "refresh_session_model_options_v1_sessions__session_id__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "auto",
+                    "force"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Refresh"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Refresh Session Model Options V1 Sessions  Session Id  Model Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Session Model Options",
         "tags": [
           "sessions"
         ]

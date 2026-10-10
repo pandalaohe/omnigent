@@ -34,6 +34,8 @@ import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { normalizeSdkPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
+import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { reconcileSpeed } from "@/lib/speedTiers";
 import { useHostModelOptions } from "@/hooks/useHosts";
 
 /** Sentinel Select value for "no permission override" (use the agent default).
@@ -45,11 +47,13 @@ export function ModelEffortFields({
   model,
   effort,
   permissionMode,
+  speed,
   harness,
   hostId,
   onModelChange,
   onEffortChange,
   onPermissionModeChange,
+  onSpeedChange,
   onSelectOpenChange,
 }: {
   /** Selected model id/alias, or "" = agent default (nothing overridden). */
@@ -58,12 +62,14 @@ export function ModelEffortFields({
   effort: string;
   /** Selected permission mode, or "" = agent default (nothing overridden). */
   permissionMode: string;
-  harness: "claude-native" | "claude-sdk" | "codex";
+  speed: string;
+  harness: "claude-native" | "claude-sdk" | "codex" | "codex-native";
   /** Pinned host id, or "" when unset (task resolves a host at fire time). */
   hostId: string;
   onModelChange: (model: string) => void;
   onEffortChange: (effort: string) => void;
   onPermissionModeChange: (mode: string) => void;
+  onSpeedChange: (speed: string) => void;
   /** Forwarded to each Select's onOpenChange so the parent Dialog can keep an
    * open dropdown from dismissing the whole modal. */
   onSelectOpenChange?: (open: boolean) => void;
@@ -82,7 +88,7 @@ export function ModelEffortFields({
   const modelOptions =
     rows.length > 0
       ? rows.map((o) => ({ id: o.id, label: o.displayName ?? o.id }))
-      : harness === "codex"
+      : harness === "codex" || harness === "codex-native"
         ? []
         : CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }));
   if (model !== "" && !modelOptions.some((option) => option.id === model)) {
@@ -90,7 +96,7 @@ export function ModelEffortFields({
   }
   const levels = effortLevelsFor(harness, rows, model);
   const effortOptions =
-    harness === "codex"
+    harness === "codex" || harness === "codex-native"
       ? (levels ?? []).map((value) => ({ value, label: normalizeEffortLabel(value) }))
       : levels === null
         ? [...CLAUDE_NATIVE_EFFORTS]
@@ -101,7 +107,10 @@ export function ModelEffortFields({
   const permissionOptions =
     harness === "claude-native"
       ? CLAUDE_NATIVE_PERMISSION_MODES
-      : (sdkPermissionOptions(harness) ?? []);
+      : harness === "codex-native"
+        ? (sdkPermissionOptions("codex") ?? [])
+        : (sdkPermissionOptions(harness) ?? []);
+  const speedOptions = sessionDefaultModeOptions(harness, "speed", rows, model);
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
@@ -115,7 +124,10 @@ export function ModelEffortFields({
             onValueChange={(v) => {
               const nextModel = v === MODEL_SELECT_DEFAULT ? "" : v;
               onModelChange(nextModel);
-              if (harness === "codex" && effort !== "") {
+              if (speed && (harness === "codex" || harness === "codex-native")) {
+                onSpeedChange(reconcileSpeed(speed, rows, nextModel) ?? "");
+              }
+              if ((harness === "codex" || harness === "codex-native") && effort !== "") {
                 onEffortChange(
                   reconcileEffortOnModelChange(harness, rows, nextModel, effort) ?? "",
                 );
@@ -168,6 +180,38 @@ export function ModelEffortFields({
           </Select>
         </div>
       </div>
+
+      {speedOptions.length > 0 && (
+        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-speed-control">
+          <Label htmlFor="task-speed">Speed</Label>
+          <Select
+            value={speed || EFFORT_SELECT_NONE}
+            onValueChange={(value) => onSpeedChange(value === EFFORT_SELECT_NONE ? "" : value)}
+            onOpenChange={onSelectOpenChange}
+          >
+            <SelectTrigger id="task-speed" data-testid="task-speed-trigger" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent
+              position="popper"
+              align="start"
+              className="w-(--radix-select-trigger-width)"
+            >
+              <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+              {speed && !speedOptions.some((option) => option.value === speed) && (
+                <SelectItem value={speed} disabled>
+                  Unavailable ({speed})
+                </SelectItem>
+              )}
+              {speedOptions.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
 
       <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
         <Label htmlFor="task-permission">Permission mode</Label>

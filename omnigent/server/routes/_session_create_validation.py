@@ -21,6 +21,7 @@ from omnigent.calling_defaults import (
     load_master,
     resolve_calling,
 )
+from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.entities.project import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
@@ -38,6 +39,7 @@ from omnigent.server.project_placement import (
     root_on_host,
 )
 from omnigent.server.routes._auth_helpers import require_access
+from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore, host_is_live
@@ -352,12 +354,17 @@ async def resolve_project_session_create(
     speed = permission = None
     if apply_calling_defaults:
         calling_host_id = updates.get("host_id", getattr(body, "host_id", None)) or parent_host_id
+        explicit = body.model_dump()
+        labels = getattr(body, "labels", None)
+        if isinstance(labels, dict) and SPEED_TIER_LABEL_KEY in labels:
+            explicit["speed"] = labels[SPEED_TIER_LABEL_KEY]
+            explicit_fields.add("speed")
         resolution = await resolve_create_calling(
             request=request,
             user_id=user_id,
             project=project if project is not None else parent_project,
             host_id=calling_host_id,
-            explicit=body.model_dump(),
+            explicit=explicit,
             explicit_fields=explicit_fields,
             path_label=calling_path_label,
             parent_session_id=getattr(body, "parent_session_id", None),
@@ -520,6 +527,8 @@ def validate_permission_mode_harness_support(
     modes = (
         CODEX_SDK_APPROVAL_MODES
         if harness == "codex"
+        else CODEX_NATIVE_PERMISSION_VALUES
+        if harness == "codex-native"
         else CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
         if harness in ("claude-native", "claude-sdk")
         else frozenset()

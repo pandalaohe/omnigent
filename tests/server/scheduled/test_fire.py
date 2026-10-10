@@ -652,6 +652,33 @@ async def test_permission_mode_becomes_terminal_launch_args() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("permission_mode", "expected_args"),
+    [
+        ("approve-for-me", ["--approve-for-me"]),
+        ("read-only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]),
+    ],
+)
+async def test_codex_native_permission_mode_becomes_terminal_launch_args(
+    permission_mode: str, expected_args: list[str]
+) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=permission_mode)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness="codex-native"),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["terminal_launch_args"] == expected_args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("harness", "permission_mode", "label_key"),
     [
         ("claude-sdk", "bypassPermissions", "omnigent.claude_sdk.permission_mode"),
@@ -686,6 +713,28 @@ async def test_sdk_permission_mode_stamped_on_fired_session(
     assert conv_store.label_writes["conv_1"][label_key] == permission_mode
     assert conv_store.updated[0]["model_override"] == "model-one"
     assert conv_store.updated[0]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness,speed",
+    [("codex", "ultrafast"), ("codex-native", "fast"), ("claude-sdk", "fast")],
+)
+async def test_scheduled_speed_reaches_fired_session_label(harness: str, speed: str) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(speed=speed)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness=harness),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.label_writes["conv_1"]["omnigent.speed_tier"] == speed
 
 
 @pytest.mark.asyncio
@@ -886,6 +935,51 @@ async def test_fire_uses_the_tasks_project_defaults() -> None:
 
     assert conv_store.updated[0]["model_override"] == "gpt-6-sol"
     assert conv_store.updated[0]["reasoning_effort"] == "high"
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("speed", "explicit_null_fields", "expected_speed"),
+    [("standard", (), "standard"), (None, ("speed",), None)],
+)
+async def test_fire_explicit_speed_wins_over_inherited_fast(
+    speed: str | None,
+    explicit_null_fields: tuple[str, ...],
+    expected_speed: str | None,
+) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                user_id="alice@example.com",
+                project_id="proj_1",
+                speed=speed,
+                explicit_null_fields=explicit_null_fields,
+            )
+        }
+    )
+    deps = _chain_deps(
+        store,
+        conv_store,
+        harness="codex",
+        project_store=_project(
+            {"calling_defaults": {"host_1": {"harnesses": {"codex": {"speed": "fast"}}}}}
+        ),
+        catalog_store=FakeCatalogStore(
+            [_catalog_row("codex", [{"id": "gpt-6-sol", "isDefault": True}])]
+        ),
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    labels = conv_store.label_writes.get("conv_1", {})
+    assert labels.get("omnigent.speed_tier") == expected_speed
     assert store.runs[0]["status"] == "running"
 
 

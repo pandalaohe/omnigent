@@ -334,6 +334,36 @@ async def test_fire_launches_session_scoped_agent_from_saved_bundle(
     assert [run.status for run in runs] == ["running"]
 
 
+@pytest.mark.parametrize(
+    ("permission_mode", "expected_args"),
+    [
+        ("approve-for-me", ["--approve-for-me"]),
+        ("read-only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]),
+    ],
+)
+async def test_codex_native_library_fire_applies_permission_args(
+    client: httpx.AsyncClient,
+    library_server: _LibraryServer,
+    permission_mode: str,
+    expected_args: list[str],
+) -> None:
+    agent_id = await _create_agent(client, harness="codex-native")
+    task_id = await _create_library_task(client, agent_id, permission_mode=permission_mode)
+    dispatched: list[Any] = []
+
+    async def _dispatch(conv: Any, task: Any) -> None:
+        dispatched.append(conv)
+
+    on_fire = build_on_fire(_fire_deps(library_server), launch_dispatch=_dispatch)
+    await on_fire(0, task_id)
+    await _drain()
+
+    assert len(dispatched) == 1
+    session = library_server.conversations.get_conversation(dispatched[0].id)
+    assert session is not None
+    assert session.terminal_launch_args == expected_args
+
+
 async def test_fire_writes_member_snapshot_labels(
     client: httpx.AsyncClient, library_server: _LibraryServer
 ) -> None:

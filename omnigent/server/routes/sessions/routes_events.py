@@ -151,6 +151,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_SESSION_TITLE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
+    _EXTERNAL_SPEED_TIER_CHANGE_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
@@ -227,6 +228,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_mcp_startup,
     _publish_policy_deny,
     _publish_session_superseded,
+    _publish_speed_tier,
     _publish_status,
     _query_host_runner_status,
     _remove_session_worktree_best_effort,
@@ -1636,6 +1638,7 @@ def register_events_routes(
             _EXTERNAL_MODEL_OPTIONS_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+            _EXTERNAL_SPEED_TIER_CHANGE_TYPE,
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_GOAL_STATE_TYPE,
@@ -3113,6 +3116,29 @@ def register_events_routes(
                 body,
                 conversation_store,
             )
+            return {"queued": False}
+        if body.type == _EXTERNAL_SPEED_TIER_CHANGE_TYPE:
+            from omnigent.server.routes._sessions.common import (
+                _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+                _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            )
+            from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
+
+            speed = body.data.get("speed_tier") if isinstance(body.data, dict) else None
+            if not isinstance(speed, str) or not valid_speed_tier(speed, "codex-native"):
+                raise OmnigentError("invalid native speed tier", code=ErrorCode.INVALID_INPUT)
+            if (
+                conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            ):
+                raise OmnigentError(
+                    "speed event requires Codex native", code=ErrorCode.INVALID_INPUT
+                )
+            if conv.labels.get(SPEED_TIER_LABEL_KEY) != speed:
+                await asyncio.to_thread(
+                    conversation_store.set_labels, session_id, {SPEED_TIER_LABEL_KEY: speed}
+                )
+                _publish_speed_tier(session_id, speed)
             return {"queued": False}
         if body.type == _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE:
             await _persist_external_codex_collaboration_mode_change(

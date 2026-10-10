@@ -95,6 +95,17 @@ def test_explicit_none_is_kept() -> None:
     assert result.model == "gpt-6-sol"
 
 
+@pytest.mark.parametrize("speed", ["standard", None])
+def test_explicit_speed_wins_over_project_default(speed: str | None) -> None:
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk", "speed": speed},
+        explicit_fields={"agent_id", "speed"},
+        project_config={"calling_defaults": {"HDS": {"harnesses": {"codex": {"speed": "fast"}}}}},
+    )
+    assert result.speed == speed
+    assert result.sources["speed"] == "explicit"
+
+
 def test_sdk_harness_inherits_master_native() -> None:
     """Scenario 5: an unset SDK harness falls back to its native sibling."""
     master = {"HDS": {"codex-native": {"model": "gpt-6-astra", "effort": "medium"}}}
@@ -317,6 +328,27 @@ def test_check_offered_names_the_master_table() -> None:
     assert "from project 'P' All hosts row is not offered by host 'HDS'" in legacy["message"]
 
 
+def test_check_offered_speed_uses_selected_or_default_model_tiers() -> None:
+    rows = [
+        {
+            "id": "gpt-6-sol",
+            "isDefault": True,
+            "serviceTiers": [{"id": "priority", "name": "Fast"}],
+        },
+        {"id": "gpt-6-luna", "serviceTiers": [{"id": "ultrafast", "name": "Ultrafast"}]},
+    ]
+    base = {
+        "harness": "codex",
+        "effort": None,
+        "catalog": _catalog(rows),
+        "sources": {"model": "none", "effort": "none", "speed": "master"},
+        "host_id": "HDS",
+    }
+    assert check_offered(model=None, speed="fast", **base) == []
+    assert [p["field"] for p in check_offered(model=None, speed="ultrafast", **base)] == ["speed"]
+    assert check_offered(model="gpt-6-luna", speed="ultrafast", **base) == []
+
+
 def test_check_offered_flags_an_unoffered_default_effort() -> None:
     """Scenario 12: an effort the matching model row omits is refused."""
     problems = check_offered(
@@ -494,8 +526,8 @@ async def test_load_master_reads_the_namespace_and_defaults_on_gaps(db_uri: str)
     "layer", ["project_host", "master", "project_host_native", "master_native"]
 )
 def test_session_modes_follow_harness_chain(field: str, value: str, layer: str) -> None:
-    project_harnesses = {"codex": {field: "invalid"}, "codex-native": {field: "invalid"}}
-    master_harnesses = {"codex": {field: "invalid"}, "codex-native": {field: "invalid"}}
+    project_harnesses = {"codex": {field: "invalid!"}, "codex-native": {field: "invalid!"}}
+    master_harnesses = {"codex": {field: "invalid!"}, "codex-native": {field: "invalid!"}}
     harness = "codex-native" if layer.endswith("native") else "codex"
     target = project_harnesses if layer.startswith("project") else master_harnesses
     target[harness][field] = value
@@ -529,7 +561,8 @@ def test_session_modes_resolve_independently_and_filter_harness_vocabulary() -> 
             }
         },
     )
-    assert result.speed is None
+    assert result.speed == "fast"
+    assert result.sources["speed"] == "master"
     assert result.permission == "plan"
     assert result.sources["permission"] == "master_native"
 
@@ -576,7 +609,11 @@ def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
     "harness,field,value",
     [
         ("codex", "speed", "fast"),
+        ("codex", "speed", "ultrafast"),
+        ("codex-native", "speed", "priority"),
         ("codex-native", "speed", "standard"),
+        ("claude-native", "speed", "fast"),
+        ("claude-sdk", "speed", "standard"),
         *[
             (harness, "permission", value)
             for harness, values in {
@@ -597,8 +634,8 @@ def test_validate_session_default_modes(harness: str, field: str, value: str) ->
 @pytest.mark.parametrize(
     "harness,field,value",
     [
-        ("codex", "speed", "priority"),
-        ("claude-native", "speed", "fast"),
+        ("codex", "speed", "priority;bad"),
+        ("claude-native", "speed", "priority"),
         ("pi-native", "permission", "plan"),
         ("codex", "permission", "plan"),
         ("claude-sdk", "permission", "read-only"),

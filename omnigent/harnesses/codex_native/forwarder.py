@@ -123,6 +123,7 @@ _DELTA_FLUSH_GRACE_SECONDS = 1.0
 # above the delta POST deadline.
 _DELTA_MARKER_TIMEOUT_SECONDS = 6.0
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+_EXTERNAL_SPEED_TIER_CHANGE_TYPE = "external_speed_tier_change"
 # Context-compaction progress edge. Publishes the same
 # ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
 # the AP-side compaction path emits, so the web UI shows its "Compacting
@@ -741,6 +742,9 @@ class _CodexForwarderState:
     effort: str | None = None
     posted_effort: str | None = None
     posted_effort_known: bool = False
+    service_tier: str | None = None
+    service_tier_known: bool = False
+    posted_service_tier: str | None = None
     # The config.toml effort as of the last _refresh_effort_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
     last_config_effort: str | None = None
@@ -833,6 +837,7 @@ class _CodexForwarderState:
         if not isinstance(result, dict):
             return
         self._note_model_fields(result)
+        self._note_service_tier(result)
         self._note_approval_mode_fields(result)
         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
         # ACTUAL model — including the spawn default — because the cost-budget
@@ -858,6 +863,7 @@ class _CodexForwarderState:
             self._note_model_fields(settings)
             self._note_developer_instructions_fields(settings)
             self._note_effort_fields(settings)
+            self._note_service_tier(settings)
             self._note_collaboration_mode_fields(settings)
             self._note_approval_mode_fields(settings)
             # Live thread settings are the running process's truth: remember
@@ -867,6 +873,16 @@ class _CodexForwarderState:
             model = settings.get("model")
             if isinstance(model, str) and model:
                 self.settings_model = model
+
+    def _note_service_tier(self, settings: _JsonObject) -> None:
+        if "serviceTier" not in settings:
+            return
+        tier = settings["serviceTier"]
+        if tier is None:
+            self.service_tier = "standard"
+        elif isinstance(tier, str):
+            self.service_tier = {"default": "standard", "priority": "fast"}.get(tier, tier)
+        self.service_tier_known = self.service_tier is not None
 
     def record_completed_plan(self, params: _JsonObject) -> None:
         """
@@ -3123,6 +3139,9 @@ async def _subscribe_until_ready_inner(
             await _sync_model_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
+            await _sync_service_tier_change(
+                ap_client, session_id=session_id, forwarder_state=forwarder_state
+            )
             # A fresh thread's subscription completes only once its first turn
             # starts, so that turn's ``turn/started`` is missed: mirror the
             # config.toml effort here too (an in-TUI ``/model`` effort change
@@ -4213,6 +4232,28 @@ async def _sync_reasoning_effort_change(
         forwarder_state.posted_effort_known = True
 
 
+async def _sync_service_tier_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    if not forwarder_state.service_tier_known:
+        return
+    tier = forwarder_state.service_tier
+    if tier is None or tier == forwarder_state.posted_service_tier:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_SPEED_TIER_CHANGE_TYPE,
+        data={"speed_tier": tier},
+    )
+    _log_failed_session_event_post(_EXTERNAL_SPEED_TIER_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_service_tier = tier
+
+
 async def _sync_codex_collaboration_mode_change(
     client: httpx.AsyncClient,
     *,
@@ -4498,6 +4539,9 @@ async def _maybe_handle_turn_event(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
             await _sync_reasoning_effort_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_service_tier_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
             await _sync_codex_collaboration_mode_change(

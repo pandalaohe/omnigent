@@ -441,6 +441,8 @@ export interface HostFolderFacts {
   toplevel: string | null;
   /** Checked-out branch, or `null` when detached or unborn. */
   branch: string | null;
+  /** Locally recorded remote default branch, then main/master; absent on older hosts. */
+  default_branch?: string | null;
   /** Full HEAD commit sha, or `null` when unresolvable. */
   head: string | null;
   detached: boolean;

@@ -46,6 +46,11 @@ const CATALOG_ROWS = [
       {
         id: "gpt-6-astra",
         displayName: "GPT-6-Astra",
+        isDefault: true,
+        serviceTiers: [
+          { id: "priority", name: "Fast" },
+          { id: "ultrafast", name: "Ultrafast" },
+        ],
         supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }],
       },
     ],
@@ -125,7 +130,7 @@ describe("CallingDefaultsSection", () => {
     await pickOption("calling-defaults-speed-codex-native", "Default");
     await pickOption("calling-defaults-permission-codex-native", "Default");
     expect(readMaster()["host-a"]["codex-native"]).toEqual({});
-    expect(screen.queryByTestId("calling-defaults-speed-claude-native")).not.toBeInTheDocument();
+    expect(screen.getByTestId("calling-defaults-speed-claude-native")).toHaveTextContent("Default");
     await pickOption("calling-defaults-permission-claude-native", "Accept edits");
     expect(readMaster()["host-a"]["claude-native"]).toEqual({ permission: "acceptEdits" });
     expect(screen.queryByTestId("calling-defaults-permission-pi-native")).not.toBeInTheDocument();
@@ -150,6 +155,26 @@ describe("CallingDefaultsSection", () => {
     expect(screen.getByTestId("calling-defaults-follows-codex")).toBeInTheDocument();
     expect(readMaster()).toEqual({ "host-a": {} });
   });
+
+  it.each(["claude-native", "claude-sdk"])(
+    "reads and saves %s speed with focused help",
+    async (harness) => {
+      localStorage.setItem(
+        DEFAULTS_KEY,
+        JSON.stringify({ "host-a": { [harness]: { speed: "fast" } } }),
+      );
+      render(<CallingDefaultsSection />);
+      expect(screen.getByTestId(`calling-defaults-speed-${harness}`)).toHaveTextContent("Fast");
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+      fireEvent.focus(screen.getByRole("button", { name: "About Claude fast mode" }));
+      expect(await screen.findByRole("tooltip")).toHaveTextContent("usage credits");
+      fireEvent.blur(screen.getByRole("button", { name: "About Claude fast mode" }));
+      await pickOption(`calling-defaults-speed-${harness}`, "Standard");
+      expect(readMaster()["host-a"][harness]).toEqual({ speed: "standard" });
+      await pickOption(`calling-defaults-speed-${harness}`, "Default");
+      expect(readMaster()["host-a"][harness]).toEqual({});
+    },
+  );
 
   it("starts carry-over off and writes enabled when toggled", async () => {
     render(<CallingDefaultsSection />);

@@ -309,17 +309,24 @@ def test_code_tab_repository_and_project_folder(
     page.get_by_test_id("project-code-add-by-address").click()
     page.get_by_test_id("project-code-add-url").fill(_REPO_URL)
     page.get_by_test_id("project-code-add-name").fill("web")
+    page.get_by_test_id("project-code-add-branch").fill("main")
     page.get_by_test_id("project-code-add-submit").click()
     expect(page.get_by_test_id("project-code-repo-remove-web")).to_be_visible()
 
-    # Give the stubbed host a card, then set its project folder through the
-    # shared browser.
-    page.get_by_test_id("project-code-add-host-picker").select_option(_HOST_ID)
-    page.get_by_test_id(f"project-code-entry-browse-{_HOST_ID}").click()
+    # Set the entry first on Session defaults, then save its draft.
+    page.get_by_role("tab", name="Session defaults", exact=True).click()
+    page.get_by_test_id("project-settings-host").click()
+    page.get_by_role("option", name="e2e-host", exact=True).click()
+    page.get_by_test_id(f"project-settings-entry-browse-{_HOST_ID}").click()
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible()
     picker.get_by_test_id("workspace-picker-entry-wt").click()
     picker.get_by_test_id("workspace-picker-select").click()
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    _open_project_settings(page, project)
+    page.get_by_role("tab", name="Code", exact=True).click()
+    page.get_by_role("button", name="About session folders on e2e-host", exact=True).click()
 
     # The saved entry makes host-roots name where new sessions open and what
     # new worktrees fork from.

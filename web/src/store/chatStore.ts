@@ -1378,6 +1378,11 @@ export interface ChatState extends ConversationState, AppChatState, ChatActions 
 
 let queryClient: QueryClient | null = null;
 
+/** Shared session cache already initialized by the chat store at app startup. */
+export function chatQueryClient(): QueryClient | null {
+  return queryClient;
+}
+
 // Any semantic stream event makes a snapshot already in flight potentially
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
@@ -7467,6 +7472,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         codexApprovalMode: event.approvalMode,
       });
       return;
+    case "session_speed_tier": {
+      const speed =
+        event.speedTier === "priority"
+          ? "fast"
+          : event.speedTier === "default"
+            ? "standard"
+            : event.speedTier;
+      queryClient?.setQueryData<Session>(["session", event.conversationId], (session) =>
+        session
+          ? { ...session, labels: { ...(session.labels ?? {}), "omnigent.speed_tier": speed } }
+          : session,
+      );
+      return;
+    }
     case "session_presence":
       // Full-state replacement — every presence event carries the
       // complete viewer list, so there is no join/leave ordering to

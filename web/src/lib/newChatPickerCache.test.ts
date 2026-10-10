@@ -91,6 +91,18 @@ describe("newChatPickerCache", () => {
     expect(readNewChatPickerOptionsCache(key)).toEqual(options);
   });
 
+  it("round-trips a native model whose default service tier is null", () => {
+    const nullableTierOptions: NewChatPickerOptions = {
+      ...options,
+      models: {
+        ...options.models,
+        codex: [{ ...options.models.codex![0], defaultServiceTier: null }],
+      },
+    };
+    writeNewChatPickerOptionsCache(key, nullableTierOptions);
+    expect(readNewChatPickerOptionsCache(key)).toEqual(nullableTierOptions);
+  });
+
   it("preserves missing catalogs separately from successfully fetched empty catalogs", () => {
     const partialOptions = {
       ...options,

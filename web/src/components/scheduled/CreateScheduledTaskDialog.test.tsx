@@ -1167,6 +1167,46 @@ describe("CreateScheduledTaskDialog project field", () => {
 });
 
 describe("CreateScheduledTaskDialog model + effort controls", () => {
+  it("persists a host-advertised Codex speed override and clears it on edit", async () => {
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "gpt-a",
+          isDefault: true,
+          serviceTiers: [
+            { id: "priority", name: "Fast" },
+            { id: "ultrafast", name: "Ultrafast" },
+          ],
+        },
+      ],
+    } as ReturnType<typeof hostsHook.useHostModelOptions>);
+    renderDialog();
+    fireEvent.click(screen.getByTestId("pick-agent-codex"));
+    openHostSelect();
+    fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+    fireEvent.keyDown(screen.getByTestId("task-speed-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Ultrafast" }));
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() =>
+      expect(mutateAsync).toHaveBeenCalledWith(expect.objectContaining({ speed: "ultrafast" })),
+    );
+    cleanup();
+
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_codex", hostId: "host_1", speed: "ultrafast" })}
+      />,
+    );
+    expect(screen.getByTestId("task-speed-trigger")).toHaveTextContent("Ultrafast");
+    fireEvent.keyDown(screen.getByTestId("task-speed-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync.mock.calls.at(-1)?.[0].input.speed).toBeNull());
+  });
   it("renders model, effort, and permission for Claude native and SDK agents", async () => {
     renderDialog();
     expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();

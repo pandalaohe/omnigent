@@ -55,6 +55,7 @@ import type {
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
   SessionCodexApprovalModeEvent,
+  SessionSpeedTierEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
@@ -739,6 +740,22 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       approvalMode,
     } satisfies SessionCodexApprovalModeEvent;
+  }
+  if (eventType === "session.speed_tier") {
+    const conversationId = data.conversation_id;
+    const speedTier = data.speed_tier;
+    if (
+      typeof conversationId !== "string" ||
+      !conversationId ||
+      typeof speedTier !== "string" ||
+      !speedTier
+    )
+      return null;
+    return {
+      type: "session_speed_tier",
+      conversationId,
+      speedTier,
+    } satisfies SessionSpeedTierEvent;
   }
   if (eventType === "session.agent_changed") {
     const conversationId = data.conversation_id;

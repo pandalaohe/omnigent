@@ -12,6 +12,7 @@ import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
   SessionCodexApprovalModeEvent,
+  SessionSpeedTierEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
@@ -1561,6 +1562,27 @@ describe("session.codex_approval_mode (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.codex_approval_mode", { approval_mode: "approve-for-me" })).toEqual([]);
+  });
+});
+
+describe("session.speed_tier (FLAT envelope)", () => {
+  it("lifts a confirmed native tier from the session event", () => {
+    const events = parse("session.speed_tier", {
+      conversation_id: "conv_abc",
+      speed_tier: "priority",
+    });
+    expect(events).toEqual([
+      {
+        type: "session_speed_tier",
+        conversationId: "conv_abc",
+        speedTier: "priority",
+      } satisfies SessionSpeedTierEvent,
+    ]);
+  });
+
+  it("rejects an incomplete event", () => {
+    expect(parse("session.speed_tier", { conversation_id: "conv_abc" })).toEqual([]);
+    expect(parse("session.speed_tier", { speed_tier: "priority" })).toEqual([]);
   });
 });
 

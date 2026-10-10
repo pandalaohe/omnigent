@@ -229,6 +229,27 @@ async def test_create_roundtrips_valid_calling_defaults(project_client: httpx.As
     assert created["config"] == config
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "claude-sdk"])
+async def test_patch_roundtrips_claude_speed_defaults(
+    project_client: httpx.AsyncClient, harness: str
+) -> None:
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    config = {"calling_defaults": {"test-host": {"harnesses": {harness: {"speed": "fast"}}}}}
+    patched = await project_client.patch(f"/v1/projects/{created['id']}", json={"config": config})
+    assert patched.status_code == 200, patched.text
+    persisted = await project_client.get(f"/v1/projects/{created['id']}")
+    assert persisted.json()["config"] == config
+    rejected = await project_client.patch(
+        f"/v1/projects/{created['id']}",
+        json={
+            "config": {
+                "calling_defaults": {"test-host": {"harnesses": {harness: {"speed": "priority"}}}}
+            }
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+
+
 async def test_patch_rejects_malformed_calling_defaults(
     project_client: httpx.AsyncClient,
 ) -> None:

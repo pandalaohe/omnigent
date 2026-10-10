@@ -35,6 +35,7 @@ from omnigent.server.routes._session_create_validation import (
     CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
 )
 from omnigent.server.schemas import CreatedSessionResponse, SessionCreateMetadata
+from omnigent.session_default_modes import CODEX_NATIVE_PERMISSION_DEFAULT_ARGS
 
 # Saved library Agent ids are minted as ``ca_<uuid>`` by the custom-agents
 # route; the web picker keys the same prefix. Nothing else starts with it.
@@ -151,6 +152,7 @@ class LibraryAgentLaunch:
     workspace: str | None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    speed: str | None = None
     permission_mode: str | None = None
 
 
@@ -204,7 +206,14 @@ async def launch_library_agent(
         and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
     ):
         launch_args = ["--permission-mode", permission_mode]
+    elif harness == "codex-native" and permission_mode in CODEX_NATIVE_PERMISSION_DEFAULT_ARGS:
+        launch_args = list(CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission_mode])
     labels = library_agent_presentation_labels(spec=spec, host_bound=launch.host_id is not None)
+    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
+
+    speed = launch.speed or spec.executor.config.get("service_tier")
+    if isinstance(speed, str) and valid_speed_tier(speed, harness):
+        labels[SPEED_TIER_LABEL_KEY] = speed
     if (
         harness == "claude-sdk"
         and permission_mode is not None

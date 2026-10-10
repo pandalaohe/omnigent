@@ -22,6 +22,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerHostTrigger,
   ComposerPermissionPicker,
+  ComposerSpeedPicker,
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
@@ -59,6 +60,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   PlusIcon,
+  RefreshCwIcon,
   ShuffleIcon,
   WandSparklesIcon,
   TriangleAlertIcon,
@@ -203,7 +205,7 @@ import {
 } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import { useAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   type LastSandboxRepo,
   readLastSandboxRepos,
@@ -279,7 +281,14 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
-import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  fetchHosts,
+  refreshHostModelOptions,
+  useHostModelOptions,
+  useHosts,
+  type Host,
+} from "@/hooks/useHosts";
+import { defaultSpeedForModel, reconcileSpeed, speedOptionsForModel } from "@/lib/speedTiers";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
@@ -421,6 +430,7 @@ function createdHarnessOptions({
   devinPermissionMode,
   pickedModel,
   pickedEffort,
+  pickedSpeed,
   smartRoutingEligible,
   costControlMode,
 }: {
@@ -440,6 +450,7 @@ function createdHarnessOptions({
   devinPermissionMode: string;
   pickedModel: string;
   pickedEffort: string;
+  pickedSpeed: string;
   smartRoutingEligible: boolean;
   costControlMode: CostControlMode;
 }): HarnessOptions | null {
@@ -448,6 +459,7 @@ function createdHarnessOptions({
   const options: HarnessOptions = {};
   if (supportsModelPicker) options.model = pickedModel;
   if (supportsEffortPicker && !supportsPermissionMode) options.effort = pickedEffort;
+  if (harness === "codex" || harness === "codex-native") options.speed = pickedSpeed;
   if (supportsPermissionMode) {
     options.mode = permissionMode;
     options.effort = pickedEffort;
@@ -1339,6 +1351,7 @@ function visibleModelLabel(label: string): string {
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
+type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
@@ -1418,6 +1431,7 @@ export function AgentHarnessPicker({
   sandboxSelected,
   allowCreateCustomAgent = true,
   onOpenChange,
+  onConfigOpen,
   dropdownModal = false,
   contentClassName,
   contentAlign = "end",
@@ -1426,6 +1440,7 @@ export function AgentHarnessPicker({
   triggerTooltip,
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  modelCatalogAvailability,
   triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
@@ -1478,6 +1493,8 @@ export function AgentHarnessPicker({
   // `triggerLabelClassName`).
   /** Notified when the picker dropdown opens/closes. */
   onOpenChange?: (open: boolean) => void;
+  /** Refresh the selected host's model catalog when its config menu opens. */
+  onConfigOpen?: () => void;
   /** Whether the dropdown blocks outside interaction. Defaults false so composer clicks reach their target. */
   dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
@@ -1497,6 +1514,8 @@ export function AgentHarnessPicker({
   triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Distinguishes a real Default model from an unavailable catalog. */
+  modelCatalogAvailability?: ModelCatalogAvailability;
   /** Harness glyph rendered before the joined model / effort label. */
   triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
@@ -1563,15 +1582,20 @@ export function AgentHarnessPicker({
     : null;
   const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
   const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
+  const modelCatalogUnavailable = modelCatalogAvailability === "unavailable";
   const visibleModelText = selectedUnavailable
     ? ""
-    : triggerModelText === "Default"
+    : modelCatalogUnavailable
       ? "Models unavailable"
       : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
-    .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
+    .map((detail) =>
+      detail.label === "Model" && modelCatalogUnavailable
+        ? "Model unavailable"
+        : `${detail.label} ${compactModelTriggerLabel(detail.value)}`,
+    )
     .join(", ");
   const triggerAccessibleName = [
     hasAgents ? agentLabel : "No agents",
@@ -1590,10 +1614,15 @@ export function AgentHarnessPicker({
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
-  const visibleCachedPreview = selectedUnavailable ? null : cachedPreview;
+  const visibleCachedPreview =
+    selectedUnavailable || modelCatalogUnavailable ? null : cachedPreview;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
     () =>
-      selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
+      selectedEntry &&
+      hasAgents &&
+      !selectedUnavailable &&
+      modelCatalogAvailability !== "unavailable" &&
+      modelCatalogAvailability !== "unknown"
         ? {
             agent: { name: selectedEntry.name, harness: selectedEntry.harness },
             label: triggerAccessibleName,
@@ -1605,7 +1634,8 @@ export function AgentHarnessPicker({
     [
       selectedEntry,
       hasAgents,
-      visibleModelText,
+      selectedUnavailable,
+      modelCatalogAvailability,
       triggerAccessibleName,
       triggerText,
       triggerSecondaryText,
@@ -1620,6 +1650,15 @@ export function AgentHarnessPicker({
   const hasSelectedConfig = selectedConfigContent != null;
   const [menuPage, setMenuPage] = useState<"more" | "custom" | "config" | null>(null);
   const [configAgentId, setConfigAgentId] = useState<string | null>(null);
+  const lastRefreshedConfigId = useRef<string | null>(null);
+  useEffect(() => {
+    if (configAgentId === null) {
+      lastRefreshedConfigId.current = null;
+    } else if (lastRefreshedConfigId.current !== configAgentId) {
+      lastRefreshedConfigId.current = configAgentId;
+      onConfigOpen?.();
+    }
+  }, [configAgentId, onConfigOpen]);
   const [focusConfigAgentId, setFocusConfigAgentId] = useState<string | null>(null);
   const [inlineHarnessId, setInlineHarnessId] = useState(effectiveAgentId);
   // Keep desktop rows anchored while a config flyout is open; promote on reopen.
@@ -2276,6 +2315,7 @@ interface LandingDraft {
   pickedHarness: string | null;
   pickedModel: string;
   pickedEffort: string;
+  pickedSpeed: string;
   costControlMode: CostControlMode;
   // Whether the agent / model / effort picker was touched this visit. Parked
   // so a same-project detour keeps a user pick authoritative over the
@@ -2283,6 +2323,8 @@ interface LandingDraft {
   agentTouched: boolean;
   modelTouched: boolean;
   effortTouched: boolean;
+  speedTouched: boolean;
+  permissionTouched: boolean;
   // Whether the workspace slot still holds an untouched project-config seed
   // (drives the create's field omission). Parked so a same-project detour
   // neither turns an untouched seed into an "explicit" value nor the reverse.
@@ -2873,6 +2915,11 @@ export function NewChatLandingScreen() {
   // via the harness-seed effect below).
   const [pickedModel, _setPickedModel] = useState<string>(() => restoredDraft?.pickedModel ?? "");
   const [pickedEffort, setPickedEffort] = useState<string>(() => restoredDraft?.pickedEffort ?? "");
+  const [pickedSpeed, setPickedSpeed] = useState<string>(() => restoredDraft?.pickedSpeed ?? "");
+  const [speedTouched, setSpeedTouched] = useState(() => restoredDraft?.speedTouched ?? false);
+  const [permissionTouched, setPermissionTouched] = useState(
+    () => restoredDraft?.permissionTouched ?? false,
+  );
   const [pickerEdits, setPickerEdits] = useState<{
     agentId: string | null;
     harness: string | null;
@@ -2954,10 +3001,13 @@ export function NewChatLandingScreen() {
     pickedHarness,
     pickedModel,
     pickedEffort,
+    pickedSpeed,
     costControlMode,
     agentTouched: agentTouchedRef.current,
     modelTouched: modelTouchedRef.current,
     effortTouched: effortTouchedRef.current,
+    speedTouched,
+    permissionTouched,
     workspaceFromConfig: workspaceFromConfigRef.current,
   };
   useEffect(() => {
@@ -3048,6 +3098,10 @@ export function NewChatLandingScreen() {
   const [callingSeedNotices, setCallingSeedNotices] = useState<string[]>([]);
   const [callingSeedProblems, setCallingSeedProblems] = useState<CallingDefaultsProblem[]>([]);
   const callingSeedAppliedRef = useRef<string | null>(null);
+  const callingPermissionSeedRef = useRef<{ key: string; harness: string; mode: string } | null>(
+    null,
+  );
+  const callingSpeedSeedRef = useRef<{ key: string; harness: string; speed: string } | null>(null);
   const agentPickGenerationRef = useRef(0);
   // Host whose workspace was already seeded once, so a host re-pick doesn't
   // clobber the field (used by the per-host seeding effect below).
@@ -3098,6 +3152,8 @@ export function NewChatLandingScreen() {
     setPickerEdits(null);
     seededConfigSigRef.current = prefillConfigSig;
     callingSeedAppliedRef.current = null;
+    callingPermissionSeedRef.current = null;
+    callingSpeedSeedRef.current = null;
     agentPickGenerationRef.current = 0;
     agentTouchedRef.current = false;
     // A settings edit re-seeds the agent and placed defaults but keeps this
@@ -3105,6 +3161,8 @@ export function NewChatLandingScreen() {
     if (projectChanged) {
       modelTouchedRef.current = false;
       effortTouchedRef.current = false;
+      setSpeedTouched(false);
+      setPermissionTouched(false);
     }
     setCallingSeedNotices([]);
     setCallingSeedProblems([]);
@@ -3906,6 +3964,35 @@ export function NewChatLandingScreen() {
               ? sdkModelOptions
               : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
+  const [modelRefreshBusy, setModelRefreshBusy] = useState(false);
+  const [modelRefreshError, setModelRefreshError] = useState<string | null>(null);
+  const refreshTarget =
+    selectedHostId && selectionHarness ? `${selectedHostId}\u0000${selectionHarness}` : "";
+  const refreshTargetRef = useRef(refreshTarget);
+  const refreshRequestId = useRef(0);
+  refreshTargetRef.current = refreshTarget;
+  useEffect(() => {
+    refreshRequestId.current += 1;
+    setModelRefreshBusy(false);
+    setModelRefreshError(null);
+  }, [refreshTarget]);
+  const refreshModels = async (mode: "auto" | "force") => {
+    if (!selectedHostId || !selectionHarness || sandboxSelected || modelRefreshBusy) return;
+    const target = refreshTarget;
+    const requestId = ++refreshRequestId.current;
+    setModelRefreshBusy(true);
+    setModelRefreshError(null);
+    try {
+      await refreshHostModelOptions(queryClient, selectedHostId, selectionHarness, mode);
+    } catch (error) {
+      if (refreshTargetRef.current === target && refreshRequestId.current === requestId) {
+        setModelRefreshError(error instanceof Error ? error.message : "Model refresh failed");
+      }
+    } finally {
+      if (refreshTargetRef.current === target && refreshRequestId.current === requestId)
+        setModelRefreshBusy(false);
+    }
+  };
   const pickerModelsLoading =
     sandboxCatalogPending ||
     (!sandboxSelected &&
@@ -4047,6 +4134,29 @@ export function NewChatLandingScreen() {
       pickedModel || pickerEffortRows.find((option) => option.isDefault)?.id,
     ) ?? []
   ).map((value) => ({ value, label: normalizeEffortLabel(value) }));
+  const speedHarness = selectionHarness === "codex" || selectionHarness === "codex-native";
+  const leadMember = selectedAgent?.members?.find((member) => member.lead);
+  const presetSpeedModel =
+    pickedModel ||
+    (leadMember?.harness === selectionHarness ? leadMember.model : null) ||
+    (effectiveAgentId === PENDING_AGENT_ID && pendingAgent?.harness === selectionHarness
+      ? pendingAgent.model
+      : null);
+  const pickerSpeedOptions = speedHarness
+    ? speedOptionsForModel(pickerModelOptions, presetSpeedModel)
+    : [];
+  const explicitSpeed = speedHarness
+    ? reconcileSpeed(pickedSpeed, pickerModelOptions, presetSpeedModel)
+    : null;
+  const selectedSpeed = speedHarness
+    ? (explicitSpeed ??
+      reconcileSpeed(
+        leadMember?.harness === selectionHarness ? leadMember.speed : pendingAgent?.speed,
+        pickerModelOptions,
+        presetSpeedModel,
+      ) ??
+      defaultSpeedForModel(pickerModelOptions, presetSpeedModel))
+    : "standard";
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -4072,8 +4182,14 @@ export function NewChatLandingScreen() {
       // take the field back on a later seed).
       setPickedModel("");
       setPickedEffort("");
+      if (speedHarness) setPickedSpeed("");
       setCostControlMode("on");
-      rememberPickerOptions(modelSelectionHarness, { routing: "on", model: "", effort: "" });
+      rememberPickerOptions(modelSelectionHarness, {
+        routing: "on",
+        model: "",
+        effort: "",
+        ...(speedHarness ? { speed: "" } : {}),
+      });
       return;
     }
     modelTouchedRef.current = true;
@@ -4101,8 +4217,17 @@ export function NewChatLandingScreen() {
       ) ?? "";
     setPickedModel(picked);
     setPickedEffort(effort);
+    const nextSpeed = speedHarness ? reconcileSpeed(pickedSpeed, pickerModelOptions, picked) : null;
+    if (speedHarness) {
+      if (nextSpeed !== pickedSpeed) setPickedSpeed(nextSpeed ?? "");
+    }
     setCostControlMode(null);
-    rememberPickerOptions(modelSelectionHarness, { model: picked, effort, routing: "off" });
+    rememberPickerOptions(modelSelectionHarness, {
+      model: picked,
+      effort,
+      routing: "off",
+      ...(speedHarness ? { speed: nextSpeed ?? "" } : {}),
+    });
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectionHarness) return;
@@ -4110,6 +4235,13 @@ export function NewChatLandingScreen() {
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
     setPickedEffort(picked);
     rememberPickerOptions(selectionHarness, { effort: picked });
+  };
+  const selectPickerSpeed = (speed: string) => {
+    if (!selectionHarness || !speedHarness) return;
+    const next = speed === "standard" ? "standard" : speed;
+    setPickedSpeed(next);
+    setSpeedTouched(true);
+    rememberPickerOptions(selectionHarness, { speed: next });
   };
   const handleSetPickedHarness = useCallback(
     (harness: string | null, agentId?: string) => {
@@ -4195,11 +4327,13 @@ export function NewChatLandingScreen() {
                       </span>
                     ),
                     checked: id === activeSdk,
-                    onSelect: () =>
+                    onSelect: () => {
+                      agentPickGenerationRef.current += 1;
                       handleSetPickedHarness(
                         id === selectedAgent.harness ? null : id,
                         selectedAgent.id,
-                      ),
+                      );
+                    },
                     testId: `new-chat-landing-harness-${id}`,
                     className: "whitespace-normal [&>span:last-child]:min-w-0",
                   })),
@@ -4218,6 +4352,27 @@ export function NewChatLandingScreen() {
                   header: "Models",
                   leading: (
                     <>
+                      {!sandboxSelected && selectedHostId && selectionHarness && (
+                        <div className="flex items-center justify-between px-2 py-1 text-xs text-muted-foreground">
+                          <span>{modelRefreshError ?? "Models on this host"}</span>
+                          <button
+                            type="button"
+                            aria-label="Refresh models"
+                            title="Refresh models"
+                            data-testid="new-chat-model-refresh"
+                            disabled={modelRefreshBusy || creating}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void refreshModels("force");
+                            }}
+                            className="rounded p-1 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"
+                          >
+                            <RefreshCwIcon
+                              className={`size-3.5 ${modelRefreshBusy ? "animate-spin" : ""}`}
+                            />
+                          </button>
+                        </div>
+                      )}
                       {sandboxInferenceConfigured && sandboxModels.data?.provider_label && (
                         <div
                           className="px-2 py-1 text-xs text-muted-foreground"
@@ -4413,6 +4568,7 @@ export function NewChatLandingScreen() {
                 ? DEVIN_NATIVE_PERMISSION_MODES
                 : [];
   const selectDirectMode = (mode: string) => {
+    setPermissionTouched(true);
     if (sdkHarness !== null) {
       if (sdkHarness === "claude-sdk") setPermissionMode(mode);
       else setApprovalMode(mode);
@@ -4448,6 +4604,8 @@ export function NewChatLandingScreen() {
     if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     setBypassSandbox(false);
     setCostControlMode(null);
+    setPermissionTouched(false);
+    setSpeedTouched(false);
   }, [effectiveAgentId, setCostControlMode]);
   // A first-class project visit owns model / effort through the calling-defaults
   // seed, so the per-harness localStorage memory (and its remembered routing)
@@ -4469,6 +4627,26 @@ export function NewChatLandingScreen() {
       ...readHarnessOptions(selectionHarness),
       ...editedOptions,
     };
+    if (sdkHarness === "codex" || selectedNativeHarness === "codex-native") {
+      const rows = sdkHarness === "codex" ? sdkModelOptions : codexModelOptions;
+      if (!projectVisit) {
+        const seededSpeed =
+          !speedTouched &&
+          callingSpeedSeedRef.current?.key === callingSeedAppliedRef.current &&
+          callingSpeedSeedRef.current.harness === selectionHarness
+            ? callingSpeedSeedRef.current.speed
+            : null;
+        setPickedSpeed(
+          reconcileSpeed(
+            seededSpeed ?? stored.speed,
+            rows,
+            seededSpeed ? pickedModel : stored.model,
+          ) ?? "",
+        );
+      }
+    } else {
+      setPickedSpeed("");
+    }
     // Resolve the mode to the stored value when it's still valid for this
     // harness, else the harness default. The else branch must RESET (not
     // early-return) because codex-native and opencode-native share the single
@@ -4478,6 +4656,12 @@ export function NewChatLandingScreen() {
     // the current list resolves to the default for the same reason.
     const resolve = (modes: readonly { value: string }[], dflt: string) =>
       stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
+    const seededPermission =
+      !permissionTouched &&
+      callingPermissionSeedRef.current?.key === callingSeedAppliedRef.current &&
+      callingPermissionSeedRef.current.harness === selectionHarness
+        ? callingPermissionSeedRef.current.mode
+        : null;
     // A remembered "route every turn" outranks a remembered concrete model: the
     // two are mutually exclusive, and sending both makes the server treat the
     // session as model-pinned and never route. Read from storage (not state) so
@@ -4486,7 +4670,7 @@ export function NewChatLandingScreen() {
     const storedRoutingOn = stored.routing === "on";
     if (sdkHarness !== null) {
       const sdkModes = sdkPermissionOptions(sdkHarness)!;
-      const sdkMode = resolve(sdkModes, sdkInitialPermissionMode(sdkHarness)!);
+      const sdkMode = seededPermission ?? resolve(sdkModes, sdkInitialPermissionMode(sdkHarness)!);
       if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
       else setApprovalMode(sdkMode);
       if (!projectVisit) {
@@ -4523,7 +4707,8 @@ export function NewChatLandingScreen() {
     }
     if (supportsPermissionMode) {
       setPermissionMode(
-        resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+        seededPermission ??
+          resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
       );
       if (!projectVisit) {
         // The model + effort picker remembers its own last pick (same per-harness
@@ -4550,7 +4735,10 @@ export function NewChatLandingScreen() {
         selectedNativeHarness === "codex-native" &&
           stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
       );
-      setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
+      setApprovalMode(
+        seededPermission ??
+          resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE),
+      );
       if (!projectVisit) {
         // A remembered routing "on" outranks a remembered concrete model, and
         // also drops any model/effort left in the shared state (e.g. seeded for
@@ -4998,12 +5186,14 @@ export function NewChatLandingScreen() {
   // still offers it (D28/D30); otherwise the resolved value replaces it with
   // a notice. Re-runs per (project, host, agent-pick generation).
   useEffect(() => {
-    if (projectParam === "" || configProjectId === null) return;
+    if (projectParam !== "" && configProjectId === null) return;
     // A sandbox has no concrete host; the project's legacy / master layers
     // still seed its agent, model and effort (a hostless resolve).
     const seedHostId = sandboxSelected ? null : selectedHostId;
     if (seedHostId === null && !sandboxSelected) return;
-    const seedKey = `${configProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}`;
+    const seedProjectId = configProjectId ?? "";
+    if (!seedProjectId && effectiveAgentId === null) return;
+    const seedKey = `${seedProjectId}|${seedHostId ?? "sandbox"}|${agentPickGenerationRef.current}`;
     if (callingSeedAppliedRef.current === seedKey) return;
     // Claim the key before the fetch: a failure leaves today's generic
     // defaults in place instead of retrying on every render.
@@ -5013,14 +5203,23 @@ export function NewChatLandingScreen() {
     const { enabled: carryEnabled, carry } =
       seedHostId === null
         ? { enabled: false, carry: null }
-        : callingLastContext(configProjectId, seedHostId);
+        : seedProjectId
+          ? callingLastContext(seedProjectId, seedHostId)
+          : { enabled: false, carry: null };
     // The picks the seed is computed from: an apply only overwrites a field
     // that still holds this value, so a pick made while the fetch was in
     // flight survives (the touched rules already ran inside the seed).
     const seedFromModel = pickedModel;
     const seedFromEffort = pickedEffort;
+    const seedFromSpeed = pickedSpeed;
+    const seedFromApprovalMode = approvalMode;
+    const seedFromClaudeMode = permissionMode;
+    const seedFromPermission =
+      selectionHarness === "codex" || selectionHarness === "codex-native"
+        ? approvalMode
+        : permissionMode;
     void resolveCallingSeed({
-      projectId: configProjectId,
+      projectId: seedProjectId,
       hostId: seedHostId,
       hostLabel:
         seedHostId === null
@@ -5032,12 +5231,18 @@ export function NewChatLandingScreen() {
         agentId: effectiveAgentId,
         model: seedFromModel,
         effort: seedFromEffort,
+        speed: seedFromSpeed,
+        permission: seedFromPermission,
       },
       touched: {
         agent: agentTouchedRef.current,
         model: modelTouchedRef.current,
         effort: effortTouchedRef.current,
+        speed: speedTouched,
+        permission: permissionTouched,
       },
+      preserveAgent: !seedProjectId,
+      harnessOverride: sdkHarness,
       carryEnabled,
       carry,
       isAgentUsable: (agentId) => {
@@ -5057,16 +5262,43 @@ export function NewChatLandingScreen() {
         if (callingSeedAppliedRef.current !== seedKey) return;
         setCallingSeedProblems(seed.problems);
         setCallingSeedNotices(seed.notices);
-        setCallingSeedAgentId(seed.agentId);
-        if (seed.agentId !== effectiveAgentId) {
+        const seedHarness = seed.harness ?? selectionHarness;
+        if (seedProjectId) setCallingSeedAgentId(seed.agentId);
+        if (seedProjectId && seed.agentId !== effectiveAgentId) {
           setPickedAgentId(seed.agentId);
           if (seed.agentId !== null) setPickedHarness(readLastHarness(seed.agentId));
         }
         // A pick committed while the resolve was in flight outranks the seed.
         _setPickedModel((current) => (current === seedFromModel ? (seed.model ?? "") : current));
         setPickedEffort((current) => (current === seedFromEffort ? (seed.effort ?? "") : current));
+        if (seedProjectId || seed.speed) {
+          if (seed.speed && seedHarness) {
+            callingSpeedSeedRef.current = {
+              key: seedKey,
+              harness: seedHarness,
+              speed: seed.speed,
+            };
+          }
+          setPickedSpeed((current) => (current === seedFromSpeed ? (seed.speed ?? "") : current));
+        }
+        if (!permissionTouched && seed.permission && seedHarness) {
+          callingPermissionSeedRef.current = {
+            key: seedKey,
+            harness: seedHarness,
+            mode: seed.permission,
+          };
+          if (seedHarness === "codex" || seedHarness === "codex-native") {
+            setApprovalMode((current) =>
+              current === seedFromApprovalMode ? seed.permission! : current,
+            );
+          } else if (seedHarness === "claude-sdk" || seedHarness === "claude-native") {
+            setPermissionMode((current) =>
+              current === seedFromClaudeMode ? seed.permission! : current,
+            );
+          }
+        }
         // A routed session never pins a model, so a seeded model clears it.
-        if (seed.model !== null) setCostControlMode(null);
+        if (seedProjectId && seed.model !== null) setCostControlMode(null);
       },
       () => {
         // Resolve failure keeps today's generic / remembered defaults.
@@ -5092,12 +5324,13 @@ export function NewChatLandingScreen() {
     _setPickedModel((current) => (current === "" ? cachedPreviewModel : current));
   }, [cachedPreviewModel]);
 
+  const alwaysUseWorktree = useAlwaysUseWorktree();
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
   // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
+    if ((prefillConfig?.useWorktree ?? alwaysUseWorktree) !== true) return;
     if (sandboxSelected || selectedHostId === null || workspaceValue === "") return;
     if (branchName !== "" || activeWorktree !== null) return;
     if (worktreeSeededForRef.current === workspaceValue) return;
@@ -5120,6 +5353,7 @@ export function NewChatLandingScreen() {
     hostWorktreesArePlaceholder,
     workspaceIsGit,
     generateBranchName,
+    alwaysUseWorktree,
   ]);
 
   // Retract our own auto-seeded branch when the effective default is now off
@@ -5127,12 +5361,12 @@ export function NewChatLandingScreen() {
   // default off in Settings. Only clears while the field still holds OUR seed.
   useEffect(() => {
     if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    if ((prefillConfig?.useWorktree ?? alwaysUseWorktree) === true) return;
     setBranchName("");
     setAutoSeededBranch("");
     // Re-arm the seed guard so flipping the default back on can seed again.
     worktreeSeededForRef.current = null;
-  }, [prefillConfig, branchName, autoSeededBranch]);
+  }, [prefillConfig, branchName, autoSeededBranch, alwaysUseWorktree]);
 
   // Sandbox repo inputs are valid when empty (empty workspace) or when every
   // selected repo's URL passes the shape check. A half-typed URL in the paste
@@ -5393,6 +5627,17 @@ export function NewChatLandingScreen() {
             !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
           ? "The selected model is no longer available. Choose a model to continue."
           : null;
+  const modelCatalogLookupEnabled = sandboxSelected
+    ? sandboxPreviewEnabled && sandboxInferenceConfigured
+    : selectionHarness !== null && canLoadHostModels(selectionHarness);
+  const modelCatalogAvailability: ModelCatalogAvailability | undefined =
+    harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
+      ? pickerModelOptions.length > 0
+        ? "available"
+        : !modelCatalogLookupEnabled || pickerModelsLoading
+          ? "unknown"
+          : "unavailable"
+      : undefined;
   useEffect(() => {
     if (!pickerLoading && pickerSelectionError === null && pickerEdits?.pendingValidation) {
       setPickerEdits({ ...pickerEdits, pendingValidation: false });
@@ -6025,7 +6270,7 @@ export function NewChatLandingScreen() {
       const inheritedLabels = selectedAgent?.templateId
         ? { ...(baseLabels ?? {}), [AGENT_TEMPLATE_LABEL]: selectedAgent.templateId }
         : baseLabels;
-      const createLabels =
+      const createLabels: Record<string, string> =
         selectedProject && createProjectId === null
           ? {
               ...(inheritedLabels ?? {}),
@@ -6033,6 +6278,9 @@ export function NewChatLandingScreen() {
               ...composerContextLabels,
             }
           : { ...(inheritedLabels ?? {}), ...composerContextLabels };
+      if (speedHarness && !routingOwnsModel && explicitSpeed) {
+        createLabels["omnigent.speed_tier"] = explicitSpeed;
+      }
 
       let data: { id: string };
 
@@ -6191,7 +6439,7 @@ export function NewChatLandingScreen() {
               : agentSupportsPermissionMode &&
                   permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
                 ? ["--permission-mode", permissionMode]
-                : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                : agentSupportsApprovalMode
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
@@ -6314,6 +6562,7 @@ export function NewChatLandingScreen() {
           devinPermissionMode,
           pickedModel,
           pickedEffort,
+          pickedSpeed: explicitSpeed ?? "",
           smartRoutingEligible: effectiveAgentId !== PENDING_AGENT_ID && smartRoutingEligible,
           costControlMode,
         });
@@ -6390,6 +6639,7 @@ export function NewChatLandingScreen() {
           harness: selectionHarness,
           model: normalizedModelOverride,
           effort: normalizedReasoningEffort,
+          speed: explicitSpeed,
         });
       }
       // A successful create becomes the remembered destination for every
@@ -7595,6 +7845,7 @@ export function NewChatLandingScreen() {
                       {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
                       <AgentHarnessPicker
+                        onConfigOpen={() => void refreshModels("auto")}
                         openNonce={modelPickerOpenNonce}
                         agentEntries={agentEntries}
                         harnessEntries={harnessEntries}
@@ -7625,6 +7876,7 @@ export function NewChatLandingScreen() {
                             : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
+                        modelCatalogAvailability={modelCatalogAvailability}
                         triggerIcon={
                           selectedAgent ? (
                             <span
@@ -7649,6 +7901,15 @@ export function NewChatLandingScreen() {
                         triggerClassName="text-[13px] leading-5"
                       />
                     </div>
+                    {speedHarness && !routingOn && (
+                      <ComposerSpeedPicker
+                        value={selectedSpeed}
+                        options={pickerSpeedOptions}
+                        onSelect={selectPickerSpeed}
+                        disabled={creating || noExecutionTargetSelected || pickerLoading}
+                        testIdPrefix="new-chat"
+                      />
+                    )}
                     <ComposerMicButton
                       className="size-8 md:size-7"
                       enableHotkey

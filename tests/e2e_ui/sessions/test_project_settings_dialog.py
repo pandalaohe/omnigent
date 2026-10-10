@@ -57,6 +57,7 @@ def _open_project_settings(page: Page, project: str) -> None:
     # The dialog's Save button confirms the editor mounted + the config fetch
     # settled (Save is disabled while loading).
     expect(page.get_by_test_id("project-settings-save")).to_be_enabled()
+    page.get_by_role("tab", name="Code", exact=True).click()
 
 
 def test_project_settings_worktree_toggle_persists(

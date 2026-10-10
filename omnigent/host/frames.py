@@ -922,6 +922,7 @@ class HostFolderFactsResultFrame:
     :param is_repo: Whether the folder lies in a non-bare git work tree.
     :param toplevel: Work-tree root, e.g. ``"/Users/alice/myrepo"``.
     :param branch: Checked-out branch, ``None`` when detached or unborn.
+    :param default_branch: Repository main branch, ``None`` if unknown.
     :param head: Full HEAD commit sha, or ``None`` when unresolvable.
     :param detached: Whether HEAD points at a commit, not a branch.
     :param dirty: ``True`` when ``git status`` lists any change, ``False``
@@ -940,6 +941,7 @@ class HostFolderFactsResultFrame:
     is_repo: bool = False
     toplevel: str | None = None
     branch: str | None = None
+    default_branch: str | None = None
     head: str | None = None
     detached: bool = False
     dirty: bool | None = None
@@ -1244,6 +1246,7 @@ class HostModelOptionsFrame:
 
     request_id: str
     harness: str
+    refresh: str | None = None
 
 
 @dataclass
@@ -1922,6 +1925,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "is_repo": frame.is_repo,
                 "toplevel": frame.toplevel,
                 "branch": frame.branch,
+                "default_branch": frame.default_branch,
                 "head": frame.head,
                 "detached": frame.detached,
                 "dirty": frame.dirty,
@@ -2047,6 +2051,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.MODEL_OPTIONS.value,
                 "request_id": frame.request_id,
                 "harness": frame.harness,
+                "refresh": frame.refresh,
             }
         )
     if isinstance(frame, HostModelOptionsResultFrame):
@@ -3097,6 +3102,7 @@ def _decode_folder_facts_result(msg: _JsonObject) -> HostFolderFactsResultFrame:
         is_repo=_required_bool(msg, "is_repo") if "is_repo" in msg else False,
         toplevel=_optional_nullable_str(msg, "toplevel"),
         branch=_optional_nullable_str(msg, "branch"),
+        default_branch=_optional_nullable_str(msg, "default_branch"),
         head=_optional_nullable_str(msg, "head"),
         detached=_required_bool(msg, "detached") if "detached" in msg else False,
         dirty=dirty,
@@ -3295,6 +3301,7 @@ def _decode_model_options(msg: _JsonObject) -> HostModelOptionsFrame:
     return HostModelOptionsFrame(
         request_id=_required_str(msg, "request_id"),
         harness=_required_str(msg, "harness"),
+        refresh=_optional_nullable_str(msg, "refresh"),
     )
 
 

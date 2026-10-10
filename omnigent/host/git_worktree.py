@@ -432,6 +432,8 @@ class FolderFacts:
         ``"/Users/alice/myrepo"``.
     :param branch: The checked-out branch, e.g. ``"main"``. ``None`` when
         HEAD is detached, unborn, or otherwise unresolvable.
+    :param default_branch: Locally recorded remote HEAD, then main/master;
+        ``None`` when no repository main branch is known.
     :param head: Full sha of the checked-out commit, or ``None``.
     :param detached: Whether HEAD points at a commit instead of a branch.
     :param dirty: ``True`` when ``git status`` lists any change, ``False``
@@ -447,6 +449,7 @@ class FolderFacts:
     is_repo: bool
     toplevel: str | None = None
     branch: str | None = None
+    default_branch: str | None = None
     head: str | None = None
     detached: bool = False
     dirty: bool | None = None
@@ -547,6 +550,31 @@ def read_folder_facts(path: str) -> FolderFacts:
             facts.remotes = _parse_folder_remotes(remotes.stdout)
         else:
             facts.error = facts.error or _git_error("git remote -v failed", remotes).message
+    try:
+        refs = _run_git(
+            ["for-each-ref", "--format=%(refname) %(symref)", "refs/heads", "refs/remotes"],
+            cwd=path,
+            timeout=_FOLDER_FACTS_GIT_TIMEOUT_S,
+        )
+        if refs.returncode == 0:
+            by_ref = dict(line.split(" ", 1) for line in refs.stdout.splitlines())
+            remote_names = [remote["name"] for remote in facts.remotes]
+            remote_names.sort(key=lambda name: name != "origin")
+            for name in remote_names:
+                target = by_ref.get(f"refs/remotes/{name}/HEAD", "")
+                prefix = f"refs/remotes/{name}/"
+                if target.startswith(prefix) and target in by_ref:
+                    facts.default_branch = target.removeprefix(prefix)
+                    break
+            if facts.default_branch is None:
+                for name in ("main", "master"):
+                    if f"refs/heads/{name}" in by_ref or any(
+                        f"refs/remotes/{remote}/{name}" in by_ref for remote in remote_names
+                    ):
+                        facts.default_branch = name
+                        break
+    except WorktreeError as exc:
+        facts.error = facts.error or exc.message
     return facts
 
 

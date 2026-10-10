@@ -3515,7 +3515,9 @@ class HostProcess:
             self._prewarm_model_options(), name="host-model-options-prewarm"
         )
 
-    async def _probed_codex_model_options(self) -> ModelOptionsResult | None:
+    async def _probed_codex_model_options(
+        self, refresh: str | None = None
+    ) -> ModelOptionsResult | None:
         """
         Store-backed harness-truth Codex listing, or ``None`` on failure.
 
@@ -3528,7 +3530,7 @@ class HostProcess:
         from omnigent.harnesses.codex_native.app_server import codex_launch_catalog
 
         try:
-            rows = await codex_launch_catalog()
+            rows = await codex_launch_catalog(refresh=refresh)
         except Exception:  # noqa: BLE001 — no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
@@ -3583,7 +3585,7 @@ class HostProcess:
             # shared catalog, probed from the configured Codex binary itself.
             # No curated fallback and no serving-endpoints listing — a probe
             # that cannot run is a failed lookup, not a successful empty catalog.
-            probed = await self._probed_codex_model_options()
+            probed = await self._probed_codex_model_options(frame.refresh)
             if probed is not None:
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4022,6 +4024,7 @@ class HostProcess:
             is_repo=facts.is_repo,
             toplevel=facts.toplevel,
             branch=facts.branch,
+            default_branch=facts.default_branch,
             head=facts.head,
             detached=facts.detached,
             dirty=facts.dirty,

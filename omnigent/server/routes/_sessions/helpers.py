@@ -304,6 +304,7 @@ from omnigent.server.schemas import (
     SessionResourceListPage,
     SessionResourcePaginatedList,
     SessionSandboxStatusEvent,
+    SessionSpeedTierEvent,
     SessionStatusEvent,
     SessionSupersededEvent,
     SessionTerminalPendingEvent,
@@ -5958,6 +5959,13 @@ def _publish_model_options(session_id: str) -> None:
     event = SessionModelOptionsEvent(
         type="session.model_options",
         conversation_id=session_id,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_speed_tier(session_id: str, speed_tier: str) -> None:
+    event = SessionSpeedTierEvent(
+        type="session.speed_tier", conversation_id=session_id, speed_tier=speed_tier
     )
     session_stream.publish(session_id, event.model_dump())
 

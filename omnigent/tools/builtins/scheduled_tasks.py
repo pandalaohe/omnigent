@@ -103,6 +103,13 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": "Optional per-run reasoning-effort hint, e.g. 'high'.",
                         },
+                        "speed": {
+                            "type": "string",
+                            "description": (
+                                "Optional speed tier for each run. Codex accepts host-advertised "
+                                "tier IDs; Claude accepts standard or fast."
+                            ),
+                        },
                         "permission_mode": {
                             "type": "string",
                             "description": (
@@ -239,6 +246,10 @@ class SysScheduledTaskUpdateTool(Tool):
                         "reasoning_effort": {
                             "type": "string",
                             "description": "New reasoning-effort hint.",
+                        },
+                        "speed": {
+                            "type": "string",
+                            "description": "New speed tier. Null clears the override.",
                         },
                         "permission_mode": {
                             "type": "string",

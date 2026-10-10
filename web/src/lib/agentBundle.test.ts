@@ -75,6 +75,17 @@ async function extractAgentsMd(file: File): Promise<string | null> {
 }
 
 describe("buildAgentBundle", () => {
+  it("writes the lead's speed under executor.config.service_tier", async () => {
+    const yaml = await extractConfigYaml(
+      await buildAgentBundle({
+        name: "codex-lead",
+        harness: "codex",
+        model: "gpt-a",
+        speed: "ultrafast",
+      }),
+    );
+    expect(yaml).toContain("    service_tier: ultrafast");
+  });
   it("produces a tar.gz file with correct config.yaml for minimal input", async () => {
     const input: AgentBundleInput = {
       name: "test-agent",
