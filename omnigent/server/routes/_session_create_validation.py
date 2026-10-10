@@ -73,6 +73,8 @@ class ProjectCreateResolution:
 
     body: Any
     project_id: str | None = None
+    speed: str | None = None
+    permission: str | None = None
     entry: str | None = None
     checkout: str | None = None
     worktree_entry: str | None = None
@@ -347,6 +349,7 @@ async def resolve_project_session_create(
             elif "workspace" in config and "workspace" in body.__class__.model_fields:
                 updates["workspace"] = config["workspace"]
 
+    speed = permission = None
     if apply_calling_defaults:
         calling_host_id = updates.get("host_id", getattr(body, "host_id", None)) or parent_host_id
         resolution = await resolve_create_calling(
@@ -369,6 +372,7 @@ async def resolve_project_session_create(
             or getattr(body, "harness_override", None) == "auto"
         )
         if not routing_requested:
+            speed, permission = resolution.speed, resolution.permission
             if "model_override" not in fields_set and resolution.model is not None:
                 updates["model_override"] = resolution.model
             if "reasoning_effort" not in fields_set and resolution.effort is not None:
@@ -429,6 +433,8 @@ async def resolve_project_session_create(
 
     return ProjectCreateResolution(
         body=resolved,
+        speed=speed,
+        permission=permission,
         project_id=project_id,
         entry=entry,
         checkout=checkout,

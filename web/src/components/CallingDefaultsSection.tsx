@@ -7,6 +7,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PlusIcon, Trash2Icon } from "lucide-react";
 
 import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
+import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -341,6 +343,17 @@ function HostDefaultsTable({
       onChange={(next) => setCallingDefaultField(hostId, harness, "effort", next)}
       onOpen={onLoadCatalog}
     />,
+    ...(["speed", "permission"] as const).map((field) => (
+      <SessionDefaultModeSelect
+        key={field}
+        harness={harness}
+        field={field}
+        value={entry[field]}
+        label={`${field === "speed" ? "Speed" : "Permission"} for ${callingHarnessLabel(harness)}`}
+        testId={`calling-defaults-${field}-${harness}`}
+        onChange={(next) => setCallingDefaultField(hostId, harness, field, next)}
+      />
+    )),
   ];
 
   if (!isMobile) {
@@ -351,10 +364,12 @@ function HostDefaultsTable({
           data-testid="calling-defaults-table"
         >
           <colgroup>
-            <col className="w-[26%]" />
-            <col className="w-[30%]" />
-            <col className="w-[26%]" />
             <col className="w-[18%]" />
+            <col className="w-[24%]" />
+            <col className="w-[16%]" />
+            <col className="w-[16%]" />
+            <col className="w-[20%]" />
+            <col className="w-[6%]" />
           </colgroup>
           <thead>
             <tr className="border-b border-border text-left text-muted-foreground">
@@ -367,6 +382,12 @@ function HostDefaultsTable({
               <th scope="col" className="py-2 pr-3 font-normal">
                 Effort
               </th>
+              <th scope="col" className="py-2 pr-3 font-normal">
+                Speed
+              </th>
+              <th scope="col" className="py-2 pr-3 font-normal">
+                Permission
+              </th>
               <th scope="col" className="py-2">
                 <span className="sr-only">Actions</span>
               </th>
@@ -375,7 +396,8 @@ function HostDefaultsTable({
           <tbody>
             {entryRows.map(({ harness, entry }) => {
               const note = catalogNote(catalogFor(catalogs, hostId, harness), host);
-              const [modelControl, effortControl] = renderEntryControls(harness, entry);
+              const [modelControl, effortControl, speedControl, permissionControl] =
+                renderEntryControls(harness, entry);
               return (
                 <tr
                   key={harness}
@@ -400,6 +422,8 @@ function HostDefaultsTable({
                   </td>
                   <td className="min-w-0 py-2 pr-3">{modelControl}</td>
                   <td className="min-w-0 py-2 pr-3">{effortControl}</td>
+                  <td className="min-w-0 py-2 pr-3">{speedControl}</td>
+                  <td className="min-w-0 py-2 pr-3">{permissionControl}</td>
                   <td className="py-2 text-right">
                     <DeleteEntryButton
                       harness={harness}
@@ -425,7 +449,7 @@ function HostDefaultsTable({
                       {callingHarnessLabel(sdk)}
                     </span>
                   </td>
-                  <td className="min-w-0 py-2 pr-3" colSpan={2}>
+                  <td className="min-w-0 py-2 pr-3" colSpan={4}>
                     <span className="block truncate" title={text}>
                       {text}
                     </span>
@@ -462,7 +486,10 @@ function HostDefaultsTable({
     <div className="flex min-w-0 flex-col gap-2">
       {entryRows.map(({ harness, entry }) => {
         const note = catalogNote(catalogFor(catalogs, hostId, harness), host);
-        const [modelControl, effortControl] = renderEntryControls(harness, entry);
+        const [modelControl, effortControl, speedControl, permissionControl] = renderEntryControls(
+          harness,
+          entry,
+        );
         return (
           <div
             key={harness}
@@ -500,6 +527,16 @@ function HostDefaultsTable({
               <span className="text-xs text-muted-foreground">Effort</span>
               {effortControl}
             </label>
+            {(["speed", "permission"] as const).map((field, index) =>
+              sessionDefaultModeOptions(harness, field).length > 0 ? (
+                <label key={field} className="flex min-w-0 flex-col gap-1">
+                  <span className="text-xs text-muted-foreground">
+                    {field === "speed" ? "Speed" : "Permission"}
+                  </span>
+                  {index === 0 ? speedControl : permissionControl}
+                </label>
+              ) : null,
+            )}
           </div>
         );
       })}

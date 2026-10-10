@@ -66,6 +66,20 @@ describe("calling_defaults master table", () => {
     expect(JSON.stringify(payload)).not.toContain("default");
   });
 
+  it("preserves speed and permission and clears them independently", () => {
+    setCallingDefaultField("host-a", "codex-native", "speed", "fast");
+    setCallingDefaultField("host-a", "codex-native", "permission", "approve-for-me");
+    expect(readCallingDefaults()).toEqual({
+      "host-a": { "codex-native": { speed: "fast", permission: "approve-for-me" } },
+    });
+    setCallingDefaultField("host-a", "codex-native", "speed", null);
+    expect(readCallingDefaults()["host-a"]["codex-native"]).toEqual({
+      permission: "approve-for-me",
+    });
+    setCallingDefaultField("host-a", "codex-native", "permission", null);
+    expect(readCallingDefaults()["host-a"]["codex-native"]).toEqual({});
+  });
+
   it("adds and removes a harness row without touching siblings", () => {
     addCallingDefaultEntry("host-a", "codex-native");
     addCallingDefaultEntry("host-a", "claude-native");

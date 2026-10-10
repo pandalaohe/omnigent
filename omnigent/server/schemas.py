@@ -328,8 +328,10 @@ class CallingDefaultsResolveResponse(BaseModel):
     :param harness: Effective harness, or ``None``.
     :param model: Effective model override, or ``None``.
     :param effort: Effective reasoning effort, or ``None``.
+    :param speed: Session speed tier, or ``None``.
+    :param permission: Harness-specific permission preset, or ``None``.
     :param sources: Per-field source tokens (``agent``, ``model``,
-        ``effort``).
+        ``effort``, ``speed``, ``permission``).
     :param problems: Default values the cached catalog does not offer;
         empty when the catalog is missing, empty, or stale.
     """
@@ -338,6 +340,8 @@ class CallingDefaultsResolveResponse(BaseModel):
     harness: str | None = None
     model: str | None = None
     effort: str | None = None
+    speed: str | None = None
+    permission: str | None = None
     sources: dict[str, str]
     problems: list[CallingDefaultsProblem] = Field(default_factory=list)
 
@@ -1184,6 +1188,7 @@ class CreateResponseRequest(BaseModel):
         e.g. ``{"effort": "medium"}``.
     :param permission_mode: Per-turn Claude SDK permission mode, when set.
     :param approval_mode: Per-turn Codex SDK approval preset, when set.
+    :param service_tier: Per-turn Codex SDK speed tier, when set.
     :param model_override: Optional per-request LLM model override,
         e.g. ``"openai/gpt-5.4-mini"``. Distinct from ``model``
         (agent name). Substitutes for the spec's ``llm.model`` for
@@ -1242,6 +1247,7 @@ class CreateResponseRequest(BaseModel):
     reasoning: dict[str, str] | None = None
     permission_mode: str | None = None
     approval_mode: str | None = None
+    service_tier: Literal["standard", "fast"] | None = None
     # Per-request LLM model override (distinct from ``model``, which
     # carries the agent name). See class docstring for semantics.
     model_override: str | None = None

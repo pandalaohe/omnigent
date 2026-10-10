@@ -1274,6 +1274,54 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("saves speed and permission in the selected and other harness rows", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/project")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: {
+              codex: { speed: "standard", permission: "read-only" },
+              "claude-native": { permission: "plan" },
+            },
+          },
+        },
+      },
+    });
+    renderDialog();
+    expect(await screen.findByTestId("project-settings-host-speed-h1")).toHaveTextContent(
+      "Standard",
+    );
+    expect(screen.getByTestId("project-settings-host-permission-h1")).toHaveTextContent(
+      "Read only",
+    );
+    await pickOption("project-settings-host-speed-h1", "Fast");
+    await pickOption("project-settings-host-permission-h1", "Approve for me");
+    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+    expect(
+      screen.queryByTestId("project-settings-host-other-speed-h1-claude-native"),
+    ).not.toBeInTheDocument();
+    await pickOption("project-settings-host-other-permission-h1-claude-native", "Auto");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: {
+              codex: { speed: "fast", permission: "approve-for-me" },
+              "claude-native": { permission: "auto" },
+            },
+          },
+        },
+      }),
+    );
+  });
+
   it("clears model and effort with Default without storing a clear word", async () => {
     availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/repo")]);
@@ -1284,7 +1332,14 @@ describe("ProjectSettingsDialog", () => {
         calling_defaults: {
           h1: {
             agent_id: "ag_codex_sdk",
-            harnesses: { codex: { model: "gpt-6-sol", effort: "high" } },
+            harnesses: {
+              codex: {
+                model: "gpt-6-sol",
+                effort: "high",
+                speed: "fast",
+                permission: "approve-for-me",
+              },
+            },
           },
         },
       },
@@ -1305,6 +1360,8 @@ describe("ProjectSettingsDialog", () => {
 
     await pickOption("project-settings-host-model-h1", "Default");
     await pickOption("project-settings-host-effort-h1", "Default");
+    await pickOption("project-settings-host-speed-h1", "Default");
+    await pickOption("project-settings-host-permission-h1", "Default");
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {

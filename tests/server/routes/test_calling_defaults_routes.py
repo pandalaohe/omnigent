@@ -246,7 +246,16 @@ async def test_resolve_reads_the_master_table_through_the_agents_harness(
     stores.prefs.patch_namespace(
         "local",
         "calling_defaults",
-        {HOST_A: {"codex": {"model": "gpt-6-sol", "effort": "high"}}},
+        {
+            HOST_A: {
+                "codex": {
+                    "model": "gpt-6-sol",
+                    "effort": "high",
+                    "speed": "fast",
+                    "permission": "approve-for-me",
+                }
+            }
+        },
     )
     stores.cache.upsert(
         HOST_A,
@@ -265,7 +274,15 @@ async def test_resolve_reads_the_master_table_through_the_agents_harness(
     assert body["harness"] == "codex"
     assert body["model"] == "gpt-6-sol"
     assert body["effort"] == "high"
-    assert body["sources"] == {"agent": "explicit", "model": "master", "effort": "master"}
+    assert body["speed"] == "fast"
+    assert body["permission"] == "approve-for-me"
+    assert body["sources"] == {
+        "agent": "explicit",
+        "model": "master",
+        "effort": "master",
+        "speed": "master",
+        "permission": "master",
+    }
     assert body["problems"] == []
 
 

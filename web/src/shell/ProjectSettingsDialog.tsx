@@ -23,6 +23,8 @@
 import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -137,6 +139,8 @@ interface DirectoryRow {
 
 /** One harness entry inside a host's calling-defaults draft. */
 interface HarnessSetDraft {
+  speed?: string | null;
+  permission?: string | null;
   model: string | null;
   effort: string | null;
 }
@@ -176,6 +180,9 @@ function sanitizeHarnessSet(value: unknown): HarnessSetDraft {
   if (!isRecord(value)) return set;
   if (typeof value.model === "string" && value.model !== "") set.model = value.model;
   if (typeof value.effort === "string" && value.effort !== "") set.effort = value.effort;
+  for (const field of ["speed", "permission"] as const) {
+    if (typeof value[field] === "string" && value[field] !== "") set[field] = value[field];
+  }
   return set;
 }
 
@@ -232,9 +239,11 @@ function buildCallingDefaults(rows: readonly HostRowDraft[]): ProjectConfig["cal
     if (row.agentId) entry.agent_id = row.agentId;
     const harnesses: NonNullable<typeof entry.harnesses> = {};
     for (const [harness, set] of Object.entries(row.harnesses)) {
-      const clean: { model?: string; effort?: string } = {};
+      const clean: { model?: string; effort?: string; speed?: string; permission?: string } = {};
       if (set.model) clean.model = set.model;
       if (set.effort) clean.effort = set.effort;
+      if (set.speed) clean.speed = set.speed;
+      if (set.permission) clean.permission = set.permission;
       if (Object.keys(clean).length > 0) harnesses[harness] = clean;
     }
     if (Object.keys(harnesses).length > 0) entry.harnesses = harnesses;
@@ -838,7 +847,7 @@ export function ProjectSettingsDialog({
   const setHarnessField = (
     rowHostId: string,
     harness: string,
-    field: "model" | "effort",
+    field: "model" | "effort" | "speed" | "permission",
     value: string | null,
   ) => {
     setHostRows((rows) =>
@@ -1278,6 +1287,22 @@ export function ProjectSettingsDialog({
             onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
           />
         </Field>
+        {(["speed", "permission"] as const).map((field) =>
+          sessionDefaultModeOptions(harness, field).length > 0 ? (
+            <Field key={field} label={field === "speed" ? "Speed" : "Permission"}>
+              <SessionDefaultModeSelect
+                harness={harness}
+                field={field}
+                value={set[field]}
+                label={field === "speed" ? "Speed" : "Permission"}
+                testId={`project-settings-host-${field}-${row.hostId}`}
+                disabled={isLoading || saving}
+                onOpenChange={onDropdownOpenChange}
+                onChange={(next) => setHarnessField(row.hostId, harness, field, next)}
+              />
+            </Field>
+          ) : null,
+        )}
       </>
     );
   };
@@ -1358,6 +1383,19 @@ export function ProjectSettingsDialog({
                       onOpenChange={onDropdownOpenChange}
                       onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
                     />
+                    {(["speed", "permission"] as const).map((field) => (
+                      <SessionDefaultModeSelect
+                        key={field}
+                        harness={harness}
+                        field={field}
+                        value={set[field]}
+                        label={field === "speed" ? "Speed" : "Permission"}
+                        testId={`project-settings-host-other-${field}-${row.hostId}-${harness}`}
+                        disabled={disabled}
+                        onOpenChange={onDropdownOpenChange}
+                        onChange={(next) => setHarnessField(row.hostId, harness, field, next)}
+                      />
+                    ))}
                   </div>
                 </div>
               );

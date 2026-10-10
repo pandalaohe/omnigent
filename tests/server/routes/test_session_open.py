@@ -24,8 +24,7 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Agent, ProjectHostBinding
 from omnigent.errors import OmnigentError
 from omnigent.native.native_coding_agents import (
-    CLAUDE_NATIVE_AGENT_NAME,
-    native_coding_agent_for_agent_name,
+    native_coding_agent_for_harness,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server import session_open_rate
@@ -761,26 +760,30 @@ async def test_open_null_model_and_effort_are_omitted_like_the_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
 async def test_plain_open_body_lets_project_calling_defaults_fill(
-    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    open_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, harness: str
 ) -> None:
     """The captured plain-open body resolves model / effort from the project row."""
     env = open_env
     native_agent_id = generate_agent_id()
-    env["agents"].create(native_agent_id, CLAUDE_NATIVE_AGENT_NAME, "test:///bundle")
-    native_agent = native_coding_agent_for_agent_name(CLAUDE_NATIVE_AGENT_NAME)
+    native_agent = native_coding_agent_for_harness(harness)
     assert native_agent is not None
-    config = dict(env["project"].config)
-    config["calling_defaults"] = {
-        HOST_ID: {
-            "harnesses": {native_agent.harness: {"model": "project-model", "effort": "high"}}
-        }
+    env["agents"].create(native_agent_id, native_agent.agent_name, "test:///bundle")
+    modes = {
+        "model": "project-model",
+        "effort": "high",
+        "permission": "plan" if harness == "claude-native" else "approve-for-me",
     }
+    if harness == "codex-native":
+        modes["speed"] = "fast"
+    config = dict(env["project"].config)
+    config["calling_defaults"] = {HOST_ID: {"harnesses": {native_agent.harness: modes}}}
     env["projects"].update(env["project"].id, user_id=ALICE, config=config)
     captured = _patch_create(env, monkeypatch)
     async with await _client(env) as client:
         data = await _post(
-            client, env["sender"].id, env["sender_token"], agent=CLAUDE_NATIVE_AGENT_NAME
+            client, env["sender"].id, env["sender_token"], agent=native_agent.agent_name
         )
     assert data["state"] == "opened"
     state = SimpleNamespace(
@@ -800,6 +803,9 @@ async def test_plain_open_body_lets_project_calling_defaults_fill(
     )
     assert resolved.body.model_override == "project-model"
     assert resolved.body.reasoning_effort == "high"
+
+    assert resolved.permission == modes["permission"]
+    assert resolved.speed == modes.get("speed")
 
 
 @pytest.mark.asyncio

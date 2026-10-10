@@ -7083,11 +7083,16 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         ("read-only", "on-request", "user", "readOnly"),
     ],
 )
+@pytest.mark.parametrize(
+    "service_tier,expected_tier", [(None, None), ("fast", "priority"), ("standard", "default")]
+)
 async def test_codex_turn_start_applies_approval_mode(
     approval_mode: str | None,
     approval_policy: str | None,
     approvals_reviewer: str | None,
     sandbox_type: str | None,
+    service_tier: str | None,
+    expected_tier: str | None,
 ) -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
@@ -7114,12 +7119,17 @@ async def test_codex_turn_start_applies_approval_mode(
             cwd=".",
             sandbox="workspace-write",
             approval_mode=approval_mode,
+            service_tier=service_tier,
         )
     ]
     await complete_task
     assert isinstance(events[-1], TurnComplete)
     assert session._request.await_args is not None
     turn_params = session._request.await_args.args[1]
+    if expected_tier is None:
+        assert "serviceTier" not in turn_params
+    else:
+        assert turn_params["serviceTier"] == expected_tier
     if approval_mode is None:
         assert "approvalPolicy" not in turn_params
         assert "approvalsReviewer" not in turn_params
@@ -7413,12 +7423,13 @@ async def test_codex_executor_passes_raw_bridge_and_turn_approval_mode() -> None
             [{"role": "user", "content": "hi", "session_id": "s1"}],
             [],
             "",
-            ExecutorConfig(approval_mode="read-only"),
+            ExecutorConfig(approval_mode="read-only", service_tier="fast"),
         )
     ]
     assert isinstance(events[-1], TurnComplete)
     assert factory_args["raw_elicitation_handler"] is _elicit
     assert fake_session.calls[0]["approval_mode"] == "read-only"
+    assert fake_session.calls[0]["service_tier"] == "fast"
 
 
 # ── Gateway-auth error surfacing (issue: codex SDK head swallows 401s) ──────

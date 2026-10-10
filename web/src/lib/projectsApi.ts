@@ -17,6 +17,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
 export interface ProjectCallingDefaultsHarness {
   model?: string;
   effort?: string;
+  speed?: string;
+  permission?: string;
 }
 
 /** One host's per-project default agent and harness overrides. */

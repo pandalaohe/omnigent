@@ -237,6 +237,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
+from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, SPEED_TIER_VALUES
 from omnigent.spec.skill_sources import resolve_session_skills, session_skill_roots
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -2005,6 +2006,7 @@ def create_runner_app(
 
     _session_permission_mode: dict[str, str] = {}
     _session_approval_mode: dict[str, str] = {}
+    _session_service_tier: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     # session_id → worktree path, from the session-init envelope or the REST
@@ -3100,6 +3102,9 @@ def create_runner_app(
             _session_permission_mode[session_id] = permission_mode
         if approval_mode := snapshot.labels.get(CODEX_SDK_APPROVAL_MODE_LABEL_KEY):
             _session_approval_mode[session_id] = approval_mode
+        service_tier = snapshot.labels.get(SPEED_TIER_LABEL_KEY)
+        if isinstance(service_tier, str) and service_tier in SPEED_TIER_VALUES:
+            _session_service_tier[session_id] = service_tier
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
         return _SessionInitContext(envelope=envelope)
 
@@ -4575,6 +4580,7 @@ def create_runner_app(
         _session_project_code.pop(session_id, None)
         _session_permission_mode.pop(session_id, None)
         _session_approval_mode.pop(session_id, None)
+        _session_service_tier.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -7092,6 +7098,8 @@ def create_runner_app(
             harness_body["permission_mode"] = permission_mode
         if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
             harness_body["approval_mode"] = approval_mode
+        if harness_name == "codex" and (service_tier := _session_service_tier.get(conv)):
+            harness_body["service_tier"] = service_tier
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:
