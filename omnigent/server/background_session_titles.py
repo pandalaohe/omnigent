@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from omnigent.entities.conversation import (
-    DEFAULT_GENERATED_TITLE_MAX_CHARS,
-    USER_SESSION_TITLE_MAX_CHARS,
-)
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
-from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+from omnigent.runner.background_titles.service import (
+    BACKGROUND_TITLE_MAX_CHARS,
+    CUSTOM_BACKGROUND_TITLE_MAX_CHARS,
+    FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
+    normalize_background_title,
+)
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
@@ -56,32 +56,6 @@ class BackgroundTitleRequest:
 
 
 BackgroundTitleGenerator = Callable[[BackgroundTitleRequest], Awaitable[str | None]]
-
-_TITLE_WRAPPERS = "'\"`“”‘’"
-_TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
-BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
-CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
-
-
-def normalize_background_title(
-    value: str | None,
-    *,
-    max_chars: int = BACKGROUND_TITLE_MAX_CHARS,
-    truncate_overflow: bool = False,
-) -> str | None:
-    """Return a compact title or ``None`` when model output is unusable."""
-    if not value:
-        return None
-    first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
-    title = " ".join(first_line.strip(_TITLE_WRAPPERS).split())
-    title = _TRAILING_PUNCTUATION.sub("", title).strip()
-    if len(title) > max_chars:
-        if not truncate_overflow:
-            return None
-        title = title[: max_chars - 1].rstrip() + "…"
-    if len(title) < 2:
-        return None
-    return title
 
 
 class RunnerBackgroundTitleGenerator:
