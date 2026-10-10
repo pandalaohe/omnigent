@@ -12549,7 +12549,14 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={"agent_id": "agent", "project_id": "project"})
+            return httpx.Response(
+                200,
+                json={
+                    "agent_id": "agent",
+                    "project_id": "project",
+                    "workspace": "/opt/work/project",
+                },
+            )
         if request.method == "POST" and request.url.path == "/v1/sessions":
             creates.append(json.loads(request.content))
             if deleted_project and len(creates) == 1:
@@ -12566,10 +12573,15 @@ async def test_clear_replacement_preserves_project_or_retries_unfiled(
 
     assert result == "replacement"
     assert creates[0]["project_id"] == "project"
-    assert creates[0]["workspace"] is None
+    assert creates[0]["workspace"] == "/opt/work/project"
     assert creates[0]["git"] is None
     if deleted_project:
         assert len(creates) == 2
-        assert set(creates[1]) == {"agent_id", "labels"}
+        assert creates[1] == {
+            "agent_id": creates[0]["agent_id"],
+            "labels": creates[0]["labels"],
+            "workspace": "/opt/work/project",
+            "git": None,
+        }
     else:
         assert len(creates) == 1

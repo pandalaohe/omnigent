@@ -382,6 +382,7 @@ async def list_worktrees_on_host(
     return worktrees
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- task identities keep in-flight work alive
 _worktree_admission_refresh_tasks: set[asyncio.Task[bool]] = set()
 
 

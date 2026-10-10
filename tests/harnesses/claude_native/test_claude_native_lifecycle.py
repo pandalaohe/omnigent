@@ -11,11 +11,12 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from filelock import FileLock
 
 from omnigent._platform import stable_user_id
-from omnigent.harnesses.claude_native import bridge, hook, lifecycle
+from omnigent.harnesses.claude_native import bridge, forwarder, hook, lifecycle
 from omnigent.inner.terminal_lifecycle import (
     TERMINAL_INSTANCE_ID_ENV,
     TERMINAL_LAUNCH_ID_ENV,
@@ -324,19 +325,35 @@ def test_repeated_end_observations_keep_the_original_time_and_stable_event_id(
     assert _read(launch) == snapshot
 
 
-def test_source_capture_precedes_synchronous_session_rotation(
+@pytest.mark.asyncio
+async def test_source_capture_precedes_clear_session_rotation(
     launch: tuple[Path, TerminalLifecycleTrace], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     directory, _ = launch
 
-    def rotate(_directory: Path) -> str:
+    async def rotate(*, client: httpx.AsyncClient, old_session_id: str, bridge_dir: Path) -> str:
+        assert old_session_id == "session-a"
+        assert bridge_dir == directory
         snapshot = _read(launch)
         assert snapshot["session_start"]["recorded_at"] == 100.0
+        assert snapshot["session_start"]["bridge_session_id"] == "session-a"
+        assert '"source":"clear"' in (directory / "hooks.jsonl").read_text()
         bridge.write_active_session_id(directory, "session-b")
         return "session-b"
 
-    monkeypatch.setattr(hook, "_rotate_session_on_clear", rotate)
+    monkeypatch.setattr(forwarder, "_create_clear_replacement_session", rotate)
     _hook(monkeypatch, directory, "SessionStart", 100.0, source="clear")
+    assert bridge.read_active_session_id(directory) == "session-a"
+    async with httpx.AsyncClient() as client:
+        state = await forwarder._ensure_hook_state(
+            directory, start_at_end=False, session_id="session-a"
+        )
+        assert (
+            await forwarder._maybe_rotate_session_on_clear(
+                client=client, session_id="session-a", bridge_dir=directory, state=state
+            )
+            == "session-b"
+        )
     assert _read(launch)["session_start"]["bridge_session_id"] == "session-a"
     assert bridge.read_active_session_id(directory) == "session-b"
 
