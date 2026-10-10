@@ -5074,6 +5074,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         receipt_id: str,
         *,
         reverse_of: bool = False,
+        allow_empty: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Move old's still-unarchived direct children and their subtrees under new.
 
@@ -5081,11 +5082,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         the receipt — commits in one AP transaction, so a crash leaves either
         the whole move or none of it. A child archived concurrently before its
         lock is simply left behind; when that leaves nothing to move, nothing
-        at all is written.
+        at all is written unless ``allow_empty`` requests a receipt.
 
         :param old_id: Top-level session whose children move.
         :param new_id: Top-level successor session.
         :param receipt_id: Pre-generated id for the receipt row.
+        :param allow_empty: Write the receipt even without live children.
         :param reverse_of: When ``True`` this move reverses an existing link
             (``new_id.succeeded_by == old_id``); the forward pair is removed
             in the same transaction, and only once the move is known to
@@ -5144,7 +5146,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_sess.refresh(candidate)
                 if not candidate.archived:
                     kept.append(candidate)
-            if not kept:
+            if not kept and not allow_empty:
                 return ([], [])
 
             # Application-level uniqueness has no DB constraint: refuse

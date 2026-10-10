@@ -2849,9 +2849,12 @@ class SessionSuccessionRequest(BaseModel):
     :param target_session_id: The successor session that takes the caller's
         live children, e.g. ``"conv_abc123"``. Must be a top-level session
         the caller can edit.
+    :param allow_empty: Complete succession and archive the old session even
+        when it has no live children. Default preserves ordinary rotation.
     """
 
     target_session_id: str = Field(min_length=1)
+    allow_empty: bool = False
 
 
 class SessionHandoverRequest(BaseModel):

@@ -446,6 +446,37 @@ async def test_succession_noop_without_live_children(
     assert store.get_succession(old, new) is None
 
 
+async def test_succession_can_archive_without_live_children(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+) -> None:
+    """A user clear finishes the same phases even without live children."""
+    old = _create(store, title="previous")
+    new = _create(store, title="successor")
+    pending_elicitations.record_publish(old, _question_event())
+    response = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new, "allow_empty": True},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "done"
+    assert response.json()["moved_ids"] == []
+    previous = store.get_conversation(old)
+    assert previous is not None and previous.archived
+    assert previous.labels[SUCCEEDED_BY_LABEL_KEY] == new
+    assert pending_elicitations.count_for(old) == 0
+    assert len(_succession_notices(store, new)) == 1
+    assert wake.await_count == 1
+    retry = await client.post(
+        f"/v1/sessions/{old}/succession",
+        json={"target_session_id": new, "allow_empty": True},
+    )
+    assert retry.json()["status"] == "done"
+    assert len(_succession_notices(store, new)) == 1
+
+
 async def test_succession_noop_for_child_session(
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,

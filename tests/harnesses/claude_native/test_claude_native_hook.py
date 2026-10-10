@@ -245,186 +245,32 @@ def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
     }
 
 
-def test_clear_session_start_hook_rotates_before_printing_conversation_url(
+def test_clear_session_start_hook_only_records_rotation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """
-    ``/clear`` SessionStart prints the URL for the replacement Omnigent session.
-
-    Claude renders hook stdout immediately, before the background
-    forwarder can poll the hook log. This test fails if the banner
-    regresses to the launch conversation URL after ``/clear``.
-    """
-    requests: list[tuple[str, str, dict[str, object] | None]] = []
-
-    class _FakeHttpxClient:
-        """
-        Minimal sync HTTP client stub for clear-session rotation.
-
-        :param headers: Headers passed to :class:`httpx.Client`.
-        :param timeout: Timeout passed to :class:`httpx.Client`.
-        """
-
-        captured_timeouts: list[object] = []
-
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
-            """
-            Capture constructor inputs.
-
-            :param headers: HTTP headers for AP.
-            :param timeout: HTTP timeout object.
-            :returns: None.
-            """
-            del headers
-            self.captured_timeouts.append(timeout)
-
-        def __enter__(self) -> _FakeHttpxClient:
-            """
-            Enter the context manager.
-
-            :returns: This fake client.
-            """
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            """
-            Exit the context manager.
-
-            :param args: Exception details.
-            :returns: None.
-            """
-            del args
-
-        def get(self, url: str) -> object:
-            """
-            Return the old session snapshot.
-
-            :param url: Target Omnigent URL.
-            :returns: HTTP response object.
-            """
-            import httpx
-
-            requests.append(("GET", url, None))
-            return httpx.Response(
-                200,
-                json={
-                    "id": "conv_old",
-                    "agent_id": "ag_claude",
-                    "runner_id": "runner_one",
-                    "labels": {"omnigent.claude_native.bridge_id": "bridge_shared"},
-                },
-                request=httpx.Request("GET", url),
-            )
-
-        def post(self, url: str, *, json: dict[str, object]) -> object:
-            """
-            Create the replacement session or transfer the terminal.
-
-            :param url: Target Omnigent URL.
-            :param json: Request JSON body.
-            :returns: HTTP response object.
-            """
-            import httpx
-
-            requests.append(("POST", url, json))
-            if url == "http://127.0.0.1:8787/v1/sessions":
-                return httpx.Response(
-                    201,
-                    json={"id": "conv_new"},
-                    request=httpx.Request("POST", url),
-                )
-            return httpx.Response(
-                200,
-                json={"id": "terminal_claude_main"},
-                request=httpx.Request("POST", url),
-            )
-
-        def patch(self, url: str, *, json: dict[str, object]) -> object:
-            """
-            Bind the new session or clear the old runner binding.
-
-            :param url: Target Omnigent URL.
-            :param json: Request JSON body.
-            :returns: HTTP response object.
-            """
-            import httpx
-
-            requests.append(("PATCH", url, json))
-            return httpx.Response(
-                200,
-                json={"id": "patched"},
-                request=httpx.Request("PATCH", url),
-            )
-
+    """The forwarder alone creates a replacement for a recorded /clear."""
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
-    bridge_dir = prepare_bridge_dir(
-        "conv_old",
-        bridge_id="bridge_shared",
-        workspace=tmp_path,
-    )
-    build_hook_settings(
-        bridge_dir,
-        ap_server_url="http://127.0.0.1:8787",
-        ap_auth_headers={"Authorization": "Bearer xyz"},
-    )
-    payload = {
-        "hook_event_name": "SessionStart",
-        "source": "clear",
-        "transcript_path": str(tmp_path / "session.jsonl"),
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
 
-    exit_code = claude_native_hook.main(["--bridge-dir", str(bridge_dir)])
+    def unexpected_client(**_kwargs: object) -> None:
+        pytest.fail("The /clear hook must not create a second replacement")
 
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert json.loads(captured.out) == {
-        "systemMessage": "Open this session in Omnigent: http://127.0.0.1:8787/c/conv_new"
-    }
-    assert captured.err == ""
-    assert requests == [
-        ("GET", "http://127.0.0.1:8787/v1/sessions/conv_old", None),
-        (
-            "POST",
-            "http://127.0.0.1:8787/v1/sessions",
-            {
-                "agent_id": "ag_claude",
-                "labels": {"omnigent.claude_native.bridge_id": "bridge_shared"},
-            },
-        ),
-        ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_new", {"runner_id": "runner_one"}),
-        (
-            "POST",
-            (
-                "http://127.0.0.1:8787/v1/sessions/conv_old/resources/"
-                "terminals/terminal_claude_main/transfer"
-            ),
-            {"target_session_id": "conv_new"},
-        ),
-        (
-            "PATCH",
-            "http://127.0.0.1:8787/v1/sessions/conv_old",
-            {
-                "runner_id": "",
-                "labels": {"omnigent.claude_native.bridge_id": "conv_old-cleared"},
-            },
-        ),
-    ]
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", unexpected_client)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({"hook_event_name": "SessionStart", "source": "clear"})),
+    )
+    assert claude_native_hook.main(["--bridge-dir", str(bridge_dir)]) == 0
     recorded = (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8")
-    assert '"omnigent_clear_rotated_to":"conv_new"' in recorded
-    # The /clear rotation gates Claude's welcome banner and must fail
-    # fast — it uses _SESSION_ROTATION_TIMEOUT_S, NOT the day-long
-    # permission long-poll budget. If this regresses to
-    # _PERMISSION_TIMEOUT_S (86400) an unresponsive Omnigent server would hang
-    # the banner for a full day instead of returning None so the
-    # background forwarder can rotate.
-    rotation_timeout = _FakeHttpxClient.captured_timeouts[0]
-    assert isinstance(rotation_timeout, httpx.Timeout)
-    assert rotation_timeout.read == claude_native_hook._SESSION_ROTATION_TIMEOUT_S
+    assert '"source":"clear"' in recorded
+    assert "omnigent_clear_rotated_to" not in recorded
+    captured = capsys.readouterr()
+    assert captured.err == ""
 
 
 def test_fork_session_start_hook_forks_before_printing_conversation_url(

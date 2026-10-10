@@ -28,6 +28,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 )
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
+    BRIDGE_DIR_ENV_VAR,
     BRIDGE_ID_LABEL_KEY,
     ClaudeNativeHookInterpreterMismatchError,
     bridge_dir_for_bridge_id,
@@ -2745,22 +2746,13 @@ def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
+async def test_auto_create_claude_terminal_keeps_successor_bridge_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    use_envelope: bool,
 ) -> None:
-    """
-    Auto-create corrects a stale ``bridge_id`` label on the Omnigent session.
-
-    If a prior rotation left ``BRIDGE_ID_LABEL_KEY`` set to an older
-    bridge id (e.g. ``"m0-bridge_from_prior_rotation"``),
-    ``_auto_create_claude_terminal`` must PATCH the label to
-    ``session_id`` before proceeding.  Without the correction,
-    ``_ensure_comment_relay_started`` would later read the stale label
-    and write ``tool_relay.json`` into the wrong bridge dir — the bridge
-    MCP subprocess would never see it and the relay tools
-    (``list_comments``, ``sys_session_list``, etc.) would be absent.
-    """
+    """A restarted /clear successor launches in its stored shared bridge."""
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -2769,11 +2761,28 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._schedule_terminal_interactive_observer",
+        lambda **_kwargs: None,
+    )
+
+    class _FakeTerminalRegistry:
+        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+            del conversation_id, terminal_name, session_key
+            return type(
+                "Terminal",
+                (),
+                {
+                    "running": True,
+                    "socket_path": "/opt/work/claude.sock",
+                    "tmux_target": "claude:0.0",
+                },
+            )()
 
     class _FakeResourceRegistry:
-        """Returns a minimal terminal view; no live terminal registry."""
+        """Returns a minimal terminal view and tmux target."""
 
-        terminal_registry = None
+        terminal_registry = _FakeTerminalRegistry()
 
         async def launch_required_terminal(
             self,
@@ -2814,7 +2823,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
             200,
             json={
                 "reasoning_effort": None,
-                "labels": {BRIDGE_ID_LABEL_KEY: "m0-bridge_from_prior_rotation"},
+                "labels": {BRIDGE_ID_LABEL_KEY: "bridge_from_clear_source"},
             },
             request=req,
         )
@@ -2824,35 +2833,61 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
         transport=httpx.MockTransport(_handle),
     )
 
+    session_id = "9a0bec6675dc7ac693d7bf6f53cfb984"
+    labels = {BRIDGE_ID_LABEL_KEY: "bridge_from_clear_source"}
+    envelope = (
+        RunnerSessionInitEnvelope(
+            protocol_version=2,
+            server_version="test",
+            session_id=session_id,
+            agent_id="agent",
+            snapshot={
+                "created_at": 0,
+                "updated_at": 0,
+                "workspace": str(tmp_path),
+                "labels": labels,
+            },
+        )
+        if use_envelope
+        else None
+    )
+    from omnigent.runner.native import _resolve_native_spawn_env
+
+    spawn_env = await _resolve_native_spawn_env(
+        "claude-native",
+        session_id,
+        server_client=fake_client,
+        optional_labels=envelope.snapshot.labels if envelope is not None else None,
+    )
     await _auto_create_claude_terminal(
-        "9a0bec6675dc7ac693d7bf6f53cfb984",
+        session_id,
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
+        session_init=envelope,
     )
 
     await fake_client.aclose()
 
-    # Exactly one PATCH request must have been sent to correct the label.
-    # 0 means the fix was not applied and the relay would target the wrong dir.
-    patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
-    assert len(patch_requests) == 1, (
-        f"Expected exactly one PATCH to correct the stale bridge_id label; "
-        f"got {len(patch_requests)}. 0 means _auto_create_claude_terminal did "
-        f"not update the label, so _ensure_comment_relay_started would write "
-        f"tool_relay.json to a dir the bridge subprocess never reads."
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("bridge_from_clear_source")
+    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id(session_id)
+    assert spawn_env is not None
+    assert spawn_env[BRIDGE_DIR_ENV_VAR] == str(bridge_dir)
+    assert (bridge_dir / "tmux.json").exists()
+    assert not natural_dir.exists()
+    assert (
+        envelope is None
+        or envelope.snapshot.labels[BRIDGE_ID_LABEL_KEY] == "bridge_from_clear_source"
     )
+
+    patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
+    assert len(patch_requests) == (0 if use_envelope else 1)
 
     import json as _json
 
-    patch_body = _json.loads(patch_requests[0].content)
-    assert (
-        patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == "9a0bec6675dc7ac693d7bf6f53cfb984"
-    ), (
-        f"PATCH must set {BRIDGE_ID_LABEL_KEY!r} to the session_id "
-        f"'9a0bec6675dc7ac693d7bf6f53cfb984' so _ensure_comment_relay_started finds the "
-        f"correct bridge dir; got {patch_body.get('labels', {})!r}"
-    )
+    if patch_requests:
+        patch_body = _json.loads(patch_requests[0].content)
+        assert patch_body["labels"][BRIDGE_ID_LABEL_KEY] == "bridge_from_clear_source"
 
 
 @pytest.mark.asyncio

@@ -9818,6 +9818,12 @@
       "SessionSuccessionRequest": {
         "description": "Request body for `POST /v1/sessions/{session_id}/succession`.\n\nStarts (or resumes) handing the caller session's live children to the\ntarget session.",
         "properties": {
+          "allow_empty": {
+            "default": false,
+            "description": "Complete succession and archive the old session even when it has no live children. Default preserves ordinary rotation.",
+            "title": "Allow Empty",
+            "type": "boolean"
+          },
           "target_session_id": {
             "description": "The successor session that takes the caller's live children, e.g. `\"conv_abc123\"`. Must be a top-level session the caller can edit.",
             "minLength": 1,
@@ -20855,7 +20861,7 @@
     },
     "/v1/sessions/{session_id}/succession": {
       "post": {
-        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop` \u2014 ordinary rotations\nmust keep today's behaviour. Undo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe move transaction clears the forward pair and writes the inverse.",
+        "description": "Hand a top-level session's live children to its successor.\n\nThe caller must hold edit access on both sessions. A session without\na parent and without live children is a `noop`, unless `allow_empty`\nrequests retirement. Undo is the same call reversed: when the\ntarget still points back at the caller via `omnigent.succeeded_by`,\nthe move transaction clears the forward pair and writes the inverse.",
         "operationId": "start_session_succession_v1_sessions__session_id__succession_post",
         "parameters": [
           {

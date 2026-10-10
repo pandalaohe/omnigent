@@ -1368,6 +1368,7 @@ class ConversationStore(ABC):
         receipt_id: str,
         *,
         reverse_of: bool = False,
+        allow_empty: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Move old's still-unarchived direct children and their subtrees under new.
 
@@ -1375,12 +1376,14 @@ class ConversationStore(ABC):
         child of ``old`` under its own lock and keep only the unarchived ones,
         reparent them to ``new``, rewrite ``root_conversation_id`` across
         their subtrees, write the succession labels and the receipt with
-        phase ``moved``. When no child is kept nothing is written and
+        phase ``moved``. Unless ``allow_empty``, no child kept means nothing is written and
         ``([], [])`` is returned; refusals raise before any write.
 
         :param old_id: Top-level session whose children move.
         :param new_id: Top-level successor session.
         :param receipt_id: Pre-generated id for the receipt row.
+        :param allow_empty: Write a receipt even without live children, so
+            the caller can finish succession and archive the old session.
         :param reverse_of: When ``True`` this move reverses an existing link
             (``new_id.succeeded_by == old_id``); the forward pair is removed
             in the same transaction, and only once the move is known to

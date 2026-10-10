@@ -31,9 +31,11 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lost_reply", [False, "transport", "proxy"])
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lost_reply: bool | str,
 ) -> None:
     """
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
@@ -76,6 +78,8 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                     "id": "conv_old",
                     "agent_id": "ag_claude",
                     "runner_id": "runner_one",
+                    "project_id": "project_alpha",
+                    "workspace": "/opt/work/claude-project",
                     "labels": {
                         "omnigent.ui": "terminal",
                         BRIDGE_ID_LABEL_KEY: "bridge_shared",
@@ -85,6 +89,9 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
         if request.method == "POST" and request.url.path == "/v1/sessions":
             assert body == {
                 "agent_id": "ag_claude",
+                "project_id": "project_alpha",
+                "workspace": "/opt/work/claude-project",
+                "git": None,
                 "labels": {
                     "omnigent.ui": "terminal",
                     BRIDGE_ID_LABEL_KEY: "bridge_shared",
@@ -94,12 +101,21 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
             assert body == {"runner_id": "runner_one"}
             return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "GET" and request.url.path.endswith(
+            "/terminals/terminal_claude_main"
+        ):
+            status = 200 if "/conv_new/" in request.url.path else 404
+            return httpx.Response(status, json={"id": "terminal_claude_main"})
         if (
             request.method == "POST"
             and request.url.path
             == "/v1/sessions/conv_old/resources/terminals/terminal_claude_main/transfer"
         ):
             assert body == {"target_session_id": "conv_new"}
+            if lost_reply == "proxy":
+                return httpx.Response(502, json={"error": {"message": "Runner reply lost"}})
+            if lost_reply:
+                raise httpx.ReadTimeout("transfer reply lost", request=request)
             return httpx.Response(200, json={"id": "terminal_claude_main"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_old":
             assert body == {
@@ -107,6 +123,9 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                 "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
             }
             return httpx.Response(200, json={"id": "conv_old"})
+        if request.url.path == "/v1/sessions/conv_old/succession":
+            assert body == {"target_session_id": "conv_new", "allow_empty": True}
+            return httpx.Response(200, json={"status": "done"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     transport = httpx.MockTransport(handler)
@@ -139,13 +158,16 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     assert read_active_session_id(bridge_dir) == "conv_new"
     assert not (bridge_dir / "transcript_forwarder.json").exists()
     assert (bridge_dir / "hook_forwarder.json").exists()
-    assert calls == [
+    assert [call for call in calls if call[0] != "GET" or call[1] == "/v1/sessions/conv_old"] == [
         ("GET", "/v1/sessions/conv_old", None),
         (
             "POST",
             "/v1/sessions",
             {
                 "agent_id": "ag_claude",
+                "project_id": "project_alpha",
+                "workspace": "/opt/work/claude-project",
+                "git": None,
                 "labels": {
                     "omnigent.ui": "terminal",
                     BRIDGE_ID_LABEL_KEY: "bridge_shared",
@@ -163,13 +185,66 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             "/v1/sessions/conv_old",
             {"runner_id": "", "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
         ),
+        (
+            "POST",
+            "/v1/sessions/conv_old/succession",
+            {"target_session_id": "conv_new", "allow_empty": True},
+        ),
     ]
+    if lost_reply:
+        assert [path for method, path, _body in calls if method == "GET"][1:] == [
+            "/v1/sessions/conv_old/resources/terminals/terminal_claude_main",
+            "/v1/sessions/conv_new/resources/terminals/terminal_claude_main",
+        ]
 
 
 @pytest.mark.asyncio
+async def test_requested_handover_keeps_empty_succession_default(
+    tmp_path: Path,
+) -> None:
+    """The empty-retirement request is confined to user /clear."""
+    from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
+
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "agent_id": "ag_claude",
+                    "runner_id": "runner_one",
+                    "labels": {
+                        BRIDGE_ID_LABEL_KEY: "stale",
+                        ROTATE_REQUESTED_LABEL_KEY: "0",
+                    },
+                },
+            )
+        if request.url.path == "/v1/sessions":
+            assert json.loads(request.content)["labels"][BRIDGE_ID_LABEL_KEY] == "bridge_shared"
+            return httpx.Response(201, json={"id": "conv_new"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        assert (
+            await forwarder._create_clear_replacement_session(
+                client=client, old_session_id="conv_old", bridge_dir=bridge_dir
+            )
+            == "conv_new"
+        )
+    assert not any(path.endswith("/succession") for path in paths)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_transport_error", [False, True])
 async def test_clear_hook_rotation_survives_old_runner_clear_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cleanup_transport_error: bool,
 ) -> None:
     """
     Old runner-binding cleanup failure must not retry the fork.
@@ -232,7 +307,11 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
                 "runner_id": "",
                 "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
             }
+            if cleanup_transport_error:
+                raise httpx.ReadTimeout("cleanup reply lost", request=request)
             return httpx.Response(503, json={"error": {"message": "temporary failure"}})
+        if request.url.path == "/v1/sessions/conv_old/succession":
+            return httpx.Response(200, json={"status": "done"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     transport = httpx.MockTransport(handler)
@@ -267,9 +346,11 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("target_has_terminal", [False, True])
 async def test_clear_hook_transfer_failure_does_not_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    target_has_terminal: bool,
 ) -> None:
     """
     A terminal-transfer failure during /clear must NOT spin into a session loop.
@@ -290,6 +371,8 @@ async def test_clear_hook_transfer_failure_does_not_loop(
         {"hook_event_name": "SessionStart", "source": "clear"},
     )
     create_count = 0
+    archived: list[str] = []
+    closed: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Mock rotation endpoints with a failing terminal transfer."""
@@ -308,7 +391,24 @@ async def test_clear_hook_transfer_failure_does_not_loop(
             create_count += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
+            body = json.loads(request.content)
+            if body.get("archived"):
+                assert body == {
+                    "archived": True,
+                    "runner_id": "",
+                    "labels": {BRIDGE_ID_LABEL_KEY: "conv_new-cleared"},
+                }
+                archived.append("conv_new")
             return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "DELETE" and "/conv_new/" in request.url.path:
+            closed.append("conv_new")
+            return httpx.Response(200, json={"deleted": True})
+        if request.method == "GET" and request.url.path.endswith(
+            "/terminals/terminal_claude_main"
+        ):
+            if target_has_terminal:
+                return httpx.Response(200, json={"id": "terminal_claude_main"})
+            return httpx.Response(404, json={"error": {"message": "No terminal"}})
         if (
             request.method == "POST"
             and request.url.path
@@ -349,6 +449,153 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     assert rotated_again is None
     # Exactly one replacement-session create — not one per poll.
     assert create_count == 1
+    assert archived == ["conv_new"]
+    assert closed == (["conv_new"] if target_has_terminal else [])
+    assert read_active_session_id(bridge_dir) == "conv_old"
+
+
+@pytest.mark.asyncio
+async def test_clear_retries_the_same_candidate_after_unavailable_ownership_probe(
+    tmp_path: Path,
+) -> None:
+    """An uncertain transfer survives reload without creating another session."""
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "source": "clear"})
+    creates = 0
+    transferred = False
+    probe_unavailable = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, transferred, probe_unavailable
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200, json={"agent_id": "ag_claude", "runner_id": "runner_one", "labels": {}}
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            creates += 1
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.url.path.endswith("/transfer"):
+            transferred = True
+            return httpx.Response(502, json={"error": {"message": "Reply lost"}})
+        if request.method == "GET" and "/terminals/" in request.url.path:
+            if probe_unavailable:
+                probe_unavailable = False
+                return httpx.Response(503, json={"error": {"message": "Probe unavailable"}})
+            present = transferred if "/conv_new/" in request.url.path else not transferred
+            return httpx.Response(200 if present else 404, json={})
+        if request.method == "PATCH":
+            assert not json.loads(request.content).get("archived")
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await forwarder._maybe_rotate_session_on_clear(
+                client=client, session_id="conv_old", bridge_dir=bridge_dir, state=state
+            )
+        pending = forwarder._read_hook_state(bridge_dir)
+        assert pending is not None and pending.pending_clear_new_id == "conv_new"
+        forwarder.reset_transcript_forward_state(bridge_dir)
+        reloaded = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        rotated = await forwarder._maybe_rotate_session_on_clear(
+            client=client, session_id="conv_old", bridge_dir=bridge_dir, state=reloaded
+        )
+    assert rotated == "conv_new"
+    assert creates == 1
+    assert read_active_session_id(bridge_dir) == "conv_new"
+    completed = forwarder._read_hook_state(bridge_dir)
+    assert completed is not None and completed.pending_clear_new_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected", [False, True])
+async def test_clear_checkpoint_finishes_after_detach_reply_is_lost(
+    tmp_path: Path,
+    rejected: bool,
+) -> None:
+    """Accepted transfer and completed rejection survive the detach window."""
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "source": "clear"})
+    creates = 0
+    detached = False
+    retired = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, detached, retired
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "agent_id": "ag_claude",
+                    "runner_id": "" if detached and not rejected else "runner_one",
+                    "labels": {},
+                },
+            )
+        if request.method == "GET" and path == "/v1/sessions/conv_new":
+            return httpx.Response(
+                200,
+                json={
+                    "archived": detached and rejected,
+                    "labels": {
+                        BRIDGE_ID_LABEL_KEY: "conv_new-cleared" if detached else "bridge_shared"
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            creates += 1
+            return httpx.Response(201, json={"id": "conv_new"})
+        if path.endswith("/transfer"):
+            return httpx.Response(400 if rejected else 200, json={})
+        if request.method == "GET" and "/terminals/" in path:
+            assert not detached, "Do not probe an intentionally unbound session"
+            return httpx.Response(200, json={})
+        if request.method == "PATCH":
+            body = json.loads(request.content)
+            if (not rejected and path.endswith("/conv_old")) or (
+                rejected and body.get("archived")
+            ):
+                if not detached:
+                    detached = True
+                    if rejected:
+                        raise httpx.ReadTimeout("archive reply lost", request=request)
+                    raise asyncio.CancelledError()
+        if path.endswith("/succession"):
+            retired = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        expected = httpx.ReadTimeout if rejected else asyncio.CancelledError
+        with pytest.raises(expected):
+            await forwarder._maybe_rotate_session_on_clear(
+                client=client, session_id="conv_old", bridge_dir=bridge_dir, state=state
+            )
+        reloaded = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        assert reloaded.pending_clear_transferred is not rejected
+        result = await forwarder._maybe_rotate_session_on_clear(
+            client=client,
+            session_id="conv_new" if not rejected else "conv_old",
+            bridge_dir=bridge_dir,
+            state=reloaded,
+        )
+    assert creates == 1
+    assert result == (None if rejected else "conv_new")
+    assert retired is not rejected
+    completed = forwarder._read_hook_state(bridge_dir)
+    assert completed is not None and completed.pending_clear_new_id is None
 
 
 @pytest.mark.asyncio

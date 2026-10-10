@@ -198,8 +198,8 @@ def register_succession_routes(
         Hand a top-level session's live children to its successor.
 
         The caller must hold edit access on both sessions. A session without
-        a parent and without live children is a ``noop`` — ordinary rotations
-        must keep today's behaviour. Undo is the same call reversed: when the
+        a parent and without live children is a ``noop``, unless ``allow_empty``
+        requests retirement. Undo is the same call reversed: when the
         target still points back at the caller via ``omnigent.succeeded_by``,
         the move transaction clears the forward pair and writes the inverse.
         """
@@ -246,13 +246,14 @@ def register_succession_routes(
                     target_id,
                     receipt_id,
                     reverse_of=reverse_of,
+                    allow_empty=body.allow_empty,
                 )
             except SuccessionRefusedError as exc:
                 raise OmnigentError(
                     f"succession refused: {exc.code}: {exc}",
                     code=ErrorCode.CONFLICT,
                 ) from exc
-            if not direct_ids:
+            if not direct_ids and not body.allow_empty:
                 return {"status": "noop"}
         else:
             receipt_id = receipt.id
