@@ -1676,6 +1676,9 @@ function ProjectFolder({
 }) {
   const query = useProjectSessions(name, expanded);
   const { registerFolder } = useSidebarData();
+  const hidePinnedHomeCopies =
+    useSidebarLayoutContext()?.layout.sections.some((section) => section.kind === "favorites") ===
+    true;
   const watchedRows = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? [],
     [query.data],
@@ -1695,9 +1698,22 @@ function ProjectFolder({
     const byId = new Map<string, Conversation>();
     for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
     for (const c of windowConversations) byId.set(c.id, c);
-    // A pinned session stays in its folder too (favorites is a copy).
-    return sortByUpdatedAtDesc([...byId.values()], activeOverride, frozenSortKeys);
-  }, [query.data, windowConversations, activeOverride, frozenSortKeys]);
+    // Pinning changes where the row is shown, not its project membership.
+    return sortByUpdatedAtDesc(
+      [...byId.values()].filter(
+        (c) => !hidePinnedHomeCopies || !pinnedConversationIds.includes(c.id),
+      ),
+      activeOverride,
+      frozenSortKeys,
+    );
+  }, [
+    query.data,
+    windowConversations,
+    hidePinnedHomeCopies,
+    pinnedConversationIds,
+    activeOverride,
+    frozenSortKeys,
+  ]);
   const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
@@ -1724,17 +1740,12 @@ function ProjectFolder({
   // The whole folder (collapsed header included) is a drop target: releasing a
   // dragged session anywhere on it files the session into this project. The
   // `project:` prefix keeps the droppable id clear of conversation ids (the
-  // draggable ids) and the ungroup sentinel. A favorites copy's drop target is
-  // its header sortable instead (`fav-item`), so its project drop is disabled.
-  const { setNodeRef, isOver } = useDroppable(
-    favoriteItem !== undefined
-      ? {
-          id: `fav-copy-root:${favoriteItem.sectionId}:${projectId ?? name}`,
-          data: { type: "fav-copy-root" },
-          disabled: true,
-        }
-      : { id: `project:${name}`, data: { type: "project", name } },
-  );
+  // draggable ids) and the ungroup sentinel. A favorite project's header has
+  // its own sortable target; the folder body still accepts session drops.
+  const { setNodeRef, isOver } = useDroppable({
+    id: `project:${name}`,
+    data: { type: "project", name },
+  });
 
   const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(
     name,
@@ -2358,6 +2369,8 @@ function ConversationList({
   // sessions render in their own group at the bottom (below "Shared with
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
+  // Removing Favorites must reveal existing server pins in their home lists.
+  const hidePinnedHomeCopies = layout.sections.some((section) => section.kind === "favorites");
   const loadedSections = useMemo(() => {
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
@@ -2375,8 +2388,7 @@ function ConversationList({
             ? notArchived.filter((c) => isOwnedByViewer(c, viewerId))
             : notArchived;
 
-    // Pinned sessions render in the favorites section AND stay in their project
-    // folder / the flat Sessions list. Ordered by the `omnigent.pinned` label
+    // With Favorites present, pinned sessions render there in order of the `omnigent.pinned` label
     // value (pin time, or a dragged position; newest pin at the bottom), NOT by
     // `updated_at`, so a pinned session holds its slot when a new message bumps
     // its `updated_at`. Pins are ownership-agnostic, so the favorites section
@@ -2394,8 +2406,8 @@ function ConversationList({
     // gated on ownership: a folder only ever holds the viewer's OWNED sessions.
     // Without the guard the legacy label arm would match a shared session by
     // project name alone, pulling a foreign session into the viewer's folder
-    // (and out of the flat Shared list via filedIds). A pinned session stays in
-    // its folder too.
+    // (and out of the flat Shared list via filedIds). The folder's view filters
+    // pinned rows while the membership remains on the server.
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
@@ -2423,9 +2435,11 @@ function ConversationList({
     // unloaded page. We render it as a folder with a "No sessions" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Sessions: the remainder — every unfiled row, pinned included.
+    // Sessions: unfiled rows without a pinned copy.
     const sessions = sortByUpdatedAtDesc(
-      tabScoped.filter((c) => !filedIds.has(c.id)),
+      tabScoped.filter(
+        (c) => !filedIds.has(c.id) && (!hidePinnedHomeCopies || !pinnedSet.has(c.id)),
+      ),
       activeOverride,
       frozenKeys,
     );
@@ -2434,6 +2448,7 @@ function ConversationList({
     allConversations,
     pinnedConversations,
     pinnedSet,
+    hidePinnedHomeCopies,
     activeOverride,
     frozenKeys,
     projects,
@@ -2477,12 +2492,21 @@ function ConversationList({
     return claimed;
   }, [layout.sections]);
 
+  const favoriteProjectIds = useMemo(() => {
+    const favorites = layout.sections.find((section) => section.kind === "favorites");
+    return new Set(
+      (favorites?.items ?? []).filter((ref) => ref.type === "project").map((ref) => ref.id),
+    );
+  }, [layout.sections]);
+
   const unclaimedProjectGroups = useMemo(
     () =>
       sections.projectGroups.filter(
-        (group) => group.id === null || !claimedProjectIds.has(group.id),
+        (group) =>
+          group.id === null ||
+          (!claimedProjectIds.has(group.id) && !favoriteProjectIds.has(group.id)),
       ),
-    [sections.projectGroups, claimedProjectIds],
+    [sections.projectGroups, claimedProjectIds, favoriteProjectIds],
   );
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
@@ -3042,13 +3066,17 @@ function ConversationList({
     for (const list of folderConversations.values()) {
       for (const c of list) byId.set(c.id, c);
     }
-    return rows.map((row) => byId.get(row.id) ?? row);
+    return rows
+      .filter((row) => !hidePinnedHomeCopies || !pinnedSet.has(row.id))
+      .map((row) => byId.get(row.id) ?? row);
   }, [
     recentQuery.data,
     sections.pinned,
     sections.projectGroups,
     loadedSections.sessions,
     folderConversations,
+    pinnedSet,
+    hidePinnedHomeCopies,
   ]);
   const projectLabelFor = useCallback(
     (conversation: Conversation): string | undefined => {
@@ -3078,7 +3106,11 @@ function ConversationList({
     const withRows = (group: SidebarProjectGroup, instanceKey?: string): ResolvedProjectGroup => {
       const key = instanceKey === undefined ? group.name : `${group.name}#${instanceKey}`;
       const snapshot = folderConversations.get(key);
-      if (snapshot === undefined) return { group, rows: group.conversations };
+      if (snapshot === undefined)
+        return {
+          group,
+          rows: group.conversations.filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id)),
+        };
       const current = new Map(group.conversations.map((c) => [c.id, c] as const));
       const rows: Conversation[] = [];
       const seen = new Set<string>();
@@ -3091,7 +3123,7 @@ function ConversationList({
       for (const row of group.conversations) {
         if (!seen.has(row.id)) rows.push(row);
       }
-      return { group, rows };
+      return { group, rows: rows.filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id)) };
     };
     return layout.sections.map((section) => {
       const collapsed = effectiveCollapsedSections.includes(section.id);
@@ -3124,6 +3156,7 @@ function ConversationList({
         }
         case "projects": {
           const resolved = (section.projectIds ?? [])
+            .filter((projectId) => !favoriteProjectIds.has(projectId))
             .map((projectId) => projectGroupsById.get(projectId))
             .filter((group): group is SidebarProjectGroup => group !== undefined);
           if (alphabetical) resolved.sort((a, b) => a.name.localeCompare(b.name));
@@ -3154,6 +3187,9 @@ function ConversationList({
     recentRows,
     allConversations,
     pinnedConversations,
+    pinnedSet,
+    hidePinnedHomeCopies,
+    favoriteProjectIds,
   ]);
 
   // The visible folder copy wins; otherwise the first visible copy in layout
@@ -3270,8 +3306,8 @@ function ConversationList({
     for (const rows of folderConversations.values()) {
       for (const c of rows) byId.set(c.id, c);
     }
-    return [...byId.values()];
-  }, [sections.projectGroups, folderConversations]);
+    return [...byId.values()].filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id));
+  }, [sections.projectGroups, folderConversations, pinnedSet, hidePinnedHomeCopies]);
 
   // The bulk-action bar lives under the header of the section it targets, so it
   // unmounts when that section empties (e.g. every selected session
@@ -3334,8 +3370,8 @@ function ConversationList({
     for (const { section, collapsed, groups, flatSessions, favoriteOrder } of projection) {
       if (collapsed) continue;
       if (section.kind === "projects" || section.kind === "other_projects") {
-        for (const { group } of groups) {
-          if (expandedProjects.includes(group.name)) push(group.conversations);
+        for (const { group, rows } of groups) {
+          if (expandedProjects.includes(group.name)) push(rows);
         }
       } else if (section.kind === "favorites" && favoriteOrder !== undefined) {
         const groupById = new Map(groups.map((entry) => [entry.group.id, entry] as const));
@@ -3588,9 +3624,6 @@ function ConversationList({
             const isProjectDrag = activeType === "project-order";
             const isSectionDrag = activeType === "section-order";
             const isReorderOnly = args.active.data.current?.reorderOnly === true;
-            // A pinned folder / Sessions copy only files / unfiles; it must not
-            // land on a pin or a pin-reorder slot (that would change the pin).
-            const isPinnedMoveOnly = args.active.data.current?.isPinned === true && !isReorderOnly;
             let collisionRect = args.collisionRect;
             if (collisionRect.width === 0 && collisionRect.height === 0) {
               if (args.pointerCoordinates) {
@@ -3620,8 +3653,14 @@ function ConversationList({
               // favorites (the ungroup / Sessions zone).
               if (isReorderOnly)
                 return type === "pin-order" || type === "fav-item" || type === "ungroup";
-              // A pinned folder / Sessions copy only files / unfiles.
-              if (isPinnedMoveOnly) return type === "project" || type === "ungroup";
+              // A session dropped on a favorite project files into that folder;
+              // dragging the project header itself still reorders favorites.
+              if (
+                activeType === "session" &&
+                type === "fav-item" &&
+                container.data.current?.refType === "project"
+              )
+                return false;
               // A project drag may reorder a folder header or land on a
               // section; a session drag must never land on either.
               if (isProjectDrag)
@@ -4120,9 +4159,7 @@ function ConversationList({
                                             )}
                                             collapsed={sectionCollapsed}
                                             expandedProjects={expandedProjects}
-                                            hasProjectSessions={unclaimedProjectGroups.some(
-                                              (group) => group.conversations.length > 0,
-                                            )}
+                                            hasProjectSessions={projectSessionPool.length > 0}
                                             onExpandAll={expandAllProjects}
                                             onCollapseAll={collapseAllProjects}
                                             onProjectCreated={expandProject}
@@ -4926,6 +4963,8 @@ function ProjectHeaderActions({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-40">
+            <DropdownMenuLabel>Project list actions</DropdownMenuLabel>
+            <DropdownMenuSeparator />
             <DropdownMenuSub>
               <DropdownMenuSubTrigger disabled={orderDisabled}>
                 Sort projects by

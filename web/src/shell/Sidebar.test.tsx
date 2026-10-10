@@ -505,8 +505,7 @@ describe("Sidebar session list", () => {
     });
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Work" }));
-    // A pinned session now also renders in Sessions, so scope the identity
-    // checks to the Pinned section's copy.
+    // Read the Pinned row while the filter query changes.
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     const pinned = within(pinnedSection).getByText("pinned-session");
     const filed = screen.getByText("filed-session");
@@ -1953,7 +1952,7 @@ describe("Sidebar failed session indicator", () => {
     mockConversations([conv("conv_error", "Codex", { status: "failed" })]);
     renderSidebar();
 
-    const pinnedSection = screen.getByRole("button", { name: /^Pinned/ }).closest("section")!;
+    const pinnedSection = screen.getByRole("button", { name: "Pinned" }).closest("section")!;
     const row = within(pinnedSection).getByRole("link", { name: "conv_error" }).closest("li")!;
     expect(within(row).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
       "data-state",
@@ -2842,13 +2841,13 @@ describe("Sidebar project sections", () => {
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
   });
 
-  it("keeps a pinned project session in its folder and the global Pinned section", () => {
+  it("shows a pinned project session only in Pinned while keeping its other folder rows", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_plain", "Claude Code", { labels: { omni_project: "Customer X" } }),
       conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
-    // Pin one of the filed sessions via localStorage (client-side pins).
+    // Pin one of the filed sessions through the server-backed mock.
     seedPins(["conv_pinned"]);
     renderSidebar();
 
@@ -2856,11 +2855,11 @@ describe("Sidebar project sections", () => {
     const pinnedSection = screen.getByText("Pinned").closest("section")!;
     expect(within(pinnedSection).getByText("conv_pinned")).toBeInTheDocument();
 
-    // ...and stays in its project folder too.
+    // Its project membership is intact, but its home copy is hidden.
     fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_plain")).toBeInTheDocument();
-    expect(within(projectSection).getByText("conv_pinned")).toBeInTheDocument();
+    expect(within(projectSection).queryByText("conv_pinned")).toBeNull();
   });
 
   it("does not render a project section when useProjects returns nothing", () => {
@@ -3333,8 +3332,8 @@ describe("Sidebar default section collapse", () => {
     mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
-    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: /Sessions/ })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Pinned" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Sessions" })).toHaveAttribute(
       "aria-expanded",
       "true",
     );
@@ -3347,7 +3346,7 @@ describe("Sidebar default section collapse", () => {
     mockConversations([conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
-    expect(screen.getByRole("button", { name: /Sessions/ })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Sessions" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
@@ -3382,7 +3381,7 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     const { rerender } = render(tree());
 
     // Collapsed to start: the header reports collapsed and the pinned row hides.
-    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Pinned" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
@@ -3395,7 +3394,7 @@ describe("Sidebar auto-expand Pinned on pin", () => {
 
     // The Pinned section auto-expands so the freshly-pinned session is visible,
     // and the expansion is persisted (dropped from the collapsed id list).
-    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Pinned" })).toHaveAttribute("aria-expanded", "true");
     expect(
       JSON.parse(localStorage.getItem("omnigent:collapsed-sidebar-section-ids")!),
     ).not.toContain("default-favorites");

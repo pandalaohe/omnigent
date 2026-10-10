@@ -65,6 +65,26 @@ describe("useSidebarLayout", () => {
     expect(result.current.layout.sections[0].id).toBe("sec_work");
   });
 
+  it("syncs a typed row cap unchanged and reads it back after a storage update", () => {
+    const { result } = renderHook(() => useSidebarLayout());
+    act(() =>
+      result.current.saveLayout((current) => ({
+        ...current,
+        sections: current.sections.map((section) =>
+          section.kind === "other_projects" ? { ...section, maxRows: 37 } : section,
+        ),
+      })),
+    );
+
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)!) as SidebarLayout;
+    expect(stored.sections.find((section) => section.kind === "other_projects")?.maxRows).toBe(37);
+    expect(queuePatchMock).toHaveBeenCalledWith("sidebar_layout", stored);
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY })));
+    expect(
+      result.current.layout.sections.find((section) => section.kind === "other_projects")?.maxRows,
+    ).toBe(37);
+  });
+
   it("re-reads the stored layout on the category and storage events", () => {
     const { result } = renderHook(() => useSidebarLayout());
     localStorage.setItem(
