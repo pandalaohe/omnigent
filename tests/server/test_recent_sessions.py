@@ -401,6 +401,125 @@ async def test_side_chat_message_touches_source(recent_route: _RecentRoute, hops
         assert key not in side_chat_after.labels
 
 
+@pytest.mark.parametrize("through_side_chat", [False, True])
+async def test_side_chat_child_message_touches_source(
+    recent_route: _RecentRoute, through_side_chat: bool
+) -> None:
+    """A side chat's child and a side chat sourced from it touch the source session."""
+    route = recent_route
+    source = route.store.create_conversation(agent_id=route.agent_id, title="source")
+    side_chat = route.store.create_conversation(title="side chat")
+    route.store.set_labels(
+        side_chat.id,
+        {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
+    )
+    child = route.store.create_conversation(
+        kind="sub_agent", parent_conversation_id=side_chat.id, title="child"
+    )
+    assert child.root_conversation_id == side_chat.id
+    sessions = [side_chat, child]
+    current = child
+    if through_side_chat:
+        current = route.store.create_conversation(title="side chat from child")
+        route.store.set_labels(
+            current.id,
+            {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: child.id},
+        )
+        sessions.append(current)
+
+    resp = await route.client.post(
+        f"/v1/sessions/{current.id}/events", json=_user_message("work on it")
+    )
+    assert resp.status_code == 202, resp.text
+
+    recent = await route.client.get("/v1/me/recent-sessions")
+    assert recent.status_code == 200, recent.text
+    assert [row["id"] for row in recent.json()["data"]] == [source.id]
+    key = touched_label_key(None)
+    source_after = route.store.get_conversation(source.id)
+    assert source_after is not None
+    assert key in source_after.labels
+    for session in sessions:
+        session_after = route.store.get_conversation(session.id)
+        assert session_after is not None
+        assert key not in session_after.labels
+
+
+async def test_side_chat_source_read_failure_does_not_fail_message(
+    recent_route: _RecentRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed source read leaves the accepted message without any touch."""
+    route = recent_route
+    source = route.store.create_conversation(agent_id=route.agent_id)
+    side_chat = route.store.create_conversation()
+    route.store.set_labels(
+        side_chat.id,
+        {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
+    )
+    get_conversation = route.store.get_conversation
+    failed_reads: list[str] = []
+
+    def _fail_source_read(conversation_id: str) -> Any:
+        if conversation_id == source.id:
+            failed_reads.append(conversation_id)
+            raise RuntimeError("source read failed")
+        return get_conversation(conversation_id)
+
+    with monkeypatch.context() as context:
+        context.setattr(route.store, "get_conversation", _fail_source_read)
+        resp = await route.client.post(
+            f"/v1/sessions/{side_chat.id}/events", json=_user_message("work on it")
+        )
+    assert resp.status_code == 202, resp.text
+    assert failed_reads == [source.id]
+    for session in (source, side_chat):
+        session_after = route.store.get_conversation(session.id)
+        assert session_after is not None
+        assert not any(is_touched_label_key(key) for key in session_after.labels)
+    recent = await route.client.get("/v1/me/recent-sessions")
+    assert recent.status_code == 200, recent.text
+    assert recent.json()["data"] == []
+
+
+async def test_touch_write_failure_does_not_fail_message(
+    recent_route: _RecentRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed touch write leaves the accepted message without any touch."""
+    route = recent_route
+    source = route.store.create_conversation(agent_id=route.agent_id)
+    side_chat = route.store.create_conversation()
+    route.store.set_labels(
+        side_chat.id,
+        {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
+    )
+    set_labels = route.store.set_labels
+    key = touched_label_key(None)
+    failed_writes: list[str] = []
+
+    def _fail_touch_write(
+        conversation_id: str, updates: dict[str, str], updated_at: int | None = None
+    ) -> None:
+        if key in updates:
+            failed_writes.append(conversation_id)
+            raise RuntimeError("touch write failed")
+        set_labels(conversation_id, updates, updated_at=updated_at)
+
+    with monkeypatch.context() as context:
+        context.setattr(route.store, "set_labels", _fail_touch_write)
+        resp = await route.client.post(
+            f"/v1/sessions/{side_chat.id}/events", json=_user_message("work on it")
+        )
+    assert resp.status_code == 202, resp.text
+    assert failed_writes == [source.id]
+    for session in (source, side_chat):
+        session_after = route.store.get_conversation(session.id)
+        assert session_after is not None
+        assert not any(is_touched_label_key(label) for label in session_after.labels)
+    recent = await route.client.get("/v1/me/recent-sessions")
+    assert recent.status_code == 200, recent.text
+    assert recent.json()["data"] == []
+
+
 @pytest.mark.parametrize("source_kind", ["missing_label", "missing_session", "cycle", "too_deep"])
 async def test_side_chat_without_reachable_source_does_not_touch(
     recent_route: _RecentRoute, source_kind: str

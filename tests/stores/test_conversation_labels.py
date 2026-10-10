@@ -189,6 +189,7 @@ def test_insert_label_if_absent_first_writer_wins(
         ("  omnigent.artifact_link_key\t", True),
         ("\ufeffomnigent.artifact_link_key", True),
         ("omnigent.artifac\u0167_link_key", True),
+        ("omnigent.artifact_link_ke\u00fd", True),
         ("unrelated", False),
     ],
 )
@@ -216,6 +217,10 @@ def test_is_artifact_link_key_matches_collation_variants(key: str, expected: boo
         ("omnigent.touche\u0111.bob", True),
         ("omnigent.touc\u0127ed.bob", True),
         ("omnigen\u0167.touched.bob", True),
+        ("omnigent.touche\u0111", True),
+        ("omnigent\u00b7touched.bob", True),
+        ("omnigent.touched\u00f8bob", True),
+        ("omnigent.touched\u034f", True),
         ("omnigent.touched_by", False),
         ("omnigent.touchedx.alice", False),
         ("omnigent.pinned.alice", False),

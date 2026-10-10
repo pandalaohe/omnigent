@@ -11702,8 +11702,8 @@ async def _write_touched_label(
     conversation's ``updated_at``.
 
     :param conversation_store: Store owning the label write.
-    :param conv: The addressed conversation; its source's root receives the
-        stamp for a side chat, otherwise its own root does.
+    :param conv: The addressed conversation; root and side-chat source links
+        identify the root session that receives the stamp.
     :param user_id: The interacting user, or ``None`` in single-user mode.
     """
     root_id = conv.root_conversation_id or conv.id
@@ -11711,21 +11711,24 @@ async def _write_touched_label(
     try:
         visited = {conv.id}
         hops = 0
-        while conv.kind == "default" and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
-            source_id = conv.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
-            if not source_id or source_id in visited or hops >= 5:
-                _logger.debug("Cannot resolve side-chat touch source for session %s", conv.id)
+        while True:
+            if conv.root_conversation_id and conv.root_conversation_id != conv.id:
+                next_id = conv.root_conversation_id
+            elif conv.kind == "default" and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+                next_id = conv.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            else:
+                root_id = conv.id
+                break
+            if not next_id or next_id in visited or hops >= 5:
+                _logger.debug("Cannot resolve touch target for session %s", conv.id)
                 return
-            source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
-            if source is None:
-                _logger.debug(
-                    "Missing side-chat touch source %s for session %s", source_id, conv.id
-                )
+            target = await asyncio.to_thread(conversation_store.get_conversation, next_id)
+            if target is None:
+                _logger.debug("Missing touch target %s for session %s", next_id, conv.id)
                 return
-            visited.add(source_id)
+            visited.add(next_id)
             hops += 1
-            conv = source
-        root_id = conv.root_conversation_id or conv.id
+            conv = target
         await asyncio.to_thread(
             conversation_store.set_labels,
             root_id,
