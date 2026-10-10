@@ -322,7 +322,9 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_LOCK_LABEL_KEY,
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
@@ -10501,10 +10503,18 @@ def cleanup_worktree(
     target = conv.worktree or conv.workspace
     if target is None:
         return None
-    if is_entry(conv.host_id, target):
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        recorded_worktree_root,
+    )
+
+    root = recorded_worktree_root(target, conv.labels.get(WORKTREE_ROOT_LABEL_KEY))
+    if root is None:
+        return None
+    if is_entry(conv.host_id, root):
         _logger.warning(
             "Keeping worktree %s: it is a project entry on host %s, not a disposable worktree",
-            target,
+            root,
             conv.host_id,
         )
         return None
@@ -10518,7 +10528,7 @@ async def remove_archived_worktree_best_effort(
     project_host_binding_store: Any,
     conversation_store: ConversationStore,
     exclude_conversation_id: str,
-) -> None:
+) -> bool:
     """
     Remove an archived session's disposable worktree, best-effort.
 
@@ -10558,12 +10568,12 @@ async def remove_archived_worktree_best_effort(
             exc_info=True,
             extra={"session_id": exclude_conversation_id},
         )
-        return
+        return False
     # cleanup_worktree only resolves a target for a session with a host and branch.
     if target is None or conv.host_id is None or conv.git_branch is None:
-        return
+        return False
     try:
-        await _facade._remove_session_worktree_best_effort(
+        return await _facade._remove_session_worktree_best_effort(
             host_id=conv.host_id,
             worktree_path=target,
             branch=conv.git_branch,
@@ -10573,6 +10583,9 @@ async def remove_archived_worktree_best_effort(
             expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
             conversation_store=conversation_store,
             exclude_conversation_id=exclude_conversation_id,
+            safe_only=True,
+            project_host_binding_store=project_host_binding_store,
+            expected_archive_revision=conv.archive_revision,
         )
     except Exception:  # noqa: BLE001
         _logger.warning(
@@ -10581,6 +10594,10 @@ async def remove_archived_worktree_best_effort(
             exc_info=True,
             extra={"session_id": exclude_conversation_id},
         )
+        return False
+
+
+_safe_archive_cleanup_tasks: set[asyncio.Task[bool]] = set()
 
 
 async def _remove_session_worktree_best_effort(
@@ -10595,7 +10612,11 @@ async def _remove_session_worktree_best_effort(
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
-) -> None:
+    safe_only: bool = False,
+    project_host_binding_store: Any = None,
+    expected_archive_revision: int | None = None,
+    _admission_lease_held: bool = False,
+) -> bool:
     """
     Best-effort removal of a session's git worktree.
 
@@ -10632,6 +10653,8 @@ async def _remove_session_worktree_best_effort(
         ``False`` so a failed create still surfaces its original error.
     """
     from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        WorktreeHostRefusalError,
         WorktreeHostUnavailableError,
         WorktreeProxyError,
         list_worktrees_on_host,
@@ -10640,6 +10663,80 @@ async def _remove_session_worktree_best_effort(
         worktree_root_fingerprint,
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
+    from omnigent.stores.conversation_store import (
+        ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+        ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+        worktree_admission_fingerprint,
+    )
+
+    recorded_path = worktree_path
+
+    if safe_only and expected_archive_revision is None:
+        if conversation_store is None or exclude_conversation_id is None:
+            return False
+        initial = await asyncio.to_thread(
+            conversation_store.get_conversation, exclude_conversation_id
+        )
+        if initial is None:
+            return False
+        expected_archive_revision = initial.archive_revision
+
+    async def archive_owner_still_matches() -> bool:
+        if not safe_only:
+            return True
+        assert conversation_store is not None and exclude_conversation_id is not None
+        current = await asyncio.to_thread(
+            conversation_store.get_conversation, exclude_conversation_id
+        )
+        return bool(
+            current is not None
+            and current.archived
+            and current.archive_revision == expected_archive_revision
+            and current.host_id == host_id
+            and (current.worktree or current.workspace) == recorded_path
+            and current.git_branch == branch
+            and current.labels.get(WORKTREE_ROOT_LABEL_KEY) == expected_root_fingerprint
+        )
+
+    if safe_only and not _admission_lease_held:
+        host_store = getattr(conversation_store, "_host_binding_store", None)
+        if host_store is None:
+            return False
+
+        async def _under_lease() -> bool:
+            token = await asyncio.to_thread(
+                host_store.acquire_worktree_admission,
+                host_id,
+                required=True,
+                wait_timeout_s=15.0,
+            )
+            try:
+                return await _remove_session_worktree_best_effort(
+                    host_id=host_id,
+                    worktree_path=worktree_path,
+                    branch=branch,
+                    delete_branch=delete_branch,
+                    host_registry=host_registry,
+                    reason=reason,
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=exclude_conversation_id,
+                    fail_if_unavailable=fail_if_unavailable,
+                    expected_root_fingerprint=expected_root_fingerprint,
+                    safe_only=True,
+                    project_host_binding_store=project_host_binding_store,
+                    expected_archive_revision=expected_archive_revision,
+                    _admission_lease_held=True,
+                )
+            finally:
+                await asyncio.to_thread(host_store.release_cli_retention, host_id, token)
+
+        task = asyncio.create_task(_under_lease())
+        _safe_archive_cleanup_tasks.add(task)
+        task.add_done_callback(_safe_archive_cleanup_tasks.discard)
+        return await asyncio.shield(task)
+
+    if not await archive_owner_still_matches():
+        return False
 
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
@@ -10647,19 +10744,28 @@ async def _remove_session_worktree_best_effort(
     # alone and let the last session out clean it up. Checked before host
     # reachability so an offline host does not 409 a delete that would not
     # have touched the directory anyway.
+    cleanup_root: str | None = None
     if conversation_store is not None and exclude_conversation_id is not None:
         cleanup_root = recorded_worktree_root(worktree_path, expected_root_fingerprint)
         if cleanup_root is None:
             _logger.warning(
                 "Workspace %s no longer matches its recorded cleanup root", worktree_path
             )
-            return
+            return False
+        if project_host_binding_store is not None and await asyncio.to_thread(
+            project_host_binding_store.entry_at_or_under, host_id, cleanup_root
+        ):
+            _logger.warning(
+                "Keeping worktree %s: a project entry lies at or under its root", cleanup_root
+            )
+            return False
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
             host_id=host_id,
             workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
             include_subdirectories=True,
+            **({"include_unclosed_archived": True} if safe_only else {}),
         )
         if shared:
             _logger.info(
@@ -10667,7 +10773,7 @@ async def _remove_session_worktree_best_effort(
                 worktree_path,
                 reason,
             )
-            return
+            return False
 
     if host_registry is None:
         if fail_if_unavailable:
@@ -10675,7 +10781,7 @@ async def _remove_session_worktree_best_effort(
                 "host registry is not configured; cannot delete a worktree",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        return
+        return False
     host_conn = host_registry.get(host_id)
     if host_conn is None:
         if fail_if_unavailable:
@@ -10689,7 +10795,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             host_id,
         )
-        return
+        return False
     try:
         if conversation_store is not None and exclude_conversation_id is not None:
             worktrees = await list_worktrees_on_host(
@@ -10714,15 +10820,81 @@ async def _remove_session_worktree_best_effort(
                 _logger.warning(
                     "No matching linked worktree for %s; skipping cleanup", worktree_path
                 )
-                return
+                return False
             worktree_path = max(roots, key=len)
-        await remove_worktree_on_host(
-            host_registry=host_registry,
-            host_conn=host_conn,
-            worktree_path=worktree_path,
-            branch=branch,
-            delete_branch=delete_branch,
-        )
+            if project_host_binding_store is not None and await asyncio.to_thread(
+                project_host_binding_store.entry_at_or_under, host_id, worktree_path
+            ):
+                _logger.warning(
+                    "Keeping worktree %s: a project entry lies at or under its root",
+                    worktree_path,
+                )
+                return False
+            if conversation_store is not None and exclude_conversation_id is not None:
+                if await asyncio.to_thread(
+                    conversation_store.has_other_live_session_in_workspace,
+                    host_id=host_id,
+                    workspace=worktree_path,
+                    exclude_conversation_id=exclude_conversation_id,
+                    include_subdirectories=True,
+                    **({"include_unclosed_archived": True} if safe_only else {}),
+                ):
+                    return False
+        fence_set = False
+        if safe_only:
+            if conversation_store is None or exclude_conversation_id is None:
+                return False
+            if not await archive_owner_still_matches():
+                return False
+            new_fence = worktree_admission_fingerprint(host_id, worktree_path)
+            owner = await asyncio.to_thread(
+                conversation_store.get_conversation, exclude_conversation_id
+            )
+            assert owner is not None  # archive_owner_still_matches succeeded under this lease.
+            old_fence = owner.labels.get(ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY)
+            if (
+                old_fence is not None
+                and old_fence != new_fence
+                and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in owner.labels
+            ):
+                _logger.warning(
+                    "Keeping unresolved worktree removal fence for session %s",
+                    exclude_conversation_id,
+                )
+                return False
+            # A new removal attempt invalidates an older settled receipt;
+            # deletion must retain this root's fence if the new RPC becomes
+            # uncertain. The host lease also serializes the deletion check.
+            await asyncio.to_thread(
+                conversation_store.delete_label,
+                exclude_conversation_id,
+                ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+            )
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                exclude_conversation_id,
+                {ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY: new_fence},
+            )
+            fence_set = True
+        try:
+            await remove_worktree_on_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                worktree_path=worktree_path,
+                branch=branch,
+                delete_branch=delete_branch,
+                safe_only=safe_only,
+            )
+        except WorktreeHostRefusalError:
+            if fence_set:
+                assert conversation_store is not None and exclude_conversation_id is not None
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    exclude_conversation_id,
+                    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                )
+            raise
+        return True
     except WorktreeHostUnavailableError as exc:
         if fail_if_unavailable:
             raise OmnigentError(
@@ -10735,6 +10907,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             host_id,
         )
+        return False
     except WorktreeProxyError:
         _logger.warning(
             "Best-effort worktree removal (%s) failed for %s",
@@ -10742,6 +10915,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             exc_info=True,
         )
+        return False
 
 
 def _resolve_subagent_spec(
@@ -11244,6 +11418,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             "set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+    from omnigent.stores.conversation_store import ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY
+
+    for key in (
+        ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
+        ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+        ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    ):
+        if key in labels:
+            raise OmnigentError(
+                f"label {key!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
     # Pins are per-user: the client may only write the bare canonical
     # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
     # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting

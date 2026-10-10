@@ -6814,6 +6814,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "worktree_status": {
+            "default": true,
+            "title": "Worktree Status",
+            "type": "boolean"
           }
         },
         "required": [
@@ -11064,7 +11069,7 @@
           },
           "delete_worktree": {
             "default": false,
-            "description": "With `archived=True`, also remove the session's server-created git worktree directory once the archive teardown runs (after the Undo grace). On an already-archived session it requests a delete-only teardown of the current archive revision, whose Undo grace counts from that archive, not from this request. The branch is kept. It forces the CLI teardown for that archive even on a host policy that keeps CLIs on archive, so the worktree is never removed under a running CLI. Ignored for sessions with no worktree; rejected (400) without `archived=True`.",
+            "description": "Legacy archive request flag. Deletion still requires the owner's `worktree_archive` preference to be `delete_safe` and the host's safe cleanup checks. Rejected (400) without `archived=True`.",
             "title": "Delete Worktree",
             "type": "boolean"
           },
@@ -11079,6 +11084,12 @@
             ],
             "description": "Runtime-native session id captured by a wrapper bridge (e.g. Claude Code's session uuid for `omnigent claude` sessions). Idempotent on same-value writes; the server rejects attempts to overwrite an already-set different value with `invalid_input` to surface programmer errors. `None` leaves unchanged.",
             "title": "External Session Id"
+          },
+          "keep_worktree": {
+            "default": false,
+            "description": "Explicitly preserve this archive revision's bound worktree even when the owner's preference is `delete_safe` and the directory becomes clean after the caller's warning. Requires `archived=True`.",
+            "title": "Keep Worktree",
+            "type": "boolean"
           },
           "labels": {
             "anyOf": [
@@ -11486,6 +11497,7 @@
                 "host_colors",
                 "keep_warm",
                 "worktree_location",
+                "worktree_archive",
                 "runner_log_warnings",
                 "sidebar_layout",
                 "sound_alerts"
@@ -14164,6 +14176,7 @@
                         "sidebar_layout",
                         "sound_alerts",
                         "usage_context",
+                        "worktree_archive",
                         "worktree_location"
                       ]
                     },
@@ -14220,6 +14233,49 @@
         "summary": "Initialize User Preferences"
       }
     },
+    "/v1/me/preferences/worktree_archive/migrate": {
+      "post": {
+        "operationId": "migrate_worktree_archive_v1_me_preferences_worktree_archive_migrate_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Migrate Worktree Archive V1 Me Preferences Worktree Archive Migrate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "Invalid Content-Length header"
+          },
+          "401": {
+            "description": "Authentication required or account deleted"
+          },
+          "413": {
+            "description": "Request body exceeds the preferences limit"
+          },
+          "415": {
+            "description": "Request body is not application/json"
+          },
+          "422": {
+            "description": "Invalid preferences payload or namespace"
+          },
+          "429": {
+            "description": "Per-user write rate exceeded"
+          },
+          "503": {
+            "description": "Preferences persistence is unavailable"
+          }
+        },
+        "summary": "Migrate Worktree Archive"
+      }
+    },
     "/v1/me/preferences/{namespace}": {
       "patch": {
         "description": "Atomically merge or remove one namespace for the current user.",
@@ -14245,6 +14301,7 @@
                 "host_colors",
                 "keep_warm",
                 "worktree_location",
+                "worktree_archive",
                 "runner_log_warnings",
                 "sidebar_layout",
                 "sound_alerts"
@@ -20742,6 +20799,61 @@
           }
         },
         "summary": "Start Session Succession",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/worktree-status": {
+      "get": {
+        "description": "Return filename-only Git state for this session and its descendants.",
+        "operationId": "worktree_status_v1_sessions__session_id__worktree_status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Worktree Status V1 Sessions  Session Id  Worktree Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Worktree Status",
         "tags": [
           "sessions"
         ]

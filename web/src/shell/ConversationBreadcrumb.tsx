@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { Link } from "@/lib/routing";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { RailAgentBadge, childAgentDisplay } from "@/components/RailAgentBadge";
+import { WorktreeStatusMark } from "@/components/WorktreeStatusMark";
 import { useHosts } from "@/hooks/useHosts";
 import { copyText } from "@/lib/clipboard";
 import { hostDisplayName } from "@/lib/hostColors";
@@ -74,6 +75,7 @@ function ChildPlacementChip({
  * generic sub-agent identity stands in while it loads.
  */
 export function ConversationBreadcrumb({
+  sessionId,
   conversationTitle,
   projectName,
   projectIcon,
@@ -89,6 +91,7 @@ export function ConversationBreadcrumb({
   actions,
   className,
 }: {
+  sessionId?: string | null;
   /** The conversation's display name. */
   conversationTitle: string;
   /** Project the conversation is filed under, or `null` when unfiled. */
@@ -202,6 +205,7 @@ export function ConversationBreadcrumb({
             </span>
           </div>
         ))}
+      {!isChildSession && <WorktreeStatusMark sessionId={sessionId} />}
       {titleLinkTo ? (
         <>
           <Link
@@ -247,6 +251,7 @@ export function ConversationBreadcrumb({
           </span>
           <span className="flex min-w-0 items-center gap-1.5">
             <RailAgentBadge child={childSession} />
+            <WorktreeStatusMark sessionId={sessionId} />
             <span
               data-testid="breadcrumb-child-label"
               className="truncate font-semibold text-foreground"
@@ -270,6 +275,7 @@ export function ConversationBreadcrumb({
             </span>
             <span className="flex min-w-0 items-center gap-1.5">
               <BotIcon className="size-4 shrink-0 text-muted-foreground" />
+              <WorktreeStatusMark sessionId={sessionId} />
               <span className="truncate font-semibold text-foreground">
                 {subAgentSegment ?? "Sub-agent"}
               </span>

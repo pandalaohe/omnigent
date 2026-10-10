@@ -3485,6 +3485,24 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
+  it("sends archive-only retention to the server and ignores it on unarchive", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", labels: {} }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "conv_a", archived: true, keepWorktree: true });
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      archived: true,
+      keep_worktree: true,
+    });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "conv_a", archived: false, keepWorktree: true });
+    });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ archived: false });
+  });
   const staleListPage = {
     object: "list",
     data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 5 }],

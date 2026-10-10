@@ -48,6 +48,11 @@ from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStor
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store import (
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    worktree_admission_fingerprint,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -615,6 +620,43 @@ async def test_launch_runner_with_existing_worktree_persists_without_creating(
     assert conv.workspace == _SOURCE_REPO
     assert conv.git_branch == "feature/existing"
     assert conv.host_id == _HOST_ID
+
+
+async def test_launch_runner_can_choose_new_tree_after_old_archive_removal(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    cap = register_host()
+    session_id = await _bare_session(client, "replacement-wt-agent")
+    store = SqlAlchemyConversationStore(db_uri)
+    old_root = "/opt/work/sample-app/removed"
+    store.set_host_id(session_id, _HOST_ID, workspace=old_root, git_branch="feature/old")
+    archived = store.update_conversation(session_id, archived=True)
+    assert archived is not None
+    store.set_labels(
+        session_id,
+        {
+            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY: worktree_admission_fingerprint(
+                _HOST_ID, old_root
+            ),
+            ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(archived.archive_revision),
+        },
+    )
+    store.update_conversation(session_id, archived=False)
+
+    response = await _launch(
+        client,
+        session_id,
+        git={"branch_name": "feature/new", "existing_worktree": True},
+    )
+    assert response.status_code == 200, response.text
+    assert len(cap.launch) == 1
+    assert cap.create == []
+    rebound = store.get_conversation(session_id)
+    assert rebound is not None
+    assert rebound.workspace == _SOURCE_REPO
+    assert rebound.git_branch == "feature/new"
 
 
 async def test_launch_runner_rolls_back_worktree_on_launch_failure(

@@ -15,6 +15,8 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
+import time
 from dataclasses import dataclass
 from typing import cast
 
@@ -578,6 +580,41 @@ class HostStore:
             session.flush()
 
         return new_row
+
+    def acquire_worktree_admission(
+        self,
+        host_id: str,
+        *,
+        required: bool = False,
+        wait_timeout_s: float = 0.0,
+    ) -> str | None:
+        """Claim the durable Host lease shared by binding writes and safe cleanup.
+
+        A missing Host row is allowed for legacy/store-only session creation,
+        but safe deletion requires the row: without it there is no durable
+        cross-replica fence.
+        """
+        if self.get_host(host_id) is None:
+            if required:
+                raise OmnigentError(
+                    "Host admission lease is unavailable",
+                    code=ErrorCode.CONFLICT,
+                )
+            return None
+        token = secrets.token_hex(16)
+        deadline = time.monotonic() + wait_timeout_s
+        while True:
+            now = int(time.time())
+            if self.claim_cli_retention(
+                host_id, token, claimed_at=now, stale_before=now - 15 * 60
+            ):
+                return token
+            if time.monotonic() >= deadline:
+                raise OmnigentError(
+                    "Host admission lease is busy; retry the session operation",
+                    code=ErrorCode.CONFLICT,
+                )
+            time.sleep(0.05)
 
     def claim_cli_retention(
         self,

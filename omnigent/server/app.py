@@ -23,7 +23,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -226,6 +226,7 @@ class ServerInfoResponse(BaseModel):
     dictation_punctuation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    worktree_status: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -1693,6 +1694,7 @@ def create_app(
         )
         archive_close_coordinator.set_host_lock_provider(cli_retention_coordinator.lease_for_host)
     archive_close_coordinator.set_project_host_binding_store(project_host_binding_store)
+    archive_close_coordinator.set_archive_preferences(user_preferences_store, permission_store)
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
@@ -1795,6 +1797,7 @@ def create_app(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 peer_message_store=peer_message_store,
+                archive_cleanup=archive_close_coordinator,
             ),
             name="succession-startup-resume",
         )
@@ -3685,6 +3688,35 @@ def create_app(
             raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
         return UserPreferencesEnvelope.model_validate(persisted)
 
+    class WorktreeArchiveMigrationRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+        delete_safe: bool
+
+    @app.post(
+        "/v1/me/preferences/worktree_archive/migrate",
+        dependencies=[Depends(require_json_content_type)],
+        responses=_preferences_error_responses,
+    )
+    async def migrate_worktree_archive(request: Request) -> dict[str, str]:
+        store = _preferences_store()
+        owner, create_if_missing = _preferences_owner(request)
+        _check_preference_write_rate(owner)
+        body = await _read_preferences_body(request, WorktreeArchiveMigrationRequest)
+        assert isinstance(body, WorktreeArchiveMigrationRequest)
+        try:
+            return await asyncio.to_thread(
+                store.migrate_worktree_archive,
+                owner,
+                body.delete_safe,
+                create_if_missing=create_if_missing,
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise StarletteHTTPException(
+                status_code=401, detail="Account no longer exists"
+            ) from exc
+        except UserPreferencesValidationError as exc:
+            raise StarletteHTTPException(status_code=422, detail=str(exc)) from exc
+
     app.include_router(
         create_sessions_router(
             conversation_store,
@@ -4463,6 +4495,7 @@ def create_app(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 peer_message_store=peer_message_store,
+                archive_cleanup=archive_close_coordinator,
             )
 
         _succession_task = asyncio.create_task(

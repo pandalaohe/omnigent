@@ -417,6 +417,35 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
     ]
 
 
+def read_worktree_status(path: str) -> dict[str, object]:
+    """Read filename-only dirt and informational merge state for one linked tree."""
+    status = _run_git(
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
+        cwd=path,
+        timeout=_FOLDER_FACTS_GIT_TIMEOUT_S,
+    )
+    if status.returncode != 0:
+        raise _git_error("git status failed", status)
+    parts = status.stdout.split("\0")
+    files: list[dict[str, str]] = []
+    index = 0
+    while index < len(parts) and parts[index]:
+        part = parts[index]
+        files.append({"path": part[3:], "status": part[:2]})
+        if "R" in part[:2] or "C" in part[:2]:
+            index += 1  # NUL porcelain adds the old name after a rename/copy.
+        index += 1
+    main = _main_work_tree(path)
+    target = _run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=main)
+    merge_target = target.stdout.strip() if target.returncode == 0 else None
+    merged: bool | None = None
+    if merge_target is not None:
+        merged_result = _run_git(["merge-base", "--is-ancestor", "HEAD", merge_target], cwd=path)
+        if merged_result.returncode in (0, 1):
+            merged = merged_result.returncode == 0
+    return {"files": files, "merged": merged, "merge_target": merge_target}
+
+
 @dataclass
 class FolderFacts:
     """Read-only git facts about one folder on the host.
@@ -1059,11 +1088,14 @@ def remove_worktree(
     worktree_path: str,
     branch: str | None = None,
     delete_branch: bool = False,
+    safe_only: bool = False,
 ) -> None:
     """Remove a git worktree and optionally delete its branch.
 
-    Removes the directory with ``--force``, then (if requested) deletes
-    the branch — in that order, since git refuses to delete a branch
+    The safe archive path rechecks branch binding and every untracked file,
+    then uses normal ``git worktree remove``. Other callers retain their
+    existing force-removal behavior and optional branch deletion. Git refuses
+    to delete a branch
     still checked out in a linked worktree. ``git worktree remove``
     refuses to remove the main work tree.
 
@@ -1074,6 +1106,8 @@ def remove_worktree(
         deletion.
     :param delete_branch: When ``True``, run ``git branch -D`` on
         ``branch`` after removing the worktree directory.
+    :param safe_only: Refuse a dirty, detached, main, or mismatched tree;
+        never force-remove or delete its branch.
     :raises WorktreeError: If the worktree path is missing/invalid, or
         a git command fails.
     """
@@ -1087,8 +1121,28 @@ def remove_worktree(
         raise _git_error("could not resolve worktree root", root)
     if os.path.normcase(root.stdout.strip()) != os.path.normcase(os.path.abspath(worktree_path)):
         raise WorktreeError(f"path is not the expected worktree root: {worktree_path}")
+    if safe_only:
+        if delete_branch or branch is None:
+            raise WorktreeError("safe archive requires a retained branch")
+        entries = list_worktrees(repo_path=worktree_path)
+        target = next(
+            (
+                entry
+                for entry in entries
+                if os.path.normcase(entry.path) == os.path.normcase(root.stdout.strip())
+            ),
+            None,
+        )
+        if target is None or target.is_main or target.detached or target.branch != branch:
+            raise WorktreeError("worktree binding changed or is protected")
+        status = _run_git(
+            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
+            cwd=worktree_path,
+        )
+        if status.returncode != 0 or status.stdout:
+            raise WorktreeError("worktree is dirty or status is unavailable")
     remove_result = _run_git(
-        ["worktree", "remove", "--force", root.stdout.strip()],
+        ["worktree", "remove", *([] if safe_only else ["--force"]), root.stdout.strip()],
         cwd=main_repo,
     )
     if remove_result.returncode != 0:

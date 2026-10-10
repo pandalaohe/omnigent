@@ -141,6 +141,7 @@ from omnigent.host.git_worktree import (
     create_worktree,
     list_worktrees,
     read_folder_facts,
+    read_worktree_status,
     remove_worktree,
 )
 from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
@@ -1379,6 +1380,10 @@ class HostProcess:
         # this lock: a session DELETE racing a slow create must not have its
         # stop overtake the launch it targets.
         self._runner_lifecycle_lock = asyncio.Lock()
+        # Worktree frames arrive in order but run in separate tasks. A timed-out
+        # remove must finish on this host before a later validation list or
+        # recreate can observe the old tree and clear its removal fence.
+        self._worktree_operation_lock = asyncio.Lock()
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
@@ -1513,14 +1518,23 @@ class HostProcess:
         finally:
             self._owned_subprocess_ops -= 1
 
-    async def _run_host_subprocess_in_thread(self, operation: Callable[[], _T]) -> _T:
+    async def _run_host_subprocess_in_thread(
+        self, operation: Callable[[], _T], *, worktree_operation: bool = False
+    ) -> _T:
         """Run a subprocess-owning operation off-loop without losing its exit status.
 
         Cancellation stops waiting for the result but cannot stop a worker
         thread. Keep the orphan reaper paused until the worker itself finishes.
         """
         self._owned_subprocess_ops += 1
-        task = asyncio.create_task(asyncio.to_thread(operation))
+
+        async def _execute() -> _T:
+            if worktree_operation:
+                async with self._worktree_operation_lock:
+                    return await asyncio.to_thread(operation)
+            return await asyncio.to_thread(operation)
+
+        task = asyncio.create_task(_execute())
         retained_task = cast("asyncio.Task[object]", task)
         self._host_subprocess_tasks.add(retained_task)
 
@@ -3875,8 +3889,8 @@ class HostProcess:
             # subprocess.run, whose children are direct children of this host
             # but not tracked runners — the reaper must not wait() them out
             # from under subprocess (#1782).
-            with self._host_subprocess_op():
-                created = await asyncio.to_thread(
+            created = await self._run_host_subprocess_in_thread(
+                functools.partial(
                     create_worktree,
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
@@ -3884,7 +3898,9 @@ class HostProcess:
                     existing_branch=frame.existing_branch,
                     entry=frame.entry,
                     path_template=frame.path_template,
-                )
+                ),
+                worktree_operation=True,
+            )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -3920,13 +3936,16 @@ class HostProcess:
         try:
             # Pause the orphan reaper while remove_worktree runs git — see
             # _handle_create_worktree above and _reap_orphans_once (#1782).
-            with self._host_subprocess_op():
-                await asyncio.to_thread(
+            await self._run_host_subprocess_in_thread(
+                functools.partial(
                     remove_worktree,
                     worktree_path=frame.worktree_path,
                     branch=frame.branch,
                     delete_branch=frame.delete_branch,
-                )
+                    safe_only=frame.safe_only,
+                ),
+                worktree_operation=True,
+            )
         except WorktreeError as exc:
             return HostRemoveWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -3958,33 +3977,49 @@ class HostProcess:
             ``status: "failed"`` with an error message.
         """
         try:
-            # Pause the orphan reaper while git runs — see
-            # _handle_create_worktree above and _reap_orphans_once.
-            with self._host_subprocess_op():
-                worktrees = await asyncio.to_thread(
-                    list_worktrees,
+            worktrees = await self._run_host_subprocess_in_thread(
+                lambda: list_worktrees(
                     repo_path=frame.repo_path,
                     for_cleanup=frame.for_cleanup,
-                )
+                ),
+                worktree_operation=True,
+            )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=exc.message,
             )
+        rows: list[dict[str, object]] = []
+        for wt in worktrees:
+            row: dict[str, object] = {
+                "path": wt.path,
+                "branch": wt.branch,
+                "is_main": wt.is_main,
+                "detached": wt.detached,
+                "updated_at": wt.updated_at,
+            }
+            if (
+                frame.for_status
+                and not wt.is_main
+                and (
+                    Path(frame.repo_path) == Path(wt.path)
+                    or Path(wt.path) in Path(frame.repo_path).parents
+                )
+            ):
+                try:
+                    row.update(
+                        await self._run_host_subprocess_in_thread(
+                            lambda path=wt.path: read_worktree_status(path)
+                        )
+                    )
+                except WorktreeError:
+                    row["status_error"] = True
+            rows.append(row)
         return HostListWorktreesResultFrame(
             request_id=frame.request_id,
             status="ok",
-            worktrees=[
-                {
-                    "path": wt.path,
-                    "branch": wt.branch,
-                    "is_main": wt.is_main,
-                    "detached": wt.detached,
-                    "updated_at": wt.updated_at,
-                }
-                for wt in worktrees
-            ],
+            worktrees=rows,
         )
 
     async def _handle_folder_facts(

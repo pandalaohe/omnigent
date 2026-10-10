@@ -7,6 +7,7 @@ import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from omnigent.entities import (
@@ -252,6 +253,30 @@ ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY = "omnigent.archive_stop_when_idle"
 # should also remove the root's server-created worktree. Keyed to the
 # revision so unarchive or re-archive voids it.
 ARCHIVE_DELETE_WORKTREE_LABEL_KEY = "omnigent.archive_delete_worktree"
+ARCHIVE_KEEP_WORKTREE_LABEL_KEY = "omnigent.archive_keep_worktree"
+ARCHIVE_REMOVED_WORKTREE_LABEL_KEY = "omnigent.archive_removed_worktree"
+ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY = "omnigent.archive_worktree_admission_fence"
+
+
+def worktree_admission_fingerprint(host_id: str, path: str) -> str:
+    """Hash a host/root binding without placing its path in a label."""
+    parsed = PureWindowsPath(path) if PureWindowsPath(path).is_absolute() else PurePosixPath(path)
+    normalized = (
+        str(parsed).replace("\\", "/").lower()
+        if isinstance(parsed, PureWindowsPath)
+        else str(parsed)
+    )
+    return hashlib.sha256(f"{host_id}\0{normalized.rstrip('/')}".encode()).hexdigest()
+
+
+def worktree_admission_ancestor_fingerprints(host_id: str, path: str) -> list[str]:
+    """Return removal-fence fingerprints for a path and its parents."""
+    parsed = PureWindowsPath(path) if PureWindowsPath(path).is_absolute() else PurePosixPath(path)
+    return [
+        worktree_admission_fingerprint(host_id, str(ancestor))
+        for ancestor in (parsed, *parsed.parents)
+    ]
+
 
 # New-session id an archived session was continued into (``POST
 # /v1/sessions/{sid}/continue``). The archived row keeps the pointer so a
@@ -1282,6 +1307,7 @@ class ConversationStore(ABC):
         close_cli_on_archive: bool = False,
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
+        keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -1480,6 +1506,7 @@ class ConversationStore(ABC):
         close_cli_on_archive: bool = False,
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
+        keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> ConversationUpdateResult | None:
         """Update a conversation and report requested model-setting changes.
@@ -2133,7 +2160,14 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
+    def set_runner_id(
+        self,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        admission_host_id: str | None = None,
+        admission_workspace: str | None = None,
+    ) -> bool:
         """
         Atomically pin ``conversations.runner_id`` only if currently NULL.
 
@@ -2147,6 +2181,10 @@ class ConversationStore(ABC):
             ``"conv_abc123"``.
         :param runner_id: Runner id to bind to, e.g.
             ``"runner_abc123"``.
+        :param admission_host_id: Host selected for this launch when it differs
+            from the row's old binding.
+        :param admission_workspace: Directory selected for this launch before
+            the row's worktree binding is persisted.
         :returns: ``True`` if this call won the bind (NULL → runner_id);
             ``False`` if already bound or the row doesn't exist.
         """
@@ -2764,6 +2802,7 @@ class ConversationStore(ABC):
         workspace: str,
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
+        include_unclosed_archived: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation working in this ``(host_id, workspace)``?
@@ -2778,15 +2817,17 @@ class ConversationStore(ABC):
         is the project entry, not the directory being cleaned up, so counting
         it as a sharer would block every worktree cleanup.
 
-        Archived sessions do not count. They run nothing, so removing the
-        directory cannot wedge them, and counting them would mean a worktree
-        shared by two forks is never cleaned up once either is archived.
+        When ``include_unclosed_archived`` is true, an archived session
+        counts until its current revision's CLI release is complete. A Host
+        policy may keep an archived CLI running.
 
         :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
         :param exclude_conversation_id: The conversation being deleted or
             archived — its own row must not count as "another session".
         :param include_subdirectories: Also protect sessions inside this worktree root.
+        :param include_unclosed_archived: Protect archived peers whose CLI
+            teardown has not completed for the current revision.
         :returns: ``True`` when at least one other live conversation
             references the pair, else ``False``.
         """

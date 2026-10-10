@@ -22,6 +22,8 @@ lifespan) since none of these paths need the runtime.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -804,3 +806,74 @@ async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path:
             json={"labels": {"omnigent.pinned": "1721760000000", "omni_project": "Moonshot"}},
         )
         assert resp.status_code == 403, resp.text
+
+
+async def test_worktree_status_hides_paths_and_files_until_workspace_sharing(
+    db_uri: str, tmp_path: Path
+) -> None:
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    host_id = "0123456789abcdef0123456789abcdef"
+    parent_path = "/opt/work/sample-app/parent"
+    child_path = "/opt/work/sample-app/child"
+    parent = conversations.create_conversation(
+        title="parent", host_id=host_id, workspace=parent_path, git_branch="feature/parent"
+    )
+    child = conversations.create_conversation(
+        kind="sub_agent",
+        title="child",
+        parent_conversation_id=parent.id,
+        host_id=host_id,
+        workspace=child_path,
+        git_branch="feature/child",
+    )
+    permissions.ensure_user(_OWNER)
+    permissions.grant(_OWNER, parent.id, LEVEL_OWNER)
+    permissions.ensure_user(_GRANTEE)
+    permissions.grant(_GRANTEE, parent.id, LEVEL_READ)
+    permissions.grant(RESERVED_USER_PUBLIC, parent.id, LEVEL_READ)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        permission_store=permissions,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
+
+    async def _list(**kwargs):
+        path = kwargs["repo_path"]
+        return [
+            {
+                "path": path,
+                "branch": "feature/child" if path == child_path else "feature/parent",
+                "is_main": False,
+                "detached": False,
+                "files": [{"path": "private.txt", "status": "??"}],
+            }
+        ]
+
+    with patch("omnigent.server.routes._host_worktree.list_worktrees_on_host", _list):
+        async with _client(app, _GRANTEE) as viewer:
+            parent_status = (await viewer.get(f"/v1/sessions/{parent.id}/worktree-status")).json()
+            child_status = (await viewer.get(f"/v1/sessions/{child.id}/worktree-status")).json()
+            assert parent_status["own"]["state"] == "dirty"
+            assert parent_status["own"]["path"] is None
+            assert parent_status["own"]["files"] == []
+            assert child_status["own"]["path"] is None
+            assert child_status["own"]["files"] == []
+        async with _client(app, "public-viewer@sharing.test") as public_viewer:
+            public_status = (
+                await public_viewer.get(f"/v1/sessions/{child.id}/worktree-status")
+            ).json()
+            assert public_status["own"]["files"] == []
+            assert public_status["own"]["path"] is None
+        conversations.update_conversation(child.id, share_workspace_files=True)
+        async with _client(app, _GRANTEE) as viewer:
+            shared = (await viewer.get(f"/v1/sessions/{child.id}/worktree-status")).json()
+            assert shared["own"]["files"] == [{"path": "private.txt", "status": "??"}]
+            assert shared["own"]["path"] is None
+        async with _client(app, _OWNER) as owner:
+            owned = (await owner.get(f"/v1/sessions/{child.id}/worktree-status")).json()
+            assert owned["own"]["path"] == child_path
+            assert owned["own"]["files"] == [{"path": "private.txt", "status": "??"}]

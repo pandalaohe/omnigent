@@ -21,6 +21,7 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   dictation_available: false,
   dictation_punctuation_available: false,
   archive_worktree_cleanup: false,
+  worktree_status: false,
   branding: null,
 };
 

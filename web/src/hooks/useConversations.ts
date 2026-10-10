@@ -1070,19 +1070,19 @@ export async function renameConversation(id: string, title: string): Promise<Con
  *
  * Exported for direct unit testing. `archived` is sent as the new
  * desired state, so the same helper handles both archive (`true`) and
- * unarchive (`false`). `deleteWorktree` (archive only) asks the server to
- * remove the session's worktree directory once its teardown runs.
+ * unarchive (`false`). `keepWorktree` overrides automatic safe deletion for
+ * this archive, even if a warning's dirty worktree becomes clean meanwhile.
  */
 export async function archiveConversation(
   id: string,
   archived: boolean,
-  deleteWorktree = false,
+  keepWorktree = false,
 ): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(
-      archived && deleteWorktree ? { archived, delete_worktree: true } : { archived },
+      archived && keepWorktree ? { archived, keep_worktree: true } : { archived },
     ),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -1297,12 +1297,12 @@ export function useArchiveConversation() {
     mutationFn: ({
       id,
       archived,
-      deleteWorktree = false,
+      keepWorktree = false,
     }: {
       id: string;
       archived: boolean;
-      deleteWorktree?: boolean;
-    }) => archiveConversation(id, archived, deleteWorktree),
+      keepWorktree?: boolean;
+    }) => archiveConversation(id, archived, keepWorktree),
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
       if (archived && context?.marked !== undefined) {
@@ -1323,6 +1323,7 @@ export function useArchiveConversation() {
       );
     },
     onSuccess: (updated, { archived }, context) => {
+      void queryClient.invalidateQueries({ queryKey: ["session-worktree-status"] });
       refreshChildLists(queryClient, updated.id, updated.parent_session_id);
       markConversationSeen(updated.id, updated.updated_at);
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
@@ -1687,15 +1688,15 @@ export function useBulkArchiveConversations() {
     mutationFn: async ({
       ids,
       archived,
-      deleteWorktreeIds,
+      keepWorktreeIds,
     }: {
       ids: string[];
       archived: boolean;
-      /** Archived sessions whose worktree should also be removed. */
-      deleteWorktreeIds?: ReadonlySet<string>;
+      /** Retain these trees even if they become clean after the warning. */
+      keepWorktreeIds?: ReadonlySet<string>;
     }) => {
       const results = await Promise.allSettled(
-        ids.map((id) => archiveConversation(id, archived, deleteWorktreeIds?.has(id) === true)),
+        ids.map((id) => archiveConversation(id, archived, keepWorktreeIds?.has(id) === true)),
       );
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
@@ -1734,6 +1735,7 @@ export function useBulkArchiveConversations() {
       reapplyLiveSessionTombstones(queryClient);
     },
     onSuccess: (_data, { ids, archived }, context) => {
+      void queryClient.invalidateQueries({ queryKey: ["session-worktree-status"] });
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, ids);
       }

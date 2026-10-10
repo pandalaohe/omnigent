@@ -1,4 +1,5 @@
 import { AgentBadge } from "@/components/AgentBadge";
+import { WorktreeStatusMark } from "@/components/WorktreeStatusMark";
 import { copyText } from "@/lib/clipboard";
 import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
 import { filterSessionScope } from "@/lib/sessionVisibility";
@@ -3400,14 +3401,33 @@ function ConversationList({
   }, [pollingPopulation, projection, expandedProjects]);
 
   const pollingArchive = useArchiveConversation();
+  const pollingArchivePrompt = useArchiveWorktreePrompt(activeId);
   useSessionPollingHotkeys({
     activeId,
     getConversations: async () => pollingPopulation,
     isCollapsed: (conversation) => hiddenPollingIds.has(conversation.id),
-    onArchive: async (conversation) => {
-      await pollingArchive.mutateAsync({ id: conversation.id, archived: true });
-      showArchiveUndoToast(queryClient, [conversation], navigate);
-    },
+    onArchive: (conversation) =>
+      new Promise<boolean>((resolve) => {
+        pollingArchivePrompt.requestArchive(
+          [conversation],
+          (keepIds) => {
+            void pollingArchive
+              .mutateAsync({
+                id: conversation.id,
+                archived: true,
+                keepWorktree: keepIds.has(conversation.id),
+              })
+              .then(
+                () => {
+                  showArchiveUndoToast(queryClient, [conversation], navigate);
+                  resolve(true);
+                },
+                () => resolve(false),
+              );
+          },
+          () => resolve(false),
+        );
+      }),
     canArchive: (conversation) => isOwnedByViewer(conversation, viewerId),
   });
   // Getter for the shift-select range, built on demand (at click time). Scopes
@@ -3581,6 +3601,7 @@ function ConversationList({
       onActivate={activateRow}
     >
       <SidebarLayoutContext.Provider value={sidebarLayoutContextValue}>
+        {pollingArchivePrompt.dialog}
         <DndContext
           sensors={sensors}
           collisionDetection={(args) => {
@@ -6314,12 +6335,12 @@ function ConversationRowImpl({
       runUnarchive();
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
-      archiveNow(deleteWorktreeIds.has(conversation.id)),
+    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds) =>
+      archiveNow(keepWorktreeIds.has(conversation.id)),
     );
   }
 
-  function archiveNow(deleteWorktree: boolean) {
+  function archiveNow(keepWorktree: boolean) {
     // The archive PATCH sends only the flag: the server stops the session (and
     // tears down a host-spawned runner) in the background once it's committed.
     // A client stop too would race that one against the same runner, and the
@@ -6333,7 +6354,7 @@ function ConversationRowImpl({
     // later with a stale `isActive`, which used to jump the user off whatever
     // session they'd switched to meanwhile. Mirrors confirmDelete.
     if (isActive) navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
+    archive.mutate({ id: conversation.id, archived: true, keepWorktree });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: the optimistic overlay unmounts this row on the next
     // frame, and per-call mutate callbacks don't fire once their observer
@@ -6492,6 +6513,7 @@ function ConversationRowImpl({
             null
           }
         />
+        <WorktreeStatusMark sessionId={conversation.id} />
         <span
           className={cn(
             "relative min-w-0 truncate",
@@ -8056,12 +8078,12 @@ function BulkActionBar({
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     const toArchive = nonArchivedSelected;
-    archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
-      archiveNow(toArchive, deleteWorktreeIds),
+    archiveWorktreePrompt.requestArchive(toArchive, (keepWorktreeIds) =>
+      archiveNow(toArchive, keepWorktreeIds),
     );
   }
 
-  function archiveNow(toArchive: Conversation[], deleteWorktreeIds: ReadonlySet<string>) {
+  function archiveNow(toArchive: Conversation[], keepWorktreeIds: ReadonlySet<string>) {
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
     // flips their cached `archived` flag in onMutate), so this bar unmounts
     // with the selection. Navigate and deselect NOW rather than in a
@@ -8070,7 +8092,7 @@ function BulkActionBar({
     // session they switched to meanwhile. Mirrors handleDelete.
     if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
+    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, keepWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.

@@ -1,7 +1,5 @@
-import { useCallback, useId, useState, type ReactNode } from "react";
-
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -11,158 +9,224 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import { fetchSessionWorktreeStatus, type SessionWorktreeStatus } from "@/hooks/useWorktreeStatus";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  readDeleteWorktreesOnArchive,
-  writeDeleteWorktreesOnArchive,
-} from "@/lib/archiveWorktreePreferences";
+import { fetchArchiveWorktreePreference } from "@/lib/archiveWorktreePreferences";
+import { getOmnigentHostGeneration } from "@/lib/host";
 
-/** Called with the ids whose worktree should be removed (empty = archive only). */
-type ProceedFn = (deleteWorktreeIds: ReadonlySet<string>) => void;
-
+/** Explicit keep overrides the server policy for the selected unsafe sessions. */
+type ProceedFn = (keepWorktreeIds: ReadonlySet<string>) => void;
+interface Warning {
+  id: string;
+  title: string;
+  own: SessionWorktreeStatus["own"] | null;
+}
 interface PendingPrompt {
-  worktreeCount: number;
-  choose: (deleteWorktrees: boolean) => void;
+  warnings: Warning[];
+  proceed: ProceedFn;
+  cancel?: () => void;
 }
 
-/**
- * Gate an archive on the "Delete worktrees for archived sessions" preference.
- *
- * `requestArchive` proceeds immediately when no session has a worktree or the
- * user has already chosen; otherwise it opens the returned `dialog`, which the
- * caller must render. Dismissing the dialog cancels the archive. Servers that
- * predate worktree cleanup always archive only.
- */
-export function useArchiveWorktreePrompt(): {
-  requestArchive: (conversations: readonly Conversation[], proceed: ProceedFn) => void;
+export function useArchiveWorktreePrompt(scope?: string): {
+  requestArchive: (
+    conversations: readonly Conversation[],
+    proceed: ProceedFn,
+    cancel?: () => void,
+  ) => void;
   dialog: ReactNode;
 } {
   const [pending, setPending] = useState<PendingPrompt | null>(null);
+  const checking = useRef(false);
+  const epoch = useRef(0);
+  const mounted = useRef(false);
+  const cancelPrompt = useRef<(() => void) | null>(null);
+  const warningList = useRef<HTMLDivElement>(null);
   const serverInfo = useServerInfo();
-  const cleanupSupported = serverInfo !== "loading" && serverInfo.archive_worktree_cleanup === true;
+  const supported = serverInfo !== "loading" && serverInfo.worktree_status === true;
+  useEffect(() => {
+    const lifecycle = mounted;
+    const requestEpoch = epoch;
+    const cancellation = cancelPrompt;
+    mounted.current = true;
+    checking.current = false;
+    setPending(null);
+    return () => {
+      lifecycle.current = false;
+      requestEpoch.current++;
+      cancellation.current?.();
+      cancellation.current = null;
+    };
+  }, [scope]);
+  useEffect(() => {
+    if (!pending) return;
+    // Opening from a menu must wait for that menu's focus restoration.
+    const timer = setTimeout(
+      () =>
+        warningList.current?.parentElement
+          ?.querySelector<HTMLButtonElement>("[data-testid='archive-worktree-keep']")
+          ?.focus(),
+      0,
+    );
+    return () => clearTimeout(timer);
+  }, [pending]);
 
   const requestArchive = useCallback(
-    (conversations: readonly Conversation[], proceed: ProceedFn) => {
-      const worktreeIds = new Set(
-        conversations.filter((c) => c.git_branch != null).map((c) => c.id),
-      );
-      if (!cleanupSupported || worktreeIds.size === 0) {
+    (conversations: readonly Conversation[], proceed: ProceedFn, cancel?: () => void) => {
+      if (checking.current || pending !== null) {
+        cancel?.();
+        return;
+      }
+      if (!supported || conversations.length === 0) {
         proceed(new Set());
         return;
       }
-      const preference = readDeleteWorktreesOnArchive();
-      if (preference !== null) {
-        proceed(preference ? worktreeIds : new Set());
-        return;
-      }
-      setPending({
-        worktreeCount: worktreeIds.size,
-        choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
-      });
+      checking.current = true;
+      cancelPrompt.current = cancel ?? null;
+      const request = epoch.current;
+      const generation = getOmnigentHostGeneration();
+      const active = () =>
+        mounted.current && epoch.current === request && getOmnigentHostGeneration() === generation;
+      void (async () => {
+        let prompted = false;
+        try {
+          // Read afresh so another device's preference applies to this archive.
+          const mode = await fetchArchiveWorktreePreference();
+          if (!active()) {
+            cancel?.();
+            return;
+          }
+          if (mode === "never") {
+            proceed(new Set());
+            return;
+          }
+          const warnings = (
+            await Promise.all(
+              conversations.map(async (conversation): Promise<Warning | null> => {
+                let own: SessionWorktreeStatus["own"] | null = null;
+                try {
+                  own = (await fetchSessionWorktreeStatus(conversation.id, true)).own;
+                } catch {
+                  // A failed read is not proof that a folder is clean.
+                }
+                if (own && ["clean", "none", "removed"].includes(own.state)) return null;
+                return {
+                  id: conversation.id,
+                  title: conversation.title || "Untitled session",
+                  own,
+                };
+              }),
+            )
+          ).filter((warning): warning is Warning => warning !== null);
+          if (!active()) {
+            cancel?.();
+            return;
+          }
+          if (warnings.length === 0) proceed(new Set());
+          else {
+            prompted = true;
+            setPending({ warnings, proceed, cancel });
+          }
+        } catch {
+          // No readable preference: archive conservatively, retaining every tree.
+          if (active()) proceed(new Set(conversations.map((conversation) => conversation.id)));
+          else cancel?.();
+        } finally {
+          if (epoch.current === request) checking.current = false;
+          if (!prompted && epoch.current === request) cancelPrompt.current = null;
+        }
+      })();
     },
-    [cleanupSupported],
+    [supported, pending],
   );
 
-  const dialog = (
-    <ArchiveWorktreeDialog
-      pending={pending}
-      onChoose={(deleteWorktrees, remember) => {
-        if (remember) writeDeleteWorktreesOnArchive(deleteWorktrees);
-        const current = pending;
-        setPending(null);
-        current?.choose(deleteWorktrees);
-      }}
-      onCancel={() => setPending(null)}
-    />
-  );
-  return { requestArchive, dialog };
-}
-
-function ArchiveWorktreeDialog({
-  pending,
-  onChoose,
-  onCancel,
-}: {
-  pending: PendingPrompt | null;
-  onChoose: (deleteWorktrees: boolean, remember: boolean) => void;
-  onCancel: () => void;
-}) {
-  const [remember, setRemember] = useState(false);
-  const checkboxId = useId();
-  const open = pending !== null;
-  const plural = (pending?.worktreeCount ?? 0) > 1;
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (next) return;
-        setRemember(false);
-        onCancel();
-      }}
-    >
-      {open && (
-        <DialogContent
-          className="sm:max-w-lg"
-          // Keep dialog clicks off a surrounding sidebar row Link.
-          onClick={(e) => e.stopPropagation()}
-          data-testid="archive-worktree-dialog"
-        >
-          <DialogHeader>
-            <DialogTitle>Also delete {plural ? "worktrees" : "the worktree"}?</DialogTitle>
-            <DialogDescription>
-              {plural
-                ? `${pending.worktreeCount} of the sessions you're archiving have a git worktree.`
-                : "This session has a git worktree."}{" "}
-              Deleting removes the worktree directory, including any uncommitted changes. The branch
-              is kept.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2">
-              <Checkbox
-                id={checkboxId}
-                checked={remember}
-                onCheckedChange={(checked) => setRemember(checked === true)}
-                data-testid="archive-worktree-remember"
-                componentId="archive.worktree_prompt.remember"
-              />
-              <label htmlFor={checkboxId} className="cursor-pointer text-ui">
-                Remember my choice
-              </label>
+  return {
+    requestArchive,
+    dialog: (
+      <Dialog
+        open={pending !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            pending?.cancel?.();
+            cancelPrompt.current = null;
+            setPending(null);
+          }
+        }}
+      >
+        {pending && (
+          <DialogContent
+            className="sm:max-w-lg"
+            onClick={(event) => event.stopPropagation()}
+            data-testid="archive-worktree-dialog"
+            onOpenAutoFocus={(event) => {
+              event.preventDefault();
+              if (event.target instanceof HTMLElement)
+                event.target
+                  .querySelector<HTMLButtonElement>("[data-testid='archive-worktree-keep']")
+                  ?.focus();
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>Keep these worktrees when archiving</DialogTitle>
+              <DialogDescription>
+                These worktrees cannot be safely deleted. Deleting a worktree would lose its
+                uncommitted and untracked files. Archive only keeps the files and branches.
+              </DialogDescription>
+            </DialogHeader>
+            <div ref={warningList} className="max-h-72 space-y-3 overflow-y-auto">
+              {pending.warnings.map(({ id, title, own }) => (
+                <div key={id} className="rounded-md border border-border p-3 text-ui">
+                  <p className="font-medium">{title}</p>
+                  {own?.path && (
+                    <p className="break-all text-sm text-muted-foreground">{own.path}</p>
+                  )}
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {own?.reason || "Worktree state could not be checked."}
+                  </p>
+                  {!!own?.files.length && (
+                    <ul
+                      className="mt-2 space-y-1 text-sm"
+                      aria-label={`Files that would be lost in ${title}`}
+                    >
+                      {own.files.map((file) => (
+                        <li key={`${file.status}-${file.path}`} className="break-all font-mono">
+                          {file.status} {file.path}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ))}
             </div>
-            <p className="pl-6 text-sm text-muted-foreground">
-              You can change this any time in Settings › Git.
-            </p>
-          </div>
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => {
-                setRemember(false);
-                onChoose(false, remember);
-              }}
-              data-testid="archive-worktree-keep"
-              componentId="archive.worktree_prompt.archive_only"
-            >
-              No, archive only
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={() => {
-                setRemember(false);
-                onChoose(true, remember);
-              }}
-              data-testid="archive-worktree-delete"
-              componentId="archive.worktree_prompt.delete_worktrees"
-            >
-              Yes, delete {plural ? "worktrees" : "worktree"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      )}
-    </Dialog>
-  );
+            <DialogFooter className="border-t-0 bg-transparent">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  pending.cancel?.();
+                  cancelPrompt.current = null;
+                  setPending(null);
+                }}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                autoFocus
+                data-testid="archive-worktree-keep"
+                componentId="archive.worktree_prompt.archive_only"
+                onClick={() => {
+                  const current = pending;
+                  cancelPrompt.current = null;
+                  setPending(null);
+                  current.proceed(new Set(current.warnings.map((warning) => warning.id)));
+                }}
+              >
+                Archive only
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        )}
+      </Dialog>
+    ),
+  };
 }

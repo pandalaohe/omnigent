@@ -1645,11 +1645,33 @@ def create_hosts_router(
                 await _rollback_worktree()
                 raise
 
-            bound = await asyncio.to_thread(
-                conversation_store.set_runner_id,
-                body.session_id,
-                runner_id,
-            )
+            if git_branch is not None:
+                from omnigent.server.routes._host_worktree import refresh_worktree_admission_fence
+
+                try:
+                    await refresh_worktree_admission_fence(
+                        host_registry=host_registry,
+                        host_conn=conn,
+                        conversation_store=conversation_store,
+                        host_id=host_id,
+                        workspace=worktree_root or workspace,
+                        branch=git_branch,
+                    )
+                except BaseException:
+                    await _rollback_worktree()
+                    raise
+
+            try:
+                bound = await asyncio.to_thread(
+                    conversation_store.set_runner_id,
+                    body.session_id,
+                    runner_id,
+                    admission_host_id=host_id,
+                    admission_workspace=worktree_root or workspace,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
             if not bound:
                 await _rollback_worktree()
                 raise HTTPException(

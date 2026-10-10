@@ -82,6 +82,7 @@ async def advance_succession(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    archive_cleanup: Any = None,
 ) -> SessionSuccession:
     """
     Run one receipt through every phase it can reach, then stop.
@@ -139,6 +140,7 @@ async def advance_succession(
                     receipt = await _phase_archive(
                         receipt,
                         conversation_store=conversation_store,
+                        archive_cleanup=archive_cleanup,
                     )
                 elif phase == "archived":
                     receipt = await _phase_publish_done(
@@ -162,6 +164,7 @@ async def advance_succession(
                     conversation_store=conversation_store,
                     runner_router=runner_router,
                     peer_message_store=peer_message_store,
+                    archive_cleanup=archive_cleanup,
                 )
                 return await _record_phase_error(receipt, exc, conversation_store)
             if receipt.phase == phase or receipt.phase == "done":
@@ -174,6 +177,7 @@ async def resume_unfinished_successions(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    archive_cleanup: Any = None,
 ) -> None:
     """
     Advance every unfinished receipt past ``planned``; never raises.
@@ -200,6 +204,7 @@ async def resume_unfinished_successions(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            archive_cleanup=archive_cleanup,
         )
 
 
@@ -209,6 +214,7 @@ async def resume_successions_for_runner(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    archive_cleanup: Any = None,
 ) -> None:
     """
     Resume unfinished receipts whose successor is bound to a runner; never raises.
@@ -245,6 +251,7 @@ async def resume_successions_for_runner(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            archive_cleanup=archive_cleanup,
         )
 
 
@@ -254,6 +261,7 @@ async def _resume_one(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    archive_cleanup: Any = None,
 ) -> None:
     """Resume one receipt, logging instead of raising."""
     try:
@@ -262,6 +270,7 @@ async def _resume_one(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            archive_cleanup=archive_cleanup,
         )
     except Exception:
         # Triggers are best-effort by contract.
@@ -558,19 +567,34 @@ async def _phase_archive(
     receipt: SessionSuccession,
     *,
     conversation_store: ConversationStore,
+    archive_cleanup: Any = None,
 ) -> SessionSuccession:
-    """``cards_closed → archived``: archive the old session without a teardown."""
+    """``cards_closed → archived``: archive the old session without runner teardown."""
     old_conversation = await asyncio.to_thread(conversation_store.get_conversation, receipt.old_id)
     if old_conversation is not None and not old_conversation.archived:
+        cleanup = archive_cleanup is not None and await archive_cleanup.should_cleanup_on_archive(
+            old_conversation
+        )
         await asyncio.to_thread(
             conversation_store.update_conversation,
             receipt.old_id,
             archived=True,
             close_cli_on_archive=False,
+            delete_worktree=cleanup,
         )
         # The normal archive route's only stream publish; for a top-level old
         # session it publishes nothing, and so does this.
         _publish_child_status_to_parent(receipt.old_id, None)
+    current = await asyncio.to_thread(conversation_store.get_conversation, receipt.old_id)
+    from omnigent.stores.conversation_store import ARCHIVE_DELETE_WORKTREE_LABEL_KEY
+
+    if (
+        archive_cleanup is not None
+        and current is not None
+        and current.archived
+        and current.labels.get(ARCHIVE_DELETE_WORKTREE_LABEL_KEY) == str(current.archive_revision)
+    ):
+        await archive_cleanup.cleanup_archived_without_close(current.id, current.archive_revision)
     return await _advance(receipt, "archived", conversation_store=conversation_store)
 
 
@@ -784,6 +808,7 @@ def _schedule_retry(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    archive_cleanup: Any = None,
 ) -> None:
     """Retry a stalled receipt in-process, within a bounded schedule."""
     attempt = _retry_attempts.get(receipt_id, 0)
@@ -811,6 +836,7 @@ def _schedule_retry(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            archive_cleanup=archive_cleanup,
         )
 
     task = asyncio.create_task(_retry(), name=f"succession-retry:{receipt_id}")

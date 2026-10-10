@@ -8,6 +8,7 @@ from sqlalchemy import asc, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
+    SqlConversationLabel,
     SqlProject,
     SqlProjectHostBinding,
     SqlProjectHostEntry,
@@ -15,6 +16,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.utils import (
+    get_or_create_conversation_engine,
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
@@ -22,6 +24,11 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.conversation_store import (
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    worktree_admission_ancestor_fingerprints,
+)
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
 
 
@@ -156,7 +163,9 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
     partition).
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """
         Initialize the SQLAlchemy project-host-binding store.
 
@@ -167,7 +176,18 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             e.g. ``"sqlite:///chat.db"``.
         """
         super().__init__(storage_location)
+        self._host_store = HostStore(storage_location)
         self._engine = get_or_create_engine(storage_location)
+        conv_uri = conversation_storage_location or storage_location
+        self._conv_engine = (
+            self._engine
+            if conv_uri == storage_location
+            else get_or_create_conversation_engine(conv_uri)
+        )
+        self._conv_session = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.project_host_binding_store",
+        )
         self._session = make_named_managed_session_maker(
             self._engine,
             query_name_prefix="omnigent.project_host_binding_store",
@@ -177,6 +197,22 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             query_name_prefix="omnigent.project_host_binding_store",
             immediate=True,
         )
+
+    def _worktree_admission_fenced(self, host_id: str, path: str) -> bool:
+        fingerprints = worktree_admission_ancestor_fingerprints(host_id, path)
+        with self._conv_session("check_project_entry_worktree_fence") as session:
+            return (
+                session.execute(
+                    select(SqlConversationLabel.conversation_id)
+                    .where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                        SqlConversationLabel.value.in_(fingerprints),
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
 
     def apply_binding(
         self,
@@ -415,7 +451,17 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             session.flush()
             return _entry_to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "project_entries.put", write)
+        token = self._host_store.acquire_worktree_admission(host_id)
+        try:
+            if self._worktree_admission_fenced(host_id, workspace):
+                raise OmnigentError(
+                    "Worktree was removed during project entry admission; refresh its path",
+                    code=ErrorCode.CONFLICT,
+                )
+            return run_write_transaction(self._session_immediate, "project_entries.put", write)
+        finally:
+            if token is not None:
+                self._host_store.release_cli_retention(host_id, token)
 
     def delete_entry(self, project_id: str, host_id: str) -> bool:
         """Delete a host's entry. Idempotent; ``False`` if not found."""

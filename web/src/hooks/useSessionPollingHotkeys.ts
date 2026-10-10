@@ -246,7 +246,8 @@ export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions):
           }
         }
         if (!active || operation.canArchive?.(active) === false) return;
-        await operation.onArchive(active);
+        const archived = await operation.onArchive(active);
+        if (archived === false) return; // The safety warning was cancelled.
         if (latest.current.activeId === operation.activeId) {
           navigate(target ? `/c/${target.id}` : "/", { replace: true });
         }

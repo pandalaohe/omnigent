@@ -22,6 +22,7 @@ from omnigent.host.git_worktree import (
     create_worktree,
     list_worktrees,
     read_folder_facts,
+    read_worktree_status,
     remove_worktree,
     validate_branch_name,
     validate_worktree_path_template,
@@ -179,6 +180,44 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
     assert isinstance(created, CreatedWorktree)
+
+
+def test_safe_archive_preserves_dirty_and_untracked_then_keeps_branch(git_repo: Path) -> None:
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/safe")
+    worktree = Path(created.worktree_path)
+    (worktree / "untracked.txt").write_text("keep")
+    assert read_worktree_status(str(worktree))["files"] == [
+        {"path": "untracked.txt", "status": "??"}
+    ]
+    with pytest.raises(WorktreeError, match="dirty"):
+        remove_worktree(worktree_path=str(worktree), branch="feature/safe", safe_only=True)
+    assert worktree.exists()
+    (worktree / "untracked.txt").unlink()
+    (worktree / "README.md").write_text("changed")
+    with pytest.raises(WorktreeError, match="dirty"):
+        remove_worktree(worktree_path=str(worktree), branch="feature/safe", safe_only=True)
+    (worktree / "README.md").write_text("hi")
+    (worktree / "committed.txt").write_text("work")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-qm", "unmerged work")
+    assert read_worktree_status(str(worktree))["merged"] is False
+    remove_worktree(worktree_path=str(worktree), branch="feature/safe", safe_only=True)
+    assert not worktree.exists()
+    assert _branch_exists(git_repo, "feature/safe")
+
+
+def test_safe_archive_rejects_main_and_binding_mismatch(git_repo: Path) -> None:
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/safe")
+    with pytest.raises(WorktreeError, match="protected"):
+        remove_worktree(worktree_path=str(git_repo), branch="main", safe_only=True)
+    with pytest.raises(WorktreeError, match="binding"):
+        remove_worktree(
+            worktree_path=created.worktree_path, branch="feature/other", safe_only=True
+        )
+    _git(Path(created.worktree_path), "checkout", "--detach")
+    with pytest.raises(WorktreeError, match="protected"):
+        remove_worktree(worktree_path=created.worktree_path, branch="feature/safe", safe_only=True)
+    assert Path(created.worktree_path).exists()
 
 
 @pytest.mark.parametrize("linked", [False, True])

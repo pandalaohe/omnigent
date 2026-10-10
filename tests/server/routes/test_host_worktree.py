@@ -282,6 +282,45 @@ async def test_remove_worktree_success(host_setup: HostRegistry) -> None:
     assert sent.branch == "feature/login"
 
 
+async def test_safe_archive_refuses_old_host_without_sending_force_opcode(
+    host_setup: HostRegistry,
+) -> None:
+    registry = host_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    before = len(registry._sent_frames_for_test)  # type: ignore[attr-defined]
+    with pytest.raises(WorktreeProxyError, match="safe archive"):
+        await remove_worktree_on_host(
+            host_registry=registry,
+            host_conn=conn,
+            worktree_path="/opt/work/sample-app/tree",
+            branch="feature/safe",
+            delete_branch=False,
+            safe_only=True,
+        )
+    assert len(registry._sent_frames_for_test) == before  # type: ignore[attr-defined]
+
+
+async def test_safe_archive_sends_safe_flag_to_capable_host(host_setup: HostRegistry) -> None:
+    registry = host_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append("worktree_safe_archive_v1")
+    registry._remove_reply_for_test.update({"status": "ok", "error": None})  # type: ignore[attr-defined]
+    await remove_worktree_on_host(
+        host_registry=registry,
+        host_conn=conn,
+        worktree_path="/opt/work/sample-app/tree",
+        branch="feature/safe",
+        delete_branch=False,
+        safe_only=True,
+    )
+    sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
+    assert isinstance(sent, HostRemoveWorktreeFrame)
+    assert sent.safe_only is True
+    assert sent.delete_branch is False
+
+
 async def test_remove_worktree_failure_surfaced(host_setup: HostRegistry) -> None:
     """A host ``status: failed`` remove reply raises with the error."""
     registry = host_setup

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
-from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, suppress
+from functools import wraps
 from pathlib import PureWindowsPath
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from sqlalchemy import (
     JSON,
@@ -104,8 +106,11 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_LOCK_LABEL_KEY,
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -136,6 +141,8 @@ from omnigent.stores.conversation_store import (
     SessionSuccession,
     SuccessionRefusedError,
     pinned_label_key,
+    worktree_admission_ancestor_fingerprints,
+    worktree_admission_fingerprint,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -143,10 +150,81 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+
+_BindingWrite = TypeVar("_BindingWrite", bound=Callable[..., Any])
+
+
+def _host_binding_admission(method: _BindingWrite) -> _BindingWrite:
+    """Fence every host binding write against safe archive cleanup."""
+    signature = inspect.signature(method)
+
+    @wraps(method)
+    def wrapped(self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(self, *args, **kwargs)
+        undo_archive = (
+            "archived" in signature.parameters and bound.arguments.get("archived") is False
+        )
+        if "archived" in signature.parameters and not undo_archive:
+            return method(self, *args, **kwargs)
+        conversation_id = bound.arguments.get("conversation_id")
+        while True:
+            before = self._get_meta(conversation_id) if conversation_id is not None else None
+            previous_host_id = before.host_id if before is not None else None
+            host_id = (
+                bound.arguments.get("admission_host_id")
+                or bound.arguments.get("host_id")
+                or previous_host_id
+            )
+            with ExitStack() as leases:
+                lease_hosts = {
+                    candidate
+                    for candidate in (previous_host_id, host_id)
+                    if isinstance(candidate, str)
+                }
+                for lease_host_id in sorted(lease_hosts):
+                    leases.enter_context(self._host_admission_lease(lease_host_id))
+                current = self._get_meta(conversation_id) if conversation_id is not None else None
+                if (current.host_id if current is not None else None) != previous_host_id:
+                    continue
+                if conversation_id is not None and not undo_archive:
+                    owner = self.get_conversation(conversation_id)
+                    if (
+                        owner is not None
+                        and ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in owner.labels
+                        and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in owner.labels
+                    ):
+                        raise OmnigentError(
+                            "Worktree removal is unresolved; wait for host confirmation",
+                            code=ErrorCode.CONFLICT,
+                        )
+                path = (
+                    bound.arguments.get("admission_workspace")
+                    or bound.arguments.get("worktree")
+                    or bound.arguments.get("workspace")
+                )
+                if path is None and current is not None:
+                    path = current.worktree or current.workspace
+                # Undo changes history, not the runner's worktree binding. It
+                # must remain possible after removal; any later binding still
+                # checks the persistent fence.
+                if (
+                    not undo_archive
+                    and host_id is not None
+                    and path
+                    and self._worktree_admission_fenced(host_id, path)
+                ):
+                    raise OmnigentError(
+                        "Worktree was removed during admission; refresh its binding",
+                        code=ErrorCode.CONFLICT,
+                    )
+                return method(self, *args, **kwargs)
+
+    return cast(_BindingWrite, wrapped)
 
 
 def _decode_session_state(
@@ -1031,6 +1109,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``storage_location`` when ``None`` (single-DB mode).
         """
         super().__init__(storage_location, conversation_storage_location)
+        self._host_binding_store = HostStore(storage_location)
         # Omnigent DB: agents, hosts, policies, files, user_daily_costs,
         # session_permissions, comments, omnigent_conversation_metadata.
         self._engine = get_or_create_engine(storage_location)
@@ -1087,6 +1166,51 @@ class SqlAlchemyConversationStore(ConversationStore):
             else cast(ColumnElement[Any], SqlConversation.id)
         )
         ensure_fts_table(self._conv_engine)
+
+    @contextmanager
+    def _host_admission_lease(self, host_id: str | None) -> Any:
+        if host_id is None:
+            yield
+            return
+        token = self._host_binding_store.acquire_worktree_admission(host_id)
+        try:
+            yield
+        finally:
+            if token is not None:
+                self._host_binding_store.release_cli_retention(host_id, token)
+
+    def _worktree_admission_fenced(self, host_id: str, path: str) -> bool:
+        fingerprints = worktree_admission_ancestor_fingerprints(host_id, path)
+        with self._conv_session("check_worktree_admission_fence") as session:
+            return (
+                session.execute(
+                    select(SqlConversationLabel.conversation_id)
+                    .where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                        SqlConversationLabel.value.in_(fingerprints),
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
+    def clear_verified_worktree_admission_fence(self, host_id: str, root: str) -> None:
+        """Clear a removal marker only after the host verifies a linked tree anew."""
+        fingerprint = worktree_admission_fingerprint(host_id, root)
+
+        def write(session: Session) -> None:
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                    SqlConversationLabel.value == fingerprint,
+                )
+            )
+
+        run_write_transaction(
+            self._conv_session_immediate, "clear_verified_worktree_admission_fence", write
+        )
 
     def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
         """
@@ -1161,6 +1285,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 {"id": uuid_to_bytes(conversation_id)},
             )
 
+    @_host_binding_admission
     def create_conversation(
         self,
         kind: str = "default",
@@ -4672,6 +4797,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         descending_scan = is_desc if forward else not is_desc
         return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
 
+    @_host_binding_admission
     def update_conversation_with_changes(
         self,
         conversation_id: str,
@@ -4692,6 +4818,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         close_cli_on_archive: bool = False,
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
+        keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> ConversationUpdateResult | None:
         """
@@ -4888,7 +5015,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 SqlConversationLabel.key == ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
                             )
                         )
-                    if archived and close_cli_on_archive and delete_worktree:
+                    if archived and delete_worktree:
                         # Names this revision in the same commit as the
                         # transition, so the durable teardown can never observe
                         # the archive without its worktree-delete intent.
@@ -4906,6 +5033,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
                                 SqlConversationLabel.conversation_id == conversation_id,
                                 SqlConversationLabel.key == ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+                            )
+                        )
+                    if archived and keep_worktree:
+                        _upsert_labels(
+                            ap_sess,
+                            conversation_id,
+                            {ARCHIVE_KEEP_WORKTREE_LABEL_KEY: str(row.archive_revision)},
+                            now,
+                        )
+                    else:
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
                             )
                         )
                     ap_changed = True
@@ -4999,6 +5141,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         close_cli_on_archive: bool = False,
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
+        keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """Update a conversation, preserving the legacy return contract."""
@@ -5021,6 +5164,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             close_cli_on_archive=close_cli_on_archive,
             archive_stop_when_idle=archive_stop_when_idle,
             delete_worktree=delete_worktree,
+            keep_worktree=keep_worktree,
             reported_model=reported_model,
         )
         return result.conversation if result is not None else None
@@ -5505,7 +5649,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             return None
         return self.get_conversation(conversation_id)
 
-    def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
+    @_host_binding_admission
+    def set_runner_id(
+        self,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        admission_host_id: str | None = None,
+        admission_workspace: str | None = None,
+    ) -> bool:
         """
         Pin a conversation to a runner via atomic
         ``UPDATE ... WHERE runner_id IS NULL``.
@@ -5526,6 +5678,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` if the row was already pinned or doesn't
             exist.
         """
+        # The decorator consumed the proposed binding before this write.
+        del admission_host_id, admission_workspace
         from sqlalchemy import update
 
         def write(session: Session) -> bool:
@@ -5919,6 +6073,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
+    @_host_binding_admission
     def replace_runner_id(
         self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
     ) -> Conversation:
@@ -6118,6 +6273,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             for r in ap_rows
         ]
 
+    @_host_binding_admission
     def set_host_id(
         self,
         conversation_id: str,
@@ -6194,6 +6350,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    @_host_binding_admission
     def set_worktree(
         self,
         conversation_id: str,
@@ -6308,6 +6465,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         return _to_conversation(ap_row, meta, labels)
 
+    @_host_binding_admission
     def create_session_with_agent(
         self,
         *,
@@ -7209,6 +7367,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         workspace: str,
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
+        include_unclosed_archived: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation working in this ``(host_id, workspace)``?
@@ -7276,13 +7435,21 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not candidate_ids:
             return False
         with self._conv_session("check_workspace_sharers_are_archived") as conv_sess:
+            in_use: ColumnElement[bool] = SqlConversation.archived.is_(False)
+            if include_unclosed_archived:
+                in_use = or_(
+                    in_use,
+                    SqlConversation.archive_close_completed_revision.is_(None),
+                    SqlConversation.archive_close_completed_revision
+                    != SqlConversation.archive_revision,
+                )
             return (
                 conv_sess.scalar(
                     select(SqlConversation.id)
                     .where(
                         SqlConversation.workspace_id == current_workspace_id(),
                         SqlConversation.id.in_(candidate_ids),
-                        SqlConversation.archived.is_(False),
+                        in_use,
                     )
                     .limit(1)
                 )
@@ -7311,10 +7478,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Agent rows are never deleted here: agents outlive the sessions using them
         # and only an explicit agent removal deletes one.
 
-        def delete_ap(ap_sess: Session) -> list[str] | None:
-            row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if not row:
-                return None
+        def subtree_ids_in(session: Session) -> list[str]:
             cte = (
                 select(SqlConversation.id)
                 .where(
@@ -7329,9 +7493,66 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.parent_conversation_id == cte.c.id,
                 )
             )
-            subtree_ids = [
-                cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
+            return [
+                cast(str, result[0]) for result in session.execute(select(cte.c.id)).fetchall()
             ]
+
+        with self._conv_session("delete_conversation_subtree") as session:
+            expected_ids = subtree_ids_in(session)
+        if not expected_ids:
+            return False
+        with self._session("delete_conversation_hosts") as session:
+            host_ids = sorted(
+                {
+                    host_id
+                    for (host_id,) in session.execute(
+                        select(SqlConversationMetadata.host_id).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.id.in_(expected_ids),
+                            SqlConversationMetadata.host_id.is_not(None),
+                        )
+                    )
+                    if host_id is not None
+                }
+            )
+
+        def delete_ap(ap_sess: Session) -> list[str] | None:
+            row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if not row:
+                return None
+            subtree_ids = subtree_ids_in(ap_sess)
+            if set(subtree_ids) != set(expected_ids):
+                raise OmnigentError(
+                    "Session tree changed during deletion; retry",
+                    code=ErrorCode.CONFLICT,
+                )
+            labels_by_id: dict[str, dict[str, str]] = {}
+            for session_id, key, value in ap_sess.execute(
+                select(
+                    SqlConversationLabel.conversation_id,
+                    SqlConversationLabel.key,
+                    SqlConversationLabel.value,
+                ).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(subtree_ids),
+                    SqlConversationLabel.key.in_(
+                        (
+                            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                            ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+                        )
+                    ),
+                )
+            ):
+                labels_by_id.setdefault(session_id, {})[key] = value
+            if any(
+                ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in labels
+                and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in labels
+                for labels in labels_by_id.values()
+            ):
+                raise OmnigentError(
+                    "Worktree removal is unresolved; retry deletion after host confirmation",
+                    code=ErrorCode.CONFLICT,
+                )
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -7364,11 +7585,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_sess.delete(row)
             return subtree_ids
 
-        ap_result = run_write_transaction(
-            self._conv_session_immediate,
-            "delete_conversation_rows",
-            delete_ap,
-        )
+        with ExitStack() as host_leases:
+            for host_id in host_ids:
+                host_leases.enter_context(self._host_admission_lease(host_id))
+            ap_result = run_write_transaction(
+                self._conv_session_immediate,
+                "delete_conversation_rows",
+                delete_ap,
+            )
         if ap_result is None:
             return False
         subtree_ids = ap_result

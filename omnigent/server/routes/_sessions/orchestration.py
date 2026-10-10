@@ -12441,6 +12441,24 @@ async def _create_session_from_existing_agent(
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+            from omnigent.server.routes._host_worktree import refresh_worktree_admission_fence
+
+            registry = getattr(request.app.state, "host_registry", None)
+            conn = registry.get(body.host_id) if registry is not None else None
+            if (
+                registry is not None
+                and conn is not None
+                and canonical_workspace is not None
+                and body.host_id is not None
+            ):
+                await refresh_worktree_admission_fence(
+                    host_registry=registry,
+                    host_conn=conn,
+                    conversation_store=conversation_store,
+                    host_id=body.host_id,
+                    workspace=canonical_workspace,
+                    branch=body.git.branch_name,
+                )
             git_branch = body.git.branch_name
         else:
             # A worktree made from the entry is sourced from the project's
@@ -12516,6 +12534,19 @@ async def _create_session_from_existing_agent(
                     and not same_canonical_path(created_worktree.workspace, created_worktree_path)
                     else canonical_workspace
                 )
+                from omnigent.server.routes._host_worktree import refresh_worktree_admission_fence
+
+                registry = getattr(request.app.state, "host_registry", None)
+                conn = registry.get(body.host_id) if registry is not None else None
+                if registry is not None and conn is not None and body.host_id is not None:
+                    await refresh_worktree_admission_fence(
+                        host_registry=registry,
+                        host_conn=conn,
+                        conversation_store=conversation_store,
+                        host_id=body.host_id,
+                        workspace=canonical_worktree_root,
+                        branch=created_worktree.branch,
+                    )
             except Exception:
                 # The host already created this worktree; a failure
                 # resolving its canonical path must not leak it. Same

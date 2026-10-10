@@ -21,8 +21,9 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { ARCHIVE_SESSION_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -30,8 +31,10 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 // Controllable archive + stop mutations, declared via vi.hoisted so the
 // vi.mock factory can reference them.
 const mocks = vi.hoisted(() => ({
-  archive: { mutate: vi.fn() },
+  archive: { mutate: vi.fn(), mutateAsync: vi.fn() },
   stop: { mutate: vi.fn() },
+  preference: vi.fn(),
+  status: vi.fn(),
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -42,6 +45,12 @@ vi.mock("@/hooks/useConversations", async () => {
     useStopSession: () => mocks.stop,
   };
 });
+
+vi.mock("@/components/WorktreeStatusMark", () => ({ WorktreeStatusMark: () => null }));
+vi.mock("@/lib/archiveWorktreePreferences", () => ({
+  fetchArchiveWorktreePreference: mocks.preference,
+}));
+vi.mock("@/hooks/useWorktreeStatus", () => ({ fetchSessionWorktreeStatus: mocks.status }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -68,17 +77,28 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => result);
 }
 
-const CLEANUP_SERVER: ServerInfo = { ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true };
+const CLEANUP_SERVER: ServerInfo = { ...FALLBACK_SERVER_INFO, worktree_status: true };
 
-function renderSidebar(serverInfo: ServerInfo = CLEANUP_SERVER) {
+function LocationProbe() {
+  return <output data-testid="archive-location">{useLocation().pathname}</output>;
+}
+
+function renderSidebar(serverInfo: ServerInfo = FALLBACK_SERVER_INFO, route = "/") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <CapabilitiesProvider info={serverInfo}>
         <SidebarDataProvider>
           <TooltipProvider>
-            <MemoryRouter initialEntries={["/"]}>
-              <Sidebar open={true} onClose={vi.fn()} />
+            <MemoryRouter initialEntries={[route]}>
+              <Routes>
+                <Route
+                  path="/c/:conversationId"
+                  element={<Sidebar open={true} onClose={vi.fn()} />}
+                />
+                <Route path="*" element={<Sidebar open={true} onClose={vi.fn()} />} />
+              </Routes>
+              <LocationProbe />
               <Toaster />
             </MemoryRouter>
           </TooltipProvider>
@@ -97,7 +117,10 @@ function clickArchive() {
 
 beforeEach(() => {
   mocks.archive.mutate.mockReset();
+  mocks.archive.mutateAsync.mockReset().mockResolvedValue({});
   mocks.stop.mutate.mockReset();
+  mocks.preference.mockReset().mockResolvedValue("delete_safe");
+  mocks.status.mockReset();
 });
 
 afterEach(() => {
@@ -118,7 +141,7 @@ describe("archive flow", () => {
     expect(mocks.archive.mutate).toHaveBeenCalledWith({
       id: "conv_1",
       archived: true,
-      deleteWorktree: false,
+      keepWorktree: false,
     });
     // The server owns the stop. A client stop here would race it against
     // the same runner and put its timeouts in front of the flag flip.
@@ -164,7 +187,7 @@ describe("archive flow", () => {
     expect(mocks.archive.mutate).toHaveBeenCalledWith({
       id: "conv_1",
       archived: true,
-      deleteWorktree: false,
+      keepWorktree: false,
     });
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
   });
@@ -184,93 +207,144 @@ describe("archive flow", () => {
   });
 });
 
-describe("archive worktree prompt", () => {
+describe("safe archive warning", () => {
   const WORKTREE_CONV: Conversation = { ...CONV, git_branch: "feature/x" };
-  const PREF_KEY = "omnigent:delete-worktrees-on-archive";
+  const status = (state: string) => ({
+    own: {
+      state,
+      reason: state === "dirty" ? "Uncommitted or untracked files." : "Checked worktree.",
+      path: "/opt/work/project/task",
+      branch: "feature/x",
+      merged: false,
+      merge_target: "main",
+      files: state === "dirty" ? [{ path: "draft.txt", status: "??" }] : [],
+    },
+    aggregate: { state, reason: null },
+    blockers: [],
+    session_count: 1,
+  });
+  it("routes the keyboard archive through the warning, cancellation and explicit keep", async () => {
+    mocks.status.mockResolvedValue(status("dirty"));
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar(CLEANUP_SERVER, "/c/conv_1");
+    act(() => window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT)));
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.archive.mutateAsync).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("archive-location")).toHaveTextContent("/c/conv_1");
+    act(() => window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT)));
+    await screen.findByTestId("archive-worktree-dialog");
+    fireEvent.click(screen.getByRole("button", { name: "Archive only" }));
+    await waitFor(() =>
+      expect(mocks.archive.mutateAsync).toHaveBeenCalledWith({
+        id: "conv_1",
+        archived: true,
+        keepWorktree: true,
+      }),
+    );
+    await waitFor(() => expect(screen.getByTestId("archive-location")).toHaveTextContent(/^\/$/));
+  });
 
-  it("archives a non-worktree session without prompting", () => {
-    mockConversations([CONV]);
-    renderSidebar();
+  it("archives a clean unmerged tree without prompting", async () => {
+    mocks.status.mockResolvedValue(status("clean"));
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar(CLEANUP_SERVER);
     clickArchive();
-
+    await waitFor(() =>
+      expect(mocks.archive.mutate).toHaveBeenCalledWith({
+        id: "conv_1",
+        archived: true,
+        keepWorktree: false,
+      }),
+    );
     expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
-    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.status).toHaveBeenCalledWith("conv_1", true);
   });
 
-  it("asks before archiving a worktree session, then deletes on Yes", async () => {
+  it("lists dirty files and defaults to archive only", async () => {
+    mocks.status.mockResolvedValue(status("dirty"));
     mockConversations([WORKTREE_CONV]);
-    renderSidebar();
+    renderSidebar(CLEANUP_SERVER);
     clickArchive();
-
     await screen.findByTestId("archive-worktree-dialog");
+    expect(screen.getByText(/draft.txt/)).toBeInTheDocument();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
-
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({
-      id: "conv_1",
-      archived: true,
-      deleteWorktree: true,
-    });
-    // Without "Remember my choice" the answer isn't remembered.
-    expect(localStorage.getItem(PREF_KEY)).toBeNull();
-  });
-
-  it("archives only on No and remembers the choice when asked to", async () => {
-    mockConversations([WORKTREE_CONV]);
-    renderSidebar();
-    clickArchive();
-
-    await screen.findByTestId("archive-worktree-dialog");
-    fireEvent.click(screen.getByTestId("archive-worktree-remember"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Archive only" })).toHaveFocus());
+    expect(screen.queryByTestId("archive-worktree-delete")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("archive-worktree-keep"));
-
     expect(mocks.archive.mutate).toHaveBeenCalledWith({
       id: "conv_1",
       archived: true,
-      deleteWorktree: false,
+      keepWorktree: true,
     });
-    expect(localStorage.getItem(PREF_KEY)).toBe("false");
   });
 
-  it("cancels the archive when the prompt is dismissed", async () => {
+  it("cancels without archiving when the warning is dismissed", async () => {
+    mocks.status.mockResolvedValue(status("dirty"));
     mockConversations([WORKTREE_CONV]);
-    renderSidebar();
+    renderSidebar(CLEANUP_SERVER);
     clickArchive();
-
     const dialog = await screen.findByTestId("archive-worktree-dialog");
     fireEvent.keyDown(dialog, { key: "Escape" });
-
-    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 
-  it("archives only, without prompting, on a server without worktree cleanup", () => {
-    // Older servers reject the unknown `delete_worktree` field, so even a saved
-    // opt-in must not send it.
-    localStorage.setItem(PREF_KEY, "true");
+  it("never prompts or reads worktree status under never delete", async () => {
+    mocks.preference.mockResolvedValue("never");
     mockConversations([WORKTREE_CONV]);
-    renderSidebar(FALLBACK_SERVER_INFO);
+    renderSidebar(CLEANUP_SERVER);
     clickArchive();
-
+    await waitFor(() =>
+      expect(mocks.archive.mutate).toHaveBeenCalledWith({
+        id: "conv_1",
+        archived: true,
+        keepWorktree: false,
+      }),
+    );
+    expect(mocks.status).not.toHaveBeenCalled();
     expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({
-      id: "conv_1",
-      archived: true,
-      deleteWorktree: false,
-    });
   });
 
-  it("applies a saved preference without prompting", () => {
-    localStorage.setItem(PREF_KEY, "true");
-    mockConversations([WORKTREE_CONV]);
-    renderSidebar();
-    clickArchive();
+  it.each(["unknown", "protected", "shared"])(
+    "keeps %s worktrees after confirmation",
+    async (state) => {
+      mocks.status.mockResolvedValue(status(state));
+      mockConversations([WORKTREE_CONV]);
+      renderSidebar(CLEANUP_SERVER);
+      clickArchive();
+      await screen.findByTestId("archive-worktree-dialog");
+      fireEvent.click(screen.getByTestId("archive-worktree-keep"));
+      expect(mocks.archive.mutate).toHaveBeenCalledWith({
+        id: "conv_1",
+        archived: true,
+        keepWorktree: true,
+      });
+    },
+  );
 
-    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({
-      id: "conv_1",
-      archived: true,
-      deleteWorktree: true,
-    });
+  it("retains trees if preferences cannot be read", async () => {
+    mocks.preference.mockRejectedValue(new Error("offline"));
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar(CLEANUP_SERVER);
+    clickArchive();
+    await waitFor(() =>
+      expect(mocks.archive.mutate).toHaveBeenCalledWith({
+        id: "conv_1",
+        archived: true,
+        keepWorktree: true,
+      }),
+    );
+  });
+
+  it("checks actual binding even when the recorded branch is absent", async () => {
+    mocks.status.mockResolvedValue(status("dirty"));
+    mockConversations([CONV]);
+    renderSidebar(CLEANUP_SERVER);
+    clickArchive();
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
   });
 });

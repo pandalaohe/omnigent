@@ -673,6 +673,7 @@ export function ChatHeader({
             window controls + title-bar cluster (index.css). */}
         {conversationId && (conversationTitle || titleLinkTo) && (
           <ConversationBreadcrumb
+            sessionId={conversationId}
             conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
             projectIcon={projectIcon}

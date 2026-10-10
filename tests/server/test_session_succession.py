@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -26,12 +27,16 @@ from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import session_succession as succession_module
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, UnifiedAuthProvider
+from omnigent.server.archive_close import ArchiveCloseCoordinator
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.routes import sessions as sessions_facade
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store import (
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     HANDOVER_ITEM_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
@@ -40,6 +45,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import (
     SqlAlchemyPeerMessageStore,
 )
@@ -48,6 +54,80 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize(("shared", "runner_bound"), [(True, True), (False, True), (False, False)])
+async def test_succession_archive_preserves_rekeyed_runner_and_shared_tree(
+    store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    shared: bool,
+    runner_bound: bool,
+) -> None:
+    host_id = "0123456789abcdef0123456789abcdef"
+    HostStore(db_uri).upsert_on_connect(host_id, "test-host", RESERVED_USER_LOCAL)
+    path = "/opt/work/sample-app/tree"
+    old = store.create_conversation(
+        title="old",
+        host_id=host_id,
+        runner_id=RUNNER_ID if runner_bound else None,
+        workspace=path,
+        git_branch="feature/work",
+    )
+    successor = store.create_conversation(
+        title="successor",
+        host_id=host_id,
+        runner_id=RUNNER_ID,
+        workspace=path if shared else "/opt/work/sample-app/other",
+        git_branch="feature/work",
+    )
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    preferences.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "delete_safe"})
+    host = SimpleNamespace()
+    registry = SimpleNamespace(get=lambda _host_id: host)
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=store,
+        host_store=None,
+        host_registry=registry,
+        runner_router=None,
+        intent_store=None,
+    )
+    coordinator.set_archive_preferences(preferences, None)
+    receipt = SimpleNamespace(old_id=old.id, new_id=successor.id, id="receipt")
+    monkeypatch.setattr(succession_module, "_advance", AsyncMock(return_value=receipt))
+    list_host = AsyncMock(
+        return_value=[
+            {
+                "path": path,
+                "branch": "feature/work",
+                "is_main": False,
+            }
+        ]
+    )
+    remove_host = AsyncMock()
+    with (
+        patch("omnigent.server.routes._host_worktree.list_worktrees_on_host", list_host),
+        patch("omnigent.server.routes._host_worktree.remove_worktree_on_host", remove_host),
+    ):
+        await succession_module._phase_archive(
+            receipt, conversation_store=store, archive_cleanup=coordinator
+        )
+    row = store.get_conversation(old.id)
+    assert row is not None
+    assert row.archived is True
+    assert row.runner_id == (RUNNER_ID if runner_bound else None)
+    assert row.archive_close_requested_revision is None
+    assert row.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(row.archive_revision)
+    assert store.get_conversation(successor.id).archived is False
+    if shared or runner_bound:
+        list_host.assert_not_awaited()
+        remove_host.assert_not_awaited()
+    else:
+        list_host.assert_awaited_once()
+        remove_host.assert_awaited_once()
+        assert remove_host.await_args.kwargs["safe_only"] is True
+        assert row.labels[ARCHIVE_REMOVED_WORKTREE_LABEL_KEY] == str(row.archive_revision)
+
 
 RUNNER_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
 RUNNER_ID_B = "b1b2c3d4e5f60718293a4b5c6d7e8f02"

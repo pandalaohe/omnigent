@@ -74,6 +74,7 @@ CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
 # and posts ``external_keep_warm_receipt`` events; the server pings only runners
 # that advertise it (older runners would forward an unknown type to the harness).
 CAP_KEEP_WARM = "keep_warm_v1"
+CAP_WORKTREE_SAFE_ARCHIVE = "worktree_safe_archive_v1"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -82,6 +83,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PATH_ATTACHMENTS,
     CAP_FS_READ_RAW,
     CAP_KEEP_WARM,
+    CAP_WORKTREE_SAFE_ARCHIVE,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
@@ -823,12 +825,15 @@ class HostRemoveWorktreeFrame:
     :param delete_branch: When ``True``, ``git branch -D`` after
         removing the directory; when ``False``, remove only the
         directory.
+    :param safe_only: Recheck cleanliness and binding on a capable host,
+        then remove without ``--force`` and retain the branch.
     """
 
     request_id: str
     worktree_path: str
     branch: str | None = None
     delete_branch: bool = False
+    safe_only: bool = False
 
 
 @dataclass
@@ -860,11 +865,14 @@ class HostListWorktreesFrame:
     :param repo_path: Absolute path inside the repo (the picked dir or
         a subdir), e.g. ``"/Users/alice/myrepo"``.
     :param for_cleanup: Avoid replacement symlinks in a stored canonical workspace.
+    :param for_status: Include filename-only status and merge information
+        for the exact requested linked worktree.
     """
 
     request_id: str
     repo_path: str
     for_cleanup: bool = False
+    for_status: bool = False
 
 
 @dataclass
@@ -1873,6 +1881,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "worktree_path": frame.worktree_path,
                 "branch": frame.branch,
                 "delete_branch": frame.delete_branch,
+                "safe_only": frame.safe_only,
             }
         )
     if isinstance(frame, HostRemoveWorktreeResultFrame):
@@ -1891,6 +1900,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "repo_path": frame.repo_path,
                 "for_cleanup": frame.for_cleanup,
+                "for_status": frame.for_status,
             }
         )
     if isinstance(frame, HostListWorktreesResultFrame):
@@ -3002,11 +3012,15 @@ def _decode_remove_worktree(msg: _JsonObject) -> HostRemoveWorktreeFrame:
     delete_branch = msg.get("delete_branch", False)
     if not isinstance(delete_branch, bool):
         raise ValueError("frame field must be a bool: 'delete_branch'")
+    safe_only = msg.get("safe_only", False)
+    if not isinstance(safe_only, bool):
+        raise ValueError("frame field must be a bool: 'safe_only'")
     return HostRemoveWorktreeFrame(
         request_id=_required_str(msg, "request_id"),
         worktree_path=_required_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
         delete_branch=delete_branch,
+        safe_only=safe_only,
     )
 
 
@@ -3035,6 +3049,7 @@ def _decode_list_worktrees(msg: _JsonObject) -> HostListWorktreesFrame:
         request_id=_required_str(msg, "request_id"),
         repo_path=_required_str(msg, "repo_path"),
         for_cleanup=msg.get("for_cleanup") is True,
+        for_status=msg.get("for_status") is True,
     )
 
 
