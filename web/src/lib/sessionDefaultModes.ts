@@ -1,6 +1,11 @@
 import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
 
-export const SPEED_TIER_HARNESSES = ["codex", "codex-native"] as const;
+export const SPEED_TIER_HARNESSES = [
+  "codex",
+  "codex-native",
+  "claude-native",
+  "claude-sdk",
+] as const;
 export const SPEED_TIER_OPTIONS = [
   { value: "standard", label: "Standard" },
   { value: "fast", label: "Fast" },

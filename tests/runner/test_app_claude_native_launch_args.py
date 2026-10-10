@@ -651,10 +651,15 @@ async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
     assert metadata.auto_harness is expected
 
 
+@pytest.mark.parametrize(
+    "speed,expected_fast", [("fast", True), ("standard", False), (None, None)]
+)
 async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    speed: str | None,
+    expected_fast: bool | None,
 ) -> None:
     """Cancelling a blocked diagnostic drain must leave the launch error logged."""
     import asyncio
@@ -695,7 +700,12 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
         server_version="test",
         session_id=session_id,
         agent_id="agent",
-        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(bridge_dir)),
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            workspace=str(bridge_dir),
+            labels={"omnigent.speed_tier": speed} if speed else {},
+        ),
     )
     loop = asyncio.get_running_loop()
     closing = asyncio.Event()
@@ -726,6 +736,16 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     try:
         await asyncio.wait_for(closing.wait(), timeout=10)
         assert not closed.is_set()
+        import json
+
+        launch_spec = registry.launch_required_terminal.call_args.kwargs["spec"]
+        settings_path = launch_spec.args[launch_spec.args.index("--settings") + 1]
+        settings = json.loads(Path(settings_path).read_text())
+        assert "hooks" in settings
+        if expected_fast is None:
+            assert "fastMode" not in settings
+        else:
+            assert settings["fastMode"] is expected_fast
         errors_before_cancel = [
             record
             for record in caplog.records

@@ -1,3 +1,6 @@
+import { CircleHelpIcon } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Select,
   SelectContent,
@@ -28,7 +31,7 @@ export function SessionDefaultModeSelect({
 }) {
   const options = sessionDefaultModeOptions(harness, field);
   if (options.length === 0) return null;
-  return (
+  const select = (
     <Select
       value={value ?? "__default__"}
       disabled={disabled}
@@ -49,5 +52,31 @@ export function SessionDefaultModeSelect({
         ))}
       </SelectContent>
     </Select>
+  );
+  if (field !== "speed" || !["claude-native", "claude-sdk"].includes(harness)) return select;
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      {select}
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="About Claude fast mode"
+            >
+              <CircleHelpIcon className="size-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            Fast mode supports Opus 5.5, 5 and 4.8, subject to account availability. Other models
+            start at standard speed. On subscription plans it uses usage credits instead of included
+            plan usage. First enable charges the conversation context at the uncached fast rate;
+            starting fast minimizes that charge.
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </div>
   );
 }

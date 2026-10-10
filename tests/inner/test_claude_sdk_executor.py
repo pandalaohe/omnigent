@@ -1383,6 +1383,41 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_speed_is_merged_into_sdk_settings(self):
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def _t(speed, expected):
+            executor = ClaudeSDKExecutor(gateway=False, api_key_helper="test-helper")
+            captured = {}
+
+            async def capture(sdk, *, session_key, options, model):
+                captured["options"] = options
+                raise RuntimeError("stop before CLI launch")
+
+            with patch.object(executor, "_get_or_create_client", side_effect=capture):
+                with pytest.raises(RuntimeError, match="stop before CLI launch"):
+                    async for _ in executor.run_turn(
+                        [{"role": "user", "content": "hi"}],
+                        [],
+                        "",
+                        ExecutorConfig(service_tier=speed),
+                    ):
+                        pass
+            options = captured["options"]
+            assert isinstance(options, ClaudeAgentOptions)
+            settings = json.loads(options.settings)
+            assert settings["apiKeyHelper"] == "test-helper"
+            if expected is None:
+                assert "fastMode" not in settings
+            else:
+                assert settings["fastMode"] is expected
+
+        for speed, expected in [("fast", True), ("standard", False), (None, None)]:
+            with self.subTest(speed=speed):
+                _run(_t(speed, expected))
+
     def test_force_close_client_uses_process_tree_termination(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 

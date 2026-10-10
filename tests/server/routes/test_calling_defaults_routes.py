@@ -237,29 +237,30 @@ async def test_catalogs_returns_only_the_callers_hosts(
     assert rows[0]["stale"] is False
 
 
+@pytest.mark.parametrize("harness", ["codex", "claude-native", "claude-sdk"])
 async def test_resolve_reads_the_master_table_through_the_agents_harness(
-    client: httpx.AsyncClient, stores: _Stores
+    client: httpx.AsyncClient, stores: _Stores, harness: str
 ) -> None:
     """No project: the master table applies under the agent's resolved harness."""
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
-    _seed_agent(stores, AGENT_ID, harness="codex")
+    _seed_agent(stores, AGENT_ID, harness=harness)
     stores.prefs.patch_namespace(
         "local",
         "calling_defaults",
         {
             HOST_A: {
-                "codex": {
+                harness: {
                     "model": "gpt-6-sol",
                     "effort": "high",
                     "speed": "fast",
-                    "permission": "approve-for-me",
+                    "permission": "auto" if harness.startswith("claude") else "approve-for-me",
                 }
             }
         },
     )
     stores.cache.upsert(
         HOST_A,
-        "codex",
+        harness,
         [{"id": "gpt-6-sol", "supportedReasoningEfforts": ["high"]}],
         10,
     )
@@ -271,11 +272,11 @@ async def test_resolve_reads_the_master_table_through_the_agents_harness(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["agent_id"] == AGENT_ID
-    assert body["harness"] == "codex"
+    assert body["harness"] == harness
     assert body["model"] == "gpt-6-sol"
     assert body["effort"] == "high"
     assert body["speed"] == "fast"
-    assert body["permission"] == "approve-for-me"
+    assert body["permission"] == ("auto" if harness.startswith("claude") else "approve-for-me")
     assert body["sources"] == {
         "agent": "explicit",
         "model": "master",

@@ -7098,7 +7098,9 @@ def create_runner_app(
             harness_body["permission_mode"] = permission_mode
         if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
             harness_body["approval_mode"] = approval_mode
-        if harness_name == "codex" and (service_tier := _session_service_tier.get(conv)):
+        if harness_name in {"codex", "claude-sdk"} and (
+            service_tier := _session_service_tier.get(conv)
+        ):
             harness_body["service_tier"] = service_tier
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]

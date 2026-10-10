@@ -2294,6 +2294,7 @@ def build_hook_settings(
     launch_permission_mode: str | None = None,
     launch_bypass_permissions: bool = False,
     launch_effort: str | None = None,
+    fast_mode: bool | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
 ) -> _JsonObject:
@@ -2340,6 +2341,7 @@ def build_hook_settings(
         dialog never blocks a host-spawned terminal.
     :param launch_effort: Effective launch effort from ``--effort``.
         Mirrored into ``effortLevel`` for restart/re-exec parity.
+    :param fast_mode: Session speed override; ``None`` preserves Claude's default.
     :param subagent_router_dir: Directory where the runner advertises its
         ``route-subagent`` endpoint (``subagent_router.json``). When set,
         a ``PreToolUse`` hook routes native subagent spawns; ``None``
@@ -2624,6 +2626,8 @@ def build_hook_settings(
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
+    if fast_mode is not None:
+        settings["fastMode"] = fast_mode
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
@@ -2716,6 +2720,7 @@ def augment_claude_args(
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
     model_overrides: Mapping[str, str] | None = None,
+    fast_mode: bool | None = None,
     bundle_dir: Path | None = None,
     workspace: Path | None = None,
     agent_name: str | None = None,
@@ -2751,6 +2756,7 @@ def augment_claude_args(
         threaded to :func:`build_hook_settings` so the sidecar carries
         Claude Code's ``modelOverrides`` map. ``None`` or empty omits
         the key.
+    :param fast_mode: Session speed override merged into the bridge settings.
     :param bundle_dir: Materialized agent-bundle root, when the
         session's agent ships a ``skills/`` directory. Triggers
         ``--plugin-dir <bundle>`` so Claude Code discovers bundled
@@ -2794,6 +2800,7 @@ def augment_claude_args(
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
         launch_effort=_arg_value(claude_args, "--effort"),
+        fast_mode=fast_mode,
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )

@@ -1358,7 +1358,8 @@ describe("ProjectSettingsDialog", () => {
             agent_id: "ag_codex_sdk",
             harnesses: {
               codex: { speed: "standard", permission: "read-only" },
-              "claude-native": { permission: "plan" },
+              "claude-native": { speed: "standard", permission: "plan" },
+              "claude-sdk": { speed: "fast" },
             },
           },
         },
@@ -1375,8 +1376,13 @@ describe("ProjectSettingsDialog", () => {
     await pickOption("project-settings-host-permission-h1", "Approve for me");
     fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
     expect(
-      screen.queryByTestId("project-settings-host-other-speed-h1-claude-native"),
-    ).not.toBeInTheDocument();
+      screen.getByTestId("project-settings-host-other-speed-h1-claude-native"),
+    ).toHaveTextContent("Standard");
+    expect(screen.getByTestId("project-settings-host-other-speed-h1-claude-sdk")).toHaveTextContent(
+      "Fast",
+    );
+    await pickOption("project-settings-host-other-speed-h1-claude-native", "Fast");
+    await pickOption("project-settings-host-other-speed-h1-claude-sdk", "Standard");
     await pickOption("project-settings-host-other-permission-h1-claude-native", "Auto");
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
@@ -1386,7 +1392,8 @@ describe("ProjectSettingsDialog", () => {
             agent_id: "ag_codex_sdk",
             harnesses: {
               codex: { speed: "fast", permission: "approve-for-me" },
-              "claude-native": { permission: "auto" },
+              "claude-native": { speed: "fast", permission: "auto" },
+              "claude-sdk": { speed: "standard" },
             },
           },
         },
