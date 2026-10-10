@@ -389,7 +389,7 @@ describe("Sidebar sections", () => {
   it("writes collapse state only under the section-id key", () => {
     renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: /Sessions/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
 
     expect(JSON.parse(localStorage.getItem(COLLAPSED_IDS_STORAGE_KEY)!)).toContain(
       "default-other-sessions",
@@ -408,7 +408,7 @@ describe("Sidebar sections", () => {
     expect(localStorage.getItem(LEGACY_COLLAPSED_STORAGE_KEY)).toBe(
       JSON.stringify(["Pinned", "Chats"]),
     );
-    expect(screen.getByRole("button", { name: /Sessions/ })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Sessions" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
@@ -567,6 +567,187 @@ describe("Sidebar sections", () => {
     await waitFor(() =>
       expect(recentCalls().some((call) => String(call[0]).includes("limit=8"))).toBe(true),
     );
+  });
+
+  it("names each Projects menu and saves an exact typed section height", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
+    renderSidebar();
+
+    const projects = sectionOf("Projects");
+    expect(
+      within(projects).getByRole("button", { name: "Project list actions" }),
+    ).toBeInTheDocument();
+    const options = within(projects).getByRole("button", { name: "Projects section options" });
+    expect(options.querySelector("svg")).toBeTruthy();
+    fireEvent.pointerDown(options, { button: 0 });
+    expect(await screen.findByText("Projects section options")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("section-max-height"));
+    fireEvent.click(await screen.findByText("Custom…"));
+
+    const input = screen.getByRole("textbox", { name: "Maximum rows" });
+    const save = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(input, { target: { value: "2.5" } });
+    fireEvent.click(save);
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a whole number from 1 to 100.");
+    fireEvent.change(input, { target: { value: "0" } });
+    fireEvent.click(save);
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a whole number from 1 to 100.");
+    fireEvent.change(input, { target: { value: "abc" } });
+    fireEvent.click(save);
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a whole number from 1 to 100.");
+    fireEvent.change(input, { target: { value: "37" } });
+    fireEvent.click(save);
+
+    await waitFor(() =>
+      expect(storedLayout().sections.find((s) => s.id === "default-other-projects")?.maxRows).toBe(
+        37,
+      ),
+    );
+    expect(within(projects).getByTestId("sidebar-section-body")).toHaveStyle({
+      maxHeight: "1073px",
+    });
+    fireEvent.pointerDown(within(projects).getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+    });
+    expect(await screen.findByText("Project list actions")).toBeInTheDocument();
+  });
+
+  it("shows pinned sessions only in Pinned, including folder pages and Recent, then restores their home rows", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        ...WORK_LAYOUT,
+        sections: [
+          ...WORK_LAYOUT.sections.slice(0, 2),
+          { id: "recent", kind: "recent", name: "Recent", maxRows: null, count: 5 },
+          ...WORK_LAYOUT.sections.slice(2),
+        ],
+      }),
+    );
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    const filed = conversation("filed", {
+      project_id: "p_alpha",
+      labels: { omni_project: "Alpha", "omnigent.pinned": "1000" },
+      updated_at: 2,
+    });
+    const before = conversation("before", { project_id: "p_alpha", updated_at: 3 });
+    const after = conversation("after", { project_id: "p_alpha", updated_at: 1 });
+    const flat = conversation("flat", { labels: { "omnigent.pinned": "2000" } });
+    pinnedRef.current = [filed, flat];
+    folderRowsRef.current.set("Alpha", [before, filed, after]);
+    mockConversations([flat, before, after]);
+    recentRef.current.data = [filed, flat];
+    renderSidebar();
+
+    expect(within(sectionOf("Pinned")).getByText("filed")).toBeInTheDocument();
+    expect(within(sectionOf("Pinned")).getByText("flat")).toBeInTheDocument();
+    expect(within(sectionOf("Work")).queryByText("filed")).toBeNull();
+    expect(within(sectionOf("Sessions")).queryByText("flat")).toBeNull();
+    expect(within(sectionOf("Recent")).queryByText("filed")).toBeNull();
+    expect(within(sectionOf("Recent")).queryByText("flat")).toBeNull();
+
+    fireEvent.click(within(sectionOf("Pinned")).getAllByTestId("quick-pin-conversation")[0]!);
+    await waitFor(() => expect(within(sectionOf("Work")).getByText("filed")).toBeInTheDocument());
+    expect(
+      isBefore(
+        within(sectionOf("Work")).getByText("before"),
+        within(sectionOf("Work")).getByText("filed"),
+      ),
+    ).toBe(true);
+    expect(
+      isBefore(
+        within(sectionOf("Work")).getByText("filed"),
+        within(sectionOf("Work")).getByText("after"),
+      ),
+    ).toBe(true);
+    await waitFor(() => expect(within(sectionOf("Recent")).getByText("filed")).toBeInTheDocument());
+    fireEvent.click(within(sectionOf("Pinned")).getByTestId("quick-pin-conversation"));
+    await waitFor(() =>
+      expect(within(sectionOf("Sessions")).getByText("flat")).toBeInTheDocument(),
+    );
+  }, 15_000);
+
+  it("returns filed and unfiled pins to their home rows when Favorites is removed", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    const filed = conversation("filed", {
+      project_id: "p_alpha",
+      labels: { omni_project: "Alpha" },
+    });
+    const flat = conversation("flat");
+    pinnedRef.current = [filed, flat];
+    folderRowsRef.current.set("Alpha", [filed]);
+    mockConversations([filed, flat]);
+    renderSidebar();
+
+    expect(within(sectionOf("Work")).queryByText("filed")).toBeNull();
+    expect(within(sectionOf("Sessions")).queryByText("flat")).toBeNull();
+    fireEvent.pointerDown(within(sectionOf("Pinned")).getByTestId("section-options"), {
+      button: 0,
+    });
+    fireEvent.click(await screen.findByTestId("remove-section"));
+
+    await waitFor(() => expect(within(sectionOf("Work")).getByText("filed")).toBeInTheDocument());
+    expect(within(sectionOf("Sessions")).getByText("flat")).toBeInTheDocument();
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(pinnedRef.current).toHaveLength(2);
+  }, 15_000);
+
+  it("loads filed and unfiled pins in home lists when the stored layout has no Favorites", () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        ...WORK_LAYOUT,
+        sections: WORK_LAYOUT.sections.filter((section) => section.kind !== "favorites"),
+      }),
+    );
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    const filed = conversation("filed", {
+      project_id: "p_alpha",
+      labels: { omni_project: "Alpha" },
+    });
+    const flat = conversation("flat");
+    pinnedRef.current = [filed, flat];
+    folderRowsRef.current.set("Alpha", [filed]);
+    mockConversations([filed, flat]);
+    renderSidebar();
+
+    expect(within(sectionOf("Work")).getByText("filed")).toBeInTheDocument();
+    expect(within(sectionOf("Sessions")).getByText("flat")).toBeInTheDocument();
+    expect(screen.queryByText("Pinned")).toBeNull();
+  });
+
+  it("shows a favorite project only in Pinned while keeping its home section order for unpin", async () => {
+    orderRef.current = { sort_mode: "manual", ordered_project_ids: ["p_beta", "p_alpha"] };
+    const layout = {
+      ...WORK_LAYOUT,
+      sections: WORK_LAYOUT.sections.map((section) => {
+        if (section.kind === "favorites")
+          return { ...section, items: [{ type: "project" as const, id: "p_alpha" }] };
+        if (section.kind === "projects") return { ...section, projectIds: ["p_beta", "p_alpha"] };
+        return section;
+      }),
+    };
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layout));
+    renderSidebar();
+
+    expect(within(sectionOf("Pinned")).getByText("Alpha")).toBeInTheDocument();
+    expect(within(sectionOf("Work")).queryByText("Alpha")).toBeNull();
+    expect(within(sectionOf("Work")).getByText("Beta")).toBeInTheDocument();
+    expect(projectIdsOf("sec_work")).toEqual(["p_beta", "p_alpha"]);
+
+    fireEvent.pointerDown(within(sectionOf("Pinned")).getByLabelText("Project actions for Alpha"), {
+      button: 0,
+    });
+    fireEvent.click(await screen.findByTestId("favorite-project"));
+    await waitFor(() => expect(within(sectionOf("Work")).getByText("Alpha")).toBeInTheDocument());
+    expect(projectIdsOf("sec_work")).toEqual(["p_beta", "p_alpha"]);
+    expect(
+      isBefore(
+        within(sectionOf("Work")).getByText("Beta"),
+        within(sectionOf("Work")).getByText("Alpha"),
+      ),
+    ).toBe(true);
   });
 
   it("shows the old-server note when the recent route 404s and does not retry", async () => {
@@ -1150,7 +1331,7 @@ describe("sidebar favorites", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders a pinned session in favorites and its folder, even when the folder's own query is its only source", async () => {
+  it("renders a pinned session only in favorites, even when the folder's own query is its only source", async () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     projectsRef.current = [{ id: "p_alpha", name: "Alpha", icon: null }];
@@ -1163,46 +1344,38 @@ describe("sidebar favorites", () => {
     renderSidebar();
 
     expect(within(sectionOf("Pinned")).getByText("s1")).toBeInTheDocument();
-    expect(within(sectionOf("Work")).getByText("s1")).toBeInTheDocument();
+    expect(within(sectionOf("Work")).queryByText("s1")).toBeNull();
   });
 
-  it("visits a duplicated pinned session once and keeps the folder copy canonical", async () => {
+  it("visits a pinned session once and keeps its sole row draggable", async () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(WORK_LAYOUT));
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     projectsRef.current = [{ id: "p_alpha", name: "Alpha", icon: null }];
     const s1 = conversation("s1", { labels: { omni_project: "Alpha" }, updated_at: 2 });
     const s2 = conversation("s2", { labels: { omni_project: "Alpha" }, updated_at: 1 });
+    const s3 = conversation("s3", { updated_at: 0 });
     pinnedRef.current = [s1];
     folderRowsRef.current.set("Alpha", [s1, s2]);
-    mockConversations([s1, s2]);
+    mockConversations([s1, s2, s3]);
     const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
     renderSidebarAt("/c/s2");
 
     await waitFor(() =>
-      expect(document.querySelectorAll('li[data-sidebar-session-id="s1"]')).toHaveLength(2),
+      expect(document.querySelectorAll('li[data-sidebar-session-id="s1"]')).toHaveLength(1),
     );
-    const folderRow = sectionOf("Work").querySelector<HTMLElement>(
-      'li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]',
-    );
-    expect(folderRow).not.toBeNull();
+    expect(sectionOf("Work").querySelector('li[data-sidebar-session-id="s1"]')).toBeNull();
     const favoritesRow = sectionOf("Pinned").querySelector<HTMLElement>(
       'li[data-sidebar-session-id="s1"]',
     );
-    expect(favoritesRow).not.toHaveAttribute("data-sidebar-canonical");
+    expect(favoritesRow).toHaveAttribute("data-sidebar-canonical", "true");
 
-    // Cmd+] steps to s1 once, then to s2 — never s1 twice.
+    // Cmd+] follows the rendered rows: home folder s2, Pinned s1, Sessions s3.
     fireEvent.keyDown(document.body, { code: "BracketRight", metaKey: true, bubbles: true });
     await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s1"));
     fireEvent.keyDown(document.body, { code: "BracketRight", metaKey: true, bubbles: true });
-    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s2"));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s3"));
 
-    // The folder copy drags (project drag)...
-    fireEvent.mouseDown(folderRow!, { button: 0, clientX: 50, clientY: 20 });
-    fireEvent.mouseMove(document, { clientX: 50, clientY: 40 });
-    expect(folderRow).toHaveClass("opacity-40");
-    fireEvent.mouseUp(document);
-
-    // ...and the favorites copy drags too, for pin reorder.
+    // The sole row still drags for pin reorder.
     fireEvent.mouseDown(favoritesRow!, { button: 0, clientX: 50, clientY: 20 });
     fireEvent.mouseMove(document, { clientX: 50, clientY: 40 });
     expect(favoritesRow).toHaveClass("opacity-40");
@@ -1617,6 +1790,116 @@ describe("sidebar project favorites", () => {
     vi.restoreAllMocks();
   });
 
+  it("files a session dropped on the sole visible favorite project folder", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p_beta" }],
+          },
+          { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["fav:sec_fav:Beta"]),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    mockConversations([conversation("unfiled"), conversation("in_beta", { project_id: "p_beta" })]);
+    renderSidebar();
+
+    const favoriteFolder = within(sectionOf("Favorites"))
+      .getByRole("button", { name: "Beta" })
+      .closest("section")!.parentElement!;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.tagName === "NAV") return new DOMRect(0, 0, 400, 500);
+      if (this === favoriteFolder) return new DOMRect(0, 100, 220, 100);
+      if (this.matches('button[aria-roledescription="sortable"]') && favoriteFolder.contains(this))
+        return new DOMRect(0, 100, 200, 29);
+      if (this.matches('li[data-sidebar-session-id="unfiled"]'))
+        return new DOMRect(0, 300, 200, 29);
+      return new DOMRect(-1000, -1000, 0, 0);
+    });
+    const row = within(sectionOf("Sessions")).getByText("unfiled").closest("li") as HTMLElement;
+    fireEvent.mouseDown(row, { button: 0, clientX: 100, clientY: 315 });
+    fireEvent.mouseMove(document, { clientX: 100, clientY: 300 });
+    await act(async () => fireEvent.mouseMove(document, { clientX: 100, clientY: 115 }));
+    await act(async () => fireEvent.mouseUp(document, { clientX: 100, clientY: 115 }));
+
+    await waitFor(() =>
+      expect(moveToProjectFn).toHaveBeenCalledWith({ id: "unfiled", project: "Beta" }),
+    );
+    expect(pinFn).not.toHaveBeenCalled();
+  });
+
+  it("offers project selection when every unclaimed project is favorited", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Favorites",
+            maxRows: null,
+            items: [{ type: "project", id: "p_beta" }],
+          },
+          { id: "default-other-projects", kind: "other_projects", name: "Projects", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["fav:sec_fav:Beta"]),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    folderRowsRef.current.set("Beta", [conversation("child", { project_id: "p_beta" })]);
+    mockConversations([]);
+    renderSidebar();
+
+    fireEvent.pointerDown(
+      await within(sectionOf("Projects")).findByRole("button", { name: "Project list actions" }),
+      { button: 0 },
+    );
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(within(sectionOf("Favorites")).getByRole("link", { name: "child" }));
+    await waitFor(() => expect(screen.getByText("1 selected")).toBeInTheDocument());
+  });
+
+  it("keeps an individual pin out of an expanded favorite project's own pages", () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_PROJECT_LAYOUT));
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["fav:sec_fav:Beta"]),
+    );
+    projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
+    const pinned = conversation("s1", {
+      project_id: "p_beta",
+      labels: { omni_project: "Beta", "omnigent.pinned": "1000" },
+    });
+    const unpinned = conversation("s2", { project_id: "p_beta", labels: { omni_project: "Beta" } });
+    pinnedRef.current = [pinned];
+    folderRowsRef.current.set("Beta", [pinned, unpinned]);
+    mockConversations([]);
+    renderSidebar();
+
+    const favorites = sectionOf("Favorites");
+    expect(favorites.querySelectorAll('li[data-sidebar-session-id="s1"]')).toHaveLength(1);
+    expect(within(favorites).getByText("s2")).toBeInTheDocument();
+    expect(within(sectionOf("Projects")).queryByText("Beta")).toBeNull();
+  });
+
   it("T10 renders a project ref, its session ref, then an unreferenced pin", () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_PROJECT_LAYOUT));
     projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
@@ -1632,11 +1915,10 @@ describe("sidebar project favorites", () => {
     const s3row = within(fav).getByText("s3");
     expect(isBefore(beta, s1row)).toBe(true);
     expect(isBefore(s1row, s3row)).toBe(true);
-    // The project copy doesn't remove the folder from its own section.
-    expect(within(sectionOf("Projects")).getByText("Beta")).toBeInTheDocument();
+    expect(within(sectionOf("Projects")).queryByText("Beta")).toBeNull();
   });
 
-  it("expands the favorite copy independently of the section copy", () => {
+  it("expands the favorite project while its home section stays hidden", () => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(FAVORITES_PROJECT_LAYOUT));
     projectsRef.current = [{ id: "p_beta", name: "Beta", icon: null }];
     const s1 = conversation("s1", { labels: { omni_project: "Beta" }, updated_at: 2 });
@@ -1653,14 +1935,10 @@ describe("sidebar project favorites", () => {
     expect(within(fav).getByText("s1")).toBeInTheDocument();
     expect(within(proj).queryByText("s1")).toBeNull();
 
-    fireEvent.click(within(proj).getByRole("button", { name: "Beta" }));
-    expect(within(proj).getByText("s1")).toBeInTheDocument();
-
-    // Collapsing the copy unregisters only its own folder rows; the section
-    // copy's stay registered and rendered.
+    expect(within(proj).queryByRole("button", { name: "Beta" })).toBeNull();
     fireEvent.click(within(fav).getByRole("button", { name: "Beta" }));
     expect(within(fav).queryByText("s1")).toBeNull();
-    expect(within(proj).getByText("s1")).toBeInTheDocument();
+    expect(within(proj).queryByText("s1")).toBeNull();
   });
 
   it("adds a label-only project to favorites from the menu, promoting it first", async () => {
@@ -1875,7 +2153,7 @@ describe("sidebar project favorites", () => {
     expect(moveToProjectFn).not.toHaveBeenCalled();
   });
 
-  it("keeps the owning section folder canonical when a favorite copy is also expanded", () => {
+  it("keeps a pinned session canonical in favorites while its project stays in its home order", () => {
     localStorage.setItem(
       LAYOUT_STORAGE_KEY,
       JSON.stringify({
@@ -1908,7 +2186,9 @@ describe("sidebar project favorites", () => {
       'li[data-sidebar-session-id="s1"][data-sidebar-canonical="true"]',
     );
     expect(canonical).toHaveLength(1);
-    expect(sectionOf("Work").contains(canonical[0]!)).toBe(true);
+    expect(sectionOf("Favorites").contains(canonical[0]!)).toBe(true);
+    expect(within(sectionOf("Work")).queryByText("Beta")).toBeNull();
+    expect(projectIdsOf("sec_work")).toEqual(["p_beta"]);
   });
 
   it("reorders a session above a project ref by dropping it on the project ref", async () => {

@@ -35,7 +35,8 @@ const MAX_SECTION_ENTRIES = 200;
 const MIN_RECENT_COUNT = 1;
 const MAX_RECENT_COUNT = 20;
 const DEFAULT_RECENT_COUNT = 5;
-const MAX_ROWS_VALUES = new Set([5, 10, 15, 20, 30]);
+export const MIN_SECTION_ROWS = 1;
+export const MAX_SECTION_ROWS = 100;
 const SECTION_KINDS = new Set<SectionKind>([
   "projects",
   "favorites",
@@ -92,7 +93,12 @@ function refKey(ref: FavoriteRef): string {
 }
 
 function normalizeMaxRows(raw: unknown): number | null {
-  return typeof raw === "number" && MAX_ROWS_VALUES.has(raw) ? raw : null;
+  return typeof raw === "number" &&
+    Number.isInteger(raw) &&
+    raw >= MIN_SECTION_ROWS &&
+    raw <= MAX_SECTION_ROWS
+    ? raw
+    : null;
 }
 
 function normalizeRecentCount(raw: unknown): number {

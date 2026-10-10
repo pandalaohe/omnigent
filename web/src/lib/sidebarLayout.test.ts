@@ -127,12 +127,12 @@ describe("normalizeLayout", () => {
     ]);
   });
 
-  it("clamps recent counts and maxRows to their allowed values", () => {
+  it("clamps recent counts and accepts only whole maxRows from 1 through 100", () => {
     const firstSection = (sections: unknown[]): SidebarSectionDef =>
       normalizeLayout(rawLayout(sections)).sections[0];
 
     const zero = firstSection([{ id: "r", kind: "recent", name: "Zero", maxRows: 7, count: 0 }]);
-    expect([zero.count, zero.maxRows]).toEqual([1, null]);
+    expect([zero.count, zero.maxRows]).toEqual([1, 7]);
 
     const high = firstSection([{ id: "r", kind: "recent", name: "High", maxRows: 30, count: 26 }]);
     expect([high.count, high.maxRows]).toEqual([20, 30]);
@@ -144,6 +144,17 @@ describe("normalizeLayout", () => {
 
     const missing = firstSection([{ id: "r", kind: "recent", name: "Missing", maxRows: 10 }]);
     expect([missing.count, missing.maxRows]).toEqual([5, 10]);
+
+    for (const rows of [1, 29, 100]) {
+      expect(firstSection([{ id: "r", kind: "recent", name: "Rows", maxRows: rows }]).maxRows).toBe(
+        rows,
+      );
+    }
+    for (const rows of [0, -1, 1.5, 101, "29", NaN, Infinity]) {
+      expect(
+        firstSection([{ id: "r", kind: "recent", name: "Invalid", maxRows: rows }]).maxRows,
+      ).toBeNull();
+    }
   });
 
   it("keeps the first favorites section and merges a second one's refs, deduped", () => {

@@ -10,9 +10,9 @@ import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   CheckIcon as CheckMarkIcon,
   FolderInputIcon,
-  MoreHorizontalIcon,
   PencilIcon,
   PlusIcon,
+  Settings2Icon,
   Trash2Icon,
 } from "lucide-react";
 
@@ -29,6 +29,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
@@ -43,6 +44,8 @@ import { resolveOrCreateProjectId } from "@/hooks/useConversations";
 import type { SaveSidebarLayout } from "@/hooks/useSidebarLayout";
 import {
   addFavorite,
+  MAX_SECTION_ROWS,
+  MIN_SECTION_ROWS,
   moveProjectToSection,
   moveSection,
   removeSection,
@@ -200,6 +203,9 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
   const [newSectionOpen, setNewSectionOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [removeOpen, setRemoveOpen] = useState(false);
+  const [customHeightOpen, setCustomHeightOpen] = useState(false);
+  const [customRows, setCustomRows] = useState("");
+  const [customRowsError, setCustomRowsError] = useState(false);
   const [renameValue, setRenameValue] = useState(section.name);
 
   if (context === null) return null;
@@ -226,6 +232,21 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
     }
     remove();
   };
+  const saveCustomHeight = () => {
+    const typed = customRows.trim();
+    const rows = Number(typed);
+    if (
+      !/^\d+$/.test(typed) ||
+      !Number.isInteger(rows) ||
+      rows < MIN_SECTION_ROWS ||
+      rows > MAX_SECTION_ROWS
+    ) {
+      setCustomRowsError(true);
+      return;
+    }
+    updateSection((current) => ({ ...current, maxRows: rows }));
+    setCustomHeightOpen(false);
+  };
 
   return (
     <>
@@ -235,15 +256,17 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
             type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label="Section options"
+            aria-label={`${section.name} section options`}
             data-testid="section-options"
             className="text-muted-foreground"
             onClick={(event) => event.stopPropagation()}
           >
-            <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+            <Settings2Icon className="size-3.5" data-icon-size="14" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-44">
+          <DropdownMenuLabel>{section.name} section options</DropdownMenuLabel>
+          <DropdownMenuSeparator />
           <DropdownMenuItem data-testid="new-section" onSelect={() => setNewSectionOpen(true)}>
             <PlusIcon className="size-3.5" />
             New section…
@@ -309,6 +332,16 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
                   </DropdownMenuRadioItem>
                 ))}
               </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setCustomRows(section.maxRows === null ? "" : String(section.maxRows));
+                  setCustomRowsError(false);
+                  setCustomHeightOpen(true);
+                }}
+              >
+                Custom…
+              </DropdownMenuItem>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
           {section.kind === "recent" && (
@@ -345,6 +378,43 @@ function SectionOptionsMenu({ section }: { section: SidebarSectionDef }) {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <Dialog open={customHeightOpen} onOpenChange={setCustomHeightOpen}>
+        <DialogContent data-testid="custom-section-height-dialog">
+          <DialogHeader>
+            <DialogTitle>Custom max height</DialogTitle>
+            <DialogDescription>Enter a whole number from 1 to 100 rows.</DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveCustomHeight();
+            }}
+          >
+            <Input
+              aria-label="Maximum rows"
+              aria-invalid={customRowsError}
+              value={customRows}
+              inputMode="numeric"
+              autoFocus
+              onChange={(event) => {
+                setCustomRows(event.target.value);
+                setCustomRowsError(false);
+              }}
+            />
+            {customRowsError && (
+              <p role="alert" className="text-sm text-destructive">
+                Enter a whole number from 1 to 100.
+              </p>
+            )}
+            <DialogFooter className="border-t-0 bg-transparent">
+              <Button type="button" variant="ghost" onClick={() => setCustomHeightOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="submit">Save</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent data-testid="rename-section-dialog">
           <DialogHeader>
