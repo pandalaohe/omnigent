@@ -1137,8 +1137,7 @@ async def test_session_create_applies_default_modes_and_persists(
     location = f"{CODEX_AGENT_ID}/bundle"
     calling_app.state.artifact_store.put(location, _harness_bundle(harness))
     modes = {"permission": permission}
-    if harness.startswith("codex"):
-        modes["speed"] = "fast"
+    modes["speed"] = "fast"
     project_id = await _project(
         calling_client,
         {
@@ -1181,8 +1180,39 @@ async def test_session_create_applies_default_modes_and_persists(
         assert body["terminal_launch_args"] == expected_args
         if label:
             assert body["labels"][label] == permission
-        if harness.startswith("codex"):
-            assert body["labels"]["omnigent.speed_tier"] == "fast"
+        assert body["labels"]["omnigent.speed_tier"] == "fast"
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "claude-sdk"])
+async def test_claude_child_explicit_speed_wins(
+    calling_client: httpx.AsyncClient,
+    calling_app: FastAPI,
+    calling_seams: None,
+    harness: str,
+) -> None:
+    calling_app.state.artifact_store.put(f"{CODEX_AGENT_ID}/bundle", _harness_bundle(harness))
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: {"agent_id": CODEX_AGENT_ID, "harnesses": {harness: {"speed": "fast"}}}
+            }
+        },
+    )
+    parent = await calling_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_id": HDS, "workspace": "/opt/work/project"},
+        headers=_headers(),
+    )
+    assert parent.status_code == 201, parent.text
+    from omnigent.runner.tool_dispatch import _build_session_create_body
+
+    body = _build_session_create_body(None, parent.json()["id"], "child")
+    body["labels"] = {"omnigent.speed_tier": "standard"}
+    child = await calling_client.post("/v1/sessions", json=body, headers=_headers())
+    assert child.status_code == 201, child.text
+    persisted = await calling_client.get(f"/v1/sessions/{child.json()['id']}", headers=_headers())
+    assert persisted.json()["labels"]["omnigent.speed_tier"] == "standard"
 
 
 @pytest.mark.parametrize(

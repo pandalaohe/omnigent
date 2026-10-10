@@ -482,10 +482,7 @@ async def test_sdk_permission_snapshot_and_event_reach_next_turn(
                 await asyncio.sleep(0.02)
             assert len(harness_client.posted_bodies) >= index
             assert harness_client.posted_bodies[index - 1][field] == value
-            if harness == "codex":
-                assert harness_client.posted_bodies[index - 1]["service_tier"] == "fast"
-            else:
-                assert "service_tier" not in harness_client.posted_bodies[index - 1]
+            assert harness_client.posted_bodies[index - 1]["service_tier"] == "fast"
 
 
 @pytest.mark.asyncio

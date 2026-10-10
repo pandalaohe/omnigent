@@ -529,7 +529,8 @@ def test_session_modes_resolve_independently_and_filter_harness_vocabulary() -> 
             }
         },
     )
-    assert result.speed is None
+    assert result.speed == "fast"
+    assert result.sources["speed"] == "master"
     assert result.permission == "plan"
     assert result.sources["permission"] == "master_native"
 
@@ -577,6 +578,8 @@ def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
     [
         ("codex", "speed", "fast"),
         ("codex-native", "speed", "standard"),
+        ("claude-native", "speed", "fast"),
+        ("claude-sdk", "speed", "standard"),
         *[
             (harness, "permission", value)
             for harness, values in {
@@ -598,7 +601,7 @@ def test_validate_session_default_modes(harness: str, field: str, value: str) ->
     "harness,field,value",
     [
         ("codex", "speed", "priority"),
-        ("claude-native", "speed", "fast"),
+        ("claude-native", "speed", "priority"),
         ("pi-native", "permission", "plan"),
         ("codex", "permission", "plan"),
         ("claude-sdk", "permission", "read-only"),
