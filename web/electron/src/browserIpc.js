@@ -269,6 +269,23 @@ function registerBrowserIpc({
   getAgentNavigationHintForEvent = () => null,
   confirmAgentNavigation = async () => null,
 }) {
+  // Only prompts currently awaiting an answer need a close marker. A blank tab
+  // has no native entry yet, so entry identity cannot detect its close.
+  const pendingPromptNavigations = new WeakMap();
+  const pendingFor = (registry, viewId) => {
+    let byView = pendingPromptNavigations.get(registry);
+    if (!byView) {
+      byView = new Map();
+      pendingPromptNavigations.set(registry, byView);
+    }
+    let pending = byView.get(viewId);
+    if (!pending) {
+      pending = new Set();
+      byView.set(viewId, pending);
+    }
+    return pending;
+  };
+
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -333,35 +350,49 @@ function registerBrowserIpc({
     // other outcome returns synchronously, exactly as before.
     if (r.ok || !agent || !r.grant) return finish(r);
     const grant = r.grant;
+    const pending = pendingFor(g.registry, conversationId);
+    const request = { cancelled: false };
+    pending.add(request);
     return (async () => {
-      const choice = await confirmAgentNavigation(event, { url, grant });
-      if (choice === "always" || choice === "once") {
-        // The prompt can span a server switch (same registry, new pinned
-        // origin); never retry the old server's answer under the new policy.
-        const regate = gateRegistry(event);
-        const serverOrigin = getAgentContextForEvent(event, opts?.sourceHostId)?.serverOrigin;
-        if (
-          regate.error ||
-          regate.registry !== g.registry ||
-          serverOrigin !== agentContext?.serverOrigin
-        ) {
+      try {
+        const choice = await confirmAgentNavigation(event, { url, grant });
+        if (request.cancelled) {
           return finish({
             ok: false,
-            error: `${r.error} The window changed servers before the answer; navigation cancelled.`,
+            error: `${r.error} Browser tab closed before the answer; navigation cancelled.`,
           });
         }
-        if (choice === "always") {
-          // Main persisted the grant, so the injected allowlist now has it.
-          return finish(regate.registry.openOrNavigate(conversationId, url, bounds, options));
+        if (choice === "always" || choice === "once") {
+          // The prompt can span a server switch (same registry, new pinned
+          // origin); never retry the old server's answer under the new policy.
+          const regate = gateRegistry(event);
+          const serverOrigin = getAgentContextForEvent(event, opts?.sourceHostId)?.serverOrigin;
+          if (
+            regate.error ||
+            regate.registry !== g.registry ||
+            serverOrigin !== agentContext?.serverOrigin
+          ) {
+            return finish({
+              ok: false,
+              error: `${r.error} The window changed servers before the answer; navigation cancelled.`,
+            });
+          }
+          if (choice === "always") {
+            // Main persisted the grant, so the injected allowlist now has it.
+            return finish(regate.registry.openOrNavigate(conversationId, url, bounds, options));
+          }
+          return finish(
+            regate.registry.openOrNavigate(conversationId, url, bounds, {
+              ...options,
+              agentContext: { ...(agentContext ?? {}), allowOnce: [grant] },
+            }),
+          );
         }
-        return finish(
-          regate.registry.openOrNavigate(conversationId, url, bounds, {
-            ...options,
-            agentContext: { ...(agentContext ?? {}), allowOnce: [grant] },
-          }),
-        );
+        return finish({ ok: false, error: `${r.error} The user did not allow this address.` });
+      } finally {
+        pending.delete(request);
+        if (pending.size === 0) pendingPromptNavigations.get(g.registry)?.delete(conversationId);
       }
-      return finish({ ok: false, error: `${r.error} The user did not allow this address.` });
     })();
   });
 
@@ -473,6 +504,7 @@ function registerBrowserIpc({
     return {
       exists: true,
       url: entry.view.webContents.getURL(),
+      title: entry.view.webContents.getTitle(),
       ...readNavState(entry.view.webContents),
     };
   });
@@ -483,6 +515,11 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, reason } = args ?? {};
     const r = g.registry.close(conversationId, reason);
+    if (r.ok) {
+      for (const request of pendingPromptNavigations.get(g.registry)?.get(conversationId) ?? []) {
+        request.cancelled = true;
+      }
+    }
     return { ok: r.ok, removed: r.removed ?? false };
   });
 

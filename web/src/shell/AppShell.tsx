@@ -45,7 +45,7 @@ import {
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
-import { onBrowserActionRequest, surfacesBrowserPane } from "@/lib/browserActionBus";
+import { onBrowserActionClaimed } from "@/lib/browserActionBus";
 import { onArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
@@ -1910,26 +1910,22 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // Auto-open a Browser soft tab on a `navigate` or `screenshot` action —
-  // agent-issued (browser_navigate / browser_screenshot) or a chat link the
-  // user routed in-app — so the action never lands in a hidden pane.
+  // Show a claimed browser target or a chat link the user routed in-app.
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    const surfaceBrowserTab = (sourceConversationId: string) => {
+    const surfaceBrowserTab = (sourceConversationId: string, tabId?: string) => {
       // The mounted WorkspacePanel hook owns the active session's tab state.
       // Persist here only for background sessions that have no mounted hook.
-      if (sourceConversationId !== conversationId) openAgentBrowserTab(sourceConversationId);
+      if (sourceConversationId !== conversationId && !tabId)
+        openAgentBrowserTab(sourceConversationId);
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
         setRightPanelOpenAnimated(true);
       }
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
-    const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
-      if (!surfacesBrowserPane(evt.action) || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId);
-    });
+    const unsubscribeAction = onBrowserActionClaimed(surfaceBrowserTab);
     return () => {
       unsubscribeLink();
       unsubscribeAction();

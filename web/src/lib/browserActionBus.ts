@@ -18,6 +18,8 @@ export type BrowserActionListener = (
 ) => void;
 
 const listeners = new Set<BrowserActionListener>();
+type BrowserActionClaimedListener = (conversationId: string, tabId: string) => void;
+const claimedListeners = new Set<BrowserActionClaimedListener>();
 
 /** Actions that need the owning session's browser pane surfaced: navigate
  *  loads it, screenshot can only capture a view that is on screen. */
@@ -44,6 +46,22 @@ export function emitBrowserActionRequest(
       listener(event, conversationId);
     } catch (err) {
       console.warn("[browser-relay] action listener threw:", err);
+    }
+  }
+}
+
+/** Surface only a validated target after this renderer wins the action claim. */
+export function onBrowserActionClaimed(listener: BrowserActionClaimedListener): () => void {
+  claimedListeners.add(listener);
+  return () => claimedListeners.delete(listener);
+}
+
+export function emitBrowserActionClaimed(conversationId: string, tabId: string): void {
+  for (const listener of claimedListeners) {
+    try {
+      listener(conversationId, tabId);
+    } catch (err) {
+      console.warn("[browser-relay] claimed action listener threw:", err);
     }
   }
 }

@@ -254,6 +254,48 @@ describe("browserIpc — agent navigation prompt on a promptable refusal", () =>
     assert.equal(h.calls.length, 1);
     assert.equal(gateCalls, 2);
   });
+
+  it("does not revive a closed blank tab after an address prompt is allowed", async () => {
+    for (const choice of ["once", "always"]) {
+      const ipcMain = makeIpcMain();
+      const calls = [];
+      let answer;
+      const registry = {
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return calls.length === 1 ? REFUSAL : { ok: true, created: true };
+        },
+        close: () => ({ ok: true, removed: false }),
+      };
+      registerBrowserIpc({
+        ipcMain,
+        isPinnedOriginSender: () => true,
+        getRegistryForEvent: () => registry,
+        getAgentContextForEvent: () => ({ serverOrigin: "https://a.example" }),
+        confirmAgentNavigation: () =>
+          new Promise((resolve) => {
+            answer = resolve;
+          }),
+      });
+      const event = { sender: { send: () => {} } };
+      const pending = ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
+        conversationId: "browser-tab:conv_1:blank",
+        url: `http://${ip(192, 168, 1, 20)}/`,
+        opts: { agent: true },
+      });
+      assert.equal(calls.length, 1);
+      assert.deepEqual(
+        ipcMain.invoke("omnigent:browser-close", event, {
+          conversationId: "browser-tab:conv_1:blank",
+        }),
+        { ok: true, removed: false },
+      );
+      answer(choice);
+      const result = await pending;
+      assert.equal(result.ok, false, choice);
+      assert.equal(calls.length, 1, `${choice}: no native retry after close`);
+    }
+  });
 });
 
 /** A stub webContents with a navigationHistory (Electron 42) and toggleable
@@ -282,6 +324,7 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
     getURL: () => "https://example.com/restored",
+    getTitle: () => "Example page",
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -387,6 +430,7 @@ it("restores the URL and history state for the requested browser tab only", () =
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
     url: "https://example.com/restored",
+    title: "Example page",
     canGoBack: true,
     canGoForward: false,
   });
