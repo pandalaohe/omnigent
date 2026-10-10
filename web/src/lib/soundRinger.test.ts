@@ -18,6 +18,7 @@ function account(overrides: Partial<SoundAlertPreferences> = {}): SoundAlertPref
       needs_response: { enabled: true, sound: "ping" },
     },
     quietHours: { enabled: false, start: "23:00", end: "08:00" },
+    soundDotWhileBackground: false,
     primaryDeviceId: null,
     mutedSessionIds: [],
     ...overrides,
@@ -36,14 +37,17 @@ function createHarness(overrides: Partial<RingerContext> = {}) {
   let now = NOON;
   let contextOverrides: Partial<RingerContext> = { ...overrides };
   const played: { level: SoundLevel; at: number }[] = [];
+  const blocked: SoundAlert[] = [];
   let queue: { fn: () => void; at: number; cancelled: boolean }[] = [];
   const ringer = createSoundRinger({
     play: (level) => played.push({ level, at: now }),
+    onDoneBlocked: (blockedAlert) => blocked.push(blockedAlert),
     getContext: () => ({
       account: account(),
       device: device(),
       windowFocused: false,
       activeConversationId: undefined,
+      backgroundSessionIds: new Set(),
       now: new Date(now),
       ...contextOverrides,
     }),
@@ -75,7 +79,7 @@ function createHarness(overrides: Partial<RingerContext> = {}) {
   function setContext(next: Partial<RingerContext>): void {
     contextOverrides = { ...contextOverrides, ...next };
   }
-  return { ringer, played, advance, setTime, setContext };
+  return { ringer, played, blocked, advance, setTime, setContext };
 }
 
 describe("sound ringer", () => {
@@ -136,6 +140,28 @@ describe("sound ringer", () => {
     h.ringer.ring(alert("needs_response"));
 
     expect(h.played).toHaveLength(1);
+  });
+
+  it.each([false, true])("checks B again at playback with the switch %s", (enabled) => {
+    const h = createHarness({ account: account({ soundDotWhileBackground: enabled }) });
+    h.ringer.ring(alert("done"));
+    h.setContext({ backgroundSessionIds: new Set(["conv_a"]) });
+    h.advance(2_000);
+    expect(h.played.map((entry) => entry.level)).toEqual(enabled ? ["done"] : []);
+    expect(h.blocked).toEqual(enabled ? [] : [alert("done")]);
+    if (!enabled) {
+      h.setContext({ backgroundSessionIds: new Set() });
+      h.ringer.ring(h.blocked[0]);
+      h.advance(2_000);
+      expect(h.played.map((entry) => entry.level)).toEqual(["done"]);
+    }
+  });
+
+  it.each(["needs_response", "error"] as const)("keeps %s audible while B shows", (level) => {
+    const h = createHarness({ backgroundSessionIds: new Set(["conv_a"]) });
+    h.ringer.ring(alert(level));
+    h.advance(2_000);
+    expect(h.played.map((entry) => entry.level)).toEqual([level]);
   });
 
   it("keeps only the last 500 alert ids", () => {

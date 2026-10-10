@@ -18,11 +18,14 @@ export interface RingerContext {
   device: SoundAlertDevicePreferences;
   windowFocused: boolean;
   activeConversationId: string | undefined;
+  backgroundSessionIds: ReadonlySet<string>;
   now: Date;
 }
 
 export interface SoundRingerDeps {
   play: (level: SoundLevel) => void;
+  /** Let the selected connection settle this delivered cue again once B clears. */
+  onDoneBlocked: (alert: SoundAlert) => void;
   getContext: () => RingerContext;
   nowMs: () => number;
   /** Schedule `fn` after `ms`; returns a cancel function for `dispose`. */
@@ -97,6 +100,22 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
     }
   }
 
+  function canPlay(alert: SoundAlert): boolean {
+    const context = deps.getContext();
+    if (!passesFilters(alert, context)) return false;
+    // B may appear after the claim; keep this cue recoverable on its ringer.
+    if (
+      alert.level === "done" &&
+      !context.account.soundDotWhileBackground &&
+      context.backgroundSessionIds.has(alert.sessionId)
+    ) {
+      if (rungSet.delete(alert.alertId)) rungIds.splice(rungIds.indexOf(alert.alertId), 1);
+      deps.onDoneBlocked(alert);
+      return false;
+    }
+    return true;
+  }
+
   /** Push `start` out so the two classes stay CLASS_GAP_MS apart. */
   function spacedStart(now: number, earlier: number | undefined): number {
     return earlier !== undefined && now < earlier + CLASS_GAP_MS ? earlier + CLASS_GAP_MS : now;
@@ -115,7 +134,7 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
     let cancel = () => {};
     cancel = deps.schedule(() => {
       scheduled.delete(cancel);
-      if (alert !== undefined && !passesFilters(alert, deps.getContext())) return;
+      if (alert !== undefined && !canPlay(alert)) return;
       deps.play(level);
     }, start - now);
     scheduled.add(cancel);
@@ -149,7 +168,7 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
 
   /** Re-filter the collected alerts and play the single surviving cue. */
   function playCollected(alerts: SoundAlert[]): void {
-    const kept = alerts.filter((alert) => passesFilters(alert, deps.getContext()));
+    const kept = alerts.filter(canPlay);
     if (kept.length === 0) return;
     deps.play(kept.some((alert) => alert.level === "error") ? "error" : "done");
   }
@@ -174,7 +193,7 @@ export function createSoundRinger(deps: SoundRingerDeps): SoundRinger {
 
   function ring(alert: SoundAlert): void {
     if (rungSet.has(alert.alertId)) return;
-    if (!passesFilters(alert, deps.getContext())) return;
+    if (!canPlay(alert)) return;
     if (alertClass(alert.level) === "needs_response") ringNeedsResponse(alert);
     else ringOther(alert);
   }

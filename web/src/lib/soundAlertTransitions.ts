@@ -31,9 +31,9 @@ export interface EdgeResult {
   settleCancel: string[];
 }
 
-/** A dot the user has not seen that is not covered by background work. */
-export function isDoneCandidate(state: RowSoundState): boolean {
-  return state.mark.state === "unseen" && !state.mark.background;
+/** A dot the user has not seen, subject to the account's background rule. */
+export function isDoneCandidate(state: RowSoundState, soundDotWhileBackground = false): boolean {
+  return state.mark.state === "unseen" && (soundDotWhileBackground || !state.mark.background);
 }
 
 /** Stable identity for de-duplication across re-deliveries of one edge. */
@@ -58,6 +58,7 @@ export function alertId(sessionId: string, level: SoundLevel, s: RowSoundState):
 export function detectEdges(
   previous: Map<string, RowSoundState> | null,
   next: Map<string, RowSoundState>,
+  soundDotWhileBackground = false,
 ): EdgeResult {
   const result: EdgeResult = { immediate: [], settleStart: [], settleCancel: [] };
   if (previous === null) return result;
@@ -82,9 +83,10 @@ export function detectEdges(
         alertId: alertId(sessionId, "error", state),
       });
     }
-    const done = isDoneCandidate(state);
-    if (done && !isDoneCandidate(prior)) result.settleStart.push(sessionId);
-    else if (!done && isDoneCandidate(prior)) result.settleCancel.push(sessionId);
+    const done = isDoneCandidate(state, soundDotWhileBackground);
+    const wasDone = isDoneCandidate(prior, soundDotWhileBackground);
+    if (done && !wasDone) result.settleStart.push(sessionId);
+    else if (!done && wasDone) result.settleCancel.push(sessionId);
   }
   return result;
 }

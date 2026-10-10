@@ -453,6 +453,112 @@ describe("useSoundAlerts", () => {
     expect(claimBodies()[0]).toMatchObject({ session_id: "conv_a", level: "done" });
   });
 
+  it.each(["before delivery", "during collection"])(
+    "defers a claimed done when B appears %s until B clears",
+    (timing) => {
+      const claimedIds = new Set<string>();
+      const routedClaims: Record<string, unknown>[] = [];
+      claimFetchMock.mockImplementation((_path: string, init: RequestInit) => {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        const id = String(body.alert_id);
+        const delivered = !claimedIds.has(id);
+        if (delivered) {
+          claimedIds.add(id);
+          routedClaims.push(body);
+        }
+        return Promise.resolve({ status: 202, json: async () => ({ delivered }) });
+      });
+      const deliverRoutedClaims = () => {
+        for (const body of routedClaims.splice(0)) {
+          emitFrame({
+            type: "sound_alert",
+            alert_id: body.alert_id,
+            session_id: body.session_id,
+            level: body.level,
+          });
+        }
+      };
+      setConversations([conv("conv_a")]);
+      const { rerender } = renderHook(() => useSoundAlerts("conv_b"));
+      settleInitialSnapshot();
+      act(() => {
+        isConversationUnseenMock.mockReturnValue(true);
+        setConversations([conv("conv_a", { updated_at: 200 })]);
+        rerender();
+      });
+      act(() => vi.advanceTimersByTime(10_000));
+      const claim = claimBodies()[0];
+      expect(claim).toMatchObject({ session_id: "conv_a", level: "done" });
+
+      const showBackground = () => {
+        act(() => {
+          setConversations([conv("conv_a", { updated_at: 200, background_activity_count: 1 })]);
+          rerender();
+        });
+      };
+      if (timing === "before delivery") showBackground();
+      deliverRoutedClaims();
+      if (timing === "during collection") showBackground();
+      act(() => vi.advanceTimersByTime(2_000));
+
+      expect(playLevelMock).not.toHaveBeenCalled();
+      act(() => {
+        setConversations([conv("conv_a", { updated_at: 200, background_activity_count: 0 })]);
+        rerender();
+      });
+      act(() => vi.advanceTimersByTime(9_999));
+      expect(playLevelMock).not.toHaveBeenCalled();
+      act(() => vi.advanceTimersByTime(1));
+      deliverRoutedClaims();
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(playLevelMock).toHaveBeenCalledTimes(1);
+      expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+      expect(claimFetchMock).toHaveBeenCalledTimes(1);
+      emitFrame({
+        type: "sound_alert",
+        alert_id: claim.alert_id,
+        session_id: "conv_a",
+        level: "done",
+      });
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(playLevelMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("with the switch on claims and plays the dot under B without re-alerting when B clears", () => {
+    localStorage.setItem(
+      SOUND_ALERTS_STORAGE_KEY,
+      JSON.stringify({ soundDotWhileBackground: true }),
+    );
+    setConversations([conv("conv_a", { background_activity_count: 1 })]);
+    const { rerender } = renderHook(() => useSoundAlerts("conv_b"));
+    settleInitialSnapshot();
+    act(() => {
+      isConversationUnseenMock.mockReturnValue(true);
+      setConversations([conv("conv_a", { updated_at: 200, background_activity_count: 1 })]);
+      rerender();
+    });
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(claimBodies()).toEqual([
+      { alert_id: "conv_a:done:200", session_id: "conv_a", level: "done" },
+    ]);
+    emitFrame({
+      type: "sound_alert",
+      alert_id: "conv_a:done:200",
+      session_id: "conv_a",
+      level: "done",
+    });
+    act(() => vi.advanceTimersByTime(2_000));
+    expect(playLevelMock).toHaveBeenCalledTimes(1);
+    expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything());
+    act(() => {
+      setConversations([conv("conv_a", { updated_at: 200 })]);
+      rerender();
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(claimFetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("cancels the settle when the session starts running again", () => {
     setConversations([conv("conv_a")]);
     const { rerender } = renderHook(() => useSoundAlerts());

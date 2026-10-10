@@ -119,6 +119,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
   const previousRows = useRef<Map<string, RowSoundState> | null>(null);
   const latestRows = useRef<Map<string, RowSoundState>>(new Map());
   const settleTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const blockedDoneAlerts = useRef<Map<string, SoundAlert>>(new Map());
   const rebaselinePending = useRef(sessionUpdatesSocket.hasSnapshot());
   // If the socket already delivered this connection's snapshot before this
   // hook mounted (it starts above AppShell's Suspense boundary), start live:
@@ -137,11 +138,19 @@ export function useSoundAlerts(activeConversationId?: string): void {
       play: (level) => {
         void playLevel(level, accountRef.current, deviceRef.current);
       },
+      onDoneBlocked: (alert) => {
+        if (latestRows.current.get(alert.sessionId)?.mark.state === "unseen") {
+          blockedDoneAlerts.current.set(alert.sessionId, alert);
+        }
+      },
       getContext: (): RingerContext => ({
         account: accountRef.current,
         device: deviceRef.current,
         windowFocused: windowFocusedRef.current,
         activeConversationId: activeIdRef.current,
+        backgroundSessionIds: new Set(
+          [...latestRows.current].filter(([, state]) => state.mark.background).map(([id]) => id),
+        ),
         now: new Date(),
       }),
       nowMs: () => Date.now(),
@@ -247,6 +256,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
       awaitingSnapshot.current = true;
       for (const timer of settleTimers.current.values()) clearTimeout(timer);
       settleTimers.current.clear();
+      blockedDoneAlerts.current.clear();
     };
     const unsubscribe = sessionUpdatesSocket.subscribeStatus(onStatusChange);
     if (!sessionUpdatesSocket.isConnected()) onStatusChange();
@@ -284,6 +294,16 @@ export function useSoundAlerts(activeConversationId?: string): void {
       starting: false,
     }));
     latestRows.current = next;
+    for (const [sessionId, alert] of blockedDoneAlerts.current) {
+      const state = next.get(sessionId);
+      if (
+        state === undefined ||
+        state.mark.state !== "unseen" ||
+        alertId(sessionId, "done", state) !== alert.alertId
+      ) {
+        blockedDoneAlerts.current.delete(sessionId);
+      }
+    }
 
     // A row that left the list can't settle (deleted, archived, filtered):
     // drop its pending cue.
@@ -326,6 +346,7 @@ export function useSoundAlerts(activeConversationId?: string): void {
       rebaselinePending.current = false;
       for (const timer of settleTimers.current.values()) clearTimeout(timer);
       settleTimers.current.clear();
+      blockedDoneAlerts.current.clear();
       previousRows.current = next;
       for (const [sessionId, state] of next) {
         if (state.mark.awaitingCount > 0) {
@@ -339,7 +360,11 @@ export function useSoundAlerts(activeConversationId?: string): void {
       return;
     }
 
-    const edges = detectEdges(previousRows.current, next);
+    const edges = detectEdges(
+      previousRows.current,
+      next,
+      accountRef.current.soundDotWhileBackground,
+    );
     previousRows.current = next;
     for (const alert of edges.immediate) deliver(alert);
     for (const sessionId of edges.settleStart) {
@@ -351,12 +376,22 @@ export function useSoundAlerts(activeConversationId?: string): void {
           settleTimers.current.delete(sessionId);
           // Re-check at fire time: the row may have resumed or been read.
           const state = latestRows.current.get(sessionId);
-          if (state === undefined || !isDoneCandidate(state)) return;
-          deliver({
+          if (
+            state === undefined ||
+            !isDoneCandidate(state, accountRef.current.soundDotWhileBackground)
+          ) {
+            return;
+          }
+          const alert: SoundAlert = {
             sessionId,
             level: "done",
             alertId: alertId(sessionId, "done", state),
-          });
+          };
+          const blocked = blockedDoneAlerts.current.get(sessionId);
+          blockedDoneAlerts.current.delete(sessionId);
+          // Its server claim is consumed; only the selected connection retries.
+          if (blocked?.alertId === alert.alertId) ringerRef.current?.ring(blocked);
+          else deliver(alert);
         }, DONE_SETTLE_MS),
       );
     }

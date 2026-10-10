@@ -71,6 +71,7 @@ import {
 } from "@/lib/soundAlertPreferences";
 
 interface StoredPreferences {
+  soundDotWhileBackground?: boolean;
   levels: Record<string, { enabled: boolean; sound: string }>;
   mutedSessionIds?: string[];
   primaryDeviceId?: string | null;
@@ -99,6 +100,21 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("SoundAlertSettings", () => {
+  it("defaults the background-dot switch off and saves it with the account", () => {
+    const first = render(<SoundAlertSettings />);
+    const toggle = screen.getByRole("switch", { name: "Sound the dot while B shows" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    expect(stored()?.soundDotWhileBackground).toBe(true);
+    expect(localStorage.getItem(SOUND_ALERTS_DEVICE_STORAGE_KEY)).toBeNull();
+    first.unmount();
+    render(<SoundAlertSettings />);
+    const saved = screen.getByRole("switch", { name: "Sound the dot while B shows" });
+    expect(saved).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(saved);
+    expect(stored()?.soundDotWhileBackground ?? false).toBe(false);
+  });
+
   it("writes a level switch to the shared namespace", () => {
     render(<SoundAlertSettings />);
     const toggle = screen.getByTestId("sound-alert-level-done");
