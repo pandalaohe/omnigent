@@ -41,6 +41,28 @@ function moveTerminalCursor(from: number, to: number, applicationCursor: boolean
   return sequence.repeat(Math.abs(to - from));
 }
 
+export function normalizeTerminalTextareaSelection(
+  before: TerminalTextareaSnapshot,
+  after: TerminalTextareaSnapshot,
+  inputData: string | null,
+): TerminalTextareaSnapshot {
+  if (!inputData || after.selectionStart !== after.selectionEnd) return after;
+
+  const insertionStart = after.selectionEnd;
+  const insertionEnd = insertionStart + inputData.length;
+  const insertedAtSelection = after.value.slice(insertionStart, insertionEnd) === inputData;
+  const valueWithoutInsertion =
+    after.value.slice(0, insertionStart) + after.value.slice(insertionEnd);
+
+  return insertedAtSelection && valueWithoutInsertion === before.value
+    ? {
+        ...after,
+        selectionStart: insertionEnd,
+        selectionEnd: insertionEnd,
+      }
+    : after;
+}
+
 export function terminalTextareaEdit(
   before: TerminalTextareaSnapshot,
   after: TerminalTextareaSnapshot,
