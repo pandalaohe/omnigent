@@ -636,6 +636,7 @@ def calling_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
+    app.state.artifact_store = artifacts
     # No live host: the create route skips the launch attempt.
     app.state.host_registry = None
     return app
@@ -910,7 +911,21 @@ async def test_sub_agent_child_keeps_an_unset_model(
     """
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {
+                        "codex": {
+                            "model": "gpt-6-sol",
+                            "effort": "high",
+                            "speed": "fast",
+                            "permission": "approve-for-me",
+                        }
+                    },
+                }
+            }
+        },
     )
     parent = await calling_client.post(
         "/v1/sessions",
@@ -949,6 +964,8 @@ async def test_sub_agent_child_keeps_an_unset_model(
     assert child.status_code == 201, child.text
     assert child.json()["model_override"] is None
     assert child.json()["reasoning_effort"] is None
+    assert "omnigent.speed_tier" not in child.json()["labels"]
+    assert "omnigent.codex_sdk.approval_mode" not in child.json()["labels"]
 
 
 async def test_routing_on_create_does_not_fill_default_model(
@@ -958,7 +975,21 @@ async def test_routing_on_create_does_not_fill_default_model(
     """F3a: a routing-on create owns model / effort; defaults must not pin them."""
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {
+                        "codex": {
+                            "model": "gpt-6-sol",
+                            "effort": "high",
+                            "speed": "fast",
+                            "permission": "approve-for-me",
+                        }
+                    },
+                }
+            }
+        },
     )
     response = await calling_client.post(
         "/v1/sessions",
@@ -976,6 +1007,8 @@ async def test_routing_on_create_does_not_fill_default_model(
     assert body["agent_id"] == CODEX_AGENT_ID
     assert body["model_override"] is None
     assert body["reasoning_effort"] is None
+    assert "omnigent.speed_tier" not in body["labels"]
+    assert "omnigent.codex_sdk.approval_mode" not in body["labels"]
 
 
 async def test_child_without_default_names_the_project_setting(
@@ -1056,3 +1089,219 @@ async def test_import_ignores_calling_defaults(
     assert session.json()["agent_id"] == builtin_agent_id("claude-native-ui")
     assert session.json()["model_override"] is None
     assert session.json()["reasoning_effort"] is None
+
+
+@pytest.mark.parametrize(
+    "harness,permission,expected_args,label",
+    [
+        ("codex-native", "approve-for-me", ["--approve-for-me"], None),
+        (
+            "codex-native",
+            "ask-for-approval",
+            [
+                "--ask-for-approval",
+                "on-request",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                'approvals_reviewer="user"',
+            ],
+            None,
+        ),
+        (
+            "codex-native",
+            "full-access",
+            ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+            None,
+        ),
+        (
+            "codex-native",
+            "read-only",
+            ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+            None,
+        ),
+        ("claude-native", "plan", ["--permission-mode", "plan"], None),
+        ("codex", "approve-for-me", None, "omnigent.codex_sdk.approval_mode"),
+        ("claude-sdk", "auto", None, "omnigent.claude_sdk.permission_mode"),
+    ],
+)
+async def test_session_create_applies_default_modes_and_persists(
+    calling_client: httpx.AsyncClient,
+    calling_app: FastAPI,
+    calling_seams: None,
+    harness: str,
+    permission: str,
+    expected_args: list[str] | None,
+    label: str | None,
+) -> None:
+    location = f"{CODEX_AGENT_ID}/bundle"
+    calling_app.state.artifact_store.put(location, _harness_bundle(harness))
+    modes = {"permission": permission}
+    if harness.startswith("codex"):
+        modes["speed"] = "fast"
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {harness: modes},
+                }
+            }
+        },
+    )
+    parent = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/opt/work/project",
+        },
+        headers=_headers(),
+    )
+    assert parent.status_code == 201, parent.text
+    from omnigent.runner.tool_dispatch import _build_session_create_body
+
+    child = await calling_client.post(
+        "/v1/sessions",
+        json=_build_session_create_body(
+            None,
+            parent.json()["id"],
+            "child",
+        ),
+        headers=_headers(),
+    )
+    assert child.status_code == 201, child.text
+    for created in (parent, child):
+        persisted = await calling_client.get(
+            f"/v1/sessions/{created.json()['id']}", headers=_headers()
+        )
+        assert persisted.status_code == 200, persisted.text
+        body = persisted.json()
+        assert body["terminal_launch_args"] == expected_args
+        if label:
+            assert body["labels"][label] == permission
+        if harness.startswith("codex"):
+            assert body["labels"]["omnigent.speed_tier"] == "fast"
+
+
+@pytest.mark.parametrize(
+    "explicit",
+    [
+        {"approval_mode": "read-only"},
+        {"terminal_launch_args": ["--ask-for-approval=never"]},
+        {"labels": {"omnigent.codex_native.bypass_sandbox": "0"}},
+    ],
+)
+async def test_explicit_permission_and_speed_win_over_defaults(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+    explicit: dict,
+) -> None:
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {"codex": {"permission": "approve-for-me", "speed": "fast"}},
+                }
+            }
+        },
+    )
+    explicit = dict(explicit)
+    explicit["labels"] = {**explicit.get("labels", {}), "omnigent.speed_tier": "standard"}
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/opt/work/project",
+            **explicit,
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["labels"]["omnigent.speed_tier"] == "standard"
+    assert body["labels"].get("omnigent.codex_sdk.approval_mode") == explicit.get("approval_mode")
+    assert body["terminal_launch_args"] == explicit.get("terminal_launch_args")
+
+
+@pytest.mark.parametrize(
+    "harness,args",
+    [
+        *(
+            ("codex-native", args)
+            for args in [
+                ["-a", "never"],
+                ["--ask-for-approval=never"],
+                ["-s", "read-only"],
+                ["--sandbox=read-only"],
+                ["--approve-for-me"],
+                ["--not-so-yolo"],
+                ["--dangerously-bypass-approvals-and-sandbox"],
+                ["--yolo"],
+                *[
+                    ["-c", f"{key}=value"]
+                    for key in [
+                        "approval_policy",
+                        "sandbox_mode",
+                        "approvals_reviewer",
+                        "default_permissions",
+                    ]
+                ],
+            ]
+        ),
+        *(
+            ("claude-native", [flag])
+            for flag in [
+                "--permission-mode=plan",
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+            ]
+        ),
+    ],
+)
+async def test_permission_default_recognizes_explicit_launch_args(
+    harness: str, args: list[str]
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _launch_args_set_permission
+
+    assert _launch_args_set_permission(args, harness)
+    assert not _launch_args_set_permission(["--model", "test-model"], harness)
+
+
+async def test_native_permission_default_respects_launch_arg_count_bounds(
+    calling_client: httpx.AsyncClient,
+    calling_app: FastAPI,
+    calling_seams: None,
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _MAX_TERMINAL_LAUNCH_ARGS
+
+    calling_app.state.artifact_store.put(
+        f"{CODEX_AGENT_ID}/bundle", _harness_bundle("codex-native")
+    )
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {"codex-native": {"permission": "approve-for-me"}},
+                }
+            }
+        },
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "host_id": HDS,
+            "workspace": "/opt/work/project",
+            "terminal_launch_args": ["--verbose"] * _MAX_TERMINAL_LAUNCH_ARGS,
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+    assert "terminal_launch_args exceeds" in response.text

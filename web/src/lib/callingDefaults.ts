@@ -93,6 +93,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export interface CallingDefaultEntry {
   model?: string;
   effort?: string;
+  speed?: string;
+  permission?: string;
 }
 
 export type CallingDefaultsTable = Record<string, Record<string, CallingDefaultEntry>>;
@@ -103,6 +105,10 @@ function sanitizeEntry(value: unknown): CallingDefaultEntry | null {
   const { model, effort } = value;
   if (typeof model === "string" && model && !isClearValue(model)) entry.model = model;
   if (typeof effort === "string" && effort && !isClearValue(effort)) entry.effort = effort;
+  for (const field of ["speed", "permission"] as const) {
+    const setting = value[field];
+    if (typeof setting === "string" && setting && !isClearValue(setting)) entry[field] = setting;
+  }
   return entry;
 }
 
@@ -156,7 +162,7 @@ export function removeCallingDefaultEntry(hostId: string, harness: string): void
 export function setCallingDefaultField(
   hostId: string,
   harness: string,
-  field: "model" | "effort",
+  field: "model" | "effort" | "speed" | "permission",
   value: string | null,
 ): void {
   const table = readCallingDefaults();

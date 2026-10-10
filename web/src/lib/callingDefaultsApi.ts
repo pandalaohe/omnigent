@@ -33,6 +33,8 @@ export interface CallingDefaultsResolution {
   harness: string | null;
   model: string | null;
   effort: string | null;
+  speed?: string | null;
+  permission?: string | null;
   /** Source tokens keyed by field: `agent`, `model`, `effort`. */
   sources: Record<string, string>;
   problems: CallingDefaultsProblem[];

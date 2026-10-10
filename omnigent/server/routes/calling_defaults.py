@@ -336,6 +336,8 @@ def create_calling_defaults_router(
             harness=resolution.harness,
             model=resolution.model,
             effort=resolution.effort,
+            speed=resolution.speed,
+            permission=resolution.permission,
             sources=resolution.sources,
             problems=problems,
         )

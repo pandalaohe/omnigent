@@ -416,6 +416,31 @@ def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _pin_codex_config_service_tier(codex_home: Path, speed: str) -> None:
+    """Pin the session's speed before any TOML table in its private config."""
+    from omnigent.session_default_modes import SPEED_TIER_VALUES
+
+    if speed not in SPEED_TIER_VALUES:
+        return
+    tier = "fast" if speed == "fast" else "default"
+    config_path = codex_home / "config.toml"
+    _materialize_config_symlink(config_path)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    lines = existing.splitlines()
+    pin_line = f"service_tier = {json.dumps(tier)}"
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            break
+        if re.match(r"^\s*service_tier\s*=", line):
+            lines[index] = pin_line
+            replaced = True
+            break
+    if not replaced:
+        lines.insert(0, pin_line)
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _materialize_config_symlink(config_path: Path) -> None:
     """
     Replace a symlinked session ``config.toml`` with a private copy.
@@ -2122,6 +2147,7 @@ class CodexNativeAppServer:
     policy_notice_pending: bool = False
     pinned_model: str | None = None
     pinned_effort: str | None = None
+    service_tier: str | None = None
     model_catalog_rows: list[_JsonObject] | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
@@ -2260,6 +2286,8 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
+        if self.service_tier is not None:
+            _pin_codex_config_service_tier(self.codex_home, self.service_tier)
         effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
         requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
         effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
@@ -3497,6 +3525,7 @@ def build_codex_native_server(
     trust_project: bool = False,
     trust_all_hooks: bool = False,
     reasoning_effort: str | None = None,
+    service_tier: str | None = None,
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
@@ -3549,6 +3578,8 @@ def build_codex_native_server(
         the private ``config.toml`` at start (see
         :func:`_pin_codex_config_effort`), e.g. ``"ultra"``. ``None`` keeps
         the copied config's value.
+    :param service_tier: Session speed (``fast`` / ``standard``) to pin in
+        the private config; ``None`` keeps the host default.
     :param model_catalog_rows: Fresh rows from the shared launch-shaped
         ``model/list`` catalog, used to avoid a redundant migration probe.
     :param reconcile_process_registry: Whether startup performs the global
@@ -3626,6 +3657,7 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         pinned_effort=reasoning_effort,
+        service_tier=service_tier,
         model_catalog_rows=model_catalog_rows,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,

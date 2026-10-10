@@ -424,6 +424,13 @@ from omnigent.server.subagent_activity import (
     record_subagent_activity,
 )
 from omnigent.server.user_preferences_store import read_worktree_path_template
+from omnigent.session_default_modes import (
+    CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
+    PERMISSION_DEFAULT_VALUES,
+    SPEED_TIER_HARNESSES,
+    SPEED_TIER_LABEL_KEY,
+    SPEED_TIER_VALUES,
+)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -433,6 +440,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     ConversationNotFoundError,
@@ -613,6 +621,51 @@ def _clear_timed_out_harness_elicitation(session_id: str, elicitation_id: str) -
 #: Error code + line for the persisted "the deadline stopped the turn" notice.
 _APPROVAL_TIMED_OUT_CODE = "approval_timed_out"
 _APPROVAL_TIMED_OUT_MESSAGE = "Timed out · turn stopped"
+
+
+def _launch_args_set_permission(args: list[str] | None, harness: str | None) -> bool:
+    """Whether launch args explicitly choose a harness's permission stance."""
+    args = args or []
+    if harness in {"codex", "codex-native"}:
+        flags = {
+            "-a",
+            "--ask-for-approval",
+            "-s",
+            "--sandbox",
+            "--approve-for-me",
+            "--not-so-yolo",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
+        }
+        config_keys = {
+            "approval_policy",
+            "sandbox_mode",
+            "approvals_reviewer",
+            "default_permissions",
+        }
+        for index, arg in enumerate(args):
+            if arg.split("=", 1)[0] in flags:
+                return True
+            config = None
+            if arg in {"-c", "--config"} and index + 1 < len(args):
+                config = args[index + 1]
+            elif arg.startswith("--config="):
+                config = arg.removeprefix("--config=")
+            elif arg.startswith("-c"):
+                config = arg[2:]
+            if config is not None and config.split("=", 1)[0].strip() in config_keys:
+                return True
+    elif harness in {"claude-native", "claude-sdk"}:
+        return any(
+            arg.split("=", 1)[0]
+            in {
+                "--permission-mode",
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+            }
+            for arg in args
+        )
+    return False
 
 
 async def _persist_approval_timeout_notice(
@@ -12603,6 +12656,56 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+
+    if body.sub_agent_name is None and (
+        project_resolution.speed is not None or project_resolution.permission is not None
+    ):
+        resolved_harness = await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
+        )
+        permission = project_resolution.permission
+        if permission is not None:
+            if permission not in PERMISSION_DEFAULT_VALUES.get(
+                resolved_harness or "", frozenset()
+            ):
+                _logger.warning(
+                    "Ignoring unsupported permission default %r for %s",
+                    permission,
+                    resolved_harness,
+                )
+            elif (
+                body.permission_mode is None
+                and body.approval_mode is None
+                and CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in (body.labels or {})
+                and not _launch_args_set_permission(validated_launch_args, resolved_harness)
+            ):
+                if resolved_harness == "codex":
+                    sdk_permission_labels[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = permission
+                elif resolved_harness == "claude-sdk":
+                    sdk_permission_labels[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = permission
+                else:
+                    preset_args = (
+                        CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission]
+                        if resolved_harness == "codex-native"
+                        else ["--permission-mode", permission]
+                    )
+                    try:
+                        validated_launch_args = _validate_terminal_launch_args(
+                            [*(validated_launch_args or []), *preset_args]
+                        )
+                    except ValueError as exc:
+                        raise OmnigentError(
+                            f"invalid terminal_launch_args with permission default: {exc}",
+                            code=ErrorCode.INVALID_INPUT,
+                        ) from exc
+        speed = project_resolution.speed
+        if speed is not None:
+            if resolved_harness not in SPEED_TIER_HARNESSES or speed not in SPEED_TIER_VALUES:
+                _logger.warning(
+                    "Ignoring unsupported speed default %r for %s", speed, resolved_harness
+                )
+            elif SPEED_TIER_LABEL_KEY not in (body.labels or {}):
+                sdk_permission_labels[SPEED_TIER_LABEL_KEY] = speed
 
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec

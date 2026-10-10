@@ -631,6 +631,7 @@ class _CodexNativeLaunchConfig:
     routing_enabled: bool = False
     turn_routing: bool = False
     reasoning_effort: str | None = None
+    service_tier: str | None = None
     parent_session_id: str | None = None
 
 
@@ -1381,7 +1382,10 @@ async def _codex_native_launch_config(
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
+    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, SPEED_TIER_VALUES
+
     bypass_sandbox = False
+    service_tier = None
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1392,6 +1396,9 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        speed = labels.get(SPEED_TIER_LABEL_KEY)
+        if isinstance(speed, str) and speed in SPEED_TIER_VALUES:
+            service_tier = speed
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1409,6 +1416,7 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        service_tier=service_tier,
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
@@ -5521,6 +5529,7 @@ async def _auto_create_codex_terminal(
         developer_instructions=_codex_developer_instructions,
         terminal_launch_args=launch_config.terminal_launch_args or (),
         reasoning_effort=launch_config.reasoning_effort,
+        service_tier=launch_config.service_tier,
         model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist

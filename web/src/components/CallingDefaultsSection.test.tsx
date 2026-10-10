@@ -110,6 +110,27 @@ describe("CallingDefaultsSection", () => {
     expect(screen.getByTestId("calling-defaults-follows-codex")).toBeInTheDocument();
   });
 
+  it("edits and clears supported session modes while hiding unsupported controls", async () => {
+    localStorage.setItem(
+      DEFAULTS_KEY,
+      JSON.stringify({ "host-a": { "codex-native": {}, "claude-native": {}, "pi-native": {} } }),
+    );
+    render(<CallingDefaultsSection />);
+    await pickOption("calling-defaults-speed-codex-native", "Fast");
+    await pickOption("calling-defaults-permission-codex-native", "Approve for me");
+    expect(readMaster()["host-a"]["codex-native"]).toEqual({
+      speed: "fast",
+      permission: "approve-for-me",
+    });
+    await pickOption("calling-defaults-speed-codex-native", "Default");
+    await pickOption("calling-defaults-permission-codex-native", "Default");
+    expect(readMaster()["host-a"]["codex-native"]).toEqual({});
+    expect(screen.queryByTestId("calling-defaults-speed-claude-native")).not.toBeInTheDocument();
+    await pickOption("calling-defaults-permission-claude-native", "Accept edits");
+    expect(readMaster()["host-a"]["claude-native"]).toEqual({ permission: "acceptEdits" });
+    expect(screen.queryByTestId("calling-defaults-permission-pi-native")).not.toBeInTheDocument();
+  });
+
   it("returns an SDK row to Follows after deleting its own entry", async () => {
     render(<CallingDefaultsSection />);
 

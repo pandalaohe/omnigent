@@ -20,6 +20,11 @@ from typing import Any, Protocol
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import is_harness_availability
+from omnigent.session_default_modes import (
+    PERMISSION_DEFAULT_VALUES,
+    SPEED_TIER_HARNESSES,
+    SPEED_TIER_VALUES,
+)
 from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness
 
 _logger = logging.getLogger(__name__)
@@ -56,7 +61,9 @@ class CallingResolution:
         ``harness_override``), or ``None`` when neither is known.
     :param model: Effective model override, or ``None``.
     :param effort: Effective reasoning effort, or ``None``.
-    :param sources: ``{"agent", "model", "effort"}`` source tokens, e.g.
+    :param speed: Session speed tier, or ``None``.
+    :param permission: Harness-specific permission preset, or ``None``.
+    :param sources: ``{"agent", "model", "effort", "speed", "permission"}`` source tokens, e.g.
         ``"explicit"``, ``"project_host"``, or ``"master_native"``.
     """
 
@@ -65,6 +72,8 @@ class CallingResolution:
     model: str | None
     effort: str | None
     sources: dict[str, str]
+    speed: str | None = None
+    permission: str | None = None
 
 
 def _setting(value: object) -> str | None:
@@ -231,12 +240,36 @@ def resolve_calling(
     effort, effort_source = _resolve_effort(
         explicit, explicit_fields, project_config, master, host_id, harness
     )
+    speed, speed_source = _resolve_harness_setting(
+        "speed",
+        project_config,
+        master,
+        host_id,
+        harness,
+        SPEED_TIER_VALUES if harness in SPEED_TIER_HARNESSES else frozenset(),
+    )
+    permission, permission_source = _resolve_harness_setting(
+        "permission",
+        project_config,
+        master,
+        host_id,
+        harness,
+        PERMISSION_DEFAULT_VALUES.get(harness or "", frozenset()),
+    )
     return CallingResolution(
         agent_id=agent_id,
         harness=harness,
         model=model,
         effort=effort,
-        sources={"agent": agent_source, "model": model_source, "effort": effort_source},
+        speed=speed,
+        permission=permission,
+        sources={
+            "agent": agent_source,
+            "model": model_source,
+            "effort": effort_source,
+            "speed": speed_source,
+            "permission": permission_source,
+        },
     )
 
 
@@ -291,24 +324,34 @@ def _resolve_effort(
     """Walk the effort chain, returning the value and its source token."""
     if "reasoning_effort" in explicit_fields:
         return _explicit(explicit.get("reasoning_effort")), "explicit"
-    entry = _project_harness_entry(project_config, host_id, harness)
-    value = _setting(entry.get("effort")) if entry is not None else None
-    if value is not None:
-        return value, "project_host"
-    entry = _master_entry(master, host_id, harness)
-    value = _setting(entry.get("effort")) if entry is not None else None
-    if value is not None:
-        return value, "master"
+    return _resolve_harness_setting("effort", project_config, master, host_id, harness)
+
+
+def _resolve_harness_setting(
+    field: str,
+    project_config: dict | None,
+    master: dict,
+    host_id: str | None,
+    harness: str | None,
+    values: frozenset[str] | None = None,
+) -> tuple[str | None, str]:
+    """Walk one per-harness setting's chain, ignoring unsupported stored values."""
     native = SDK_NATIVE_PARENT.get(harness) if harness is not None else None
+    entries = [
+        (_project_harness_entry(project_config, host_id, harness), "project_host"),
+        (_master_entry(master, host_id, harness), "master"),
+    ]
     if native is not None:
-        entry = _project_harness_entry(project_config, host_id, native)
-        value = _setting(entry.get("effort")) if entry is not None else None
-        if value is not None:
-            return value, "project_host_native"
-        entry = _master_entry(master, host_id, native)
-        value = _setting(entry.get("effort")) if entry is not None else None
-        if value is not None:
-            return value, "master_native"
+        entries.extend(
+            [
+                (_project_harness_entry(project_config, host_id, native), "project_host_native"),
+                (_master_entry(master, host_id, native), "master_native"),
+            ]
+        )
+    for entry, source in entries:
+        value = _setting(entry.get(field)) if entry is not None else None
+        if value is not None and (values is None or value in values):
+            return value, source
     return None, "none"
 
 
@@ -619,7 +662,7 @@ def validate_project_calling_defaults(value: object) -> dict:
                 base = f"calling_defaults[{host_id!r}].harnesses[{harness!r}]"
                 if not isinstance(entry, dict):
                     raise _invalid(f"{base} must be an object")
-                unknown = set(entry) - {"model", "effort"}
+                unknown = set(entry) - {"model", "effort", "speed", "permission"}
                 if unknown:
                     raise _invalid(f"{base} has unknown key {next(iter(unknown))!r}")
                 clean_entry: dict = {}
@@ -630,6 +673,18 @@ def validate_project_calling_defaults(value: object) -> dict:
                     if not isinstance(effort, str) or effort not in EFFORT_VALUES:
                         raise _invalid(f"{base}.effort must be one of {sorted(EFFORT_VALUES)}")
                     clean_entry["effort"] = effort
+                for field, values in (
+                    (
+                        "speed",
+                        SPEED_TIER_VALUES if harness in SPEED_TIER_HARNESSES else frozenset(),
+                    ),
+                    ("permission", PERMISSION_DEFAULT_VALUES.get(harness, frozenset())),
+                ):
+                    if field in entry:
+                        value = entry[field]
+                        if not isinstance(value, str) or value not in values:
+                            raise _invalid(f"{base}.{field} must be one of {sorted(values)}")
+                        clean_entry[field] = value
                 clean_harnesses[harness] = clean_entry
             clean["harnesses"] = clean_harnesses
         validated[host_id] = clean

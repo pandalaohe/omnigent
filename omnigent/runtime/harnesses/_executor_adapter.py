@@ -222,6 +222,7 @@ class ExecutorAdapter(HarnessApp):
             model=request.model_override,
             permission_mode=request.permission_mode,
             approval_mode=request.approval_mode,
+            service_tier=request.service_tier,
             extra=extra,
         )
         tools = _normalize_tool_schemas(request.tools or [])

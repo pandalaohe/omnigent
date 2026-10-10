@@ -69,7 +69,13 @@ def test_explicit_values_win_per_field() -> None:
     assert result.harness == "codex"
     assert result.model == "gpt-6-luna"
     assert result.effort == "high"
-    assert result.sources == {"agent": "explicit", "model": "explicit", "effort": "project_host"}
+    assert result.sources == {
+        "agent": "explicit",
+        "model": "explicit",
+        "effort": "project_host",
+        "speed": "none",
+        "permission": "none",
+    }
 
 
 def test_explicit_none_is_kept() -> None:
@@ -146,7 +152,13 @@ def test_no_defaults_anywhere() -> None:
     assert result.agent_id == "codex-sdk"
     assert result.model is None
     assert result.effort is None
-    assert result.sources == {"agent": "explicit", "model": "none", "effort": "none"}
+    assert result.sources == {
+        "agent": "explicit",
+        "model": "none",
+        "effort": "none",
+        "speed": "none",
+        "permission": "none",
+    }
 
 
 def test_projectless_uses_master_layers_only() -> None:
@@ -475,3 +487,89 @@ async def test_load_master_reads_the_namespace_and_defaults_on_gaps(db_uri: str)
     assert await load_master("nobody@example.com", store) == {}
     assert await load_master("alice@example.com", None) == {}
     assert await load_master("broken@example.com", _RaisingStore()) == {}
+
+
+@pytest.mark.parametrize("field,value", [("speed", "fast"), ("permission", "approve-for-me")])
+@pytest.mark.parametrize(
+    "layer", ["project_host", "master", "project_host_native", "master_native"]
+)
+def test_session_modes_follow_harness_chain(field: str, value: str, layer: str) -> None:
+    project_harnesses = {"codex": {field: "invalid"}, "codex-native": {field: "invalid"}}
+    master_harnesses = {"codex": {field: "invalid"}, "codex-native": {field: "invalid"}}
+    harness = "codex-native" if layer.endswith("native") else "codex"
+    target = project_harnesses if layer.startswith("project") else master_harnesses
+    target[harness][field] = value
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk"},
+        explicit_fields={"agent_id"},
+        project_config={"calling_defaults": {"HDS": {"harnesses": project_harnesses}}},
+        master={"HDS": master_harnesses},
+    )
+    assert getattr(result, field) == value
+    assert result.sources[field] == layer
+
+
+def test_session_modes_resolve_independently_and_filter_harness_vocabulary() -> None:
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk"},
+        explicit_fields={"agent_id"},
+        project_config={
+            "calling_defaults": {"HDS": {"harnesses": {"codex": {"speed": "standard"}}}}
+        },
+        master={"HDS": {"codex": {"speed": "fast", "permission": "read-only"}}},
+    )
+    assert (result.speed, result.permission) == ("standard", "read-only")
+    result = _resolve(
+        explicit={"agent_id": "claude-agent"},
+        explicit_fields={"agent_id"},
+        master={
+            "HDS": {
+                "claude-sdk": {"speed": "fast", "permission": "read-only"},
+                "claude-native": {"permission": "plan"},
+            }
+        },
+    )
+    assert result.speed is None
+    assert result.permission == "plan"
+    assert result.sources["permission"] == "master_native"
+
+
+@pytest.mark.parametrize(
+    "harness,field,value",
+    [
+        ("codex", "speed", "fast"),
+        ("codex-native", "speed", "standard"),
+        *[
+            (harness, "permission", value)
+            for harness, values in {
+                "codex": ["ask-for-approval", "approve-for-me", "full-access", "read-only"],
+                "codex-native": ["ask-for-approval", "approve-for-me", "full-access", "read-only"],
+                "claude-sdk": ["acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"],
+                "claude-native": ["acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"],
+            }.items()
+            for value in values
+        ],
+    ],
+)
+def test_validate_session_default_modes(harness: str, field: str, value: str) -> None:
+    defaults = {"HDS": {"harnesses": {harness: {field: value}}}}
+    assert validate_project_calling_defaults(defaults) == defaults
+
+
+@pytest.mark.parametrize(
+    "harness,field,value",
+    [
+        ("codex", "speed", "priority"),
+        ("claude-native", "speed", "fast"),
+        ("pi-native", "permission", "plan"),
+        ("codex", "permission", "plan"),
+        ("claude-sdk", "permission", "read-only"),
+        ("codex", "speed", None),
+        ("codex", "permission", ["read-only"]),
+    ],
+)
+def test_validate_session_default_modes_rejects_wrong_vocabulary(
+    harness: str, field: str, value: object
+) -> None:
+    with pytest.raises(OmnigentError, match=field):
+        validate_project_calling_defaults({"HDS": {"harnesses": {harness: {field: value}}}})

@@ -141,9 +141,11 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
         }
 
 
+@pytest.mark.parametrize("speed", [None, "fast", "standard"])
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    speed: str | None,
 ) -> None:
     """
     The default (``bypass_sandbox=False``) writes no approval/sandbox overrides.
@@ -167,8 +169,10 @@ def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
         bridge_dir=tmp_path / "bridge",
         ap_server_url=None,
         ap_auth_headers={},
+        service_tier=speed,
     )
 
+    assert app_server.service_tier == speed
     overrides = "\n".join(app_server.config_overrides)
     assert "approval_policy" not in overrides
     assert "sandbox_mode" not in overrides
@@ -759,11 +763,13 @@ async def test_codex_native_launch_config_reads_the_auto_harness_flag(
     [("ultra", "ultra"), ("bogus", None), (None, None)],
     ids=["ultra", "unsupported", "unset"],
 )
+@pytest.mark.parametrize("speed", ["fast", "standard", "bogus", None])
 async def test_codex_native_launch_config_reads_reasoning_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     persisted: str | None,
     expected: str | None,
+    speed: str | None,
 ) -> None:
     """The persisted effort reaches the launch; an unsupported one is dropped, not fatal."""
     import httpx
@@ -775,7 +781,11 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"workspace": str(tmp_path), "labels": {}, "reasoning_effort": persisted},
+            json={
+                "workspace": "/opt/work/project",
+                "labels": {"omnigent.speed_tier": speed},
+                "reasoning_effort": persisted,
+            },
         )
 
     async with httpx.AsyncClient(
@@ -784,3 +794,51 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.reasoning_effort == expected
+    assert config.service_tier == (speed if speed in {"fast", "standard"} else None)
+
+
+@pytest.mark.parametrize("speed,expected", [("fast", "fast"), ("standard", "default")])
+@pytest.mark.parametrize(
+    "original", ["", 'service_tier = "default"\n', '[profile.test]\nservice_tier = "priority"\n']
+)
+def test_pin_codex_service_tier_top_level(
+    tmp_path: Path, speed: str, expected: str, original: str
+) -> None:
+    from omnigent.harnesses.codex_native.app_server import _pin_codex_config_service_tier
+
+    config = tmp_path / "config.toml"
+    config.write_text(original)
+    _pin_codex_config_service_tier(tmp_path, speed)
+    _pin_codex_config_service_tier(tmp_path, speed)
+    rendered = config.read_text()
+    parsed = tomllib.loads(rendered)
+    assert parsed["service_tier"] == expected
+    assert rendered.splitlines()[0] == f'service_tier = "{expected}"'
+    if "[profile.test]" in original:
+        assert parsed["profile"]["test"]["service_tier"] == "priority"
+    else:
+        assert rendered.count("service_tier") == 1
+
+
+@pytest.mark.parametrize(
+    "speed,expected", [(None, "priority"), ("fast", "fast"), ("standard", "default")]
+)
+async def test_start_pins_session_service_tier_only_in_private_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    speed: str | None,
+    expected: str,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    original = 'service_tier = "priority"\n'
+    (source_home / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    codex_home = tmp_path / "session-home"
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", tmp_path)
+    server.service_tier = speed
+    await server.start()
+    await server.close()
+    assert tomllib.loads((codex_home / "config.toml").read_text())["service_tier"] == expected
+    assert (source_home / "config.toml").read_text() == original

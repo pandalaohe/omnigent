@@ -108,6 +108,7 @@ class ExecutorConfig:
     extra: ExecutorExtra = field(default_factory=dict)
     permission_mode: str | None = None
     approval_mode: str | None = None
+    service_tier: str | None = None
 
 
 # ---------------------------------------------------------------------------

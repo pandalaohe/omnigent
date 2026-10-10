@@ -416,8 +416,15 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
     ],
 )
 async def test_sdk_permission_snapshot_and_event_reach_next_turn(
-    harness: str, field: str, initial: str, changed: str, label_key: str, event_type: str
+    harness: str,
+    field: str,
+    initial: str,
+    changed: str,
+    label_key: str,
+    event_type: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.session_skill_registry", lambda *args: [])
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -445,7 +452,7 @@ async def test_sdk_permission_snapshot_and_event_reach_next_turn(
         updated_at=1,
         agent_id=agent_id,
         root_conversation_id=sid,
-        labels={label_key: initial},
+        labels={label_key: initial, "omnigent.speed_tier": "fast"},
     )
     async with _runner_client(app) as client:
         created = await client.post(
@@ -475,6 +482,10 @@ async def test_sdk_permission_snapshot_and_event_reach_next_turn(
                 await asyncio.sleep(0.02)
             assert len(harness_client.posted_bodies) >= index
             assert harness_client.posted_bodies[index - 1][field] == value
+            if harness == "codex":
+                assert harness_client.posted_bodies[index - 1]["service_tier"] == "fast"
+            else:
+                assert "service_tier" not in harness_client.posted_bodies[index - 1]
 
 
 @pytest.mark.asyncio

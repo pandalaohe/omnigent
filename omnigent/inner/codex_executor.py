@@ -74,6 +74,7 @@ from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, COD
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
+from omnigent.session_default_modes import CODEX_APP_SERVER_SERVICE_TIERS
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import (
     CODEX_EFFORTS,
@@ -3981,6 +3982,7 @@ class _CodexAppServerSession:
         sandbox: str,
         reasoning_effort: str | None = None,
         approval_mode: str | None = None,
+        service_tier: str | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
@@ -4107,6 +4109,8 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = reasoning_effort
             turn_params["summary"] = "detailed"
+        if service_tier is not None and service_tier in CODEX_APP_SERVER_SERVICE_TIERS:
+            turn_params["serviceTier"] = CODEX_APP_SERVER_SERVICE_TIERS[service_tier]
         if approval_mode is not None:
             policy = CODEX_SDK_TURN_POLICIES.get(approval_mode)
             if policy is None:
@@ -5594,6 +5598,7 @@ class CodexExecutor(Executor):
                 sandbox=sandbox_mode,
                 reasoning_effort=reasoning_effort,
                 approval_mode=cfg.approval_mode,
+                service_tier=cfg.service_tier,
             ):
                 yield event
         except (HarnessTransportClosedError, ProviderAuthRequired):

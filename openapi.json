@@ -818,6 +818,18 @@
             "description": "Effective model override, or `None`.",
             "title": "Model"
           },
+          "permission": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Harness-specific permission preset, or `None`.",
+            "title": "Permission"
+          },
           "problems": {
             "description": "Default values the cached catalog does not offer; empty when the catalog is missing, empty, or stale.",
             "items": {
@@ -830,9 +842,21 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Per-field source tokens (`agent`, `model`, `effort`).",
+            "description": "Per-field source tokens (`agent`, `model`, `effort`, `speed`, `permission`).",
             "title": "Sources",
             "type": "object"
+          },
+          "speed": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session speed tier, or `None`.",
+            "title": "Speed"
           }
         },
         "required": [
