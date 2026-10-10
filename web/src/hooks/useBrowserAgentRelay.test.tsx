@@ -483,7 +483,8 @@ describe("useBrowserAgentRelay — session tabs", () => {
         (window as unknown as { __omni_snapshot_id__?: string }).__omni_snapshot_id__ =
           viewId === browserViewId(CONV, "tab-one") ? "snap-one" : "snap-two";
         try {
-          return { ok: true, result: window.eval(js) };
+          const value: unknown = window.eval(js);
+          return { ok: true, result: typeof value === "string" ? value : JSON.stringify(value) };
         } catch (error) {
           return { ok: false, error: (error as Error).message };
         }
@@ -514,6 +515,61 @@ describe("useBrowserAgentRelay — session tabs", () => {
       browserViewId(CONV, "tab-two"),
       expect.any(String),
     );
+  });
+
+  it("keeps lookup errors clear when Electron hides thrown page exceptions", async () => {
+    const generic =
+      "Script failed to execute, this normally means an error was thrown. Check the renderer console for the error.";
+    let refs: Map<number, { deref: () => Element | undefined }> | undefined;
+    const bridge = installBridge({
+      browserExecute: vi.fn(async (_viewId: string, js: string) => {
+        (window as unknown as { __omni_snapshot_id__?: string }).__omni_snapshot_id__ = "snap-b";
+        (window as unknown as { __omni_refs__?: typeof refs }).__omni_refs__ = refs;
+        try {
+          const value: unknown = window.eval(js);
+          return { ok: true, result: typeof value === "string" ? value : JSON.stringify(value) };
+        } catch {
+          return { ok: false, error: generic };
+        }
+      }),
+    });
+    authenticatedFetch.mockResolvedValue(WON);
+    writeSessionWorkspaceState(CONV, {
+      openBrowsers: ["tab-a", "tab-b"],
+      selectedBrowserId: "tab-b",
+    });
+    renderWithTabs();
+
+    const stale = await sendClaimed("click", { ref: 1, snapshot_id: "snap-a" }, 1);
+    expect(stale.error).toBe(
+      "snapshot snap-a was superseded by snap-b — call browser_snapshot again",
+    );
+    expect(bridge.browserExecute).toHaveBeenCalledWith(
+      browserViewId(CONV, "tab-b"),
+      expect.any(String),
+    );
+
+    const noSnapshot = await sendClaimed("click", { ref: 1, snapshot_id: "snap-b" }, 2);
+    expect(noSnapshot.error).toBe("no snapshot in this page — call browser_snapshot first");
+    refs = new Map();
+    const absentRef = await sendClaimed("click", { ref: 1, snapshot_id: "snap-b" }, 3);
+    expect(absentRef.error).toBe("ref 1 not in snapshot — call browser_snapshot again");
+    refs.set(1, { deref: () => undefined });
+    const collected = await sendClaimed("type", { ref: 1, snapshot_id: "snap-b", text: "hi" }, 4);
+    expect(collected.error).toBe("ref 1 was garbage-collected — call browser_snapshot again");
+    const missing = await sendClaimed("type", { selector: "#absent", text: "hello" }, 5);
+    expect(missing.error).toBe("selector not found: #absent");
+
+    const button = document.createElement("button");
+    button.id = "present";
+    button.scrollIntoView = vi.fn();
+    const onClick = vi.fn();
+    button.addEventListener("click", onClick);
+    document.body.append(button);
+    const success = await sendClaimed("click", { selector: "#present" }, 6);
+    expect(success).toEqual({ ok: true });
+    expect(onClick).toHaveBeenCalledTimes(1);
+    button.remove();
   });
 
   it("opens the reserved tab for the first navigation and reports a missing browser view", async () => {

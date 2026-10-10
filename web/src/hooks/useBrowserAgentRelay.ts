@@ -212,7 +212,7 @@ const SNAPSHOT_JS = `(() => {
 })()`;
 
 /** Build the "find element" preamble for an action that accepts EITHER ref OR
- *  selector. Sets `el` in the in-page scope; throws on miss.
+ *  selector. Sets `el` in the in-page scope; returns an error on miss.
  *
  *  The resolver validates `snapshot_id`
  *  matches `window.__omni_snapshot_id__` BEFORE looking up the ref — gives the
@@ -225,21 +225,31 @@ function findElJs(args: Record<string, unknown>): string {
   if (ref !== undefined) {
     const idCheck = snapshotId
       ? `if (window.__omni_snapshot_id__ !== ${jsString(snapshotId)}) ` +
-        `throw new Error('snapshot ' + ${jsString(snapshotId)} + ' was superseded by ' + (window.__omni_snapshot_id__ || '(none)') + ' — call browser_snapshot again'); `
+        `return { browser_error: 'snapshot ' + ${jsString(snapshotId)} + ' was superseded by ' + (window.__omni_snapshot_id__ || '(none)') + ' — call browser_snapshot again' }; `
       : "";
     return (
       idCheck +
       `const el = (window.__omni_refs__ && window.__omni_refs__.get(${jsNumber(ref)}))?.deref(); ` +
       // Distinguish no-snapshot / ref-missing / GC'd so the agent's retry is specific.
-      `if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); ` +
-      `if (!window.__omni_refs__.has(${jsNumber(ref)})) throw new Error('ref ' + ${jsNumber(ref)} + ' not in snapshot — call browser_snapshot again'); ` +
-      `if (!el) throw new Error('ref ' + ${jsNumber(ref)} + ' was garbage-collected — call browser_snapshot again'); `
+      `if (!window.__omni_refs__) return { browser_error: 'no snapshot in this page — call browser_snapshot first' }; ` +
+      `if (!window.__omni_refs__.has(${jsNumber(ref)})) return { browser_error: 'ref ' + ${jsNumber(ref)} + ' not in snapshot — call browser_snapshot again' }; ` +
+      `if (!el) return { browser_error: 'ref ' + ${jsNumber(ref)} + ' was garbage-collected — call browser_snapshot again' }; `
     );
   }
   return (
     `const el = document.querySelector(${jsString(selector)}); ` +
-    `if (!el) throw new Error('selector not found: ' + ${jsString(selector)}); `
+    `if (!el) return { browser_error: 'selector not found: ' + ${jsString(selector)} }; `
   );
+}
+
+function lookupError(result: unknown): string | null {
+  if (typeof result !== "string" || !result.startsWith('{"browser_error":')) return null;
+  try {
+    const parsed = JSON.parse(result) as { browser_error?: unknown };
+    return typeof parsed.browser_error === "string" ? parsed.browser_error : null;
+  } catch {
+    return null;
+  }
 }
 
 interface BrowserTarget {
@@ -424,6 +434,8 @@ async function dispatch(
           `el.click(); return 'ok'; })()`;
         const r = await desktop.browserExecute(target.viewId, js);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
+        const error = lookupError(r.result);
+        if (error) return { ok: false, error };
         return { ok: true };
       }
       case "type": {
@@ -450,6 +462,8 @@ async function dispatch(
           `return 'ok'; })()`;
         const r = await desktop.browserExecute(target.viewId, js);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
+        const error = lookupError(r.result);
+        if (error) return { ok: false, error };
         return { ok: true };
       }
       default:
