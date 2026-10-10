@@ -584,12 +584,16 @@ async def test_fallback_archive_stop_keeps_runner_shared_with_live_parent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("archive_mode", ["delete_safe", "never", None])
 async def test_coordinator_deletes_worktree_once_after_every_target_completes(
     db_uri: str,
+    archive_mode: str | None,
 ) -> None:
-    """The delete waits for the whole tree and runs exactly once."""
+    """Safe cleanup waits for the whole tree; never/default retain the worktree."""
     from omnigent.server.routes import sessions as sessions_facade
     from omnigent.server.routes._sessions import common as _sessions_common
+    from omnigent.server.session_collab import collab_owner_for
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 
     host_id = "a4b2c3d4e5f61234567890abcdef0123"
     runner_id = "b4b2c3d4e5f61234567890abcdef0123"
@@ -625,7 +629,15 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         intent_store=intents,
         scan_interval_seconds=3600,
     )
-    remove = AsyncMock()
+    if archive_mode is not None:
+        preferences = SqlAlchemyUserPreferencesStore(db_uri)
+        preferences.patch_namespace(
+            collab_owner_for(archived, conversations, None),
+            "worktree_archive",
+            {"mode": archive_mode},
+        )
+        coordinator.set_archive_preferences(preferences, None)
+    remove = AsyncMock(return_value=True)
     stop_runner = AsyncMock(return_value="acked")
     try:
         with (
@@ -646,12 +658,17 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         for conversation in (root, child):
             _sessions_common._intentional_stop_sessions.pop(conversation.id, None)
 
-    remove.assert_awaited_once()
-    kwargs = remove.await_args.kwargs
-    assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/root"
-    assert kwargs["branch"] == "feature/root"
-    assert kwargs["delete_branch"] is False
-    assert kwargs["exclude_conversation_id"] == root.id
+    if archive_mode == "delete_safe":
+        remove.assert_awaited_once()
+        kwargs = remove.await_args.kwargs
+        assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/root"
+        assert kwargs["branch"] == "feature/root"
+        assert kwargs["delete_branch"] is False
+        assert kwargs["exclude_conversation_id"] == root.id
+        assert kwargs["safe_only"] is True
+        assert kwargs["expected_archive_revision"] == archived.archive_revision
+    else:
+        remove.assert_not_awaited()
     settled = conversations.get_conversation(root.id)
     assert settled is not None
     assert settled.archive_close_completed_revision == settled.archive_revision

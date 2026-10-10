@@ -1,6 +1,7 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -123,15 +124,18 @@ function defaultSession(): ReturnType<typeof useSession> {
 }
 
 function renderPanel(opts: { conversationId?: string; rootSessionId?: string } = {}) {
+  const queryClient = new QueryClient();
   return render(
-    <MemoryRouter>
-      <TooltipProvider delayDuration={0}>
-        <SubagentsPanel
-          conversationId={opts.conversationId ?? "conv_root"}
-          rootSessionId={opts.rootSessionId ?? "conv_root"}
-        />
-      </TooltipProvider>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <TooltipProvider delayDuration={0}>
+          <SubagentsPanel
+            conversationId={opts.conversationId ?? "conv_root"}
+            rootSessionId={opts.rootSessionId ?? "conv_root"}
+          />
+        </TooltipProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

@@ -10605,6 +10605,7 @@ async def remove_archived_worktree_best_effort(
         return False
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- task identities keep in-flight work alive
 _safe_archive_cleanup_tasks: set[asyncio.Task[bool]] = set()
 
 
