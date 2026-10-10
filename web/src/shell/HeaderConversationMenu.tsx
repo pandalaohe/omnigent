@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type FormEvent,
@@ -9,7 +10,11 @@ import {
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
+  BellIcon,
+  BellOffIcon,
   ChevronLeftIcon,
+  CircleStopIcon,
+  CopyIcon,
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -17,10 +22,13 @@ import {
   GitForkIcon,
   InfoIcon,
   MailIcon,
+  MailOpenIcon,
   MessageCircleIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PanelRightOpenIcon,
+  PlayIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -46,9 +54,13 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { exportSessionTranscript, retrySession } from "@/lib/sessionsApi";
+import { copyText } from "@/lib/clipboard";
+import { isSessionStoppable } from "@/lib/sessionStop";
+import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { useRunnerHealthRegistration, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { unhandledCommentsDeleteLine } from "@/lib/comments";
 import { useComments } from "@/hooks/useComments";
 import { effectiveWorktree } from "@/lib/types";
@@ -60,10 +72,18 @@ import {
   useMoveToProject,
   useRenameConversation,
   useStopAndDeleteConversation,
+  useStopSession,
   useTogglePinnedConversation,
 } from "@/hooks/useConversations";
 import { ProjectPicker } from "./ProjectPicker";
-import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import {
+  markConversationRead,
+  markConversationUnread,
+  useConversationReadState,
+} from "@/hooks/useUnseenConversations";
+import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
+import { readSoundAlertPreferences, writeSoundAlertPreferences } from "@/lib/soundAlertPreferences";
+import { useChatStore } from "@/store/chatStore";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useLocation, useNavigate } from "@/lib/routing";
@@ -101,6 +121,9 @@ interface HeaderConversationMenuProps {
   viewItems?: ReactNode;
   /** Mobile workspace-rail entries (Files · Agents · Shells · Logs). */
   workspaceItems?: ReactNode;
+  trigger?: ReactNode;
+  initiallyOpen?: boolean;
+  canManage?: boolean;
 }
 
 export function HeaderConversationMenu({
@@ -118,6 +141,9 @@ export function HeaderConversationMenu({
   onPeerMessages,
   viewItems = null,
   workspaceItems = null,
+  trigger,
+  initiallyOpen = false,
+  canManage = true,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -132,11 +158,24 @@ export function HeaderConversationMenu({
   const archive = useArchiveConversation();
   const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const deleteConversation = useStopAndDeleteConversation();
-  const [menuOpen, setMenuOpen] = useState(false);
+  const stopSession = useStopSession();
+  const { account: soundAccount } = useSoundAlertPreferences();
+  const readState = useConversationReadState(
+    conversation.id,
+    conversation.updated_at,
+    conversation.status,
+  );
+  const [menuOpen, setMenuOpen] = useState(initiallyOpen);
+  const healthSessions = useMemo(
+    () => (menuOpen ? [{ id: conversation.id }] : []),
+    [menuOpen, conversation.id],
+  );
+  useRunnerHealthRegistration(healthSessions);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [stopOpen, setStopOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
   // Unhandled comments die with the session; fetch them when the delete
   // confirmation opens so the dialog can name the count.
@@ -150,6 +189,34 @@ export function HeaderConversationMenu({
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const isArchived = conversation.archived === true;
+  const isChild = conversation.parent_session_id != null;
+  const runnerOnline = useSessionRunnerOnline(conversation.id);
+  const canStop =
+    !isArchived &&
+    runnerOnline !== false &&
+    (isChild ||
+      isSessionStoppable({
+        labels: conversation.labels,
+        hostId: conversation.host_id,
+        runnerId: conversation.runner_id,
+      }));
+  const canResume =
+    !isArchived &&
+    Boolean(conversation.host_id) &&
+    runnerOnline === false &&
+    !nativeCodingAgentForSubagentWrapper(conversation.labels[WRAPPER_LABEL_KEY]);
+  const resume = useMutation({
+    mutationFn: async () => {
+      const result = await retrySession(conversation.id);
+      if (!result.recovered) throw new Error("No recovery was performed; refresh and try again");
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["session", conversation.id] });
+      navigate(`/c/${conversation.id}?view=terminal`);
+    },
+    onError: (error) => toast.error(`Couldn't resume the session: ${error.message}`),
+  });
+  const soundsMuted = soundAccount.mutedSessionIds.includes(conversation.id);
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
@@ -188,6 +255,7 @@ export function HeaderConversationMenu({
     setRenameOpen(false);
     setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
+    setStopOpen(false);
     setDeleteBranch(false);
   }, [conversation.id, conversation.title]);
 
@@ -213,7 +281,7 @@ export function HeaderConversationMenu({
   const confirmDelete = () => {
     setDeleteOpen(false);
     setDeleteBranch(false);
-    navigate("/", { replace: true });
+    if (location.pathname === `/c/${conversation.id}`) navigate("/", { replace: true });
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
@@ -229,6 +297,15 @@ export function HeaderConversationMenu({
       );
     } catch {
       toast.error("Export failed");
+    }
+  };
+
+  const copySessionId = async () => {
+    try {
+      await copyText(conversation.id);
+      toast.success("Session ID copied");
+    } catch {
+      toast.error("Couldn't copy session ID");
     }
   };
 
@@ -267,6 +344,10 @@ export function HeaderConversationMenu({
       if (mountedRef.current) setArchivePending(false);
     }
 
+    // The Undo toast survives this menu unmounting when an Agents row leaves
+    // the active tree after its archive succeeds.
+    showArchiveUndoToast(queryClient, [conversation], navigate);
+
     // A completed request must not pull the user away from a destination they
     // chose while it was in flight, nor from a newer active session rendered
     // into this same header instance.
@@ -274,6 +355,7 @@ export function HeaderConversationMenu({
     if (
       !mountedRef.current ||
       currentConversationIdRef.current !== requestedConversationId ||
+      activeLocation.pathname !== `/c/${requestedConversationId}` ||
       activeLocation.key !== requestedLocation.key ||
       activeLocation.pathname !== requestedLocation.pathname ||
       activeLocation.search !== requestedLocation.search ||
@@ -282,9 +364,6 @@ export function HeaderConversationMenu({
       return;
     }
 
-    // The Undo toast is driven by module state + the app-level Toaster, so it
-    // survives this menu unmounting.
-    showArchiveUndoToast(queryClient, [conversation], navigate);
     navigate("/", { replace: true });
   };
 
@@ -293,19 +372,21 @@ export function HeaderConversationMenu({
       {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
           renders its own trailing separator (null on other sessions). */}
       {viewItems}
-      <DropdownMenuItem
-        data-testid="header-pin-conversation"
-        className={itemClass}
-        disabled={pinSaving}
-        onSelect={() =>
-          isPinned
-            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
-            : togglePinned.mutate({ id: conversation.id, pinned: true })
-        }
-      >
-        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        {isPinned ? "Unpin" : "Pin"}
-      </DropdownMenuItem>
+      {!isChild && (
+        <DropdownMenuItem
+          data-testid="header-pin-conversation"
+          className={itemClass}
+          disabled={pinSaving}
+          onSelect={() =>
+            isPinned
+              ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+              : togglePinned.mutate({ id: conversation.id, pinned: true })
+          }
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? "Unpin" : "Pin"}
+        </DropdownMenuItem>
+      )}
       {canShare && (
         <DropdownMenuItem
           data-testid="header-share-conversation"
@@ -372,52 +453,103 @@ export function HeaderConversationMenu({
       <DropdownMenuItem
         data-testid="header-rename-conversation"
         className={itemClass}
+        disabled={!canManage}
+        title={canManage ? undefined : "Only the session owner can rename this session"}
         onSelect={() => setRenameOpen(true)}
       >
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
+      {readState.explicitlyUnread || readState.unseen ? (
+        <DropdownMenuItem
+          data-testid="header-mark-read-conversation"
+          className={itemClass}
+          onSelect={() => markConversationRead(conversation.id, conversation.updated_at)}
+        >
+          <MailOpenIcon className="size-3.5" /> Mark as read
+        </DropdownMenuItem>
+      ) : (
+        <DropdownMenuItem
+          data-testid="header-mark-unread-conversation"
+          className={itemClass}
+          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        >
+          <MailIcon className="size-3.5" /> Mark as unread
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
-        data-testid="header-mark-unread-conversation"
+        data-testid="header-copy-session-id"
         className={itemClass}
-        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        onSelect={() => void copySessionId()}
       >
-        <MailIcon className="size-3.5" />
-        Mark as unread
+        <CopyIcon className="size-3.5" /> Copy session ID
       </DropdownMenuItem>
+      <DropdownMenuItem
+        data-testid="header-toggle-session-sounds"
+        className={itemClass}
+        onSelect={() => {
+          const preferences = readSoundAlertPreferences();
+          const mutedSessionIds = preferences.mutedSessionIds.includes(conversation.id)
+            ? preferences.mutedSessionIds.filter((id) => id !== conversation.id)
+            : [...preferences.mutedSessionIds, conversation.id];
+          writeSoundAlertPreferences({ ...preferences, mutedSessionIds });
+        }}
+      >
+        {soundsMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
+        {soundsMuted ? "Unmute sounds" : "Mute sounds"}
+      </DropdownMenuItem>
+      {isChild && (
+        <DropdownMenuItem
+          data-testid="header-open-in-panel"
+          className={itemClass}
+          onSelect={() => {
+            useChatStore.setState({
+              sideChatToOpen: {
+                childId: conversation.id,
+                parentId: conversation.parent_session_id!,
+              },
+            });
+            if (location.pathname !== `/c/${conversation.parent_session_id}`)
+              navigate(`/c/${conversation.parent_session_id}`);
+          }}
+        >
+          <PanelRightOpenIcon className="size-3.5" /> Open in panel
+        </DropdownMenuItem>
+      )}
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
-      {isMobile ? (
-        // Mobile has no room for a side flyout, so this item swaps the menu body
-        // to the project picker in place (see the `projectPickerOpen` branch).
-        <DropdownMenuItem
-          data-testid="header-move-to-project"
-          className={cn("whitespace-nowrap", itemClass)}
-          onSelect={(event) => {
-            event.preventDefault();
-            setProjectPickerOpen(true);
-          }}
-        >
-          <FolderInputIcon className="size-3.5" />
-          {currentProject ? "Move session" : "Add to project"}
-        </DropdownMenuItem>
-      ) : (
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
+      {!isChild &&
+        (isMobile ? (
+          // Mobile has no room for a side flyout, so this item swaps the menu body
+          // to the project picker in place (see the `projectPickerOpen` branch).
+          <DropdownMenuItem
             data-testid="header-move-to-project"
-            className="whitespace-nowrap"
+            className={cn("whitespace-nowrap", itemClass)}
+            onSelect={(event) => {
+              event.preventDefault();
+              setProjectPickerOpen(true);
+            }}
           >
             <FolderInputIcon className="size-3.5" />
             {currentProject ? "Move session" : "Add to project"}
-          </DropdownMenuSubTrigger>
-          {/* A native submenu flyout — no separate popover layer, so no
+          </DropdownMenuItem>
+        ) : (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger
+              data-testid="header-move-to-project"
+              className="whitespace-nowrap"
+            >
+              <FolderInputIcon className="size-3.5" />
+              {currentProject ? "Move session" : "Add to project"}
+            </DropdownMenuSubTrigger>
+            {/* A native submenu flyout — no separate popover layer, so no
               open/dismiss race with the parent menu. */}
-          <DropdownMenuSubContent className="min-w-56">
-            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-      )}
+            <DropdownMenuSubContent className="min-w-56">
+              <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ))}
       {workspaceItems && (
         <>
           <DropdownMenuSeparator />
@@ -425,10 +557,35 @@ export function HeaderConversationMenu({
         </>
       )}
       <DropdownMenuSeparator />
+      {canResume && (
+        <DropdownMenuItem
+          data-testid="header-resume-session"
+          className={itemClass}
+          disabled={!canManage || resume.isPending}
+          title={canManage ? undefined : "Only the session owner can resume this session"}
+          onSelect={() => resume.mutate()}
+        >
+          <PlayIcon className="size-3.5" /> {resume.isPending ? "Resuming…" : "Resume session"}
+        </DropdownMenuItem>
+      )}
+      {canStop && (
+        <DropdownMenuItem
+          data-testid="header-stop-session"
+          className={itemClass}
+          disabled={!canManage}
+          title={canManage ? undefined : "Only the session owner can stop this session"}
+          onSelect={() => setStopOpen(true)}
+        >
+          <CircleStopIcon className="size-3.5" /> Stop session
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-archive-conversation"
         className={itemClass}
-        disabled={archivePending || archive.isPending}
+        disabled={!canManage || archivePending || archive.isPending}
+        title={
+          canManage ? undefined : "Only the session owner can archive or unarchive this session"
+        }
         onSelect={archiveConversation}
       >
         {isArchived ? (
@@ -442,6 +599,8 @@ export function HeaderConversationMenu({
         data-testid="header-delete-conversation"
         className={itemClass}
         variant="destructive"
+        disabled={!canManage}
+        title={canManage ? undefined : "Only the session owner can delete this session"}
         onSelect={() => setDeleteOpen(true)}
       >
         <Trash2Icon className="size-3.5" />
@@ -467,16 +626,18 @@ export function HeaderConversationMenu({
         }}
       >
         <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size={isMobile ? "icon" : "icon-xs"}
-            aria-label="Conversation actions"
-            data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
-          >
-            <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
-          </Button>
+          {trigger ?? (
+            <Button
+              type="button"
+              variant="ghost"
+              size={isMobile ? "icon" : "icon-xs"}
+              aria-label="Conversation actions"
+              data-testid="header-conversation-actions"
+              className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
+            >
+              <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
+            </Button>
+          )}
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
@@ -518,6 +679,36 @@ export function HeaderConversationMenu({
       </DropdownMenu>
 
       {archiveWorktreePrompt.dialog}
+      <Dialog open={stopOpen} onOpenChange={setStopOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Stop session?</DialogTitle>
+            <DialogDescription>
+              This stops <span className="font-medium">{label}</span>. Its conversation and history
+              are kept.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setStopOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              data-testid="header-stop-session-confirm"
+              disabled={stopSession.isPending}
+              onClick={() => {
+                setStopOpen(false);
+                stopSession.mutate(conversation.id, {
+                  onError: () => toast.error("Couldn't stop the session"),
+                });
+              }}
+            >
+              Stop session
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form onSubmit={submitRename}>

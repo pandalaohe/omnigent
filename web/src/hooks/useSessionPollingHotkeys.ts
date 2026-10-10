@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { toast } from "sonner";
 
 import type { Conversation } from "@/hooks/useConversations";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
@@ -6,6 +7,8 @@ import { getConversationForegroundStatus } from "@/hooks/useSessionState";
 import { isConversationUnseen, seedReadState } from "@/hooks/useUnseenConversations";
 import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import { useNavigate } from "@/lib/routing";
+import { isOwnerLevel } from "@/lib/permissionsApi";
+import { getSessionSlim } from "@/lib/sessionsApi";
 import { isSessionInsidePollingWindow } from "@/lib/sessionNavigationPreferences";
 
 export const POLL_SESSIONS_ACTION_EVENT = "omnigent:action:poll-sessions";
@@ -213,7 +216,35 @@ export function useSessionPollingHotkeys(options: SessionPollingHotkeysOptions):
         // The window narrows only the next-target candidates. An older active
         // session must remain archivable, otherwise enabling the filter would
         // silently disable the archive hotkey on that session.
-        const active = allRows.find((row) => row.id === operation.activeId);
+        let active = allRows.find((row) => row.id === operation.activeId);
+        // Children are absent from the sidebar population. Resolve the selected
+        // session itself rather than archiving its top-level ancestor.
+        if (!active && operation.activeId) {
+          try {
+            const session = await getSessionSlim(operation.activeId);
+            if (
+              session.id !== operation.activeId ||
+              session.archived ||
+              !isOwnerLevel(session.permissionLevel)
+            ) {
+              return;
+            }
+            active = {
+              id: session.id,
+              object: "conversation",
+              title: session.title,
+              created_at: session.createdAt,
+              updated_at: session.updatedAt ?? session.createdAt,
+              labels: session.labels ?? {},
+              permission_level: session.permissionLevel,
+              archived: false,
+              parent_session_id: session.parentSessionId,
+            };
+          } catch {
+            toast.error("Couldn't load the session to archive");
+            return;
+          }
+        }
         if (!active || operation.canArchive?.(active) === false) return;
         await operation.onArchive(active);
         if (latest.current.activeId === operation.activeId) {

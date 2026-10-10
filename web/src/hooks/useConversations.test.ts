@@ -1390,6 +1390,27 @@ describe("recently-created keep-alive", () => {
     expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_new", "conv_old"]);
   });
 
+  it("does not inject a child into the top-level list keep-alive", async () => {
+    markRecentlyCreated({
+      id: "conv_child",
+      object: "conversation",
+      title: "Child",
+      created_at: 0,
+      updated_at: 9,
+      labels: {},
+      permission_level: 4,
+      parent_session_id: "conv_parent",
+    });
+    fetchMock.mockResolvedValueOnce(listResponse(["conv_parent"]));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useConversations("", true, {}), { wrapper });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_parent"]);
+  });
+
   it("drops the keep-alive (no duplicate) once the fetch returns the row", async () => {
     markRecentlyCreated({
       id: "conv_new",
@@ -3938,6 +3959,37 @@ it("maps absent warm_state and keep_warm to null on a backfilled row", async () 
 });
 
 describe("undoArchiveConversations optimistic restore", () => {
+  it("refreshes a restored child's active and past lists without promoting it to the sidebar", async () => {
+    const queryClient = new QueryClient();
+    const parentKey = ["conversation", "conv_parent", "child_sessions"];
+    const pastKey = [...parentKey, "past"];
+    queryClient.setQueryData(parentKey, []);
+    queryClient.setQueryData(pastKey, { pages: [] });
+    const sidebarKey = ["conversations", "", false];
+    queryClient.setQueryData(sidebarKey, infinitePage([]));
+    queryClient.setQueryData(["session", "conv_child"], {
+      id: "conv_child",
+      parentSessionId: "conv_parent",
+      archived: true,
+    });
+    const child = conversation({
+      id: "conv_child",
+      parent_session_id: "conv_parent",
+      archived: true,
+    });
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...child, archived: false }));
+
+    await undoArchiveConversations(queryClient, [child]);
+
+    expect(queryClient.getQueryState(parentKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(pastKey)?.isInvalidated).toBe(true);
+    expect(
+      queryClient.getQueryData<{ archived: boolean }>(["session", "conv_child"])?.archived,
+    ).toBe(false);
+    expect(queryClient.getQueryData<ConversationsInfiniteData>(sidebarKey)?.pages[0].data).toEqual(
+      [],
+    );
+  });
   it("restores owned rows to Mine without inserting them into Shared", async () => {
     const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
     try {

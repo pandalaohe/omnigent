@@ -860,7 +860,7 @@ describe("AppShell header", () => {
     },
   );
 
-  it("keeps owner actions hidden for an off-window sub-agent", () => {
+  it("offers owner actions for an off-window child while keeping parent-managed filing hidden", () => {
     mockConversations([]);
     useSessionMock.mockReturnValue({
       session: {
@@ -885,10 +885,13 @@ describe("AppShell header", () => {
 
     renderShell("/c/conv_child");
 
-    fireEvent.pointerDown(screen.getByTestId("desktop-fork-actions-menu"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("header-conversation-actions"), { button: 0 });
     expect(screen.getByRole("menuitem", { name: "Fork" })).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "Delete" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Archive" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^Pin$/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /^Share$/ })).toBeNull();
   });
 
   it("defaults to chat view on a native Claude session", () => {

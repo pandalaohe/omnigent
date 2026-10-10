@@ -144,7 +144,7 @@ interface ChatHeaderProps {
   conversationId: string | undefined;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
-  /** Owner-managed top-level row backing the title-adjacent action menu. */
+  /** Owner-managed row backing the title-adjacent action menu. */
   actionConversation?: Conversation | null;
   /**
    * Breadcrumb title: the active conversation's display name, or its
@@ -325,7 +325,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * workspace-rail entries that open Files · Agents · Shells as full-screen
  * drawers — one trigger rather than two adjacent ones. It falls back to a
  * smaller Share · Agent info + rail menu when the session isn't
- * owner-managed. Stop session lives in the sidebar row's kebab menu; Clone
+ * owner-managed. Stop session also lives in the session actions menu; Clone
  * lives on each assistant message's "Fork from here" action (ChatPage).
  *
  * All state lives in AppShell — this is a pure presentational component.

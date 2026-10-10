@@ -15,6 +15,7 @@
 // click opens it in a new tab, matching the sidebar's behavior.
 
 import { Fragment, lazy, Suspense, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type { ComponentType, ReactNode, SVGProps } from "react";
 import {
   BookOpenIcon,
@@ -61,7 +62,7 @@ import {
   usePastChildSessions,
   type ChildSessionInfo,
 } from "@/hooks/useChildSessions";
-import { useStopSession } from "@/hooks/useConversations";
+import { useStopSession, type Conversation } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useHostColorPreferences } from "@/hooks/useHostColorPreferences";
 import { useSession } from "@/hooks/useSession";
@@ -85,6 +86,8 @@ import {
 import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 import { ReconcileSubagentsButton } from "./ReconcileSubagentsButton";
+import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { useForkDialog } from "./ForkDialogContext";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
@@ -127,6 +130,73 @@ function sessionLike(session: Session | null, fallbackId: string): ChildSessionL
     host_id: session?.hostId,
     labels: session?.labels ?? {},
   };
+}
+
+function ChildRowActions({ childId, className }: { childId: string; className?: string }) {
+  const [requested, setRequested] = useState(false);
+  const queryClient = useQueryClient();
+  const forkDialog = useForkDialog();
+  const { session, error, isLoading } = useSession(requested ? childId : null);
+  const conversation: Conversation | null =
+    session?.id === childId
+      ? {
+          id: session.id,
+          object: "conversation",
+          title: session.title,
+          created_at: session.createdAt,
+          updated_at: session.updatedAt ?? session.createdAt,
+          labels: session.labels ?? {},
+          archived: session.archived ?? false,
+          status:
+            session.status === "failed"
+              ? "failed"
+              : session.status === "running" || session.status === "launching"
+                ? "running"
+                : "idle",
+          permission_level: session.permissionLevel,
+          runner_id: session.runnerId ?? null,
+          host_id: session.hostId ?? null,
+          workspace: session.workspace ?? null,
+          worktree: session.worktree ?? null,
+          agent_id: session.agentId,
+          agent_name: session.agentName,
+          git_branch: session.gitBranch ?? null,
+          parent_session_id: session.parentSessionId,
+        }
+      : null;
+  const trigger = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-xs"
+      data-testid="subagent-row-actions"
+      aria-label="Agent actions"
+      disabled={isLoading}
+      title={error ? "Couldn't load session actions. Click to retry." : undefined}
+      className={cn("z-10 text-muted-foreground hover:text-foreground", className)}
+      onClick={() => {
+        setRequested(true);
+        if (error) void queryClient.resetQueries({ queryKey: ["session", childId], exact: true });
+      }}
+    >
+      <EllipsisIcon className="size-3.5" />
+    </Button>
+  );
+  return conversation ? (
+    <HeaderConversationMenu
+      conversation={conversation}
+      currentProject={null}
+      canShare={false}
+      canFork={forkDialog?.canFork === true}
+      onShare={() => {}}
+      onFork={() => forkDialog?.openForkDialog({ sourceSessionId: childId })}
+      trigger={trigger}
+      initiallyOpen
+      canManage={isOwnerLevel(conversation.permission_level)}
+    />
+  ) : (
+    trigger
+  );
 }
 
 function hostNameForHost(hostId: string | null | undefined, hosts: Map<string, Host>): string {
@@ -919,7 +989,6 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
             )}
           </div>
         </div>
-
       </Link>
     </li>
   );
@@ -1064,7 +1133,7 @@ function SubagentRow({
               className={cn(
                 "flex w-full flex-col gap-0.5 rounded-md py-1 text-left",
                 hostBar && "host-color",
-                canStop ? "pr-12" : "pr-1",
+                "pr-16",
                 isActive ? "bg-accent" : "group-hover/agent:bg-muted",
                 dim && "opacity-60 group-hover/agent:opacity-100",
               )}
@@ -1131,6 +1200,10 @@ function SubagentRow({
             <ChildTooltipContent child={child} hostName={hostName} />
           </TooltipContent>
         </Tooltip>
+        <ChildRowActions
+          childId={child.id}
+          className={cn("absolute top-1/2 -translate-y-1/2", canStop ? "right-10" : "right-1")}
+        />
         {canStop && (
           <Button
             type="button"
@@ -1206,7 +1279,7 @@ function PastChildRow({
   const isActive = conversationId === child.id;
   const cwdLabel = child.cwd ? shortenPath(child.cwd) : UNKNOWN_DIRECTORY;
   return (
-    <li>
+    <li className="relative">
       <Tooltip>
         <TooltipTrigger asChild>
           <Link
@@ -1214,7 +1287,7 @@ function PastChildRow({
             data-testid="subagent-past-row"
             data-child-session-id={child.id}
             className={cn(
-              "flex w-full flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-accent/60",
+              "flex w-full flex-col gap-0.5 px-2.5 py-2 pr-10 text-left hover:bg-accent/60",
               isActive && "bg-accent",
             )}
           >
@@ -1246,6 +1319,7 @@ function PastChildRow({
           <ChildTooltipContent child={child} hostName={hostName} />
         </TooltipContent>
       </Tooltip>
+      <ChildRowActions childId={child.id} className="absolute top-1/2 right-1 -translate-y-1/2" />
     </li>
   );
 }

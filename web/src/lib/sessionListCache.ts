@@ -394,6 +394,7 @@ const CREATED_KEEPALIVE_MS = 60_000;
 
 /** Keep a just-created session in the first-page list fetch until it's indexed. */
 export function markRecentlyCreated(conv: Conversation): void {
+  if (conv.parent_session_id != null) return;
   recentlyCreatedSessions.set(conv.id, conv);
   setTimeout(() => recentlyCreatedSessions.delete(conv.id), CREATED_KEEPALIVE_MS);
 }

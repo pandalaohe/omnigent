@@ -64,7 +64,8 @@ actions (archive, unarchive, delete).
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, rename, archive or unarchive, and delete. Clicking the title also
-renames. Sub-agent sessions hide owner-only actions.
+renames. Sub-agent sessions offer direct owner controls; sharing, pinning and
+project filing remain managed through the parent/top-level list.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -138,7 +139,8 @@ plain `uv run pytest`, which starts a private server for the test.
   Dropping an unpinned row onto a pinned row has web unit coverage only.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
-  `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`
+  `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_manages_owner_and_child`
+  also checks child rename, archive and unarchive while its parent stays active.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,

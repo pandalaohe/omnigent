@@ -15,6 +15,9 @@ import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { useChatStore } from "@/store/chatStore";
+import { readSoundAlertPreferences } from "@/lib/soundAlertPreferences";
+import * as clipboard from "@/lib/clipboard";
 
 const mocks = vi.hoisted(() => ({
   isMobile: false,
@@ -29,6 +32,10 @@ const mocks = vi.hoisted(() => ({
   moveToProject: vi.fn(),
   archive: vi.fn(),
   deleteConversation: vi.fn(),
+  stopSession: vi.fn(),
+  runnerOnline: undefined as boolean | undefined,
+  registerHealth: vi.fn(),
+  retrySession: vi.fn(),
   markUnread: vi.fn(),
   showToast: vi.fn(),
   showArchiveUndoToast: vi.fn(),
@@ -50,6 +57,10 @@ vi.mock("./archiveUndoToast", () => ({
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
+}));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: () => mocks.runnerOnline,
+  useRunnerHealthRegistration: mocks.registerHealth,
 }));
 
 // The delete confirmation reads the session's comments to name what dies with
@@ -78,6 +89,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
       mutate: mocks.deleteConversation,
       isPending: false,
     }),
+    useStopSession: () => ({ mutate: mocks.stopSession, isPending: false }),
   };
 });
 
@@ -88,7 +100,11 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => {
   const actual = await importOriginal<typeof SessionsApiModule>();
-  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+  return {
+    ...actual,
+    exportSessionTranscript: mocks.exportTranscript,
+    retrySession: mocks.retrySession,
+  };
 });
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
@@ -98,7 +114,12 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
 
 // `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
 vi.mock("sonner", () => ({
-  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
+  toast: Object.assign(vi.fn(), {
+    error: mocks.toastError,
+    success: vi.fn(),
+    custom: vi.fn(),
+    dismiss: vi.fn(),
+  }),
 }));
 
 const CONVERSATION: Conversation = {
@@ -109,6 +130,8 @@ const CONVERSATION: Conversation = {
   updated_at: 1_700_000_100,
   labels: {},
   permission_level: 3,
+  host_id: "host",
+  runner_id: "runner",
   git_branch: "feature/quarterly-planning",
 };
 
@@ -159,8 +182,10 @@ function openMenu() {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   setOmnigentHostConfig({});
   mocks.isMobile = false;
+  mocks.runnerOnline = undefined;
   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
   mocks.deleteComments = [];
   vi.clearAllMocks();
@@ -169,6 +194,150 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
+  it("registers only the open menu's session for health, then unregisters on close", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+    });
+    expect(mocks.registerHealth).toHaveBeenLastCalledWith([]);
+    openMenu();
+    expect(mocks.registerHealth).toHaveBeenLastCalledWith([{ id: "conv_child" }]);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(mocks.registerHealth).toHaveBeenLastCalledWith([]);
+  });
+
+  it("closes a Stop confirmation when the selected session changes", () => {
+    const { rerender } = renderMenu({ conversation: { ...CONVERSATION, id: "conv_child" } });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-stop-session"));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    rerender(menuTree({ conversation: { ...CONVERSATION, id: "conv_other" } }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.stopSession).not.toHaveBeenCalled();
+  });
+  it("copies the selected child's id through the shared clipboard fallback", async () => {
+    const copy = vi.spyOn(clipboard, "copyText").mockResolvedValue(undefined);
+    try {
+      renderMenu({
+        conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+      });
+      openMenu();
+      fireEvent.click(screen.getByTestId("header-copy-session-id"));
+      await waitFor(() => expect(copy).toHaveBeenCalledWith("conv_child"));
+    } finally {
+      copy.mockRestore();
+    }
+  });
+
+  it("resumes an independently hosted stopped child and opens that child", async () => {
+    mocks.runnerOnline = false;
+    mocks.retrySession.mockResolvedValue({ recovered: true });
+    renderMenu({
+      conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-stop-session")).toBeNull();
+    fireEvent.click(screen.getByTestId("header-resume-session"));
+    await waitFor(() => expect(mocks.retrySession).toHaveBeenCalledWith("conv_child"));
+    await waitFor(() =>
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_child"),
+    );
+  });
+
+  it("does not offer independent resume for a native sub-agent mirror", () => {
+    mocks.runnerOnline = false;
+    renderMenu({
+      conversation: {
+        ...CONVERSATION,
+        parent_session_id: "conv_parent",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-resume-session")).toBeNull();
+  });
+  it("keeps read actions available while disabling owner mutations on a shared child", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+      canManage: false,
+      canShare: false,
+    });
+    openMenu();
+    for (const id of [
+      "rename-conversation",
+      "stop-session",
+      "archive-conversation",
+      "delete-conversation",
+    ]) {
+      expect(screen.getByTestId(`header-${id}`)).toHaveAttribute("aria-disabled", "true");
+    }
+    expect(screen.getByTestId("header-copy-session-id")).not.toHaveAttribute("aria-disabled");
+    expect(screen.getByTestId("header-open-in-panel")).not.toHaveAttribute("aria-disabled");
+    expect(screen.getByTestId("header-mark-unread-conversation")).not.toHaveAttribute(
+      "aria-disabled",
+    );
+  });
+  it("offers child actions without top-level filing and opens its own parent panel", () => {
+    const child = {
+      ...CONVERSATION,
+      id: "conv_child",
+      parent_session_id: "conv_parent",
+      git_branch: null,
+    };
+    renderMenu({ conversation: child, canShare: false });
+    openMenu();
+    expect(screen.queryByTestId("header-pin-conversation")).toBeNull();
+    expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+    expect(screen.queryByTestId("header-share-conversation")).toBeNull();
+    expect(screen.getByTestId("header-archive-conversation")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("header-open-in-panel"));
+    expect(useChatStore.getState().sideChatToOpen).toEqual({
+      childId: "conv_child",
+      parentId: "conv_parent",
+    });
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/c/conv_parent");
+    useChatStore.setState({ sideChatToOpen: null });
+  });
+
+  it("confirms Stop against the selected child", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+    });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-stop-session"));
+    expect(mocks.stopSession).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("header-stop-session-confirm"));
+    expect(mocks.stopSession).toHaveBeenCalledWith("conv_child", expect.any(Object));
+  });
+
+  it("archives the selected child without mutating its parent", async () => {
+    renderMenu({
+      conversation: {
+        ...CONVERSATION,
+        id: "conv_child",
+        parent_session_id: "conv_parent",
+        git_branch: null,
+      },
+    });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-archive-conversation"));
+    await waitFor(() =>
+      expect(mocks.archive).toHaveBeenCalledWith({
+        id: "conv_child",
+        archived: true,
+        deleteWorktree: false,
+      }),
+    );
+    expect(mocks.archive).not.toHaveBeenCalledWith(expect.objectContaining({ id: "conv_parent" }));
+  });
+
+  it("mutes sounds for the child alone", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+    });
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-toggle-session-sounds"));
+    expect(readSoundAlertPreferences().mutedSessionIds).toEqual(["conv_child"]);
+  });
   it("exposes an accessible trigger and the established action order", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
@@ -189,7 +358,10 @@ describe("HeaderConversationMenu", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Copy session ID",
+      "Mute sounds",
       "Add to project",
+      "Stop session",
       "Archive",
       "Delete",
     ]);
@@ -600,7 +772,10 @@ describe("HeaderConversationMenu", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Copy session ID",
+      "Mute sounds",
       "Add to project",
+      "Stop session",
       "Archive this session",
       "Delete",
     ]);
@@ -622,8 +797,11 @@ describe("HeaderConversationMenu", () => {
       "Export",
       "Rename",
       "Mark as unread",
+      "Copy session ID",
+      "Mute sounds",
       "Add to project",
       "Files",
+      "Stop session",
       "Archive this session",
       "Delete",
     ]);

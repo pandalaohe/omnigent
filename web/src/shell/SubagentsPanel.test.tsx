@@ -12,6 +12,7 @@ import {
   SearchIcon,
 } from "lucide-react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
@@ -96,12 +97,15 @@ function renderPanel({
   rootSessionId = "conv_parent",
   initialEntries,
 }: RenderOptions & { initialEntries?: string[] } = {}) {
+  const queryClient = new QueryClient();
   const buildElement = () => (
-    <MemoryRouter initialEntries={initialEntries}>
-      <TooltipProvider delayDuration={0}>
-        <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-      </TooltipProvider>
-    </MemoryRouter>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={initialEntries}>
+        <TooltipProvider delayDuration={0}>
+          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+        </TooltipProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
   );
   const result = render(buildElement());
   return { ...result, rerenderPanel: () => result.rerender(buildElement()) };
@@ -217,6 +221,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SubagentsPanel", () => {
+  it("loads each child's own session snapshot only when its actions are requested", () => {
+    mockChildTree({ conv_parent: [childInfo({ id: "conv_child", title: "Child" })] });
+    const { container } = renderPanel();
+    expect(useSessionMock).not.toHaveBeenCalledWith("conv_child");
+
+    const row = childRow(container, "conv_child");
+    fireEvent.click(row.closest("li")!.querySelector('[data-testid="subagent-row-actions"]')!);
+    expect(useSessionMock).toHaveBeenCalledWith("conv_child");
+  });
+
   it("always renders a 'main' row linking to the root session", () => {
     // No children at all — the panel still shows the main link so
     // the user always has a path back to the parent.
