@@ -24,6 +24,7 @@ afterEach(() => {
 });
 
 const DEFAULTS_LITERAL: SoundAlertPreferences = {
+  soundDotWhileBackground: false,
   levels: {
     done: { enabled: true, sound: "chime" },
     error: { enabled: true, sound: "alert" },
@@ -63,6 +64,7 @@ describe("sound alert preferences", () => {
     );
 
     expect(readSoundAlertPreferences()).toEqual({
+      soundDotWhileBackground: false,
       levels: {
         done: { enabled: false, sound: "pop" },
         error: { enabled: true, sound: "alert" },
@@ -85,6 +87,24 @@ describe("sound alert preferences", () => {
     expect(stored).toHaveLength(200);
     expect(stored[0]).toBe("conv_60");
     expect(stored.at(-1)).toBe("conv_259");
+  });
+
+  it("syncs the background-dot switch and defaults old or invalid values to off", () => {
+    writeSoundAlertPreferences({ ...DEFAULTS_LITERAL, soundDotWhileBackground: true });
+    expect(readSoundAlertPreferences().soundDotWhileBackground).toBe(true);
+    expect(queuePatchMock).toHaveBeenLastCalledWith("sound_alerts", {
+      ...DEFAULTS_LITERAL,
+      soundDotWhileBackground: true,
+    });
+    for (const value of [undefined, "true", 1, null]) {
+      localStorage.setItem(
+        SOUND_ALERTS_STORAGE_KEY,
+        JSON.stringify({ soundDotWhileBackground: value }),
+      );
+      expect(readSoundAlertPreferences().soundDotWhileBackground).toBe(false);
+    }
+    writeSoundAlertPreferences({ ...DEFAULTS_LITERAL, soundDotWhileBackground: false });
+    expect(queuePatchMock).toHaveBeenLastCalledWith("sound_alerts", null);
   });
 
   it("treats a non-object payload as defaults", () => {

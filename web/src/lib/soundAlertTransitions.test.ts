@@ -176,6 +176,35 @@ describe("sound alert transitions", () => {
     expect(isDoneCandidate(rowState({ state: "unseen" }))).toBe(true);
   });
 
+  it.each([false, true])("follows the dot and B edges with the switch %s", (enabled) => {
+    const initial = new Map([["conv_a", rowState({ background: true })]]);
+    const dot = new Map([["conv_a", rowState({ state: "unseen", background: true })]]);
+    const cleared = new Map([["conv_a", rowState({ state: "unseen" })]]);
+    expect(detectEdges(initial, dot, enabled).settleStart).toEqual(enabled ? ["conv_a"] : []);
+    expect(detectEdges(dot, cleared, enabled).settleStart).toEqual(enabled ? [] : ["conv_a"]);
+    expect(detectEdges(cleared, dot, enabled).settleCancel).toEqual(enabled ? [] : ["conv_a"]);
+    expect(isDoneCandidate(dot.get("conv_a")!, enabled)).toBe(enabled);
+    expect(detectEdges(dot, initial, enabled).settleCancel).toEqual(enabled ? ["conv_a"] : []);
+  });
+
+  it.each([false, true])(
+    "keeps response and error edges independent of B with the switch %s",
+    (enabled) => {
+      const previous = new Map([
+        ["conv_a", rowState({ background: true })],
+        ["conv_b", rowState({ background: true })],
+      ]);
+      const next = new Map([
+        ["conv_a", rowState({ state: "awaiting", awaitingCount: 1, background: true })],
+        ["conv_b", rowState({ state: "error", background: true })],
+      ]);
+      expect(detectEdges(previous, next, enabled).immediate.map((a) => a.level)).toEqual([
+        "needs_response",
+        "error",
+      ]);
+    },
+  );
+
   it("omits the awaiting count from done and error alert ids", () => {
     expect(alertId("conv_a", "done", rowState({ state: "unseen" }, 42))).toBe("conv_a:done:42");
     expect(alertId("conv_a", "error", rowState({ state: "error" }, 42))).toBe("conv_a:error:42");

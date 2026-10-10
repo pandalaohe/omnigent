@@ -43,6 +43,7 @@ export interface SoundAlertQuietHours {
 
 export interface SoundAlertPreferences {
   levels: Record<SoundLevel, SoundAlertLevelPreferences>;
+  soundDotWhileBackground: boolean;
   quietHours: SoundAlertQuietHours;
   primaryDeviceId: string | null;
   mutedSessionIds: string[];
@@ -62,6 +63,7 @@ export const SOUND_ALERT_DEFAULT_QUIET_HOURS: SoundAlertQuietHours = {
 
 export const SOUND_ALERT_DEFAULTS: SoundAlertPreferences = {
   levels: SOUND_ALERT_DEFAULT_LEVELS,
+  soundDotWhileBackground: false,
   quietHours: SOUND_ALERT_DEFAULT_QUIET_HOURS,
   primaryDeviceId: null,
   mutedSessionIds: [],
@@ -79,6 +81,7 @@ function defaultSoundAlertPreferences(): SoundAlertPreferences {
       error: { ...SOUND_ALERT_DEFAULT_LEVELS.error },
       needs_response: { ...SOUND_ALERT_DEFAULT_LEVELS.needs_response },
     },
+    soundDotWhileBackground: false,
     quietHours: { ...SOUND_ALERT_DEFAULT_QUIET_HOURS },
     primaryDeviceId: null,
     mutedSessionIds: [],
@@ -147,6 +150,8 @@ export function normalizeSoundAlertPreferences(value: unknown): SoundAlertPrefer
   }
   return {
     levels,
+    soundDotWhileBackground:
+      typeof raw.soundDotWhileBackground === "boolean" ? raw.soundDotWhileBackground : false,
     quietHours: normalizeQuietHours(raw.quietHours),
     primaryDeviceId:
       typeof raw.primaryDeviceId === "string" && raw.primaryDeviceId.length > 0

@@ -224,6 +224,23 @@ export function SoundAlertSettings() {
         </div>
       ))}
 
+      <div className="flex items-center justify-between gap-6 border-t border-border pt-3">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-sm text-foreground">Sound the dot while B shows</span>
+          <span id="sound-dot-background-description" className="text-sm text-muted-foreground">
+            Play the done sound for an unread dot while background work is still active.
+          </span>
+        </div>
+        <Switch
+          aria-label="Sound the dot while B shows"
+          aria-describedby="sound-dot-background-description"
+          checked={account.soundDotWhileBackground}
+          onCheckedChange={(soundDotWhileBackground) =>
+            writeSoundAlertPreferences({ ...account, soundDotWhileBackground })
+          }
+        />
+      </div>
+
       {systemSounds.length > 0 && (
         <p className="text-sm text-muted-foreground" data-testid="sound-alert-system-sounds-hint">
           System sounds apply to this device only.
