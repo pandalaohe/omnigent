@@ -4022,6 +4022,7 @@ class HostProcess:
             is_repo=facts.is_repo,
             toplevel=facts.toplevel,
             branch=facts.branch,
+            default_branch=facts.default_branch,
             head=facts.head,
             detached=facts.detached,
             dirty=facts.dirty,

@@ -971,6 +971,7 @@ async def _receive_loop(
                         "is_repo": frame.is_repo,
                         "toplevel": frame.toplevel,
                         "branch": frame.branch,
+                        "default_branch": frame.default_branch,
                         "head": frame.head,
                         "detached": frame.detached,
                         "dirty": frame.dirty,

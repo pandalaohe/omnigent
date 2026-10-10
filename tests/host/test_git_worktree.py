@@ -1194,11 +1194,32 @@ def test_read_folder_facts_clean_repo(git_repo: Path) -> None:
     assert facts.is_repo is True
     assert facts.toplevel == _rev_parse(git_repo, "--show-toplevel")
     assert facts.branch == "main"
+    assert facts.default_branch == "main"
     assert facts.head == _rev_parse(git_repo, "HEAD")
     assert facts.detached is False
     assert facts.dirty is False
     assert facts.remotes == []
     assert facts.error is None
+
+
+def test_folder_default_branch_prefers_remote_head_over_current_branch(git_repo: Path) -> None:
+    """A feature checkout must keep the remote's main branch as the base."""
+    _git(git_repo, "remote", "add", "origin", "https://git.example.test/team/repo.git")
+    _git(git_repo, "update-ref", "refs/remotes/origin/trunk", "HEAD")
+    _git(git_repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    _git(git_repo, "checkout", "-b", "feature/settings")
+    facts = read_folder_facts(str(git_repo))
+    assert facts.branch == "feature/settings"
+    assert facts.default_branch == "trunk"
+
+
+def test_folder_default_branch_falls_back_to_master_then_unknown(git_repo: Path) -> None:
+    """Without a remote HEAD, master is known; a lone feature branch is not."""
+    _git(git_repo, "branch", "-m", "master")
+    _git(git_repo, "checkout", "-b", "feature/settings")
+    assert read_folder_facts(str(git_repo)).default_branch == "master"
+    _git(git_repo, "branch", "-D", "master")
+    assert read_folder_facts(str(git_repo)).default_branch is None
 
 
 def test_read_folder_facts_dirty_repo(git_repo: Path) -> None:

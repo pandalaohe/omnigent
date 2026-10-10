@@ -6,11 +6,11 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
+import { HelpTip } from "@/components/HelpTip";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjectHostRoots } from "@/hooks/useConversations";
 import {
-  deleteProjectEntry,
   deleteProjectHostBinding,
   deleteProjectRepository,
   getAgentCodeNote,
@@ -71,7 +71,6 @@ function defaultRemote(remotes: { name: string; url: string }[]) {
 
 /** What the one folder picker is choosing a path for. */
 type FolderPickerTarget =
-  | { kind: "entry"; hostId: string }
   | { kind: "binding"; hostId: string; repositoryId: string; bindingName: string }
   | { kind: "add"; hostId: string };
 
@@ -216,34 +215,46 @@ function FolderFactsLine({
           </Button>
         </div>
       )}
-      {facts.setup_command_configured && onRunAgain && (
+      {onRunAgain && (
         <div className="space-y-1" data-testid={`${testId}-setup`}>
-          <p className="text-sm font-medium">Host setup command</p>
+          <div className="flex items-center gap-2 text-sm font-medium">
+            Host setup command
+            <HelpTip label="About the host setup command">
+              Host configuration, read-only here. Edit host.post_bind_command in this host&apos;s
+              ~/.omnigent/config.yaml. It runs after a folder is saved or verified, not when a
+              session starts. Command text stays on the host.
+            </HelpTip>
+          </div>
           <p className="text-sm text-muted-foreground">
-            A command this host runs after a folder is saved (configured on the host).
+            {facts.setup_command_configured ? "Configured on host" : "Not configured"}
           </p>
-          <p className="text-sm text-muted-foreground" data-testid={`${testId}-setup-outcome`}>
-            {outcome ? (
-              <>
-                Last run: {hookStatusLabel(outcome.status)}
-                {typeof outcome.exit_code === "number" ? ` (exit code ${outcome.exit_code})` : ""}
-                {` · ${formatOutcomeTime(outcome.at)}`}
-              </>
-            ) : (
-              "No run yet since the server started."
-            )}
-          </p>
-          <p className="text-sm text-muted-foreground">Recorded since the server started.</p>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid={`${testId}-run-again`}
-            onClick={onRunAgain}
-            disabled={disabled}
-          >
-            Run again
-          </Button>
+          {facts.setup_command_configured && (
+            <>
+              <p className="text-sm text-muted-foreground" data-testid={`${testId}-setup-outcome`}>
+                {outcome ? (
+                  <>
+                    Last run: {hookStatusLabel(outcome.status)}
+                    {typeof outcome.exit_code === "number"
+                      ? ` (exit code ${outcome.exit_code})`
+                      : ""}
+                    {` · ${formatOutcomeTime(outcome.at)}`}
+                  </>
+                ) : (
+                  "No run yet since the server started."
+                )}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                data-testid={`${testId}-run-again`}
+                onClick={onRunAgain}
+                disabled={disabled}
+              >
+                Run again
+              </Button>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -258,8 +269,7 @@ function AgentCodeNotePanel({ projectId, hostId }: { projectId: string; hostId: 
   });
 
   return (
-    <details className="text-sm" data-testid={`project-code-agent-note-${hostId}`}>
-      <summary className="cursor-pointer font-medium">What the agent is told</summary>
+    <HelpTip label={`What agents receive on ${hostId}`}>
       <div className="mt-2 space-y-1">
         {note.isPending && <p className="text-muted-foreground">Loading…</p>}
         {note.isError && <p className="text-muted-foreground">Couldn&apos;t load the preview.</p>}
@@ -290,7 +300,7 @@ function AgentCodeNotePanel({ projectId, hostId }: { projectId: string; hostId: 
           </>
         )}
       </div>
-    </details>
+    </HelpTip>
   );
 }
 
@@ -354,7 +364,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
     filledAddFactsKey.current = key;
     const remote = defaultRemote(result.facts.remotes);
     setAddRemoteName(remote?.name ?? "");
-    setAddBranch(result.facts.branch ?? "main");
+    setAddBranch(result.facts.default_branch ?? "");
     setAddName(repositoryNameFromUrl(remote?.url ?? "", addFactsPath));
   }, [addFactsQuery.data, addFactsPath, effectiveAddHostId]);
 
@@ -408,21 +418,6 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         : {}),
       ...changes,
     });
-
-  const saveEntry = (hostId: string, workspace: string) => {
-    void runAction(async () => {
-      const entry = await putProjectEntry(projectId, hostId, workspace);
-      markUnchecked(`${hostId}::project`, entry.checked === false);
-      invalidate(hostId);
-    });
-  };
-
-  const removeEntry = (hostId: string) => {
-    void runAction(async () => {
-      await deleteProjectEntry(projectId, hostId);
-      invalidate(hostId);
-    });
-  };
 
   const saveBinding = (
     hostId: string,
@@ -556,13 +551,14 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         defaultRemote(addFacts.facts.remotes))
       : null;
   const canSubmitAdd =
-    addMode === "address"
+    addBranch.trim().length > 0 &&
+    (addMode === "address"
       ? addName.trim().length > 0
       : addFacts?.state === "ok" &&
         addFacts.facts.exists &&
         addFacts.facts.is_dir &&
         addFolder.trim().length > 0 &&
-        !!effectiveAddHostId;
+        !!effectiveAddHostId);
 
   const submitAdd = () => {
     const name =
@@ -579,7 +575,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
       if (addMode === "address") {
         await putProjectRepository(projectId, name, {
           remote_url: addUrl.trim(),
-          default_branch: addBranch.trim() || "main",
+          default_branch: addBranch.trim(),
           role,
         });
         resetAddForm();
@@ -589,7 +585,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
       if (addFacts?.state !== "ok" || !addFolder.trim() || !effectiveAddHostId) return;
       await putProjectRepository(projectId, name, {
         remote_url: addRemote?.url ?? "",
-        default_branch: addBranch.trim() || "main",
+        default_branch: addBranch.trim(),
         role,
       });
       try {
@@ -616,19 +612,8 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
       setAddFactsPath(path.trim());
       return;
     }
-    if (target.kind === "entry") {
-      saveEntry(target.hostId, path);
-      return;
-    }
     const repository = repositories.find((candidate) => candidate.id === target.repositoryId);
     if (repository) saveBinding(target.hostId, repository, path, target.bindingName);
-  };
-
-  const saveTypedEntry = (hostId: string) => {
-    const key = `${hostId}::project`;
-    const path = (folderDrafts[key] ?? entryByHost.get(hostId)?.workspace ?? "").trim();
-    if (!path) return;
-    saveEntry(hostId, path);
   };
 
   const saveTypedBinding = (hostId: string, repository: ProjectRepository, bindingName: string) => {
@@ -667,10 +652,13 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         <div className="space-y-1" data-testid={`project-code-entry-${hostId}`}>
           <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
             <div className="min-w-0 flex-1 basis-48">
-              <p className="text-sm font-medium">Project folder</p>
-              <p className="text-sm text-muted-foreground">
-                Where new sessions on this host start.
-              </p>
+              <div className="flex items-center gap-2 text-sm font-medium">
+                Entry folder
+                <HelpTip label={`About the entry folder on ${hostName(hostId)}`}>
+                  Where New Chat sessions on this host start. Set or change it on the Session
+                  defaults page.
+                </HelpTip>
+              </div>
               {entry ? (
                 <p
                   className="truncate font-mono text-sm text-muted-foreground"
@@ -682,59 +670,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 <p className="text-sm text-muted-foreground">No project folder set</p>
               )}
             </div>
-            <div className="flex shrink-0 gap-1">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                data-testid={`project-code-entry-browse-${hostId}`}
-                onClick={() => openPicker({ kind: "entry", hostId })}
-                disabled={pending || !hostOnline}
-              >
-                {entry ? "Change…" : "Set folder…"}
-              </Button>
-              {entry && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  data-testid={`project-code-entry-remove-${hostId}`}
-                  onClick={() => removeEntry(hostId)}
-                  disabled={pending}
-                >
-                  Remove
-                </Button>
-              )}
-            </div>
           </div>
-          {!hostOnline && (
-            <div className="flex min-w-0 gap-2">
-              <input
-                className={`${inputClassName} min-w-0 flex-1 font-mono`}
-                data-testid={`project-code-entry-path-${hostId}`}
-                aria-label={`Project folder on ${hostName(hostId)}`}
-                placeholder="/path/to/project"
-                value={folderDrafts[`${hostId}::project`] ?? entry?.workspace ?? ""}
-                onChange={(event) =>
-                  setFolderDrafts((current) => ({
-                    ...current,
-                    [`${hostId}::project`]: event.target.value,
-                  }))
-                }
-                disabled={pending}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                data-testid={`project-code-entry-save-${hostId}`}
-                onClick={() => saveTypedEntry(hostId)}
-                disabled={pending}
-              >
-                Save
-              </Button>
-            </div>
-          )}
           {uncheckedKeys.has(`${hostId}::project`) && (
             <p
               className="text-sm text-amber-700 dark:text-amber-400"
@@ -765,6 +701,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           );
           const bindingName = binding?.name ?? repository.name;
           const sameAsEntry = binding ? sameFolder(binding.workspace, entry?.workspace) : false;
+          const draftKey = `${hostId}::binding::${bindingName}`;
           return (
             <div
               key={repository.id}
@@ -773,17 +710,22 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             >
               <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
                 <div className="min-w-0 flex-1 basis-48">
-                  <p className="text-sm font-medium">{repository.name} folder</p>
-                  <p className="text-sm text-muted-foreground">
-                    Where this repository is checked out on this host.
-                  </p>
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    {repository.name} folder
+                    <HelpTip label={`About the ${repository.name} folder on ${hostName(hostId)}`}>
+                      The checkout this repository uses on this host. The code repository supplies
+                      new worktrees; related repositories are reference folders for agents. Entry
+                      and repository paths are saved separately; changing the entry folder does not
+                      move an existing checkout.
+                    </HelpTip>
+                  </div>
                   {binding ? (
                     sameAsEntry ? (
                       <p
                         className="text-sm text-muted-foreground"
                         data-testid={`project-code-binding-same-${hostId}-${repository.name}`}
                       >
-                        Same as the project folder
+                        Same as entry folder
                       </p>
                     ) : (
                       <p
@@ -803,17 +745,21 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                     variant="ghost"
                     size="sm"
                     data-testid={`project-code-binding-browse-${hostId}-${repository.name}`}
-                    onClick={() =>
+                    onClick={() => {
+                      if (!hostOnline && sameAsEntry) {
+                        setFolderDrafts((current) => ({ ...current, [draftKey]: "" }));
+                        return;
+                      }
                       openPicker({
                         kind: "binding",
                         hostId,
                         repositoryId: repository.id,
                         bindingName,
-                      })
-                    }
-                    disabled={pending || !hostOnline}
+                      });
+                    }}
+                    disabled={pending || (!hostOnline && !sameAsEntry)}
                   >
-                    {binding ? "Change…" : "Set folder…"}
+                    {sameAsEntry ? "Use another folder…" : binding ? "Change…" : "Set folder…"}
                   </Button>
                   {binding && (
                     <Button
@@ -829,7 +775,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                   )}
                 </div>
               </div>
-              {!hostOnline && (
+              {!hostOnline && (!sameAsEntry || draftKey in folderDrafts) && (
                 <div className="flex min-w-0 gap-2">
                   <input
                     className={`${inputClassName} min-w-0 flex-1 font-mono`}
@@ -867,7 +813,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                   Saved without checking — host offline
                 </p>
               )}
-              {binding && (
+              {binding && !sameAsEntry && (
                 <FolderFactsLine
                   projectId={projectId}
                   hostId={hostId}
@@ -920,16 +866,15 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           })}
 
         {root ? (
-          <div
-            className="space-y-1 text-sm text-muted-foreground"
-            data-testid={`project-code-root-${hostId}`}
-          >
-            <p>
-              New sessions open in: {root.workspace}
-              {root.source === "config" ? " (from the project's single-folder setting)" : ""}
-            </p>
-            <p>New worktrees come from: {root.checkout ?? root.workspace}</p>
-          </div>
+          <HelpTip label={`About session folders on ${hostName(hostId)}`}>
+            <div data-testid={`project-code-root-${hostId}`}>
+              <p>
+                New sessions open in: {root.workspace}
+                {root.source === "config" ? " (from the project's single-folder setting)" : ""}
+              </p>
+              <p>New worktrees come from: {root.checkout ?? root.workspace}</p>
+            </div>
+          </HelpTip>
         ) : (
           <p
             className="text-sm text-amber-700 dark:text-amber-400"
@@ -947,17 +892,14 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
   return (
     <div className="flex min-w-0 flex-col gap-6" data-testid="project-code-section">
       <div className="min-w-0">
-        <span className="font-medium text-ui">Project code</span>
-        <p className="text-sm text-muted-foreground">
-          Where this project&apos;s code lives on each host.
-        </p>
-        <p className="text-sm text-muted-foreground" data-testid="project-code-immediate-note">
-          Changes here save immediately.
-        </p>
-        <p className="text-sm text-muted-foreground">
-          Changes reach new sessions only. After a runner restart, resumed sessions receive the
-          current repository information in their agent instructions.
-        </p>
+        <div className="flex items-center gap-2 font-medium text-ui">
+          Project code
+          <HelpTip label="About project code settings">
+            Repository and checkout changes save immediately. Session defaults and Random worktree
+            apply when you press Save. Repository information reaches new sessions; after a runner
+            restart, resumed sessions receive it too.
+          </HelpTip>
+        </div>
       </div>
 
       {actionError && (
@@ -967,22 +909,28 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
       )}
 
       <section className="min-w-0 space-y-3" data-testid="project-code-repositories">
-        <h3 className="font-medium text-ui">Repositories</h3>
-        <p className="text-sm text-muted-foreground">
-          The code this project works with. Each repository is a git project; one is the code your
-          sessions change.
-        </p>
+        <h3 className="flex items-center gap-2 font-medium text-ui">
+          Repositories
+          <HelpTip label="About project repositories">
+            One repository is the code your sessions change; other repositories are references. A
+            saved Git address identifies the repository for agents. Configure Git remotes, push
+            targets, credentials and network access in Git on each host.
+          </HelpTip>
+        </h3>
         {repositories.length === 0 && (
           <p className="text-sm text-muted-foreground">No repositories yet.</p>
         )}
         {repositories.length > 0 && !hasCodeRepository && (
-          <p
-            className="text-sm text-amber-700 dark:text-amber-400"
+          <div
+            className="flex items-center gap-2 text-sm text-amber-700 dark:text-amber-400"
             data-testid="project-code-no-code-repo"
           >
-            No code repository yet. Mark one repository as Code we change; on hosts where it has a
-            folder, new worktrees come from it and agents are told it is the code to change.
-          </p>
+            No code repository yet
+            <HelpTip label="About choosing the code repository">
+              Mark one repository as Code we change. On hosts where it has a folder, it supplies new
+              worktrees and agents are told it is the code to change.
+            </HelpTip>
+          </div>
         )}
         {repositories.map((repository) => (
           <div
@@ -1016,11 +964,13 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             </div>
             <div className="flex min-w-0 flex-wrap gap-4">
               <label className="space-y-1 text-sm">
-                <span className="block font-medium">Role</span>
-                <span className="block text-muted-foreground">
-                  Code we change: on hosts where it has a folder, new worktrees come from it and
-                  agents are told it is the code to change. Related code: on hosts where it has a
-                  folder, agents are told where it is, for reference.
+                <span className="flex items-center gap-2 font-medium">
+                  Role
+                  <HelpTip label={`About the role of ${repository.name}`}>
+                    Code we change: on hosts where it has a folder, new worktrees come from it and
+                    agents are told it is the code to change. Related code: on hosts where it has a
+                    folder, agents are told where it is, for reference.
+                  </HelpTip>
                 </span>
                 <select
                   className={inputClassName}
@@ -1037,11 +987,13 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 </select>
               </label>
               <label className="min-w-0 flex-1 space-y-1 text-sm">
-                <span className="block font-medium">Default branch</span>
-                <span className="block text-muted-foreground">
-                  {repository.role === "code"
-                    ? "New worktrees branch from this when no base branch is given."
-                    : "Kept for reference; sessions do not use it."}
+                <span className="flex items-center gap-2 font-medium">
+                  Default branch
+                  <HelpTip label={`About the default branch of ${repository.name}`}>
+                    {repository.role === "code"
+                      ? "New worktrees branch from this when no base branch is given."
+                      : "Kept for reference; sessions do not use it."}
+                  </HelpTip>
                 </span>
                 <input
                   className={inputClassName}
@@ -1114,6 +1066,10 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 <div className="space-y-1">
                   <label htmlFor={`${formId}-add-folder`} className="block font-medium">
                     Folder on this host
+                    <HelpTip label="About the repository folder">
+                      Type an absolute path or browse this host. This is the code checkout; it can
+                      be the same as your usual entry folder.
+                    </HelpTip>
                   </label>
                   <div className="flex min-w-0 gap-2">
                     <input
@@ -1147,9 +1103,6 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                       Browse…
                     </Button>
                   </div>
-                  <p className="text-sm text-muted-foreground">
-                    Type the absolute path, or Browse… the host
-                  </p>
                 </div>
                 {addFactsPath !== null && addFactsQuery.isPending && (
                   <p className="text-sm text-muted-foreground" data-testid="project-code-add-facts">
@@ -1187,10 +1140,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                     <div className="space-y-1">
                       <label htmlFor={`${formId}-add-remote`} className="block font-medium">
                         Git remote
+                        <HelpTip label="About the repository Git remote">
+                          Select which existing fetch remote identifies this repository. Omnigent
+                          records its URL; it does not change Git remotes or configure pushing.
+                        </HelpTip>
                       </label>
-                      <p className="text-sm text-muted-foreground">
-                        Which of the folder&apos;s remotes identifies this repository.
-                      </p>
                       <select
                         id={`${formId}-add-remote`}
                         className={inputClassName}
@@ -1223,10 +1177,10 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                     <div className="space-y-1">
                       <label htmlFor={`${formId}-add-name`} className="block font-medium">
                         Name
+                        <HelpTip label="About the repository name">
+                          A short name using letters, digits, dots, underscores or hyphens.
+                        </HelpTip>
                       </label>
-                      <p className="text-sm text-muted-foreground">
-                        A short name for this repository (letters, digits, . _ -).
-                      </p>
                       <input
                         id={`${formId}-add-name`}
                         className={inputClassName}
@@ -1243,6 +1197,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                     <div className="space-y-1">
                       <label htmlFor={`${formId}-add-branch`} className="block font-medium">
                         Default branch
+                        <HelpTip label="About the new repository default branch">
+                          Uses the locally recorded remote default branch, then main or master. If
+                          none is known, enter the repository&apos;s main branch. An older host may
+                          need an update to report it.
+                        </HelpTip>
                       </label>
                       <input
                         id={`${formId}-add-branch`}
@@ -1256,17 +1215,23 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                   </>
                 )}
                 {addFolder.trim() === "" && addFacts?.state !== "ok" && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className={mutedButtonClassName}
-                    data-testid="project-code-add-by-address"
-                    onClick={() => setAddMode("address")}
-                    disabled={pending}
-                  >
-                    Add by address
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className={mutedButtonClassName}
+                      data-testid="project-code-add-by-address"
+                      onClick={() => setAddMode("address")}
+                      disabled={pending}
+                    >
+                      Add by address
+                    </Button>
+                    <HelpTip label="About adding a repository by address">
+                      Records a URL only. It does not clone the repository, set a push target or
+                      configure credentials. Set its folder on each host separately.
+                    </HelpTip>
+                  </div>
                 )}
               </>
             ) : (
@@ -1274,6 +1239,10 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 <div className="space-y-1">
                   <label htmlFor={`${formId}-add-url`} className="block font-medium">
                     Git location
+                    <HelpTip label="About the repository address">
+                      Records a URL only. Clone the repository and configure Git credentials,
+                      remotes and network access on the host yourself.
+                    </HelpTip>
                   </label>
                   <input
                     id={`${formId}-add-url`}
@@ -1304,6 +1273,10 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 <div className="space-y-1">
                   <label htmlFor={`${formId}-add-address-branch`} className="block font-medium">
                     Default branch
+                    <HelpTip label="About the address-only default branch">
+                      Enter the repository&apos;s main branch. An address alone cannot tell Omnigent
+                      which branch is the default.
+                    </HelpTip>
                   </label>
                   <input
                     id={`${formId}-add-address-branch`}
@@ -1361,7 +1334,14 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
 
       <section className="min-w-0 space-y-3" data-testid="project-code-hosts">
         <div className="flex min-w-0 items-center justify-between gap-3">
-          <h3 className="font-medium text-ui">Hosts</h3>
+          <h3 className="flex items-center gap-2 font-medium text-ui">
+            Hosts
+            <HelpTip label="About entry and code folders">
+              Sessions opened from New Chat use the entry folder on the selected host. Projects
+              without any entries can fall back to the code checkout. New worktrees come from the
+              code repository&apos;s checkout when one is set on that host.
+            </HelpTip>
+          </h3>
           <Button
             type="button"
             variant="outline"
@@ -1374,11 +1354,6 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             Refresh
           </Button>
         </div>
-        <p className="text-sm text-muted-foreground">
-          Sessions open in the project folder. If the project has no project folder on any host,
-          sessions open in the code repository&apos;s folder. New worktrees come from the code
-          repository&apos;s folder when this host has one.
-        </p>
         {cardHostIds.map(renderHostCard)}
         {addableHosts.length > 0 && (
           <label className="block space-y-1 text-sm">
@@ -1415,15 +1390,13 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           }}
           hostId={picker.hostId}
           initialPath={
-            picker.kind === "entry"
-              ? entryByHost.get(picker.hostId)?.workspace
-              : picker.kind === "binding"
-                ? bindings.find(
-                    (binding) =>
-                      binding.host_id === picker.hostId &&
-                      binding.repository_id === picker.repositoryId,
-                  )?.workspace
-                : addFolder || undefined
+            picker.kind === "binding"
+              ? bindings.find(
+                  (binding) =>
+                    binding.host_id === picker.hostId &&
+                    binding.repository_id === picker.repositoryId,
+                )?.workspace
+              : addFolder || undefined
           }
           onConfirm={confirmPicker}
         />

@@ -3046,6 +3046,7 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
             is_repo=True,
             toplevel="/opt/work/omnigent/fork/myrepo",
             branch="main",
+            default_branch="main",
             head="a" * 40,
             detached=False,
             dirty=True,

@@ -1,24 +1,7 @@
-// Editor for a project's stored default session settings (`config`), reached
-// from the project-folder kebab menu. Writing a project's config is what lets
-// the new-chat composer pre-fill host / working directory / agent and the
-// isolated-worktree default when starting a session in the project.
-//
-// A first-class project shows two tabs: "Session defaults" (host / per-host
-// agent / model / effort / worktree) and "Code" (the project's repositories
-// and folders, whose actions save immediately). A label-only folder has no
-// project row yet, so it keeps the single form below — its Save creates the
-// project and writes the directories it collected.
-//
-// "Session defaults" is a Hosts block: a per-host list (default agent / model
-// / effort) with a detail pane at >= md and a single-open accordion below,
-// plus an "All hosts" row carrying the legacy `config.agent_id` /
-// `config.model` fallback. Per-host sets live in `config.calling_defaults`,
-// shape-validated server-side; the resolution chain that consumes them is
-// server-side. The All-hosts agent picker reuses the composer's component;
-// the label-only Directory field reuses its filesystem browser (inline, so it
-// scrolls inside the modal).
-// Fields are optional: an unset one stores no default (an absent key), and an
-// all-default dialog stores an empty config.
+// Project settings: entry folders and per-host session defaults first;
+// repositories and worktree options on the second page. Entry/default changes
+// apply on Save; repository actions save immediately. Label-only folders are
+// promoted to projects on Save. Unset fields inherit their existing defaults.
 
 import { ChevronDownIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -117,11 +100,10 @@ function Field({
       }
     >
       <label htmlFor={htmlFor} className="flex min-w-0 flex-col pt-1.5">
-        <span className="font-medium text-ui">
+        <span className="flex items-center gap-2 font-medium text-ui">
           {label}
-          {hint && switchRow && <HelpTip label={`About ${label.toLowerCase()}`}>{hint}</HelpTip>}
+          {hint && <HelpTip label={`About ${label.toLowerCase()}`}>{hint}</HelpTip>}
         </span>
-        {hint && !switchRow && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
       <div className="min-w-0 w-full">{children}</div>
     </div>
@@ -600,10 +582,8 @@ export function ProjectSettingsDialog({
   });
   const info = useServerInfo();
   const isCompact = useIsMobileViewport();
-  // A first-class project gets the two-tab layout; a label-only folder is
-  // still created by this dialog's Save, so it keeps the single settings form.
+  // A label-only folder has no repository settings until Save creates it.
   const isRealProject = projectId !== null;
-  const labelOnly = projectId === null;
   // Shared with the Code section (same query key): the code repository's
   // default branch feeds the base-branch hint.
   const { data: collaboration } = useQuery({
@@ -616,8 +596,8 @@ export function ProjectSettingsDialog({
     collaboration?.repositories.find((repository) => repository.role === "code") ?? null;
   const baseBranchHint =
     codeRepository && codeRepository.default_branch !== ""
-      ? `Blank: the code repository's default branch (${codeRepository.default_branch}), else the current branch.`
-      : "Branch new worktrees fork from; blank uses the current branch";
+      ? `Leave blank to use the code repository's default branch (${codeRepository.default_branch}); if unavailable, use Settings › Git's base branch, then the checkout's current HEAD.`
+      : "Leave blank to use Settings › Git's base branch, then the checkout's current HEAD.";
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
@@ -660,7 +640,7 @@ export function ProjectSettingsDialog({
   // now 404s.
   const [savedEntries, setSavedEntries] = useState<ReadonlyMap<string, string>>(() => new Map());
   // The dialog open (or project) whose drafts have been seeded, so a later
-  // entries refetch (a Code-tab folder change) can't overwrite edited drafts.
+  // entries refetch (another client's folder change) can't overwrite edited drafts.
   const seededKeyRef = useRef<string | null>(null);
   // Undefined keeps inheritance live while the account default refreshes.
   const alwaysUseWorktree = useAlwaysUseWorktree();
@@ -765,7 +745,7 @@ export function ProjectSettingsDialog({
     // Wait for the config and the entry rows, or the config-fallback row would
     // be seeded and then immediately replaced by the fetched rows.
     if (isLoading || entriesLoading) return;
-    // Seed once per opening (or project): a Code-tab folder change refetches
+    // Seed once per opening (or project): a folder refetch updates
     // entries, and re-seeding then would discard unsaved Session-default edits.
     const seedKey = projectId ?? "__label_only__";
     if (seededKeyRef.current === seedKey) return;
@@ -773,8 +753,18 @@ export function ProjectSettingsDialog({
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     const rows = seedHostRows(entries, c);
+    if (
+      c.host_id &&
+      c.host_id !== NONE &&
+      c.host_id !== SANDBOX_HOST_CHOICE &&
+      !rows.some((row) => row.hostId === c.host_id)
+    ) {
+      rows.push({ hostId: c.host_id, path: "", agentId: null, harnesses: {} });
+    }
     setHostRows(rows);
-    setSelectedRowId(rows[0]?.hostId ?? ALL_HOSTS);
+    setSelectedRowId(
+      rows.find((row) => row.hostId === c.host_id)?.hostId ?? rows[0]?.hostId ?? ALL_HOSTS,
+    );
     setSavedEntries(new Map(entries.map((entry) => [entry.host_id, entry.workspace])));
     setWorktreeOverride(c.use_worktree);
     setBaseBranch(c.base_branch ?? "");
@@ -795,7 +785,7 @@ export function ProjectSettingsDialog({
     return path !== "" && savedEntries.get(row.hostId) !== path;
   });
   const removedHostIds = [...savedEntries.keys()].filter(
-    (entryHostId) => !hostRows.some((row) => row.hostId === entryHostId),
+    (entryHostId) => !hostRows.some((row) => row.hostId === entryHostId && row.path.trim() !== ""),
   );
   // The default host's row supplies the config's `workspace` mirror. A missing
   // row, a blank path, or the sandbox default host leaves it unset.
@@ -890,18 +880,9 @@ export function ProjectSettingsDialog({
     const config: ProjectConfig = { ...(stored ?? {}) };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
-    // The stored workspace is only a single-host mirror for upstream readers.
-    // For a real project it follows the default host's saved project folder
-    // when one exists; otherwise the stored value is kept, because this form
-    // no longer edits folders (the Code tab does). For a label-only folder the
-    // default host's row is the draft that Save is about to turn into an entry.
-    if (labelOnly) {
-      if (defaultHostRowPath) config.workspace = defaultHostRowPath;
-      else delete config.workspace;
-    } else {
-      const defaultEntry = entries.find((entry) => entry.host_id === hostId);
-      if (defaultEntry) config.workspace = defaultEntry.workspace;
-    }
+    // The single-host mirror follows the same draft that the entry writes use.
+    if (defaultHostRowPath) config.workspace = defaultHostRowPath;
+    else delete config.workspace;
     if (agentId) config.agent_id = agentId;
     else delete config.agent_id;
     if (worktreeOverride !== undefined) config.use_worktree = worktreeOverride;
@@ -948,57 +929,59 @@ export function ProjectSettingsDialog({
           return;
         }
       }
-      // Entry writes belong to the label-only path, where Save is what creates
-      // the project. A real project's folders are edited in the Code tab.
       // PUT changed rows, DELETE removed rows, sequentially: the first failure
       // stops the sequence, its server message lands on that row, the dialog
       // stays open and no config is written. Sequential by design — the next
       // write must not start after a failure. Each success advances the
       // baseline so a retry only sends what is still pending.
-      if (labelOnly) {
-        for (const row of changedRows) {
-          const path = row.path.trim();
-          let written: ProjectHostEntry & { post_bind?: PostBindResult };
-          try {
-            // eslint-disable-next-line no-await-in-loop
-            written = await putProjectEntry(id, row.hostId, path);
-          } catch (error) {
-            // Select the row so its detail (where the message renders) is on
-            // screen; the user may have been editing another host.
-            setSelectedRowId(row.hostId);
-            setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
+      for (const row of changedRows) {
+        const path = row.path.trim();
+        let written: ProjectHostEntry & { post_bind?: PostBindResult };
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          written = await putProjectEntry(id, row.hostId, path);
+        } catch (error) {
+          // Select the row so its detail (where the message renders) is on
+          // screen; the user may have been editing another host.
+          setSelectedRowId(row.hostId);
+          setActiveTab("defaults");
+          setEntriesError({ hostId: row.hostId, message: errorMessage(error) });
+          return;
+        }
+        entryWriteCommitted = true;
+        setSavedEntries((current) => new Map(current).set(row.hostId, path));
+        const postBind = written.post_bind;
+        if (postBind && WARNING_HOOK_STATUSES.has(postBind.status)) {
+          if (!hookWarningSeen) setSelectedRowId(row.hostId);
+          hookWarningSeen = true;
+          setActiveTab("defaults");
+        }
+        setEntryHookOutcomes((current) => {
+          const next = new Map(current);
+          if (postBind) next.set(row.hostId, postBind);
+          else next.delete(row.hostId);
+          return next;
+        });
+      }
+      for (const removedHostId of removedHostIds) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await deleteProjectEntry(id, removedHostId);
+        } catch (error) {
+          // Already gone (a committed earlier attempt, or another tab):
+          // the goal state holds, so the save continues.
+          if (!(error instanceof ApiError && error.status === 404)) {
+            setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
+            setActiveTab("defaults");
             return;
           }
-          entryWriteCommitted = true;
-          setSavedEntries((current) => new Map(current).set(row.hostId, path));
-          const postBind = written.post_bind;
-          if (postBind && WARNING_HOOK_STATUSES.has(postBind.status)) hookWarningSeen = true;
-          setEntryHookOutcomes((current) => {
-            const next = new Map(current);
-            if (postBind) next.set(row.hostId, postBind);
-            else next.delete(row.hostId);
-            return next;
-          });
         }
-        for (const removedHostId of removedHostIds) {
-          try {
-            // eslint-disable-next-line no-await-in-loop
-            await deleteProjectEntry(id, removedHostId);
-          } catch (error) {
-            // Already gone (a committed earlier attempt, or another tab):
-            // the goal state holds, so the save continues.
-            if (!(error instanceof ApiError && error.status === 404)) {
-              setEntriesError({ hostId: removedHostId, message: errorMessage(error) });
-              return;
-            }
-          }
-          entryWriteCommitted = true;
-          setSavedEntries((current) => {
-            const next = new Map(current);
-            next.delete(removedHostId);
-            return next;
-          });
-        }
+        entryWriteCommitted = true;
+        setSavedEntries((current) => {
+          const next = new Map(current);
+          next.delete(removedHostId);
+          return next;
+        });
       }
       try {
         await updateConfig.mutateAsync({ id, name: projectName, config });
@@ -1034,12 +1017,11 @@ export function ProjectSettingsDialog({
   const browsableHostId =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
 
-  // The default host is a config field of its own — changing it leaves the
-  // per-host rows untouched. Close any open browser so the newly selected
-  // default host's row starts collapsed.
+  // Selecting the default host also opens its entry/defaults row.
   const onHostChange = (nextHostId: string) => {
     if (nextHostId !== hostId) setOpenRow(null);
     setHostId(nextHostId);
+    if (nextHostId !== NONE && nextHostId !== SANDBOX_HOST_CHOICE) addHostRow(nextHostId);
   };
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
@@ -1443,11 +1425,12 @@ export function ProjectSettingsDialog({
         className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
         data-testid={`project-settings-host-detail-${row.hostId}`}
       >
-        {labelOnly && (
-          <Field label="Directory" hint="Where new sessions open on this host">
-            {renderDirectoryField(row)}
-          </Field>
-        )}
+        <Field
+          label="Entry folder"
+          hint="The usual folder where New Chat sessions open on this host. Each host has its own path. Sessions opened by agents or tools follow their parent's folder unless another folder is specified."
+        >
+          {renderDirectoryField(row)}
+        </Field>
         <Field label="Agent" hint="Default agent / harness for new sessions on this host">
           {renderAgentSelect(row)}
         </Field>
@@ -1527,7 +1510,7 @@ export function ProjectSettingsDialog({
             <Trash2Icon />
           </Button>
         </div>
-        {(row.path || !isRealProject) && (
+        {
           <span
             className={cn(
               "min-w-0 truncate text-xs",
@@ -1538,7 +1521,7 @@ export function ProjectSettingsDialog({
           >
             {row.path || "No directory"}
           </span>
-        )}
+        }
         <span
           className="min-w-0 max-w-full truncate self-start rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
           title={summary}
@@ -1603,7 +1586,7 @@ export function ProjectSettingsDialog({
       className="flex min-w-0 flex-col gap-3 rounded-md border p-3"
       data-testid="project-settings-all-hosts-detail"
     >
-      <p className="text-sm text-muted-foreground">Used for hosts without their own defaults.</p>
+      <HelpTip label="About all-host defaults">Used for hosts without their own defaults.</HelpTip>
       <Field label="Agent" hint="Default agent / harness for new sessions">
         <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
           <AgentHarnessPicker
@@ -1692,6 +1675,40 @@ export function ProjectSettingsDialog({
 
   const selectedRow = hostRows.find((row) => row.hostId === selectedRowId) ?? null;
 
+  const worktreeFields = (
+    <div className="flex flex-col gap-4">
+      <Field
+        switchRow
+        label="Random worktree"
+        hint="Sessions opened from New Chat start in a separate Git checkout of the project, with a random branch name. They branch from the base branch below, the code repository's default branch, Settings › Git's base branch, or the checkout's current HEAD, in that order. Sessions opened by agents or tools keep following their parent's folder unless a folder or worktree is specified. Overrides the default in Settings › Git."
+      >
+        <div className="flex justify-end">
+          <Switch
+            data-testid="project-settings-worktree"
+            checked={useWorktree}
+            onCheckedChange={(value) =>
+              setWorktreeOverride(value === alwaysUseWorktree ? undefined : value)
+            }
+            disabled={isLoading || saving}
+          />
+        </div>
+      </Field>
+      {useWorktree && (
+        <Field label="Base branch" hint={baseBranchHint} htmlFor="project-settings-base-branch">
+          <input
+            id="project-settings-base-branch"
+            data-testid="project-settings-base-branch"
+            className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            placeholder="e.g. main"
+            value={baseBranch}
+            onChange={(e) => setBaseBranch(e.target.value)}
+            disabled={isLoading || saving}
+          />
+        </Field>
+      )}
+    </div>
+  );
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -1705,9 +1722,7 @@ export function ProjectSettingsDialog({
       >
         <DialogHeader className="shrink-0 border-b px-5 pt-5 sm:px-6 sm:pt-6">
           <DialogTitle>Project settings</DialogTitle>
-          <DialogDescription>
-            Defaults and code locations for <b>{projectName}</b>.
-          </DialogDescription>
+          <DialogDescription>{projectName}</DialogDescription>
           {isRealProject && (
             <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
               <TabsList variant="line" className="mt-3 -mb-px w-full justify-start gap-4 px-0">
@@ -1744,10 +1759,13 @@ export function ProjectSettingsDialog({
               : "hidden"
           }
         >
-          <Field label="Host" hint="Where new sessions run by default">
+          <Field
+            label="Default host"
+            hint="Where New Chat sessions run by default. Select its entry folder below before choosing the usual agent and model."
+          >
             <Select
               value={hostId}
-              onValueChange={onHostChange}
+              onValueChange={onPick(onHostChange)}
               onOpenChange={onDropdownOpenChange}
               disabled={isLoading}
             >
@@ -1781,11 +1799,12 @@ export function ProjectSettingsDialog({
               hosts" row carries the legacy config.agent_id / config.model. */}
           <div className="grid min-w-0 grid-cols-1 gap-2">
             <div className="flex min-w-0 flex-col">
-              <span className="font-medium text-ui">Hosts</span>
-              <span className="text-muted-foreground text-sm">
-                {isRealProject
-                  ? "Agent, model and effort to use on each host."
-                  : "Per-host directories and session defaults"}
+              <span className="flex items-center gap-2 font-medium text-ui">
+                Hosts
+                <HelpTip label="About host folders and defaults">
+                  Each host has one usual entry folder and its own agent, model and effort defaults.
+                  Changes on this page apply when you Save.
+                </HelpTip>
               </span>
             </div>
             <div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,15rem)_minmax(0,1fr)]">
@@ -1798,22 +1817,7 @@ export function ProjectSettingsDialog({
                     className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
                     data-testid="project-settings-directories-empty"
                   >
-                    {isRealProject ? (
-                      <>
-                        No host defaults yet. Folders are set in the{" "}
-                        <button
-                          type="button"
-                          className="underline"
-                          data-testid="project-settings-open-code-tab"
-                          onClick={() => setActiveTab("code")}
-                        >
-                          Code tab
-                        </button>
-                        .
-                      </>
-                    ) : (
-                      "No project directory yet"
-                    )}
+                    Select a host to set its entry folder
                   </p>
                 )}
                 {hostRows.map((row) =>
@@ -1879,62 +1883,7 @@ export function ProjectSettingsDialog({
             </div>
           </div>
 
-          <Field
-            switchRow
-            label="Random worktree"
-            hint="Sessions opened from New Chat start in a separate Git checkout of the project, with a random branch name. They branch from the base branch below, the code repository's default branch, Settings › Git's base branch, or the checkout's current HEAD, in that order. Sessions opened by agents or tools keep following their parent's folder unless a folder or worktree is specified. Overrides the default in Settings › Git."
-          >
-            <div className="flex justify-end">
-              <Switch
-                data-testid="project-settings-worktree"
-                checked={useWorktree}
-                onCheckedChange={(value) =>
-                  setWorktreeOverride(value === alwaysUseWorktree ? undefined : value)
-                }
-                disabled={isLoading}
-              />
-            </div>
-          </Field>
-
-          {useWorktree && (
-            <Field label="Base branch" hint={baseBranchHint} htmlFor="project-settings-base-branch">
-              <input
-                id="project-settings-base-branch"
-                data-testid="project-settings-base-branch"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="e.g. main"
-                value={baseBranch}
-                onChange={(e) => setBaseBranch(e.target.value)}
-                disabled={isLoading}
-              />
-            </Field>
-          )}
-
-          {loadFailed && (
-            <p
-              className="text-destructive text-ui"
-              role="alert"
-              data-testid="project-settings-load-error"
-            >
-              Couldn't load this project's settings. Close and reopen to try again — saving is
-              disabled so your existing defaults aren't overwritten.
-            </p>
-          )}
-          {entriesLoadFailed && (
-            <p
-              className="text-destructive text-ui"
-              role="alert"
-              data-testid="project-settings-entries-load-error"
-            >
-              Couldn't load this project's directories. Close and reopen to try again — saving is
-              disabled so they aren't overwritten.
-            </p>
-          )}
-          {(saveError ?? (updateConfig.isError ? (updateConfig.error as Error).message : null)) && (
-            <p className="text-destructive text-ui" role="alert">
-              {saveError ?? (updateConfig.error as Error).message}
-            </p>
-          )}
+          {!isRealProject && worktreeFields}
         </form>
         {projectId !== null && (
           <div
@@ -1945,40 +1894,62 @@ export function ProjectSettingsDialog({
             hidden={activeTab !== "code"}
             className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-5 py-5 sm:px-6"
           >
-            <ProjectCodeSection projectId={projectId} />
+            <div className="flex flex-col gap-6">
+              <ProjectCodeSection projectId={projectId} />
+              {worktreeFields}
+            </div>
+          </div>
+        )}
+        {(loadFailed || entriesLoadFailed || saveError || updateConfig.isError) && (
+          <div className="px-5 py-2 sm:px-6">
+            {loadFailed && (
+              <p
+                className="text-destructive text-ui"
+                role="alert"
+                data-testid="project-settings-load-error"
+              >
+                Couldn't load this project's settings. Close and reopen to try again — saving is
+                disabled so your existing defaults aren't overwritten.
+              </p>
+            )}
+            {entriesLoadFailed && (
+              <p
+                className="text-destructive text-ui"
+                role="alert"
+                data-testid="project-settings-entries-load-error"
+              >
+                Couldn't load this project's directories. Close and reopen to try again — saving is
+                disabled so they aren't overwritten.
+              </p>
+            )}
+            {(saveError ??
+              (updateConfig.isError ? (updateConfig.error as Error).message : null)) && (
+              <p className="text-destructive text-ui" role="alert">
+                {saveError ?? (updateConfig.error as Error).message}
+              </p>
+            )}
           </div>
         )}
         <DialogFooter className="m-0 shrink-0 rounded-none border-t bg-popover px-5 py-4 sm:px-6 sm:py-4">
-          {activeTab === "defaults" ? (
-            <>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => onOpenChange(false)}
-                disabled={updateConfig.isPending || saving}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                form="project-settings-defaults-form"
-                data-testid="project-settings-save"
-                loading={updateConfig.isPending || saving}
-                disabled={isLoading || entriesLoading || loadFailed || entriesLoadFailed}
-              >
-                Save
-              </Button>
-            </>
-          ) : (
-            <>
-              <span className="mr-auto self-center text-sm text-muted-foreground">
-                Changes here save immediately.
-              </span>
-              <Button type="button" onClick={() => onOpenChange(false)}>
-                Done
-              </Button>
-            </>
-          )}
+          <>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => onOpenChange(false)}
+              disabled={updateConfig.isPending || saving}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              form="project-settings-defaults-form"
+              data-testid="project-settings-save"
+              loading={updateConfig.isPending || saving}
+              disabled={isLoading || entriesLoading || loadFailed || entriesLoadFailed}
+            >
+              Save
+            </Button>
+          </>
         </DialogFooter>
       </DialogContent>
     </Dialog>
