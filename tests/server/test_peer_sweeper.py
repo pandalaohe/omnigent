@@ -1009,9 +1009,38 @@ async def test_steerable_child_receiver_stays_queued(harness: _Harness) -> None:
     record = harness.seed_record(receiver_session_id="child", state="queued")
     harness.true_state.states["child"] = "steerable"
     await harness.sweeper._tick()
+    assert [
+        receiver
+        for session_id, receiver in zip(
+            harness.true_state.calls, harness.true_state.receiver_args, strict=True
+        )
+        if session_id == "child"
+    ] == [True]
+
     assert _row(harness.store, record.id).state == "queued"
     assert harness.deliver.calls == []
-    assert True in harness.true_state.receiver_args
+    assert harness.post_event.calls == []
+
+
+async def test_steerable_child_receiver_recheck_stays_queued(harness: _Harness) -> None:
+    """A child becoming steerable after the claim reverts to its queued state."""
+    child = dataclasses.replace(
+        harness.add_conv(_conv("child", title="Child")), parent_conversation_id="parent"
+    )
+    harness.conv_store.convs["child"] = child
+    record = harness.seed_record(receiver_session_id="child", state="queued")
+    harness.true_state.sequences["child"] = ["idle", "steerable"]
+    await harness.sweeper._tick()
+    assert [
+        receiver
+        for session_id, receiver in zip(
+            harness.true_state.calls, harness.true_state.receiver_args, strict=True
+        )
+        if session_id == "child"
+    ] == [True, True]
+    assert _row(harness.store, record.id).state == "queued"
+    assert harness.deliver.calls == []
+    assert harness.post_event.calls == []
 
 
 async def test_older_queued_record_holds_newer_from_same_sender(harness: _Harness) -> None:

@@ -6556,18 +6556,20 @@ def create_runner_app(
         key = peer_turn.get("result_item_id")
         if not isinstance(parent_id, str) or not isinstance(key, str):
             return
-        _subagent_work.record_peer_copy(
-            parent_id,
-            child_session_id,
-            key,
-            _peer_copy_payload(
-                peer_turn,
-                child_session_id=child_session_id,
-                status=status,
-                result_key=result_key,
-                output=output,
-            ),
-        )
+        # Quiet turns still settle the restart pin and recovered placeholder.
+        if not _subagent_work._is_quiet_output(output):
+            _subagent_work.record_peer_copy(
+                parent_id,
+                child_session_id,
+                key,
+                _peer_copy_payload(
+                    peer_turn,
+                    child_session_id=child_session_id,
+                    status=status,
+                    result_key=result_key,
+                    output=output,
+                ),
+            )
         entry = get_subagent_work(child_session_id)
         if (
             entry is not None

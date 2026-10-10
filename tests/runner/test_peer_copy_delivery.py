@@ -23,6 +23,7 @@ import pytest
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.server.routes.sessions.peer_child_turn import PeerTurn
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -57,16 +58,16 @@ def _peer_turn(
     sender_session_id: str = "conv_hermes_lead",
 ) -> dict[str, str]:
     """Build the server's ``data.peer_turn`` annotation."""
-    return {
-        "parent_session_id": parent_session_id,
-        "peer_id": "peer_msg_1",
-        "result_item_id": result_item_id,
-        "ref": "omn054-hermes-facts",
-        "sender_session_id": sender_session_id,
-        "sender_title": "hermes lead",
-        "sender_origin": "agent",
-        "excerpt": "please check the facts",
-    }
+    return PeerTurn(
+        parent_session_id=parent_session_id,
+        peer_id="peer_msg_1",
+        result_item_id=result_item_id,
+        ref="omn054-hermes-facts",
+        sender_session_id=sender_session_id,
+        sender_title="hermes lead",
+        sender_origin="agent",
+        excerpt="please check the facts",
+    ).as_dict()
 
 
 def _peer_app(items: list[dict[str, Any]] | None = None) -> tuple[Any, _PatchRecordingClient]:
@@ -200,6 +201,31 @@ async def test_peer_turn_copy_is_recorded_not_delivered(
         "a peer turn must not reach the mother inbox"
     )
     assert _wake_posts(server_client) == [], "a peer turn must not wake the mother"
+
+
+@pytest.mark.asyncio
+async def test_quiet_peer_turn_records_no_copy_or_delivery(
+    _clean_subagent_registry: None,
+) -> None:
+    """A completed peer turn ending in the quiet marker needs no parent copy."""
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    app, server_client = _delivery_app([])
+    async with _runner_client(app) as client:
+        resp = await _post_status(
+            client,
+            {
+                "status": "completed",
+                "output": "routine update\n[quiet]\n\n",
+                "peer_turn": _peer_turn(),
+            },
+        )
+        await asyncio.sleep(0.05)
+
+    assert resp.status_code == 204, resp.text
+    assert subagent_work.pop_peer_copies(PARENT_SESSION_ID) == ([], 0)
+    assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
+    assert _wake_posts(server_client) == []
 
 
 @pytest.mark.asyncio
@@ -426,15 +452,21 @@ async def test_running_mother_dispatch_wins_over_peer_annotation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("peer_output", "copy_count"), [("the answer", 1), ("routine update\n[quiet]\n\n", 0)]
+)
 async def test_annotated_copy_clears_recovered_launching_placeholder(
     _clean_subagent_registry: None,
+    peer_output: str,
+    copy_count: int,
 ) -> None:
-    """A copy settles the recovered ``launching`` placeholder its bare idle left.
+    """A settled peer turn clears the recovered ``launching`` placeholder its bare idle left.
 
     An earlier unannotated bare idle of the same turn registers a
     ``recovered=True`` entry in ``launching``. The later annotated completion is
-    copied and must clear that placeholder: left open, the launch reaper would
-    later deliver a fake "no start acknowledgment" failure to the mother.
+    settled and must clear that placeholder even when quiet: left open, the
+    launch reaper would later deliver a fake "no start acknowledgment" failure
+    to the mother.
     """
     subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     app, server_client = _forwarder_confirmed_app()
@@ -450,13 +482,15 @@ async def test_annotated_copy_clears_recovered_launching_placeholder(
         assert entry is not None and entry.recovered and entry.status == "launching"
         done = await _post_status(
             client,
-            {"status": "completed", "output": "the answer", "peer_turn": _peer_turn()},
+            {"status": "completed", "output": peer_output, "peer_turn": _peer_turn()},
         )
         assert done.status_code == 204
 
-    copies, _ = subagent_work.pop_peer_copies(PARENT_SESSION_ID)
-    assert len(copies) == 1
-    assert copies[0]["status"] == "completed"
+    copies, dropped = subagent_work.pop_peer_copies(PARENT_SESSION_ID)
+    assert dropped == 0
+    assert len(copies) == copy_count
+    if copies:
+        assert copies[0]["status"] == "completed"
     assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None, (
         "the recovered launching placeholder must be cleared by the copy"
     )
@@ -701,13 +735,19 @@ def test_peer_copy_replay_after_pop_is_a_noop(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("peer_output", "copy_count"), [("the peer answer", 1), ("routine update\n[quiet]\n\n", 0)]
+)
+@pytest.mark.parametrize(
     "mother_status", ["completed", "cancelled", "failed", "stopped", "killed"]
 )
 async def test_undrained_delivered_mother_result_stamps_result_item_label(
     _clean_subagent_registry: None,
     mother_status: str,
+    peer_output: str,
+    copy_count: int,
 ) -> None:
-    """A peer copy on an undrained delivered mother result stamps the restart label."""
+    """A settled peer turn on an undrained delivered mother result stamps the restart label."""
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     app, server_client = _peer_app([])
     entry = subagent_work.register_subagent_work(
         parent_session_id=PARENT_SESSION_ID,
@@ -722,7 +762,7 @@ async def test_undrained_delivered_mother_result_stamps_result_item_label(
     async with _runner_client(app) as client:
         resp = await _post_status(
             client,
-            {"status": "completed", "output": "the peer answer", "peer_turn": _peer_turn()},
+            {"status": "completed", "output": peer_output, "peer_turn": _peer_turn()},
         )
         for _ in range(200):
             if server_client.patches:
@@ -745,6 +785,12 @@ async def test_undrained_delivered_mother_result_stamps_result_item_label(
             },
         )
     ], "an undrained delivered mother result must stamp the result-item label"
+
+    copies, dropped = subagent_work.pop_peer_copies(PARENT_SESSION_ID)
+    assert dropped == 0
+    assert len(copies) == copy_count
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
+    assert _wake_posts(server_client) == []
 
 
 @pytest.mark.asyncio
