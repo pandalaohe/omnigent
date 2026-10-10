@@ -3051,9 +3051,8 @@ function ConversationList({
   );
   const recentQuery = useRecentSessions(recentSection?.count ?? 5, recentSection !== null);
   const recentUnavailable = recentQuery.error instanceof RecentSessionsUnavailableError;
-  // Replace each recent row with the freshest copy the sidebar already holds
-  // (pinned / folder / flat), so live status updates apply; a session the
-  // sidebar doesn't hold renders from the query row.
+  // Loaded list rows carry optimistic changes. Retained folder snapshots can
+  // outlive their mounted section, so they must not override live Recent rows.
   const recentRows = useMemo(() => {
     const rows = recentQuery.data ?? [];
     if (rows.length === 0) return rows;
@@ -3063,9 +3062,6 @@ function ConversationList({
     for (const group of sections.projectGroups) {
       for (const c of group.conversations) byId.set(c.id, c);
     }
-    for (const list of folderConversations.values()) {
-      for (const c of list) byId.set(c.id, c);
-    }
     return rows
       .filter((row) => !hidePinnedHomeCopies || !pinnedSet.has(row.id))
       .map((row) => byId.get(row.id) ?? row);
@@ -3074,7 +3070,6 @@ function ConversationList({
     sections.pinned,
     sections.projectGroups,
     loadedSections.sessions,
-    folderConversations,
     pinnedSet,
     hidePinnedHomeCopies,
   ]);

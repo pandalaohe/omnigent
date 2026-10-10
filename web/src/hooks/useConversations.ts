@@ -1261,6 +1261,8 @@ function snapshotArchiveLists(queryClient: QueryClient): ArchiveListsSnapshot {
 function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSnapshot): void {
   for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
+  // Recent may have refetched while the optimistic archive hid its row.
+  void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
 }
 
 /**
