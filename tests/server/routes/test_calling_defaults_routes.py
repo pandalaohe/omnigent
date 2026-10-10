@@ -261,7 +261,17 @@ async def test_resolve_reads_the_master_table_through_the_agents_harness(
     stores.cache.upsert(
         HOST_A,
         harness,
-        [{"id": "gpt-6-sol", "supportedReasoningEfforts": ["high"]}],
+        [
+            {
+                "id": "gpt-6-sol",
+                "supportedReasoningEfforts": ["high"],
+                **(
+                    {"serviceTiers": [{"id": "priority", "name": "Fast"}]}
+                    if harness == "codex"
+                    else {}
+                ),
+            }
+        ],
         10,
     )
 

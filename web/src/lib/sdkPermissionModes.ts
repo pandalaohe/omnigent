@@ -2,29 +2,17 @@ import {
   CLAUDE_NATIVE_PERMISSION_MODES,
   type ClaudePermissionModeOption,
 } from "@/lib/claudePermissionMode";
-import {
-  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
-  type CodexRuntimeApprovalPreset,
-} from "@/lib/codexApprovalMode";
+import { CODEX_APPROVAL_PRESETS } from "@/lib/codexApprovalMode";
 import { isSdkHarnessSession } from "@/lib/sessionCapabilities";
 
 const CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_sdk.permission_mode";
 const CODEX_SDK_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_sdk.approval_mode";
 
-const CODEX_SDK_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[] = [
-  ...CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
-  {
-    value: "read-only",
-    label: "Read Only",
-    description: "Read workspace files, with approval required for edits or internet access",
-  },
-];
-
 export function sdkPermissionOptions(
   harness: string | null | undefined,
 ): readonly ClaudePermissionModeOption[] | null {
   if (harness === "claude-sdk") return CLAUDE_NATIVE_PERMISSION_MODES;
-  if (harness === "codex") return CODEX_SDK_APPROVAL_PRESETS;
+  if (harness === "codex") return CODEX_APPROVAL_PRESETS;
   return null;
 }
 

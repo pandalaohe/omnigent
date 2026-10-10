@@ -12766,6 +12766,133 @@ async def test_patch_collaboration_mode_persists_label_and_forwards_event(
     assert mode_events[0]["mode"] == "plan"
 
 
+@pytest.mark.parametrize("runner_status", [200, 503])
+async def test_patch_codex_speed_commits_only_after_runner_accepts(
+    client: httpx.AsyncClient, runner_status: int
+) -> None:
+    forwarded: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(runner_status, json={"speed_tier": "ultrafast"})
+
+    async with _runtime_runner(handler):
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+        )
+        changed = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"speed_tier": "ultrafast"}
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+
+    assert forwarded == [{"type": "speed_tier_change", "speed_tier": "ultrafast"}]
+    assert changed.status_code == (200 if runner_status == 200 else 503), changed.text
+    if runner_status == 200:
+        assert snapshot["labels"]["omnigent.speed_tier"] == "ultrafast"
+    else:
+        assert "omnigent.speed_tier" not in snapshot["labels"]
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "claude-native", "cursor-native"])
+async def test_patch_live_speed_rejects_unsupported_harness_without_changing_label(
+    client: httpx.AsyncClient, harness: str
+) -> None:
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    initial_labels = None if harness == "cursor-native" else {"omnigent.speed_tier": "standard"}
+    session = await _create_session(client, agent["id"], labels=initial_labels)
+    response = await client.patch(f"/v1/sessions/{session['id']}", json={"speed_tier": "fast"})
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+
+    assert response.status_code == 400, response.text
+    assert "live speed changes require a Codex session" in response.text
+    if harness == "cursor-native":
+        assert "omnigent.speed_tier" not in snapshot["labels"]
+    else:
+        assert snapshot["labels"]["omnigent.speed_tier"] == "standard"
+
+
+async def test_session_model_refresh_is_single_fresh_read_and_preserves_old_rows(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    fail = False
+    row = {
+        "id": "gpt-6-sol",
+        "isDefault": True,
+        "serviceTiers": [{"id": "priority", "name": "Fast"}],
+        "source": {"kind": "subscription", "label": "Subscription"},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "GET":
+            return httpx.Response(204)
+        calls.append(str(request.url))
+        return httpx.Response(503 if fail else 200, json={"models": [row]})
+
+    async with _runtime_runner(handler) as runner:
+
+        async def bound_runner(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+            return runner
+
+        monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", bound_runner)
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+        )
+        path = f"/v1/sessions/{session['id']}/model-options"
+        first = await client.get(f"{path}?refresh=auto")
+        from omnigent.server.routes._sessions.common import _model_options_cache
+
+        assert _model_options_cache.get(session["id"]) is not None
+        probes_after_first = sum(url.endswith("/model-options") for url in calls)
+        second = await client.get(f"{path}?refresh=auto")
+        assert first.status_code == second.status_code == 200
+        assert first.json()["models"][0]["serviceTiers"] == row["serviceTiers"]
+        assert first.json()["models"][0]["source"] == row["source"]
+        assert sum(url.endswith("/model-options") for url in calls) == probes_after_first
+        fail = True
+        forced = await client.get(f"{path}?refresh=force")
+        cached = await client.get(path)
+
+    assert forced.status_code == 502
+    assert cached.status_code == 200
+    assert cached.json()["models"] == first.json()["models"]
+
+
+async def test_native_terminal_speed_notification_updates_session_label(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+    )
+    event = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_speed_tier_change", "data": {"speed_tier": "ultrafast"}},
+    )
+    assert event.status_code == 202, event.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["labels"]["omnigent.speed_tier"] == "ultrafast"
+    assert any(
+        payload["type"] == "session.speed_tier" and payload["speed_tier"] == "ultrafast"
+        for _, payload in published
+    )
+
+
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
 async def test_patch_collaboration_mode_requires_live_runner_before_persisting(
     client: httpx.AsyncClient,

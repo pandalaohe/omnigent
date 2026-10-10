@@ -6,6 +6,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerHarnessTrigger,
   ComposerPermissionPicker,
+  ComposerSpeedPicker,
 } from "./ComposerControls";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
@@ -13,6 +14,55 @@ import {
 } from "./ChatComposer";
 
 describe("shared composer controls", () => {
+  it("keeps one gauge icon across Standard and advertised tiers", () => {
+    const onSelect = vi.fn();
+    render(
+      <ComposerSpeedPicker
+        value="ultrafast"
+        options={[
+          { value: "standard", label: "Standard" },
+          { value: "fast", label: "Fast" },
+          { value: "ultrafast", label: "Ultrafast" },
+        ]}
+        onSelect={onSelect}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Speed: Ultrafast" });
+    expect(trigger.querySelector("svg.lucide-gauge")).toBeInTheDocument();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    for (const tier of ["standard", "fast", "ultrafast"]) {
+      expect(
+        screen.getByTestId(`composer-speed-option-${tier}`).querySelector("svg.lucide-gauge"),
+      ).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByTestId("composer-speed-option-standard"));
+    expect(onSelect).toHaveBeenCalledWith("standard");
+  });
+
+  it("explains why a running Codex session cannot switch into Read Only", () => {
+    const onSelect = vi.fn();
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Ask for approval"
+        selectedValue="ask-for-approval"
+        options={[
+          { value: "ask-for-approval", label: "Ask for approval" },
+          { value: "read-only", label: "Read Only" },
+        ]}
+        disabledOptions={["read-only"]}
+        onSelect={onSelect}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Permission mode: Ask for approval" }), {
+      key: "ArrowDown",
+    });
+    const readOnly = screen.getByTestId("composer-permission-option-read-only");
+    expect(readOnly).toHaveAttribute("data-disabled");
+    expect(readOnly).toHaveTextContent("Start a new session");
+    fireEvent.click(readOnly);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
   it("uses the same workspace header and host geometry in either context", () => {
     render(
       <>

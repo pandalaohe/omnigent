@@ -30,6 +30,7 @@ import {
   SquareTerminalIcon,
   MessagesSquareIcon,
   UsersIcon,
+  RefreshCwIcon,
   XIcon,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -54,6 +55,7 @@ import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
   ComposerPermissionPicker,
+  ComposerSpeedPicker,
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
@@ -101,7 +103,13 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { createSideChat, retrySession } from "@/lib/sessionsApi";
+import {
+  createSideChat,
+  refreshSessionModelOptions,
+  retrySession,
+  updateSession,
+} from "@/lib/sessionsApi";
+import { defaultSpeedForModel, reconcileSpeed, speedOptionsForModel } from "@/lib/speedTiers";
 import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
@@ -113,6 +121,7 @@ import {
   isTempConvId,
   type PendingInitialPrompt,
   useChatStore,
+  chatQueryClient,
 } from "@/store/chatStore";
 import {
   claudeNativeSubagentLabel,
@@ -3109,6 +3118,36 @@ function ComposerImpl(
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
+  const speedHarness = sessionHarness === "codex" || sessionHarness === "codex-native";
+  const sessionModel = useChatStore((s) => s.sessionModelOverride);
+  const sessionDefaultModel = useChatStore((s) => s.llmModel);
+  const speedOptions = speedHarness
+    ? speedOptionsForModel(codexModelOptions, sessionModel || sessionDefaultModel)
+    : [];
+  const currentSpeed = speedHarness
+    ? (reconcileSpeed(
+        composerSession?.labels?.["omnigent.speed_tier"],
+        codexModelOptions,
+        sessionModel || sessionDefaultModel,
+      ) ?? defaultSpeedForModel(codexModelOptions, sessionModel || sessionDefaultModel))
+    : "standard";
+  const changeSpeed = async (speed: string) => {
+    if (!composerSessionId || isReadOnly || unreachable || configBusyRef.current) return;
+    configBusyRef.current = true;
+    setConfigBusy(true);
+    try {
+      const updated = await updateSession(composerSessionId, { speedTier: speed });
+      if (useChatStore.getState().conversationId === composerSessionId) {
+        chatQueryClient()?.setQueryData(["session", composerSessionId], updated);
+      }
+    } catch (error) {
+      if (useChatStore.getState().conversationId === composerSessionId)
+        setCommandError(error instanceof Error ? error.message : "Unable to change speed");
+    } finally {
+      configBusyRef.current = false;
+      setConfigBusy(false);
+    }
+  };
 
   // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
@@ -4709,6 +4748,9 @@ function ComposerImpl(
                     showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
                   }
                   options={permissionOptions}
+                  disabledOptions={
+                    showCodexApprovalMode && sessionHarness === "codex-native" ? ["read-only"] : []
+                  }
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}
                 />
@@ -4748,6 +4790,19 @@ function ComposerImpl(
                   openNonce={pickerOpenNonce}
                 />
               </div>
+              {speedHarness &&
+                !multiMemberSession &&
+                !(
+                  costRoutingEligible && useChatStore.getState().costControlModeOverride === "on"
+                ) && (
+                  <ComposerSpeedPicker
+                    value={currentSpeed}
+                    options={speedOptions}
+                    onSelect={(speed) => void changeSpeed(speed)}
+                    disabled={isReadOnly || unreachable || configBusy || !composerSessionId}
+                    testIdPrefix="composer"
+                  />
+                )}
               <ComposerMicButton
                 className="size-8 md:size-7"
                 enableHotkey
@@ -5430,8 +5485,47 @@ function SessionHarnessPicker({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const refreshRequestId = useRef(0);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
+  const refreshModels = async (mode: "auto" | "force") => {
+    if (!conversationId || conversationId.startsWith("temp:") || refreshBusy) return;
+    const sourceSessionId = conversationId;
+    const requestId = ++refreshRequestId.current;
+    setRefreshBusy(true);
+    setRefreshError(null);
+    try {
+      const models = await refreshSessionModelOptions(sourceSessionId, mode);
+      if (
+        useChatStore.getState().conversationId !== sourceSessionId ||
+        refreshRequestId.current !== requestId
+      )
+        return;
+      useChatStore.setState({ codexModelOptions: models });
+      chatQueryClient()?.setQueryData<Session>(["session", sourceSessionId], (session) =>
+        session ? { ...session, codexModelOptions: models } : session,
+      );
+    } catch (error) {
+      if (
+        useChatStore.getState().conversationId === sourceSessionId &&
+        refreshRequestId.current === requestId
+      )
+        setRefreshError(error instanceof Error ? error.message : "Model refresh failed");
+    } finally {
+      if (
+        useChatStore.getState().conversationId === sourceSessionId &&
+        refreshRequestId.current === requestId
+      )
+        setRefreshBusy(false);
+    }
+  };
+  useEffect(() => {
+    refreshRequestId.current += 1;
+    setRefreshBusy(false);
+    setRefreshError(null);
+  }, [conversationId]);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
@@ -5517,6 +5611,18 @@ function SessionHarnessPicker({
     }
   }, [openNonce, disabled, configurable, membersMenu]);
   useEffect(() => {
+    if (
+      configOpen &&
+      !membersMenu &&
+      showModels &&
+      !inferenceConfigured &&
+      modelPickerKind !== "configured"
+    )
+      void refreshModels("auto");
+    // Only opening this model menu starts an automatic probe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [configOpen, conversationId]);
+  useEffect(() => {
     setMenuOpen(false);
     setConfigOpen(false);
   }, [conversationId]);
@@ -5598,12 +5704,36 @@ function SessionHarnessPicker({
             ? {
                 testId: "composer-agent-models",
                 header: "Models",
-                leading:
-                  (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
-                    <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
-                      {inferenceError ?? "No usable models are available for this session."}
+                leading: (
+                  <div className="flex items-center justify-between gap-2 px-2 py-1 text-xs text-muted-foreground">
+                    <div>
+                      {(inferenceError || modelOptions.length === 0) && (
+                        <span role="status">
+                          {inferenceError ?? "No usable models are available for this session."}
+                        </span>
+                      )}
+                      {refreshError && <div role="alert">{refreshError}</div>}
                     </div>
-                  ) : undefined,
+                    {!inferenceConfigured && modelPickerKind !== "configured" && (
+                      <button
+                        type="button"
+                        aria-label="Refresh models"
+                        title="Refresh models"
+                        data-testid="composer-model-refresh"
+                        disabled={refreshBusy || busy || disabled || !conversationId}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void refreshModels("force");
+                        }}
+                        className="rounded p-1 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"
+                      >
+                        <RefreshCwIcon
+                          className={`size-3.5 ${refreshBusy ? "animate-spin" : ""}`}
+                        />
+                      </button>
+                    )}
+                  </div>
+                ),
                 choices: [
                   ...(supportsModelReset &&
                   !inferenceConfigured &&

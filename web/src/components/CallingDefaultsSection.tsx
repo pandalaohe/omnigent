@@ -9,6 +9,7 @@ import { PlusIcon, Trash2Icon } from "lucide-react";
 import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -321,6 +322,12 @@ function HostDefaultsTable({
     if (reconciled !== (entry.effort ?? null)) {
       setCallingDefaultField(hostId, harness, "effort", reconciled);
     }
+    if (entry.speed && (harness === "codex" || harness === "codex-native")) {
+      const reconciledSpeed = reconcileSpeed(entry.speed, rows, next);
+      if (reconciledSpeed !== entry.speed) {
+        setCallingDefaultField(hostId, harness, "speed", reconciledSpeed);
+      }
+    }
   };
 
   const renderEntryControls = (harness: string, entry: CallingDefaultEntry) => [
@@ -349,6 +356,8 @@ function HostDefaultsTable({
         harness={harness}
         field={field}
         value={entry[field]}
+        models={catalogFor(catalogs, hostId, harness)?.models ?? []}
+        model={entry.model}
         label={`${field === "speed" ? "Speed" : "Permission"} for ${callingHarnessLabel(harness)}`}
         testId={`calling-defaults-${field}-${harness}`}
         onChange={(next) => setCallingDefaultField(hostId, harness, field, next)}

@@ -23,6 +23,7 @@ async def request_host_model_options(
     host_conn: HostConnection,
     harness: str,
     timeout_s: float,
+    refresh: str | None = None,
 ) -> dict[str, Any]:
     """
     Send a ``host.model_options`` frame and await the host's result.
@@ -40,7 +41,9 @@ async def request_host_model_options(
     request_id = secrets.token_hex(8)
     future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
     host_conn.pending_model_options[request_id] = future
-    frame = encode_host_frame(HostModelOptionsFrame(request_id=request_id, harness=harness))
+    frame = encode_host_frame(
+        HostModelOptionsFrame(request_id=request_id, harness=harness, refresh=refresh)
+    )
     try:
         host_registry.send_text(host_conn, frame)
         return await asyncio.wait_for(future, timeout=timeout_s)

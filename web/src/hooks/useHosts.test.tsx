@@ -9,6 +9,7 @@ import {
   useDetectedCredentials,
   useCodexRateLimits,
   useHostModelOptions,
+  refreshHostModelOptions,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
@@ -49,6 +50,33 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+describe("host catalog refresh", () => {
+  it("sends auto and force to the same endpoint and keeps cached rows after a failed probe", async () => {
+    const client = new QueryClient();
+    const key = ["host-model-options", "host_1", "codex-native"];
+    const first = [
+      { id: "gpt-a", isDefault: true, serviceTiers: [{ id: "priority", name: "Fast" }] },
+    ];
+    client.setQueryData(key, [{ id: "old" }]);
+    fetchMock.mockResolvedValueOnce(mockResponse({ models: first }));
+    await expect(
+      refreshHostModelOptions(client, "host_1", "codex-native", "auto"),
+    ).resolves.toEqual(first);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/hosts/host_1/harnesses/codex-native/model-options?refresh=auto",
+    );
+    expect(client.getQueryData(key)).toEqual(first);
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: "probe failed" }, 503));
+    await expect(
+      refreshHostModelOptions(client, "host_1", "codex-native", "force"),
+    ).rejects.toThrow("probe failed");
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/v1/hosts/host_1/harnesses/codex-native/model-options?refresh=force",
+    );
+    expect(client.getQueryData(key)).toEqual(first);
+  });
 });
 
 describe("useHosts", () => {

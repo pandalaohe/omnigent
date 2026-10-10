@@ -5153,7 +5153,7 @@ describe("NewChatLandingScreen", () => {
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
     expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "Models unavailable",
+      "Default",
     );
     expect(picker).toHaveAccessibleName("Claude Code, Model Default");
 
@@ -5174,10 +5174,42 @@ describe("NewChatLandingScreen", () => {
     selectAgent("a2");
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(picker).toHaveAccessibleName("Codex, Model Default");
+    expect(picker).toHaveAccessibleName("Codex, Model unavailable");
     expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
       "Models unavailable",
     );
+  });
+
+  it("keeps an unmarked Codex catalog available and exposes that model's efforts", () => {
+    mockModelQueries((harness) =>
+      harness === "codex-native"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            data: [
+              {
+                id: "hidden-default",
+                displayName: "GPT example",
+                isDefault: false,
+                supportedReasoningEfforts: [
+                  { reasoningEffort: "low" },
+                  { reasoningEffort: "high" },
+                ],
+              },
+            ],
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    selectAgent("a2");
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model Default");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Default",
+    );
+    openAgentModels("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-hidden-default"));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-low")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toBeInTheDocument();
   });
 
   it("names the Pi default model in the harness trigger from the host catalog", () => {
@@ -6342,7 +6374,13 @@ describe("NewChatLandingScreen", () => {
       within(menu)
         .getAllByRole("menuitemradio")
         .map((item) => item.textContent),
-    ).toEqual(["Default", "Full access", "Read only", "Bypass approvals & sandbox"]);
+    ).toEqual([
+      "Ask for approval",
+      "Approve for me",
+      "Full Access",
+      "Read Only",
+      "Bypass approvals & sandbox",
+    ]);
   });
 
   it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
@@ -6631,9 +6669,9 @@ describe("NewChatLandingScreen", () => {
   });
 
   it.each([
-    ["default", "Default"],
-    ["full-access", "Full access"],
-    ["read-only", "Read only"],
+    ["ask-for-approval", "Ask for approval"],
+    ["full-access", "Full Access"],
+    ["read-only", "Read Only"],
     ["bypass", "Bypass approvals & sandbox"],
   ])("remembers Codex %s across harness switches and fresh visits", (mode, label) => {
     renderLanding();
@@ -6687,13 +6725,24 @@ describe("NewChatLandingScreen", () => {
   });
 
   it.each([
-    ["default", "Default", undefined],
+    [
+      "ask-for-approval",
+      "Ask for approval",
+      [
+        "--ask-for-approval",
+        "on-request",
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        'approvals_reviewer="user"',
+      ],
+    ],
     [
       "full-access",
-      "Full access",
+      "Full Access",
       ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
     ],
-    ["read-only", "Read only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
+    ["read-only", "Read Only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
   ] as const)("clears bypass when the hand dropdown selects %s", async (mode, label, args) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
@@ -9354,9 +9403,7 @@ describe("NewChatLandingScreen agent picker + Edit settings", () => {
   it("summarizes the current settings across the integrated controls", () => {
     renderLanding();
     pickPermissionOption("plan");
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "Models unavailable",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("Default");
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
   });
 

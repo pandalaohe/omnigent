@@ -93,6 +93,7 @@ class ScheduledTask:
     explicit_null_fields: list[str] | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    speed: str | None = None
     permission_mode: str | None = None
     max_cost_usd: float | None = None
     workspace: str | None = None

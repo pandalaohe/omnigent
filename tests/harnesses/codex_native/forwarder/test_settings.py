@@ -367,6 +367,23 @@ def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None
     assert state.collaboration_mode == "plan"
 
 
+@pytest.mark.asyncio
+async def test_thread_settings_service_tier_mirrors_terminal_change() -> None:
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.note_thread_settings_updated({"threadSettings": {"serviceTier": "ultrafast"}})
+
+    await fwd._sync_service_tier_change(client, session_id="conv_x", forwarder_state=state)
+    await fwd._sync_service_tier_change(client, session_id="conv_x", forwarder_state=state)
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_speed_tier_change", "data": {"speed_tier": "ultrafast"}},
+        )
+    ]
+
+
 def test_thread_settings_updated_records_approval_preset() -> None:
     """
     ``thread/settings/updated`` resolves the live ``/permissions`` preset.

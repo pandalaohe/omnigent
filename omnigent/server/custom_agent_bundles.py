@@ -38,6 +38,11 @@ def project_members(spec: AgentSpec) -> list[dict[str, Any]]:
             "harness": member.executor.harness_kind,
             "model": member.executor.model,
             "reasoning_effort": member.executor.reasoning_effort,
+            **(
+                {"speed": member.executor.config["service_tier"]}
+                if member.executor.config.get("service_tier") is not None
+                else {}
+            ),
             "lead": index == 0,
         }
         for index, member in enumerate((spec, *ordered))
@@ -170,6 +175,12 @@ def _apply_member(data: dict[str, Any], member: dict[str, Any]) -> None:
     _mutable_mapping(executor, "config")["harness"] = member["harness"]
     for key in ("model", "reasoning_effort"):
         _set_or_remove(executor, key, member.get(key))
+    from omnigent.session_default_modes import valid_speed_tier
+
+    speed = member.get("speed")
+    if speed is not None and not valid_speed_tier(speed, member["harness"]):
+        raise OmnigentError("invalid member speed", code=ErrorCode.INVALID_INPUT)
+    _set_or_remove(_mutable_mapping(executor, "config"), "service_tier", speed)
     # The parser lifts llm.model / llm.reasoning_effort into a bare executor
     # when the executor keys are absent, so a removed value must go from both.
     llm = data.get("llm")

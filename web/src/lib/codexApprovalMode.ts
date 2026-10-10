@@ -19,7 +19,7 @@ export const CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.appro
  * The three runtime approval stances the picker can switch into, in Codex's
  * `/permissions` popup order.
  */
-export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[] = [
+export const CODEX_APPROVAL_PRESETS: readonly CodexRuntimeApprovalPreset[] = [
   {
     value: "ask-for-approval",
     label: "Ask for approval",
@@ -35,17 +35,23 @@ export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[]
     label: "Full Access",
     description: "Edit any file and access the internet without approval",
   },
+  {
+    value: "read-only",
+    label: "Read Only",
+    description: "Read workspace files, with approval required for edits or internet access",
+  },
 ];
+
+/** Runtime picker uses the same list; the UI disables Read Only transitions. */
+export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS = CODEX_APPROVAL_PRESETS;
 
 // A session launched read-only still reports it as its live mode, so it keeps
 // a label even though the picker can't switch into it.
-const CODEX_NATIVE_READ_ONLY_LABEL = "Read Only";
 
 /** Human label for an approval-mode value, falling back to the raw value. */
 export function codexApprovalModeLabel(mode: string | null | undefined): string {
   if (!mode) return "";
-  if (mode === "read-only") return CODEX_NATIVE_READ_ONLY_LABEL;
-  return CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.find((m) => m.value === mode)?.label ?? mode;
+  return CODEX_APPROVAL_PRESETS.find((m) => m.value === mode)?.label ?? mode;
 }
 
 /**

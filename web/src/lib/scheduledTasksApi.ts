@@ -45,6 +45,7 @@ export interface ScheduledTask {
   updatedAt: number;
   modelOverride: string | null;
   reasoningEffort: string | null;
+  speed?: string | null;
   /**
    * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
    * to use the agent's configured default. The server derives the runner's
@@ -105,6 +106,7 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
+  speed?: string | null;
   /** Native-harness permission mode (Claude Code); omit for the agent default. */
   permissionMode?: string | null;
   /** Optional pinned workspace; only valid together with `hostId`. */
@@ -140,6 +142,7 @@ export interface UpdateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
+  speed?: string | null;
   permissionMode?: string | null;
   workspace?: string;
   hostId?: string;
@@ -166,6 +169,7 @@ interface ScheduledTaskWire {
   updated_at: number;
   model_override: string | null;
   reasoning_effort: string | null;
+  speed?: string | null;
   permission_mode: string | null;
   workspace: string | null;
   host_id: string | null;
@@ -243,6 +247,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     updatedAt: wire.updated_at,
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
+    speed: wire.speed ?? null,
     permissionMode: wire.permission_mode,
     workspace: wire.workspace,
     hostId: wire.host_id,
@@ -305,6 +310,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
+  if (input.speed != null) body.speed = input.speed;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
@@ -335,6 +341,7 @@ export async function updateScheduledTask(
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
+  if (input.speed !== undefined) body.speed = input.speed;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;

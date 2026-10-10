@@ -8,13 +8,12 @@ import {
 } from "@/lib/codexApprovalMode";
 
 describe("codexApprovalMode", () => {
-  it("offers only the stances a running session can switch into, in popup order", () => {
-    // Read Only and the full-bypass sandbox stance are launch-only, so the
-    // runtime picker doesn't offer them.
+  it("uses all four presets in popup order; the runtime UI disables Read Only transitions", () => {
     expect(CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((m) => m.value)).toEqual([
       "ask-for-approval",
       "approve-for-me",
       "full-access",
+      "read-only",
     ]);
   });
 

@@ -413,9 +413,17 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
             "omnigent.codex_sdk.approval_mode",
             "codex_approval_mode_change",
         ),
+        (
+            "codex",
+            "speed_tier",
+            "fast",
+            "ultrafast",
+            "omnigent.speed_tier",
+            "speed_tier_change",
+        ),
     ],
 )
-async def test_sdk_permission_snapshot_and_event_reach_next_turn(
+async def test_sdk_mode_snapshot_and_event_reach_next_turn(
     harness: str,
     field: str,
     initial: str,
@@ -481,8 +489,11 @@ async def test_sdk_permission_snapshot_and_event_reach_next_turn(
                     break
                 await asyncio.sleep(0.02)
             assert len(harness_client.posted_bodies) >= index
-            assert harness_client.posted_bodies[index - 1][field] == value
-            assert harness_client.posted_bodies[index - 1]["service_tier"] == "fast"
+            if field == "speed_tier":
+                assert harness_client.posted_bodies[index - 1]["service_tier"] == value
+            else:
+                assert harness_client.posted_bodies[index - 1][field] == value
+                assert harness_client.posted_bodies[index - 1]["service_tier"] == "fast"
 
 
 @pytest.mark.asyncio

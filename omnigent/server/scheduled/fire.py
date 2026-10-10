@@ -83,6 +83,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_uploaded_bundle_host_workspace,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.session_default_modes import CODEX_NATIVE_PERMISSION_DEFAULT_ARGS
 
 _logger = logging.getLogger(__name__)
 
@@ -761,7 +762,7 @@ async def _permission_mode_harness(deps: FireDeps, task: ScheduledTask) -> str |
     This guarantee holds regardless of whether the create/update/fire capability
     gates ran, so a mis-stamped row cannot break a fire or apply a wrong SDK mode.
     """
-    if task.permission_mode is None:
+    if task.permission_mode is None and task.speed is None:
         return None
     if deps.agent_cache is None:
         return None
@@ -903,6 +904,7 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
             workspace=task.workspace,
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
+            speed=task.speed,
             permission_mode=task.permission_mode,
         ),
         project_config=project.config if project is not None else None,
@@ -975,12 +977,15 @@ async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> Schedule
         "agent_id": task.agent_id,
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
+        "speed": task.speed,
     }
     explicit_fields: set[str] = {"agent_id"}
     if task.model_override is not None:
         explicit_fields.add("model_override")
     if task.reasoning_effort is not None:
         explicit_fields.add("reasoning_effort")
+    if task.speed is not None:
+        explicit_fields.add("speed")
     explicit_fields.update(task.explicit_null_fields or ())
     resolution = await resolve_create_calling_stores(
         user_id=task.user_id,
@@ -995,7 +1000,12 @@ async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> Schedule
         preferences_store=deps.preferences_store,
         catalog_store=deps.catalog_store,
     )
-    return replace(task, model_override=resolution.model, reasoning_effort=resolution.effort)
+    return replace(
+        task,
+        model_override=resolution.model,
+        reasoning_effort=resolution.effort,
+        speed=resolution.speed,
+    )
 
 
 async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -1034,11 +1044,15 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         return await _create_library_agent_session(deps, task)
     harness = await _permission_mode_harness(deps, task)
     permission_mode = task.permission_mode
-    launch_args = (
-        ["--permission-mode", permission_mode]
-        if harness == "claude-native" and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
-        else None
-    )
+    launch_args: list[str] | None = None
+    if (
+        harness == "claude-native"
+        and permission_mode is not None
+        and permission_mode in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES
+    ):
+        launch_args = ["--permission-mode", permission_mode]
+    elif harness == "codex-native" and permission_mode in CODEX_NATIVE_PERMISSION_DEFAULT_ARGS:
+        launch_args = list(CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[permission_mode])
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
@@ -1065,6 +1079,10 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # the override reload above) so the labels land on the conversation returned
     # to the launch/dispatch caller, not a stale pre-label reload of it.
     labels = await _presentation_labels(deps, task)
+    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
+
+    if task.speed is not None and valid_speed_tier(task.speed, harness):
+        labels[SPEED_TIER_LABEL_KEY] = task.speed
     if (
         harness == "claude-sdk"
         and permission_mode is not None

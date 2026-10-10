@@ -573,9 +573,8 @@ function ForkRunConfig({
             <DescribedSelect
               value={mode}
               onValueChange={changeMode}
-              // Codex offers the DANGEROUS full-bypass as a 4th option, exactly
-              // as the new-session dialog does; other approval harnesses list
-              // only the three presets. Selecting it arms bypass on the fork
+              // Codex offers the DANGEROUS full-bypass after the four presets,
+              // exactly as the new-session dialog does. Selecting it arms bypass on the fork
               // (a fresh, deliberate opt-in — the source's is always dropped).
               options={
                 isCodex

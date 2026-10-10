@@ -1258,6 +1258,159 @@ async def test_explicit_permission_and_speed_win_over_defaults(
     assert body["terminal_launch_args"] == explicit.get("terminal_launch_args")
 
 
+async def test_explicit_speed_skips_catalog_check_for_inherited_fast(
+    calling_app: FastAPI,
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+) -> None:
+    """An explicit Standard speed must not be refused as inherited Fast."""
+    calling_app.state.host_model_catalog_cache_store.upsert(
+        HDS, "codex", [{"id": "gpt-6-sol", "isDefault": True}], 1700000000
+    )
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {"codex": {"model": "gpt-6-sol", "speed": "fast"}},
+                }
+            }
+        },
+    )
+    base = {"project_id": project_id, "host_id": HDS, "workspace": "/opt/work/project"}
+    inherited = await calling_client.post("/v1/sessions", json=base, headers=_headers())
+    assert inherited.status_code == 400, inherited.text
+    explicit = await calling_client.post(
+        "/v1/sessions",
+        json={**base, "labels": {"omnigent.speed_tier": "standard"}},
+        headers=_headers(),
+    )
+    assert explicit.status_code == 201, explicit.text
+    assert explicit.json()["labels"]["omnigent.speed_tier"] == "standard"
+
+
+@pytest.mark.parametrize(
+    ("harness", "explicit_speed", "expected_speed"),
+    [
+        ("codex", None, "fast"),
+        ("codex-native", None, "fast"),
+        ("codex", "standard", "standard"),
+        ("codex-native", "standard", "standard"),
+    ],
+)
+async def test_bundled_session_uses_saved_or_explicit_speed(
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    harness: str,
+    explicit_speed: str | None,
+    expected_speed: str,
+) -> None:
+    """Saved speed reaches the runner unless metadata explicitly overrides it."""
+    from omnigent.server.routes import _session_create_validation
+
+    async def echo_workspace(**kwargs: object) -> str:
+        return str(kwargs["workspace"])
+
+    monkeypatch.setattr(
+        _session_create_validation, "validate_uploaded_bundle_host_workspace", echo_workspace
+    )
+    metadata: dict[str, object] = {"host_id": HDS, "workspace": "/opt/work/project"}
+    if explicit_speed is not None:
+        metadata["labels"] = {"omnigent.speed_tier": explicit_speed}
+    response = await calling_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    name="saved-speed",
+                    executor={
+                        "type": "omnigent",
+                        "config": {"harness": harness, "service_tier": "fast"},
+                    },
+                ),
+                "application/gzip",
+            )
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    session = await calling_client.get(
+        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
+    )
+    assert session.status_code == 200, session.text
+    assert session.json()["labels"]["omnigent.speed_tier"] == expected_speed
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        response.json()["session_id"]
+    )
+    assert conversation is not None
+    payload = build_runner_session_init_payload(conversation, server_version="test")
+    assert payload["session_init"]["snapshot"]["labels"]["omnigent.speed_tier"] == expected_speed
+
+
+async def test_bundled_saved_speed_precedes_inherited_catalog_check(
+    calling_app: FastAPI,
+    calling_client: httpx.AsyncClient,
+    calling_seams: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _session_create_validation
+
+    async def echo_workspace(**kwargs: object) -> str:
+        return str(kwargs["workspace"])
+
+    monkeypatch.setattr(
+        _session_create_validation, "validate_uploaded_bundle_host_workspace", echo_workspace
+    )
+    calling_app.state.host_model_catalog_cache_store.upsert(
+        HDS, "codex", [{"id": "gpt-6-sol", "isDefault": True}], 1700000000
+    )
+    project_id = await _project(
+        calling_client,
+        {
+            "calling_defaults": {
+                HDS: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {"codex": {"model": "gpt-6-sol", "speed": "fast"}},
+                }
+            }
+        },
+    )
+    response = await calling_client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {"project_id": project_id, "host_id": HDS, "workspace": "/opt/work/project"}
+            )
+        },
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    name="saved-standard-speed",
+                    executor={
+                        "type": "omnigent",
+                        "config": {"harness": "codex", "service_tier": "standard"},
+                    },
+                ),
+                "application/gzip",
+            )
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    session = await calling_client.get(
+        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
+    )
+    assert session.json()["labels"]["omnigent.speed_tier"] == "standard"
+
+
 @pytest.mark.parametrize(
     "harness,args",
     [

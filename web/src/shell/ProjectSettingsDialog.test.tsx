@@ -1347,6 +1347,13 @@ describe("ProjectSettingsDialog", () => {
   });
 
   it("saves speed and permission in the selected and other harness rows", async () => {
+    const codexRows = [
+      catalogRow("h1", "codex", [
+        { id: "gpt-a", isDefault: true, serviceTiers: [{ id: "priority", name: "Fast" }] },
+      ]),
+    ];
+    listCatalogsMock.mockResolvedValue(codexRows);
+    syncCatalogsMock.mockResolvedValue(codexRows);
     availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/project")]);
     getProjectMock.mockResolvedValue({
@@ -1370,7 +1377,7 @@ describe("ProjectSettingsDialog", () => {
       "Standard",
     );
     expect(screen.getByTestId("project-settings-host-permission-h1")).toHaveTextContent(
-      "Read only",
+      "Read Only",
     );
     await pickOption("project-settings-host-speed-h1", "Fast");
     await pickOption("project-settings-host-permission-h1", "Approve for me");
@@ -1424,7 +1431,13 @@ describe("ProjectSettingsDialog", () => {
       },
     });
     const catalogRows = [
-      catalogRow("h1", "codex", [{ id: "gpt-6-sol", displayName: "GPT-6-Sol" }]),
+      catalogRow("h1", "codex", [
+        {
+          id: "gpt-6-sol",
+          displayName: "GPT-6-Sol",
+          serviceTiers: [{ id: "priority", name: "Fast" }],
+        },
+      ]),
     ];
     listCatalogsMock.mockResolvedValue(catalogRows);
     // The dialog's open-time full sync replaces the listed rows, so it must

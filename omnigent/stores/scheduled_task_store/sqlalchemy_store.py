@@ -105,6 +105,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         explicit_null_fields=_decode_explicit_null_fields(row.explicit_null_fields),
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
+        speed=row.speed,
         permission_mode=row.permission_mode,
         max_cost_usd=row.max_cost_usd,
         workspace=row.workspace,
@@ -188,6 +189,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         explicit_null_fields: list[str] | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        speed: str | None = None,
         permission_mode: str | None = None,
         max_cost_usd: float | None = None,
         workspace: str | None = None,
@@ -215,6 +217,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 explicit_null_fields=_encode_explicit_null_fields(explicit_null_fields),
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
+                speed=speed,
                 permission_mode=permission_mode,
                 max_cost_usd=max_cost_usd,
                 workspace=workspace,
@@ -325,6 +328,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         explicit_null_fields: builtins.list[str] | None = _UNSET,
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
+        speed: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = _UNSET,
@@ -391,6 +395,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if reasoning_effort is not _UNSET and row.reasoning_effort != reasoning_effort:
                 row.reasoning_effort = reasoning_effort
+                changed = True
+            if speed is not _UNSET and row.speed != speed:
+                row.speed = speed
                 changed = True
             if permission_mode is not _UNSET and row.permission_mode != permission_mode:
                 row.permission_mode = permission_mode

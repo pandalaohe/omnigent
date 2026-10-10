@@ -33,6 +33,7 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
     Agent,
@@ -145,6 +146,7 @@ from omnigent.server.routes._sessions.common import (
     _SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,
     _logger,
     _managed_launch_tasks,
+    _model_options_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -170,6 +172,7 @@ from omnigent.server.routes._sessions.helpers import (
     _LiveSettingsChange,
     _member_hosts_from_library_agent,
     _member_snapshot_labels,
+    _model_options_from_wire,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
     _note_settings_write,
@@ -184,8 +187,10 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_child_status_to_parent,
     _publish_codex_approval_mode,
     _publish_collaboration_mode,
+    _publish_model_options,
     _publish_permission_mode,
     _publish_sandbox_status,
+    _publish_speed_tier,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
@@ -257,6 +262,7 @@ from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_HEADER,
     admit_open,
 )
+from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -478,6 +484,105 @@ def register_core_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the core session routes on router."""
+
+    model_refresh_at: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
+    model_refresh_inflight: WorkspaceScopedCache[str, asyncio.Task[list[dict[str, Any]]]] = (
+        WorkspaceScopedCache()
+    )
+
+    @router.get("/sessions/{session_id}/model-options")
+    async def refresh_session_model_options(
+        request: Request,
+        session_id: str,
+        refresh: Literal["auto", "force"] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        cached = _model_options_cache.get(session_id)
+        if refresh is None or (
+            refresh == "auto"
+            and cached is not None
+            and time.monotonic() - model_refresh_at.get(session_id, 0) <= 300
+        ):
+            return {"models": cached or []}
+
+        async def probe() -> list[dict[str, Any]]:
+            wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            if wrapper is not None:
+                from omnigent.server.routes._sessions.common import (
+                    _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
+                )
+
+                legacy_endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper)
+                if legacy_endpoint is None:
+                    raise HTTPException(status_code=409, detail="session catalog is push-owned")
+                client = await _get_runner_client(session_id, runner_router)
+                if client is None:
+                    raise HTTPException(status_code=503, detail="session runner unavailable")
+                try:
+                    response = await client.get(
+                        f"/v1/sessions/{session_id}/model-options", timeout=10.0
+                    )
+                    if response.status_code == 404:
+                        response = await client.get(
+                            f"/v1/sessions/{session_id}/{legacy_endpoint}", timeout=10.0
+                        )
+                    response.raise_for_status()
+                    rows = response.json().get("models")
+                except (httpx.HTTPError, ValueError, AttributeError) as exc:
+                    raise HTTPException(
+                        status_code=502, detail="session model refresh failed"
+                    ) from exc
+            else:
+                from omnigent.harness_aliases import canonicalize_harness
+                from omnigent.server.routes._sessions.common import get_server_host_registry
+                from omnigent.server.routes.hosts import _proxy_model_options
+
+                harness = canonicalize_harness(
+                    _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+                )
+                registry = get_server_host_registry()
+                connection = registry.get(conv.host_id) if registry and conv.host_id else None
+                if registry is None or connection is None or harness is None:
+                    raise HTTPException(status_code=503, detail="session host unavailable")
+                result = await _proxy_model_options(
+                    host_registry=registry,
+                    host_conn=connection,
+                    harness=harness,
+                    refresh=refresh,
+                )
+                if result.get("status") != "ok":
+                    raise HTTPException(status_code=502, detail="session model refresh failed")
+                rows = result.get("models")
+            try:
+                options = _model_options_from_wire(rows)
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(
+                    status_code=502, detail="invalid session model catalog"
+                ) from exc
+            if not options and cached:
+                raise HTTPException(status_code=502, detail="empty session model catalog")
+            _model_options_cache[session_id] = options
+            model_refresh_at[session_id] = time.monotonic()
+            _publish_model_options(session_id)
+            return options
+
+        task = model_refresh_inflight.get(session_id)
+        if task is None or task.done():
+            task = asyncio.create_task(probe())
+            model_refresh_inflight[session_id] = task
+
+            def clear_finished(finished: asyncio.Task[list[dict[str, Any]]]) -> None:
+                if model_refresh_inflight.get(session_id) is finished:
+                    model_refresh_inflight.pop(session_id, None)
+
+            task.add_done_callback(clear_finished)
+        return {"models": await asyncio.shield(task)}
 
     async def _schedule_managed_launch(
         request: Request,
@@ -1180,6 +1285,22 @@ def register_core_routes(
         )
 
         request_fields_set = parsed_metadata.model_fields_set
+        bundle_bytes = await bundle.read()
+        # The lead Agent's saved speed is an explicit launch value. Seed it
+        # before resolving project defaults so an inherited tier cannot be
+        # rejected against the catalog or overwrite the saved spec.
+        spec = await asyncio.to_thread(
+            validate_agent_bundle,
+            bundle_bytes,
+            enforce_handler_allowlist=not local_single_user_enabled(),
+        )
+        spec_speed = spec.executor.config.get("service_tier")
+        if SPEED_TIER_LABEL_KEY not in parsed_metadata.labels and valid_speed_tier(
+            spec_speed, spec.executor.harness_kind
+        ):
+            parsed_metadata = parsed_metadata.model_copy(
+                update={"labels": {**parsed_metadata.labels, SPEED_TIER_LABEL_KEY: spec_speed}}
+            )
         project_resolution = await resolve_project_session_create(
             body=parsed_metadata,
             user_id=user_id,
@@ -1229,17 +1350,6 @@ def register_core_routes(
             user_id=user_id,
             parent_session_id=parsed_metadata.parent_session_id,
             sub_agent_name=None,
-        )
-
-        bundle_bytes = await bundle.read()
-        # Validate the bundle BEFORE any row exists: the external-host
-        # branch below needs the spec's os_env.cwd for workspace
-        # validation, and _create_session_from_bundle reuses the parsed
-        # spec so the tarball isn't extracted twice.
-        spec = await asyncio.to_thread(
-            validate_agent_bundle,
-            bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
         # Caller-supplied external host: validate the workspace against
@@ -3143,7 +3253,10 @@ def register_core_routes(
         """
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
-        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
+        if (
+            not body.silent
+            and {"reasoning_effort", "model_override", "speed_tier"} & body.model_fields_set
+        ):
             live_change = _live_settings_change(session_id)
             async with live_change.lock:
                 return await _update_session(request, session_id, body, include_usage, live_change)
@@ -3356,6 +3469,28 @@ def register_core_routes(
                 )
             requested_codex_approval_mode = body.approval_mode
         labels_to_set = dict(body.labels or {})
+        requested_speed: str | None = None
+        if "speed_tier" in body.model_fields_set:
+            speed_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if speed_conv is None:
+                raise _session_not_found()
+            speed_harness = (
+                "codex-native"
+                if speed_conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+                else _resolve_harness(speed_conv, agent_store=agent_store, agent_cache=agent_cache)
+            )
+            if speed_harness not in {"codex", "codex-native"}:
+                raise OmnigentError(
+                    "live speed changes require a Codex session",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if not valid_speed_tier(body.speed_tier, speed_harness):
+                raise OmnigentError(
+                    "speed_tier is unsupported for this session harness",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_speed = body.speed_tier
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -3430,6 +3565,60 @@ def register_core_routes(
                     None if clear_model else model_override,
                     agent_store,
                 )
+
+        if model_override is not None or requested_speed is not None:
+            tier_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if tier_conv is None:
+                raise _session_not_found()
+            selected_model = (
+                (None if clear_model else model_override)
+                if model_override is not None
+                else tier_conv.model_override
+            )
+            rows = _model_options_cache.get(session_id) or []
+            selected_row = next(
+                (
+                    row
+                    for row in rows
+                    if selected_model is not None
+                    and (row.get("id") == selected_model or row.get("model") == selected_model)
+                ),
+                None,
+            )
+            if selected_row is None and selected_model is None:
+                selected_row = next((row for row in rows if row.get("isDefault") is True), None)
+            if selected_row is not None and (
+                tier_conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+                or _resolve_harness(tier_conv, agent_store=agent_store, agent_cache=agent_cache)
+                == "codex"
+            ):
+                tiers = selected_row.get("serviceTiers")
+                offered = {"standard", "default"}
+                if isinstance(tiers, list):
+                    offered.update(
+                        tier["id"]
+                        for tier in tiers
+                        if isinstance(tier, dict) and isinstance(tier.get("id"), str)
+                    )
+                default_tier = selected_row.get("defaultServiceTier")
+                if isinstance(default_tier, str) and valid_speed_tier(default_tier, "codex"):
+                    offered.add(default_tier)
+                if "priority" in offered:
+                    offered.add("fast")
+                if requested_speed is not None and requested_speed not in offered:
+                    raise OmnigentError(
+                        "speed_tier is not offered by the selected model",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                previous_speed = tier_conv.labels.get(SPEED_TIER_LABEL_KEY)
+                if (
+                    requested_speed is None
+                    and model_override is not None
+                    and previous_speed is not None
+                    and previous_speed not in offered
+                ):
+                    requested_speed = "standard"
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
@@ -4138,6 +4327,19 @@ def register_core_routes(
                 )
         if requested_codex_approval_mode is not None and sdk_approval_mode and live_forward:
             labels_to_set[CODEX_SDK_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+        if requested_speed is not None:
+            _speed_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {"type": "speed_tier_change", "speed_tier": requested_speed},
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+            )
+            if _speed_result is None or not (200 <= _speed_result.status_code < 300):
+                raise OmnigentError(
+                    "speed tier was not applied by the runner; try again",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            labels_to_set[SPEED_TIER_LABEL_KEY] = requested_speed
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before
@@ -4157,6 +4359,8 @@ def register_core_routes(
             await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if SPEED_TIER_LABEL_KEY in labels_to_set:
+            _publish_speed_tier(session_id, labels_to_set[SPEED_TIER_LABEL_KEY])
         # Only when the switch was forwarded: a silent PATCH writes no label,
         # and an unconfirmed mode must not reach the picker.
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:

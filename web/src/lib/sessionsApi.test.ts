@@ -20,6 +20,7 @@ import {
   fetchSessionItemsPage,
   fetchSessionItemsWindow,
   forkSession,
+  refreshSessionModelOptions,
   getSession,
   getSessionSlim,
   getSessionUsage,
@@ -834,6 +835,34 @@ describe("runner binding", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ reasoning_effort: "high" });
+  });
+
+  it("PATCHes the selected speed tier and preserves the confirmed label", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        labels: { "omnigent.speed_tier": "ultrafast" },
+      }),
+    );
+    const session = await updateSession("conv_abc", { speedTier: "ultrafast" });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ speed_tier: "ultrafast" });
+    expect(session.labels?.["omnigent.speed_tier"]).toBe("ultrafast");
+  });
+
+  it("refreshes the session-owned catalog with force and surfaces probe failure", async () => {
+    const models = [{ id: "gpt-a", serviceTiers: [{ id: "priority", name: "Fast" }] }];
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ models }));
+    await expect(refreshSessionModelOptions("conv_abc", "force")).resolves.toEqual(models);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc/model-options?refresh=force");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ error: { message: "probe failed" } }, { ok: false, status: 503 }),
+    );
+    await expect(refreshSessionModelOptions("conv_abc", "auto")).rejects.toThrow("probe failed");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/conv_abc/model-options?refresh=auto");
   });
 
   it("PATCHes model_override as snake_case", async () => {

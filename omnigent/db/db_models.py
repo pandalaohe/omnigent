@@ -1948,6 +1948,7 @@ class SqlScheduledTask(OmnigentBase):
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    speed: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Per-task permission mode for native coding harnesses that carry one
     # (Claude Code). The fire path converts it to the runner's
     # ``--permission-mode`` launch arg. NULL = use the agent default.

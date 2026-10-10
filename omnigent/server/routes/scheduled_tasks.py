@@ -46,6 +46,7 @@ from omnigent.server.routes._session_create_validation import (
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.session_default_modes import valid_speed_tier
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
@@ -81,6 +82,7 @@ class CreateScheduledTaskRequest(BaseModel):
     source_session_id: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    speed: str | None = None
     # Harness permission mode (Claude Code or SDK), e.g. "acceptEdits" or
     # "read-only". The fire path derives the runner's --permission-mode launch
     # arg for Claude Code or stamps a matching SDK permission label from it.
@@ -128,6 +130,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     project_id: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    speed: str | None = None
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
     workspace: str | None = Field(default=None, min_length=1)
@@ -189,6 +192,7 @@ def _to_response(
         "created_at": task.created_at,
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
+        "speed": task.speed,
         "permission_mode": task.permission_mode,
         "max_cost_usd": task.max_cost_usd,
         "workspace": task.workspace,
@@ -338,6 +342,23 @@ def create_scheduled_tasks_router(
                 agent_cache=agent_cache,
             )
 
+    async def _gate_speed(agent: Any | None, library_spec: Any | None, speed: str | None) -> None:
+        if speed is None:
+            return
+        if library_spec is not None:
+            harness = library_agent_lead_harness(library_spec)
+        elif agent is not None and agent_cache is not None and agent.bundle_location:
+            loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+            harness = loaded.spec.executor.harness_kind
+        else:
+            raise OmnigentError(
+                "speed requires a resolved agent harness", code=ErrorCode.INVALID_INPUT
+            )
+        if not valid_speed_tier(speed, harness):
+            raise OmnigentError(
+                "unsupported speed for agent harness", code=ErrorCode.INVALID_INPUT
+            )
+
     async def _validate_launch_inputs(
         request: Request,
         *,
@@ -347,6 +368,7 @@ def create_scheduled_tasks_router(
         workspace: str | None,
         model_override: str | None,
         reasoning_effort: str | None,
+        speed: str | None,
         permission_mode: str | None,
         execution_target: str = "connected_host",
     ) -> tuple[Agent | None, str | None, str | None, str | None]:
@@ -377,6 +399,7 @@ def create_scheduled_tasks_router(
         # A mode on the wrong harness could break a native fire (unknown
         # --permission-mode flag) or select an invalid SDK permission preset.
         await _gate_permission_mode(agent, library_spec, permission_mode)
+        await _gate_speed(agent, library_spec, speed)
         if execution_target == "managed_sandbox":
             if library_spec is not None:
                 raise OmnigentError(
@@ -524,6 +547,7 @@ def create_scheduled_tasks_router(
             workspace=body.workspace,
             model_override=body.model_override,
             reasoning_effort=body.reasoning_effort,
+            speed=body.speed,
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
@@ -531,7 +555,7 @@ def create_scheduled_tasks_router(
         # not refill it from the project / master chain.
         explicit_null_fields = sorted(
             name
-            for name in ("model_override", "reasoning_effort")
+            for name in ("model_override", "reasoning_effort", "speed")
             if name in body.model_fields_set and getattr(body, name) is None
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
@@ -549,6 +573,7 @@ def create_scheduled_tasks_router(
                 explicit_null_fields=explicit_null_fields or None,
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
+                speed=body.speed,
                 permission_mode=permission_mode,
                 max_cost_usd=body.max_cost_usd,
                 workspace=workspace,
@@ -731,7 +756,7 @@ def create_scheduled_tasks_router(
         # "Default" (inherit the project / master defaults at fire). Fields the
         # caller did not send keep their state.
         explicit_nulls = set(existing.explicit_null_fields or ())
-        for field_name in ("model_override", "reasoning_effort"):
+        for field_name in ("model_override", "reasoning_effort", "speed"):
             if field_name in body.model_fields_set:
                 explicit_nulls.discard(field_name)
         fields["explicit_null_fields"] = sorted(explicit_nulls) or None
@@ -743,7 +768,7 @@ def create_scheduled_tasks_router(
             # it: a model id and permission vocabulary are harness-bound.
             # Clear whichever the caller did not resend so a switched task never
             # fires the new harness with the old one's flags.
-            for stale in ("model_override", "reasoning_effort", "permission_mode"):
+            for stale in ("model_override", "reasoning_effort", "speed", "permission_mode"):
                 fields.setdefault(stale, None)
         if {"model_override", "reasoning_effort"}.intersection(fields):
             model_override, reasoning_effort = validate_session_model_metadata(
@@ -762,6 +787,9 @@ def create_scheduled_tasks_router(
             if new_mode is not None:
                 agent, library_spec = await _resolve_launch_agent(owner, target_agent_id)
                 await _gate_permission_mode(agent, library_spec, new_mode)
+        if "speed" in fields and fields["speed"] is not None:
+            agent, library_spec = await _resolve_launch_agent(owner, target_agent_id)
+            await _gate_speed(agent, library_spec, fields["speed"])
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
         # Reject pinning a host/workspace on a managed-sandbox task rather than
@@ -793,6 +821,7 @@ def create_scheduled_tasks_router(
                 ),
                 model_override=fields.get("model_override", existing.model_override),
                 reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
+                speed=fields.get("speed", existing.speed),
                 permission_mode=None,
                 execution_target=target_execution,
             )

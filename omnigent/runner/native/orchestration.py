@@ -1383,7 +1383,7 @@ async def _codex_native_launch_config(
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
-    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, SPEED_TIER_VALUES
+    from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
 
     bypass_sandbox = False
     service_tier = None
@@ -1398,7 +1398,7 @@ async def _codex_native_launch_config(
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
         speed = labels.get(SPEED_TIER_LABEL_KEY)
-        if isinstance(speed, str) and speed in SPEED_TIER_VALUES:
+        if valid_speed_tier(speed, "codex-native"):
             service_tier = speed
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.

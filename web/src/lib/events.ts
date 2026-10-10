@@ -676,6 +676,13 @@ export interface SessionCodexApprovalModeEvent {
   approvalMode: string;
 }
 
+/** Confirmed speed for the next turn, including native TUI changes while idle. */
+export interface SessionSpeedTierEvent {
+  type: "session_speed_tier";
+  conversationId: string;
+  speedTier: string;
+}
+
 /**
  * `session.agent_changed`: the session's bound agent changed (e.g. its
  * MCP servers were edited).
@@ -1060,6 +1067,7 @@ export type StreamEvent =
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
+  | SessionSpeedTierEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

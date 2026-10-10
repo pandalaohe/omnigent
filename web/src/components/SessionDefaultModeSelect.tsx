@@ -9,6 +9,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import type { NativeModelOption } from "@/lib/types";
+
+const EMPTY_MODELS: readonly NativeModelOption[] = [];
 
 export function SessionDefaultModeSelect({
   harness,
@@ -17,6 +20,8 @@ export function SessionDefaultModeSelect({
   label,
   testId,
   disabled,
+  models = EMPTY_MODELS,
+  model = null,
   onOpenChange,
   onChange,
 }: {
@@ -26,14 +31,18 @@ export function SessionDefaultModeSelect({
   label: string;
   testId: string;
   disabled?: boolean;
+  models?: readonly NativeModelOption[];
+  model?: string | null;
   onOpenChange?: (open: boolean) => void;
   onChange: (value: string | null) => void;
 }) {
-  const options = sessionDefaultModeOptions(harness, field);
+  const options = sessionDefaultModeOptions(harness, field, models, model);
   if (options.length === 0) return null;
+  const selected = value === "priority" ? "fast" : value;
+  const available = selected == null || options.some((option) => option.value === selected);
   const select = (
     <Select
-      value={value ?? "__default__"}
+      value={selected ?? "__default__"}
       disabled={disabled}
       onOpenChange={onOpenChange}
       onValueChange={(next) => {
@@ -45,6 +54,11 @@ export function SessionDefaultModeSelect({
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
         <SelectItem value="__default__">Default</SelectItem>
+        {!available && selected && (
+          <SelectItem value={selected} disabled>
+            Unavailable ({value})
+          </SelectItem>
+        )}
         {options.map((option) => (
           <SelectItem key={option.value} value={option.value}>
             {option.label}

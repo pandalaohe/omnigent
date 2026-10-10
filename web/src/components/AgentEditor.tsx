@@ -65,6 +65,7 @@ interface MemberDraft {
   harness: string;
   model: string | null;
   effort: string | null;
+  speed: string | null;
   /** The member's saved host; null = the session's selected host. */
   hostId: string | null;
   /** Loaded from the saved roster: the server keys its config dir by this name. */
@@ -79,6 +80,7 @@ function draftFromMember(member: CustomAgentMember, key: number): MemberDraft {
     harness: member.harness,
     model: member.model,
     effort: member.reasoning_effort,
+    speed: member.speed ?? null,
     hostId: member.host_id ?? null,
     saved: true,
   };
@@ -96,6 +98,7 @@ function initialMembers(detail: CustomAgentDetail): MemberDraft[] {
       harness: detail.harness ?? DEFAULT_HARNESS,
       model: detail.model,
       effort: null,
+      speed: null,
       hostId: null,
       saved: true,
     },
@@ -114,6 +117,7 @@ function memberPayload(
     harness: member.harness,
     model: member.model,
     reasoning_effort: member.effort,
+    ...(member.speed ? { speed: member.speed } : {}),
     lead: index === 0,
     host_id: member.hostId,
   }));
@@ -134,6 +138,7 @@ function rosterSignature(members: MemberDraft[]): string {
       harness: member.harness,
       model: member.model,
       effort: member.effort,
+      speed: member.speed,
       hostId: member.hostId,
     })),
   );
@@ -329,6 +334,7 @@ export function AgentEditor({
         harness: lead.harness,
         model: null,
         effort: null,
+        speed: null,
         hostId: null,
         saved: false,
       },
@@ -440,6 +446,7 @@ export function AgentEditor({
                     harness={member.harness}
                     model={member.model}
                     effort={member.effort}
+                    speed={member.speed}
                     harnessOptions={leadHarnessOptions}
                     hostId={member.hostId}
                     sessionHostId={sessionHostId}
@@ -481,6 +488,7 @@ export function AgentEditor({
                       harness={member.harness}
                       model={member.model}
                       effort={member.effort}
+                      speed={member.speed}
                       harnessOptions={memberHarnessOptions}
                       hostId={member.hostId}
                       sessionHostId={sessionHostId}

@@ -12,6 +12,7 @@ export interface CustomAgentMember {
   harness: string;
   model: string | null;
   reasoning_effort: string | null;
+  speed?: string | null;
   lead: boolean;
   /** Saved host for this member; absent/null = the session's picked host. */
   host_id?: string | null;
@@ -91,6 +92,7 @@ export function customAgentForPicker(agent: CustomAgent): AvailableAgent {
     description: agent.description,
     harness: agent.harness,
     skills: [],
+    members: agent.members,
     builtin: false,
     created_at: agent.created_at,
   };

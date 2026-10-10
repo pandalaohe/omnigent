@@ -450,9 +450,11 @@ export function useNewChatHostId(): string | null {
 async function fetchHostModelOptions(
   hostId: string,
   harness: string,
+  refresh?: "auto" | "force",
 ): Promise<NativeModelOption[]> {
+  const suffix = refresh ? `?refresh=${refresh}` : "";
   const res = await authenticatedFetch(
-    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options${suffix}`,
   );
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
@@ -467,7 +469,19 @@ async function fetchHostModelOptions(
   const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
   const models = body.models ?? [];
   // Backward compatibility with servers that encoded probe failure in a 200.
-  if (models.length === 0 && body.error) throw new Error(body.error);
+  if (body.error) throw new Error(body.error);
+  return models;
+}
+
+/** Refresh a catalog while retaining the last usable rows if the probe fails. */
+export async function refreshHostModelOptions(
+  queryClient: QueryClient,
+  hostId: string,
+  harness: string,
+  mode: "auto" | "force",
+): Promise<NativeModelOption[]> {
+  const models = await fetchHostModelOptions(hostId, harness, mode);
+  queryClient.setQueryData(["host-model-options", hostId, harness], models);
   return models;
 }
 

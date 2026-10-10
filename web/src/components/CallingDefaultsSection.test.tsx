@@ -46,6 +46,11 @@ const CATALOG_ROWS = [
       {
         id: "gpt-6-astra",
         displayName: "GPT-6-Astra",
+        isDefault: true,
+        serviceTiers: [
+          { id: "priority", name: "Fast" },
+          { id: "ultrafast", name: "Ultrafast" },
+        ],
         supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }],
       },
     ],

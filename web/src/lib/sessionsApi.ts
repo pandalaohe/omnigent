@@ -1151,6 +1151,8 @@ export async function updateSession(
      * `"read-only"`, applied from the next turn.
      */
     codexApprovalMode?: string;
+    /** Service tier for the next turn; legacy fast maps to provider priority. */
+    speedTier?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
     /**
@@ -1179,6 +1181,9 @@ export async function updateSession(
   if (updates.codexApprovalMode !== undefined) {
     body.approval_mode = updates.codexApprovalMode;
   }
+  if (updates.speedTier !== undefined) {
+    body.speed_tier = updates.speedTier;
+  }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
   }
@@ -1205,6 +1210,19 @@ export async function updateSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/** Ask the session's own runner for its model catalog, preserving provenance. */
+export async function refreshSessionModelOptions(
+  sessionId: string,
+  mode: "auto" | "force",
+): Promise<NativeModelOption[]> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/model-options?refresh=${mode}`,
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const body = (await res.json()) as { models?: NativeModelOption[] };
+  return body.models ?? [];
 }
 
 interface RunnerSummaryWire {

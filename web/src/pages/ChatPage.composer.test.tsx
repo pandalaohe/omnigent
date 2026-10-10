@@ -27,6 +27,7 @@ import {
 import { setOmnigentHostConfig } from "@/lib/host";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import * as sessionsApi from "@/lib/sessionsApi";
 import {
   getSessionModelLabelCacheKey,
   readSessionModelLabelCache,
@@ -280,6 +281,75 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("running Codex speed and catalog refresh", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    composerSessionSnapshot.labels = {};
+  });
+
+  it("submits an advertised speed and retains the confirmed pick after a rejected PATCH", async () => {
+    useChatStore.setState({
+      conversationId: "conv_speed",
+      sessionHarness: "codex-native",
+      sessionModelOverride: null,
+      llmModel: "gpt-a",
+    });
+    composerSessionSnapshot.labels = { "omnigent.speed_tier": "fast" };
+    const patch = vi
+      .spyOn(sessionsApi, "updateSession")
+      .mockRejectedValue(new Error("tier rejected"));
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: [
+            {
+              id: "gpt-a",
+              isDefault: true,
+              serviceTiers: [
+                { id: "priority", name: "Fast" },
+                { id: "ultrafast", name: "Ultrafast" },
+              ],
+            },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByTestId("composer-speed-trigger")).toHaveTextContent("Fast");
+    fireEvent.keyDown(screen.getByTestId("composer-speed-trigger"), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-speed-option-ultrafast"));
+    await waitFor(() =>
+      expect(patch).toHaveBeenCalledWith("conv_speed", { speedTier: "ultrafast" }),
+    );
+    expect(screen.getByTestId("composer-speed-trigger")).toHaveTextContent("Fast");
+  });
+
+  it("refreshes the session-owned catalog on model menu open and reports force failure without dropping rows", async () => {
+    useChatStore.setState({ conversationId: "conv_refresh", sessionHarness: "codex-native" });
+    const refresh = vi
+      .spyOn(sessionsApi, "refreshSessionModelOptions")
+      .mockResolvedValueOnce([{ id: "gpt-a", isDefault: true }])
+      .mockRejectedValueOnce(new Error("probe failed"));
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: [{ id: "gpt-a", isDefault: true }],
+        })}
+      />,
+    );
+    await openSessionModels();
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith("conv_refresh", "auto"));
+    fireEvent.click(screen.getByTestId("composer-model-refresh"));
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith("conv_refresh", "force"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("probe failed");
+    expect(screen.getByTestId("composer-agent-model-gpt-a")).toBeInTheDocument();
+  });
+});
 
 function tooltipKeys(tooltip: HTMLElement): string[] {
   return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
@@ -2797,10 +2867,11 @@ describe("Composer shared visible controls", () => {
     await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
   });
 
-  it("doesn't offer Read Only as a codex runtime switch", () => {
+  it("shows Read Only with guidance while disabling the unsupported runtime transition", () => {
     useChatStore.setState({
       conversationId: "codex-no-read-only",
       codexApprovalMode: "read-only",
+      sessionHarness: "codex-native",
     });
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     const chip = screen.getByTestId("composer-permission-chip");
@@ -2808,7 +2879,9 @@ describe("Composer shared visible controls", () => {
     expect(chip).toHaveTextContent("Read Only");
     fireEvent.keyDown(chip, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
-    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
+    const readOnly = screen.getByTestId("composer-permission-option-read-only");
+    expect(readOnly).toHaveAttribute("data-disabled");
+    expect(readOnly).toHaveTextContent("Start a new session");
   });
 });
 

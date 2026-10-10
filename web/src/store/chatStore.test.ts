@@ -8374,6 +8374,33 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.speed_tier", () => {
+    it("updates only the named session snapshot and canonicalizes priority to fast", () => {
+      client.setQueryData(["session", "conv_speed"], {
+        labels: { "omnigent.speed_tier": "standard" },
+      });
+      client.setQueryData(["session", "conv_other"], {
+        labels: { "omnigent.speed_tier": "ultrafast" },
+      });
+      useChatStore.setState({ conversationId: "conv_other" });
+      handleSessionEvent({
+        type: "session_speed_tier",
+        conversationId: "conv_speed",
+        speedTier: "priority",
+      });
+      expect(
+        client.getQueryData<{ labels: Record<string, string> }>(["session", "conv_speed"])?.labels[
+          "omnigent.speed_tier"
+        ],
+      ).toBe("fast");
+      expect(
+        client.getQueryData<{ labels: Record<string, string> }>(["session", "conv_other"])?.labels[
+          "omnigent.speed_tier"
+        ],
+      ).toBe("ultrafast");
+    });
+  });
+
   describe("session.input.consumed", () => {
     it.each([false, true])(
       "does not consume an unsent model-switch draft (already mirrored=%s)",

@@ -1938,6 +1938,9 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     expect(body.agent_id).toBe(AG_CLAUDE);
     expect(body.model_override).toBe("sonnet");
     expect(body.reasoning_effort).toBe("low");
-    expect(vi.mocked(resolveCallingDefaults)).not.toHaveBeenCalled();
+    expect(vi.mocked(resolveCallingDefaults)).toHaveBeenCalledWith({
+      projectId: "",
+      hostId: HDS,
+    });
   });
 });

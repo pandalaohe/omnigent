@@ -427,9 +427,8 @@ from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.session_default_modes import (
     CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
     PERMISSION_DEFAULT_VALUES,
-    SPEED_TIER_HARNESSES,
     SPEED_TIER_LABEL_KEY,
-    SPEED_TIER_VALUES,
+    valid_speed_tier,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -12605,8 +12604,9 @@ async def _create_session_from_existing_agent(
     own_spec: AgentSpec | None = None
     needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
+    needs_speed_from_spec = sub_spec is None and SPEED_TIER_LABEL_KEY not in (body.labels or {})
     if (
-        (needs_launch_args_from_spec or needs_effort_from_spec)
+        (needs_launch_args_from_spec or needs_effort_from_spec or needs_speed_from_spec)
         and agent_cache is not None
         and agent.bundle_location is not None
     ):
@@ -12680,7 +12680,7 @@ async def _create_session_from_existing_agent(
                         ) from exc
         speed = project_resolution.speed
         if speed is not None:
-            if resolved_harness not in SPEED_TIER_HARNESSES or speed not in SPEED_TIER_VALUES:
+            if not valid_speed_tier(speed, resolved_harness):
                 _logger.warning(
                     "Ignoring unsupported speed default %r for %s", speed, resolved_harness
                 )
@@ -12695,6 +12695,13 @@ async def _create_session_from_existing_agent(
                 model_override=None,
                 reasoning_effort=spec_effort,
             )
+
+    selected_spec = sub_spec if sub_spec is not None else own_spec
+    spec_speed = selected_spec.executor.config.get("service_tier") if selected_spec else None
+    if spec_speed is not None and SPEED_TIER_LABEL_KEY not in (body.labels or {}):
+        spec_harness = selected_spec.executor.harness_kind if selected_spec else None
+        if valid_speed_tier(spec_speed, spec_harness):
+            sdk_permission_labels[SPEED_TIER_LABEL_KEY] = spec_speed
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}

@@ -69,11 +69,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { resolveCallingDefaults } from "@/lib/callingDefaultsApi";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import type { Host } from "@/hooks/useHosts";
-import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { refreshHostModelOptions, useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useCustomAgents } from "@/lib/customAgentsApi";
@@ -170,6 +171,7 @@ vi.mock("@/hooks/useHosts", () => ({
       { id: "haiku", displayName: "Haiku" },
     ],
   })),
+  refreshHostModelOptions: vi.fn(async () => []),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
@@ -473,6 +475,16 @@ beforeEach(() => {
   pushMatchers.length = 0;
   announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(resolveCallingDefaults).mockReset().mockResolvedValue({
+    agent_id: null,
+    harness: null,
+    model: null,
+    effort: null,
+    speed: null,
+    permission: null,
+    sources: {},
+    problems: [],
+  });
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
@@ -490,6 +502,7 @@ beforeEach(() => {
     ],
     isLoading: false,
   } as unknown as ReturnType<typeof useHostModelOptions>);
+  vi.mocked(refreshHostModelOptions).mockReset().mockResolvedValue([]);
   // Seed host_1's recent so the working directory pre-fills deterministically
   // (the create body must carry SEEDED_WORKSPACE through).
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
@@ -2287,7 +2300,7 @@ describe("NewChatLandingScreen create flow", () => {
     ).toBe("full-access");
   });
 
-  it("omits terminal_launch_args when approval mode is left at default for codex-native", async () => {
+  it("launches the displayed Ask for approval preset for codex-native", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -2304,7 +2317,205 @@ describe("NewChatLandingScreen create flow", () => {
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
     expect(body.labels?.["omnigent.wrapper"]).toBe("codex-native-ui");
-    expect(body.terminal_launch_args).toBeUndefined();
+    expect(body.terminal_launch_args).toEqual([
+      "--ask-for-approval",
+      "on-request",
+      "--sandbox",
+      "workspace-write",
+      "-c",
+      'approvals_reviewer="user"',
+    ]);
+  });
+
+  it.each([false, true])(
+    "seeds untouched %s calling permission and speed defaults into the launched Codex session",
+    async (project) => {
+      if (project) {
+        searchParams = new URLSearchParams("project=Alpha");
+        projects = [{ id: "proj_alpha", name: "Alpha" }];
+        projectConfig = { host_id: "host_1", workspace: SEEDED_WORKSPACE };
+      }
+      setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+      vi.mocked(useHostModelOptions).mockReturnValue({
+        data: [
+          {
+            id: "gpt-a",
+            isDefault: true,
+            serviceTiers: [{ id: "priority", name: "Fast" }],
+          },
+        ],
+        isLoading: false,
+      } as unknown as ReturnType<typeof useHostModelOptions>);
+      vi.mocked(resolveCallingDefaults).mockResolvedValue({
+        agent_id: "ag_codex",
+        harness: "codex-native",
+        model: null,
+        effort: null,
+        speed: "fast",
+        permission: "approve-for-me",
+        sources: {},
+        problems: [],
+      });
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_codex" }),
+      } as Response);
+      renderLanding();
+      await waitForWorkspaceSeed();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent(
+          "Approve for me",
+        ),
+      );
+      expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Fast");
+      typeMessage("go");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      const body = JSON.parse(
+        (vi.mocked(authenticatedFetch).mock.calls[0][1] as RequestInit).body as string,
+      );
+      expect(body.terminal_launch_args).toEqual(["--approve-for-me"]);
+      expect(body.labels["omnigent.speed_tier"]).toBe("fast");
+    },
+  );
+
+  it("offers speed for the model inherited from the master resolve, not the host default", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "gpt-a", isDefault: true, serviceTiers: [{ id: "priority", name: "Fast" }] },
+        { id: "gpt-b", serviceTiers: [{ id: "ultrafast", name: "Ultrafast" }] },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(resolveCallingDefaults).mockResolvedValue({
+      agent_id: "ag_codex",
+      harness: "codex-native",
+      model: "gpt-b",
+      effort: null,
+      speed: "ultrafast",
+      permission: "approve-for-me",
+      sources: {},
+      problems: [],
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Ultrafast"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-speed-trigger"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-speed-option-fast")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("new-chat-speed-menu"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const body = JSON.parse(
+      (vi.mocked(authenticatedFetch).mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(body.model_override).toBe("gpt-b");
+    expect(body.labels["omnigent.speed_tier"]).toBe("ultrafast");
+  });
+
+  it("shows the host default speed without an override and sends an explicit future tier", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "gpt-a",
+          displayName: "GPT A",
+          isDefault: true,
+          defaultServiceTier: "priority",
+          serviceTiers: [
+            { id: "priority", name: "Fast" },
+            { id: "ultrafast", name: "Ultrafast" },
+          ],
+        },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Fast");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-speed-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-speed-option-ultrafast"));
+    pickPermissionOption("approve-for-me");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const body = JSON.parse(
+      (vi.mocked(authenticatedFetch).mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(body.labels["omnigent.speed_tier"]).toBe("ultrafast");
+    expect(body.terminal_launch_args).toEqual(["--approve-for-me"]);
+  });
+
+  it("leaves speed unset when the displayed host default is untouched", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "gpt-a",
+          isDefault: true,
+          defaultServiceTier: "priority",
+          serviceTiers: [{ id: "priority", name: "Fast" }],
+        },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Fast");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const body = JSON.parse(
+      (vi.mocked(authenticatedFetch).mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(body.labels).not.toHaveProperty("omnigent.speed_tier");
+  });
+
+  it("auto refreshes the model menu and retains rows after a failed manual refresh", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [{ id: "gpt-a", isDefault: true }],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_codex");
+    await waitFor(() =>
+      expect(refreshHostModelOptions).toHaveBeenCalledWith(
+        expect.anything(),
+        "host_1",
+        "codex-native",
+        "auto",
+      ),
+    );
+    vi.mocked(refreshHostModelOptions).mockRejectedValueOnce(new Error("probe failed"));
+    fireEvent.click(screen.getByTestId("new-chat-model-refresh"));
+    await waitFor(() =>
+      expect(refreshHostModelOptions).toHaveBeenCalledWith(
+        expect.anything(),
+        "host_1",
+        "codex-native",
+        "force",
+      ),
+    );
+    expect(await screen.findByText("probe failed")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-model-gpt-a")).toBeInTheDocument();
   });
 
   it("posts harness_override when a brain harness is picked from the harness menu", async () => {

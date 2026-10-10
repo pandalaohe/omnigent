@@ -151,6 +151,47 @@ afterEach(() => {
 });
 
 describe("AgentEditor", () => {
+  it("roundtrips a saved Codex member's advertised speed", async () => {
+    mocks.useHostModelOptions.mockReturnValue({
+      data: [
+        {
+          id: "gpt-a",
+          isDefault: true,
+          serviceTiers: [
+            { id: "priority", name: "Fast" },
+            { id: "ultrafast", name: "Ultrafast" },
+          ],
+        },
+      ],
+    });
+    renderEditor(crewDetail);
+    await awaitLoaded();
+    const reviewer = memberRows()[0];
+    choose(
+      within(reviewer).getByTestId("agent-member-trigger"),
+      "agent-member-speed",
+      "agent-member-speed-ultrafast",
+    );
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mocks.updateCustomAgent).toHaveBeenCalled());
+    const [, patch] = mocks.updateCustomAgent.mock.calls.at(-1) as [
+      string,
+      { members: { speed?: string }[] },
+    ];
+    expect(patch.members[1].speed).toBe("ultrafast");
+
+    cleanup();
+    renderEditor({
+      ...crewDetail,
+      members: crewDetail.members!.map((member, index) =>
+        index === 1 ? { ...member, speed: "ultrafast" } : member,
+      ),
+    });
+    await awaitLoaded();
+    expect(within(memberRows()[0]).getByTestId("agent-member-trigger")).toHaveTextContent(
+      "Ultrafast",
+    );
+  });
   it("sends an edited lead model in the roster, lead first", async () => {
     renderEditor(crewDetail);
     await awaitLoaded();

@@ -129,6 +129,14 @@ class _RecordingCodexAppServerClient:
             {"threadId": "thread_codex", "effort": "xhigh"},
         ),
         (
+            {"type": "speed_tier_change", "speed_tier": "fast"},
+            {"threadId": "thread_codex", "serviceTier": "priority"},
+        ),
+        (
+            {"type": "speed_tier_change", "speed_tier": "ultrafast"},
+            {"threadId": "thread_codex", "serviceTier": "ultrafast"},
+        ),
+        (
             {"type": "plan_mode_change", "enabled": True},
             {
                 "threadId": "thread_codex",
@@ -143,7 +151,7 @@ class _RecordingCodexAppServerClient:
             },
         ),
     ],
-    ids=["model_change", "effort_change", "plan_mode_change"],
+    ids=["model_change", "effort_change", "speed_fast", "speed_future", "plan_mode_change"],
 )
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
@@ -236,6 +244,24 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         f"codex-native {event_payload['type']} must call thread/settings/update "
         f"with next-turn settings; got {fake_client.requests!r}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-sdk", "claude-native", "cursor-native"])
+async def test_speed_tier_change_rejects_unsupported_live_harness(harness: str) -> None:
+    app, _ = await _build_app_for_spec(_harness_spec(harness, model="test-model"))
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "speed_tier_change", "speed_tier": "fast"},
+        )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "Live speed changes require a Codex session"
 
 
 @pytest.mark.asyncio

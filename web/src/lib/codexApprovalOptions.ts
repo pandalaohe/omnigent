@@ -21,8 +21,8 @@ export interface CodexApprovalOption {
 }
 
 /**
- * The Codex approval options for a CREATE-time picker: the standard presets
- * plus the bypass entry. `{ value, label }` only — the picker renders them and
+ * The Codex approval options for a CREATE-time picker: four presets plus the
+ * bypass entry. `{ value, label }` only — the picker renders them and
  * has no need for the CLI-flag `args`.
  */
 export function codexCreateApprovalOptions(): CodexApprovalOption[] {

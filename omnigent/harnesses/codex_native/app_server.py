@@ -420,11 +420,9 @@ def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -
 
 def _pin_codex_config_service_tier(codex_home: Path, speed: str) -> None:
     """Pin the session's speed before any TOML table in its private config."""
-    from omnigent.session_default_modes import SPEED_TIER_VALUES
+    from omnigent.session_default_modes import codex_service_tier
 
-    if speed not in SPEED_TIER_VALUES:
-        return
-    tier = "fast" if speed == "fast" else "default"
+    tier = codex_service_tier(speed)
     config_path = codex_home / "config.toml"
     _materialize_config_symlink(config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
@@ -1897,7 +1895,10 @@ async def _codex_launch_catalog(
 
 
 async def codex_launch_catalog(
-    *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    *,
+    codex_path: str | None = None,
+    launch: NativeCodexLaunch | None = None,
+    refresh: str | None = None,
 ) -> list[_JsonObject] | None:
     """
     The shared codex catalog for a launch shape: store, then probe.
@@ -1912,7 +1913,20 @@ async def codex_launch_catalog(
         omitted, resolve the host's default shape.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
-    return await _codex_launch_catalog(codex_path=codex_path, launch=launch, reprobe=False)
+    if refresh not in {None, "auto", "force"}:
+        raise ValueError("refresh must be auto or force")
+    if refresh == "auto":
+        from omnigent.models.model_catalog_store import catalog_age_s
+
+        shape = launch or await asyncio.to_thread(resolve_native_codex_launch, model=None)
+        age = catalog_age_s(
+            "codex-native", codex_catalog_fingerprint(shape, codex_path=codex_path)
+        )
+        launch = shape
+        refresh = "force" if age is None or age > 300 else None
+    return await _codex_launch_catalog(
+        codex_path=codex_path, launch=launch, reprobe=refresh == "force"
+    )
 
 
 async def codex_reprobed_launch_catalog(
@@ -3572,7 +3586,7 @@ def build_codex_native_server(
         the private ``config.toml`` at start (see
         :func:`_pin_codex_config_effort`), e.g. ``"ultra"``. ``None`` keeps
         the copied config's value.
-    :param service_tier: Session speed (``fast`` / ``standard``) to pin in
+    :param service_tier: Session speed alias or advertised Codex tier id to pin in
         the private config; ``None`` keeps the host default.
     :param model_catalog_rows: Fresh rows from the shared launch-shaped
         ``model/list`` catalog, used to avoid a redundant migration probe.

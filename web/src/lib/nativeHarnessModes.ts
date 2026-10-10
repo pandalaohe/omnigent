@@ -7,6 +7,7 @@
 // own configured default). Keep in sync with each CLI's `--help`.
 
 import { CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE } from "@/lib/claudePermissionMode";
+import { CODEX_APPROVAL_PRESETS } from "@/lib/codexApprovalMode";
 
 /** One selectable mode: value + label + blurb + the CLI flags it maps to. */
 export interface NativeHarnessMode {
@@ -30,6 +31,8 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
   },
   "codex-native": {
     default: "automatic",
+    "ask-for-approval": "automatic",
+    "approve-for-me": "automatic",
     "full-access": "full-access",
     "read-only": "read-only",
     bypass: "full-access",
@@ -170,32 +173,33 @@ export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
 
 // Codex approval presets matching the `/permissions` TUI popup.
 // Each preset bundles a sandbox profile + approval policy, mirroring
-// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
-// preset (workspace-write + on-request) and sends no flags so the
-// runner uses Codex's built-in default.
+// codex-rs/utils/approval-presets/src/lib.rs. Ask for approval explicitly
+// selects the user reviewer so a host config cannot silently change it.
 // Keep in sync with `codex --help` and
 // https://developers.openai.com/codex/agent-approvals-security
-export const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
-export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = [
-  {
-    value: "default",
-    label: "Default",
-    description: "Read/edit/run in workspace; approval for external edits or network",
-    args: [],
-  },
-  {
-    value: "full-access",
-    label: "Full access",
-    description: "Edit any file and access the internet without approval",
-    args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
-  },
-  {
-    value: "read-only",
-    label: "Read only",
-    description: "Read files only; approval required for edits, commands, or network",
-    args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
-  },
-];
+export const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "ask-for-approval";
+export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = CODEX_APPROVAL_PRESETS.map(
+  (preset) => ({
+    ...preset,
+    args:
+      preset.value === "ask-for-approval"
+        ? [
+            "--ask-for-approval",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
+            "-c",
+            'approvals_reviewer="user"',
+          ]
+        : preset.value === "approve-for-me"
+          ? ["--approve-for-me"]
+          : preset.value === "full-access"
+            ? ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+            : preset.value === "read-only"
+              ? ["--sandbox", "read-only", "--ask-for-approval", "on-request"]
+              : [],
+  }),
+);
 
 // Conversation-label key for the DANGEROUS codex full-bypass opt-in. When
 // set to "1" the runner launches Codex with
@@ -206,7 +210,7 @@ export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = [
 // approval-mode presets above: when bypass is on the runner strips any
 // `--sandbox` / `--ask-for-approval` flags those presets would emit.
 export const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox";
-// Bypass is the most-permissive Codex approval stance — presented as a 4th
+// Bypass is the most-permissive Codex approval stance — presented after the four
 // option in the Codex approval dropdown (Codex only; OpenCode shares the
 // presets above but has no bypass). It rides as a conversation label, not
 // terminal_launch_args, so its `args` are empty and it's handled specially.

@@ -701,6 +701,10 @@ export interface NativeModelOption {
   defaultReasoningEffort?: string;
   /** Reasoning efforts advertised for this model. */
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
+  /** Service tiers advertised by the host for this specific model. */
+  serviceTiers?: { id: string; name: string }[];
+  /** Host's effective service tier when this model is selected and no override is sent. */
+  defaultServiceTier?: string | null;
   /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
   /** Configuration that supplies this model; never includes credentials. */

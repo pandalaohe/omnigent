@@ -9,6 +9,7 @@ import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState }
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
 import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
+import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -846,9 +847,14 @@ export function ProjectSettingsDialog({
       rows.map((row) => {
         if (row.hostId !== rowHostId) return row;
         const current = row.harnesses[harness] ?? { model: null, effort: null };
+        const next = { ...current, [field]: value };
+        if (field === "model" && (harness === "codex" || harness === "codex-native")) {
+          const models = catalogFor(catalogs, rowHostId, harness)?.models ?? [];
+          if (next.speed) next.speed = reconcileSpeed(next.speed, models, value);
+        }
         return {
           ...row,
-          harnesses: { ...row.harnesses, [harness]: { ...current, [field]: value } },
+          harnesses: { ...row.harnesses, [harness]: next },
         };
       }),
     );
@@ -1269,12 +1275,14 @@ export function ProjectSettingsDialog({
           />
         </Field>
         {(["speed", "permission"] as const).map((field) =>
-          sessionDefaultModeOptions(harness, field).length > 0 ? (
+          sessionDefaultModeOptions(harness, field, models, set.model).length > 0 ? (
             <Field key={field} label={field === "speed" ? "Speed" : "Permission"}>
               <SessionDefaultModeSelect
                 harness={harness}
                 field={field}
                 value={set[field]}
+                models={models}
+                model={set.model}
                 label={field === "speed" ? "Speed" : "Permission"}
                 testId={`project-settings-host-${field}-${row.hostId}`}
                 disabled={isLoading || saving}
@@ -1370,6 +1378,8 @@ export function ProjectSettingsDialog({
                         harness={harness}
                         field={field}
                         value={set[field]}
+                        models={models}
+                        model={set.model}
                         label={field === "speed" ? "Speed" : "Permission"}
                         testId={`project-settings-host-other-${field}-${row.hostId}-${harness}`}
                         disabled={disabled}

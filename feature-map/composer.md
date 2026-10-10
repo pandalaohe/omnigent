@@ -24,8 +24,17 @@ and steers messages while the agent is busy.
   change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
+- `speed-picker`: Codex choices are Standard plus the selected model's advertised
+  service tiers. New Chat shows one Speed chip beside model/effort, with the same
+  icon for every tier. Session controls and launch presets use the same choices.
+- `catalog-refresh`: model menus offer a compact manual refresh. Opening a menu
+  checks whether its catalog is older than five minutes; a stale catalog is
+  re-probed. Cached host polling remains every 15 seconds, with the one-hour
+  background refresh and CLI/configuration fingerprint invalidation retained.
 - `permission-mode`: the harness's native approval modes; the current mode is
-  marked and the choice persists.
+  marked and the choice persists. Codex shares Ask for approval, Approve for me,
+  Full Access and Read Only across its pickers and presets. Native Read Only is
+  launch-only, so its running-session choice is disabled.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. Any file type attaches; a file over the size limit is rejected
@@ -57,6 +66,8 @@ and steers messages while the agent is busy.
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
+- In a Codex session, choose Speed for subsequent turns, or refresh the model
+  catalog from its model menu.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
@@ -78,6 +89,8 @@ and steers messages while the agent is busy.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
+- For Codex, use the Speed chip to choose a reported tier. The model menu's
+  refresh control reloads models, their effort levels and their service tiers.
 - Attach files or type `/` before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
@@ -130,6 +143,22 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`speed-picker`, Codex presets and both composers:** host/model tier choices
+  and launch payloads are covered by `web/src/lib/speedTiers.test.ts`,
+  `web/src/shell/NewChatDialog.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`,
+  `tests/server/routes/test_session_create_project_consistency.py`, and
+  `tests/runner/test_app_sessions_native_events_options.py`. Manually, open
+  a Codex model's Speed menu and expect Standard plus that host's advertised
+  tiers; changing tiers keeps the same chip icon.
+- **`catalog-refresh`, both model menus:** refresh requests, retained choices
+  and nullable catalog metadata are covered by `web/src/hooks/useHosts.test.tsx`,
+  `web/src/lib/newChatPickerCache.test.ts`,
+  `web/src/shell/NewChatDialog.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `tests/server/integration/test_sessions_endpoints.py`. Manually, use the model
+  menu's refresh control and expect fresh model, effort and speed choices;
+  a failed refresh keeps the previous catalog and reports the failure.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
@@ -175,6 +204,14 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 
 ## Gotchas
 
+- Speed choices depend on both host and model. An unset speed inherits the
+  launch preset; Standard is an explicit override. Settings calling defaults,
+  Project host rows, saved Agent members and scheduled tasks also preset speed.
+- Catalog refresh reads capabilities without starting an inference turn.
+  Refresh failure preserves the last usable choices and reports the failure.
+- A running session's configured provider can differ from the host's ambient
+  launch preview; refresh the session's catalog rather than replacing it with
+  another provider's choices.
 - The in-session and new-session composers are different surfaces. A change to
   the pill, tooltip, configuration menu, or effort picker in one does not reach
   the other. Verify both, plus the mobile layout.

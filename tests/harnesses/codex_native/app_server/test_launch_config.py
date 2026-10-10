@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -763,13 +765,24 @@ async def test_codex_native_launch_config_reads_the_auto_harness_flag(
     [("ultra", "ultra"), ("bogus", None), (None, None)],
     ids=["ultra", "unsupported", "unset"],
 )
-@pytest.mark.parametrize("speed", ["fast", "standard", "bogus", None])
+@pytest.mark.parametrize(
+    ("speed", "expected_speed"),
+    [
+        ("fast", "fast"),
+        ("standard", "standard"),
+        ("ultrafast", "ultrafast"),
+        ("future-tier", "future-tier"),
+        ("bad tier", None),
+        (None, None),
+    ],
+)
 async def test_codex_native_launch_config_reads_reasoning_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     persisted: str | None,
     expected: str | None,
     speed: str | None,
+    expected_speed: str | None,
 ) -> None:
     """The persisted effort reaches the launch; an unsupported one is dropped, not fatal."""
     import httpx
@@ -794,10 +807,12 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.reasoning_effort == expected
-    assert config.service_tier == (speed if speed in {"fast", "standard"} else None)
+    assert config.service_tier == expected_speed
 
 
-@pytest.mark.parametrize("speed,expected", [("fast", "fast"), ("standard", "default")])
+@pytest.mark.parametrize(
+    "speed,expected", [("fast", "priority"), ("standard", "default"), ("ultrafast", "ultrafast")]
+)
 @pytest.mark.parametrize(
     "original", ["", 'service_tier = "default"\n', '[profile.test]\nservice_tier = "priority"\n']
 )
@@ -841,7 +856,7 @@ def test_pin_codex_service_tier_edits_the_root_key(tmp_path: Path, original: str
     rendered = config.read_text()
     before = tomllib.loads(original)
     parsed = tomllib.loads(rendered)
-    assert parsed["service_tier"] == "fast"
+    assert parsed["service_tier"] == "priority"
     assert {key: value for key, value in parsed.items() if key != "service_tier"} == {
         key: value for key, value in before.items() if key != "service_tier"
     }
@@ -850,7 +865,7 @@ def test_pin_codex_service_tier_edits_the_root_key(tmp_path: Path, original: str
 
 
 @pytest.mark.parametrize(
-    "speed,expected", [(None, "priority"), ("fast", "fast"), ("standard", "default")]
+    "speed,expected", [(None, "priority"), ("fast", "priority"), ("standard", "default")]
 )
 async def test_start_pins_session_service_tier_only_in_private_config(
     tmp_path: Path,
@@ -871,3 +886,36 @@ async def test_start_pins_session_service_tier_only_in_private_config(
     await server.close()
     assert tomllib.loads((codex_home / "config.toml").read_text())["service_tier"] == expected
     assert (source_home / "config.toml").read_text() == original
+
+
+async def test_codex_catalog_auto_and_force_refresh_preserve_last_good_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(app_server, "codex_catalog_fingerprint", lambda *_a, **_k: "test")
+    launch = app_server.NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+    answers = [[{"id": "gpt-old"}], [{"id": "gpt-new"}], []]
+    calls: list[int] = []
+
+    async def probe(**_kwargs: object) -> list[dict[str, str]]:
+        calls.append(1)
+        return answers.pop(0)
+
+    monkeypatch.setattr(app_server, "probe_codex_model_options", probe)
+    assert await app_server.codex_launch_catalog(launch=launch) == [{"id": "gpt-old"}]
+    assert await app_server.codex_launch_catalog(launch=launch, refresh="auto") == [
+        {"id": "gpt-old"}
+    ]
+    assert calls == [1]
+    path = model_catalog_store.catalog_path("codex-native", "test")
+    old = time.time() - 301
+    os.utime(path, (old, old))
+    assert await app_server.codex_launch_catalog(launch=launch, refresh="auto") == [
+        {"id": "gpt-new"}
+    ]
+    assert await app_server.codex_launch_catalog(launch=launch, refresh="force") is None
+    assert model_catalog_store.read_catalog("codex-native", "test") == [{"id": "gpt-new"}]
+    assert calls == [1, 1, 1]
