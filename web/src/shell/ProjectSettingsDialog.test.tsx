@@ -1114,6 +1114,38 @@ describe("ProjectSettingsDialog", () => {
     expect(await screen.findByText(/default branch \(release\)/)).toBeInTheDocument();
   });
 
+  it.each(["pointer", "keyboard"] as const)(
+    "keeps the selected tab and visible panel aligned when switching to Code by %s",
+    async (input) => {
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+      renderDialog();
+      await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+
+      const defaultsTab = screen.getByRole("tab", { name: "Session defaults" });
+      const codeTab = screen.getByRole("tab", { name: "Code" });
+      const defaultsPanel = document.getElementById(defaultsTab.getAttribute("aria-controls")!)!;
+      const codePanel = document.getElementById(codeTab.getAttribute("aria-controls")!)!;
+      expect(defaultsTab).toHaveAttribute("aria-selected", "true");
+      expect(codeTab).toHaveAttribute("aria-selected", "false");
+      expect(defaultsPanel).toBeVisible();
+      expect(codePanel).not.toBeVisible();
+
+      if (input === "pointer") {
+        fireEvent.mouseDown(codeTab, { button: 0, ctrlKey: false });
+      } else {
+        act(() => defaultsTab.focus());
+        fireEvent.keyDown(defaultsTab, { key: "ArrowRight" });
+        await waitFor(() => expect(codeTab).toHaveFocus());
+      }
+      expect(codeTab).toHaveAttribute("aria-selected", "true");
+      expect(defaultsTab).toHaveAttribute("aria-selected", "false");
+      expect(codeTab).toHaveAttribute("data-state", "active");
+      expect(defaultsTab).toHaveAttribute("data-state", "inactive");
+      expect(codePanel).toBeVisible();
+      expect(defaultsPanel).not.toBeVisible();
+    },
+  );
+
   it("connects each tab to its labelled panel", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
     renderDialog();
