@@ -17,7 +17,7 @@ import {
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -39,6 +39,8 @@ import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
+import { getSessionState } from "./useSessionState";
+import { useRecentSessions } from "./useRecentSessions";
 
 type SidebarDataValue = NonNullable<ContextType<typeof SidebarDataContext>>;
 const identityPendingSidebarData = {
@@ -115,6 +117,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -319,6 +322,138 @@ describe("SessionUpdatesProvider comments fingerprint", () => {
     // Zero comments-key invalidations proves an unchanged fingerprint is
     // inert; a call here means every row change would refetch comments.
     expect(commentsCalls).toEqual([]);
+  });
+});
+
+describe("SessionUpdatesProvider recent sessions", () => {
+  it("restores Recent after a failed archive races a streamed update and refetch", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    seedConversations(client, ["conv_a", "conv_b"]);
+    let rejectArchive!: (error: Error) => void;
+    let recentFetches = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (init?.method === "PATCH") {
+          return new Promise((_resolve, reject) => {
+            rejectArchive = reject;
+          });
+        }
+        if (url.includes("recent-sessions")) recentFetches += 1;
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            data: url.includes("recent-sessions") ? [conv("conv_a")] : [],
+            has_more: false,
+          }),
+        });
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SessionUpdatesProvider>{children}</SessionUpdatesProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const { result, unmount } = renderHook(
+      () => ({ archive: useArchiveConversation(), recent: useRecentSessions(5, true) }),
+      { wrapper },
+    );
+    try {
+      await waitFor(() =>
+        expect(result.current.recent.data?.map((row) => row.id)).toEqual(["conv_a"]),
+      );
+      act(() => result.current.archive.mutate({ id: "conv_a", archived: true }));
+      await waitFor(() => expect(rejectArchive).toBeTypeOf("function"));
+      act(() =>
+        frameHandler()({ type: "changed", items: [{ ...conv("conv_a"), archived: false }] }),
+      );
+      await waitFor(() => expect(result.current.recent.data).toEqual([]));
+      await waitFor(() => expect(recentFetches).toBeGreaterThanOrEqual(2));
+      await waitFor(() => expect(result.current.recent.isFetching).toBe(false));
+      act(() => rejectArchive(new Error("archive failed")));
+      await waitFor(() => expect(result.current.archive.isError).toBe(true));
+      await waitFor(() =>
+        expect(result.current.recent.data?.map((row) => row.id)).toEqual(["conv_a"]),
+      );
+    } finally {
+      unmount();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("watches Recent rows outside the sidebar window and adds newly fetched rows", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      client.setQueryData(["recent-sessions", 5], [conv("recent")]);
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <SidebarDataContext.Provider value={identityReadySidebarData}>
+              <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+            </SidebarDataContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      expect(lastWatched()).toEqual(["conv_a", "recent"]);
+      act(() => client.setQueryData(["recent-sessions", 5], [conv("new-recent")]));
+      act(() => vi.advanceTimersByTime(250));
+      expect(lastWatched()).toEqual(["conv_a", "new-recent"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows real own and child prompts, then clears them while Recent's session keeps running", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const recent = { ...conv("recent"), project_id: "project_alpha", status: "running" as const };
+    client.setQueryData(["recent-sessions", 5], [recent, conv("other")]);
+    renderProvider(client, ["/c/recent"]);
+    const state = () =>
+      getSessionState(client.getQueryData<Conversation[]>(["recent-sessions", 5])?.[0]);
+    expect(state()).toEqual({ kind: "running" });
+    for (const counts of [
+      { pending_elicitations_count: 1, child_pending_elicitations_count: 0 },
+      { pending_elicitations_count: 0, child_pending_elicitations_count: 1 },
+    ]) {
+      act(() => frameHandler()({ type: "changed", items: [{ ...recent, ...counts }] }));
+      expect(state()).toEqual({ kind: "awaiting", count: 1 });
+    }
+    act(() =>
+      frameHandler()({
+        type: "snapshot",
+        items: [{ ...recent, pending_elicitations_count: 0, child_pending_elicitations_count: 0 }],
+      }),
+    );
+    expect(state()).toEqual({ kind: "running" });
+    expect(
+      client.getQueryData<Conversation[]>(["recent-sessions", 5])?.map((row) => row.id),
+    ).toEqual(["recent", "other"]);
+  });
+
+  it.each(["removed", "archived"])("drops a %s row from every cached Recent count", (kind) => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    for (const count of [5, 8]) {
+      client.setQueryData(["recent-sessions", count], [conv("recent"), conv("other")]);
+    }
+    renderProvider(client, ["/"]);
+    act(() =>
+      frameHandler()(
+        kind === "removed"
+          ? { type: "removed", ids: ["recent"] }
+          : { type: "changed", items: [{ ...conv("recent"), archived: true }] },
+      ),
+    );
+    for (const count of [5, 8]) {
+      expect(
+        client.getQueryData<Conversation[]>(["recent-sessions", count])?.map((row) => row.id),
+      ).toEqual(["other"]);
+    }
   });
 });
 

@@ -1261,6 +1261,46 @@ describe("reordering folders inside a projects section", () => {
 });
 
 describe("collapsed section marker freshness", () => {
+  it("clears Recent's response pill after a hidden folder's prompt is answered", async () => {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(RECENT_FOLDER_LAYOUT));
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    const pending = conversation("working", {
+      labels: { omni_project: "Alpha" },
+      status: "running",
+      pending_elicitations_count: 1,
+    });
+    recentRef.current.data = [pending];
+    mockConversations([pending]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const mineKey = ["conversations", "", false, null, "mine"];
+    qc.setQueryData(mineKey, conversationPage([pending]).data);
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const view = render(tree());
+    expect(await within(sectionOf("Recent")).findByText("Needs response")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    const answered = { ...pending, pending_elicitations_count: 0 };
+    act(() => qc.setQueryData(mineKey, conversationPage([answered]).data));
+    mockConversations([answered]);
+    view.rerender(tree());
+    await waitFor(() => {
+      expect(within(sectionOf("Recent")).queryByText("Needs response")).toBeNull();
+      expect(within(sectionOf("Recent")).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      );
+    });
+  });
+
   it("refreshes a collapsed section's badge when a hidden session's state changes", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const mineKey = ["conversations", "", false, null, "mine"];

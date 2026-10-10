@@ -1,5 +1,9 @@
 import { SidebarDataContext } from "./useSidebarData";
-import { PINNED_CONVERSATIONS_KEY, type PinnedConversationsResult } from "./useConversations";
+import {
+  PINNED_CONVERSATIONS_KEY,
+  type Conversation,
+  type PinnedConversationsResult,
+} from "./useConversations";
 // App-level wiring for the `WS /v1/sessions/updates` push stream.
 //
 // Mounted once near the app root. It:
@@ -167,6 +171,19 @@ function applyItemsToCache(
       .filter((row) => !row.archived);
     return changed ? { ...previous, conversations } : previous;
   });
+  // Recent keeps interaction order, independently of the paginated lists.
+  queryClient.setQueriesData<Conversation[]>({ queryKey: ["recent-sessions"] }, (previous) =>
+    previous?.flatMap((row) => {
+      const item = itemsById.get(row.id);
+      if (!item) return [row];
+      foundAnywhere.add(row.id);
+      if (item.archived || item.parent_session_id) {
+        needsRefetch = true;
+        return [];
+      }
+      return [{ ...row, ...item }];
+    }),
+  );
   return {
     missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
     needsRefetch,
@@ -233,6 +250,13 @@ function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
       }
     }
   }
+  queryClient.setQueriesData<Conversation[]>({ queryKey: ["recent-sessions"] }, (previous) => {
+    if (!previous) return previous;
+    const next = previous.filter((row) => !idSet.has(row.id));
+    if (next.length === previous.length) return previous;
+    removedAny = true;
+    return next;
+  });
   return removedAny;
 }
 
@@ -288,6 +312,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     const ids = sidebarIdsRef.current
       ? [...sidebarIdsRef.current]
       : collectConversationIds([...entries, ...projectEntries].map(([, data]) => data));
+    for (const [, rows] of queryClient.getQueriesData<Conversation[]>({
+      queryKey: ["recent-sessions"],
+    })) {
+      for (const row of rows ?? []) {
+        if (!ids.includes(row.id)) ids.push(row.id);
+      }
+    }
     // Union in the open session. A directly-opened child / sub-agent
     // session is filtered out of the sidebar list, so it's absent from
     // every cached conversations page and wouldn't otherwise be watched —
@@ -368,6 +399,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       // Converge each project folder's own list too (new/archived/relabeled
       // members the local field-patch can't place).
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
       // Another client archiving/relabeling/deleting can add or remove a
       // project from the Archived view's picker; only local mutations
       // invalidate this scan otherwise.
@@ -534,7 +566,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       // Recompute the watch-set when either the global list or a project
       // folder's list changes (fetch, pagination, splice) so newly loaded
       // folder members join the stream's watch-set.
-      if (Array.isArray(key) && (key[0] === "conversations" || key[0] === "project-sessions")) {
+      if (
+        Array.isArray(key) &&
+        (key[0] === "conversations" ||
+          key[0] === "project-sessions" ||
+          key[0] === "recent-sessions")
+      ) {
         scheduleWatch();
       }
       // Also recompute when a child-sessions list loads so the tree nodes
