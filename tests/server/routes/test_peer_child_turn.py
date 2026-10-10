@@ -201,6 +201,37 @@ def test_classify_hit_returns_peer_turn(stores: Any) -> None:
     assert turn.as_dict()["sender_origin"] == SENDER_ORIGIN
 
 
+@pytest.mark.parametrize(
+    ("stored_text", "body"),
+    [
+        ("do the thing", "do the thing\n"),
+        ("a\r\nb", "a\nb\n"),
+        ("a\rb", "a\nb\n"),
+        ("a\x1bb", "ab\n"),
+        ("a\tb", "a\tb\n"),
+    ],
+)
+def test_classify_hit_native_delivery(stores: Any, stored_text: str, body: str) -> None:
+    conv, peer, mother, child, sender = stores
+    record = _record(peer, sender=sender.id, receiver=child.id, text=stored_text, ref="ref-1")
+    x_item = conv.append(
+        child.id, [_user(_envelope(record, text=body)), _assistant("final answer")]
+    )[-1]
+
+    turn = classify_child_turn(conv, peer, child, "final answer")
+
+    assert turn == PeerTurn(
+        parent_session_id=mother.id,
+        peer_id=record.id,
+        result_item_id=x_item.id,
+        ref="ref-1",
+        sender_session_id=sender.id,
+        sender_title=SENDER_TITLE,
+        sender_origin=SENDER_ORIGIN,
+        excerpt=stored_text,
+    )
+
+
 def test_classify_truncates_excerpt_to_600_chars(stores: Any) -> None:
     conv, peer, _mother, child, sender = stores
     record = _record(peer, sender=sender.id, receiver=child.id, text="x" * 900)
@@ -277,6 +308,23 @@ def test_classify_miss_edited_envelope_body(stores: Any) -> None:
         child.id,
         [_user(_envelope(record, text="tampered body")), _assistant("final answer")],
     )
+
+    assert classify_child_turn(conv, peer, child, "final answer") is None
+
+
+@pytest.mark.parametrize("body", ["do the  thing\n", " do the thing"])
+def test_classify_miss_leading_or_interior_body_change(stores: Any, body: str) -> None:
+    conv, peer, _mother, child, sender = stores
+    record = _record(peer, sender=sender.id, receiver=child.id, text="do the thing")
+    conv.append(child.id, [_user(_envelope(record, text=body)), _assistant("final answer")])
+
+    assert classify_child_turn(conv, peer, child, "final answer") is None
+
+
+def test_classify_miss_tab_changed_to_space(stores: Any) -> None:
+    conv, peer, _mother, child, sender = stores
+    record = _record(peer, sender=sender.id, receiver=child.id, text="a\tb")
+    conv.append(child.id, [_user(_envelope(record, text="a b\n")), _assistant("final answer")])
 
     assert classify_child_turn(conv, peer, child, "final answer") is None
 

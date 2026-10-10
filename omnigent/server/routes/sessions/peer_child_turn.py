@@ -149,15 +149,24 @@ def _single_text_block(content: list[dict[str, Any]]) -> str | None:
     return text if isinstance(text, str) else None
 
 
+def _delivered_text(text: str) -> str:
+    """Return text in terminal-delivered form without trailing whitespace.
+
+    Mirrors ``omnigent/harnesses/claude_native/bridge.py::_paste_payload_bytes``.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(ch for ch in normalized if ord(ch) >= 0x20 or ch in "\n\t").rstrip()
+
+
 def _verified_envelope(
     peer_store: PeerMessageStore, child: Conversation, data: MessageData
 ) -> _Envelope | None:
     """Return the record and header when *data* is a verified foreign envelope.
 
     Verifies the single text block, a current-format header, the record's
-    existence / receiver / state / sender, that the body equals the stored
-    text, that the sender is not the child's mother, and that the thread was
-    not started by the child itself.
+    existence / receiver / state / sender, that the body and stored text
+    match in delivered form, that the sender is not the child's mother,
+    and that the thread was not started by the child itself.
     """
     text = _single_text_block(data.content)
     if text is None:
@@ -174,7 +183,7 @@ def _verified_envelope(
         return None
     if record.sender_session_id != header.sender_session_id:
         return None
-    if header.body != record.text:
+    if _delivered_text(header.body) != _delivered_text(record.text):
         return None
     if record.sender_session_id == child.parent_conversation_id:
         return None
