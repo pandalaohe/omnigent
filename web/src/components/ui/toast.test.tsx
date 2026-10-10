@@ -22,6 +22,24 @@ afterEach(async () => {
 });
 
 describe("Toaster", () => {
+  it("keeps a top toast below the mobile safe area while its action stays tappable", async () => {
+    const onUndo = vi.fn();
+    render(<Toaster position="top-center" mobileOffset={{ right: "1rem" }} />);
+    act(() => {
+      toast("Archived 1 session", {
+        duration: Number.POSITIVE_INFINITY,
+        action: { label: "Undo", onClick: onUndo },
+      });
+    });
+
+    expect(await screen.findByText("Archived 1 session")).toBeInTheDocument();
+    expect(document.querySelector("[data-sonner-toaster]")).toHaveStyle({
+      "--mobile-offset-top": "calc(var(--omnigent-safe-top) + 1rem)",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    expect(onUndo).toHaveBeenCalledOnce();
+  });
+
   it("renders nothing until a toast is shown", () => {
     render(<Toaster />);
     expect(document.querySelector("[data-sonner-toast]")).toBeNull();

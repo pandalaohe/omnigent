@@ -1052,6 +1052,11 @@ function SidebarImpl({
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
+  useLayoutEffect(() => {
+    if (!effectiveOpen || !isMobileViewport() || !scrollContainerRef.current) return;
+    scrollContainerRef.current.scrollTop = 0;
+    setHasScrolled(false);
+  }, [effectiveOpen]);
 
   // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
   // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
@@ -5989,14 +5994,12 @@ function ConversationRowImpl({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
-  // When this row becomes the active conversation (e.g. a freshly created
-  // session navigated to via `/c/:id`), scroll it toward the center of the
-  // sidebar so it's comfortably in view rather than pinned to an edge.
+  // Desktop keeps the active row centered; a phone drawer opens at the top.
   const rowRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
-    if (!isActive || !isCanonical) return;
+    if (!isActive || !isCanonical || isMobile) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [isActive, isCanonical]);
+  }, [isActive, isCanonical, isMobile]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();

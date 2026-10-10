@@ -7956,6 +7956,12 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
+          {/* The notices' 4px top gap completes the 32px session status slot. */}
+          <div
+            aria-hidden="true"
+            className="h-7 shrink-0 md:hidden"
+            data-testid="new-chat-landing-status-space"
+          />
           <WorkspacePickerDialog
             open={workspacePickerOpen}
             onOpenChange={setWorkspacePickerOpen}

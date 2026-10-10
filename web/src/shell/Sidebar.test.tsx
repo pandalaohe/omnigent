@@ -3505,6 +3505,73 @@ describe("Sidebar mobile overlay background", () => {
 // stranded below the fold. We center it with a smooth animation. jsdom doesn't
 // implement scrollIntoView, so it's spied on.
 describe("Sidebar active-row auto-scroll", () => {
+  it.each([null, "Deep project"])(
+    "resets the phone drawer on every open with active project %s",
+    (project) => {
+      const priorMatchMedia = window.matchMedia;
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query !== "(min-width: 768px)",
+        media: query,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }));
+      const scrollIntoView = vi.fn();
+      vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
+      if (project) projectsMock.push(project);
+      mockConversations([
+        conv("conv_top", "Claude Code"),
+        conv("conv_active", "Claude Code", {
+          labels: project ? { omni_project: project } : {},
+        }),
+      ]);
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const renderDrawer = (open: boolean, dragProgress: number | null = null) => (
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_active"]}>
+                <Routes>
+                  <Route
+                    path="/c/:conversationId"
+                    element={<Sidebar open={open} dragProgress={dragProgress} onClose={vi.fn()} />}
+                  />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(renderDrawer(false));
+      expect(screen.getByText("conv_active")).toBeInTheDocument();
+      const scroller = screen.getByRole("navigation", { hidden: true });
+      scroller.scrollTop = 310;
+      rerender(renderDrawer(true));
+      expect(scroller.scrollTop).toBe(0);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      rerender(renderDrawer(false));
+      scroller.scrollTop = 190;
+      rerender(renderDrawer(false, 0.2));
+      expect(scroller.scrollTop).toBe(0);
+      scroller.scrollTop = 60;
+      rerender(renderDrawer(false, 0.8));
+      expect(scroller.scrollTop).toBe(60);
+      rerender(renderDrawer(false));
+      scroller.scrollTop = 205;
+      rerender(renderDrawer(false, 0.1));
+      expect(scroller.scrollTop).toBe(0);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      scroller.scrollTop = 245;
+      rerender(renderDrawer(false));
+      rerender(renderDrawer(true));
+      expect(scroller.scrollTop).toBe(0);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+      vi.stubGlobal("matchMedia", priorMatchMedia);
+    },
+  );
+
   function renderAtRoute(initialEntry: string) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
