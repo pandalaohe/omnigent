@@ -270,6 +270,18 @@ describe("KeepBottomOnViewportResize", () => {
     expect(metrics.scrollTop).toBe(800);
   });
 
+  it("does not repin a touch escape before its first scroll event on viewport resize", () => {
+    const { metrics } = makeScrollRoot();
+    lockToBottom();
+    render(<KeepBottomOnViewportResize />);
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(metrics.scrollTop).toBe(1300);
+  });
+
   it("ignores the public near-bottom alias when the live lock is escaped", () => {
     const { metrics } = makeScrollRoot(1250);
     stickContext.isAtBottom = true;

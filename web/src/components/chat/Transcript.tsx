@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { type Virtualizer, measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
+  CONVERSATION_RESUME_SCROLL_EVENT,
   Conversation,
   ConversationContent,
   ConversationEmptyState,
@@ -885,6 +886,7 @@ export function VirtualBubbleList({
 
     if (!saved || saved.atBottom) {
       const pinBottom = () => {
+        scrollEl.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
         c.state.isAtBottom = true;
         c.state.escapedFromLock = false;
         scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);

@@ -17,6 +17,7 @@ export interface ConversationScrollLock {
 }
 
 export const ConversationScrollLockContext = createContext<ConversationScrollLock | null>(null);
+export const CONVERSATION_RESUME_SCROLL_EVENT = "conversation-resume-scroll";
 
 // Module handle so non-React scroll helpers (deep links, activity rail,
 // Cmd+Alt nav) can release the bottom-lock without Conversation context.
@@ -58,6 +59,151 @@ const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
       if (activeScrollLock === value) activeScrollLock = null;
     };
   }, [value]);
+  useLayoutEffect(() => {
+    const el = ctx.scrollRef.current;
+    const content = ctx.contentRef.current;
+    if (!el || !content) return;
+    let touch: { x: number; y: number } | null = null;
+    let pressed: { el: HTMLElement; top: number } | null = null;
+    let releaseFrame = 0;
+    let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+    let released = false;
+    const release = () => {
+      released = true;
+      ctx.stopScroll();
+    };
+    // A nested scrollable control owns its gesture (code, terminals, editors).
+    const ownsScroll = (target: EventTarget | null) => {
+      for (
+        let node = target instanceof Element ? target : null;
+        node && node !== el;
+        node = node.parentElement
+      ) {
+        if (
+          node.scrollHeight > node.clientHeight &&
+          /auto|scroll/.test(getComputedStyle(node).overflowY)
+        )
+          return false;
+      }
+      return true;
+    };
+    const onTouchStart = (event: TouchEvent) => {
+      const point = event.touches.length === 1 ? event.touches[0] : undefined;
+      touch = point && ownsScroll(event.target) ? { x: point.clientX, y: point.clientY } : null;
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      const point = event.touches.length === 1 ? event.touches[0] : undefined;
+      if (!touch || !point) return;
+      const dy = point.clientY - touch.y;
+      if (dy > 6 && dy > Math.abs(point.clientX - touch.x)) {
+        pressed = null;
+        release();
+      }
+    };
+    const onTouchEnd = () => {
+      touch = null;
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") return;
+      const target =
+        event.target instanceof Element
+          ? event.target.closest<HTMLElement>(
+              "button, input, textarea, select, a, [role='button'], label",
+            )
+          : null;
+      if (!target || !el.contains(target) || !ownsScroll(target)) return;
+      cancelAnimationFrame(releaseFrame);
+      ctx.stopScroll();
+      pressed = { el: target, top: target.getBoundingClientRect().top };
+    };
+    // Keep the touched control under the finger, even when rows grow above it.
+    const observer = new ResizeObserver(() => {
+      if (released || pressed) ctx.stopScroll();
+      if (!pressed?.el.isConnected) return;
+      const delta = pressed.el.getBoundingClientRect().top - pressed.top;
+      if (Math.abs(delta) > 1) el.scrollTop += delta;
+    });
+    observer.observe(content);
+    const onPointerEnd = (event: PointerEvent) => {
+      if (!pressed) return;
+      if (event.type === "pointercancel") {
+        pressed = null;
+        return;
+      }
+      // The compatibility click is dispatched after pointerup.
+      releaseFrame = requestAnimationFrame(() => {
+        pressed = null;
+        if (el.scrollHeight - el.clientHeight - el.scrollTop <= 1) {
+          ctx.state.escapedFromLock = false;
+          void ctx.scrollToBottom("instant");
+        }
+      });
+    };
+    // The library resumes within 70px of the bottom. A reader's escape lasts
+    // until they actually reach it, including after a resize swallowed a scroll.
+    const onScroll = () => {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        if (pressed) ctx.stopScroll();
+        else if (released) {
+          if (el.scrollHeight - el.clientHeight - el.scrollTop <= 1) {
+            released = false;
+            ctx.state.escapedFromLock = false;
+            void ctx.scrollToBottom("instant");
+          } else ctx.stopScroll();
+        }
+      }, 1);
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0 && ownsScroll(event.target)) release();
+    };
+    const onResume = () => {
+      released = false;
+      ctx.state.escapedFromLock = false;
+    };
+    el.addEventListener(CONVERSATION_RESUME_SCROLL_EVENT, onResume);
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+      if ((event.shiftKey && event.key !== " ") || !ownsScroll(target)) return;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+      )
+        return;
+      if (
+        ["ArrowUp", "PageUp", "Home"].includes(event.key) ||
+        (event.key === " " && event.shiftKey)
+      )
+        release();
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("keydown", onKeyDown);
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    el.addEventListener("touchend", onTouchEnd, { passive: true });
+    el.addEventListener("touchcancel", onTouchEnd, { passive: true });
+    el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    el.addEventListener("pointerup", onPointerEnd, { passive: true });
+    el.addEventListener("pointercancel", onPointerEnd, { passive: true });
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(releaseFrame);
+      clearTimeout(scrollTimer);
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener(CONVERSATION_RESUME_SCROLL_EVENT, onResume);
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("keydown", onKeyDown);
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("touchend", onTouchEnd);
+      el.removeEventListener("touchcancel", onTouchEnd);
+      el.removeEventListener("pointerdown", onPointerDown);
+      el.removeEventListener("pointerup", onPointerEnd);
+      el.removeEventListener("pointercancel", onPointerEnd);
+    };
+  }, [ctx.scrollRef, ctx.contentRef, ctx.stopScroll, ctx.scrollToBottom, ctx.state]);
   return (
     <ConversationScrollLockContext.Provider value={value}>
       {children}
@@ -73,7 +219,11 @@ export const Conversation = ({ className, children, ...props }: ConversationProp
     role="log"
     {...props}
   >
-    {typeof children === "function" ? children : <ScrollLockBridge>{children}</ScrollLockBridge>}
+    {(context) => (
+      <ScrollLockBridge>
+        {typeof children === "function" ? children(context) : children}
+      </ScrollLockBridge>
+    )}
   </StickToBottom>
 );
 
@@ -122,11 +272,12 @@ export const ConversationScrollButton = ({
   className,
   ...props
 }: ConversationScrollButtonProps) => {
-  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
+  const { isAtBottom, scrollToBottom, scrollRef } = useStickToBottomContext();
 
   const handleScrollToBottom = useCallback(() => {
+    scrollRef.current?.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
     scrollToBottom("instant");
-  }, [scrollToBottom]);
+  }, [scrollRef, scrollToBottom]);
 
   return (
     !isAtBottom && (

@@ -77,6 +77,7 @@ import {
   useScopedConversationId,
 } from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
+import { CONVERSATION_RESUME_SCROLL_EVENT } from "@/components/ai-elements/conversation";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
@@ -1237,13 +1238,14 @@ function AssistantBubble({
  * message.
  */
 export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
-  const { scrollToBottom } = useStickToBottomContext();
+  const { scrollToBottom, scrollRef } = useStickToBottomContext();
 
   useLayoutEffect(() => {
     if (nonce === 0) return;
+    scrollRef?.current?.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [nonce, scrollToBottom]);
+  }, [nonce, scrollRef, scrollToBottom]);
 
   return null;
 }
@@ -1258,7 +1260,7 @@ export function ScrollToBottomOnSessionOpen({
   enabled: boolean;
   openedConversationIdRef?: { current: string | null };
 }) {
-  const { scrollToBottom } = useStickToBottomContext();
+  const { scrollToBottom, scrollRef } = useStickToBottomContext();
   const localOpenedConversationIdRef = useRef<string | null>(null);
   const openedRef = openedConversationIdRef ?? localOpenedConversationIdRef;
 
@@ -1270,9 +1272,10 @@ export function ScrollToBottomOnSessionOpen({
     if (conversationId === openedRef.current) return;
     openedRef.current = conversationId;
     if (!enabled) return;
+    scrollRef?.current?.dispatchEvent(new Event(CONVERSATION_RESUME_SCROLL_EVENT));
     scrollToBottom("instant");
     requestAnimationFrame(() => scrollToBottom("instant"));
-  }, [conversationId, enabled, openedRef, scrollToBottom]);
+  }, [conversationId, enabled, openedRef, scrollRef, scrollToBottom]);
 
   return null;
 }
@@ -1333,7 +1336,7 @@ export function KeepBottomOnViewportResize({
       scrollHeight = el.scrollHeight;
       if (!viewportChanged && !contentGrew) return;
       if (!wasBottomLocked) return;
-      if (!viewportChanged && !lockLive()) return;
+      if (!lockLive()) return;
       // The library corrects a frame later (a rAF promise), so the change would
       // paint off the bottom first, and a long task after that paint holds the
       // correction back as long as it runs. Pin now; the rAF pin stays as a net.
