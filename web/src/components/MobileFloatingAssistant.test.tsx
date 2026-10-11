@@ -5,8 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
 import {
   MOBILE_ASSISTANT_DEVICE_STORAGE_KEY,
+  TERMINAL_SOFT_KEY_EVENT,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
+  type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
   MobileFloatingAssistant,
@@ -354,11 +356,14 @@ describe("MobileFloatingAssistant", () => {
     function ControlledComposer() {
       const [value, setValue] = useState("hello ");
       return (
-        <textarea
-          aria-label="Composer"
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
-        />
+        <>
+          <textarea
+            aria-label="Composer"
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+          />
+          <button type="button">Header control</button>
+        </>
       );
     }
     render(
@@ -370,10 +375,40 @@ describe("MobileFloatingAssistant", () => {
     const composer = screen.getByRole("textbox", { name: "Composer" });
     composer.focus();
     (composer as HTMLTextAreaElement).setSelectionRange(6, 6);
+    screen.getByRole("button", { name: "Header control" }).focus();
     fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
     fireEvent.click(screen.getByRole("button", { name: "Compact" }));
 
     expect(composer).toHaveValue("hello /compact");
+    fireEvent.change(composer, { target: { value: "hello /compact next" } });
+    expect(composer).toHaveValue("hello /compact next");
+  });
+
+  it("keeps the last terminal as the key target after chrome focus with two terminals", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const textarea = document.createElement("textarea");
+    const header = document.createElement("button");
+    document.body.append(textarea, header);
+    const collect = (event: Event) => {
+      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
+      (detail.candidates ??= []).push(
+        { focused: false, ownsPreferredTarget: detail.preferredTarget === textarea, send: first },
+        { focused: false, ownsPreferredTarget: false, send: second },
+      );
+    };
+    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
+    render(<MobileFloatingAssistant />);
+    textarea.focus();
+    header.focus();
+    fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
+    fireEvent.click(screen.getByRole("button", { name: "↑" }));
+
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).not.toHaveBeenCalled();
+    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
+    textarea.remove();
+    header.remove();
   });
 
   it("collapses into an edge handle and restores when pulled out", () => {

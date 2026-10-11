@@ -490,7 +490,11 @@ function softKeyForChord(chord: ShortcutChord): MobileAssistantSoftKey | null {
 function preferredTarget(preferredDomTarget?: HTMLElement | null): HTMLElement {
   const activeTarget =
     document.activeElement instanceof HTMLElement ? document.activeElement : document.body;
-  return preferredDomTarget?.isConnected ? preferredDomTarget : activeTarget;
+  if (!preferredDomTarget?.isConnected) return activeTarget;
+  const visible =
+    preferredDomTarget.checkVisibility?.({ checkVisibilityCSS: true }) ??
+    getComputedStyle(preferredDomTarget).visibility === "visible";
+  return visible ? preferredDomTarget : activeTarget;
 }
 
 function dispatchChord(chord: ShortcutChord, preferredDomTarget?: HTMLElement | null): void {

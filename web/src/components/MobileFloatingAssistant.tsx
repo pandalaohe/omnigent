@@ -278,7 +278,7 @@ export function MobileFloatingAssistant() {
   const repeatIntervalRef = useRef<number | null>(null);
   const repeatingPointerRef = useRef<{ buttonId: string; pointerId: number } | null>(null);
   const assistantRef = useRef<HTMLDivElement>(null);
-  const lastExternalFocusRef = useRef<HTMLElement | null>(
+  const lastInputFocusRef = useRef<HTMLElement | null>(
     typeof document !== "undefined" && document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null,
@@ -313,8 +313,15 @@ export function MobileFloatingAssistant() {
   useEffect(() => {
     const rememberFocus = (event: FocusEvent) => {
       const target = event.target;
-      if (target instanceof HTMLElement && !assistantRef.current?.contains(target)) {
-        lastExternalFocusRef.current = target;
+      // Closing menus can focus app chrome; retain the user's input destination.
+      if (
+        target instanceof HTMLElement &&
+        (target instanceof HTMLInputElement ||
+          target instanceof HTMLTextAreaElement ||
+          target.isContentEditable) &&
+        !assistantRef.current?.contains(target)
+      ) {
+        lastInputFocusRef.current = target;
       }
     };
     document.addEventListener("focusin", rememberFocus);
@@ -341,19 +348,19 @@ export function MobileFloatingAssistant() {
   const actionPositions = circle.actions;
 
   const fireButton = (button: MobileAssistantButton) =>
-    dispatchMobileAssistantButton(button, lastExternalFocusRef.current);
+    dispatchMobileAssistantButton(button, lastInputFocusRef.current);
 
   const onActionPointerDown = (
     button: MobileAssistantButton,
     event: PointerEvent<HTMLButtonElement>,
   ) => {
+    if (event.button === 0) event.preventDefault();
     if (
       event.button !== 0 ||
       button.repeat !== true ||
       !mobileAssistantBindingSupportsRepeat(button.binding)
     )
       return;
-    event.preventDefault();
     stopRepeating();
     suppressActionClickRef.current = button.id;
     repeatingPointerRef.current = { buttonId: button.id, pointerId: event.pointerId };
@@ -380,6 +387,7 @@ export function MobileFloatingAssistant() {
   });
 
   const onPointerDown = (event: PointerEvent<HTMLButtonElement>) => {
+    if (event.button === 0) event.preventDefault();
     dragRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,

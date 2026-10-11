@@ -294,6 +294,25 @@ describe("mobileAssistantPreferences", () => {
     textarea.remove();
   });
 
+  it("ignores a connected saved input after its surface becomes hidden", () => {
+    const hidden = document.createElement("textarea");
+    hidden.style.visibility = "hidden";
+    const current = document.createElement("textarea");
+    document.body.append(hidden, current);
+    current.focus();
+
+    dispatchMobileAssistantButton(
+      { id: "phrase", label: "Phrase", binding: { kind: "text", text: "hello" } },
+      hidden,
+    );
+
+    expect(hidden.value).toBe("");
+    expect(current.value).toBe("hello");
+    expect(document.activeElement).toBe(current);
+    hidden.remove();
+    current.remove();
+  });
+
   it("dispatches a workspace-tab action event for select-tab buttons", () => {
     const listener = vi.fn();
     window.addEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, listener);
