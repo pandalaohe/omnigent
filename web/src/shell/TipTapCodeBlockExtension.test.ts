@@ -22,6 +22,7 @@ import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
 import { CODE_BLOCK_LANGUAGE_EDIT_META, isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
+import { decodeRenderedTextAnchor } from "./renderedTextAnchor";
 import type { Comment } from "@/hooks/useComments";
 
 const SafeListItem = ListItem.extend({ content: "block+" });
@@ -127,8 +128,8 @@ describe("CodeBlockWithLanguage", () => {
 
 // Commenting on a mermaid block targets the SELECTABLE SOURCE, not the SVG
 // preview (which is contentEditable=false chrome outside the PM document). The
-// source lives in the codeBlock node as ordinary PM text, so the existing
-// text-offset comment anchoring must work over it — no geometric anchor scheme.
+// source lives in the codeBlock node as PM text. Its comment uses the same
+// rendered quote/context anchor as other TipTap text, not an SVG geometry anchor.
 describe("commenting on mermaid source text", () => {
   const MD = "# Title\n\n```mermaid\ngraph TD\nA-->B\n```\n";
 
@@ -142,16 +143,24 @@ describe("commenting on mermaid source text", () => {
     // Simulate selecting "graph TD" inside the code block.
     const data = computeSelectionData(
       // textOffset → PM pos: the plugin passes PM selection positions; emulate by
-      // locating the text and letting computeSelectionData resolve raw offsets.
+      // locating the text and letting computeSelectionData capture the rendered quote.
       resolvePmPos(editor, from),
       resolvePmPos(editor, from + "graph TD".length),
       doc,
       MD,
     );
     expect(data).not.toBeNull();
-    expect(data!.anchor_content).toBe("graph TD");
-    // The anchor text exists verbatim in the raw markdown, so offsets point at it.
-    expect(MD.slice(data!.start_index, data!.end_index)).toBe("graph TD");
+    expect(decodeRenderedTextAnchor(data!.anchor_content)).toEqual({
+      v: 1,
+      kind: "markdown",
+      text: "graph TD",
+      occ: 0,
+      prefix: "Title\n",
+      suffix: "\nA-->B",
+    });
+    expect(data).toMatchObject({ start_index: 6, end_index: 14 });
+    // These are rendered offsets; the fence and heading shift source positions.
+    expect(MD.slice(data!.start_index, data!.end_index)).not.toBe("graph TD");
   });
 
   it("re-locates the saved comment's highlight range inside the code block", () => {
@@ -167,6 +176,39 @@ describe("commenting on mermaid source text", () => {
     expect(range).not.toBeNull();
     expect(editor.state.doc.textBetween(range!.from, range!.to, "\n")).toBe("graph TD");
   });
+
+  it.each(["mermaid", "python"])(
+    "restores a persisted typed selection in the second %s block",
+    (language) => {
+      const quote = language === "mermaid" ? "graph TD" : "print('node')";
+      const body = language === "mermaid" ? "A-->B" : "# trailing";
+      const fence = `\`\`\`${language}\n${quote}\n${body}\n\`\`\``;
+      const markdown = `[Intro](https://example.test/${"x".repeat(1000)})\n\n## Alpha\n\n${fence}\n\n## Beta\n\n${fence}`;
+      editor = makeEditor(markdown);
+      const text = editor.state.doc.textBetween(0, editor.state.doc.content.size, "\n");
+      const at = text.lastIndexOf(quote);
+      const data = computeSelectionData(
+        resolvePmPos(editor, at),
+        resolvePmPos(editor, at + quote.length),
+        editor.state.doc,
+        markdown,
+      );
+      expect(decodeRenderedTextAnchor(data?.anchor_content)).toMatchObject({
+        kind: "markdown",
+        text: quote,
+        occ: 1,
+      });
+      expect(decodeRenderedTextAnchor(data?.anchor_content)?.prefix).toContain("Beta\n");
+      const saved = JSON.parse(JSON.stringify(data)) as Comment;
+      editor.destroy();
+      editor = makeEditor(markdown);
+      const range = findPmRangeForComment(editor.state.doc, saved, markdown);
+      expect(range).not.toBeNull();
+      expect(editor.state.doc.resolve(range!.from).parent.type.name).toBe("codeBlock");
+      expect(editor.state.doc.textBetween(range!.from, range!.to, "\n")).toBe(quote);
+      expect(editor.state.doc.textBetween(0, range!.from, "\n")).toContain("Beta\n");
+    },
+  );
 });
 
 // A language change from the picker dispatches while the editor is blurred (the

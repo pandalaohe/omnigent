@@ -48,6 +48,12 @@ def text_anchor(kind: str = "html") -> str:
     )
 
 
+MERMAID_ANCHOR = (
+    '__text__{"v":1,"kind":"markdown","text":"graph TD",'
+    '"occ":0,"prefix":"Title\\n","suffix":"\\nA-->B"}'
+)
+
+
 @pytest.mark.parametrize("kind", ["html", "markdown"])
 def test_send_and_list_preserve_second_rendered_occurrence(kind: str) -> None:
     row = comment(text_anchor(kind))
@@ -153,24 +159,32 @@ def test_visitor_plain_text_limit_stays_bounded() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "anchor,path,start,end",
+    [(text_anchor(), "preview.html", 0, 0), (MERMAID_ANCHOR, "diagram.md", 6, 14)],
+)
 def test_saved_anchor_survives_store_reload_and_actual_list_tool(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, anchor: str, path: str, start: int, end: int
 ) -> None:
     import omnigent.runtime as runtime
 
     store = SqlAlchemyCommentStore(db_uri)
     session_id = "c" * 32
-    saved = store.add(session_id, "preview.html", "second Code", 0, 0, text_anchor())
+    saved = store.add(session_id, path, "change selection", start, end, anchor)
     reloaded = SqlAlchemyCommentStore(db_uri).get(saved.id, session_id)
-    assert reloaded is not None and reloaded.anchor_content == text_anchor()
+    assert reloaded is not None and reloaded.anchor_content == anchor
     monkeypatch.setattr(runtime, "get_comment_store", lambda: SqlAlchemyCommentStore(db_uri))
     listed = json.loads(
         ListCommentsTool().invoke(
             "{}", ToolContext(task_id="task", agent_id="agent", conversation_id=session_id)
         )
     )
-    assert listed["comments"][0]["location"]["occ"] == 1
-    assert "occurrence 2" in _format_message([reloaded])
+    expected = json.loads(anchor[8:])
+    assert listed["comments"][0]["location"] == expected
+    message = _format_message([reloaded])
+    assert f"occurrence {expected['occ'] + 1}" in message
+    assert f"> {expected['text']}" in message
+    assert "source offset unavailable" in message
 
 
 @pytest.mark.parametrize(
@@ -198,8 +212,12 @@ def test_hostile_pdf_numeric_and_deep_json_stay_unknown() -> None:
     assert parse_text_anchor(deep) is None
 
 
+@pytest.mark.parametrize(
+    "anchor,path,start,end",
+    [(text_anchor(), "preview.html", 0, 0), (MERMAID_ANCHOR, "diagram.md", 6, 14)],
+)
 async def test_http_create_reload_and_address_all_keep_rendered_location(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, anchor: str, path: str, start: int, end: int
 ) -> None:
     agent_id = generate_agent_id()
     SqlAlchemyAgentStore(db_uri).create(
@@ -210,23 +228,28 @@ async def test_http_create_reload_and_address_all_keep_rendered_location(
     created = await client.post(
         api,
         json={
-            "path": "preview.html",
-            "body": "second Code",
-            "start_index": 0,
-            "end_index": 0,
-            "anchor_content": text_anchor(),
+            "path": path,
+            "body": "change selection",
+            "start_index": start,
+            "end_index": end,
+            "anchor_content": anchor,
         },
     )
     assert created.status_code == 200
     reloaded = await client.get(api)
     assert reloaded.status_code == 200
-    assert reloaded.json()[0]["location"]["occ"] == 1
+    expected = json.loads(anchor[8:])
+    assert reloaded.json()[0]["location"] == expected
     sent = await client.post(
         api + "/send", json={"comment_ids": [created.json()["id"]], "mark_addressed": False}
     )
     assert sent.status_code == 200
-    assert "occurrence 2" in sent.json()["formatted_message"]
-    assert "characters 0–0" not in sent.json()["formatted_message"]
+    message = sent.json()["formatted_message"]
+    assert f"occurrence {expected['occ'] + 1}" in message
+    assert f"> {expected['text']}" in message
+    assert json.dumps(expected["prefix"])[1:-1] in message
+    assert "source offset unavailable" in message
+    assert "Location: characters" not in message
     assert (await client.get(api)).json()[0]["status"] == "draft"
 
 
