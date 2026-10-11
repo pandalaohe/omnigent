@@ -18,7 +18,6 @@ import {
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
-  FolderOpenIcon,
   GitBranchIcon,
   GitForkIcon,
   InfoIcon,
@@ -127,6 +126,7 @@ interface HeaderConversationMenuProps {
   trigger?: ReactNode;
   initiallyOpen?: boolean;
   canManage?: boolean;
+  surface?: "header" | "row";
 }
 
 export function HeaderConversationMenu({
@@ -147,6 +147,7 @@ export function HeaderConversationMenu({
   trigger,
   initiallyOpen = false,
   canManage = true,
+  surface = "header",
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -458,6 +459,13 @@ export function HeaderConversationMenu({
           Agent info
         </DropdownMenuItem>
       )}
+      <DropdownMenuItem
+        data-testid="header-worktree-details"
+        className={itemClass}
+        onSelect={() => setWorktreeDetailsOpen(true)}
+      >
+        <InfoIcon className="size-3.5" /> Worktree details
+      </DropdownMenuItem>
       {/* Rename is also reachable on desktop by clicking the breadcrumb title
           (HeaderTitle); on mobile the native shells hide the breadcrumb, so this
           menu is the sole entry point. */}
@@ -488,27 +496,31 @@ export function HeaderConversationMenu({
           <MailIcon className="size-3.5" /> Mark as unread
         </DropdownMenuItem>
       )}
-      <DropdownMenuItem
-        data-testid="header-copy-session-id"
-        className={itemClass}
-        onSelect={() => void copySessionId()}
-      >
-        <CopyIcon className="size-3.5" /> Copy session ID
-      </DropdownMenuItem>
-      <DropdownMenuItem
-        data-testid="header-toggle-session-sounds"
-        className={itemClass}
-        onSelect={() => {
-          const preferences = readSoundAlertPreferences();
-          const mutedSessionIds = preferences.mutedSessionIds.includes(conversation.id)
-            ? preferences.mutedSessionIds.filter((id) => id !== conversation.id)
-            : [...preferences.mutedSessionIds, conversation.id];
-          writeSoundAlertPreferences({ ...preferences, mutedSessionIds });
-        }}
-      >
-        {soundsMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
-        {soundsMuted ? "Unmute sounds" : "Mute sounds"}
-      </DropdownMenuItem>
+      {surface === "row" && (
+        <>
+          <DropdownMenuItem
+            data-testid="header-copy-session-id"
+            className={itemClass}
+            onSelect={() => void copySessionId()}
+          >
+            <CopyIcon className="size-3.5" /> Copy session ID
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            data-testid="header-toggle-session-sounds"
+            className={itemClass}
+            onSelect={() => {
+              const preferences = readSoundAlertPreferences();
+              const mutedSessionIds = preferences.mutedSessionIds.includes(conversation.id)
+                ? preferences.mutedSessionIds.filter((id) => id !== conversation.id)
+                : [...preferences.mutedSessionIds, conversation.id];
+              writeSoundAlertPreferences({ ...preferences, mutedSessionIds });
+            }}
+          >
+            {soundsMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
+            {soundsMuted ? "Unmute sounds" : "Mute sounds"}
+          </DropdownMenuItem>
+        </>
+      )}
       {isChild && (
         <DropdownMenuItem
           data-testid="header-open-in-panel"
@@ -579,7 +591,7 @@ export function HeaderConversationMenu({
           <PlayIcon className="size-3.5" /> {resume.isPending ? "Resuming…" : "Resume session"}
         </DropdownMenuItem>
       )}
-      {canStop && (
+      {surface === "row" && canStop && (
         <DropdownMenuItem
           data-testid="header-stop-session"
           className={itemClass}
@@ -604,27 +616,7 @@ export function HeaderConversationMenu({
         ) : (
           <ArchiveIcon className="size-3.5" />
         )}
-        {isArchived ? "Unarchive" : isMobile ? "Archive this session" : "Archive"}
-      </DropdownMenuItem>
-      {!isArchived && canManage && (
-        <DropdownMenuItem
-          data-testid="header-archive-keep-worktree"
-          className={itemClass}
-          disabled={archivePending || archive.isPending}
-          onSelect={() => {
-            closeMenu();
-            void archiveNow(true);
-          }}
-        >
-          <FolderOpenIcon className="size-3.5" /> Archive and keep worktree
-        </DropdownMenuItem>
-      )}
-      <DropdownMenuItem
-        data-testid="header-worktree-details"
-        className={itemClass}
-        onSelect={() => setWorktreeDetailsOpen(true)}
-      >
-        <InfoIcon className="size-3.5" /> Worktree details
+        {isArchived ? "Unarchive" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"

@@ -231,11 +231,14 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("closes a Stop confirmation when the selected session changes", () => {
-    const { rerender } = renderMenu({ conversation: { ...CONVERSATION, id: "conv_child" } });
+    const { rerender } = renderMenu({
+      conversation: { ...CONVERSATION, id: "conv_child" },
+      surface: "row",
+    });
     openMenu();
     fireEvent.click(screen.getByTestId("header-stop-session"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    rerender(menuTree({ conversation: { ...CONVERSATION, id: "conv_other" } }));
+    rerender(menuTree({ conversation: { ...CONVERSATION, id: "conv_other" }, surface: "row" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(mocks.stopSession).not.toHaveBeenCalled();
   });
@@ -244,6 +247,7 @@ describe("HeaderConversationMenu", () => {
     try {
       renderMenu({
         conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+        surface: "row",
       });
       openMenu();
       fireEvent.click(screen.getByTestId("header-copy-session-id"));
@@ -285,6 +289,7 @@ describe("HeaderConversationMenu", () => {
       conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
       canManage: false,
       canShare: false,
+      surface: "row",
     });
     openMenu();
     for (const id of [
@@ -326,6 +331,7 @@ describe("HeaderConversationMenu", () => {
   it("confirms Stop against the selected child", () => {
     renderMenu({
       conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+      surface: "row",
     });
     openMenu();
     fireEvent.click(screen.getByTestId("header-stop-session"));
@@ -375,6 +381,7 @@ describe("HeaderConversationMenu", () => {
   it("mutes sounds for the child alone", () => {
     renderMenu({
       conversation: { ...CONVERSATION, id: "conv_child", parent_session_id: "conv_parent" },
+      surface: "row",
     });
     openMenu();
     fireEvent.click(screen.getByTestId("header-toggle-session-sounds"));
@@ -398,19 +405,26 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Worktree details",
       "Rename",
       "Mark as unread",
-      "Copy session ID",
-      "Mute sounds",
       "Add to project",
-      "Stop session",
       "Archive",
-      "Archive and keep worktree",
-      "Worktree details",
       "Delete",
     ]);
     expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
+  });
+
+  it("keeps Copy, Mute, and Stop in the row menu while offering one Archive action", () => {
+    renderMenu({ surface: "row" });
+    openMenu();
+
+    expect(screen.getByRole("menuitem", { name: "Copy session ID" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Mute sounds" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Stop session" })).toBeInTheDocument();
+    expect(screen.getAllByRole("menuitem", { name: "Archive" })).toHaveLength(1);
+    expect(screen.queryByRole("menuitem", { name: "Archive and keep worktree" })).toBeNull();
   });
 
   it("opens worktree details for a session without a recorded branch", async () => {
@@ -586,7 +600,7 @@ describe("HeaderConversationMenu", () => {
     expect(within(dialog).queryByText(/unhandled comments/)).toBeNull();
   });
 
-  it("archives from the distinctly labelled mobile action, then returns home", async () => {
+  it("archives from the mobile action, then returns home", async () => {
     mocks.archivePreference.mockResolvedValue({
       mode: "green_only",
       ask_before_archive: true,
@@ -595,7 +609,7 @@ describe("HeaderConversationMenu", () => {
     mocks.isMobile = true;
     renderMenu();
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Archive this session" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
     expect(mocks.archive).not.toHaveBeenCalled();
     fireEvent.click(await screen.findByTestId("archive-worktree-confirm"));
     expect(mocks.archive).toHaveBeenCalledWith({
@@ -824,9 +838,8 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });
 
-  it("keeps every session action reachable on mobile", () => {
-    // Regression guard for the native mobile shells, where this menu is the
-    // only entry point to the session operations.
+  it("keeps header session actions reachable on mobile", () => {
+    // Regression guard for the native mobile shells' header menu.
     mocks.isMobile = true;
     renderMenu();
     openMenu();
@@ -836,15 +849,11 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Worktree details",
       "Rename",
       "Mark as unread",
-      "Copy session ID",
-      "Mute sounds",
       "Add to project",
-      "Stop session",
-      "Archive this session",
-      "Archive and keep worktree",
-      "Worktree details",
+      "Archive",
       "Delete",
     ]);
   });
@@ -863,16 +872,12 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Worktree details",
       "Rename",
       "Mark as unread",
-      "Copy session ID",
-      "Mute sounds",
       "Add to project",
       "Files",
-      "Stop session",
-      "Archive this session",
-      "Archive and keep worktree",
-      "Worktree details",
+      "Archive",
       "Delete",
     ]);
   });
@@ -937,6 +942,8 @@ describe("HeaderConversationMenu", () => {
     renderMenu({ onShare, hasAgentInfo: true, onAgentInfo });
 
     openMenu();
+    const menuItems = screen.getAllByRole("menuitem").map((item) => item.textContent?.trim());
+    expect(menuItems[menuItems.indexOf("Agent info") + 1]).toBe("Worktree details");
     fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
     expect(analytics).toHaveBeenCalledWith({
       type: "click",

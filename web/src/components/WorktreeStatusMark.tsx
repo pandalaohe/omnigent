@@ -95,7 +95,7 @@ export function WorktreeStatusMark({
           }
           data-worktree-state={state}
           className={cn(
-            "relative inline-flex size-5 shrink-0 items-center justify-center rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            "inline-flex size-5 shrink-0 items-center justify-center rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
             state === "clean" && "text-success",
             state === "local" && "text-warning",
             state === "dirty" && "text-destructive",
@@ -106,14 +106,6 @@ export function WorktreeStatusMark({
           )}
         >
           <TreeGlyph state={state} />
-          {blockers.length > 0 && (
-            <span
-              className="absolute -right-1 -top-1 rounded bg-warning px-0.5 text-[9px] leading-3 text-zinc-950"
-              aria-hidden="true"
-            >
-              {blockers.length}
-            </span>
-          )}
         </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" className="flex-col items-start gap-1">

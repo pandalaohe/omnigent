@@ -110,8 +110,15 @@ def test_header_session_menu_manages_owner_and_child(
         child_trigger = page.get_by_test_id("header-conversation-actions")
         expect(child_trigger).to_be_visible(timeout=30_000)
         child_trigger.click()
-        for label in ["Fork", "Export", "Rename", "Copy session ID", "Archive", "Delete"]:
+        for label in ["Fork", "Export", "Rename", "Archive", "Delete"]:
             expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+        for label in [
+            "Copy session ID",
+            "Mute sounds",
+            "Stop session",
+            "Archive and keep worktree",
+        ]:
+            expect(page.get_by_role("menuitem", name=label, exact=True)).to_have_count(0)
         expect(page.get_by_role("menuitem", name="Pin", exact=True)).to_have_count(0)
         expect(page.get_by_test_id("header-move-to-project")).to_have_count(0)
 

@@ -228,6 +228,7 @@ def test_worktree_marks_past_aggregate_and_archive_prompt(
         mark = page.get_by_role("navigation", name="Conversation").locator(
             "[data-worktree-state='clean']"
         )
+        expect(mark).to_have_text("")
         mark.hover()
         expect(page.get_by_role("tooltip").filter(has_text="Research notes")).to_be_visible()
         _shot(page, request, "mother-past-blocker")
@@ -257,7 +258,7 @@ def test_worktree_marks_past_aggregate_and_archive_prompt(
         )
         page.mouse.move(350, 700)
         page.get_by_test_id("header-conversation-actions").click()
-        page.get_by_role("menuitem", name="Archive this session", exact=True).click()
+        page.get_by_role("menuitem", name="Archive", exact=True).click()
         dialog = page.get_by_test_id("archive-worktree-dialog")
         expect(dialog).to_be_visible()
         expect(dialog.get_by_role("radio", name="Never delete worktrees")).to_be_checked()

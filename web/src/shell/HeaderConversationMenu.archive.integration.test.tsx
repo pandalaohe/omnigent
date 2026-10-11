@@ -174,7 +174,7 @@ function openMenu() {
 
 function clickArchive() {
   openMenu();
-  fireEvent.click(screen.getByRole("menuitem", { name: "Archive this session" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
 }
 
 async function settleMutation(client: QueryClient) {
@@ -248,18 +248,20 @@ describe("HeaderConversationMenu archive integration", () => {
     ).toBe(false);
   });
 
-  it("archives once while keeping the worktree without opening the preference prompt", async () => {
+  it("offers one Archive action and sends the ordinary archive PATCH", async () => {
     mocks.fetch.mockResolvedValue(response({ ...CONVERSATION, archived: true }));
     const client = createClient();
     seedConversation(client);
-    render(harness({ client, worktreeStatus: true }));
+    render(harness({ client }));
 
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Archive and keep worktree" }));
+    expect(screen.getAllByRole("menuitem", { name: "Archive" })).toHaveLength(1);
+    expect(screen.queryByRole("menuitem", { name: "Archive and keep worktree" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
 
     await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
     const [, init] = mocks.fetch.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ archived: true, keep_worktree: true });
+    expect(JSON.parse(init.body as string)).toEqual({ archived: true });
     expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
   });
 
@@ -285,7 +287,7 @@ describe("HeaderConversationMenu archive integration", () => {
     // Reopening the menu while the request is pending exposes a disabled row;
     // selecting it cannot dispatch a second PATCH.
     openMenu();
-    const pendingAction = screen.getByRole("menuitem", { name: "Archive this session" });
+    const pendingAction = screen.getByRole("menuitem", { name: "Archive" });
     expect(pendingAction).toHaveAttribute("data-disabled");
     fireEvent.click(pendingAction);
     expect(mocks.fetch).toHaveBeenCalledOnce();

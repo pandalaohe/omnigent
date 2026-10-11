@@ -1033,19 +1033,16 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
+      "Worktree details",
       "Rename",
       "Mark as unread",
-      "Copy session ID",
-      "Mute sounds",
       "Add to project",
       "Files",
       "Archived sessions",
       "Changes",
       "Pull Requests",
       "Agents1",
-      "Archive this session",
-      "Archive and keep worktree",
-      "Worktree details",
+      "Archive",
       "Delete",
     ]);
   });

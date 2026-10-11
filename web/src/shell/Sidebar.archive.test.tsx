@@ -142,7 +142,10 @@ describe("archive flow", () => {
   it("archives with a single PATCH and no client-side stop", () => {
     mockConversations([CONV]);
     renderSidebar();
-    clickArchive();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getAllByTestId("archive-conversation")).toHaveLength(1);
+    expect(screen.queryByTestId("archive-keep-worktree")).toBeNull();
+    fireEvent.click(screen.getByTestId("archive-conversation"));
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     // Just the flag — the optimistic overlay + error reconcile live in the
@@ -156,20 +159,6 @@ describe("archive flow", () => {
     // The server owns the stop. A client stop here would race it against
     // the same runner and put its timeouts in front of the flag flip.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
-  });
-
-  it("archives and keeps the worktree once without changing the preference", () => {
-    mockConversations([CONV]);
-    renderSidebar();
-    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
-    fireEvent.click(screen.getByTestId("archive-keep-worktree"));
-
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({
-      id: "conv_1",
-      archived: true,
-      keepWorktree: true,
-    });
-    expect(mocks.preference).not.toHaveBeenCalled();
   });
 
   it("opens worktree details for a session without a recorded branch", async () => {

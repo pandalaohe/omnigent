@@ -25,13 +25,14 @@ the header menu), and each place is a separate entry point.
   protected and shared trees remain; branches remain. The first archive of a
   worktree session prompts with the tiers and Don't ask again. Settings › Git
   can re-enable asking and edit the rebuildable ignored-directory list. The
-  menu also offers one-time keep and Worktree details.
+  menu offers a single Archive action following these settings, plus Worktree
+  details.
 - `worktree-marks`: asymmetric tree icons precede session names in the sidebar,
   Agents tree and current header. Green means clean/rebuildable, yellow means
   other local files, and red means uncommitted source changes;
   dashed means unknown, a trunk bar means protected/shared, and an outline
-  means confirmed removed. A marker shows its own tree; a count flags child
-  problems, including Past. Hover names at most two blockers; full reasons
+  means confirmed removed. A marker shows its own tree without a number badge.
+  Hover names at most two child blockers, including Past; full reasons
   stay in Worktree details. Merge state is information, not a deletion gate.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
@@ -101,8 +102,9 @@ action in the same dialog.
 another message after its runner restarts. Also open a sub-agent's conversation
 and send a follow-up after its parent runner is replaced.
 
-**Mobile:** the header menu and the sidebar drawer offer the same actions; touch
-devices fold some row controls into the menu.
+**Mobile:** the header menu offers conversation actions and workspace panels.
+Copy session ID, Mute sounds and Stop session stay in sidebar and Agents row
+menus rather than the header menu.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open
