@@ -17,6 +17,11 @@ from pydantic import BaseModel, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
+from omnigent.entities.comment_location import (
+    TEXT_ANCHOR_PREFIX,
+    comment_location,
+    parse_text_anchor,
+)
 from omnigent.entities.element_annotation import (
     ELEMENT_ANCHOR_PREFIX,
     element_anchor_evidence,
@@ -103,6 +108,50 @@ _EVIDENCE_NOTICE = (
 )
 
 
+def _location_lines(comment: Comment) -> list[str]:
+    """Render the anchor's coordinate space, keeping page context inside evidence.
+
+    :param comment: A text or PDF review comment.
+    :returns: Location, selected excerpt and any bounded context lines.
+    """
+    location = comment_location(comment)
+    kind = location["kind"]
+    evidence = None
+    if kind in ("html", "markdown"):
+        surface = "HTML" if kind == "html" else "Markdown"
+        title = f"Location: rendered {surface} text, captured occurrence {location['occ'] + 1}"
+        source = location.get("source")
+        if source:
+            title += f"; source characters {source['start_index']}–{source['end_index']}"
+        else:
+            title += "; source offset unavailable"
+        evidence = {
+            key: location[key] for key in ("prefix", "suffix", "selector") if key in location
+        }
+    elif kind == "pdf":
+        title = f"Location: PDF page {location['page']}"
+        evidence = {"page_regions_relative_to_page": location["rects"]}
+    elif kind == "whole-page":
+        title = "Location: whole page"
+    elif kind == "unknown":
+        title = "Location: original position unavailable"
+    else:
+        title = f"Location: characters {comment.start_index}–{comment.end_index}"
+    lines = [title, *_excerpt_lines(location.get("text", comment.anchor_content))]
+    if evidence is not None:
+        lines.extend(
+            [
+                _EVIDENCE_NOTICE,
+                "<untrusted_page_evidence>",
+                _escape_line_breaks(json.dumps(evidence, ensure_ascii=False)).replace(
+                    "</", "<\\/"
+                ),
+                "</untrusted_page_evidence>",
+            ]
+        )
+    return lines
+
+
 def _rows_by_path(
     comments: list[Comment],
 ) -> list[tuple[str, list[tuple[Comment, dict[str, Any] | None]]]]:
@@ -162,8 +211,7 @@ def _comment_sections(
         for index, (comment, _anchor) in enumerate(rows):
             if index:
                 lines.append("")
-            lines.append(f"Location: characters {comment.start_index}–{comment.end_index}")
-            lines.extend(_excerpt_lines(comment.anchor_content))
+            lines.extend(_location_lines(comment))
             prefix = (
                 f"Visitor comment ({bullet_label(comment)})"
                 if bullet_label is not None
@@ -202,8 +250,7 @@ def _format_message(comments: list[Comment]) -> str:
             if index:
                 lines.append("")
             if anchor is None:
-                lines.append(f"Location: characters {comment.start_index}–{comment.end_index}")
-                lines.extend(_excerpt_lines(comment.anchor_content))
+                lines.extend(_location_lines(comment))
                 lines.append(f"User comment: {_quoted_comment_body(comment.body)}")
                 continue
             element_count += 1
@@ -311,6 +358,22 @@ class AddCommentRequest(BaseModel):
             if parsed is None:
                 raise ValueError("invalid element anchor")
             self.anchor_content = ELEMENT_ANCHOR_PREFIX + json.dumps(
+                parsed, ensure_ascii=False, separators=(",", ":")
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_text_anchor(self) -> AddCommentRequest:
+        """Reject invalid typed text locators rather than storing fake source ranges.
+
+        :returns: This validated request.
+        :raises ValueError: If a typed text anchor fails its bounded schema.
+        """
+        if self.anchor_content and self.anchor_content.startswith(TEXT_ANCHOR_PREFIX):
+            parsed = parse_text_anchor(self.anchor_content)
+            if parsed is None:
+                raise ValueError("invalid rendered text anchor")
+            self.anchor_content = TEXT_ANCHOR_PREFIX + json.dumps(
                 parsed, ensure_ascii=False, separators=(",", ":")
             )
         return self
