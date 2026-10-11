@@ -1,7 +1,7 @@
 """Phone composer geometry with the advertised Fast control present."""
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat._geometry_helpers import (
     assert_no_overlap,
@@ -15,8 +15,9 @@ from tests.browser_ui.chat.session_contract import ChatSessionContract, model_op
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
+@pytest.mark.parametrize("menu", [False, True], ids=["toggle", "menu"])
 def test_fast_control_keeps_send_and_stop_inside_phone_composer(
-    page: Page, chat_session_contract: ChatSessionContract, surface: str
+    page: Page, chat_session_contract: ChatSessionContract, surface: str, menu: bool
 ) -> None:
     chat = chat_session_contract
     model = model_option(
@@ -25,6 +26,8 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
         is_default=True,
     )
     model["serviceTiers"] = [{"id": "priority", "name": "Fast"}]
+    if menu:
+        model["serviceTiers"].append({"id": "ultrafast", "name": "Ultrafast"})
     chat.set_catalog(harness="codex-native", models=[model], selected_model="gpt-long-model")
     chat.update_session(
         labels={"omnigent.wrapper": "codex-native-ui", "omnigent.speed_tier": "fast"},
@@ -53,6 +56,16 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
         submit = page.get_by_test_id("new-chat-landing-submit")
     else:
         chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+
+        def patch_speed(request: Request) -> dict:
+            speed = request.post_data_json["speed_tier"]
+            assert speed in {"standard", "fast", "ultrafast"}
+            chat.update_session(
+                labels={"omnigent.wrapper": "codex-native-ui", "omnigent.speed_tier": speed}
+            )
+            return chat._session()
+
+        chat.contract.json(f"/v1/sessions/{chat.session_id}", patch_speed, method="PATCH")
         open_live(page, chat, viewport)
         input_field = page.get_by_label("Message the agent")
         model_label = page.get_by_test_id("composer-agent-config-value")
@@ -60,7 +73,9 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
         submit = page.get_by_role("button", name="Send", exact=True)
 
     input_field.fill("Check compact phone controls")
-    fast = page.get_by_role("button", name="Fast mode")
+    fast = page.get_by_test_id(
+        "new-chat-speed-trigger" if surface == "landing" else "composer-speed-trigger"
+    )
     expect(fast).to_be_visible()
     assert fast.inner_text() == ""
     for width in [375, 390, 430]:
@@ -75,13 +90,36 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
         assert page.evaluate("document.documentElement.scrollWidth") <= width
 
     page.set_viewport_size(viewport)
-    if surface == "landing":
+    if menu:
+        fast.click()
+        expect(
+            page.get_by_role(
+                "menuitemradio", name="Standard" if surface == "landing" else "Fast", exact=True
+            )
+        ).to_have_attribute("aria-checked", "true")
+        page.get_by_role("menuitemradio", name="Ultrafast", exact=True).click()
+        expect(fast).to_have_attribute("aria-label", "Speed: Ultrafast")
+        assert fast.locator("svg.lucide-zap").count() == 1
+        speed_menu = page.get_by_test_id(
+            "new-chat-speed-menu" if surface == "landing" else "composer-speed-menu"
+        )
+        expect(speed_menu).to_have_count(0)
+        fast.click()
+        expect(page.get_by_role("menuitemradio", name="Ultrafast", exact=True)).to_have_attribute(
+            "aria-checked", "true"
+        )
+        page.get_by_role("menuitemradio", name="Standard", exact=True).click()
+        expect(fast).to_have_attribute("aria-label", "Speed: Standard")
+        assert fast.locator("svg.lucide-zap-off").count() == 1
+        expect(speed_menu).to_have_count(0)
+    elif surface == "landing":
         fast.click()
         expect(fast).to_have_attribute("aria-pressed", "true")
         fast.press("Space")
         expect(fast).to_have_attribute("aria-pressed", "false")
-    else:
-        expect(fast).to_have_attribute("aria-pressed", "true")
+    if surface == "live":
+        if not menu:
+            expect(fast).to_have_attribute("aria-pressed", "true")
         input_field.fill("")
         chat.emit_busy()
         stop = page.get_by_role("button", name="Interrupt", exact=True)

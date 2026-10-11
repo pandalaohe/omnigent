@@ -233,7 +233,7 @@ export function ComposerPermissionPicker({
   );
 }
 
-/** One tap switches between Fast and Standard when the model supports Fast. */
+/** Two Standard/Fast choices toggle directly; other tiers use an icon-triggered menu. */
 export function ComposerSpeedPicker({
   value,
   options,
@@ -247,25 +247,56 @@ export function ComposerSpeedPicker({
   disabled?: boolean;
   testIdPrefix?: string;
 }) {
-  if (!options.some((option) => option.value === "fast")) return null;
-  const fast = value === "fast";
-  const Icon = fast ? ZapIcon : ZapOffIcon;
-  return (
+  if (!options.some((option) => option.value !== "standard")) return null;
+  const toggle =
+    options.length === 2 &&
+    options.some((option) => option.value === "standard") &&
+    options.some((option) => option.value === "fast");
+  const label = options.find((option) => option.value === value)?.label ?? value;
+  const active = value !== "standard";
+  const Icon = active ? ZapIcon : ZapOffIcon;
+  const trigger = (
     <button
       type="button"
       disabled={disabled}
-      aria-label="Fast mode"
-      aria-pressed={fast}
-      title={fast ? "Fast mode on — use Standard" : "Fast mode off — enable Fast"}
+      aria-label={`Speed: ${label}`}
+      aria-pressed={toggle ? active : undefined}
+      title={toggle ? `Speed: ${label} — use ${active ? "Standard" : "Fast"}` : `Speed: ${label}`}
       data-testid={`${testIdPrefix}-speed-trigger`}
-      onClick={() => onSelect(fast ? "standard" : "fast")}
+      onClick={toggle ? () => onSelect(active ? "standard" : "fast") : undefined}
       className={cn(
         "flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg hover:bg-muted/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50 md:size-7",
-        fast ? "text-primary" : "text-muted-foreground",
+        active ? "text-primary" : "text-muted-foreground",
       )}
     >
       <Icon className="size-4" aria-hidden="true" />
     </button>
+  );
+  if (toggle) return trigger;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild disabled={disabled}>
+        {trigger}
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        className="max-w-[calc(100vw-2rem)]"
+        data-testid={`${testIdPrefix}-speed-menu`}
+      >
+        <DropdownMenuRadioGroup value={value} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              className="whitespace-normal break-words"
+              data-testid={`${testIdPrefix}-speed-option-${option.value}`}
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

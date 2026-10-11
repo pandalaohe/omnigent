@@ -294,49 +294,59 @@ describe("running Codex speed and catalog refresh", () => {
     (harness) => {
       useChatStore.setState({ conversationId: "conv_speed", sessionHarness: harness });
       renderWithTooltips(<Composer {...composerProps()} />);
-      expect(screen.queryByRole("button", { name: "Fast mode" })).not.toBeInTheDocument();
+      expect(screen.queryByTestId("composer-speed-trigger")).not.toBeInTheDocument();
     },
   );
 
-  it("retains the confirmed fast toggle after a rejected PATCH", async () => {
-    const errorToast = vi.spyOn(toast, "error");
-    useChatStore.setState({
-      conversationId: "conv_speed",
-      sessionHarness: "codex-native",
-      sessionModelOverride: null,
-      llmModel: "gpt-a",
-    });
-    composerSessionSnapshot.labels = { "omnigent.speed_tier": "fast" };
-    const patch = vi
-      .spyOn(sessionsApi, "updateSession")
-      .mockRejectedValue(new Error("tier rejected"));
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: true,
-          modelPickerKind: "codex",
-          codexModelOptions: [
-            {
-              id: "gpt-a",
-              isDefault: true,
-              serviceTiers: [
-                { id: "priority", name: "Fast" },
-                { id: "ultrafast", name: "Ultrafast" },
-              ],
-            },
-          ],
-        })}
-      />,
-    );
-    const toggle = screen.getByRole("button", { name: "Fast mode" });
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(toggle);
-    await waitFor(() =>
-      expect(patch).toHaveBeenCalledWith("conv_speed", { speedTier: "standard" }),
-    );
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(errorToast).toHaveBeenCalledWith("tier rejected");
-  });
+  it.each([false, true])(
+    "retains the confirmed speed after a rejected PATCH (menu=%s)",
+    async (menu) => {
+      const errorToast = vi.spyOn(toast, "error");
+      useChatStore.setState({
+        conversationId: "conv_speed",
+        sessionHarness: "codex-native",
+        sessionModelOverride: null,
+        llmModel: "gpt-a",
+      });
+      composerSessionSnapshot.labels = { "omnigent.speed_tier": "fast" };
+      const patch = vi
+        .spyOn(sessionsApi, "updateSession")
+        .mockRejectedValue(new Error("tier rejected"));
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "codex",
+            codexModelOptions: [
+              {
+                id: "gpt-a",
+                isDefault: true,
+                serviceTiers: [
+                  { id: "priority", name: "Fast" },
+                  ...(menu ? [{ id: "ultrafast", name: "Ultrafast" }] : []),
+                ],
+              },
+            ],
+          })}
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "Speed: Fast" });
+      if (menu) {
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitemradio", { name: "Ultrafast" }));
+      } else {
+        expect(trigger).toHaveAttribute("aria-pressed", "true");
+        fireEvent.click(trigger);
+      }
+      await waitFor(() =>
+        expect(patch).toHaveBeenCalledWith("conv_speed", {
+          speedTier: menu ? "ultrafast" : "standard",
+        }),
+      );
+      expect(trigger).toHaveAttribute("aria-label", "Speed: Fast");
+      expect(errorToast).toHaveBeenCalledWith("tier rejected");
+    },
+  );
 
   it("refreshes the session-owned catalog on model menu open and reports force failure without dropping rows", async () => {
     useChatStore.setState({ conversationId: "conv_refresh", sessionHarness: "codex-native" });
