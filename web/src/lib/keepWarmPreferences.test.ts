@@ -10,6 +10,7 @@ import {
   clampKeepWarmMaxSeconds,
   KEEP_WARM_DEFAULTS,
   KEEP_WARM_STORAGE_KEY,
+  planKeepWarmCopy,
   readKeepWarmPreferences,
   resolveKeepWarmAgent,
   setKeepWarmAgent,
@@ -111,6 +112,97 @@ describe("keep-warm preferences", () => {
       child: false,
       intervalSeconds: 3300,
       maxSeconds: 14400,
+    });
+  });
+
+  it("copies only selected compatible values without clamping a Claude interval for Codex", () => {
+    const preferences = {
+      agents: {
+        source: {
+          main: true,
+          child: true,
+          intervalSeconds: 3300,
+          maxSeconds: 7200,
+          coldAfterSeconds: 0,
+        },
+        codex: {
+          main: false,
+          child: false,
+          intervalSeconds: 600,
+          maxSeconds: 3600,
+          coldAfterSeconds: 120,
+        },
+        excluded: { main: false, child: false, intervalSeconds: 600, maxSeconds: 3600 },
+      },
+      hostOfflineArchiveSeconds: 0,
+    };
+    const plan = planKeepWarmCopy(
+      preferences,
+      "source",
+      resolveKeepWarmAgent(preferences, "source", "claude"),
+      [
+        { id: "codex", harness: "codex-native" },
+        { id: "unsupported", harness: "opencode-native" },
+        { id: "excluded", harness: "claude-sdk" },
+      ],
+      new Set(["codex", "unsupported"]),
+      new Set(["main", "child", "intervalSeconds", "maxSeconds", "coldAfterSeconds"] as const),
+    );
+
+    expect(plan.results).toEqual([
+      {
+        agentId: "codex",
+        applied: ["main", "child", "maxSeconds", "coldAfterSeconds"],
+        skipped: [{ field: "intervalSeconds", reason: "Outside 5–29 min for this agent" }],
+      },
+      {
+        agentId: "unsupported",
+        applied: [],
+        skipped: ["main", "child", "intervalSeconds", "maxSeconds", "coldAfterSeconds"].map(
+          (field) => ({ field, reason: "This agent has no keep-warm channel" }),
+        ),
+      },
+    ]);
+    expect(plan.preferences.agents.codex).toEqual({
+      main: true,
+      child: true,
+      intervalSeconds: 600,
+      maxSeconds: 7200,
+      coldAfterSeconds: 0,
+    });
+    expect(plan.preferences.agents.excluded).toEqual(preferences.agents.excluded);
+    expect(plan.preferences.agents.unsupported).toBeUndefined();
+    expect(plan.preferences.hostOfflineArchiveSeconds).toBe(0);
+  });
+
+  it("keeps unchecked fields and can copy auto cold-after to an existing row", () => {
+    const preferences = {
+      agents: {
+        source: { main: false, child: false, intervalSeconds: 1500, maxSeconds: 14400 },
+        target: {
+          main: true,
+          child: true,
+          intervalSeconds: 900,
+          maxSeconds: 7200,
+          coldAfterSeconds: 0,
+        },
+      },
+      hostOfflineArchiveSeconds: 14400,
+    };
+    const plan = planKeepWarmCopy(
+      preferences,
+      "source",
+      resolveKeepWarmAgent(preferences, "source", "codex"),
+      [{ id: "target", harness: "claude-native" }],
+      new Set(["target"]),
+      new Set(["main", "coldAfterSeconds"] as const),
+    );
+    expect(plan.results[0].applied).toEqual(["main", "coldAfterSeconds"]);
+    expect(plan.preferences.agents.target).toEqual({
+      main: false,
+      child: true,
+      intervalSeconds: 900,
+      maxSeconds: 7200,
     });
   });
 

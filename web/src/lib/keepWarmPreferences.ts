@@ -120,6 +120,85 @@ export interface AgentKeepWarmPatch {
   coldAfterSeconds?: number | null;
 }
 
+export type KeepWarmCopyField = keyof ResolvedAgentKeepWarm;
+
+export const KEEP_WARM_COPY_FIELDS: readonly KeepWarmCopyField[] = [
+  "main",
+  "child",
+  "intervalSeconds",
+  "maxSeconds",
+  "coldAfterSeconds",
+];
+
+export interface KeepWarmCopyResult {
+  agentId: string;
+  applied: KeepWarmCopyField[];
+  skipped: { field: KeepWarmCopyField; reason: string }[];
+}
+
+/** Preview and apply exactly the same selected, target-valid fields. */
+export function planKeepWarmCopy(
+  preferences: KeepWarmPreferences,
+  sourceId: string,
+  source: ResolvedAgentKeepWarm,
+  targets: readonly KeepWarmAgentIdentity[],
+  selectedTargetIds: ReadonlySet<string>,
+  selectedFields: ReadonlySet<KeepWarmCopyField>,
+): { preferences: KeepWarmPreferences; results: KeepWarmCopyResult[] } {
+  let next = preferences;
+  const results: KeepWarmCopyResult[] = [];
+  for (const target of targets) {
+    if (target.id === sourceId || !selectedTargetIds.has(target.id)) continue;
+    const family = keepWarmFamilyForHarness(target.harness);
+    const result: KeepWarmCopyResult = { agentId: target.id, applied: [], skipped: [] };
+    const patch: AgentKeepWarmPatch = {};
+    for (const field of KEEP_WARM_COPY_FIELDS) {
+      if (!selectedFields.has(field)) continue;
+      const value = source[field];
+      let reason: string | null = null;
+      if (!family) reason = "This agent has no keep-warm channel";
+      else if (field === "intervalSeconds") {
+        const { min, max } = keepWarmIntervalBoundsSeconds(family);
+        if (!Number.isInteger(value) || (value as number) < min || (value as number) > max)
+          reason = `Outside ${min / 60}–${max / 60} min for this agent`;
+      } else if (field === "maxSeconds") {
+        if (
+          !Number.isInteger(value) ||
+          (value as number) < KEEP_WARM_MAX_BOUNDS_SECONDS.min ||
+          (value as number) > KEEP_WARM_MAX_BOUNDS_SECONDS.max
+        )
+          reason = "Outside the supported keep-warm duration";
+      } else if (field === "coldAfterSeconds" && value !== null) {
+        if (
+          !Number.isInteger(value) ||
+          (value as number) < 0 ||
+          ((value as number) !== 0 &&
+            ((value as number) < KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS.min ||
+              (value as number) > KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS.max))
+        )
+          reason = "Outside the supported cold-after duration";
+      }
+      if (reason) result.skipped.push({ field, reason });
+      else {
+        result.applied.push(field);
+        Object.assign(patch, { [field]: value });
+      }
+    }
+    if (family && result.applied.length > 0) {
+      const current = next.agents[target.id];
+      if (!current) {
+        next = setKeepWarmAgent(next, target.id, family, patch);
+      } else {
+        const row = { ...current, ...patch } as AgentKeepWarmPreferences;
+        if (patch.coldAfterSeconds === null) delete row.coldAfterSeconds;
+        next = { ...next, agents: { ...next.agents, [target.id]: row } };
+      }
+    }
+    results.push(result);
+  }
+  return { preferences: next, results };
+}
+
 /** An absent agent row is off; the row is only written when it is first used. */
 export const KEEP_WARM_DEFAULTS: KeepWarmPreferences = {
   agents: {},
