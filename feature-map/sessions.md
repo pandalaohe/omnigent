@@ -19,15 +19,20 @@ the header menu), and each place is a separate entry point.
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
-- `archive-worktree-safety`: the server preference chooses safe deletion or
-  never deletion. Archive checks only the selected session's bound worktree.
-  Dirty, unknown, protected and shared trees remain; branches remain. The UI
-  lists unsafe files and offers Archive only as the default.
+- `archive-worktree-safety`: the account preference chooses never (default),
+  green only, or green and yellow. Green has only committed/rebuildable local
+  files; yellow also has other ignored local files. Source changes, unknown,
+  protected and shared trees remain; branches remain. The first archive of a
+  worktree session prompts with the tiers and Don't ask again. Settings › Git
+  can re-enable asking and edit the rebuildable ignored-directory list. The
+  menu also offers one-time keep and Worktree details.
 - `worktree-marks`: asymmetric tree icons precede session names in the sidebar,
-  Agents tree and current header. Green means clean, orange means dirty,
+  Agents tree and current header. Green means clean/rebuildable, yellow means
+  other local files, and red means uncommitted source changes;
   dashed means unknown, a trunk bar means protected/shared, and an outline
-  means confirmed removed. Mothers aggregate every descendant, including Past;
-  hover names blockers. Merge state is information, not a deletion gate.
+  means confirmed removed. A marker shows its own tree; a count flags child
+  problems, including Past. Hover names at most two blockers; full reasons
+  stay in Worktree details. Merge state is information, not a deletion gate.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -157,7 +162,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`archive-worktree-safety`, settings and UI marks:**
   `tests/e2e_ui/sessions/test_worktree_safe_archive_ui.py` drives real preference
   and archive requests with injected host-status responses for dark/light
-  sidebar, header, Agents/Past rows and blocking-child hover coverage. Actual
+  sidebar, header, Agents/Past rows, blocking-child hover, details and mobile
+  first-archive coverage. Actual
   Git safety/removal is checked by `tests/host/test_git_worktree.py`; server
   archive, tool and keep-warm policy by
   `tests/server/integration/test_sessions_archive.py` and
@@ -317,8 +323,9 @@ plain `uv run pytest`, which starts a private server for the test.
   Open an archived session directly to see it.
 - Safe worktree deletion also applies to tool archive, keep-warm auto archive
   and session rotation. The host checks cleanliness again before removing a
-  linked worktree without force. Missing folders stay unknown unless a matching
-  successful-removal receipt exists. Old hosts without safe removal keep trees.
+  linked worktree without force. Source changes never qualify under any tier.
+  Missing folders stay unknown unless a matching successful-removal receipt
+  exists. Old hosts without the content-policy removal capability keep trees.
   The old browser archive preference migrates once; an existing server choice wins.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone

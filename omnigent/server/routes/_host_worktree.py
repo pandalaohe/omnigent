@@ -111,7 +111,7 @@ class WorktreeHostUnavailableError(WorktreeProxyError):
 
 
 class WorktreeHostRefusalError(WorktreeProxyError):
-    """The host replied that Git refused removal; no directory was removed."""
+    """A pre-send check or the host definitively refused removal."""
 
 
 class FolderFactsUnsupportedError(WorktreeProxyError):
@@ -282,6 +282,8 @@ async def remove_worktree_on_host(
     branch: str | None,
     delete_branch: bool,
     safe_only: bool = False,
+    archive_mode: str | None = None,
+    rebuildable_paths: list[str] | None = None,
 ) -> None:
     """
     Send a ``host.remove_worktree`` frame and await the result.
@@ -301,10 +303,15 @@ async def remove_worktree_on_host(
     :raises WorktreeProxyError: If the host reports a removal failure.
     """
     if safe_only:
-        from omnigent.host.frames import CAP_WORKTREE_SAFE_ARCHIVE
+        from omnigent.host.frames import CAP_WORKTREE_ARCHIVE_CONTENT, CAP_WORKTREE_SAFE_ARCHIVE
 
         if CAP_WORKTREE_SAFE_ARCHIVE not in host_conn.hello.capabilities:
-            raise WorktreeProxyError("host does not support safe archive removal")
+            raise WorktreeHostRefusalError("host does not support safe archive removal")
+        if (
+            archive_mode is not None
+            and CAP_WORKTREE_ARCHIVE_CONTENT not in host_conn.hello.capabilities
+        ):
+            raise WorktreeHostRefusalError("host does not support content-aware archive removal")
     request_id = secrets.token_hex(8)
     frame = encode_host_frame(
         HostRemoveWorktreeFrame(
@@ -313,6 +320,8 @@ async def remove_worktree_on_host(
             branch=branch,
             delete_branch=delete_branch,
             safe_only=safe_only,
+            archive_mode=archive_mode,
+            rebuildable_paths=rebuildable_paths,
         )
     )
     result = await _await_host_worktree_result(
@@ -380,6 +389,42 @@ async def list_worktrees_on_host(
     if not isinstance(worktrees, list):
         raise WorktreeProxyError("host returned an incomplete worktree list")
     return worktrees
+
+
+async def existing_linked_worktree(
+    *, host_registry: HostRegistry | None, host_id: str | None, workspace: str | None
+) -> tuple[str, str] | None:
+    """Find a live linked root containing a validated workspace."""
+    if host_registry is None or host_id is None or workspace is None:
+        return None
+    conn = host_registry.get(host_id)
+    if conn is None:
+        return None
+    from omnigent.host.frames import CAP_WORKTREE_ARCHIVE_CONTENT
+
+    if CAP_WORKTREE_ARCHIVE_CONTENT not in conn.hello.capabilities:
+        return None
+    try:
+        trees = await list_worktrees_on_host(
+            host_registry=host_registry,
+            host_conn=conn,
+            repo_path=workspace,
+            for_cleanup=True,
+        )
+    except (WorktreeProxyError, WorktreeHostUnavailableError):
+        return None
+    from omnigent.server.routes._workspace_validation import _is_subpath_of
+
+    matches = [
+        (tree["path"], tree["branch"])
+        for tree in trees
+        if isinstance(tree.get("path"), str)
+        and isinstance(tree.get("branch"), str)
+        and not tree.get("is_main")
+        and not tree.get("detached")
+        and _is_subpath_of(workspace, tree["path"])
+    ]
+    return max(matches, key=lambda item: len(item[0])) if matches else None
 
 
 # custom-lint: disable-next=workspace-scoped-cache -- task identities keep in-flight work alive

@@ -179,6 +179,8 @@ import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import type { ArchiveWorktreeMode } from "@/lib/archiveWorktreePreferences";
+import { WorktreeDetailsDialog } from "@/components/WorktreeDetailsDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -3446,12 +3448,13 @@ function ConversationList({
       new Promise<boolean>((resolve) => {
         pollingArchivePrompt.requestArchive(
           [conversation],
-          (keepIds) => {
+          (keepIds, worktreeArchiveMode) => {
             void pollingArchive
               .mutateAsync({
                 id: conversation.id,
                 archived: true,
                 keepWorktree: keepIds.has(conversation.id),
+                ...(worktreeArchiveMode ? { worktreeArchiveMode } : {}),
               })
               .then(
                 () => {
@@ -5410,8 +5413,10 @@ function ConversationMenuItems({
   setStopOpen,
   setDeleteOpen,
   setLeaveOpen,
+  setWorktreeDetailsOpen,
   setMenuOpen,
   runArchive,
+  runArchiveAndKeepWorktree,
 }: {
   components: MenuComponents;
   conversation: Conversation;
@@ -5445,10 +5450,12 @@ function ConversationMenuItems({
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
   setLeaveOpen: (open: boolean) => void;
+  setWorktreeDetailsOpen: (open: boolean) => void;
   // Closes the controlled kebab after a project pick; a no-op for the
   // (uncontrolled) context menu, which Radix closes on select automatically.
   setMenuOpen: (open: boolean) => void;
   runArchive: () => void;
+  runArchiveAndKeepWorktree: () => void;
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -5773,6 +5780,16 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
+      {!isArchived && isOwner && (
+        <C.Item data-testid="archive-keep-worktree" onSelect={runArchiveAndKeepWorktree}>
+          <FolderOpenIcon className="size-3.5" />
+          Archive and keep worktree
+        </C.Item>
+      )}
+      <C.Item data-testid="worktree-details" onSelect={() => setWorktreeDetailsOpen(true)}>
+        <FolderGit2Icon className="size-3.5" />
+        Worktree details
+      </C.Item>
       {/* One destructive slot, resolved by ownership — NOT two items. The owner
           deletes the session; a shared-with viewer leaves it (gives up their own
           grant). Non-owners used to get Delete rendered disabled here, an
@@ -6057,6 +6074,7 @@ function ConversationRowImpl({
   }, [isEditing, conversation.id, reportRowEditing]);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
+  const [worktreeDetailsOpen, setWorktreeDetailsOpen] = useState(false);
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
@@ -6372,14 +6390,14 @@ function ConversationRowImpl({
       runUnarchive();
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds) =>
-      archiveNow(keepWorktreeIds.has(conversation.id)),
+    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds, mode) =>
+      archiveNow(keepWorktreeIds.has(conversation.id), mode),
     );
   }
 
-  function archiveNow(keepWorktree: boolean) {
-    // The archive PATCH sends only the flag: the server stops the session (and
-    // tears down a host-spawned runner) in the background once it's committed.
+  function archiveNow(keepWorktree: boolean, worktreeArchiveMode?: ArchiveWorktreeMode) {
+    // The server stops the session (and tears down a host-spawned runner)
+    // in the background once the archive flag commits.
     // A client stop too would race that one against the same runner, and the
     // loser gets a 503 from the already-killed pane.
     //
@@ -6391,7 +6409,12 @@ function ConversationRowImpl({
     // later with a stale `isActive`, which used to jump the user off whatever
     // session they'd switched to meanwhile. Mirrors confirmDelete.
     if (isActive) navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true, keepWorktree });
+    archive.mutate({
+      id: conversation.id,
+      archived: true,
+      keepWorktree,
+      ...(worktreeArchiveMode ? { worktreeArchiveMode } : {}),
+    });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: the optimistic overlay unmounts this row on the next
     // frame, and per-call mutate callbacks don't fire once their observer
@@ -6399,6 +6422,10 @@ function ConversationRowImpl({
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
     showArchiveUndoToast(queryClient, [conversation], navigate);
+  }
+
+  function runArchiveAndKeepWorktree() {
+    if (!isArchived) archiveNow(true);
   }
 
   function runUnarchive() {
@@ -6461,7 +6488,9 @@ function ConversationRowImpl({
     setStopOpen,
     setDeleteOpen,
     setLeaveOpen,
+    setWorktreeDetailsOpen,
     runArchive,
+    runArchiveAndKeepWorktree,
   };
 
   // The clickable row surface. Extracted so it can be rendered bare (selection
@@ -6935,6 +6964,13 @@ function ConversationRowImpl({
           sourceGitBranch={conversation.git_branch}
           open
           onOpenChange={setForkOpen}
+        />
+      )}
+      {worktreeDetailsOpen && (
+        <WorktreeDetailsDialog
+          sessionId={conversation.id}
+          open={worktreeDetailsOpen}
+          onOpenChange={setWorktreeDetailsOpen}
         />
       )}
       <Dialog
@@ -8115,12 +8151,16 @@ function BulkActionBar({
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     const toArchive = nonArchivedSelected;
-    archiveWorktreePrompt.requestArchive(toArchive, (keepWorktreeIds) =>
-      archiveNow(toArchive, keepWorktreeIds),
+    archiveWorktreePrompt.requestArchive(toArchive, (keepWorktreeIds, mode) =>
+      archiveNow(toArchive, keepWorktreeIds, mode),
     );
   }
 
-  function archiveNow(toArchive: Conversation[], keepWorktreeIds: ReadonlySet<string>) {
+  function archiveNow(
+    toArchive: Conversation[],
+    keepWorktreeIds: ReadonlySet<string>,
+    worktreeArchiveMode?: ArchiveWorktreeMode,
+  ) {
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
     // flips their cached `archived` flag in onMutate), so this bar unmounts
     // with the selection. Navigate and deselect NOW rather than in a
@@ -8129,7 +8169,12 @@ function BulkActionBar({
     // session they switched to meanwhile. Mirrors handleDelete.
     if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, keepWorktreeIds });
+    bulkArchive.mutate({
+      ids: toArchive.map((c) => c.id),
+      archived: true,
+      keepWorktreeIds,
+      ...(worktreeArchiveMode ? { worktreeArchiveMode } : {}),
+    });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.

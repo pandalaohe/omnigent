@@ -3699,7 +3699,7 @@ def create_app(
         dependencies=[Depends(require_json_content_type)],
         responses=_preferences_error_responses,
     )
-    async def migrate_worktree_archive(request: Request) -> dict[str, str]:
+    async def migrate_worktree_archive(request: Request) -> dict[str, Any]:
         store = _preferences_store()
         owner, create_if_missing = _preferences_owner(request)
         _check_preference_write_rate(owner)

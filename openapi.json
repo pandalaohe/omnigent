@@ -11128,7 +11128,7 @@
           },
           "delete_worktree": {
             "default": false,
-            "description": "Legacy archive request flag. Deletion still requires the owner's `worktree_archive` preference to be `delete_safe` and the host's safe cleanup checks. Rejected (400) without `archived=True`.",
+            "description": "Legacy archive request flag. Deletion still requires an effective archive tier permitting removal and the host's safe cleanup checks. Rejected (400) without `archived=True`.",
             "title": "Delete Worktree",
             "type": "boolean"
           },
@@ -11146,7 +11146,7 @@
           },
           "keep_worktree": {
             "default": false,
-            "description": "Explicitly preserve this archive revision's bound worktree even when the owner's preference is `delete_safe` and the directory becomes clean after the caller's warning. Requires `archived=True`.",
+            "description": "Explicitly preserve this archive revision's bound worktree even when the owner's preference permits cleanup and the directory becomes clean after the caller's warning. Requires `archived=True`.",
             "title": "Keep Worktree",
             "type": "boolean"
           },
@@ -11299,6 +11299,23 @@
             ],
             "description": "New title, e.g. `\"debugging auth flow\"`. `None` leaves unchanged.",
             "title": "Title"
+          },
+          "worktree_archive_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "never",
+                  "green_only",
+                  "yellow_too"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional tier for this archive request only; leaves the saved account preference unchanged.",
+            "title": "Worktree Archive Mode"
           }
         },
         "title": "UpdateSessionRequest",
@@ -14333,9 +14350,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
+                  "additionalProperties": true,
                   "title": "Response Migrate Worktree Archive V1 Me Preferences Worktree Archive Migrate Post",
                   "type": "object"
                 }

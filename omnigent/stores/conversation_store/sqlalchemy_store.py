@@ -111,6 +111,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
     ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     FORK_CARRY_HISTORY_LABEL_KEY,
@@ -169,7 +170,11 @@ def _host_binding_admission(method: _BindingWrite) -> _BindingWrite:
         undo_archive = (
             "archived" in signature.parameters and bound.arguments.get("archived") is False
         )
-        if "archived" in signature.parameters and not undo_archive:
+        archive_intent = bound.arguments.get("archived") is True and (
+            bound.arguments.get("delete_worktree") is True
+            or bound.arguments.get("keep_worktree") is True
+        )
+        if "archived" in signature.parameters and not undo_archive and not archive_intent:
             return method(self, *args, **kwargs)
         conversation_id = bound.arguments.get("conversation_id")
         while True:
@@ -498,6 +503,7 @@ def _new_session_metadata_row(
     runner_id: str | None = None,
     workspace: str | None = None,
     worktree: str | None = None,
+    git_branch: str | None = None,
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
     host_id: str | None = None,
@@ -533,6 +539,7 @@ def _new_session_metadata_row(
         inference_snapshot=inference_snapshot,
         workspace=workspace,
         worktree=worktree,
+        git_branch=git_branch,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
@@ -4819,6 +4826,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
         keep_worktree: bool = False,
+        worktree_archive_mode: str | None = None,
+        override_keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> ConversationUpdateResult | None:
         """
@@ -5025,6 +5034,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                             {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(row.archive_revision)},
                             now,
                         )
+                        if worktree_archive_mode is not None:
+                            mode_intent = f"{row.archive_revision}:{worktree_archive_mode}"
+                            _upsert_labels(
+                                ap_sess,
+                                conversation_id,
+                                {ARCHIVE_WORKTREE_MODE_LABEL_KEY: mode_intent},
+                                now,
+                            )
                     else:
                         # An archive without the flag and an unarchive both void
                         # the prior revision's delete intent; drop the stale row.
@@ -5033,6 +5050,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
                                 SqlConversationLabel.conversation_id == conversation_id,
                                 SqlConversationLabel.key == ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+                            )
+                        )
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARCHIVE_WORKTREE_MODE_LABEL_KEY,
                             )
                         )
                     if archived and keep_worktree:
@@ -5051,6 +5075,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                             )
                         )
                     ap_changed = True
+                elif archived and row.archived and keep_worktree:
+                    _upsert_labels(
+                        ap_sess,
+                        conversation_id,
+                        {ARCHIVE_KEEP_WORKTREE_LABEL_KEY: str(row.archive_revision)},
+                        now,
+                    )
+                    ap_changed = True
                 elif archived and row.archived and close_cli_on_archive and delete_worktree:
                     # A delete on an already-archived session is a delete-only
                     # close request for the current revision: no transition,
@@ -5064,6 +5096,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                         {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(row.archive_revision)},
                         now,
                     )
+                    if override_keep_worktree:
+                        ap_sess.execute(
+                            delete(SqlConversationLabel).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.key == ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
+                            )
+                        )
+                    if worktree_archive_mode is not None:
+                        mode_intent = f"{row.archive_revision}:{worktree_archive_mode}"
+                        _upsert_labels(
+                            ap_sess,
+                            conversation_id,
+                            {ARCHIVE_WORKTREE_MODE_LABEL_KEY: mode_intent},
+                            now,
+                        )
                     row.archive_close_requested_revision = row.archive_revision
                     row.archive_close_completed_revision = None
                     row.archive_close_last_error = None
@@ -5142,6 +5190,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
         keep_worktree: bool = False,
+        worktree_archive_mode: str | None = None,
+        override_keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """Update a conversation, preserving the legacy return contract."""
@@ -5165,6 +5215,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             archive_stop_when_idle=archive_stop_when_idle,
             delete_worktree=delete_worktree,
             keep_worktree=keep_worktree,
+            worktree_archive_mode=worktree_archive_mode,
+            override_keep_worktree=override_keep_worktree,
             reported_model=reported_model,
         )
         return result.conversation if result is not None else None
@@ -6481,6 +6533,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         model_override: str | None = None,
         workspace: str | None = None,
         worktree: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -6560,6 +6613,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             model_override=model_override,
             workspace=workspace,
             worktree=worktree,
+            git_branch=git_branch,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
@@ -6583,6 +6637,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         model_override: str | None = None,
         workspace: str | None = None,
         worktree: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -6668,6 +6723,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 project_id=project_id,
                 workspace=workspace,
                 worktree=worktree,
+                git_branch=git_branch,
                 terminal_launch_args=terminal_launch_args,
                 host_id=host_id,
                 inference_snapshot=encoded_inference_snapshot,

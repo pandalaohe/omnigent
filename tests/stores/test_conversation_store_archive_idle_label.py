@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from omnigent.stores.conversation_store import (
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ARCHIVE_WORKTREE_MODE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -232,3 +234,41 @@ def test_delete_worktree_on_an_archived_session_reopens_the_close(
     assert re_requested.archive_close_requested_revision == revision
     assert re_requested.archive_close_completed_revision is None
     assert re_requested.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(revision)
+
+
+def test_later_owner_delete_request_supersedes_previous_keep_for_same_revision(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    kept = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        keep_worktree=True,
+    )
+    assert kept is not None
+    assert kept.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(kept.archive_revision)
+
+    retry = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="yellow_too",
+    )
+    assert retry is not None
+    assert retry.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(retry.archive_revision)
+
+    delete = conversation_store.update_conversation(
+        conv.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="green_only",
+        override_keep_worktree=True,
+    )
+    assert delete is not None
+    assert ARCHIVE_KEEP_WORKTREE_LABEL_KEY not in delete.labels
+    assert delete.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(delete.archive_revision)
+    assert delete.labels[ARCHIVE_WORKTREE_MODE_LABEL_KEY] == (
+        f"{delete.archive_revision}:green_only"
+    )

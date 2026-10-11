@@ -2,9 +2,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useWorktreeStatus, type WorktreeState } from "@/hooks/useWorktreeStatus";
 import { cn } from "@/lib/utils";
 
-const LABELS: Record<WorktreeState, string> = {
+export const WORKTREE_LABELS: Record<WorktreeState, string> = {
   none: "No worktree",
-  clean: "Worktrees clean",
+  clean: "Clean or rebuildable worktree",
+  local: "Worktree has local files",
   dirty: "Worktree has uncommitted changes",
   unknown: "Worktree status unknown",
   protected: "Worktree kept by rule",
@@ -64,22 +65,40 @@ export function WorktreeStatusMark({
 }) {
   const { data, supported, isError, isFetching } = useWorktreeStatus(sessionId);
   if (!sessionId || !supported) return null;
-  const state: WorktreeState = isError || isFetching || !data ? "unknown" : data.aggregate.state;
-  if (state === "none") return null;
-  const label = LABELS[state];
-  const blockers = data?.blockers ?? [];
+  const state: WorktreeState = isError || isFetching || !data ? "unknown" : data.own.state;
+  const label = WORKTREE_LABELS[state];
+  const blockers = (data?.blockers ?? []).filter(
+    (blocker) =>
+      blocker.session_id !== sessionId &&
+      !(
+        blocker.state === "protected" &&
+        ["project entry", "main checkout"].includes(blocker.reason ?? "")
+      ),
+  );
+  if (state === "none" && blockers.length === 0) return null;
+  const action =
+    state === "clean" || state === "local"
+      ? "follows archive setting"
+      : state === "removed"
+        ? "branch kept"
+        : state === "none"
+          ? "no directory to remove"
+          : "kept on archive";
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
           tabIndex={0}
           role="img"
-          aria-label={label}
+          aria-label={
+            blockers.length ? `${label}; ${blockers.length} child worktrees need attention` : label
+          }
           data-worktree-state={state}
           className={cn(
-            "inline-flex size-5 shrink-0 items-center justify-center rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            "relative inline-flex size-5 shrink-0 items-center justify-center rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
             state === "clean" && "text-success",
-            state === "dirty" && "text-warning",
+            state === "local" && "text-warning",
+            state === "dirty" && "text-destructive",
             state === "unknown" && "text-muted-foreground",
             (state === "protected" || state === "shared") && "text-foreground opacity-70",
             state === "removed" && "text-muted-foreground opacity-45",
@@ -87,31 +106,27 @@ export function WorktreeStatusMark({
           )}
         >
           <TreeGlyph state={state} />
+          {blockers.length > 0 && (
+            <span
+              className="absolute -right-1 -top-1 rounded bg-warning px-0.5 text-[9px] leading-3 text-zinc-950"
+              aria-hidden="true"
+            >
+              {blockers.length}
+            </span>
+          )}
         </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" className="flex-col items-start gap-1">
-        <span className="font-medium">{label}</span>
-        {data?.aggregate.reason && <span>{data.aggregate.reason}</span>}
-        {data?.own.branch && <span>Branch: {data.own.branch} (kept on archive)</span>}
-        {data?.own.merged !== null && data?.own.merged !== undefined && (
-          <span>
-            {data.own.merged ? "Merged" : "Not merged"}
-            {data.own.merge_target ? ` into ${data.own.merge_target}` : ""}. Merge state does not
-            affect safe deletion.
-          </span>
-        )}
-        {data && data.session_count > 1 && (
-          <span>
-            This session: {LABELS[data.own.state]}
-            {data.own.reason ? ` — ${data.own.reason}` : ""}
-          </span>
-        )}
-        {blockers.map((blocker) => (
-          <span key={blocker.session_id}>
-            {blocker.title}: {LABELS[blocker.state]}
-            {blocker.reason ? ` — ${blocker.reason}` : ""}
+        <span className="font-medium">
+          {label} · {action}
+        </span>
+        {blockers.slice(0, 2).map((blocker) => (
+          <span key={blocker.session_id} className="max-w-full truncate">
+            {blocker.title}: {WORKTREE_LABELS[blocker.state]}
           </span>
         ))}
+        {blockers.length > 2 && <span>{blockers.length - 2} more child worktrees</span>}
+        <span className="text-xs opacity-75">Session menu → Worktree details</span>
       </TooltipContent>
     </Tooltip>
   );

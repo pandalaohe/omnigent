@@ -838,7 +838,11 @@ async def test_worktree_status_hides_paths_and_files_until_workspace_sharing(
         permission_store=permissions,
         auth_provider=UnifiedAuthProvider(source="header"),
     )
-    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    conn = SimpleNamespace(
+        hello=SimpleNamespace(
+            capabilities=["worktree_safe_archive_v1", "worktree_archive_content_v1"]
+        )
+    )
     app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
 
     async def _list(**kwargs):
@@ -871,9 +875,13 @@ async def test_worktree_status_hides_paths_and_files_until_workspace_sharing(
         conversations.update_conversation(child.id, share_workspace_files=True)
         async with _client(app, _GRANTEE) as viewer:
             shared = (await viewer.get(f"/v1/sessions/{child.id}/worktree-status")).json()
-            assert shared["own"]["files"] == [{"path": "private.txt", "status": "??"}]
+            assert shared["own"]["files"] == [
+                {"path": "private.txt", "status": "??", "kind": "source"}
+            ]
             assert shared["own"]["path"] is None
         async with _client(app, _OWNER) as owner:
             owned = (await owner.get(f"/v1/sessions/{child.id}/worktree-status")).json()
             assert owned["own"]["path"] == child_path
-            assert owned["own"]["files"] == [{"path": "private.txt", "status": "??"}]
+            assert owned["own"]["files"] == [
+                {"path": "private.txt", "status": "??", "kind": "source"}
+            ]

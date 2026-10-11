@@ -80,6 +80,38 @@ describe("fetchSessionWorktreeStatus", () => {
     fetchMock.mockResolvedValue(response({ detail: "host unavailable" }, 503));
     await expect(fetchSessionWorktreeStatus("one")).rejects.toThrow("HTTP 503");
   });
+
+  it("accepts yellow local files and per-file classification", async () => {
+    fetchMock.mockResolvedValue(
+      response({
+        ...status,
+        own: {
+          ...status.own,
+          state: "local",
+          files: [
+            { path: "node_modules/", status: "!!", kind: "rebuildable" },
+            { path: "local-notes.md", status: "!!", kind: "local" },
+          ],
+        },
+        aggregate: { state: "local", reason: "local files" },
+      }),
+    );
+    const result = await fetchSessionWorktreeStatus("one");
+    expect(result.own.state).toBe("local");
+    expect(result.own.files[1].kind).toBe("local");
+  });
+
+  it("rejects an unknown file classification", async () => {
+    fetchMock.mockResolvedValue(
+      response({
+        ...status,
+        own: { ...status.own, files: [{ path: "notes.md", status: "??", kind: "disposable" }] },
+      }),
+    );
+    await expect(fetchSessionWorktreeStatus("one")).rejects.toThrow(
+      "Invalid worktree status response",
+    );
+  });
 });
 
 describe("useWorktreeStatus", () => {

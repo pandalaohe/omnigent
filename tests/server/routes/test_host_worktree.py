@@ -321,6 +321,26 @@ async def test_safe_archive_sends_safe_flag_to_capable_host(host_setup: HostRegi
     assert sent.delete_branch is False
 
 
+async def test_archive_content_requires_new_host_capability(host_setup: HostRegistry) -> None:
+    registry = host_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append("worktree_safe_archive_v1")
+    before = len(registry._sent_frames_for_test)  # type: ignore[attr-defined]
+    with pytest.raises(WorktreeProxyError, match="content-aware"):
+        await remove_worktree_on_host(
+            host_registry=registry,
+            host_conn=conn,
+            worktree_path="/opt/work/sample-app/tree",
+            branch="feature/topic",
+            delete_branch=False,
+            safe_only=True,
+            archive_mode="yellow_too",
+            rebuildable_paths=["node_modules/"],
+        )
+    assert len(registry._sent_frames_for_test) == before  # type: ignore[attr-defined]
+
+
 async def test_remove_worktree_failure_surfaced(host_setup: HostRegistry) -> None:
     """A host ``status: failed`` remove reply raises with the error."""
     registry = host_setup

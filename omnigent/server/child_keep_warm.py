@@ -1121,13 +1121,14 @@ class ChildKeepWarmSweeper:
                 getattr(getattr(self._app, "state", None), "user_preferences_store", None),
                 owner,
             )
-            close_for_cleanup = archive_mode == "delete_safe" and bool(conv.git_branch)
+            close_for_cleanup = archive_mode != "never" and bool(conv.git_branch)
             updated = await asyncio.to_thread(
                 store.update_conversation,
                 conv.id,
                 archived=True,
                 close_cli_on_archive=close_for_cleanup,
                 delete_worktree=close_for_cleanup,
+                worktree_archive_mode=archive_mode if close_for_cleanup else None,
             )
         except Exception:
             await _clear_provenance()

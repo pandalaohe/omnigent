@@ -191,6 +191,8 @@ async def register_worktree_host(
         workspace: str | None = None,
         canonical_path: Callable[[str], str] | None = None,
         place_like_host: bool = False,
+        existing_branch: str | None = None,
+        existing_root: str | None = None,
         owner: str = RESERVED_USER_LOCAL,
         app_override: FastAPI | None = None,
     ) -> _HostCapture:
@@ -199,7 +201,12 @@ async def register_worktree_host(
         conn = target_app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
-            hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
+            hello=HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="wt-host",
+                capabilities=["worktree_archive_content_v1"] if existing_branch else [],
+            ),
             owner=owner,
         )
         cap = _HostCapture()
@@ -274,7 +281,9 @@ async def register_worktree_host(
                                 }
                             )
                 elif isinstance(frame, HostListWorktreesFrame):
-                    branch = cap.create[-1].branch_name if cap.create else None
+                    branch = existing_branch or (
+                        cap.create[-1].branch_name if cap.create else None
+                    )
                     fut = conn.pending_list_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(
@@ -282,7 +291,7 @@ async def register_worktree_host(
                                 "status": "ok",
                                 "worktrees": [
                                     {
-                                        "path": frame.repo_path,
+                                        "path": existing_root or frame.repo_path,
                                         "branch": branch,
                                         "is_main": False,
                                     }
@@ -589,6 +598,92 @@ async def test_create_with_existing_worktree_persists_without_creating(
     body = resp.json()
     assert body["git_branch"] == "feature/existing"
     assert body["workspace"] == _SOURCE_REPO
+
+
+async def test_workspace_only_create_records_live_linked_tree_from_nested_directory(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    root = "/opt/work/sample-app/topic"
+    workspace = f"{root}/packages/app"
+    cap = register_worktree_host(existing_branch="feature/topic", existing_root=root)
+    agent = await create_test_agent(client, name="workspace-bound-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": workspace},
+    )
+    assert response.status_code == 201, response.text
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(response.json()["id"])
+    assert row is not None
+    assert row.workspace == workspace
+    assert row.worktree == root
+    assert row.git_branch == "feature/topic"
+    assert row.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(root)
+    assert cap.create == []
+    assert cap.remove == []
+
+
+async def test_bundled_workspace_only_create_records_live_linked_tree(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    root = "/opt/work/sample-app/bundled-topic"
+    cap = register_worktree_host(existing_branch="feature/bundled", existing_root=root)
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_id": _HOST_ID, "workspace": f"{root}/src"})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="workspace-bundled-agent"),
+                "application/gzip",
+            )
+        },
+    )
+    assert response.status_code == 201, response.text
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(response.json()["session_id"])
+    assert row is not None
+    assert row.workspace == f"{root}/src"
+    assert row.worktree == root
+    assert row.git_branch == "feature/bundled"
+    assert WORKTREE_ROOT_LABEL_KEY in row.labels
+    assert cap.create == []
+
+
+async def test_workspace_only_create_failure_keeps_preexisting_tree(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cap = register_worktree_host(
+        existing_branch="feature/existing", existing_root="/opt/work/sample-app/existing"
+    )
+    agent = await create_test_agent(client, name="workspace-failure-agent")
+
+    def fail_create(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("simulated persistence failure")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", fail_create)
+    with pytest.raises(RuntimeError, match="simulated persistence failure"):
+        await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": "/opt/work/sample-app/existing/src",
+            },
+        )
+    assert cap.create == []
+    assert cap.remove == []
 
 
 async def test_create_with_invalid_existing_worktree_branch_fails_400(

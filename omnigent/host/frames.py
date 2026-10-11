@@ -75,6 +75,7 @@ CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
 # that advertise it (older runners would forward an unknown type to the harness).
 CAP_KEEP_WARM = "keep_warm_v1"
 CAP_WORKTREE_SAFE_ARCHIVE = "worktree_safe_archive_v1"
+CAP_WORKTREE_ARCHIVE_CONTENT = "worktree_archive_content_v1"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -84,6 +85,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FS_READ_RAW,
     CAP_KEEP_WARM,
     CAP_WORKTREE_SAFE_ARCHIVE,
+    CAP_WORKTREE_ARCHIVE_CONTENT,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
@@ -834,6 +836,8 @@ class HostRemoveWorktreeFrame:
     branch: str | None = None
     delete_branch: bool = False
     safe_only: bool = False
+    archive_mode: str | None = None
+    rebuildable_paths: list[str] | None = None
 
 
 @dataclass
@@ -1885,6 +1889,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch": frame.branch,
                 "delete_branch": frame.delete_branch,
                 "safe_only": frame.safe_only,
+                "archive_mode": frame.archive_mode,
+                "rebuildable_paths": frame.rebuildable_paths,
             }
         )
     if isinstance(frame, HostRemoveWorktreeResultFrame):
@@ -3020,12 +3026,21 @@ def _decode_remove_worktree(msg: _JsonObject) -> HostRemoveWorktreeFrame:
     safe_only = msg.get("safe_only", False)
     if not isinstance(safe_only, bool):
         raise ValueError("frame field must be a bool: 'safe_only'")
+    archive_mode = _optional_nullable_str(msg, "archive_mode")
+    rebuildable_paths = msg.get("rebuildable_paths")
+    if rebuildable_paths is not None and (
+        not isinstance(rebuildable_paths, list)
+        or not all(isinstance(item, str) for item in rebuildable_paths)
+    ):
+        raise ValueError("frame field must be a list of strings: 'rebuildable_paths'")
     return HostRemoveWorktreeFrame(
         request_id=_required_str(msg, "request_id"),
         worktree_path=_required_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
         delete_branch=delete_branch,
         safe_only=safe_only,
+        archive_mode=archive_mode,
+        rebuildable_paths=rebuildable_paths,
     )
 
 

@@ -29,6 +29,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
+import type { ArchiveWorktreeMode } from "@/lib/archiveWorktreePreferences";
 import { getOmnigentHostGeneration } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
@@ -1077,13 +1078,16 @@ export async function archiveConversation(
   id: string,
   archived: boolean,
   keepWorktree = false,
+  worktreeArchiveMode?: ArchiveWorktreeMode,
 ): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(
-      archived && keepWorktree ? { archived, keep_worktree: true } : { archived },
-    ),
+    body: JSON.stringify({
+      archived,
+      ...(archived && keepWorktree ? { keep_worktree: true } : {}),
+      ...(archived && worktreeArchiveMode ? { worktree_archive_mode: worktreeArchiveMode } : {}),
+    }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
@@ -1300,11 +1304,13 @@ export function useArchiveConversation() {
       id,
       archived,
       keepWorktree = false,
+      worktreeArchiveMode,
     }: {
       id: string;
       archived: boolean;
       keepWorktree?: boolean;
-    }) => archiveConversation(id, archived, keepWorktree),
+      worktreeArchiveMode?: ArchiveWorktreeMode;
+    }) => archiveConversation(id, archived, keepWorktree, worktreeArchiveMode),
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
       if (archived && context?.marked !== undefined) {
@@ -1691,14 +1697,18 @@ export function useBulkArchiveConversations() {
       ids,
       archived,
       keepWorktreeIds,
+      worktreeArchiveMode,
     }: {
       ids: string[];
       archived: boolean;
       /** Retain these trees even if they become clean after the warning. */
       keepWorktreeIds?: ReadonlySet<string>;
+      worktreeArchiveMode?: ArchiveWorktreeMode;
     }) => {
       const results = await Promise.allSettled(
-        ids.map((id) => archiveConversation(id, archived, keepWorktreeIds?.has(id) === true)),
+        ids.map((id) =>
+          archiveConversation(id, archived, keepWorktreeIds?.has(id) === true, worktreeArchiveMode),
+        ),
       );
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {

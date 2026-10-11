@@ -17,6 +17,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+    ARCHIVE_WORKTREE_MODE_LABEL_KEY,
 )
 from omnigent.stores.host_store import host_is_live
 
@@ -75,7 +76,7 @@ class ArchiveCloseCoordinator:
         )
         return (
             await asyncio.to_thread(read_worktree_archive_mode, self._preferences_store, owner)
-            == "delete_safe"
+            != "never"
         )
 
     async def cleanup_archived_without_close(self, session_id: str, revision: int) -> None:
@@ -730,13 +731,25 @@ class ArchiveCloseCoordinator:
         if root.labels.get(ARCHIVE_KEEP_WORKTREE_LABEL_KEY) == str(revision):
             return
         from omnigent.server.session_collab import collab_owner_for
-        from omnigent.server.user_preferences_store import read_worktree_archive_mode
+        from omnigent.server.user_preferences_store import (
+            read_worktree_archive_preference_for_cleanup,
+        )
 
         owner = await asyncio.to_thread(
             collab_owner_for, root, self._conversation_store, self._permission_store
         )
-        mode = await asyncio.to_thread(read_worktree_archive_mode, self._preferences_store, owner)
-        if mode != "delete_safe":
+        preference = await asyncio.to_thread(
+            read_worktree_archive_preference_for_cleanup, self._preferences_store, owner
+        )
+        if preference is None:
+            return
+        recorded_mode = root.labels.get(ARCHIVE_WORKTREE_MODE_LABEL_KEY)
+        mode = (
+            recorded_mode.split(":", 1)[1]
+            if recorded_mode is not None and recorded_mode.startswith(f"{revision}:")
+            else preference["mode"]
+        )
+        if mode == "never":
             return
         removed = await remove_archived_worktree_best_effort(
             root,
@@ -744,6 +757,8 @@ class ArchiveCloseCoordinator:
             project_host_binding_store=self._project_host_binding_store,
             conversation_store=self._conversation_store,
             exclude_conversation_id=root_id,
+            archive_mode=mode,
+            rebuildable_paths=preference["rebuildable_paths"],
         )
         if removed:
             current = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)

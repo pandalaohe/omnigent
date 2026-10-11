@@ -18,6 +18,7 @@ import {
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
+  FolderOpenIcon,
   GitBranchIcon,
   GitForkIcon,
   InfoIcon,
@@ -91,6 +92,8 @@ import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import type { ArchiveWorktreeMode } from "@/lib/archiveWorktreePreferences";
+import { WorktreeDetailsDialog } from "@/components/WorktreeDetailsDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -182,6 +185,7 @@ export function HeaderConversationMenu({
   const { data: deleteComments } = useComments(deleteOpen ? conversation.id : undefined);
   const deleteCommentsLine = unhandledCommentsDeleteLine(deleteComments ?? []);
   const [archivePending, setArchivePending] = useState(false);
+  const [worktreeDetailsOpen, setWorktreeDetailsOpen] = useState(false);
   const mountedRef = useRef(false);
   const archiveRequestRef = useRef(false);
   const currentConversationIdRef = useRef(conversation.id);
@@ -256,6 +260,7 @@ export function HeaderConversationMenu({
     setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
     setStopOpen(false);
+    setWorktreeDetailsOpen(false);
     setDeleteBranch(false);
   }, [conversation.id, conversation.title]);
 
@@ -321,12 +326,12 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds) => {
-      void archiveNow(keepWorktreeIds.has(conversation.id));
+    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds, mode) => {
+      void archiveNow(keepWorktreeIds.has(conversation.id), mode);
     });
   };
 
-  const archiveNow = async (keepWorktree: boolean) => {
+  const archiveNow = async (keepWorktree: boolean, worktreeArchiveMode?: ArchiveWorktreeMode) => {
     if (!mountedRef.current || currentConversationIdRef.current !== conversation.id) return;
     if (archiveRequestRef.current || archive.isPending) return;
     archiveRequestRef.current = true;
@@ -335,7 +340,12 @@ export function HeaderConversationMenu({
     const requestedLocation = location;
 
     try {
-      await archive.mutateAsync({ id: requestedConversationId, archived: true, keepWorktree });
+      await archive.mutateAsync({
+        id: requestedConversationId,
+        archived: true,
+        keepWorktree,
+        ...(worktreeArchiveMode ? { worktreeArchiveMode } : {}),
+      });
     } catch {
       // useArchiveConversation owns the error toast and optimistic-cache
       // rollback. Staying on this route makes the restored session usable.
@@ -596,6 +606,26 @@ export function HeaderConversationMenu({
         )}
         {isArchived ? "Unarchive" : isMobile ? "Archive this session" : "Archive"}
       </DropdownMenuItem>
+      {!isArchived && canManage && (
+        <DropdownMenuItem
+          data-testid="header-archive-keep-worktree"
+          className={itemClass}
+          disabled={archivePending || archive.isPending}
+          onSelect={() => {
+            closeMenu();
+            void archiveNow(true);
+          }}
+        >
+          <FolderOpenIcon className="size-3.5" /> Archive and keep worktree
+        </DropdownMenuItem>
+      )}
+      <DropdownMenuItem
+        data-testid="header-worktree-details"
+        className={itemClass}
+        onSelect={() => setWorktreeDetailsOpen(true)}
+      >
+        <InfoIcon className="size-3.5" /> Worktree details
+      </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
         className={itemClass}
@@ -680,6 +710,13 @@ export function HeaderConversationMenu({
       </DropdownMenu>
 
       {archiveWorktreePrompt.dialog}
+      {worktreeDetailsOpen && (
+        <WorktreeDetailsDialog
+          sessionId={conversation.id}
+          open={worktreeDetailsOpen}
+          onOpenChange={setWorktreeDetailsOpen}
+        />
+      )}
       <Dialog open={stopOpen} onOpenChange={setStopOpen}>
         <DialogContent>
           <DialogHeader>

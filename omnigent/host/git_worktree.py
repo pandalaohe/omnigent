@@ -417,7 +417,9 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
     ]
 
 
-def read_worktree_status(path: str) -> dict[str, object]:
+def read_worktree_status(
+    path: str, rebuildable_paths: list[str] | None = None
+) -> dict[str, object]:
     """Read filename-only dirt and informational merge state for one linked tree."""
     status = _run_git(
         ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
@@ -426,12 +428,27 @@ def read_worktree_status(path: str) -> dict[str, object]:
     )
     if status.returncode != 0:
         raise _git_error("git status failed", status)
+    from omnigent.worktree_archive import (
+        DEFAULT_REBUILDABLE_PATHS,
+        file_kind,
+        validate_rebuildable_paths,
+    )
+
+    paths = validate_rebuildable_paths(
+        DEFAULT_REBUILDABLE_PATHS if rebuildable_paths is None else rebuildable_paths
+    )
     parts = status.stdout.split("\0")
     files: list[dict[str, str]] = []
     index = 0
     while index < len(parts) and parts[index]:
         part = parts[index]
-        files.append({"path": part[3:], "status": part[:2]})
+        files.append(
+            {
+                "path": part[3:],
+                "status": part[:2],
+                "kind": file_kind(part[3:], part[:2], paths),
+            }
+        )
         if "R" in part[:2] or "C" in part[:2]:
             index += 1  # NUL porcelain adds the old name after a rename/copy.
         index += 1
@@ -1117,6 +1134,8 @@ def remove_worktree(
     branch: str | None = None,
     delete_branch: bool = False,
     safe_only: bool = False,
+    archive_mode: str | None = None,
+    rebuildable_paths: list[str] | None = None,
 ) -> None:
     """Remove a git worktree and optionally delete its branch.
 
@@ -1149,10 +1168,28 @@ def remove_worktree(
         raise _git_error("could not resolve worktree root", root)
     if os.path.normcase(root.stdout.strip()) != os.path.normcase(os.path.abspath(worktree_path)):
         raise WorktreeError(f"path is not the expected worktree root: {worktree_path}")
+    if archive_mode is not None and not safe_only:
+        raise WorktreeError("archive mode requires safe removal")
     if safe_only:
+        from omnigent.worktree_archive import (
+            ARCHIVE_MODES,
+            DEFAULT_REBUILDABLE_PATHS,
+            archive_can_remove,
+            validate_rebuildable_paths,
+            worktree_state,
+        )
+
         if delete_branch or branch is None:
             raise WorktreeError("safe archive requires a retained branch")
-        entries = list_worktrees(repo_path=worktree_path)
+        if archive_mode is not None and archive_mode not in ARCHIVE_MODES:
+            raise WorktreeError("invalid archive mode")
+        try:
+            paths = validate_rebuildable_paths(
+                DEFAULT_REBUILDABLE_PATHS if rebuildable_paths is None else rebuildable_paths
+            )
+        except ValueError as exc:
+            raise WorktreeError(str(exc)) from exc
+        entries = list_worktrees(repo_path=worktree_path, for_cleanup=True)
         target = next(
             (
                 entry
@@ -1163,12 +1200,37 @@ def remove_worktree(
         )
         if target is None or target.is_main or target.detached or target.branch != branch:
             raise WorktreeError("worktree binding changed or is protected")
-        status = _run_git(
-            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
-            cwd=worktree_path,
-        )
-        if status.returncode != 0 or status.stdout:
+        status = read_worktree_status(worktree_path, paths)
+        files = status["files"]
+        assert isinstance(files, list)
+        if archive_mode is None and files:
             raise WorktreeError("worktree is dirty or status is unavailable")
+        state = worktree_state(files)
+        if archive_mode is not None and not archive_can_remove(state, archive_mode):
+            raise WorktreeError("worktree is dirty or archive tier excludes local files")
+        refreshed = next(
+            (
+                entry
+                for entry in list_worktrees(repo_path=worktree_path, for_cleanup=True)
+                if os.path.normcase(entry.path) == os.path.normcase(root.stdout.strip())
+            ),
+            None,
+        )
+        if (
+            refreshed is None
+            or refreshed.is_main
+            or refreshed.detached
+            or refreshed.branch != branch
+        ):
+            raise WorktreeError("worktree binding changed during archive cleanup")
+        fresh_files = read_worktree_status(worktree_path, paths)["files"]
+        assert isinstance(fresh_files, list)
+        if archive_mode is None and fresh_files:
+            raise WorktreeError("worktree changed during archive cleanup")
+        if archive_mode is not None and not archive_can_remove(
+            worktree_state(fresh_files), archive_mode
+        ):
+            raise WorktreeError("worktree changed during archive cleanup")
     remove_result = _run_git(
         ["worktree", "remove", *([] if safe_only else ["--force"]), root.stdout.strip()],
         cwd=main_repo,

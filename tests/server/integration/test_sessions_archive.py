@@ -40,6 +40,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ARCHIVE_WORKTREE_MODE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -813,6 +814,7 @@ async def test_worktree_status_includes_archived_child_and_requires_a_removal_re
     assert payload["aggregate"]["state"] == "unknown"
     assert payload["blockers"][0]["session_id"] == child.id
     assert payload["blockers"][0]["state"] == "unknown"
+    assert payload["blockers"][0]["reason"] == "host update required for archive content policy"
 
     store.set_labels(child.id, {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: "1"})
     removed = await client.get(f"/v1/sessions/{child.id}/worktree-status")
@@ -850,6 +852,44 @@ async def test_keep_worktree_archive_override_survives_delete_safe_preference(
     assert row is not None
     assert row.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(row.archive_revision)
     remove.assert_not_awaited()
+    retry = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": True})
+    assert retry.status_code == 200
+    retained = store.get_conversation(session["id"])
+    assert retained is not None
+    assert retained.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(row.archive_revision)
+
+
+async def test_retried_one_time_tier_preserves_same_revision_keep(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="tier-retry-keep")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        session["id"],
+        "0123456789abcdef0123456789abcdef",
+        workspace="/opt/work/sample-app/tier-retry",
+        git_branch="feature/tier-retry",
+    )
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "never"})
+    url = f"/v1/sessions/{session['id']}"
+    original = await client.patch(
+        url, json={"archived": True, "worktree_archive_mode": "yellow_too"}
+    )
+    assert original.status_code == 200
+    kept = await client.patch(url, json={"archived": True, "keep_worktree": True})
+    assert kept.status_code == 200
+    before = store.get_conversation(session["id"])
+    assert before is not None
+    assert before.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(before.archive_revision)
+
+    retry = await client.patch(url, json={"archived": True, "worktree_archive_mode": "yellow_too"})
+    assert retry.status_code == 200
+    after = store.get_conversation(session["id"])
+    assert after is not None
+    assert after.archive_revision == before.archive_revision
+    assert after.labels[ARCHIVE_KEEP_WORKTREE_LABEL_KEY] == str(after.archive_revision)
 
 
 async def test_never_preference_preserves_worktree_despite_legacy_delete_request(
@@ -879,6 +919,34 @@ async def test_never_preference_preserves_worktree_despite_legacy_delete_request
     remove.assert_not_awaited()
 
 
+async def test_one_time_archive_tier_overrides_global_never_without_saving_it(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="one-time-tier")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        session["id"],
+        "0123456789abcdef0123456789abcdef",
+        workspace="/opt/work/sample-app/one-time",
+        git_branch="feature/one-time",
+    )
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "never"})
+    response = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"archived": True, "worktree_archive_mode": "yellow_too"},
+    )
+    await _drain_detached_stops()
+    assert response.status_code == 200
+    row = store.get_conversation(session["id"])
+    assert row is not None
+    assert row.labels[ARCHIVE_WORKTREE_MODE_LABEL_KEY] == f"{row.archive_revision}:yellow_too"
+    assert preferences.get(RESERVED_USER_LOCAL)["settings"]["worktree_archive"] == {
+        "mode": "never"
+    }
+
+
 async def test_worktree_status_aggregate_prioritizes_dirty_over_unknown(
     app, client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -901,7 +969,11 @@ async def test_worktree_status_aggregate_prioritizes_dirty_over_unknown(
         workspace="/opt/work/sample-app/unknown",
         git_branch="feature/unknown",
     )
-    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    conn = SimpleNamespace(
+        hello=SimpleNamespace(
+            capabilities=["worktree_safe_archive_v1", "worktree_archive_content_v1"]
+        )
+    )
     app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
 
     async def list_for_path(**kwargs):
@@ -926,6 +998,40 @@ async def test_worktree_status_aggregate_prioritizes_dirty_over_unknown(
         dirty.id: "dirty",
         unknown.id: "unknown",
     }
+
+
+async def test_worktree_status_distinguishes_ignored_local_and_source(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session = await create_test_session(client, name="status-content")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "0123456789abcdef0123456789abcdef"
+    root = "/opt/work/sample-app/content"
+    store.set_host_id(session["id"], host_id, workspace=root, git_branch="feature/content")
+    conn = SimpleNamespace(
+        hello=SimpleNamespace(
+            capabilities=["worktree_safe_archive_v1", "worktree_archive_content_v1"]
+        )
+    )
+    app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
+    with patch(
+        "omnigent.server.routes._host_worktree.list_worktrees_on_host",
+        AsyncMock(
+            return_value=[
+                {
+                    "path": root,
+                    "branch": "feature/content",
+                    "is_main": False,
+                    "detached": False,
+                    "files": [{"path": "private-cache/", "status": "!!"}],
+                }
+            ]
+        ),
+    ):
+        response = await client.get(f"/v1/sessions/{session['id']}/worktree-status")
+    assert response.status_code == 200
+    assert response.json()["own"]["state"] == "local"
+    assert response.json()["own"]["files"][0]["kind"] == "local"
 
 
 async def test_worktree_status_protects_sibling_project_entry_under_recorded_root(
@@ -960,7 +1066,11 @@ async def test_worktree_status_without_recorded_branch_uses_live_linked_binding(
     host_id = "0123456789abcdef0123456789abcdef"
     store.set_host_id(session["id"], host_id, workspace=f"{root}/packages/app", worktree=root)
     store.set_labels(session["id"], {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)})
-    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=["worktree_safe_archive_v1"]))
+    conn = SimpleNamespace(
+        hello=SimpleNamespace(
+            capabilities=["worktree_safe_archive_v1", "worktree_archive_content_v1"]
+        )
+    )
     app.state.host_registry = SimpleNamespace(get=lambda _host_id: conn)
     with patch(
         "omnigent.server.routes._host_worktree.list_worktrees_on_host",
@@ -1891,8 +2001,12 @@ async def test_client_cannot_seed_the_archive_deferral_label(
     assert listed.json()["archived"] is False
 
 
+@pytest.mark.parametrize(
+    "label_key", [ARCHIVE_DELETE_WORKTREE_LABEL_KEY, ARCHIVE_WORKTREE_MODE_LABEL_KEY]
+)
 async def test_client_cannot_seed_the_archive_worktree_delete_label(
     client: httpx.AsyncClient,
+    label_key: str,
 ) -> None:
     """A client-supplied worktree-delete label is rejected like other reserved keys."""
     session = await create_test_session(client, name="archive-forged-delete-label")
@@ -1902,7 +2016,7 @@ async def test_client_cannot_seed_the_archive_worktree_delete_label(
         f"/v1/sessions/{session_id}",
         json={
             "archived": True,
-            "labels": {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: "1"},
+            "labels": {label_key: "1"},
         },
     )
     assert resp.status_code == 400

@@ -2120,6 +2120,18 @@ def test_remove_worktree_frame_round_trip() -> None:
     assert decoded == original
 
 
+def test_archive_content_frame_round_trip() -> None:
+    frame = HostRemoveWorktreeFrame(
+        request_id="archive-1",
+        worktree_path="/opt/work/sample-app/topic",
+        branch="feature/topic",
+        safe_only=True,
+        archive_mode="yellow_too",
+        rebuildable_paths=["cache/generated/"],
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
 def test_remove_worktree_frame_non_bool_delete_branch_raises() -> None:
     """Verify a non-bool delete_branch is rejected, not coerced.
 
