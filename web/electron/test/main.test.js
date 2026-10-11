@@ -239,6 +239,7 @@ function loadNavigationHarness({
   const appEvents = new Map();
   const webContents = {
     id: 1,
+    getOSProcessId: () => 123,
     send: (channel, data) => calls.progress.push({ channel, data }),
     stop() {},
     reload() {
@@ -315,6 +316,9 @@ function loadNavigationHarness({
     app: {
       isPackaged,
       getPath: () => userData,
+      getAppMetrics: () => [
+        { pid: 123, memory: { workingSetSize: 1200, peakWorkingSetSize: 2400 } },
+      ],
       setName: () => {},
       setPath: () => {},
       setBadgeCount: () => true,
@@ -646,6 +650,7 @@ function loadNavigationHarness({
     settingsPath: path.join(userData, "settings.json"),
     pickers,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
+    emitApp: (eventName, ...args) => appEvents.get(eventName)?.({}, ...args),
     emitWindow: (eventName) => {
       for (const listener of winListeners.get(eventName) ?? []) listener();
     },
@@ -661,6 +666,39 @@ function loadNavigationHarness({
     },
   };
 }
+
+describe("desktop diagnostics wiring", () => {
+  it("persists main-window renderer and GPU failures in packaged Windows builds", (t) => {
+    const h = loadNavigationHarness({ isPackaged: true, omnigentBuild: "dev", platform: "win32" });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    h.webContents.emitWith("console-message", {
+      level: "error",
+      message: "Renderer failed",
+      sourceId: "https://app.example/app.js",
+      lineNumber: 1,
+    });
+    h.emit("unresponsive");
+    h.emit("responsive");
+    h.emit("render-process-gone", { reason: "crashed", exitCode: 9 });
+    h.emitApp("child-process-gone", { type: "GPU", reason: "crashed", exitCode: 1 });
+    const file = path.join(path.dirname(h.settingsPath), "logs", "desktop.log");
+    const records = fs.readFileSync(file, "utf8").trim().split("\n").map(JSON.parse);
+    assert.deepEqual(
+      records.map((record) => record.event),
+      [
+        "console-message",
+        "unresponsive",
+        "responsive",
+        "render-process-gone",
+        "child-process-gone",
+      ],
+    );
+    assert.equal(records[1].rendererPid, 123);
+    assert.equal(records[1].memoryKB.workingSetSize, 1200);
+    assert.equal(h.calls.reloads, 0);
+  });
+});
 
 describe("Arca auto-connect wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
