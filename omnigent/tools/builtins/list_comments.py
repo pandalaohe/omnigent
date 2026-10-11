@@ -33,7 +33,8 @@ class ListCommentsTool(Tool):
         return (
             "List review comments for the current session. "
             "Returns comments with the file path, selected text, "
-            "character range, and comment body. Use this to see "
+            "location, and comment body. Rendered text and PDF comments include a decoded "
+            "location; their numeric range fields are not source offsets. Use this to see "
             "what the user has flagged before addressing each item."
         )
 

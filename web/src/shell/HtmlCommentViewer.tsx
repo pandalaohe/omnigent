@@ -42,13 +42,19 @@ import {
   anchorOccurrence,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
-  findAnchorInSource,
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
 import { AnnotationComposer } from "./AnnotationComposer";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useHtmlAnnotate } from "./useHtmlAnnotate";
+import { isElementAnchor } from "./annotationAnchor";
+import { isPdfAnchor } from "./pdfCommentHelpers";
+import {
+  decodeRenderedTextAnchor,
+  encodeRenderedTextAnchor,
+  isRenderedTextAnchor,
+} from "./renderedTextAnchor";
 
 // Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
 const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
@@ -69,7 +75,7 @@ interface HtmlCommentViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** Lifts the page the frame currently displays (null once it unmounts). */
   onFrameChange?: (frame: { path: string; source: string } | null) => void;
-  /** Reports the ids of this page's element annotations that no longer resolve. */
+  /** Reports the ids of rendered text or element comments that no longer resolve. */
   onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
 }
 
@@ -86,11 +92,23 @@ function genNonce(): string {
   return randomUUID();
 }
 
-/** Bridge payload for one comment: its id, anchor text, and which occurrence of
- * that text (by source offset) it belongs to — so repeated anchor text such as
- * a title reused in the body highlights only the commented instance. */
+/** Typed comments carry their rendered quote and context back into the frame.
+ * Historical source-offset comments use their old occurrence hint only when
+ * the stored source slice still equals the quote. */
 function commentPayload(source: string, c: Comment) {
   const anchor = c.anchor_content ?? "";
+  if (!anchor || isElementAnchor(anchor) || isPdfAnchor(anchor)) return null;
+  if (isRenderedTextAnchor(anchor)) {
+    const rendered = decodeRenderedTextAnchor(anchor);
+    return {
+      id: c.id,
+      anchor_content: rendered?.text ?? "",
+      anchor: rendered?.kind === "html" ? rendered : null,
+    };
+  }
+  if (c.start_index === 0 && c.end_index === 0) return { id: c.id, anchor_content: "", occ: -1 };
+  if (source.slice(c.start_index, c.end_index) !== anchor)
+    return { id: c.id, anchor_content: "", occ: -1 };
   return {
     id: c.id,
     anchor_content: anchor,
@@ -101,6 +119,15 @@ function commentPayload(source: string, c: Comment) {
 /** Bridge payload for the active selection, or null. */
 function activePayload(source: string, sel: ActiveSelection | null) {
   if (!sel) return null;
+  if (!sel.anchor_content || isElementAnchor(sel.anchor_content) || isPdfAnchor(sel.anchor_content))
+    return null;
+  if (isRenderedTextAnchor(sel.anchor_content)) {
+    const anchor = decodeRenderedTextAnchor(sel.anchor_content);
+    return anchor?.kind === "html"
+      ? { anchor_content: anchor.text, anchor, comment_id: sel.comment_id }
+      : null;
+  }
+  if (sel.start_index === 0 && sel.end_index === 0) return null;
   return {
     anchor_content: sel.anchor_content,
     occ: anchorOccurrence(source, sel.anchor_content, sel.start_index),
@@ -381,6 +408,7 @@ export function HtmlCommentViewer({
   }, []);
   const portRef = useRef<MessagePort | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
+  const [renderedOrphans, setRenderedOrphans] = useState<ReadonlySet<string>>(new Set());
 
   // Single writer for the displayed page: keeps displayedPathRef in lockstep
   // with the state the `ready` handler compares against.
@@ -422,6 +450,7 @@ export function HtmlCommentViewer({
     setFramePath(null);
     showPage(null);
     setBridgeMissing(false);
+    setRenderedOrphans(new Set());
   }, [conversationId, path, isEmbed, showPage]);
 
   // The entry's source is known as soon as its fetch lands. A refresh replaces
@@ -555,17 +584,21 @@ export function HtmlCommentViewer({
         // The displayed page's own source has not arrived yet: anchoring now
         // would compute offsets against the previous page's bytes.
         if (sourcePendingRef.current) return;
-        const offsets = findAnchorInSource(sourceRef.current, msg.text, msg.occ);
+        const anchorContent = encodeRenderedTextAnchor({
+          v: 1,
+          kind: "html",
+          text: msg.text,
+          occ: msg.occ,
+          prefix: msg.prefix,
+          suffix: msg.suffix,
+          ...(msg.selector ? { selector: msg.selector } : {}),
+        });
+        if (!anchorContent) return;
         // Selecting a range that already has a comment activates it (which
         // scrolls the panel to its card) rather than offering to add a new one.
-        const existing =
-          offsets &&
-          commentsRef.current.find(
-            (c) =>
-              c.status === "draft" &&
-              c.start_index === offsets.start_index &&
-              c.end_index === offsets.end_index,
-          );
+        const existing = commentsRef.current.find(
+          (c) => c.status === "draft" && c.anchor_content === anchorContent,
+        );
         if (existing) {
           onSetActiveSelectionRef.current({
             start_index: existing.start_index,
@@ -580,9 +613,9 @@ export function HtmlCommentViewer({
         setFloating({
           x: rect.left + msg.rect.left,
           y: rect.top + msg.rect.top - 6,
-          start_index: offsets?.start_index ?? 0,
-          end_index: offsets?.end_index ?? 0,
-          anchor_content: msg.text,
+          start_index: 0,
+          end_index: 0,
+          anchor_content: anchorContent,
         });
       } else if (msg.type === BRIDGE_MSG.commentClick) {
         if (sourcePendingRef.current) return;
@@ -607,6 +640,11 @@ export function HtmlCommentViewer({
         const resolved = resolveFrameLinkPath(msg.href, msg.base, path, root, home);
         if (resolved) openFileRef.current?.(resolved);
         else showToast(`Can't open ${msg.href}`);
+      } else if (msg.type === BRIDGE_MSG.orphans) {
+        const textIds = new Set(
+          commentsRef.current.filter((c) => commentPayload(sourceRef.current, c)).map((c) => c.id),
+        );
+        setRenderedOrphans(new Set(msg.ids.filter((id) => textIds.has(id))));
       }
     };
 
@@ -619,7 +657,9 @@ export function HtmlCommentViewer({
         source: BRIDGE_SOURCE,
         nonce,
         type: BRIDGE_MSG.setComments,
-        comments: commentsRef.current.map((c) => commentPayload(sourceRef.current, c)),
+        comments: commentsRef.current
+          .map((c) => commentPayload(sourceRef.current, c))
+          .filter((c) => c !== null),
       });
       port.postMessage({
         source: BRIDGE_SOURCE,
@@ -630,6 +670,7 @@ export function HtmlCommentViewer({
     };
 
     const onLoad = () => {
+      setRenderedOrphans(new Set());
       // A different document is loading: source fetches for the old one are
       // obsolete even before its `ready` arrives.
       navGenRef.current += 1;
@@ -681,7 +722,7 @@ export function HtmlCommentViewer({
       source: BRIDGE_SOURCE,
       nonce,
       type: BRIDGE_MSG.setComments,
-      comments: comments.map((c) => commentPayload(activeSource, c)),
+      comments: comments.map((c) => commentPayload(activeSource, c)).filter((c) => c !== null),
     });
   }, [comments, activeSource, nonce]);
 
@@ -734,8 +775,8 @@ export function HtmlCommentViewer({
   // Lift the orphan set so the comments panel can label those cards; the ref
   // keeps a fresh handler without re-running on every parent render.
   useEffect(() => {
-    onAnnotationOrphansChangeRef.current?.(annotate.orphanIds);
-  }, [annotate.orphanIds]);
+    onAnnotationOrphansChangeRef.current?.(new Set([...annotate.orphanIds, ...renderedOrphans]));
+  }, [annotate.orphanIds, renderedOrphans]);
 
   // When the composer closes (submit, cancel, mode off), focus returns to the
   // frame so the mode's shortcut and Escape work without a click.

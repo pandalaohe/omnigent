@@ -11,7 +11,6 @@ import {
   buildAnnotateScript,
   buildBridgeScript,
   buildCaptureScript,
-  findAnchorInSource,
   HTML_COMMENT_BRIDGE_RUNTIME,
   injectCommentBridge,
   parseBridgeMessage,
@@ -210,6 +209,8 @@ describe("parseBridgeMessage", () => {
         type: BRIDGE_MSG.selection,
         text: "Design Goals",
         occ: 2,
+        prefix: "before ",
+        suffix: " after",
         rect: { left: 1, top: 2, right: 3, bottom: 4 },
       },
       NONCE,
@@ -218,11 +219,13 @@ describe("parseBridgeMessage", () => {
       type: BRIDGE_MSG.selection,
       text: "Design Goals",
       occ: 2,
+      prefix: "before ",
+      suffix: " after",
       rect: { left: 1, top: 2, right: 3, bottom: 4 },
     });
   });
 
-  it("defaults occ to 0 when a selection message omits it (older frame)", () => {
+  it("rejects a selection message missing disambiguating context", () => {
     const msg = parseBridgeMessage(
       {
         ...base,
@@ -232,13 +235,21 @@ describe("parseBridgeMessage", () => {
       },
       NONCE,
     );
-    expect(msg).toMatchObject({ type: BRIDGE_MSG.selection, occ: 0 });
+    expect(msg).toBeNull();
   });
 
   it("round-trips anchor text containing quotes and newlines", () => {
     const text = 'He said "hi"\nthen left';
     const msg = parseBridgeMessage(
-      { ...base, type: BRIDGE_MSG.selection, text, rect: { left: 0, top: 0, right: 0, bottom: 0 } },
+      {
+        ...base,
+        type: BRIDGE_MSG.selection,
+        text,
+        occ: 0,
+        prefix: "",
+        suffix: "",
+        rect: { left: 0, top: 0, right: 0, bottom: 0 },
+      },
       NONCE,
     );
     expect(msg && "text" in msg && msg.text).toBe(text);
@@ -333,106 +344,6 @@ describe("parseBridgeMessage", () => {
     ).toBeNull();
     expect(parseBridgeMessage("not-an-object", NONCE)).toBeNull();
     expect(parseBridgeMessage(null, NONCE)).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// findAnchorInSource — rendered selection text -> raw HTML source offsets
-// ---------------------------------------------------------------------------
-
-describe("findAnchorInSource", () => {
-  it("returns exact offsets when the anchor is a verbatim substring", () => {
-    const src = "<h1>Title</h1><p>The quick brown fox.</p>";
-    const res = findAnchorInSource(src, "quick brown fox");
-    expect(res).not.toBeNull();
-    expect(src.slice(res!.start_index, res!.end_index)).toBe("quick brown fox");
-  });
-
-  it("trims the anchor before matching", () => {
-    const src = "<p>hello world</p>";
-    const res = findAnchorInSource(src, "  hello world  ");
-    expect(src.slice(res!.start_index, res!.end_index)).toBe("hello world");
-  });
-
-  it("tolerates collapsed whitespace via a normalized fallback", () => {
-    // Rendered selection collapses the newline+indent the source spells out.
-    const src = "<p>Design\n      goals matter</p>";
-    const res = findAnchorInSource(src, "Design goals matter");
-    expect(res).not.toBeNull();
-    expect(src.slice(res!.start_index, res!.end_index)).toBe("Design\n      goals matter");
-  });
-
-  it("returns null when the anchor is empty or absent", () => {
-    expect(findAnchorInSource("<p>hi</p>", "   ")).toBeNull();
-    expect(findAnchorInSource("<p>hi</p>", "not present anywhere")).toBeNull();
-  });
-
-  it("picks the first occurrence for repeated text by default", () => {
-    const src = "alpha beta alpha";
-    const res = findAnchorInSource(src, "alpha");
-    expect(res).toEqual({ start_index: 0, end_index: 5 });
-  });
-
-  it("resolves the requested occurrence for repeated text", () => {
-    // "Aurora Sync" as a title, then again in body prose — selecting the body
-    // copy (occurrence 1) must anchor to the SECOND match, not the first.
-    const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
-    const first = src.indexOf("Aurora Sync");
-    const second = src.indexOf("Aurora Sync", first + 1);
-    expect(findAnchorInSource(src, "Aurora Sync", 0)).toEqual({
-      start_index: first,
-      end_index: first + "Aurora Sync".length,
-    });
-    expect(findAnchorInSource(src, "Aurora Sync", 1)).toEqual({
-      start_index: second,
-      end_index: second + "Aurora Sync".length,
-    });
-  });
-
-  it("resolves a later occurrence even when an earlier one is whitespace-wrapped", () => {
-    const src = "<p>then\n   latency</p><p>then latency again</p>";
-    const second = src.indexOf("then latency again");
-    expect(findAnchorInSource(src, "then latency", 1)).toEqual({
-      start_index: second,
-      end_index: second + "then latency".length,
-    });
-  });
-
-  it("anchors occurrence 0 to the wrapped first copy, not a later verbatim one", () => {
-    // Regression: the old occurrence-0 fast path used a verbatim indexOf, which
-    // skipped the whitespace-wrapped first rendered copy and landed on the
-    // second (verbatim) one — storing the comment at the wrong offset.
-    const src = "<p>then\n   latency</p><p>then latency</p>";
-    const firstWrapped = src.indexOf("then\n   latency");
-    const res = findAnchorInSource(src, "then latency", 0);
-    expect(res).not.toBeNull();
-    expect(res!.start_index).toBe(firstWrapped);
-    expect(src.slice(res!.start_index, res!.end_index)).toBe("then\n   latency");
-  });
-
-  it("skips matches inside tags/attributes when counting occurrences", () => {
-    // "Submit" appears first in an attribute (non-rendered), then as button
-    // text. Occurrence 0 must resolve to the rendered text, not the attribute.
-    const src = '<button aria-label="Submit">Submit</button>';
-    const rendered = src.indexOf("Submit</button>");
-    const res = findAnchorInSource(src, "Submit", 0);
-    expect(res).not.toBeNull();
-    expect(res!.start_index).toBe(rendered);
-  });
-
-  it("skips matches inside <title>, comments, and <script>", () => {
-    const src =
-      "<head><title>Report</title></head>" +
-      "<!-- Report draft -->" +
-      "<script>var x = 'Report';</script>" +
-      "<h1>Report</h1>";
-    const heading = src.lastIndexOf("Report");
-    const res = findAnchorInSource(src, "Report", 0);
-    expect(res!.start_index).toBe(heading);
-  });
-
-  it("returns null when the requested occurrence doesn't exist", () => {
-    expect(findAnchorInSource("only once here", "once", 3)).toBeNull();
   });
 });
 
@@ -541,6 +452,218 @@ describe("omni-html-bridge.js runtime", () => {
   afterEach(() => {
     for (const win of windows) win.close();
     windows.length = 0;
+  });
+
+  it("captures the selected rendered copy and paints it after reload; stale context stays orphaned", async () => {
+    const win = startBridge(BUNDLE_URL, NONCE);
+    win.document.body.innerHTML =
+      "<p>Alpha &amp; <em>Code</em></p><p>Beta &amp; <strong>Code</strong></p>";
+    const highlights = new Map<string, { ranges: Range[] }>();
+    (win as unknown as { CSS: unknown }).CSS = {
+      highlights: {
+        set: (name: string, value: { ranges: Range[] }) => highlights.set(name, value),
+      },
+    };
+    (win as unknown as { Highlight: unknown }).Highlight = class {
+      ranges: Range[];
+      constructor(...ranges: Range[]) {
+        this.ranges = ranges;
+      }
+    };
+    const channel = new MessageChannel();
+    const messages: Record<string, unknown>[] = [];
+    channel.port2.onmessage = (ev) => messages.push(ev.data as Record<string, unknown>);
+    win.dispatchEvent(
+      new win.MessageEvent("message", {
+        data: { source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.init },
+        ports: [channel.port1],
+      }),
+    );
+    await flushPorts();
+
+    const second = win.document.querySelector("strong")!.firstChild!;
+    const range = win.document.createRange();
+    range.setStart(second, 0);
+    range.setEnd(second, 4);
+    Object.defineProperty(range, "getClientRects", {
+      value: () => [{ left: 0, top: 0, right: 20, bottom: 12 }],
+    });
+    win.getSelection()!.removeAllRanges();
+    win.getSelection()!.addRange(range);
+    second.parentElement!.dispatchEvent(new win.MouseEvent("mouseup", { bubbles: true }));
+    await flushPorts();
+    const captured = messages.find((m) => m.type === BRIDGE_MSG.selection)!;
+    expect(captured).toMatchObject({ text: "Code", occ: 1 });
+    expect(captured.prefix).toContain("Beta & ");
+    const anchor = {
+      v: 1,
+      kind: "html",
+      text: captured.text,
+      occ: captured.occ,
+      prefix: captured.prefix,
+      suffix: captured.suffix,
+      selector: captured.selector,
+    };
+
+    channel.port2.postMessage({
+      type: BRIDGE_MSG.setComments,
+      comments: [{ id: "c2", anchor_content: "Code", anchor }],
+    });
+    await flushPorts();
+    expect(highlights.get("omni-comment")?.ranges.map((r) => r.toString())).toEqual(["Code"]);
+    expect(messages.at(-1)).toMatchObject({ type: BRIDGE_MSG.orphans, ids: [] });
+
+    const spanning = win.document.createRange();
+    spanning.setStart(win.document.querySelectorAll("p")[1].firstChild!, 0);
+    spanning.setEnd(second, 4);
+    Object.defineProperty(spanning, "getClientRects", {
+      value: () => [{ left: 0, top: 0, right: 80, bottom: 12 }],
+    });
+    win.getSelection()!.removeAllRanges();
+    win.getSelection()!.addRange(spanning);
+    second.parentElement!.dispatchEvent(new win.MouseEvent("mouseup", { bubbles: true }));
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({ type: BRIDGE_MSG.selection, text: "Beta & Code" });
+
+    win.document.body.innerHTML =
+      "<p>Alpha &amp; <em>Code</em></p><p>Gamma &amp; <strong>Code</strong></p>";
+    channel.port2.postMessage({
+      type: BRIDGE_MSG.setComments,
+      comments: [{ id: "c2", anchor_content: "Code", anchor }],
+    });
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({ type: BRIDGE_MSG.orphans, ids: ["c2"] });
+    expect(highlights.get("omni-comment")?.ranges).toEqual([]);
+    win.document.body.innerHTML = "<p>Code</p><p>Code</p>";
+    channel.port2.postMessage({
+      type: BRIDGE_MSG.setComments,
+      comments: [
+        {
+          id: "ambiguous",
+          anchor_content: "Code",
+          anchor: {
+            v: 1,
+            kind: "html",
+            text: "Code",
+            occ: 1,
+            prefix: "",
+            suffix: "",
+            selector: "p:nth-of-type(2)",
+          },
+        },
+        { id: "legacy-zero", anchor_content: "", occ: -1 },
+      ],
+    });
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({
+      type: BRIDGE_MSG.orphans,
+      ids: ["ambiguous", "legacy-zero"],
+    });
+    const before = "😀" + "a".repeat(31);
+    const after = "b".repeat(31) + "😀";
+    win.document.body.innerHTML = `<span>${before}Code${after}</span>`;
+    const textNode = win.document.querySelector("span")!.firstChild!;
+    const emojiRange = win.document.createRange();
+    emojiRange.setStart(textNode, before.length);
+    emojiRange.setEnd(textNode, before.length + 4);
+    Object.defineProperty(emojiRange, "getClientRects", {
+      value: () => [{ left: 0, top: 0, right: 20, bottom: 12 }],
+    });
+    win.getSelection()!.removeAllRanges();
+    win.getSelection()!.addRange(emojiRange);
+    textNode.parentElement!.dispatchEvent(new win.MouseEvent("mouseup", { bubbles: true }));
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({
+      type: BRIDGE_MSG.selection,
+      text: "Code",
+      prefix: "a".repeat(31),
+      suffix: "b".repeat(31),
+    });
+    win.document.body.textContent =
+      "A".repeat(32) +
+      "Code" +
+      "B".repeat(32) +
+      ("X".repeat(32) + "Code" + "Y".repeat(32)).repeat(1002) +
+      "A".repeat(32) +
+      "Code" +
+      "B".repeat(32);
+    channel.port2.postMessage({
+      type: BRIDGE_MSG.setComments,
+      comments: [
+        {
+          id: "late-duplicate",
+          anchor_content: "Code",
+          anchor: {
+            v: 1,
+            kind: "html",
+            text: "Code",
+            occ: 0,
+            prefix: "A".repeat(32),
+            suffix: "B".repeat(32),
+          },
+        },
+      ],
+    });
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({ type: BRIDGE_MSG.orphans, ids: ["late-duplicate"] });
+    expect(highlights.get("omni-comment")?.ranges).toEqual([]);
+    win.document.body.innerHTML = "<p>Alpha</p><p>Beta</p>";
+    const blocks = win.document.querySelectorAll("p");
+    const blockRange = win.document.createRange();
+    blockRange.setStart(blocks[0].firstChild!, 0);
+    blockRange.setEnd(blocks[1].firstChild!, 4);
+    Object.defineProperty(blockRange, "getClientRects", {
+      value: () => [{ left: 0, top: 0, right: 80, bottom: 12 }],
+    });
+    win.getSelection()!.removeAllRanges();
+    win.getSelection()!.addRange(blockRange);
+    // jsdom has no layout; Chromium inserts paragraph breaks in Selection text.
+    Object.defineProperty(win.getSelection()!, "toString", {
+      value: () => "Alpha\n\nBeta",
+      configurable: true,
+    });
+    blocks[1].dispatchEvent(new win.MouseEvent("mouseup", { bubbles: true }));
+    await flushPorts();
+    const crossBlock = messages.at(-1)!;
+    expect(crossBlock).toMatchObject({ type: BRIDGE_MSG.selection, text: "Alpha\n\nBeta" });
+    channel.port2.postMessage({
+      type: BRIDGE_MSG.setComments,
+      comments: [
+        {
+          id: "blocks",
+          anchor_content: crossBlock.text,
+          anchor: {
+            v: 1,
+            kind: "html",
+            text: crossBlock.text,
+            occ: crossBlock.occ,
+            prefix: crossBlock.prefix,
+            suffix: crossBlock.suffix,
+          },
+        },
+      ],
+    });
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({ type: BRIDGE_MSG.orphans, ids: [] });
+    expect(highlights.get("omni-comment")?.ranges).toHaveLength(1);
+
+    win.document.body.innerHTML = "<p>Al<em>pha</em></p>";
+    Reflect.deleteProperty(win.getSelection()!, "toString");
+    const inlineRange = win.document.createRange();
+    inlineRange.setStart(win.document.querySelector("p")!.firstChild!, 0);
+    inlineRange.setEnd(win.document.querySelector("em")!.firstChild!, 3);
+    Object.defineProperty(inlineRange, "getClientRects", {
+      value: () => [{ left: 0, top: 0, right: 50, bottom: 12 }],
+    });
+    win.getSelection()!.removeAllRanges();
+    win.getSelection()!.addRange(inlineRange);
+    win.document
+      .querySelector("em")!
+      .dispatchEvent(new win.MouseEvent("mouseup", { bubbles: true }));
+    await flushPorts();
+    expect(messages.at(-1)).toMatchObject({ type: BRIDGE_MSG.selection, text: "Alpha" });
+    channel.port1.close();
+    channel.port2.close();
   });
 
   it("registers nothing when the script carries no nonce", async () => {

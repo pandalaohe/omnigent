@@ -30,6 +30,7 @@ import {
   createCommentDecorationExtension,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
+import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
 
 const CONTENT = "The quick brown fox jumps over the lazy dog.";
 
@@ -84,6 +85,7 @@ interface RenderOpts {
   ) => void;
   pendingBodyRef?: RefObject<string>;
   canEdit?: boolean;
+  onOrphansChange?: (ids: ReadonlySet<string>) => void;
 }
 
 function renderPlugin(opts: RenderOpts = {}) {
@@ -99,6 +101,7 @@ function renderPlugin(opts: RenderOpts = {}) {
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={opts.pendingBodyRef}
       canEdit={opts.canEdit}
+      onOrphansChange={opts.onOrphansChange}
     />,
   );
   return { ...utils, onSetActiveSelection };
@@ -121,6 +124,48 @@ describe("MarkdownCommentPlugin render", () => {
     editor = makeEditor();
     renderPlugin();
     expect(document.querySelector("[data-add-comment-btn]")).toBeNull();
+  });
+});
+
+describe("rendered anchor orphan reporting", () => {
+  it("reports stale Markdown context and clears it when the quote resolves", () => {
+    editor = makeEditor();
+    const onOrphansChange = vi.fn();
+    const stale = makeComment({
+      anchor_content: encodeRenderedTextAnchor({
+        v: 1,
+        kind: "markdown",
+        text: "quick",
+        occ: 0,
+        prefix: "Old ",
+        suffix: " brown",
+      })!,
+    });
+    const fresh = makeComment({
+      anchor_content: encodeRenderedTextAnchor({
+        v: 1,
+        kind: "markdown",
+        text: "quick",
+        occ: 0,
+        prefix: "The ",
+        suffix: " brown",
+      })!,
+    });
+    const view = renderPlugin({ comments: [stale], onOrphansChange });
+    expect(onOrphansChange).toHaveBeenLastCalledWith(new Set(["c1"]));
+    view.rerender(
+      <MarkdownCommentPlugin
+        editor={editor}
+        contentRef={contentRef}
+        commentStateRef={commentStateRef}
+        comments={[fresh]}
+        isDirty={false}
+        activeSelection={null}
+        onSetActiveSelection={vi.fn()}
+        onOrphansChange={onOrphansChange}
+      />,
+    );
+    expect(onOrphansChange).toHaveBeenLastCalledWith(new Set());
   });
 });
 

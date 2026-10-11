@@ -5,16 +5,15 @@
 //   appears above the selection (rendered by MarkdownCommentPlugin).  Clicking
 //   it creates a transient "pending" ProseMirror Decoration (blue highlight)
 //   so the range stays visible while the user types in the comment textarea,
-//   then calls onSetActiveSelection with absolute char offsets into the raw
-//   file.  Existing comments are highlighted as yellow spans via Decorations
+//   then calls onSetActiveSelection with rendered text offsets and a typed
+//   anchor. Existing comments are highlighted as yellow spans via Decorations
 //   that remap automatically through transactions.
 //
 // Key design choices:
 //   • Decorations never touch the document → markdown serialisation is clean.
 //   • Comment anchor mapping uses doc.textBetween("\n") for plain-text offsets,
 //     avoiding markdown-syntax drift.
-//   • ProseMirror positions are stable integers; binary search maps text
-//     offsets to PM positions without bespoke offset-inversion code.
+//   • ProseMirror text nodes map rendered offsets to editor ranges.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
@@ -105,6 +104,7 @@ interface MarkdownRichTextViewerProps {
   /** Called when the search bar is closed (Escape / ✕) so the parent can reset the toggle. */
   onSearchHandled?: () => void;
   searchInputRef?: React.RefObject<HTMLInputElement | null>;
+  onOrphansChange?: (ids: ReadonlySet<string>) => void;
 }
 
 export function MarkdownRichTextViewer({
@@ -121,6 +121,7 @@ export function MarkdownRichTextViewer({
   searchOpen,
   onSearchHandled,
   searchInputRef,
+  onOrphansChange,
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
@@ -186,6 +187,7 @@ export function MarkdownRichTextViewer({
       searchOpen={searchOpen ?? false}
       onSearchHandled={onSearchHandled}
       searchInputRef={searchInputRef}
+      onOrphansChange={onOrphansChange}
       setContentRef={setContentRef}
     />
   );
@@ -220,6 +222,7 @@ interface InnerProps {
   onSearchHandled?: () => void;
   searchInputRef?: React.RefObject<HTMLInputElement | null>;
   setContentRef: React.RefObject<((content: string) => void) | null>;
+  onOrphansChange?: (ids: ReadonlySet<string>) => void;
 }
 
 function MarkdownRichTextViewerInner({
@@ -246,6 +249,7 @@ function MarkdownRichTextViewerInner({
   onSearchHandled,
   searchInputRef,
   setContentRef,
+  onOrphansChange,
 }: InnerProps) {
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
@@ -590,6 +594,7 @@ function MarkdownRichTextViewerInner({
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
         canEdit={canEdit}
+        onOrphansChange={onOrphansChange}
       />
     </div>
   );

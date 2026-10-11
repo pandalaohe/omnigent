@@ -19,7 +19,8 @@ import type { ReactElement, RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { commentDecorationKey, type CommentDecorationState } from "./TipTapCommentExtension";
-import { computeSelectionData } from "./TipTapEditorHelpers";
+import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
+import { isRenderedTextAnchor } from "./renderedTextAnchor";
 import { getEmbedRoot } from "@/lib/host";
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,7 @@ interface MarkdownCommentPluginProps {
   ) => void;
   pendingBodyRef?: RefObject<string>;
   canEdit?: boolean;
+  onOrphansChange?: (ids: ReadonlySet<string>) => void;
 }
 
 export function MarkdownCommentPlugin({
@@ -68,8 +70,31 @@ export function MarkdownCommentPlugin({
   onSetActiveSelection,
   pendingBodyRef,
   canEdit = true,
+  onOrphansChange,
 }: MarkdownCommentPluginProps): ReactElement | null {
   const [buttonPos, setButtonPos] = useState<{ top: number; left: number } | null>(null);
+
+  useEffect(() => {
+    if (!editor || !onOrphansChange) return;
+    const report = () =>
+      onOrphansChange(
+        new Set(
+          comments
+            .filter(
+              (comment) =>
+                isRenderedTextAnchor(comment.anchor_content) &&
+                !findPmRangeForComment(editor.state.doc, comment, contentRef.current),
+            )
+            .map((comment) => comment.id),
+        ),
+      );
+    report();
+    editor.on("update", report);
+    return () => {
+      editor.off("update", report);
+      onOrphansChange(new Set());
+    };
+  }, [editor, comments, contentRef, onOrphansChange]);
 
   // Stable refs so callbacks always see the latest values.
   const onSetActiveSelectionRef = useRef(onSetActiveSelection);
@@ -133,7 +158,9 @@ export function MarkdownCommentPlugin({
     if (!editor || !activeSelection) return;
     const comment = comments.find(
       (c) =>
-        c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index,
+        c.start_index === activeSelection.start_index &&
+        c.end_index === activeSelection.end_index &&
+        c.anchor_content === activeSelection.anchor_content,
     );
     if (!comment) return;
     const rafId = requestAnimationFrame(() => {

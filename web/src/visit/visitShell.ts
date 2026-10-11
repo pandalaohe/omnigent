@@ -6,14 +6,17 @@
 // Visitors never see other comments: the shell sends no `setComments` state
 // into the frame and renders no list.
 
-import { stripInjectedScripts } from "@/lib/stripInjectedScripts";
 import {
   BRIDGE_MSG,
   BRIDGE_SOURCE,
-  findAnchorInSource,
   parseBridgeMessage,
   type BridgeRect,
 } from "@/shell/htmlCommentBridge";
+import {
+  decodeRenderedTextAnchor,
+  encodeRenderedTextAnchor,
+  type RenderedTextAnchor,
+} from "@/shell/renderedTextAnchor";
 import { artifactCommentsEndpoint, framePagePath, type VisitConfig } from "./visitConfig";
 
 /** The window operations the shell uses; tests stand in for `location`. */
@@ -46,23 +49,25 @@ const RETRY_MESSAGE = "Couldn't send your comment. Try again.";
 interface Anchor {
   text: string;
   occ: number;
+  prefix: string;
+  suffix: string;
+  selector?: string;
 }
 
 /** Where the open composer sends: the page the frame showed when it opened. */
 interface ComposerTarget {
   path: string;
-  url: string;
   anchor: Anchor | null;
+  legacyQuote?: string;
 }
 
 /** An unsent comment kept in sessionStorage until a 201. */
 interface VisitDraft {
   path: string;
-  url: string;
   text: string;
   name: string;
   anchor_content: string | null;
-  occ: number;
+  legacyQuote?: string;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -172,7 +177,7 @@ export function mountVisitShell(
   let readyTimer: number | null = null;
   let ready = false;
   let sending = false;
-  let page = { path: config.path, url: config.frameUrl };
+  let page = { path: config.path };
   let selection: (Anchor & { rect: BridgeRect }) | null = null;
   let composerTarget: ComposerTarget | null = null;
 
@@ -213,11 +218,12 @@ export function mountVisitShell(
       }
       const draft: VisitDraft = {
         path: composerTarget.path,
-        url: composerTarget.url,
         text: bodyInput.value,
         name: nameInput.value,
-        anchor_content: composerTarget.anchor?.text ?? null,
-        occ: composerTarget.anchor?.occ ?? 0,
+        anchor_content: composerTarget.anchor
+          ? encodeRenderedTextAnchor({ v: 1, kind: "html", ...composerTarget.anchor })
+          : null,
+        ...(composerTarget.legacyQuote ? { legacyQuote: composerTarget.legacyQuote } : {}),
       };
       win.sessionStorage.setItem(key, JSON.stringify(draft));
     } catch {
@@ -233,18 +239,36 @@ export function mountVisitShell(
         const key = win.sessionStorage.key(i);
         if (!key || !key.startsWith(prefix)) continue;
         const parsed = JSON.parse(win.sessionStorage.getItem(key) ?? "null") as unknown;
+        if (typeof parsed !== "object" || parsed === null) continue;
+        const draft = parsed as VisitDraft;
         if (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          typeof (parsed as VisitDraft).path === "string" &&
-          typeof (parsed as VisitDraft).url === "string" &&
-          typeof (parsed as VisitDraft).text === "string" &&
-          typeof (parsed as VisitDraft).name === "string" &&
-          ((parsed as VisitDraft).anchor_content === null ||
-            typeof (parsed as VisitDraft).anchor_content === "string") &&
-          typeof (parsed as VisitDraft).occ === "number"
-        ) {
-          return parsed as VisitDraft;
+          typeof draft.path !== "string" ||
+          typeof draft.text !== "string" ||
+          typeof draft.name !== "string" ||
+          draft.text.length > MAX_BODY ||
+          draft.name.length > MAX_NAME
+        )
+          continue;
+        if (draft.anchor_content === null) {
+          if (
+            draft.legacyQuote !== undefined &&
+            (typeof draft.legacyQuote !== "string" || draft.legacyQuote.length > 16000)
+          )
+            continue;
+          return draft;
+        }
+        if (typeof draft.anchor_content !== "string") continue;
+        if (decodeRenderedTextAnchor(draft.anchor_content)?.kind === "html") return draft;
+        // Older drafts retained a quote and occurrence but no reliable DOM
+        // context. Keep the writing and make the whole-page conversion visible.
+        if (draft.anchor_content.length <= 16000) {
+          return {
+            path: draft.path,
+            text: draft.text,
+            name: draft.name,
+            anchor_content: null,
+            legacyQuote: draft.anchor_content,
+          };
         }
       }
     } catch {
@@ -257,8 +281,12 @@ export function mountVisitShell(
     composerTarget = target;
     nameInput.value = draft?.name ?? "";
     bodyInput.value = draft?.text ?? "";
-    anchorPreview.textContent = target.anchor ? `“${target.anchor.text}”` : "";
-    anchorPreview.hidden = target.anchor === null;
+    anchorPreview.textContent = target.anchor
+      ? `“${target.anchor.text}”`
+      : target.legacyQuote
+        ? `Original selection “${target.legacyQuote}” cannot be located. This comment will be about the whole page.`
+        : "";
+    anchorPreview.hidden = target.anchor === null && !target.legacyQuote;
     setError(null);
     form.hidden = false;
     updateAffordances();
@@ -273,17 +301,6 @@ export function mountVisitShell(
       bodyInput.value = "";
     }
     updateAffordances();
-  };
-
-  const fetchPageSource = async (url: string): Promise<string | null> => {
-    try {
-      // oxlint-disable-next-line no-restricted-globals -- the artifact GET is token-authorized; identity/embed headers must not be attached.
-      const response = await fetch(url);
-      if (!response.ok) return null;
-      return stripInjectedScripts(await response.text(), config.nonce);
-    } catch {
-      return null;
-    }
   };
 
   const readReason = async (response: Response): Promise<string | null> => {
@@ -310,19 +327,18 @@ export function mountVisitShell(
     submitButton.disabled = true;
     submitButton.textContent = "Sending…";
 
-    let startIndex = 0;
-    let endIndex = 0;
+    const startIndex = 0;
+    const endIndex = 0;
     let anchorContent: string | undefined;
     if (target.anchor) {
-      // The frame's page source anchors offsets to the file the agent edits;
-      // when it cannot be read, the anchor text still travels as the locator.
-      anchorContent = target.anchor.text;
-      const source = await fetchPageSource(target.url);
-      const offsets =
-        source === null ? null : findAnchorInSource(source, target.anchor.text, target.anchor.occ);
-      if (offsets) {
-        startIndex = offsets.start_index;
-        endIndex = offsets.end_index;
+      anchorContent =
+        encodeRenderedTextAnchor({ v: 1, kind: "html", ...target.anchor }) ?? undefined;
+      if (!anchorContent) {
+        sending = false;
+        submitButton.disabled = false;
+        submitButton.textContent = "Send";
+        setError("This text selection is too long to comment on");
+        return;
       }
     }
 
@@ -396,14 +412,21 @@ export function mountVisitShell(
       unavailable.hidden = true;
       if (message.pathname !== undefined) {
         const path = framePagePath(message.pathname);
-        if (path !== null) page = { path, url: message.pathname };
+        if (path !== null) page = { path };
       }
       updateAffordances();
       return;
     }
     if (message.type === BRIDGE_MSG.selection) {
       if (!ready) return;
-      selection = { text: message.text, occ: message.occ, rect: message.rect };
+      selection = {
+        text: message.text,
+        occ: message.occ,
+        prefix: message.prefix,
+        suffix: message.suffix,
+        selector: message.selector,
+        rect: message.rect,
+      };
       positionSelectionButton();
       updateAffordances();
       return;
@@ -441,7 +464,7 @@ export function mountVisitShell(
 
   if (commentButton) {
     commentButton.addEventListener("click", () => {
-      openComposer({ path: page.path, url: page.url, anchor: null });
+      openComposer({ path: page.path, anchor: null });
     });
   }
   if (selectionButton) {
@@ -449,8 +472,13 @@ export function mountVisitShell(
       if (selection) {
         openComposer({
           path: page.path,
-          url: page.url,
-          anchor: { text: selection.text, occ: selection.occ },
+          anchor: {
+            text: selection.text,
+            occ: selection.occ,
+            prefix: selection.prefix,
+            suffix: selection.suffix,
+            selector: selection.selector,
+          },
         });
       }
     });
@@ -470,11 +498,11 @@ export function mountVisitShell(
     openComposer(
       {
         path: restored.path,
-        url: restored.url,
+        legacyQuote: restored.legacyQuote,
         anchor:
           restored.anchor_content === null
             ? null
-            : { text: restored.anchor_content, occ: restored.occ },
+            : (decodeRenderedTextAnchor(restored.anchor_content) as RenderedTextAnchor),
       },
       restored,
     );

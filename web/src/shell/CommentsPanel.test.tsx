@@ -768,7 +768,7 @@ describe("CommentsPanel orphan annotations", () => {
     renderPanel([makeComment("c1")], [], undefined, new Set(["c1"]));
 
     expect(screen.getByTestId("comment-orphan")).toBeTruthy();
-    expect(screen.getByText("Element not found on this page")).toBeTruthy();
+    expect(screen.getByText("Original location cannot be confirmed on this page")).toBeTruthy();
   });
 
   it("shows no orphan line when the comment id is not orphaned", () => {

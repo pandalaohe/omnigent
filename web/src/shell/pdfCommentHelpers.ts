@@ -5,6 +5,7 @@
 
 import type { Comment } from "@/hooks/useComments";
 import { decodeElementAnchor, elementAnchorLabel, isElementAnchor } from "./annotationAnchor";
+import { decodeRenderedTextAnchor, isRenderedTextAnchor } from "./renderedTextAnchor";
 import type { ActiveSelection } from "./codeViewerHelpers";
 
 /** Prefix that marks anchor_content as a PDF geometry payload, not raw text. */
@@ -39,6 +40,9 @@ export function decodePdfAnchor(anchorContent: string | null | undefined): PdfAn
 
 /** Human-readable anchor text for the comments panel and agent messages. */
 export function displayAnchorContent(anchorContent: string | null | undefined): string {
+  if (isRenderedTextAnchor(anchorContent)) {
+    return decodeRenderedTextAnchor(anchorContent)?.text ?? "Text location unavailable";
+  }
   const decoded = decodePdfAnchor(anchorContent);
   if (decoded) return decoded.text;
   if (isElementAnchor(anchorContent)) {

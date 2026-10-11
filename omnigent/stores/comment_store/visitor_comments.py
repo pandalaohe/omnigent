@@ -13,6 +13,7 @@ from dataclasses import asdict
 from typing import Any
 
 from omnigent.entities import Comment
+from omnigent.entities.comment_location import comment_location
 from omnigent.entities.element_annotation import parse_element_anchor
 from omnigent.stores.comment_store import COMMENT_STATUS_DRAFT
 
@@ -97,6 +98,11 @@ def comment_rows(
         if visitor and not include_visitor_drafts and comment.status == COMMENT_STATUS_DRAFT:
             continue
         row: dict[str, Any] = asdict(comment)
+        location = comment_location(comment)
+        if location["kind"] != "source" and not (comment.anchor_content or "").startswith(
+            "__element__"
+        ):
+            row["location"] = location
         if visitor:
             row["source"] = VISITOR_SOURCE
             row["note"] = VISITOR_COMMENT_NOTE

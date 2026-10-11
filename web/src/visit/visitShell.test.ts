@@ -4,7 +4,8 @@
 // persistence across a reload.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_MSG, BRIDGE_SOURCE, findAnchorInSource } from "@/shell/htmlCommentBridge";
+import { BRIDGE_MSG, BRIDGE_SOURCE } from "@/shell/htmlCommentBridge";
+import { encodeRenderedTextAnchor } from "@/shell/renderedTextAnchor";
 import { readVisitConfig, type VisitConfig } from "./visitConfig";
 import { mountVisitShell, type VisitShellWindow } from "./visitShell";
 
@@ -13,9 +14,6 @@ const LINKED_URL = "/v1/artifacts/h-token/reports/page2.html";
 const ENDPOINT = "/v1/artifact-comments";
 const NONCE = "bridge-nonce";
 const DRAFT_KEY = "omni-visit-draft:g-token:reports/index.html";
-
-const PAGE_SOURCE = "<html><body><p>Hello world</p></body></html>";
-const PAGE_BODY = `<html><body><p>Hello world</p><script data-omni-nonce="${NONCE}">bridge()</script></body></html>`;
 
 function baseConfig(overrides: Partial<VisitConfig> = {}): VisitConfig {
   return {
@@ -196,9 +194,50 @@ describe("visitor shell visibility", () => {
 });
 
 describe("visitor shell comments", () => {
-  it("maps a selection to source offsets and posts the anchor with the comment", async () => {
+  it("restores a pre-upgrade selection draft without losing its body or inventing a location", async () => {
+    window.sessionStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({
+        path: "reports/index.html",
+        url: FRAME_URL,
+        text: "Keep this thought",
+        name: "Ada",
+        anchor_content: "Code",
+        occ: 1,
+      }),
+    );
+    const fetchMock = mockFetch((url) =>
+      url === ENDPOINT ? new Response(JSON.stringify({ ok: true }), { status: 201 }) : null,
+    );
+    mount();
+    expect(get<HTMLFormElement>("omni-visit-form").hidden).toBe(false);
+    expect(get<HTMLTextAreaElement>("omni-visit-body").value).toBe("Keep this thought");
+    expect(get<HTMLInputElement>("omni-visit-name").value).toBe("Ada");
+    expect(get<HTMLDivElement>("omni-visit-anchor").textContent).toContain(
+      "This comment will be about the whole page.",
+    );
+    get<HTMLTextAreaElement>("omni-visit-body").dispatchEvent(
+      new Event("input", { bubbles: true }),
+    );
+    expect(JSON.parse(window.sessionStorage.getItem(DRAFT_KEY) ?? "null")).toMatchObject({
+      text: "Keep this thought",
+      name: "Ada",
+      anchor_content: null,
+      legacyQuote: "Code",
+    });
+    sendComment();
+    await vi.waitFor(() => expect(get("omni-visit-status").textContent).toBe("Received"));
+    expect(postedBody(fetchMock)).toMatchObject({
+      body: "Keep this thought",
+      name: "Ada",
+      start_index: 0,
+      end_index: 0,
+    });
+    expect(postedBody(fetchMock)).not.toHaveProperty("anchor_content");
+  });
+
+  it("posts a rendered selection without guessing source offsets", async () => {
     const fetchMock = mockFetch((url) => {
-      if (url === FRAME_URL) return new Response(PAGE_BODY, { status: 200 });
       if (url === ENDPOINT) return new Response(JSON.stringify({ ok: true }), { status: 201 });
       return null;
     });
@@ -209,6 +248,9 @@ describe("visitor shell comments", () => {
       type: BRIDGE_MSG.selection,
       text: "Hello world",
       occ: 0,
+      prefix: "Before ",
+      suffix: " After",
+      selector: "#visit-text",
       rect: { left: 10, top: 20, right: 80, bottom: 30 },
     });
 
@@ -221,18 +263,25 @@ describe("visitor shell comments", () => {
     sendComment();
 
     await vi.waitFor(() => expect(get("omni-visit-status").textContent).toBe("Received"));
-    const expected = findAnchorInSource(PAGE_SOURCE, "Hello world", 0);
-    expect(expected).not.toBeNull();
     expect(postedBody(fetchMock)).toEqual({
       token: "g-token",
       grant: null,
       path: "reports/index.html",
       body: "Nice page",
-      anchor_content: "Hello world",
-      start_index: expected?.start_index,
-      end_index: expected?.end_index,
+      anchor_content: encodeRenderedTextAnchor({
+        v: 1,
+        kind: "html",
+        text: "Hello world",
+        occ: 0,
+        prefix: "Before ",
+        suffix: " After",
+        selector: "#visit-text",
+      }),
+      start_index: 0,
+      end_index: 0,
       name: "Ada",
     });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     // A 201 clears the draft and the composer.
     expect(get<HTMLFormElement>("omni-visit-form").hidden).toBe(true);
     expect(window.sessionStorage.getItem(DRAFT_KEY)).toBeNull();
@@ -334,7 +383,6 @@ describe("visitor shell comments", () => {
     await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
     expect(JSON.parse(window.sessionStorage.getItem(DRAFT_KEY) ?? "null")).toMatchObject({
       path: "reports/index.html",
-      url: FRAME_URL,
       text: "Keep me",
       name: "Ada",
     });

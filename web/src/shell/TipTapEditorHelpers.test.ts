@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { Schema, type Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { Editor } from "@tiptap/core";
+import { StarterKit } from "@tiptap/starter-kit";
+import { Markdown } from "@tiptap/markdown";
 import { findPmRangeForComment, computeSelectionData } from "./TipTapEditorHelpers";
 import type { Comment } from "@/hooks/useComments";
+import { decodeRenderedTextAnchor } from "./renderedTextAnchor";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -19,6 +23,9 @@ function makeDoc(text: string): ProseMirrorNode {
   return {
     content: { size: text.length },
     textBetween: (from: number, to: number, _sep: string) => text.slice(from, to),
+    descendants: (callback: (node: { isText: boolean; text: string }, pos: number) => void) => {
+      if (text) callback({ isText: true, text }, 0);
+    },
   } as unknown as ProseMirrorNode;
 }
 
@@ -66,6 +73,13 @@ describe("findPmRangeForComment", () => {
   it("returns null when anchor_content is not present in the document", () => {
     const doc = makeDoc("Hello, world!");
     expect(findPmRangeForComment(doc, makeComment("missing text", 0), raw)).toBeNull();
+  });
+
+  it("does not search malformed typed payload as literal text", () => {
+    const text = "Here is __text__not-json in a paragraph";
+    expect(
+      findPmRangeForComment(makeDoc(text), makeComment("__text__not-json", 8), text),
+    ).toBeNull();
   });
 
   it("finds anchor at the very beginning of the document", () => {
@@ -156,7 +170,14 @@ describe("computeSelectionData", () => {
     const text = "Hello, world!";
     const doc = makeDoc(text);
     const result = computeSelectionData(7, 12, doc, text);
-    expect(result).toEqual({ start_index: 7, end_index: 12, anchor_content: "world" });
+    expect(result).toMatchObject({ start_index: 7, end_index: 12 });
+    expect(decodeRenderedTextAnchor(result?.anchor_content)).toMatchObject({
+      kind: "markdown",
+      text: "world",
+      occ: 0,
+      prefix: "Hello, ",
+      suffix: "!",
+    });
   });
 
   it("uses anchor_content as-is (no trimming)", () => {
@@ -164,7 +185,7 @@ describe("computeSelectionData", () => {
     const text = "Hello, world!";
     const doc = makeDoc(text);
     const result = computeSelectionData(0, 7, doc, text); // "Hello, "
-    expect(result).toEqual({ start_index: 0, end_index: 7, anchor_content: "Hello, " });
+    expect(decodeRenderedTextAnchor(result?.anchor_content)?.text).toBe("Hello, ");
   });
 
   it("skips the first occurrence when hint places it >500 chars away", () => {
@@ -175,7 +196,8 @@ describe("computeSelectionData", () => {
     const text = "foo" + padding + "foo"; // "foo" at 0 and 600
     const doc = makeDoc(text);
     const result = computeSelectionData(600, 603, doc, text);
-    expect(result).toEqual({ start_index: 600, end_index: 603, anchor_content: "foo" });
+    expect(result).toMatchObject({ start_index: 600, end_index: 603 });
+    expect(decodeRenderedTextAnchor(result?.anchor_content)?.occ).toBe(1);
   });
 
   it("uses the nearest occurrence when duplicate strings are within the search window", () => {
@@ -184,7 +206,8 @@ describe("computeSelectionData", () => {
     const text = "foo bar foo baz";
     const doc = makeDoc(text);
     const result = computeSelectionData(8, 11, doc, text);
-    expect(result).toEqual({ start_index: 8, end_index: 11, anchor_content: "foo" });
+    expect(result).toMatchObject({ start_index: 8, end_index: 11 });
+    expect(decodeRenderedTextAnchor(result?.anchor_content)?.occ).toBe(1);
   });
 
   it("falls back to proportional indices when anchor_content is not in rawContent verbatim", () => {
@@ -197,7 +220,8 @@ describe("computeSelectionData", () => {
     const result = computeSelectionData(0, 12, doc, rawContent);
     expect(result).not.toBeNull();
     // Should use proportional fallback (hint-based) rather than returning null.
-    expect(result!.anchor_content).toBe("first\nsecond");
+    expect(decodeRenderedTextAnchor(result!.anchor_content)?.text).toBe("first\nsecond");
+    expect(decodeRenderedTextAnchor(result!.anchor_content)?.source).toBeUndefined();
     // start_index is proportional: hint = round(0 * 13 / 12) = 0
     expect(result!.start_index).toBe(0);
     // end_index is start_index + anchor_content.length = 0 + 12 = 12
@@ -209,7 +233,7 @@ describe("computeSelectionData", () => {
     const doc = makeDoc(text);
     const result = computeSelectionData(0, 5, doc, "");
     expect(result).not.toBeNull();
-    expect(result!.anchor_content).toBe("Hello");
+    expect(decodeRenderedTextAnchor(result!.anchor_content)?.text).toBe("Hello");
     expect(result!.start_index).toBe(0);
     expect(result!.end_index).toBe(5);
   });
@@ -218,10 +242,81 @@ describe("computeSelectionData", () => {
     const text = "Hello, world!";
     const doc = makeDoc(text);
     const result = computeSelectionData(0, text.length, doc, text);
-    expect(result).toEqual({
-      start_index: 0,
-      end_index: text.length,
-      anchor_content: text,
+    expect(result).toMatchObject({ start_index: 0, end_index: text.length });
+    expect(decodeRenderedTextAnchor(result?.anchor_content)?.text).toBe(text);
+  });
+});
+
+describe("rendered anchors in a real ProseMirror document", () => {
+  const schema = new Schema({
+    nodes: { doc: { content: "paragraph+" }, paragraph: { content: "text*" }, text: {} },
+  });
+  const paragraph = (text: string) =>
+    schema.node("paragraph", null, text ? schema.text(text) : undefined);
+
+  it("restores the second Code after long Markdown link syntax", () => {
+    const href = `https://example.test/${"x".repeat(1007)}`;
+    const raw = `[Code](${href})\n\nCode`;
+    expect(raw.lastIndexOf("Code")).toBe(1038);
+    const editor = new Editor({
+      element: document.createElement("div"),
+      extensions: [StarterKit, Markdown],
+      content: raw,
+      contentType: "markdown",
     });
+    try {
+      const doc = editor.state.doc;
+      expect(doc.textBetween(0, doc.content.size, "\n")).toBe("Code\nCode");
+      const selection = computeSelectionData(7, 11, doc, raw);
+      expect(selection).not.toBeNull();
+      expect(decodeRenderedTextAnchor(selection?.anchor_content)).toMatchObject({
+        kind: "markdown",
+        text: "Code",
+        occ: 1,
+        prefix: "Code\n",
+        suffix: "",
+      });
+      expect(
+        findPmRangeForComment(
+          doc,
+          makeComment(selection!.anchor_content, selection!.start_index),
+          raw,
+        ),
+      ).toEqual({ from: 7, to: 11 });
+    } finally {
+      editor.destroy();
+    }
+  });
+
+  it("keeps a selection spanning Markdown blocks after syntax is stripped", () => {
+    const doc = schema.node("doc", null, [paragraph("Alpha"), paragraph("Beta")]);
+    const raw = "**Alpha**\n\n_Beta_";
+    const selection = computeSelectionData(1, 13, doc, raw);
+    expect(decodeRenderedTextAnchor(selection?.anchor_content)?.text).toBe("Alpha\nBeta");
+    expect(
+      findPmRangeForComment(
+        doc,
+        makeComment(selection!.anchor_content, selection!.start_index),
+        raw,
+      ),
+    ).toEqual({ from: 1, to: 12 });
+  });
+
+  it("counts an empty paragraph between repeated rendered words", () => {
+    const doc = schema.node("doc", null, [paragraph("Code"), paragraph(""), paragraph("Code")]);
+    const raw = "Code\n\n\n\nCode";
+    const selection = computeSelectionData(9, 13, doc, raw);
+    expect(decodeRenderedTextAnchor(selection?.anchor_content)).toMatchObject({
+      text: "Code",
+      occ: 1,
+      prefix: "Code\n\n",
+    });
+    expect(
+      findPmRangeForComment(
+        doc,
+        makeComment(selection!.anchor_content, selection!.start_index),
+        raw,
+      ),
+    ).toEqual({ from: 9, to: 13 });
   });
 });

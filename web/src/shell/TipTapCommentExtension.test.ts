@@ -26,6 +26,7 @@ import {
   createCommentDecorationExtension,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
+import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
 
 let editor: Editor | null = null;
 afterEach(() => {
@@ -86,6 +87,28 @@ describe("commentDecorationKey", () => {
 // ---------------------------------------------------------------------------
 
 describe("createCommentDecorationExtension decorations", () => {
+  it("removes a rendered highlight when an edit makes its context stale", () => {
+    const anchor_content = encodeRenderedTextAnchor({
+      v: 1,
+      kind: "markdown",
+      text: "quick",
+      occ: 0,
+      prefix: "The ",
+      suffix: " brown",
+    })!;
+    const stateRef = makeStateRef({
+      comments: [makeComment({ anchor_content })],
+      activeSelection: null,
+      rawContent: CONTENT,
+      pendingRange: null,
+      onClickComment: vi.fn(),
+    });
+    editor = makeEditor(stateRef);
+    expect(editor.view.dom.querySelector('[data-comment-id="c1"]')?.textContent).toBe("quick");
+    editor.commands.setContent("The quick red fox jumps over the lazy dog.");
+    expect(editor.view.dom.querySelector('[data-comment-id="c1"]')).toBeNull();
+  });
+
   // WHY: a matched comment must render an inline span tagged with its id and the base class.
   it("renders an inline decoration for a matched comment", () => {
     const stateRef = makeStateRef({

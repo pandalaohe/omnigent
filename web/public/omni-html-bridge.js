@@ -16,6 +16,7 @@
     commentClick: "omni:commentClick",
     selectionCleared: "omni:selectionCleared",
     openPath: "omni:openPath",
+    orphans: "omni:orphans",
   };
 
   // The highlight styles live here rather than in the injected markup so the
@@ -30,8 +31,8 @@
   // The visitor shell's init marks visit mode: link clicks must keep the shell
   // in place, unlike the panel's own link routing.
   var VISIT = false;
-  var comments = []; // [{ id, anchor_content, occ }]
-  var active = null; // { anchor_content, occ } | null
+  var comments = [];
+  var active = null;
   var activeRanges = []; // ranges matching the active comment (for scroll-into-view)
   var ranges = []; // [{ id, range }] for click hit-testing
 
@@ -46,8 +47,29 @@
     }
   }
 
-  // Flat index of visible text nodes -> concatenated string, so an anchor that
-  // spans multiple nodes still resolves to a single Range.
+  function blockOwner(node) {
+    var el = node.parentElement;
+    while (el && el !== document.body) {
+      if (
+        /^(P|DIV|SECTION|ARTICLE|HEADER|FOOTER|MAIN|ASIDE|LI|PRE|BLOCKQUOTE|H[1-6]|TD|TH|TR)$/i.test(
+          el.tagName,
+        )
+      )
+        return el;
+      el = el.parentElement;
+    }
+    return document.body;
+  }
+
+  function blockGap(previous, next) {
+    var a = blockOwner(previous);
+    var b = blockOwner(next);
+    if (a === b) return "";
+    return a.tagName === "P" || b.tagName === "P" ? "\n\n" : "\n";
+  }
+
+  // Flat rendered-text index. A block gap is indexed as text so a selection
+  // across paragraphs matches the quote sent to the parent.
   function buildIndex() {
     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
       acceptNode: function (n) {
@@ -57,6 +79,11 @@
         if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
           return NodeFilter.FILTER_REJECT;
         }
+        var visibility = window.getComputedStyle(p).visibility;
+        if (visibility === "hidden" || visibility === "collapse") return NodeFilter.FILTER_REJECT;
+        for (var el = p; el; el = el.parentElement) {
+          if (window.getComputedStyle(el).display === "none") return NodeFilter.FILTER_REJECT;
+        }
         return NodeFilter.FILTER_ACCEPT;
       },
     });
@@ -64,6 +91,7 @@
     var text = "";
     var n;
     while ((n = walker.nextNode())) {
+      if (nodes.length) text += blockGap(nodes[nodes.length - 1].node, n);
       nodes.push({ node: n, start: text.length });
       text += n.nodeValue;
     }
@@ -72,6 +100,7 @@
 
   function locate(nodes, pos) {
     for (var i = 0; i < nodes.length; i++) {
+      if (pos < nodes[i].start) return { node: nodes[i].node, offset: 0 };
       var len = nodes[i].node.nodeValue.length;
       if (pos <= nodes[i].start + len) {
         return { node: nodes[i].node, offset: pos - nodes[i].start };
@@ -79,6 +108,28 @@
     }
     var last = nodes[nodes.length - 1];
     return last ? { node: last.node, offset: last.node.nodeValue.length } : null;
+  }
+
+  function contextBefore(text, end) {
+    var start = Math.max(0, end - 32);
+    if (
+      start > 0 &&
+      /[\uDC00-\uDFFF]/.test(text.charAt(start)) &&
+      /[\uD800-\uDBFF]/.test(text.charAt(start - 1))
+    )
+      start++;
+    return text.slice(start, end);
+  }
+
+  function contextAfter(text, start) {
+    var end = Math.min(text.length, start + 32);
+    if (
+      end < text.length &&
+      /[\uD800-\uDBFF]/.test(text.charAt(end - 1)) &&
+      /[\uDC00-\uDFFF]/.test(text.charAt(end))
+    )
+      end--;
+    return text.slice(start, end);
   }
 
   // Whitespace-normalized view of a string: runs of whitespace collapse to a
@@ -109,10 +160,9 @@
   // All ranges matching the anchor. anchor_content is rendered-selection text
   // (whitespace collapsed) but the haystack is raw text-node data that preserves
   // the source's newlines/indentation, so match on the normalized view and map
-  // normalized offsets back to raw node positions — mirroring the parent's
-  // whitespace-tolerant findAnchorInSource. H (the normalized view of
+  // normalized offsets back to raw node positions. H (the normalized view of
   // index.text) is passed in so repaint builds it once for all comments.
-  function anchorRanges(index, H, anchor) {
+  function anchorRanges(index, H, anchor, overlapping) {
     var out = [];
     var raw = (anchor || "").trim();
     if (!raw) return out;
@@ -135,9 +185,73 @@
           // A boundary that no longer resolves to a valid range is skipped.
         }
       }
-      from = at + Math.max(1, needle.length);
+      from = at + (overlapping ? 1 : Math.max(1, needle.length));
     }
     return out;
+  }
+
+  function selectorFor(node) {
+    var el = node.nodeType === 1 ? node : node.parentElement;
+    var parts = [];
+    while (el && el !== document.body && parts.length < 20) {
+      if (el.id && typeof CSS !== "undefined" && CSS.escape) {
+        var id = "#" + CSS.escape(el.id);
+        if (document.querySelectorAll(id).length === 1) {
+          parts.unshift(id);
+          break;
+        }
+      }
+      var ordinal = 1;
+      for (var prev = el.previousElementSibling; prev; prev = prev.previousElementSibling) {
+        if (prev.tagName === el.tagName) ordinal++;
+      }
+      parts.unshift(el.tagName.toLowerCase() + ":nth-of-type(" + ordinal + ")");
+      el = el.parentElement;
+    }
+    if (el === document.body) parts.unshift("body");
+    else if (el && parts.length >= 20) return undefined;
+    var selector = parts.join(" > ");
+    if (!selector || selector.length > 700) return undefined;
+    try {
+      var matches = document.querySelectorAll(selector);
+      return matches.length === 1 ? selector : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function matchingRanges(index, H, anchor) {
+    if (!anchor || typeof anchor.text !== "string" || !anchor.text.trim()) return [];
+    var needle = normWs(anchor.text.trim()).norm.trim();
+    var prefix = normWs(anchor.prefix || "").norm;
+    var suffix = normWs(anchor.suffix || "").norm;
+    var match = -1;
+    var from = 0;
+    while (from <= H.norm.length) {
+      var at = H.norm.indexOf(needle, from);
+      if (at < 0) break;
+      var end = at + needle.length;
+      if (
+        H.norm.slice(Math.max(0, at - prefix.length), at) === prefix &&
+        H.norm.slice(end, end + suffix.length) === suffix
+      ) {
+        if (match !== -1) return [];
+        match = at;
+      }
+      from = at + 1;
+    }
+    if (match === -1) return [];
+    var s = locate(index.nodes, H.map[match]);
+    var e = locate(index.nodes, H.map[match + needle.length]);
+    if (!s || !e) return [];
+    var range = document.createRange();
+    try {
+      range.setStart(s.node, s.offset);
+      range.setEnd(e.node, e.offset);
+    } catch {
+      return [];
+    }
+    return [range];
   }
 
   // Flat raw-text offset of a selection boundary (node, offset) within the
@@ -164,7 +278,7 @@
       // First text node that starts at or after the boundary.
       if (boundary.comparePoint(tn, 0) >= 0) return index.nodes[k].start;
     }
-    return -1;
+    return index.text.length;
   }
 
   // Which occurrence (0-based, document order) of the selected text the current
@@ -172,30 +286,40 @@
   // than the first text match. Counts normalized matches starting before the
   // selection's start — mirrors anchorRanges/anchorOccurrence so a wrapped
   // occurrence still counts. Returns 0 if the position can't be resolved.
-  function selectionOccurrence(range, text) {
+  function selectionAnchor(range, text) {
     var index = buildIndex();
     var start = flatOffset(index, range.startContainer, range.startOffset);
-    if (start === -1) return 0;
+    var end = flatOffset(index, range.endContainer, range.endOffset);
+    if (start < 0 || end <= start) return null;
     var H = normWs(index.text);
     var needle = normWs((text || "").trim()).norm.trim();
-    if (!needle) return 0;
+    if (!needle) return null;
+    // Native selection is authoritative. If our rendered index cannot account
+    // for its text, keep the selection unresolved rather than invent an excerpt.
+    if (normWs(index.text.slice(start, end)).norm.trim() !== needle) return null;
     var count = 0;
     var from = 0;
-    var guard = 0;
-    while (guard++ < 1000) {
+    while (from <= H.norm.length) {
       var at = H.norm.indexOf(needle, from);
       if (at === -1) break;
-      if (H.map[at] >= start) break;
+      if (H.map[at] >= start) {
+        return {
+          occ: count,
+          text: text,
+          prefix: contextBefore(H.norm, at),
+          suffix: contextAfter(H.norm, at + needle.length),
+          selector: selectorFor(range.commonAncestorContainer),
+        };
+      }
       count++;
-      from = at + Math.max(1, needle.length);
+      from = at + 1;
     }
-    return count;
+    return null;
   }
 
   function repaint() {
     var supported =
       typeof CSS !== "undefined" && CSS.highlights && typeof Highlight !== "undefined";
-    if (!supported) return; // highlights degrade gracefully; commenting still works
     var index = buildIndex();
     // Normalize the document text once and reuse it for every comment, rather
     // than rebuilding the whitespace map per comment inside anchorRanges.
@@ -203,14 +327,15 @@
     ranges = [];
     var base = [];
     var activeHi = [];
+    var orphans = [];
     for (var i = 0; i < comments.length; i++) {
       var c = comments[i];
-      var rs = anchorRanges(index, H, c.anchor_content);
-      // Anchor text can repeat (e.g. a title and a body paragraph). The parent
-      // sends the occurrence index (document order) the comment belongs to, so
-      // highlight only that one. When occ is missing or out of range (stale
-      // offset), fall back to all matches so the comment is at least visible.
-      var picked = typeof c.occ === "number" && c.occ >= 0 && c.occ < rs.length ? [rs[c.occ]] : rs;
+      var picked = c.anchor
+        ? matchingRanges(index, H, c.anchor)
+        : typeof c.occ === "number" && c.occ >= 0
+          ? anchorRanges(index, H, c.anchor_content).slice(c.occ, c.occ + 1)
+          : [];
+      if (!picked.length && c.id) orphans.push(c.id);
       var isActive = active && active.comment_id === c.id;
       for (var j = 0; j < picked.length; j++) {
         ranges.push({ id: c.id, range: picked[j] });
@@ -219,6 +344,8 @@
       }
     }
     activeRanges = activeHi;
+    send({ type: T.orphans, ids: orphans });
+    if (!supported) return;
     try {
       CSS.highlights.set("omni-comment", new Highlight(...base.filter(Boolean)));
       CSS.highlights.set("omni-comment-active", new Highlight(...activeHi.filter(Boolean)));
@@ -272,10 +399,15 @@
   function emitSelection() {
     var s = currentSelection();
     if (s) {
+      var anchor = selectionAnchor(s.range, s.text);
+      if (!anchor) return;
       send({
         type: T.selection,
-        text: s.text,
-        occ: selectionOccurrence(s.range, s.text),
+        text: anchor.text,
+        occ: anchor.occ,
+        prefix: anchor.prefix,
+        suffix: anchor.suffix,
+        selector: anchor.selector,
         rect: rectOf(s.range),
       });
     }
@@ -302,10 +434,15 @@
   function onMouseUp(e) {
     var s = currentSelection();
     if (s) {
+      var anchor = selectionAnchor(s.range, s.text);
+      if (!anchor) return;
       send({
         type: T.selection,
-        text: s.text,
-        occ: selectionOccurrence(s.range, s.text),
+        text: anchor.text,
+        occ: anchor.occ,
+        prefix: anchor.prefix,
+        suffix: anchor.suffix,
+        selector: anchor.selector,
         rect: rectOf(s.range),
       });
       return;

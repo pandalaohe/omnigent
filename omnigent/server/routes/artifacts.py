@@ -45,6 +45,11 @@ from omnigent.artifact_paths import artifact_path_allowed, artifact_segments_val
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
+from omnigent.entities.comment_location import (
+    MAX_TEXT_ANCHOR_BYTES,
+    TEXT_ANCHOR_PREFIX,
+    parse_text_anchor,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_FS_READ_RAW
 from omnigent.server.artifact_links import (
@@ -581,7 +586,7 @@ class VisitorCommentRequest(BaseModel):
     grant: str | None = None
     path: str = Field(max_length=1024)
     body: str = Field(max_length=4000)
-    anchor_content: str | None = Field(default=None, max_length=2000)
+    anchor_content: str | None = Field(default=None, max_length=MAX_TEXT_ANCHOR_BYTES)
     start_index: int
     end_index: int
     name: str | None = Field(default=None, max_length=40)
@@ -597,6 +602,16 @@ class VisitorCommentRequest(BaseModel):
             raise ValueError("start_index must be >= 0")
         if self.end_index < self.start_index:
             raise ValueError("end_index must be >= start_index")
+        if self.anchor_content:
+            if self.anchor_content.startswith(TEXT_ANCHOR_PREFIX):
+                parsed = parse_text_anchor(self.anchor_content)
+                if parsed is None:
+                    raise ValueError("invalid rendered text anchor")
+                self.anchor_content = TEXT_ANCHOR_PREFIX + json.dumps(
+                    parsed, ensure_ascii=False, separators=(",", ":")
+                )
+            elif len(self.anchor_content) > 2000:
+                raise ValueError("plain text anchor must be at most 2000 characters")
         return self
 
 

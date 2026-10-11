@@ -243,13 +243,16 @@ export function CommentsPanel({
     if (activeSelectionStart == null || activeSelectionEnd == null) return;
     if (activeCommentId) return;
     const isExisting = comments.some(
-      (c) => c.start_index === activeSelectionStart && c.end_index === activeSelectionEnd,
+      (c) =>
+        c.start_index === activeSelectionStart &&
+        c.end_index === activeSelectionEnd &&
+        c.anchor_content === activeAnchorContent,
     );
     if (isExisting) return undefined;
     // rAF ensures the textarea has been rendered before we try to focus it.
     const id = requestAnimationFrame(() => addCommentTextareaRef.current?.focus());
     return () => cancelAnimationFrame(id);
-  }, [activeSelectionStart, activeSelectionEnd, activeCommentId, comments]);
+  }, [activeSelectionStart, activeSelectionEnd, activeAnchorContent, activeCommentId, comments]);
 
   // activeSelection is FileViewer state and keeps its identity across query
   // refreshes; this guard lets a later manual tab switch stick.
@@ -285,7 +288,8 @@ export function CommentsPanel({
       ? activeCommentId === comment.id
       : comment.status === "draft" &&
         activeSelectionStart === comment.start_index &&
-        activeSelectionEnd === comment.end_index;
+        activeSelectionEnd === comment.end_index &&
+        activeAnchorContent === comment.anchor_content;
 
   return (
     <div
@@ -359,7 +363,8 @@ export function CommentsPanel({
           !comments.some(
             (c) =>
               c.start_index === activeSelection.start_index &&
-              c.end_index === activeSelection.end_index,
+              c.end_index === activeSelection.end_index &&
+              c.anchor_content === activeSelection.anchor_content,
           ) &&
           (canEdit ? (
             <div className="space-y-2 border-b border-border px-3 py-2">
@@ -559,7 +564,7 @@ function CommentCard({
       )}
       {isOrphan && (
         <p data-testid="comment-orphan" className="text-xs text-muted-foreground">
-          Element not found on this page
+          Original location cannot be confirmed on this page
         </p>
       )}
 
