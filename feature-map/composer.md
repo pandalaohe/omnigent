@@ -24,9 +24,10 @@ and steers messages while the agent is busy.
   change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
-- `speed-picker`: both Codex composers show an icon-only Fast toggle when the
-  selected model advertises Fast. One tap switches between Fast and Standard;
-  distinct icons identify on and off. Launch presets retain all advertised tiers.
+- `speed-picker`: both Codex composers use an icon-only speed control. Exactly
+  Standard/Fast toggles in one tap; other tier sets open a menu with every tier
+  and the current choice checked. Its icon distinguishes Standard from other
+  tiers; its accessible name identifies the current tier. Standard alone hides it.
 - `catalog-refresh`: model menus offer a compact manual refresh. Opening a menu
   checks whether its catalog is older than five minutes; a stale catalog is
   re-probed. Cached host polling remains every 15 seconds, with the one-hour
@@ -66,7 +67,7 @@ and steers messages while the agent is busy.
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
-- In a Codex session, toggle Fast for subsequent turns, or refresh the model
+- In a Codex session, choose speed for subsequent turns, or refresh the model
   catalog from its model menu.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
@@ -89,7 +90,7 @@ and steers messages while the agent is busy.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
-- For Codex, tap the Fast icon to toggle Fast and Standard. The model menu's
+- For Codex, tap the speed icon to toggle Standard/Fast or choose another tier. The model menu's
   refresh control reloads models, their effort levels and their service tiers.
 - Attach files or type `/` before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
@@ -150,8 +151,9 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `web/src/shell/NewChatDialog.flow.test.tsx`,
   `tests/server/routes/test_session_create_project_consistency.py`, and
   `tests/runner/test_app_sessions_native_events_options.py`. Manually, tap the
-  Fast icon twice and expect the icon and pressed state to switch on then off.
-  Models without Fast have no toggle; other tiers remain available in presets.
+  speed icon twice with Standard/Fast and expect it to switch on then off.
+  With Ultrafast advertised, expect a menu with every tier and the current one
+  checked; choose Ultrafast. A model offering only Standard has no control.
 - **`catalog-refresh`, both model menus:** refresh requests, retained choices
   and nullable catalog metadata are covered by `web/src/hooks/useHosts.test.tsx`,
   `web/src/lib/newChatPickerCache.test.ts`,
@@ -204,7 +206,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 - **`mobile-labels`, both composers with Fast:**
   `tests/browser_ui/chat/test_composer_fast_toggle.py::test_fast_control_keeps_send_and_stop_inside_phone_composer`
-  checks 375–430 px widths, hidden model/permission labels, and send/stop geometry.
+  checks 375–430 px widths, hidden model/permission labels, send/stop geometry,
+  and both the two-tier toggle and three-tier menu on both composer surfaces.
 
 ## Gotchas
 

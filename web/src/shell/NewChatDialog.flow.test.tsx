@@ -2407,7 +2407,14 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("gpt-b"),
     );
-    expect(screen.queryByTestId("new-chat-speed-trigger")).toBeNull();
+    const trigger = screen.getByRole("button", { name: "Speed: Ultrafast" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(screen.getByRole("menuitemradio", { name: "Ultrafast" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.queryByRole("menuitemradio", { name: "Fast" })).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("new-chat-speed-menu"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -2418,7 +2425,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels["omnigent.speed_tier"]).toBe("ultrafast");
   });
 
-  it("toggles the inherited host fast default to an explicit standard tier", async () => {
+  it("selects an advertised tier from the inherited host fast default", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(useHostModelOptions).mockReturnValue({
       data: [
@@ -2442,10 +2449,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    const toggle = screen.getByRole("button", { name: "Fast mode" });
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    const trigger = screen.getByRole("button", { name: "Speed: Fast" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Ultrafast" }));
+    expect(trigger).toHaveAttribute("aria-label", "Speed: Ultrafast");
     pickPermissionOption("approve-for-me");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -2453,7 +2460,7 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(
       (vi.mocked(authenticatedFetch).mock.calls[0][1] as RequestInit).body as string,
     );
-    expect(body.labels["omnigent.speed_tier"]).toBe("standard");
+    expect(body.labels["omnigent.speed_tier"]).toBe("ultrafast");
     expect(body.terminal_launch_args).toEqual(["--approve-for-me"]);
   });
 

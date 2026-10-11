@@ -19,14 +19,13 @@ describe("shared composer controls", () => {
     const options = [
       { value: "standard", label: "Standard" },
       { value: "fast", label: "Fast" },
-      { value: "ultrafast", label: "Ultrafast" },
     ];
     const { rerender } = render(
-      <ComposerSpeedPicker value="ultrafast" options={options} onSelect={onSelect} />,
+      <ComposerSpeedPicker value="standard" options={options} onSelect={onSelect} />,
     );
-    const trigger = screen.getByRole("button", { name: "Fast mode" });
+    const trigger = screen.getByRole("button", { name: "Speed: Standard" });
     expect(trigger).toHaveAttribute("aria-pressed", "false");
-    expect(trigger).toHaveAttribute("title", "Fast mode off — enable Fast");
+    expect(trigger).toHaveAttribute("title", "Speed: Standard — use Fast");
     expect(trigger).toHaveTextContent(/^$/);
     expect(trigger.querySelector("svg.lucide-zap-off")).toBeInTheDocument();
     fireEvent.click(trigger);
@@ -39,7 +38,43 @@ describe("shared composer controls", () => {
     expect(onSelect).toHaveBeenCalledWith("standard");
   });
 
-  it("hides the fast toggle when the model does not advertise fast", () => {
+  it.each([
+    ["standard", "Standard"],
+    ["fast", "Fast"],
+    ["ultrafast", "Ultrafast"],
+  ])(
+    "opens all advertised tiers with %s checked and a distinct non-standard icon",
+    (value, label) => {
+      const onSelect = vi.fn();
+      const options = [
+        { value: "standard", label: "Standard" },
+        { value: "fast", label: "Fast" },
+        { value: "ultrafast", label: "Ultrafast" },
+      ];
+      render(<ComposerSpeedPicker value={value} options={options} onSelect={onSelect} />);
+      const trigger = screen.getByTestId("composer-speed-trigger");
+      expect(trigger).toHaveAttribute("aria-label", `Speed: ${label}`);
+      expect(trigger).not.toHaveAttribute("aria-pressed");
+      expect(trigger).toHaveTextContent(/^$/);
+      expect(
+        trigger.querySelector(value === "standard" ? "svg.lucide-zap-off" : "svg.lucide-zap"),
+      ).toBeInTheDocument();
+      fireEvent.keyDown(trigger, { key: "ArrowDown" });
+      for (const option of options) {
+        expect(screen.getByRole("menuitemradio", { name: option.label })).toHaveAttribute(
+          "aria-checked",
+          String(option.value === value),
+        );
+      }
+      fireEvent.click(
+        screen.getByRole("menuitemradio", { name: value === "ultrafast" ? "Fast" : "Ultrafast" }),
+      );
+      expect(onSelect).toHaveBeenCalledWith(value === "ultrafast" ? "fast" : "ultrafast");
+    },
+  );
+
+  it("offers non-fast tiers through a menu even when there are only two choices", () => {
+    const onSelect = vi.fn();
     render(
       <ComposerSpeedPicker
         value="ultrafast"
@@ -47,6 +82,20 @@ describe("shared composer controls", () => {
           { value: "standard", label: "Standard" },
           { value: "ultrafast", label: "Ultrafast" },
         ]}
+        onSelect={onSelect}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Speed: Ultrafast" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Standard" }));
+    expect(onSelect).toHaveBeenCalledWith("standard");
+  });
+
+  it("hides speed when the model only offers standard", () => {
+    render(
+      <ComposerSpeedPicker
+        value="standard"
+        options={[{ value: "standard", label: "Standard" }]}
         onSelect={vi.fn()}
       />,
     );
@@ -58,12 +107,15 @@ describe("shared composer controls", () => {
     render(
       <ComposerSpeedPicker
         value="standard"
-        options={[{ value: "fast", label: "Fast" }]}
+        options={[
+          { value: "standard", label: "Standard" },
+          { value: "fast", label: "Fast" },
+        ]}
         disabled
         onSelect={onSelect}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "Fast mode" });
+    const trigger = screen.getByRole("button", { name: "Speed: Standard" });
     expect(trigger).toBeDisabled();
     fireEvent.click(trigger);
     expect(onSelect).not.toHaveBeenCalled();
