@@ -158,6 +158,7 @@ class _ChatSseStream:
                         except queue.Empty:
                             event = b": heartbeat\n\n"
                         if event is None:
+                            self.close_connection = True
                             break
                         self.wfile.write(event)
                         self.wfile.flush()
@@ -203,6 +204,12 @@ class _ChatSseStream:
                 self._pending.append(encoded)
             for client in self._clients:
                 client.put(encoded)
+
+    def disconnect(self) -> None:
+        """Drop current SSE transports without a terminal event or shutting down."""
+        with self._lock:
+            for client in self._clients:
+                client.put(None)
 
     def close(self) -> None:
         with self._lock:

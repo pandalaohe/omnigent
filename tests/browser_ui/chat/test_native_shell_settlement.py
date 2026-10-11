@@ -17,7 +17,7 @@ def test_shell_mirror_settles_its_bubble_before_the_next_prompt(
     output_path: str,
     width: int,
 ) -> None:
-    """A command card replaces its optimistic bubble across live and reload views."""
+    """A committed shell turn replaces its optimistic bubble across live and reload views."""
     chat = chat_session_contract
     chat.harness = "claude-native"
     chat.event_ack = {"queued": True, "pending_id": "pending-shell"}
@@ -52,10 +52,10 @@ def test_shell_mirror_settles_its_bubble_before_the_next_prompt(
     }
     for item in (shell_input, shell_output):
         chat.emit({"event": "response.output_item.done", "data": {"item": item}})
-    shell = page.locator('[data-testid="terminal-command-card"][data-terminal-kind="input"]')
+    shell = page.locator(f'{_USER}[data-user-message-id="shell-input"]')
     expect(shell).to_have_count(1)
     expect(shell).to_contain_text("echo shell-settled")
-    expect(page.locator(_USER)).to_have_count(0)
+    expect(page.locator(_USER)).to_have_count(1)
     output = page.locator('[data-testid="terminal-command-card"][data-terminal-kind="output"]')
     expect(output).to_have_count(1)
     output.click()
@@ -69,8 +69,8 @@ def test_shell_mirror_settles_its_bubble_before_the_next_prompt(
         lambda response: response.url.endswith(f"/{chat.session_id}/events")
     ):
         page.get_by_role("button", name="Send", exact=True).click()
-    expect(page.locator(_USER)).to_have_count(1)
-    expect(page.locator(_USER)).to_contain_text(prompt)
+    expect(page.locator(_USER)).to_have_count(2)
+    expect(page.locator(_USER).last).to_contain_text(prompt)
     user = message_item("next-user", "user", prompt, response_id="next-turn")
     assistant = message_item(
         "next-assistant", "assistant", "prompt-settled", response_id="next-turn"
@@ -92,8 +92,9 @@ def test_shell_mirror_settles_its_bubble_before_the_next_prompt(
     )
     chat.emit({"event": "response.output_item.done", "data": {"item": assistant}})
     chat.emit_idle("next-turn")
-    expect(page.locator(_USER)).to_have_count(1)
+    expect(page.locator(_USER)).to_have_count(2)
     expect(page.get_by_text("prompt-settled", exact=True)).to_be_visible()
+
     expect(page.get_by_test_id("working-indicator")).to_have_count(0)
     assert len(chat.event_posts) == 2
     page.screenshot(path=str(artifacts / "shell-settled.png"), full_page=True)
@@ -102,7 +103,66 @@ def test_shell_mirror_settles_its_bubble_before_the_next_prompt(
     chat.update_session(pending_inputs=[])
     page.reload()
     chat.wait_for_stream()
-    expect(page.locator(_USER)).to_have_count(1)
-    expect(page.locator(_USER)).to_contain_text(prompt)
+    expect(page.locator(_USER)).to_have_count(2)
+    expect(page.locator(_USER).last).to_contain_text(prompt)
     expect(shell).to_have_count(1)
     expect(page.get_by_text("prompt-settled", exact=True)).to_be_visible()
+
+
+def test_phone_reconnect_settles_shell_before_later_replies(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A shell mirror missed by the stream must settle during history recovery."""
+    chat = chat_session_contract
+    chat.harness = "claude-native"
+    chat.event_ack = {"queued": True, "pending_id": "pending-gap-shell"}
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=20_000)
+    composer.fill("! echo gap-shell")
+    with page.expect_response(
+        lambda response: response.url.endswith(f"/{chat.session_id}/events")
+    ):
+        page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_USER)).to_have_count(1)
+
+    shell_input = {
+        "id": "gap-shell-input",
+        "response_id": "gap-shell-turn",
+        "type": "terminal_command",
+        "kind": "input",
+        "input": "echo gap-shell",
+    }
+    reply = message_item(
+        "gap-reply", "assistant", "Reply after shell", response_id="gap-reply-turn"
+    )
+    chat.set_items([reply, shell_input])
+    # End only the browser's current transport, without a terminal [DONE].
+    chat.stream.disconnect()
+    chat.wait_for_stream()
+    expect(page.get_by_text("Reply after shell", exact=True)).to_be_visible(timeout=20_000)
+    expect(page.locator(_USER)).to_have_count(1)
+    expect(page.locator(_USER)).to_have_attribute("data-user-message-id", "gap-shell-input")
+
+    chat.emit(
+        {
+            "event": "response.output_item.done",
+            "data": {
+                "item": message_item(
+                    "later-reply",
+                    "assistant",
+                    "Another reply after shell",
+                    response_id="later-turn",
+                )
+            },
+        }
+    )
+    expect(page.get_by_text("Another reply after shell", exact=True)).to_be_visible()
+    expect(page.locator(_USER)).to_have_count(1)
+    shell_box = page.locator(_USER).bounding_box()
+    reply_box = page.get_by_text("Another reply after shell", exact=True).bounding_box()
+    assert shell_box is not None and reply_box is not None
+    assert shell_box["y"] + shell_box["height"] <= reply_box["y"]
