@@ -16,6 +16,7 @@ import re
 import secrets
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -3635,7 +3636,104 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+async def _persist_elicitation_answer(
+    session_id: str,
+    elicitation_id: str,
+    params: dict[str, Any],
+    result: ElicitationResult,
+    conversation_store: ConversationStore,
+) -> None:
+    """Save the user's complete answer before resolving or delivering the card."""
+    content = result.content
+    if not content:
+        return
+    answers: list[dict[str, str]] = []
+    used: set[str] = set()
+    question_payload = params.get("ask_user_question")
+    questions = question_payload.get("questions", []) if isinstance(question_payload, dict) else []
+    for question in questions:
+        if not isinstance(question, dict) or not isinstance(question.get("question"), str):
+            continue
+        text = question["question"]
+        question_id = question.get("id")
+        key = question_id if isinstance(question_id, str) and question_id in content else text
+        if key not in content:
+            continue
+        used.add(text)
+        if isinstance(question_id, str):
+            used.add(question_id)
+        value = content[key]
+        answer = (
+            "[redacted]"
+            if question.get("isSecret") is True
+            else "; ".join(value)
+            if isinstance(value, list)
+            else str(value)
+        )
+        entry = {"question": text, "answer": answer}
+        if isinstance(question_id, str):
+            entry["id"] = question_id
+        answers.append(entry)
+    schema = params.get("requestedSchema")
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    for key, value in content.items():
+        if key in used:
+            continue
+        field = properties.get(key, {}) if isinstance(properties, dict) else {}
+        title = field.get("title") if isinstance(field, dict) else None
+        text = title if isinstance(title, str) else key
+        if key in {"feedback", "answer"} and not field:
+            text = params.get("message") or key
+        elif params.get("message"):
+            text = f"{params['message']}\n{text}"
+        description = field.get("description") if isinstance(field, dict) else None
+        if isinstance(description, str) and description:
+            text = f"{text}\n{description}"
+        secret = isinstance(field, dict) and (
+            field.get("writeOnly") is True or field.get("format") == "password"
+        )
+        answer = (
+            "[redacted]" if secret else "; ".join(value) if isinstance(value, list) else str(value)
+        )
+        answers.append({"question": text, "answer": answer})
+    payload = {"elicitation_id": elicitation_id, "action": result.action, "answers": answers}
+    text = "[System: Question answered]\n" + json.dumps(payload, ensure_ascii=False)
+    fingerprint = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+    stable_id = hashlib.sha256(
+        f"elicitation_answer:{session_id}:{elicitation_id}:{fingerprint}".encode()
+    ).hexdigest()[:32]
+    item = NewConversationItem(
+        type="message",
+        response_id=generate_task_id(),
+        data=MessageData(
+            role="user", user_authored=True, content=[{"type": "input_text", "text": text}]
+        ),
+        stable_id=stable_id,
+    )
+    persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    if persisted and not persisted[0].deduplicated:
+        _publish_external_conversation_item(session_id, persisted[0])
+
+
+_elicitation_resolution_locks: WorkspaceScopedCache[tuple[str, str], asyncio.Lock] = (
+    WorkspaceScopedCache(weakref.WeakValueDictionary)
+)
+
+
 async def _resolve_elicitation(
+    session_id: str,
+    data: dict[str, Any],
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore | None = None,
+) -> None:
+    """Serialize a card's durable receipt and verdict; unused locks are collected."""
+    key = (session_id, str(data.get("elicitation_id", "")))
+    lock = _elicitation_resolution_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        await _resolve_elicitation_locked(session_id, data, runner_router, conversation_store)
+
+
+async def _resolve_elicitation_locked(
     session_id: str,
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
@@ -3657,7 +3755,10 @@ async def _resolve_elicitation(
     ``elicitation_timed_out`` before any effect below: the wait is
     over, and accepting a late answer would resurrect a stopped turn.
 
-    Three effects, in order:
+    Submitted answer content is saved before the three resolution effects below,
+    independently of whether the harness can receive it.
+
+    Three resolution effects, in order:
 
     1. **Server-side harness Future.** Claude-native permission
        hooks (and any other server-parked elicitation) register a
@@ -3714,6 +3815,48 @@ async def _resolve_elicitation(
             "This approval timed out and the turn was stopped.",
             code=ErrorCode.ELICITATION_TIMED_OUT,
         )
+    pending_entry = next(
+        (
+            event
+            for event in pending_elicitations.snapshot_for(session_id)
+            if event.get("elicitation_id") == elicitation_id
+        ),
+        None,
+    )
+    reuse_verdict = False
+    if (
+        pending_entry is None
+        and timed_out_record is not None
+        and timed_out_record.session_id == session_id
+        and timed_out_record.result is not None
+    ):
+        # A duplicate must not replace the winning verdict while the native
+        # hook is reconnecting and its receipt has already been saved.
+        data.clear()
+        data.update(
+            {
+                "elicitation_id": elicitation_id,
+                **timed_out_record.result.model_dump(exclude_none=True),
+            }
+        )
+        reuse_verdict = True
+    if conversation_store is not None and pending_entry is not None:
+        params = pending_entry.get("params")
+        try:
+            answer_result = ElicitationResult.model_validate(
+                {key: value for key, value in data.items() if key != "elicitation_id"}
+            )
+        except ValidationError:
+            answer_result = None
+        if (
+            isinstance(params, dict)
+            and answer_result is not None
+            and params.get("target_session_id") in (None, session_id)
+            and _harness_elicitation_owners.get(elicitation_id, session_id) == session_id
+        ):
+            await _persist_elicitation_answer(
+                session_id, elicitation_id, params, answer_result, conversation_store
+            )
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
@@ -3756,7 +3899,12 @@ async def _resolve_elicitation(
                     )
                 )
                 _prune_pre_resolved_harness_elicitations()
-    elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
+    elif (
+        harness_future is None
+        and isinstance(elicitation_id, str)
+        and elicitation_id
+        and not reuse_verdict
+    ):
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
         # returns it; consume is session-checked, so no cross-session use.

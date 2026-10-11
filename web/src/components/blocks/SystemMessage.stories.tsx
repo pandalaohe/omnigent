@@ -49,3 +49,17 @@ export const Interrupted: Story = {
     },
   },
 };
+
+export const AnsweredQuestions: Story = {
+  args: {
+    message: {
+      kind: "question_answer",
+      label: "Question answered",
+      body: "",
+      answers: [
+        { question: "Which surfaces should be checked?", answer: "Desktop, mobile" },
+        { question: "What else matters?", answer: "Keep the answer visible.\nPreserve each line." },
+      ],
+    },
+  },
+};

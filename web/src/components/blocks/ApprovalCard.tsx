@@ -371,6 +371,17 @@ export function ApprovalCard({
   // before the structured field was added.
   const askPayload: AskUserQuestionPayload | null =
     castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview);
+  const secretQuestions = new Set(
+    Array.isArray(askUserQuestion?.questions)
+      ? askUserQuestion.questions.flatMap((entry: unknown) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+          const question = entry as Record<string, unknown>;
+          return question.isSecret === true && typeof question.question === "string"
+            ? [question.question]
+            : [];
+        })
+      : [],
+  );
   // ExitPlanMode plan review: the server stamps the full tool_input
   // as `exit_plan_mode`; a usable plan card needs the `plan` markdown
   // string. Anything else falls back to the binary card.
@@ -579,13 +590,21 @@ export function ApprovalCard({
     // (flat ``{[question]: answer}``) — matches MCP's
     // ElicitResult.content shape.
     const submittedAnswers =
-      isAskUserQuestion && response.content && Object.keys(response.content).length > 0
+      accepted &&
+      (isAskUserQuestion || isSchemaForm) &&
+      response.content &&
+      Object.keys(response.content).length > 0
         ? response.content
         : null;
     const selectedAnswer =
-      !isAskUserQuestion && response.content && typeof response.content.answer === "string"
+      accepted &&
+      !isAskUserQuestion &&
+      response.content &&
+      typeof response.content.answer === "string"
         ? (response.content.answer as string)
         : null;
+    const showAnswerFallback =
+      response["_meta"]?.answerFallback === true && submittedAnswers !== null;
     // Plan rejections can carry the feedback the user typed into the
     // card; echo it on the responded pill so the chat shows WHY the
     // plan went back for revision.
@@ -627,7 +646,7 @@ export function ApprovalCard({
       label = "Submitted";
     } else if (selectedAnswer !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
-      label = `Selected: ${selectedAnswer}`;
+      label = "Selected";
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
@@ -659,12 +678,17 @@ export function ApprovalCard({
     // if the prompt were still outstanding — the answers below and the
     // verdict label already say what happened. The pending card omits it
     // for the same reason: purposeful content instead of the raw ask.
-    const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
+    const showGatingMessage =
+      !isCodexCommandApproval &&
+      !isAskUserQuestion &&
+      !isExitPlanMode &&
+      !isSchemaForm &&
+      !isMultiChoice;
     const hasBody =
       showSource ||
       showGatingMessage ||
       isCodexCommandApproval ||
-      submittedAnswers !== null ||
+      showAnswerFallback ||
       planRejectionFeedback !== null ||
       promptExpired;
 
@@ -700,17 +724,23 @@ export function ApprovalCard({
             ) : showGatingMessage ? (
               <span>{message}</span>
             ) : null}
-            {submittedAnswers !== null && (
-              <ul className="flex flex-col gap-0.5">
-                {Object.entries(submittedAnswers).map(([q, ans]) => (
-                  <li key={q} className="flex flex-wrap items-baseline gap-x-1.5">
-                    <span className="text-muted-foreground">{q}</span>
-                    <span className="font-medium">
-                      {Array.isArray(ans) ? ans.join(", ") : String(ans)}
-                    </span>
-                  </li>
+            {showAnswerFallback && submittedAnswers && (
+              <div className="space-y-2" data-testid="answered-card-fallback">
+                {Object.entries(submittedAnswers).map(([question, raw]) => (
+                  <div key={question} className="min-w-0">
+                    <p className="break-words whitespace-pre-wrap text-muted-foreground">
+                      {question}
+                    </p>
+                    <p className="break-words whitespace-pre-wrap text-foreground">
+                      {secretQuestions.has(question)
+                        ? "[redacted]"
+                        : Array.isArray(raw)
+                          ? raw.join(", ")
+                          : String(raw)}
+                    </p>
+                  </div>
                 ))}
-              </ul>
+              </div>
             )}
             {planRejectionFeedback !== null && (
               <span className="italic" data-testid="plan-rejection-feedback">

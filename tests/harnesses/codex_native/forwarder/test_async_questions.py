@@ -55,6 +55,17 @@ def test_parse_question_reply_round_trips_entries() -> None:
     ]
 
 
+def test_parse_question_reply_accepts_array_item_id() -> None:
+    reply = (
+        '<send_user_message_question_reply>\n[{"answer":"First line\\nSecond line",'
+        '"question":"What next?","questionItemId":["request_user_input_async","call_a",0]}]'
+        "\n</send_user_message_question_reply>"
+    )
+    assert fwd.parse_question_reply(reply) == [
+        ("call_a", "What next?", 0, "First line\nSecond line")
+    ]
+
+
 @pytest.mark.parametrize(
     "text",
     [

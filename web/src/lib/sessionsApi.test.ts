@@ -1416,6 +1416,28 @@ describe("getSessionUsage", () => {
 });
 
 describe("exportSessionTranscript", () => {
+  it("keeps a saved question and multiline answer in the portable transcript", async () => {
+    const text =
+      '[System: Question answered]\n{"elicitation_id":"elicit_example","action":"accept","answers":[{"question":"What next?","answer":"Check mobile.\\nKeep the tests."}]}';
+    const item = {
+      id: "answer_record",
+      type: "message",
+      role: "user",
+      user_authored: true,
+      content: [{ type: "input_text", text }],
+    };
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "sess_1" }));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ data: [item], has_more: false }));
+    const jsonl = await exportSessionTranscript("sess_1");
+    expect(JSON.parse(jsonl.trimEnd().split("\n")[1]!)).toEqual({ record_type: "item", ...item });
+    const exported = JSON.parse(
+      JSON.parse(jsonl.trimEnd().split("\n")[1]!).content[0].text.split("\n")[1],
+    );
+    expect(exported.answers).toEqual([
+      { question: "What next?", answer: "Check mobile.\nKeep the tests." },
+    ]);
+  });
+
   it("writes session_meta first, then every item in ascending order", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({ id: "sess_1", object: "conversation", title: "Planning" }),

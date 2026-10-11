@@ -8,6 +8,7 @@ import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   parseSystemMessage,
+  sameQuestionAnswer,
 } from "./systemMessage";
 
 describe("isClaudeAgentMessageContent", () => {
@@ -393,12 +394,14 @@ describe("Codex question replies", () => {
         { answer: "date-fns", question: "Which library?", questionItemId: itemId("call_abc", 0) },
       ]),
     );
-    expect(marker).toBe("[System: Question answered]\nWhich library? → date-fns");
-    // The generic branch already names it "Question answered" — no new kind.
+    expect(marker).toBe(
+      '[System: Question answered]\n{"answers":[{"question":"Which library?","answer":"date-fns","id":"call_abc:0"}]}',
+    );
     expect(parseSystemMessage(marker!)).toEqual({
-      kind: "generic",
+      kind: "question_answer",
       label: "Question answered",
-      body: "Which library? → date-fns",
+      body: "",
+      answers: [{ question: "Which library?", answer: "date-fns", id: "call_abc:0" }],
     });
     // It is a system row, not a human turn: the consumed-event FIFO head
     // must not be popped for it.
@@ -412,7 +415,91 @@ describe("Codex question replies", () => {
         { answer: "b", question: "Q2", questionItemId: itemId("call_abc", 1) },
       ]),
     );
-    expect(marker).toBe("[System: Question answered]\nQ1 → a\nQ2 → b");
+    expect(parseSystemMessage(marker!)?.answers).toEqual([
+      { question: "Q1", answer: "a", id: "call_abc:0" },
+      { question: "Q2", answer: "b", id: "call_abc:1" },
+    ]);
+  });
+
+  it("accepts direct protocol ids and preserves multiline answers", () => {
+    const marker = codexQuestionReplyMarker(
+      reply([
+        {
+          answer: "first line\nsecond line",
+          question: "Why?",
+          questionItemId: ["request_user_input_async", "call_abc", 0],
+        },
+      ]),
+    );
+    expect(parseSystemMessage(marker!)?.answers).toEqual([
+      { question: "Why?", answer: "first line\nsecond line", id: "call_abc:0" },
+    ]);
+  });
+
+  it("parses the durable receipt and correlates it with a native echo", () => {
+    const receipt = parseSystemMessage(
+      "[System: Question answered]\n" +
+        JSON.stringify({
+          elicitation_id: "elicit_abcdef123",
+          action: "accept",
+          answers: [{ question: "Why?", answer: "first\nsecond", id: "call_abc:0" }],
+        }),
+    )!;
+    const native = parseSystemMessage(
+      codexQuestionReplyMarker(
+        reply([
+          {
+            question: "Why?",
+            answer: "first\nsecond",
+            questionItemId: itemId("call_abc", 0),
+          },
+        ]),
+      )!,
+    )!;
+    expect(receipt.answers?.[0]?.answer).toBe("first\nsecond");
+    expect(sameQuestionAnswer(receipt, native)).toBe(true);
+    expect(
+      sameQuestionAnswer(
+        receipt,
+        parseSystemMessage(
+          "[System: answers to your question card #qabcdef]\nWhy? → first\nsecond",
+        )!,
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps ambiguous legacy text intact while reading a simple old answer", () => {
+    const body = "Why?\nGive context → because\nA → B is part of the answer";
+    const legacy = parseSystemMessage(`[System: answers to your question card #qabcdef]\n${body}`)!;
+    expect(legacy.kind).toBe("question_answer");
+    expect(legacy.body).toBe(body);
+    expect(legacy.answers).toBeUndefined();
+    expect(parseSystemMessage("[System: Question answered]\nPick → B")?.answers).toEqual([
+      { question: "Pick", answer: "B" },
+    ]);
+  });
+
+  it("correlates keyed legacy text only when the full rendered answer is equal", () => {
+    const receipt = parseSystemMessage(
+      `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [
+          { question: "Why?\nGive context", answer: "because\nA → B is part of the answer" },
+        ],
+      })}`,
+    )!;
+    const legacy = (body: string) =>
+      parseSystemMessage(`[System: answers to your question card #qabcdef]\n${body}`)!;
+    expect(
+      sameQuestionAnswer(
+        receipt,
+        legacy("Why?\nGive context → because\nA → B is part of the answer"),
+      ),
+    ).toBe(true);
+    expect(
+      sameQuestionAnswer(receipt, legacy("Why?\nGive context → because\nA → B is different")),
+    ).toBe(false);
   });
 
   it.each([
@@ -456,7 +543,12 @@ describe("Codex question replies", () => {
     const valid = reply([{ answer: "B", question: "Pick", questionItemId: itemId("call_abc", 0) }]);
     expect(codexQuestionReplyMarkerContent([{ type: "input_text", text: "hi" }])).toBeNull();
     expect(codexQuestionReplyMarkerContent([{ type: "input_text", text: valid }])).toEqual([
-      { type: "input_text", text: "[System: Question answered]\nPick → B" },
+      {
+        type: "input_text",
+        text: `[System: Question answered]\n${JSON.stringify({
+          answers: [{ question: "Pick", answer: "B", id: "call_abc:0" }],
+        })}`,
+      },
     ]);
   });
 });

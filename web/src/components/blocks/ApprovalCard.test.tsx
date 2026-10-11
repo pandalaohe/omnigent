@@ -732,8 +732,7 @@ describe("ApprovalCard — multi-choice options", () => {
 
   it("renders 'Selected: <label>' on the responded card when content carries an answer", () => {
     // The store stamps `response.content.answer` after a successful
-    // submit so the responded pill can show the actual choice
-    // rather than a generic "Approved" label.
+    // The receipt at the submitted-answer position carries the full choice.
     render(
       <ApprovalCard
         elicitationId="elic_done"
@@ -752,7 +751,8 @@ describe("ApprovalCard — multi-choice options", () => {
       />,
     );
 
-    expect(screen.getByText(/Selected: Alpha/)).toBeDefined();
+    expect(screen.getByText(/Selected/)).toBeDefined();
+    expect(screen.queryByText(/Alpha/)).toBeNull();
   });
 });
 
@@ -1435,10 +1435,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByTestId("ask-user-question-previews").textContent).toContain("[editor only]");
   });
 
-  it("renders 'Submitted' with the answer summary in the responded state", () => {
+  it("renders a compact Submitted card after the answer moves into the transcript", () => {
     // After submit the card retains the response so the user (and
-    // anyone scrolling history) can see what was chosen rather than
-    // a generic "Approved" pill. ``content`` is the flat MCP map.
+    // anyone scrolling history) sees a compact pill; the receipt carries
+    // the answer at the submitted-answer position. ``content`` is the flat MCP map.
     render(
       <ApprovalCard
         elicitationId="elic_done"
@@ -1456,11 +1456,60 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.getByText(/Submitted/)).toBeDefined();
-    expect(screen.getByText(/Vue/)).toBeDefined();
+    expect(screen.queryByText(/Vue/)).toBeNull();
     // The user already answered, so the pending-tense gating message
     // ("wants to call AskUserQuestion") would read as if the prompt
     // were still outstanding.
     expect(screen.queryByText(/wants to call/)).toBeNull();
+  });
+
+  it("keeps a historical tool-result-only answer readable on its rebuilt card", () => {
+    render(
+      <ApprovalCard
+        elicitationId="answered:call_old"
+        message=""
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview={sampleSinglePreview}
+        requestedSchema={{}}
+        status="responded"
+        response={{
+          action: "accept",
+          content: { "Why?\nGive context": "because\nA → B" },
+          _meta: { answerFallback: true },
+        }}
+      />,
+    );
+    const fallback = screen.getByTestId("answered-card-fallback");
+    expect(fallback.textContent).toContain("Why?\nGive context");
+    expect(fallback.textContent).toContain("because\nA → B");
+    expect(fallback.querySelector("p:last-child")).toHaveClass("whitespace-pre-wrap");
+  });
+
+  it("redacts an explicitly secret historical fallback answer", () => {
+    render(
+      <ApprovalCard
+        elicitationId="answered:secret"
+        message=""
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview=""
+        requestedSchema={{}}
+        askUserQuestion={{
+          questions: [
+            { question: "Access phrase?", isSecret: true, options: [], multiSelect: false },
+          ],
+        }}
+        status="responded"
+        response={{
+          action: "accept",
+          content: { "Access phrase?": "private value" },
+          _meta: { answerFallback: true },
+        }}
+      />,
+    );
+    expect(screen.getByTestId("answered-card-fallback").textContent).toContain("[redacted]");
+    expect(screen.queryByText("private value")).toBeNull();
   });
 });
 
