@@ -256,7 +256,7 @@ describe("browserIpc — agent navigation prompt on a promptable refusal", () =>
   });
 
   it("does not revive a closed blank tab after an address prompt is allowed", async () => {
-    for (const choice of ["once", "always"]) {
+    const checkClosedTab = async (choice) => {
       const ipcMain = makeIpcMain();
       const calls = [];
       let answer;
@@ -294,7 +294,9 @@ describe("browserIpc — agent navigation prompt on a promptable refusal", () =>
       const result = await pending;
       assert.equal(result.ok, false, choice);
       assert.equal(calls.length, 1, `${choice}: no native retry after close`);
-    }
+    };
+    await checkClosedTab("once");
+    await checkClosedTab("always");
   });
 });
 
