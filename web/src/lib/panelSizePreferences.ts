@@ -13,6 +13,8 @@ export interface PanelSizePreferences {
   inlinePanelWideWidthPx?: number;
   /** User's target width when opening a browser tab in the desktop right rail. */
   inlinePanelBrowserWidthPx?: number;
+  /** Chat space reserved when automatically opening a desktop browser panel. */
+  inlinePanelChatReserveWidthPx?: number;
   /** Width for the always-visible desktop left sidebar (conversations). */
   sidebarWidthPx?: number;
   /** Width for the comments panel inside the file viewer. */
@@ -22,6 +24,19 @@ export interface PanelSizePreferences {
 export type PanelSizePreferenceKey = keyof PanelSizePreferences;
 
 const STORAGE_KEY = "omnigent:panel-size-preferences";
+const CHANGED_EVENT = "omnigent:panel-size-preferences-changed";
+export const CHAT_RESERVE_DEFAULT_PX = 600;
+export const CHAT_RESERVE_MIN_PX = 480;
+export const CHAT_RESERVE_MAX_PX = 1200;
+
+function isValidChatReserve(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= CHAT_RESERVE_MIN_PX &&
+    value <= CHAT_RESERVE_MAX_PX
+  );
+}
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -50,6 +65,8 @@ export function readPanelSizePreferences(): PanelSizePreferences {
       prefs.inlinePanelWideWidthPx = record.inlinePanelWideWidthPx;
     if (isValidWidth(record.inlinePanelBrowserWidthPx))
       prefs.inlinePanelBrowserWidthPx = record.inlinePanelBrowserWidthPx;
+    if (isValidChatReserve(record.inlinePanelChatReserveWidthPx))
+      prefs.inlinePanelChatReserveWidthPx = record.inlinePanelChatReserveWidthPx;
     if (isValidWidth(record.sidebarWidthPx)) prefs.sidebarWidthPx = record.sidebarWidthPx;
     if (isValidWidth(record.commentsPanelWidthPx))
       prefs.commentsPanelWidthPx = record.commentsPanelWidthPx;
@@ -76,6 +93,21 @@ function writePanelSizePreferences(prefs: PanelSizePreferences): void {
   } catch {
     // Storage quota/access errors should not break resize interactions.
   }
+  window.dispatchEvent(new Event(CHANGED_EVENT));
+}
+
+export function readInlinePanelChatReserveWidth(): number {
+  return readPanelSizePreference("inlinePanelChatReserveWidthPx") ?? CHAT_RESERVE_DEFAULT_PX;
+}
+
+export function subscribePanelSizePreferences(callback: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(CHANGED_EVENT, callback);
+  window.addEventListener("storage", callback);
+  return () => {
+    window.removeEventListener(CHANGED_EVENT, callback);
+    window.removeEventListener("storage", callback);
+  };
 }
 
 /**
@@ -85,6 +117,8 @@ function writePanelSizePreferences(prefs: PanelSizePreferences): void {
  * @param width Pixel width to store. ``null`` removes that field.
  */
 export function writePanelSizePreference(key: PanelSizePreferenceKey, width: number | null): void {
+  if (key === "inlinePanelChatReserveWidthPx" && width !== null && !isValidChatReserve(width))
+    return;
   const prefs = readPanelSizePreferences();
   if (width === null) {
     const { [key]: _removedPreference, ...remainingPreferences } = prefs;

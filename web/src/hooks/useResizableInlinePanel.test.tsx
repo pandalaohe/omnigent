@@ -383,9 +383,9 @@ describe("useResizableInlinePanel browser opening", () => {
 
   it.each([
     [1920, 1024],
-    [1440, 560],
-    [1200, 432],
-  ])("sizes a new browser at %i px without shrinking the current panel", (viewport, expected) => {
+    [1440, 552],
+    [1200, 312],
+  ])("sizes a new browser at %i px with the chat reserve", (viewport, expected) => {
     setInnerWidth(viewport);
     const { result, rerender } = renderBrowser();
     rerender({ id: "browser-one", open: true, maximized: false });
@@ -399,7 +399,32 @@ describe("useResizableInlinePanel browser opening", () => {
     resetWidthStoreForTesting();
     const { result, rerender } = renderBrowser();
     rerender({ id: "browser-one", open: true, maximized: false });
-    expect(result.current.panelWidth).toBe(560);
+    expect(result.current.panelWidth).toBe(552);
+  });
+
+  it("uses the configured reserve only for automatic browser opening", () => {
+    setInnerWidth(1440);
+    writePanelSizePreference("inlinePanelChatReserveWidthPx", 800);
+    writePanelSizePreference("inlinePanelWideWidthPx", 700);
+    resetWidthStoreForTesting();
+    const { result, rerender } = renderBrowser();
+    rerender({ id: "browser-one", open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(352);
+    expect(nudgeWiderOnce(result)).toBe(372);
+    expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(372);
+    rerender({ id: null, open: true, maximized: false });
+    expect(result.current.panelWidth).toBe(518);
+    const files = renderHook(() => useResizableInlinePanel(SESSION, undefined, 280, true, true));
+    expect(files.result.current.panelWidth).toBe(672);
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(700);
+  });
+
+  it("leaves room for chat when the reserve exceeds the available space", () => {
+    setInnerWidth(1200);
+    writePanelSizePreference("inlinePanelChatReserveWidthPx", 1200);
+    resetWidthStoreForTesting();
+    const { result } = renderBrowser("browser-one");
+    expect(result.current.panelWidth).toBe(0);
   });
 
   it("restores each open tab's last shown width, but recomputes on panel reopening", () => {
@@ -439,10 +464,10 @@ describe("useResizableInlinePanel browser opening", () => {
     expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(672);
     rerender({ id: "browser-one", open: false, maximized: false });
     rerender({ id: "browser-one", open: true, maximized: false });
-    expect(result.current.panelWidth).toBe(560);
+    expect(result.current.panelWidth).toBe(552);
     rerender({ id: null, open: true, maximized: false });
     rerender({ id: "browser-two", open: true, maximized: false });
-    expect(result.current.panelWidth).toBe(560);
+    expect(result.current.panelWidth).toBe(552);
     expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(672);
   });
 
@@ -528,7 +553,7 @@ describe("useResizableInlinePanel browser opening", () => {
         }),
       { initialProps: { id: SESSION as string | null, present: true } },
     );
-    expect(result.current.panelWidth).toBe(560);
+    expect(result.current.panelWidth).toBe(552);
     act(() =>
       result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
     );
@@ -538,7 +563,7 @@ describe("useResizableInlinePanel browser opening", () => {
     rerender({ id: null, present: false });
     expect(result.current.panelWidth).toBe(420);
     rerender({ id: SESSION, present: true });
-    expect(result.current.panelWidth).toBe(560);
+    expect(result.current.panelWidth).toBe(552);
     expect(readPanelSizePreference("inlinePanelBrowserWidthPx")).toBe(672);
   });
 });
