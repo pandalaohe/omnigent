@@ -83,6 +83,7 @@ const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
 const { registerSessionExpiryReload } = require("./session-expiry");
+const { registerDesktopDiagnostics } = require("./desktopDiagnostics");
 const { ensureDatabricksSession } = require("./databricks-session");
 const {
   deleteStoredToken: forgetDatabricksToken,
@@ -2376,6 +2377,7 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  registerWindowDiagnostics(win);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   // CLI config stores the API mount; Electron boots the browser-facing SPA.
@@ -5096,6 +5098,7 @@ if (isDevBuild) {
 }
 
 // Single-instance: focus the existing window instead of opening a second.
+const registerWindowDiagnostics = registerDesktopDiagnostics(app);
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
