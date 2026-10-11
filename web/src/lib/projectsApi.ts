@@ -84,6 +84,8 @@ export interface Project {
   updated_at?: number | null;
   /** Stored default session settings; `{}` when the project has none. */
   config?: ProjectConfig;
+  /** Content revision used by narrow project-default writes. */
+  config_revision?: string;
 }
 
 interface ProjectListResponse {
@@ -230,6 +232,27 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
     body: JSON.stringify({ config }),
   });
   if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Project;
+}
+
+/** Patch only selected defaults on one host/harness after a fresh project read. */
+export async function patchProjectCallingDefaults(
+  id: string,
+  patch: {
+    expected_revision: string;
+    host_id: string;
+    harness: string;
+    fields: Partial<Record<"model" | "effort" | "speed" | "permission", string | null>>;
+    copy_agent?: boolean;
+    agent_id?: string | null;
+  },
+): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/calling-defaults`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 

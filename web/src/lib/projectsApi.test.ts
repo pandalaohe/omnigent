@@ -13,6 +13,7 @@ import {
   getProjectCollaboration,
   listProjectEntries,
   listProjects,
+  patchProjectCallingDefaults,
   putProjectEntry,
   putProjectHostBinding,
   putProjectRepository,
@@ -118,6 +119,29 @@ describe("updateProjectConfig", () => {
   });
 });
 
+describe("patchProjectCallingDefaults", () => {
+  it("sends only selected host/harness fields with a config revision", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "p a", config_revision: "next" }));
+    await patchProjectCallingDefaults("p a", {
+      expected_revision: "before",
+      host_id: "h1",
+      harness: "codex",
+      fields: { model: "gpt-6-sol", effort: null },
+      copy_agent: false,
+    });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p%20a/calling-defaults");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({
+      expected_revision: "before",
+      host_id: "h1",
+      harness: "codex",
+      fields: { model: "gpt-6-sol", effort: null },
+      copy_agent: false,
+    });
+  });
+});
+
 describe("renameProject", () => {
   it("PATCHes /v1/projects/{id} with the new name (url-encoded id)", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ id: "p a", name: "Renamed" }));
@@ -146,9 +170,7 @@ describe("deleteProject", () => {
 
 describe("getProjectCollaboration", () => {
   it("GETs /v1/projects/{id}/collaboration", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ repositories: [], bindings: [], problems: [] }),
-    );
+    fetchMock.mockResolvedValueOnce(mockResponse({ repositories: [], bindings: [], problems: [] }));
     const result = await getProjectCollaboration("p_1");
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/projects/p_1/collaboration");

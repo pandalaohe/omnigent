@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+import { readCallingDefaults } from "@/lib/callingDefaults";
 import { writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   createProject,
@@ -10,7 +11,9 @@ import {
   getProject,
   getProjectCollaboration,
   getProjectHostRoots,
+  listProjects,
   listProjectEntries,
+  patchProjectCallingDefaults,
   putProjectEntry,
   updateProjectConfig,
 } from "@/lib/projectsApi";
@@ -22,7 +25,9 @@ vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
   getProjectCollaboration: vi.fn(),
   getProjectHostRoots: vi.fn(),
+  listProjects: vi.fn(),
   listProjectEntries: vi.fn(),
+  patchProjectCallingDefaults: vi.fn(),
   putProjectEntry: vi.fn(),
   putProjectRepository: vi.fn(),
   deleteProjectRepository: vi.fn(),
@@ -129,6 +134,8 @@ const getHostRootsMock = vi.mocked(getProjectHostRoots);
 const updateMock = vi.mocked(updateProjectConfig);
 const createMock = vi.mocked(createProject);
 const listEntriesMock = vi.mocked(listProjectEntries);
+const listProjectsMock = vi.mocked(listProjects);
+const patchDefaultsMock = vi.mocked(patchProjectCallingDefaults);
 const putEntryMock = vi.mocked(putProjectEntry);
 const deleteEntryMock = vi.mocked(deleteProjectEntry);
 
@@ -196,6 +203,8 @@ beforeEach(() => {
   updateMock.mockReset();
   createMock.mockReset();
   listEntriesMock.mockReset();
+  listProjectsMock.mockReset();
+  patchDefaultsMock.mockReset();
   putEntryMock.mockReset();
   deleteEntryMock.mockReset();
   hostsMock.mockReset();
@@ -216,6 +225,8 @@ beforeEach(() => {
     features: {},
   });
   listEntriesMock.mockResolvedValue([]);
+  listProjectsMock.mockResolvedValue([]);
+  window.localStorage.removeItem("omnigent:calling-defaults");
   putEntryMock.mockImplementation(async (_id, hostId, workspace) => entry(hostId, workspace));
   deleteEntryMock.mockResolvedValue(undefined);
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
@@ -1450,10 +1461,9 @@ describe("ProjectSettingsDialog", () => {
       ),
     );
 
-    await pickOption("project-settings-host-model-h1", "Default");
-    await pickOption("project-settings-host-effort-h1", "Default");
-    await pickOption("project-settings-host-speed-h1", "Default");
-    await pickOption("project-settings-host-permission-h1", "Default");
+    for (const field of ["model", "effort", "speed", "permission"]) {
+      fireEvent.click(screen.getByTestId(`project-settings-host-reset-${field}-h1`));
+    }
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
@@ -1771,5 +1781,273 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-all-hosts"));
     fireEvent.click(screen.getByRole("button", { name: "About all-host defaults" }));
     expect(screen.getByText("Used for hosts without their own defaults.")).toBeInTheDocument();
+  });
+
+  it("shows the concrete inherited value and resets only the selected harness", async () => {
+    window.localStorage.setItem(
+      "omnigent:calling-defaults",
+      JSON.stringify({ h1: { codex: { model: "master-model", effort: "medium" } } }),
+    );
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: {
+              codex: { model: "local-model", effort: "high" },
+              "claude-native": { model: "sonnet" },
+            },
+          },
+        },
+      },
+    });
+    renderDialog();
+    await screen.findByTestId("project-settings-host-model-h1");
+    fireEvent.click(screen.getByTestId("project-settings-host-reset-model-h1"));
+    expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent(
+      "Inherit master table · master-model",
+    );
+    fireEvent.click(screen.getByTestId("project-settings-host-reset-row-h1-codex"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: {
+          h1: { agent_id: "ag_codex_sdk", harnesses: { "claude-native": { model: "sonnet" } } },
+        },
+      }),
+    );
+  });
+
+  it("keeps a switched agent's harness row and discards unsaved edits on Cancel", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent(), claudeAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: { codex: { model: "gpt-6-sol" }, "claude-native": { model: "sonnet" } },
+          },
+        },
+      },
+    });
+    const dialog = renderDialog();
+    await screen.findByTestId("project-settings-host-agent-h1");
+    await pickOption("project-settings-host-agent-h1", "Claude Code");
+    expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent("sonnet");
+    expect(screen.getByTestId("project-settings-host-copy-h1-claude-native")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(dialog.onOpenChange).toHaveBeenCalledWith(false);
+    expect(updateMock).not.toHaveBeenCalled();
+    dialog.rerenderOpen(false);
+    dialog.rerenderOpen(true);
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent("gpt-6-sol"),
+    );
+  });
+
+  it("copies saved selected fields to all checked targets without sending folders or Agent", async () => {
+    const source = {
+      id: "p_1",
+      name: "Work",
+      config_revision: "source-revision",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: { codex: { model: "gpt-6-sol", permission: "read-only" } },
+          },
+        },
+      },
+    };
+    const target = { id: "p_2", name: "Other", config_revision: "target-revision", config: {} };
+    const missing = {
+      id: "p_3",
+      name: "No folder",
+      config_revision: "missing-revision",
+      config: {},
+    };
+    getProjectMock.mockImplementation(async (id) =>
+      id === "p_1" ? source : id === "p_2" ? target : missing,
+    );
+    listProjectsMock.mockResolvedValue([source, target, missing]);
+    listEntriesMock.mockImplementation(async (id) =>
+      id === "p_3" ? [] : [entry("h1", `/opt/work/${id}`)],
+    );
+    hostsMock.mockReturnValue({ data: [{ ...LAPTOP, configured_harnesses: { codex: true } }] });
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    const catalog = [catalogRow("h1", "codex", [{ id: "gpt-6-sol" }])];
+    listCatalogsMock.mockResolvedValue(catalog);
+    syncCatalogsMock.mockResolvedValue(catalog);
+    patchDefaultsMock.mockResolvedValue({ ...target, config: { calling_defaults: {} } });
+    renderDialog();
+    const copy = await screen.findByTestId("project-settings-host-copy-h1-codex");
+    await waitFor(() => expect(copy).toBeEnabled());
+    fireEvent.click(copy);
+    expect(await screen.findByTestId("project-settings-copy-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-copy-target-p_2")).toBeChecked();
+    expect(screen.getByTestId("project-settings-copy-target-p_3")).toBeChecked();
+    expect(screen.getByTestId("project-settings-copy-field-agent")).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
+    await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
+    expect(patchDefaultsMock).toHaveBeenCalledWith("p_2", {
+      expected_revision: "target-revision",
+      host_id: "h1",
+      harness: "codex",
+      fields: { model: "gpt-6-sol", effort: null, speed: null, permission: "read-only" },
+      copy_agent: false,
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-copy-results")).toHaveTextContent(
+        "No folder: skipped — no entry folder",
+      ),
+    );
+  });
+
+  it("updates the master four fields while retaining project overrides", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config_revision: "saved-revision",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_codex_sdk", harnesses: { codex: { model: "gpt-6-sol" } } },
+        },
+      },
+    });
+    renderDialog();
+    const master = await screen.findByTestId("project-settings-host-master-h1-codex");
+    await waitFor(() => expect(master).toBeEnabled());
+    fireEvent.click(master);
+    expect(screen.getByTestId("project-settings-master-panel")).toHaveTextContent(
+      "model: gpt-6-sol",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update master defaults" }));
+    await waitFor(() => expect(readCallingDefaults().h1.codex.model).toBe("gpt-6-sol"));
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("previews unavailable fields and reports a target revision conflict", async () => {
+    const source = {
+      id: "p_1",
+      name: "Work",
+      config_revision: "source-revision",
+      config: {
+        calling_defaults: {
+          h1: {
+            agent_id: "ag_codex_sdk",
+            harnesses: { codex: { model: "unavailable-model", speed: "fast" } },
+          },
+        },
+      },
+    };
+    const target = { id: "p_2", name: "Other", config_revision: "target-revision", config: {} };
+    getProjectMock.mockImplementation(async (id) => (id === "p_1" ? source : target));
+    listProjectsMock.mockResolvedValue([source, target]);
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    hostsMock.mockReturnValue({ data: [{ ...LAPTOP, configured_harnesses: { codex: true } }] });
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    const catalog = [catalogRow("h1", "codex", [{ id: "gpt-6-sol" }])];
+    listCatalogsMock.mockResolvedValue(catalog);
+    syncCatalogsMock.mockResolvedValue(catalog);
+    patchDefaultsMock.mockRejectedValue(new Error("Project settings changed"));
+    renderDialog();
+    const copy = await screen.findByTestId("project-settings-host-copy-h1-codex");
+    await waitFor(() => expect(copy).toBeEnabled());
+    fireEvent.click(copy);
+    await screen.findByTestId("project-settings-copy-panel");
+    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
+      "model unavailable",
+    );
+    expect(screen.getByTestId("project-settings-copy-panel")).toHaveTextContent(
+      "speed unavailable",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-copy-results")).toHaveTextContent(
+        "Other: failed — Project settings changed",
+      ),
+    );
+    expect(patchDefaultsMock).toHaveBeenCalledWith("p_2", {
+      expected_revision: "target-revision",
+      host_id: "h1",
+      harness: "codex",
+      fields: { effort: null, permission: null },
+      copy_agent: false,
+    });
+  });
+
+  it("refuses to publish stale source settings as master defaults", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    const saved = {
+      id: "p_1",
+      name: "Work",
+      config_revision: "before",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_codex_sdk", harnesses: { codex: { model: "gpt-6-sol" } } },
+        },
+      },
+    };
+    getProjectMock.mockResolvedValueOnce(saved).mockResolvedValue({
+      ...saved,
+      config_revision: "after",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_codex_sdk", harnesses: { codex: { model: "changed" } } },
+        },
+      },
+    });
+    renderDialog();
+    const master = await screen.findByTestId("project-settings-host-master-h1-codex");
+    await waitFor(() => expect(master).toBeEnabled());
+    fireEvent.click(master);
+    fireEvent.click(screen.getByRole("button", { name: "Update master defaults" }));
+    expect(
+      await screen.findByText(/The source project changed\. Reopen its settings/),
+    ).toBeInTheDocument();
+    expect(readCallingDefaults()).toEqual({});
+  });
+
+  it("skips targets without a runnable matching harness, even with a saved folder", async () => {
+    const source = {
+      id: "p_1",
+      name: "Work",
+      config_revision: "source-revision",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_codex_sdk", harnesses: { codex: { model: "gpt-6-sol" } } },
+        },
+      },
+    };
+    const target = { id: "p_2", name: "Other", config_revision: "target-revision", config: {} };
+    getProjectMock.mockImplementation(async (id) => (id === "p_1" ? source : target));
+    listProjectsMock.mockResolvedValue([source, target]);
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    hostsMock.mockReturnValue({ data: [{ ...LAPTOP, configured_harnesses: { codex: false } }] });
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    renderDialog();
+    const copy = await screen.findByTestId("project-settings-host-copy-h1-codex");
+    await waitFor(() => expect(copy).toBeEnabled());
+    fireEvent.click(copy);
+    expect(await screen.findByTestId("project-settings-copy-panel")).toHaveTextContent(
+      "matching harness is unavailable",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-copy-results")).toHaveTextContent(
+        "Other: skipped — matching harness is unavailable",
+      ),
+    );
+    expect(patchDefaultsMock).not.toHaveBeenCalled();
   });
 });

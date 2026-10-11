@@ -28,11 +28,17 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
     CreateProjectRequest,
+    PatchProjectCallingDefaultsRequest,
     ProjectOrderRequest,
     ProjectOrderResponse,
     UpdateProjectRequest,
 )
-from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
+from omnigent.stores.project_store import (
+    ProjectOrderPreference,
+    ProjectStore,
+    apply_project_order,
+    project_config_revision,
+)
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -48,6 +54,7 @@ def _to_response(project: Project) -> dict[str, Any]:
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "config": project.config,
+        "config_revision": project_config_revision(project.config),
     }
 
 
@@ -191,6 +198,30 @@ def create_projects_router(
         # A rename/config change is only ever seen by other connected clients
         # (another tab, the mobile app) if it is pushed; nothing else refreshes
         # their projects cache until a full reload.
+        announce_projects_changed(user_id)
+        return _to_response(project)
+
+    @router.patch("/projects/{project_id}/calling-defaults")
+    async def patch_project_calling_defaults(
+        request: Request,
+        project_id: str,
+        body: PatchProjectCallingDefaultsRequest,
+    ) -> dict[str, Any]:
+        """Apply selected defaults without replacing the project's other config."""
+        user_id = require_user(request, auth_provider)
+        project = await asyncio.to_thread(
+            project_store.patch_calling_defaults,
+            project_id,
+            user_id=user_id,
+            expected_revision=body.expected_revision,
+            host_id=body.host_id,
+            harness=body.harness,
+            fields=body.fields,
+            agent_id=body.agent_id,
+            copy_agent=body.copy_agent,
+        )
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         announce_projects_changed(user_id)
         return _to_response(project)
 

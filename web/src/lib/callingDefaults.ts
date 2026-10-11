@@ -12,6 +12,8 @@
 // server (like agentPins.ts).
 
 import { useEffect, useState } from "react";
+import type { ProjectConfig } from "./projectsApi";
+import { PERMISSION_DEFAULT_OPTIONS } from "./sessionDefaultModes";
 
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
@@ -98,6 +100,50 @@ export interface CallingDefaultEntry {
 }
 
 export type CallingDefaultsTable = Record<string, Record<string, CallingDefaultEntry>>;
+
+export type CallingDefaultField = keyof CallingDefaultEntry;
+export type ProjectDefaultSource =
+  "project_legacy" | "master" | "project_host_native" | "master_native" | "none";
+
+/** The create-time fallback chain after the project's own harness field. */
+export function resolveProjectInheritedField(
+  config: ProjectConfig,
+  master: CallingDefaultsTable,
+  hostId: string,
+  harness: string,
+  field: CallingDefaultField,
+  agentId: string | null,
+): { value: string | null; source: ProjectDefaultSource } {
+  const projectHost = config.calling_defaults?.[hostId]?.harnesses;
+  const masterHost = master[hostId];
+  const parent = SDK_NATIVE_PARENT[harness];
+  const candidates: [string | undefined, ProjectDefaultSource][] = [];
+  if (field === "model" && agentId && agentId === config.agent_id) {
+    candidates.push([config.model, "project_legacy"]);
+  }
+  candidates.push([masterHost?.[harness]?.[field], "master"]);
+  if (parent) {
+    candidates.push([projectHost?.[parent]?.[field], "project_host_native"]);
+    candidates.push([masterHost?.[parent]?.[field], "master_native"]);
+  }
+  for (const [value, source] of candidates) {
+    if (!value) continue;
+    if (
+      field === "permission" &&
+      !PERMISSION_DEFAULT_OPTIONS[harness]?.some((option) => option.value === value)
+    )
+      continue;
+    if (
+      field === "speed" &&
+      !(["codex", "codex-native"].includes(harness)
+        ? /^[a-z][a-z0-9_-]{0,63}$/.test(value)
+        : ["claude-native", "claude-sdk"].includes(harness) && ["standard", "fast"].includes(value))
+    )
+      continue;
+    return { value, source };
+  }
+  return { value: null, source: "none" };
+}
 
 function sanitizeEntry(value: unknown): CallingDefaultEntry | null {
   if (!isRecord(value)) return null;

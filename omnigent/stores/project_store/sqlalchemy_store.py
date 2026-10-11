@@ -5,7 +5,8 @@ from __future__ import annotations
 import builtins
 import json
 import re
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import zstandard
 from sqlalchemy import LargeBinary, asc, select, type_coerce, update
@@ -15,6 +16,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
+from omnigent.calling_defaults import validate_project_calling_defaults
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
 from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
@@ -27,7 +29,11 @@ from omnigent.db.utils import (
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
+from omnigent.stores.project_store import (
+    ProjectOrderPreference,
+    ProjectStore,
+    project_config_revision,
+)
 
 # Max serialized length of a project's config blob. The value is persisted
 # verbatim and reflected back on every read, so an unbounded blob is a mild
@@ -304,6 +310,77 @@ class SqlAlchemyProjectStore(ProjectStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_project", write)
+
+    def patch_calling_defaults(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        expected_revision: str,
+        host_id: str,
+        harness: str,
+        fields: Mapping[Literal["model", "effort", "speed", "permission"], str | None],
+        agent_id: str | None = None,
+        copy_agent: bool = False,
+    ) -> Project | None:
+        """Apply one narrow host/harness patch to the current config in one transaction."""
+
+        def write(session: Session) -> Project | None:
+            require_active_account(session, user_id)
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if row is None or row.user_id != user_id:
+                return None
+            config = _decode_config(row.config)
+            if project_config_revision(config) != expected_revision:
+                raise OmnigentError(
+                    "Project settings changed. Reload before applying these defaults.",
+                    code=ErrorCode.CONFLICT,
+                )
+            next_config = dict(config)
+            defaults = dict(next_config.get("calling_defaults") or {})
+            host = dict(defaults.get(host_id) or {})
+            harnesses = dict(host.get("harnesses") or {})
+            setting = dict(harnesses.get(harness) or {})
+            for field, value in fields.items():
+                if value is None:
+                    setting.pop(field, None)
+                else:
+                    setting[field] = value
+            if setting:
+                harnesses[harness] = setting
+            else:
+                harnesses.pop(harness, None)
+            if harnesses:
+                host["harnesses"] = harnesses
+            else:
+                host.pop("harnesses", None)
+            if copy_agent:
+                if agent_id is None:
+                    host.pop("agent_id", None)
+                else:
+                    host["agent_id"] = agent_id
+            if host:
+                defaults[host_id] = host
+            else:
+                defaults.pop(host_id, None)
+            if defaults:
+                next_config["calling_defaults"] = defaults
+            else:
+                next_config.pop("calling_defaults", None)
+            if "calling_defaults" in next_config:
+                validate_project_calling_defaults(next_config["calling_defaults"])
+            encoded = _encode_config(next_config)
+            if row.config != encoded:
+                row.config = encoded
+                row.updated_at = now_epoch()
+            session.flush()
+            return _to_entity(row)
+
+        return run_write_transaction(
+            self._session_immediate, "patch_project_calling_defaults", write
+        )
 
     def delete(self, project_id: str, *, user_id: str | None) -> bool:
         """Delete an owned project. Idempotent; returns ``False`` if not found."""

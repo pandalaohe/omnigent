@@ -5469,6 +5469,73 @@
         "title": "PaginatedList",
         "type": "object"
       },
+      "PatchProjectCallingDefaultsRequest": {
+        "additionalProperties": false,
+        "description": "Revision-checked changes to one project's host and harness defaults.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "copy_agent": {
+            "default": false,
+            "title": "Copy Agent",
+            "type": "boolean"
+          },
+          "expected_revision": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Revision",
+            "type": "string"
+          },
+          "fields": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "propertyNames": {
+              "enum": [
+                "model",
+                "effort",
+                "speed",
+                "permission"
+              ]
+            },
+            "title": "Fields",
+            "type": "object"
+          },
+          "harness": {
+            "minLength": 1,
+            "title": "Harness",
+            "type": "string"
+          },
+          "host_id": {
+            "minLength": 1,
+            "title": "Host Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "host_id",
+          "harness",
+          "fields"
+        ],
+        "title": "PatchProjectCallingDefaultsRequest",
+        "type": "object"
+      },
       "PermissionObject": {
         "description": "API representation of a session permission grant.",
         "properties": {
@@ -15085,6 +15152,61 @@
           }
         },
         "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/calling-defaults": {
+      "patch": {
+        "description": "Apply selected defaults without replacing the project's other config.",
+        "operationId": "patch_project_calling_defaults_v1_projects__project_id__calling_defaults_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchProjectCallingDefaultsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Project Calling Defaults V1 Projects  Project Id  Calling Defaults Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Project Calling Defaults",
         "tags": [
           "projects"
         ]
