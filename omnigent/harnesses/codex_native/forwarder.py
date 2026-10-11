@@ -5633,12 +5633,13 @@ def parse_question_reply(text: str) -> list[tuple[str, str, int, str]] | None:
         item_id = raw.get("questionItemId")
         if not isinstance(answer, str) or not isinstance(question, str):
             return None
-        if not isinstance(item_id, str):
-            return None
-        try:
-            decoded = json.loads(item_id)
-        except ValueError:
-            return None
+        if isinstance(item_id, str):
+            try:
+                decoded = json.loads(item_id)
+            except ValueError:
+                return None
+        else:
+            decoded = item_id
         if (
             not isinstance(decoded, list)
             or len(decoded) != 3
@@ -5647,6 +5648,7 @@ def parse_question_reply(text: str) -> list[tuple[str, str, int, str]] | None:
             or not decoded[1]
             or not isinstance(decoded[2], int)
             or isinstance(decoded[2], bool)
+            or decoded[2] < 0
         ):
             return None
         entries.append((decoded[1], question, decoded[2], answer))

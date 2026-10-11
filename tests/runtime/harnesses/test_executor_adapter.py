@@ -2529,6 +2529,16 @@ class _ElicitingTurnContext:
         return self.reply
 
 
+def test_claude_sdk_question_card_keeps_full_questions() -> None:
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    question = "Which framework? " + "context " * 100
+    payload = {"questions": [{"question": question, "options": []}]}
+    params = adapter._permission_card("AskUserQuestion", payload)
+    assert params.model_dump()["ask_user_question"] == payload
+
+
 @pytest.mark.asyncio
 async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> None:
     """The card is asked for buttons, and the chosen label comes back.

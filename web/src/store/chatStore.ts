@@ -158,6 +158,9 @@ import {
   codexQuestionReplyMarkerContent,
   isClaudeAgentMessageContent,
   isSystemUserContent,
+  questionAnswerFromContent,
+  questionAnswerCoveredByReceipts,
+  sameQuestionAnswer,
   taskNotificationMarkerContent,
 } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
@@ -6762,7 +6765,6 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
       "type" in b &&
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
   );
-  if (event.isMeta !== true && isHumanAuthoredInput(event)) return content;
   // A Claude background-task wake is hidden context (`is_meta`) that still
   // has to start a new turn on screen: render it as a system marker. Every
   // other meta message (injected skill text) stays hidden.
@@ -6772,6 +6774,7 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   // "[System: Question answered]" marker instead of the raw tags.
   const replyMarker = codexQuestionReplyMarkerContent(content);
   if (replyMarker !== null) return replyMarker;
+  if (event.isMeta !== true && isHumanAuthoredInput(event)) return content;
   if (event.isMeta === true) return null;
   return content;
 }
@@ -7063,6 +7066,37 @@ function committedUserBlock(
     content,
     stableKey,
   };
+}
+
+function appendCorrelatedUserBlock(blocks: AnyBlock[], committed: UserMessageBlock): AnyBlock[] {
+  const answer = questionAnswerFromContent(committed.content);
+  if (!answer) return [...blocks, committed];
+  const existing = blocks
+    .filter((block) => block.type === "user_message")
+    .map((block) => questionAnswerFromContent(block.content))
+    .filter((parsed) => parsed !== null);
+  const receipts = existing.filter((parsed) => parsed.elicitationId);
+  if (answer.elicitationId) {
+    if (receipts.some((receipt) => sameQuestionAnswer(answer, receipt))) return blocks;
+    receipts.push(answer);
+  } else if (
+    existing.some((parsed) => sameQuestionAnswer(answer, parsed)) ||
+    questionAnswerCoveredByReceipts(answer, receipts)
+  ) {
+    return blocks;
+  }
+  return [
+    ...blocks.filter((block) => {
+      if (block.type !== "user_message") return true;
+      const parsed = questionAnswerFromContent(block.content);
+      return (
+        parsed === null ||
+        parsed.elicitationId !== undefined ||
+        !questionAnswerCoveredByReceipts(parsed, receipts)
+      );
+    }),
+    committed,
+  ];
 }
 
 interface RefetchRunnerBackedSessionStateOptions {
@@ -7935,8 +7969,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
               // stableKey = the optimistic bubble's temp id → the
               // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
+              blocks: appendCorrelatedUserBlock(
+                s.blocks,
                 committedUserBlock(
                   event.itemId,
                   content,
@@ -7944,7 +7978,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
-              ],
+              ),
             };
           }
         }
@@ -7972,8 +8006,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             pendingUserMessages: s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
+            blocks: appendCorrelatedUserBlock(
+              s.blocks,
               committedUserBlock(
                 event.itemId,
                 content,
@@ -7981,7 +8015,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? matchedHead.author,
                 matchedHead.createdAtS,
               ),
-            ],
+            ),
           };
         }
 
@@ -7989,10 +8023,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    event payload fresh.
         if (eventContent === null) return {};
         return {
-          blocks: [
-            ...s.blocks,
+          blocks: appendCorrelatedUserBlock(
+            s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
-          ],
+          ),
         };
       });
       return;

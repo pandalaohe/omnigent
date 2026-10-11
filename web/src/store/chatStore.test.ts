@@ -8908,12 +8908,192 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           type: "input_text",
           text:
             "[System: Question answered]\n" +
-            "选择卡显示测试：你能看到这张可点击的单选卡吗？ → 看到了，可以点击选项",
+            JSON.stringify({
+              answers: [
+                {
+                  question: "选择卡显示测试：你能看到这张可点击的单选卡吗？",
+                  answer: "看到了，可以点击选项",
+                  id: "call_5q2o:0",
+                },
+              ],
+            }),
         },
       ]);
       expect(after.pendingUserMessages).toEqual([
         { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
       ]);
+    });
+
+    it("keeps one live answer record when an authored receipt precedes the native echo", () => {
+      const id = "call_a:0";
+      const receipt = `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [{ question: "Why?", answer: "First\nSecond", id }],
+      })}`;
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pending", content: [{ type: "input_text", text: "Later message" }] },
+        ],
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "receipt",
+        itemType: "message",
+        createdBy: "user",
+        data: { role: "user", content: [{ type: "input_text", text: receipt }] },
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "echo",
+        itemType: "message",
+        createdBy: "user",
+        data: {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `<send_user_message_question_reply>${JSON.stringify([
+                {
+                  question: "Why?",
+                  answer: "First\nSecond",
+                  questionItemId: ["request_user_input_async", "call_a", 0],
+                },
+              ])}</send_user_message_question_reply>`,
+            },
+          ],
+        },
+      });
+      const after = useChatStore.getState();
+      expect(after.blocks).toHaveLength(1);
+      expect(after.blocks[0]?.ctx.itemId).toBe("receipt");
+      expect((after.blocks[0] as UserMessageBlock).content).toEqual([
+        { type: "input_text", text: receipt },
+      ]);
+      expect(after.pendingUserMessages).toHaveLength(1);
+    });
+
+    it("replaces a live native echo when its durable receipt arrives later", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "echo",
+        itemType: "message",
+        createdBy: "user",
+        data: {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `<send_user_message_question_reply>${JSON.stringify([
+                {
+                  question: "Reason?",
+                  answer: "because",
+                  questionItemId: ["request_user_input_async", "call_b", 0],
+                },
+              ])}</send_user_message_question_reply>`,
+            },
+          ],
+        },
+      });
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(["echo"]);
+      const receipt = `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [{ question: "Reason?", answer: "because", id: "call_b:0" }],
+      })}`;
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "receipt",
+        itemType: "message",
+        createdBy: "user",
+        data: { role: "user", content: [{ type: "input_text", text: receipt }] },
+      });
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(["receipt"]);
+    });
+
+    it("keeps a batched echo until all separate live receipts cover it", () => {
+      const consume = (itemId: string, text: string) =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId,
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text }] },
+        });
+      const receipt = (id: string, question: string, answer: string, elicitationId: string) =>
+        `[System: Question answered]\n${JSON.stringify({
+          elicitation_id: elicitationId,
+          action: "accept",
+          answers: [{ question, answer, id }],
+        })}`;
+      const echo = `<send_user_message_question_reply>${JSON.stringify([
+        {
+          question: "First?",
+          answer: "A",
+          questionItemId: ["request_user_input_async", "call_batch", 0],
+        },
+        {
+          question: "Second?",
+          answer: "B",
+          questionItemId: ["request_user_input_async", "call_batch", 1],
+        },
+      ])}</send_user_message_question_reply>`;
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+      consume("echo", echo);
+      consume("first", receipt("call_batch:0", "First?", "A", "elicit_111111aa"));
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        "echo",
+        "first",
+      ]);
+      consume("second", receipt("call_batch:1", "Second?", "B", "elicit_222222bb"));
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        "first",
+        "second",
+      ]);
+    });
+
+    it("acks a recovered pending legacy echo without duplicating its receipt", () => {
+      const receipt = `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [{ question: "Why?\nGive context", answer: "because\nA → B" }],
+      })}`;
+      const legacy =
+        "[System: answers to your question card #qabcdef]\nWhy?\nGive context → because\nA → B";
+      useChatStore.setState({
+        blocks: [
+          {
+            type: "user_message",
+            ctx: {
+              agent: null,
+              depth: 0,
+              turn: 0,
+              timestamp: 0,
+              responseId: "",
+              itemId: "receipt",
+            },
+            content: [{ type: "input_text", text: receipt }],
+          },
+        ],
+        pendingUserMessages: [
+          {
+            tempId: "pending",
+            pendingId: "pending",
+            content: [{ type: "input_text", text: legacy }],
+          },
+        ],
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "legacy",
+        itemType: "message",
+        clearedPendingId: "pending",
+        data: { role: "user", content: [{ type: "input_text", text: legacy }] },
+      });
+      const after = useChatStore.getState();
+      expect(after.blocks.map((block) => block.ctx.itemId)).toEqual(["receipt"]);
+      expect(after.pendingUserMessages).toEqual([]);
     });
 
     const teamContent = [

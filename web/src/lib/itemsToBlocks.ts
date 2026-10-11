@@ -62,9 +62,13 @@ import {
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
 import {
+  type ParsedSystemMessage,
   isClaudeAgentMessageContent,
   taskNotificationMarkerContent,
   codexQuestionReplyMarkerContent,
+  questionAnswerFromContent,
+  questionAnswerCoveredByReceipts,
+  sameQuestionAnswer,
 } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
 
@@ -100,20 +104,175 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
   const agents = agentNamesByResponseId(items);
-  for (const item of items) {
+  const indexedAnswers = items.flatMap((item, index) => {
+    if (!isMessageItem(item) || item.role !== "user") return [];
+    const message = questionAnswerFromContent(item.content);
+    return message ? [{ index, message }] : [];
+  });
+  const answerRecords = indexedAnswers.map(({ message }) => message);
+  const receipts = answerRecords.filter((message) => message.elicitationId !== undefined);
+  const answerOwners = questionAnswerOwners(items, outputs, indexedAnswers);
+  const seenAnswers: typeof receipts = [];
+  for (const [index, item] of items.entries()) {
     if (!item.response_id) continue;
+    if (isMessageItem(item) && item.role === "user") {
+      const answer = questionAnswerFromContent(item.content);
+      if (answer) {
+        if (
+          (!answer.elicitationId && questionAnswerCoveredByReceipts(answer, receipts)) ||
+          seenAnswers.some((seen) => sameQuestionAnswer(answer, seen))
+        )
+          continue;
+        seenAnswers.push(answer);
+      }
+    }
     if (isSlashCommandItem(item)) {
       const echo = skillEchoBlock(item);
       if (echo !== null) blocks.push(echo);
     }
     if (isFunctionCallItem(item)) {
       const card = answeredElicitationBlock(item, outputs.get(item.call_id));
-      if (card !== null) blocks.push(card);
+      if (card !== null) {
+        if (
+          card.askUserQuestion &&
+          card.response?.action === "accept" &&
+          !hasAnswerRecord(
+            card.response.content,
+            indexedAnswers
+              .filter((record) => answerOwners.get(record.index)?.has(index))
+              .map((record) => record.message),
+            item.name === ASYNC_QUESTION_TOOL ? item.call_id : undefined,
+            secretQuestionTexts(card.askUserQuestion),
+          )
+        ) {
+          card.response["_meta"] = { answerFallback: true };
+        }
+        blocks.push(card);
+      }
     }
     const block = itemToBlock(item, agents.get(item.response_id));
     if (block !== null) blocks.push(block);
   }
   return blocks;
+}
+
+function questionAnswerOwners(
+  items: ConversationItem[],
+  outputs: Map<string, string>,
+  records: { index: number; message: ParsedSystemMessage }[],
+): Map<number, Set<number>> {
+  const outputPositions = new Map<string, number>();
+  items.forEach((item, index) => {
+    if (isFunctionCallOutputItem(item)) outputPositions.set(item.call_id, index);
+  });
+  const calls = items.flatMap((item, index) => {
+    if (!isFunctionCallItem(item)) return [];
+    const outputIndex = outputPositions.get(item.call_id);
+    const card = answeredElicitationBlock(item, outputs.get(item.call_id));
+    return outputIndex !== undefined &&
+      outputIndex > index &&
+      card?.askUserQuestion &&
+      card.response?.action === "accept"
+      ? [{ index, outputIndex, item, card }]
+      : [];
+  });
+  const owners = new Map<number, Set<number>>();
+  for (const record of records) {
+    const recordOwners = new Set<number>();
+    for (const answer of record.message.answers ?? []) {
+      if (!answer.id) continue;
+      const exactCalls = calls.filter(
+        ({ item, card }) =>
+          item.name === ASYNC_QUESTION_TOOL &&
+          item.call_id === answer.id &&
+          recordFitsCall({ ...record.message, answers: [answer] }, card, item),
+      );
+      if (exactCalls.length === 1) recordOwners.add(exactCalls[0]!.index);
+    }
+    const candidates = calls.filter(({ index, outputIndex, item, card }) => {
+      const inWindow = index < record.index && record.index < outputIndex;
+      const exactCodexId =
+        item.name === ASYNC_QUESTION_TOOL &&
+        record.message.answers?.some((answer) => answer.id === item.call_id);
+      return (inWindow || exactCodexId) && recordFitsCall(record.message, card, item);
+    });
+    if (candidates.length === 1) recordOwners.add(candidates[0]!.index);
+    if (recordOwners.size) owners.set(record.index, recordOwners);
+  }
+  return owners;
+}
+
+function recordFitsCall(
+  record: ParsedSystemMessage,
+  card: ElicitationBlock,
+  item: FunctionCallItem,
+): boolean {
+  const content = card.response?.content;
+  if (!content) return false;
+  const entries = Object.entries(content).map(([question, raw]) => ({
+    question,
+    answer: Array.isArray(raw) ? raw.join("; ") : String(raw),
+  }));
+  if (record.cardRef) {
+    return (
+      record.body === entries.map(({ question, answer }) => `${question} → ${answer}`).join("\n")
+    );
+  }
+  const secrets = secretQuestionTexts(card.askUserQuestion ?? {});
+  const knownQuestions = castAskUserQuestionPayload(card.askUserQuestion)?.questions ?? [];
+  return Boolean(
+    record.answers?.length &&
+    record.answers.every((answer) =>
+      entries.some((entry) => {
+        const knownId = knownQuestions.find((question) => question.question === entry.question)?.id;
+        return (
+          entry.question === answer.question &&
+          (secrets.has(entry.question) || entry.answer === answer.answer) &&
+          (!answer.id || !knownId || answer.id === knownId) &&
+          (item.name !== ASYNC_QUESTION_TOOL || !answer.id || answer.id === item.call_id)
+        );
+      }),
+    ),
+  );
+}
+
+function secretQuestionTexts(payload: Record<string, unknown>): Set<string> {
+  const questions = Array.isArray(payload.questions) ? payload.questions : [];
+  return new Set(
+    questions.flatMap((entry: unknown) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+      const question = entry as Record<string, unknown>;
+      return question.isSecret === true && typeof question.question === "string"
+        ? [question.question]
+        : [];
+    }),
+  );
+}
+
+function hasAnswerRecord(
+  content: Record<string, unknown> | undefined,
+  records: ParsedSystemMessage[],
+  expectedId?: string,
+  secretQuestions = new Set<string>(),
+): boolean {
+  if (!content) return false;
+  const entries = Object.entries(content).map(([question, raw]) => ({
+    question,
+    answer: Array.isArray(raw) ? raw.join("; ") : String(raw),
+  }));
+  if (entries.length === 0) return false;
+  const legacyBody = entries.map(({ question, answer }) => `${question} → ${answer}`).join("\n");
+  if (records.some((record) => record.cardRef && record.body === legacyBody)) return true;
+  return entries.every(({ question, answer }) =>
+    records.some((record) =>
+      record.answers?.some(
+        (candidate) =>
+          candidate.question === question &&
+          (secretQuestions.has(question) || candidate.answer === answer) &&
+          (!expectedId || !candidate.id || candidate.id === expectedId),
+      ),
+    ),
+  );
 }
 
 function agentNamesByResponseId(items: ConversationItem[]): Map<string, string | null> {
@@ -277,10 +436,6 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     };
   }
   if (isMessageItem(item) && item.role === "user") {
-    if (!item.is_meta && (item.created_by || item.user_authored === true)) {
-      return userMessageToBlock(item);
-    }
-    if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and
     // starts a new turn on it. Render it as a muted system marker so the
@@ -296,6 +451,10 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     if (replyMarker !== null) {
       return { ...userMessageToBlock(item), content: replyMarker };
     }
+    if (!item.is_meta && (item.created_by || item.user_authored === true)) {
+      return userMessageToBlock(item);
+    }
+    if (isClaudeAgentMessageContent(item.content)) return null;
   }
   if (isMessageItem(item) && item.is_meta === true) {
     return null;

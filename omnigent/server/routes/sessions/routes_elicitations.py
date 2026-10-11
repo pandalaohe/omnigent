@@ -121,8 +121,8 @@ def register_elicitations_routes(
         :param body: The MCP-shaped verdict — ``action``
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
-        :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item.
+        :returns: ``{"queued": False}`` after resolution; submitted form
+            answers are saved as user conversation items.
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)

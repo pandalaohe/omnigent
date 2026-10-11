@@ -57,7 +57,14 @@ export type SystemMessageKind =
   | "subagent_wake"
   | "interrupted"
   | "peer_outcome"
+  | "question_answer"
   | "generic";
+
+export interface QuestionAnswer {
+  question: string;
+  answer: string;
+  id?: string;
+}
 
 export interface ParsedSystemMessage {
   kind: SystemMessageKind;
@@ -65,6 +72,9 @@ export interface ParsedSystemMessage {
   label: string;
   /** Everything after the header line. Empty for headers without a body. */
   body: string;
+  answers?: QuestionAnswer[];
+  elicitationId?: string;
+  cardRef?: string;
 }
 
 const HEADER_RE = /^\[System: (.+)\]$/;
@@ -137,6 +147,36 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   if (!headerMatch) return null;
   const inner = headerMatch[1];
 
+  if (inner === "Question answered" || /^answers to your question card #q[\da-f]+$/.test(inner)) {
+    const parsed = parseQuestionAnswers(body);
+    if (parsed) {
+      return {
+        kind: "question_answer",
+        label: "Question answered",
+        body: "",
+        answers: parsed.answers,
+        ...(parsed.elicitationId ? { elicitationId: parsed.elicitationId } : {}),
+        ...(inner.startsWith("answers to your question card #")
+          ? { cardRef: inner.slice("answers to your question card #".length) }
+          : {}),
+      };
+    }
+    const cardRef = inner.startsWith("answers to your question card #")
+      ? inner.slice("answers to your question card #".length)
+      : undefined;
+    const singleLine =
+      !body.includes("\n") && body.split(" → ").length === 2 ? /^(.+?) → (.*)$/.exec(body) : null;
+    return {
+      kind: "question_answer",
+      label: "Question answered",
+      body,
+      ...(cardRef ? { cardRef } : {}),
+      ...(!cardRef && singleLine
+        ? { answers: [{ question: singleLine[1]!, answer: singleLine[2]! }] }
+        : {}),
+    };
+  }
+
   // The runner synthesizes `[System: interrupted]` for codex-native (which
   // writes no interrupt record of its own); render it the same as Claude's.
   if (inner === "interrupted") {
@@ -206,6 +246,118 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   // Known prefix, unknown pattern — still treat as a system marker so new
   // producers get the muted styling without an web change.
   return { kind: "generic", label: inner, body };
+}
+
+function parseQuestionAnswers(
+  body: string,
+): { answers: QuestionAnswer[]; elicitationId?: string } | null {
+  try {
+    const value: unknown = JSON.parse(body);
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      if (
+        Array.isArray(record.answers) &&
+        record.answers.length > 0 &&
+        record.answers.every(
+          (answer) =>
+            answer &&
+            typeof answer === "object" &&
+            typeof answer.question === "string" &&
+            typeof answer.answer === "string" &&
+            (answer.id === undefined || typeof answer.id === "string"),
+        )
+      ) {
+        return {
+          answers: record.answers as QuestionAnswer[],
+          ...(typeof record.elicitation_id === "string"
+            ? { elicitationId: record.elicitation_id }
+            : {}),
+        };
+      }
+    }
+  } catch {
+    // Older receipts use readable question/answer lines.
+  }
+  return null;
+}
+
+/** Correlate a durable receipt with a later native echo or older delivery marker. */
+export function sameQuestionAnswer(a: ParsedSystemMessage, b: ParsedSystemMessage): boolean {
+  if (a.kind !== "question_answer" || b.kind !== "question_answer") return false;
+  if (a.elicitationId && b.elicitationId && a.elicitationId !== b.elicitationId) return false;
+  const aRef =
+    a.cardRef ??
+    (a.elicitationId?.startsWith("elicit_")
+      ? `q${a.elicitationId.slice("elicit_".length, "elicit_".length + 6)}`
+      : null);
+  const bRef =
+    b.cardRef ??
+    (b.elicitationId?.startsWith("elicit_")
+      ? `q${b.elicitationId.slice("elicit_".length, "elicit_".length + 6)}`
+      : null);
+  if (aRef && bRef && aRef !== bRef) return false;
+  if (a.cardRef || b.cardRef) {
+    if (!aRef || !bRef) return false;
+    const rendered = (message: ParsedSystemMessage) =>
+      message.cardRef
+        ? message.body
+        : message.answers?.map(({ question, answer }) => `${question} → ${answer}`).join("\n");
+    return rendered(a) === rendered(b);
+  }
+  const keyed = Boolean(
+    (a.elicitationId && b.elicitationId) ||
+    (aRef && bRef) ||
+    a.answers?.some((answer) => answer.id && b.answers?.some((other) => other.id === answer.id)),
+  );
+  if (!keyed) return false;
+  return Boolean(
+    a.answers?.length &&
+    a.answers.length === b.answers?.length &&
+    a.answers.every((answer) =>
+      b.answers?.some((other) => answerMatches(answer, other, Boolean(aRef && bRef))),
+    ),
+  );
+}
+
+function answerMatches(a: QuestionAnswer, b: QuestionAnswer, allowMissingId = false): boolean {
+  return (
+    a.question === b.question &&
+    a.answer === b.answer &&
+    (allowMissingId ? !a.id || !b.id || a.id === b.id : a.id === b.id)
+  );
+}
+
+/** A batched native echo is redundant only after every entry has a durable receipt. */
+export function questionAnswerCoveredByReceipts(
+  message: ParsedSystemMessage,
+  receipts: ParsedSystemMessage[],
+): boolean {
+  if (message.cardRef) return receipts.some((receipt) => sameQuestionAnswer(message, receipt));
+  if (message.kind !== "question_answer" || !message.answers?.length) return false;
+  return message.answers.every((answer) =>
+    receipts.some((receipt) => {
+      if (receipt.kind !== "question_answer" || !receipt.elicitationId) return false;
+      if (message.cardRef) {
+        const ref = `q${receipt.elicitationId.replace(/^elicit_/, "").slice(0, 6)}`;
+        if (ref !== message.cardRef) return false;
+      }
+      return receipt.answers?.some((candidate) =>
+        answerMatches(answer, candidate, Boolean(message.cardRef)),
+      );
+    }),
+  );
+}
+
+export function questionAnswerFromContent(
+  content: MessageContentBlock[],
+): ParsedSystemMessage | null {
+  const marker = codexQuestionReplyMarkerContent(content);
+  const text = (marker ?? content)
+    .filter(isTextBlock)
+    .map((block) => block.text)
+    .join("");
+  const parsed = parseSystemMessage(text);
+  return parsed?.kind === "question_answer" ? parsed : null;
 }
 
 // Matches ChatPage's inline "[Attached: …]" marker stripper; the header check
@@ -314,7 +466,7 @@ const ASYNC_QUESTION_TOOL = "request_user_input_async";
  * user message that merely mentions the tags stays a normal bubble.
  *
  * :param text: One user message text block.
- * :returns: Marker text (header plus ``"<question> → <answer>"`` lines),
+ * :returns: Marker text with structured answers and stable question ids,
  *   or ``null`` when ``text`` is not a well-formed reply.
  */
 export function codexQuestionReplyMarker(text: string): string | null {
@@ -330,17 +482,18 @@ export function codexQuestionReplyMarker(text: string): string | null {
     return null;
   }
   if (!Array.isArray(rawEntries) || rawEntries.length === 0) return null;
-  const lines: string[] = [];
+  const answers: QuestionAnswer[] = [];
   for (const raw of rawEntries) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
     const { answer, question, questionItemId } = raw as Record<string, unknown>;
     if (typeof answer !== "string" || typeof question !== "string") return null;
-    if (typeof questionItemId !== "string") return null;
-    let decoded: unknown;
-    try {
-      decoded = JSON.parse(questionItemId);
-    } catch {
-      return null;
+    let decoded: unknown = questionItemId;
+    if (typeof decoded === "string") {
+      try {
+        decoded = JSON.parse(decoded);
+      } catch {
+        return null;
+      }
     }
     if (
       !Array.isArray(decoded) ||
@@ -353,9 +506,9 @@ export function codexQuestionReplyMarker(text: string): string | null {
     ) {
       return null;
     }
-    lines.push(`${question} → ${answer}`);
+    answers.push({ question, answer, id: `${decoded[1]}:${decoded[2]}` });
   }
-  return `[System: Question answered]\n${lines.join("\n")}`;
+  return `[System: Question answered]\n${JSON.stringify({ answers })}`;
 }
 
 /**

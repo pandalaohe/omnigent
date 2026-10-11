@@ -160,10 +160,119 @@ describe("itemsToBlocks — flat shape", () => {
         type: "input_text",
         text:
           "[System: Question answered]\n" +
-          "选择卡显示测试：你能看到这张可点击的单选卡吗？ → 看到了，可以点击选项",
+          JSON.stringify({
+            answers: [
+              {
+                question: "选择卡显示测试：你能看到这张可点击的单选卡吗？",
+                answer: "看到了，可以点击选项",
+                id: "call_5q2o:0",
+              },
+            ],
+          }),
       },
     ]);
     expect(userBlocks[1]!.ctx.itemId).toBe("msg_reply");
+  });
+
+  it("routes an authored receipt and keeps one answer record when the Codex echo follows", () => {
+    const id = "call_1:0";
+    const receipt = userMessage(
+      "r1",
+      `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_123456789",
+        action: "accept",
+        answers: [{ question: "Reason?", answer: "first\nsecond", id }],
+      })}`,
+      "receipt",
+    );
+    if (receipt.type === "message") receipt.created_by = "web-user";
+    const echo = userMessage(
+      "r2",
+      `<send_user_message_question_reply>${JSON.stringify([
+        {
+          question: "Reason?",
+          answer: "first\nsecond",
+          questionItemId: ["request_user_input_async", "call_1", 0],
+        },
+      ])}</send_user_message_question_reply>`,
+      "echo",
+    );
+    const blocks = itemsToBlocks([receipt, echo]);
+    expect(blocks).toHaveLength(1);
+    expect((blocks[0] as UserMessageBlock).ctx.itemId).toBe("receipt");
+    expect((blocks[0] as UserMessageBlock).content[0]).toEqual(
+      (receipt as { content: unknown[] }).content[0],
+    );
+    expect(itemsToBlocks([echo, receipt]).map((block) => block.ctx.itemId)).toEqual(["receipt"]);
+  });
+
+  it("dedupes an exact keyed legacy reply and preserves a differing one on reload", () => {
+    const receipt = userMessage(
+      "r1",
+      `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [{ question: "Why?\nGive context", answer: "because\nA → B" }],
+      })}`,
+      "receipt",
+    );
+    const legacy = (answer: string) =>
+      userMessage(
+        "r2",
+        `[System: answers to your question card #qabcdef]\nWhy?\nGive context → ${answer}`,
+        "legacy",
+      );
+    expect(
+      itemsToBlocks([receipt, legacy("because\nA → B")]).map((block) => block.ctx.itemId),
+    ).toEqual(["receipt"]);
+    expect(
+      itemsToBlocks([receipt, legacy("different\nA → B")]).map((block) => block.ctx.itemId),
+    ).toEqual(["receipt", "legacy"]);
+  });
+
+  it("dedupes a batched Codex echo only when separate receipts cover every answer", () => {
+    const receipt = (id: string, question: string, answer: string, elicitationId: string) =>
+      userMessage(
+        `resp_${id}`,
+        `[System: Question answered]\n${JSON.stringify({
+          elicitation_id: elicitationId,
+          action: "accept",
+          answers: [{ question, answer, id }],
+        })}`,
+        `receipt_${id}`,
+      );
+    const first = receipt("call_batch:0", "First?", "A", "elicit_111111aa");
+    const second = receipt("call_batch:1", "Second?", "B", "elicit_222222bb");
+    const echo = userMessage(
+      "resp_echo",
+      `<send_user_message_question_reply>${JSON.stringify([
+        {
+          question: "First?",
+          answer: "A",
+          questionItemId: ["request_user_input_async", "call_batch", 0],
+        },
+        {
+          question: "Second?",
+          answer: "B",
+          questionItemId: ["request_user_input_async", "call_batch", 1],
+        },
+      ])}</send_user_message_question_reply>`,
+      "echo",
+    );
+    expect(itemsToBlocks([first, second, echo]).map((block) => block.ctx.itemId)).toEqual([
+      "receipt_call_batch:0",
+      "receipt_call_batch:1",
+    ]);
+    expect(itemsToBlocks([first, echo]).map((block) => block.ctx.itemId)).toEqual([
+      "receipt_call_batch:0",
+      "echo",
+    ]);
+    const wrong = receipt("call_batch:1", "Second?", "Different", "elicit_222222bb");
+    expect(itemsToBlocks([first, wrong, echo]).map((block) => block.ctx.itemId)).toEqual([
+      "receipt_call_batch:0",
+      "receipt_call_batch:1",
+      "echo",
+    ]);
   });
 
   it("re-labels an is_meta task notification (bridge-marked) as a system marker", () => {
@@ -640,6 +749,7 @@ describe("itemsToBlocks — answered question and plan cards", () => {
         "Which library should we use?": "date-fns",
         'Ship the "fast path" too?': "Yes",
       },
+      _meta: { answerFallback: true },
     });
     // Keyed off the call's item id so re-hydration converges, and stamped
     // with the vendor so the card still reads "Claude Code".
@@ -661,6 +771,96 @@ describe("itemsToBlocks — answered question and plan cards", () => {
     expect(card.response?.content).toEqual({
       "Which library should we use?": "whatever you think",
     });
+  });
+
+  it("keeps a rebuilt Claude card compact when an answer record exists", () => {
+    const items: ConversationItem[] = [
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1"),
+      userMessage(
+        "resp_1",
+        `[System: Question answered]\n${JSON.stringify({
+          elicitation_id: "elicit_123456aa",
+          action: "accept",
+          answers: [{ question: "Which library should we use?", answer: "date-fns" }],
+        })}`,
+        "receipt",
+      ),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        'Your questions have been answered: "Which library should we use?"="date-fns".',
+      ),
+    ];
+    const card = itemsToBlocks(items).find(
+      (block): block is ElicitationBlock => block.type === "elicitation",
+    )!;
+    expect(card.response?.content).toEqual({ "Which library should we use?": "date-fns" });
+    expect(card.response?._meta).toBeUndefined();
+  });
+
+  it("keeps an older identical tool-only answer when a later call owns the receipt", () => {
+    const question = { questions: [{ question: "Proceed?", options: [], multiSelect: false }] };
+    const call = (id: string) =>
+      functionCall("resp_1", id, "AskUserQuestion", question, `fc_${id}`);
+    const output = (id: string) =>
+      functionCallOutput("resp_1", id, 'The user answered: "Proceed?"="Yes".', `out_${id}`);
+    const receipt = userMessage(
+      "resp_1",
+      `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [{ question: "Proceed?", answer: "Yes" }],
+      })}`,
+      "receipt",
+    );
+    const cards = (items: ConversationItem[]) =>
+      itemsToBlocks(items).filter(
+        (block): block is ElicitationBlock => block.type === "elicitation",
+      );
+    expect(
+      cards([call("old"), output("old"), call("new"), receipt, output("new")]).map(
+        (card) => card.response?.["_meta"]?.answerFallback,
+      ),
+    ).toEqual([true, undefined]);
+    expect(
+      cards([call("first"), receipt, output("first"), call("later"), output("later")]).map(
+        (card) => card.response?.["_meta"]?.answerFallback,
+      ),
+    ).toEqual([undefined, true]);
+    expect(
+      cards([call("a"), call("b"), receipt, output("a"), output("b")]).map(
+        (card) => card.response?.["_meta"]?.answerFallback,
+      ),
+    ).toEqual([true, true]);
+  });
+
+  it("recognizes a redacted secret receipt by question identity", () => {
+    const secret = {
+      questions: [{ question: "Access phrase?", isSecret: true, options: [], multiSelect: false }],
+    };
+    const call = functionCall("resp_1", "c1", "AskUserQuestion", secret, "fc_secret");
+    const output = functionCallOutput(
+      "resp_1",
+      "c1",
+      'The user answered: "Access phrase?"="private value".',
+    );
+    const receipt = userMessage(
+      "resp_1",
+      `[System: Question answered]\n${JSON.stringify({
+        elicitation_id: "elicit_abcdef123",
+        action: "accept",
+        answers: [{ question: "Access phrase?", answer: "[redacted]" }],
+      })}`,
+      "receipt",
+    );
+    const oldCard = itemsToBlocks([call, output]).find(
+      (block): block is ElicitationBlock => block.type === "elicitation",
+    )!;
+    expect(oldCard.response?.["_meta"]).toEqual({ answerFallback: true });
+    const newCard = itemsToBlocks([call, receipt, output]).find(
+      (block): block is ElicitationBlock => block.type === "elicitation",
+    )!;
+    expect(newCard.response?.["_meta"]).toBeUndefined();
   });
 
   it("leaves an unanswered question as a plain tool row", () => {
@@ -713,11 +913,49 @@ describe("itemsToBlocks — answered question and plan cards", () => {
     expect(card.response).toEqual({
       action: "accept",
       content: { "选择卡显示测试：你能看到这张可点击的单选卡吗？": "看到了，可以点击选项" },
+      _meta: { answerFallback: true },
     });
     // The card reads "Codex" like the live one did: item.model resolves
     // through the same vendor table the live elicitation's policy id does.
     expect(card.policyName).toBe("codex_native_permission");
     expect(card.ctx.itemId).toBe("fc_async_q0:answer");
+  });
+
+  it.each(["array", "string"])("correlates every card in a batched Codex %s reply", (encoding) => {
+    const calls = ["First?", "Second?"].map((question, index) =>
+      functionCall(
+        "resp_1",
+        `call_batch:${index}`,
+        "request_user_input_async",
+        { questions: [{ id: `call_batch:${index}`, question, options: [], multiSelect: false }] },
+        `fc_batch_${index}`,
+        "codex-native-ui",
+      ),
+    );
+    const echo = (secondAnswer: string) =>
+      userMessage(
+        "resp_echo",
+        `<send_user_message_question_reply>${JSON.stringify(
+          ["First?", "Second?"].map((question, index) => {
+            const id = ["request_user_input_async", "call_batch", index];
+            return {
+              question,
+              answer: index === 0 ? "A" : secondAnswer,
+              questionItemId: encoding === "array" ? id : JSON.stringify(id),
+            };
+          }),
+        )}</send_user_message_question_reply>`,
+        "echo",
+      );
+    const outputs = ["A", "B"].map((answer, index) =>
+      functionCallOutput("resp_1", `call_batch:${index}`, answer, `out_batch_${index}`),
+    );
+    const fallbackFlags = (secondAnswer: string) =>
+      itemsToBlocks([...calls, echo(secondAnswer), ...outputs])
+        .filter((block): block is ElicitationBlock => block.type === "elicitation")
+        .map((card) => card.response?.["_meta"]?.answerFallback);
+    expect(fallbackFlags("B")).toEqual([undefined, undefined]);
+    expect(fallbackFlags("Different")).toEqual([undefined, true]);
   });
 
   it("leaves an unanswered Codex async question as a plain tool row", () => {

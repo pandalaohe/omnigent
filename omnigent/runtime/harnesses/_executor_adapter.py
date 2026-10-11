@@ -706,6 +706,11 @@ class ExecutorAdapter(HarnessApp):
         preview = preview[:300]
 
         label = self._harness_label
+        extras: dict[str, Any] = (
+            {"ask_user_question": {"questions": tool_input["questions"]}}
+            if tool_name == "AskUserQuestion" and isinstance(tool_input.get("questions"), list)
+            else {}
+        )
         return ElicitationRequestParams(
             mode="form",
             message=f"{label} wants to use **{tool_name}**",
@@ -714,6 +719,7 @@ class ExecutorAdapter(HarnessApp):
             phase="tool_call",
             policy_name=f"{label.lower()}_sdk_permission",
             content_preview=f"{tool_name}({preview})",
+            **extras,
         )
 
     async def _stable_elicitation_choice_handler(

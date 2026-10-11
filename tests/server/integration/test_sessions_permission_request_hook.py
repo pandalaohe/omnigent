@@ -1766,6 +1766,17 @@ async def test_permission_request_hook_substitutes_ask_user_question_answers(
         "Which framework should we use?": "Vue",
         "Pick snacks": ["Popcorn", "Pretzels"],
     }
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    answers = [
+        json.loads(block["text"].split("\n", 1)[1])
+        for item in items.json()["data"]
+        for block in item.get("content", [])
+        if block.get("text", "").startswith("[System: Question answered]\n")
+    ]
+    assert answers[0]["answers"] == [
+        {"question": "Which framework should we use?", "answer": "Vue"},
+        {"question": "Pick snacks", "answer": "Popcorn; Pretzels"},
+    ]
 
 
 async def test_permission_request_hook_no_updated_input_without_answers(
@@ -2059,6 +2070,15 @@ async def test_permission_request_hook_decline_forwards_feedback_message(
         "behavior": "deny",
         "message": "Too risky — split it into two phases.",
     }
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    answers = [
+        json.loads(block["text"].split("\n", 1)[1])
+        for item in items.json()["data"]
+        for block in item.get("content", [])
+        if block.get("text", "").startswith("[System: Question answered]\n")
+    ]
+    assert answers[0]["action"] == "decline"
+    assert answers[0]["answers"][0]["answer"] == "Too risky — split it into two phases."
 
 
 async def test_permission_request_hook_omits_structured_extras_for_other_tools(
@@ -3641,6 +3661,16 @@ async def test_codex_request_user_input_hook_returns_id_keyed_answers(
     resp = await hook_task
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"answers": {"framework": {"answers": ["React"]}}}
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    answers = [
+        json.loads(block["text"].split("\n", 1)[1])
+        for item in items.json()["data"]
+        for block in item.get("content", [])
+        if block.get("text", "").startswith("[System: Question answered]\n")
+    ]
+    assert answers[0]["answers"] == [
+        {"id": "framework", "question": "Which framework?", "answer": "React"}
+    ]
 
 
 def _codex_async_question_payload() -> dict[str, Any]:

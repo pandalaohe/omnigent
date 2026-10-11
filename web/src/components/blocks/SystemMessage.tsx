@@ -13,7 +13,10 @@ import { useState } from "react";
 import { cn } from "@/lib/utils";
 import type { ParsedSystemMessage, SystemMessageKind } from "@/lib/systemMessage";
 
-const KIND_ICON: Record<Exclude<SystemMessageKind, "subagent_wake">, LucideIcon> = {
+const KIND_ICON: Record<
+  Exclude<SystemMessageKind, "subagent_wake" | "question_answer">,
+  LucideIcon
+> = {
   task_completed: CheckCircle2Icon,
   task_failed: AlertCircleIcon,
   task_cancelled: BanIcon,
@@ -41,6 +44,26 @@ interface SystemMessageViewProps {
 export function SystemMessageView({ message }: SystemMessageViewProps) {
   const [open, setOpen] = useState(false);
   if (message.kind === "subagent_wake") return null;
+  if (message.kind === "question_answer") {
+    return (
+      <div
+        className="my-2 min-w-0 space-y-2 text-sm"
+        data-testid="system-message"
+        data-system-kind="question_answer"
+      >
+        <p className="text-muted-foreground">Question answered</p>
+        {message.answers?.map(({ question, answer, id }) => (
+          <div key={id ?? `${question}:${answer}`} className="min-w-0 space-y-0.5">
+            <p className="break-words whitespace-pre-wrap text-muted-foreground">{question}</p>
+            <p className="break-words whitespace-pre-wrap text-foreground">{answer}</p>
+          </div>
+        ))}
+        {!message.answers?.length && message.body && (
+          <p className="break-words whitespace-pre-wrap text-foreground">{message.body}</p>
+        )}
+      </div>
+    );
+  }
   const Icon = KIND_ICON[message.kind];
   const hasBody = message.body.trim().length > 0;
 
