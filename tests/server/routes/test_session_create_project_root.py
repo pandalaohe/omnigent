@@ -281,9 +281,12 @@ async def test_json_filled_host_reaches_launch(
     expected_workspace = "/b" if use_binding else "/c"
     launched: list[str] = []
     validated: list[str] = []
-    conn = SimpleNamespace(pending_launches={})
+    conn = SimpleNamespace(pending_launches={}, hello=SimpleNamespace(capabilities=[]))
 
     class Registry:
+        def get(self, _host_id: str) -> object:
+            return conn
+
         async def admit_launch(self, connection: object, session_id: str) -> None:
             assert connection is conn
 
@@ -870,7 +873,12 @@ class _WorkspaceHost:
 
     def __init__(self, canonical_workspaces: dict[str, str]) -> None:
         self.canonical_workspaces = canonical_workspaces
-        self.conn = SimpleNamespace(host_id=_HOST, pending_stats={}, pending_launches={})
+        self.conn = SimpleNamespace(
+            host_id=_HOST,
+            pending_stats={},
+            pending_launches={},
+            hello=SimpleNamespace(capabilities=[]),
+        )
         self.stats: list[str] = []
 
     def get(self, host_id: str) -> object | None:
