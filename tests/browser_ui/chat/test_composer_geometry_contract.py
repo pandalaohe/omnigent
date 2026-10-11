@@ -232,6 +232,20 @@ def test_label_collapse_preserves_submit_geometry(
     surface: str,
 ) -> None:
     chat = chat_session_contract
+    if surface == "landing":
+        chat.contract.json(
+            "/v1/calling-defaults/resolve",
+            {
+                "agent_id": chat.agent_id,
+                "harness": chat.harness,
+                "model": None,
+                "effort": None,
+                "speed": None,
+                "permission": None,
+                "sources": {},
+                "problems": [],
+            },
+        )
     if surface == "live":
         chat.set_catalog(
             harness="claude-native",
@@ -251,7 +265,12 @@ def test_label_collapse_preserves_submit_geometry(
     # Exercise the narrowest common phone width after the mobile composer
     # adopted 24px outer gutters.
     page.set_viewport_size({"width": 320, "height": PHONE["height"]})
-    expect(_action_row(page, surface)).to_have_attribute("data-labels", "collapsed")
+    model_label = page.get_by_test_id(
+        "new-chat-landing-agent-config-value"
+        if surface == "landing"
+        else "composer-agent-config-value"
+    )
+    expect(model_label).to_be_hidden()
     collapsed_inset = right_inset(box(card_locator), box(_submit(page, surface)))
     assert collapsed_inset == pytest.approx(expanded_inset, abs=TOLERANCE)
     leading = (

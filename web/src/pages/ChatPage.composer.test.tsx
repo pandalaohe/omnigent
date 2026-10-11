@@ -289,7 +289,7 @@ describe("running Codex speed and catalog refresh", () => {
     composerSessionSnapshot.labels = {};
   });
 
-  it("submits an advertised speed and retains the confirmed pick after a rejected PATCH", async () => {
+  it("retains the confirmed fast toggle after a rejected PATCH", async () => {
     useChatStore.setState({
       conversationId: "conv_speed",
       sessionHarness: "codex-native",
@@ -318,13 +318,13 @@ describe("running Codex speed and catalog refresh", () => {
         })}
       />,
     );
-    expect(screen.getByTestId("composer-speed-trigger")).toHaveTextContent("Fast");
-    fireEvent.keyDown(screen.getByTestId("composer-speed-trigger"), { key: "ArrowDown" });
-    fireEvent.click(screen.getByTestId("composer-speed-option-ultrafast"));
+    const toggle = screen.getByRole("button", { name: "Fast mode" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(toggle);
     await waitFor(() =>
-      expect(patch).toHaveBeenCalledWith("conv_speed", { speedTier: "ultrafast" }),
+      expect(patch).toHaveBeenCalledWith("conv_speed", { speedTier: "standard" }),
     );
-    expect(screen.getByTestId("composer-speed-trigger")).toHaveTextContent("Fast");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
   });
 
   it("refreshes the session-owned catalog on model menu open and reports force failure without dropping rows", async () => {

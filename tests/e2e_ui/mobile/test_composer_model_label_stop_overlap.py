@@ -310,10 +310,8 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         # its icon: the text is in the DOM yet hidden, never wrapped.
         trigger = page.get_by_test_id("composer-config-gear")
         label = page.get_by_test_id("composer-agent-config-value")
-        row = page.get_by_test_id("composer-action-row")
         expect(trigger).to_be_visible(timeout=15_000)
         expect(label).to_contain_text(_MODEL_ID)
-        expect(row).to_have_attribute("data-labels", "collapsed")
         expect(label).to_be_hidden()
         _screenshot(page, "chat-composer-phone-collapsed")
 
@@ -452,7 +450,6 @@ async def _drive_landing_collapse(base_url: str, session_id: str) -> None:
             await async_expect(model_text).not_to_be_empty()
 
             # Phone width: both labels collapse to icons and the row stays single-line.
-            await async_expect(row).to_have_attribute("data-labels", "collapsed")
             await async_expect(permission_text).to_be_hidden()
             await async_expect(model_text).to_be_hidden()
             add_box = await page.get_by_test_id("new-chat-landing-attach").bounding_box()

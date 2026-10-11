@@ -3,11 +3,12 @@ import {
   ChevronDownIcon,
   FolderIcon,
   GitForkIcon,
-  GaugeIcon,
   HandIcon,
   LaptopIcon,
   Loader2Icon,
   MonitorCloudIcon,
+  ZapIcon,
+  ZapOffIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -182,7 +183,10 @@ export function ComposerPermissionPicker({
           <HandIcon className="size-3 shrink-0" />
           {!iconOnly && (
             <span
-              className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+              className={cn(
+                "min-w-0 truncate text-ui font-normal max-md:hidden",
+                COMPOSER_COLLAPSED_LABEL_CLASS,
+              )}
             >
               {value}
             </span>
@@ -229,7 +233,7 @@ export function ComposerPermissionPicker({
   );
 }
 
-/** Compact tier picker; the same gauge identifies every advertised speed. */
+/** One tap switches between Fast and Standard when the model supports Fast. */
 export function ComposerSpeedPicker({
   value,
   options,
@@ -243,39 +247,25 @@ export function ComposerSpeedPicker({
   disabled?: boolean;
   testIdPrefix?: string;
 }) {
-  const label = options.find((option) => option.value === value)?.label ?? "Standard";
+  if (!options.some((option) => option.value === "fast")) return null;
+  const fast = value === "fast";
+  const Icon = fast ? ZapIcon : ZapOffIcon;
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled}>
-        <button
-          type="button"
-          disabled={disabled}
-          aria-label={`Speed: ${label}`}
-          title={`Speed: ${label}`}
-          data-testid={`${testIdPrefix}-speed-trigger`}
-          className="flex h-8 min-w-0 items-center gap-1 rounded-lg px-2 text-foreground hover:bg-muted/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50 md:h-7"
-        >
-          <GaugeIcon className="size-3.5 shrink-0" aria-hidden="true" />
-          <span className="truncate text-ui">{label}</span>
-          <ChevronDownIcon className="size-3 shrink-0 opacity-60" aria-hidden="true" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" data-testid={`${testIdPrefix}-speed-menu`}>
-        <div className="px-2 py-1 text-xs text-muted-foreground">Speed</div>
-        <DropdownMenuRadioGroup value={value} onValueChange={onSelect}>
-          {options.map((option) => (
-            <DropdownMenuRadioItem
-              key={option.value}
-              value={option.value}
-              data-testid={`${testIdPrefix}-speed-option-${option.value}`}
-            >
-              <GaugeIcon className="size-3.5" aria-hidden="true" />
-              {option.label}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <button
+      type="button"
+      disabled={disabled}
+      aria-label="Fast mode"
+      aria-pressed={fast}
+      title={fast ? "Fast mode on — use Standard" : "Fast mode off — enable Fast"}
+      data-testid={`${testIdPrefix}-speed-trigger`}
+      onClick={() => onSelect(fast ? "standard" : "fast")}
+      className={cn(
+        "flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg hover:bg-muted/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-default disabled:opacity-50 md:size-7",
+        fast ? "text-primary" : "text-muted-foreground",
+      )}
+    >
+      <Icon className="size-4" aria-hidden="true" />
+    </button>
   );
 }
 
@@ -364,7 +354,7 @@ export const ComposerHarnessTrigger = forwardRef<
       <span
         className={cn(
           "inline-flex min-w-0 flex-nowrap items-baseline gap-1",
-          icon != null && COMPOSER_COLLAPSED_LABEL_CLASS,
+          icon != null && `max-md:hidden ${COMPOSER_COLLAPSED_LABEL_CLASS}`,
           labelClassName,
         )}
         data-testid={`${testIdPrefix}-agent-config-value`}

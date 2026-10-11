@@ -14,29 +14,59 @@ import {
 } from "./ChatComposer";
 
 describe("shared composer controls", () => {
-  it("keeps one gauge icon across Standard and advertised tiers", () => {
+  it("toggles fast directly with distinct icons and no visible label or menu", () => {
     const onSelect = vi.fn();
+    const options = [
+      { value: "standard", label: "Standard" },
+      { value: "fast", label: "Fast" },
+      { value: "ultrafast", label: "Ultrafast" },
+    ];
+    const { rerender } = render(
+      <ComposerSpeedPicker value="ultrafast" options={options} onSelect={onSelect} />,
+    );
+    const trigger = screen.getByRole("button", { name: "Fast mode" });
+    expect(trigger).toHaveAttribute("aria-pressed", "false");
+    expect(trigger).toHaveAttribute("title", "Fast mode off — enable Fast");
+    expect(trigger).toHaveTextContent(/^$/);
+    expect(trigger.querySelector("svg.lucide-zap-off")).toBeInTheDocument();
+    fireEvent.click(trigger);
+    expect(onSelect).toHaveBeenCalledWith("fast");
+    expect(screen.queryByRole("menu")).toBeNull();
+    rerender(<ComposerSpeedPicker value="fast" options={options} onSelect={onSelect} />);
+    expect(trigger).toHaveAttribute("aria-pressed", "true");
+    expect(trigger.querySelector("svg.lucide-zap")).toBeInTheDocument();
+    fireEvent.click(trigger);
+    expect(onSelect).toHaveBeenCalledWith("standard");
+  });
+
+  it("hides the fast toggle when the model does not advertise fast", () => {
     render(
       <ComposerSpeedPicker
         value="ultrafast"
         options={[
           { value: "standard", label: "Standard" },
-          { value: "fast", label: "Fast" },
           { value: "ultrafast", label: "Ultrafast" },
         ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("composer-speed-trigger")).toBeNull();
+  });
+
+  it("does not toggle while disabled", () => {
+    const onSelect = vi.fn();
+    render(
+      <ComposerSpeedPicker
+        value="standard"
+        options={[{ value: "fast", label: "Fast" }]}
+        disabled
         onSelect={onSelect}
       />,
     );
-    const trigger = screen.getByRole("button", { name: "Speed: Ultrafast" });
-    expect(trigger.querySelector("svg.lucide-gauge")).toBeInTheDocument();
-    fireEvent.keyDown(trigger, { key: "ArrowDown" });
-    for (const tier of ["standard", "fast", "ultrafast"]) {
-      expect(
-        screen.getByTestId(`composer-speed-option-${tier}`).querySelector("svg.lucide-gauge"),
-      ).toBeInTheDocument();
-    }
-    fireEvent.click(screen.getByTestId("composer-speed-option-standard"));
-    expect(onSelect).toHaveBeenCalledWith("standard");
+    const trigger = screen.getByRole("button", { name: "Fast mode" });
+    expect(trigger).toBeDisabled();
+    fireEvent.click(trigger);
+    expect(onSelect).not.toHaveBeenCalled();
   });
 
   it("explains why a running Codex session cannot switch into Read Only", () => {

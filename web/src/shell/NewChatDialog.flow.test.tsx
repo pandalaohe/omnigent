@@ -2367,7 +2367,7 @@ describe("NewChatLandingScreen create flow", () => {
           "Approve for me",
         ),
       );
-      expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Fast");
+      expect(screen.getByTestId("new-chat-speed-trigger")).toHaveAttribute("aria-pressed", "true");
       typeMessage("go");
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
       await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -2405,11 +2405,9 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Ultrafast"),
+      expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("gpt-b"),
     );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-speed-trigger"), { button: 0 });
-    expect(screen.queryByTestId("new-chat-speed-option-fast")).toBeNull();
-    fireEvent.keyDown(screen.getByTestId("new-chat-speed-menu"), { key: "Escape" });
+    expect(screen.queryByTestId("new-chat-speed-trigger")).toBeNull();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -2420,7 +2418,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels["omnigent.speed_tier"]).toBe("ultrafast");
   });
 
-  it("shows the host default speed without an override and sends an explicit future tier", async () => {
+  it("toggles the inherited host fast default to an explicit standard tier", async () => {
     setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
     vi.mocked(useHostModelOptions).mockReturnValue({
       data: [
@@ -2444,9 +2442,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Fast");
-    fireEvent.pointerDown(screen.getByTestId("new-chat-speed-trigger"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-speed-option-ultrafast"));
+    const toggle = screen.getByRole("button", { name: "Fast mode" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
     pickPermissionOption("approve-for-me");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -2454,7 +2453,7 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(
       (vi.mocked(authenticatedFetch).mock.calls[0][1] as RequestInit).body as string,
     );
-    expect(body.labels["omnigent.speed_tier"]).toBe("ultrafast");
+    expect(body.labels["omnigent.speed_tier"]).toBe("standard");
     expect(body.terminal_launch_args).toEqual(["--approve-for-me"]);
   });
 
@@ -2477,7 +2476,7 @@ describe("NewChatLandingScreen create flow", () => {
     } as Response);
     renderLanding();
     await waitForWorkspaceSeed();
-    expect(screen.getByTestId("new-chat-speed-trigger")).toHaveTextContent("Fast");
+    expect(screen.getByTestId("new-chat-speed-trigger")).toHaveAttribute("aria-pressed", "true");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
