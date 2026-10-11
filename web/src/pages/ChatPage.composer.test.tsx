@@ -289,7 +289,17 @@ describe("running Codex speed and catalog refresh", () => {
     composerSessionSnapshot.labels = {};
   });
 
+  it.each(["claude-native", "claude-sdk"])(
+    "keeps the live Fast toggle hidden for %s",
+    (harness) => {
+      useChatStore.setState({ conversationId: "conv_speed", sessionHarness: harness });
+      renderWithTooltips(<Composer {...composerProps()} />);
+      expect(screen.queryByRole("button", { name: "Fast mode" })).not.toBeInTheDocument();
+    },
+  );
+
   it("retains the confirmed fast toggle after a rejected PATCH", async () => {
+    const errorToast = vi.spyOn(toast, "error");
     useChatStore.setState({
       conversationId: "conv_speed",
       sessionHarness: "codex-native",
@@ -325,6 +335,7 @@ describe("running Codex speed and catalog refresh", () => {
       expect(patch).toHaveBeenCalledWith("conv_speed", { speedTier: "standard" }),
     );
     expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(errorToast).toHaveBeenCalledWith("tier rejected");
   });
 
   it("refreshes the session-owned catalog on model menu open and reports force failure without dropping rows", async () => {

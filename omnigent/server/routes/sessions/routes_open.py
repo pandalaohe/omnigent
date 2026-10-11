@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -93,6 +93,7 @@ class SessionOpenRequest(BaseModel):
     agent: str = Field(min_length=1)
     model: str | None = None
     reasoning_effort: str | None = None
+    speed: Literal["standard", "fast"] | None = None
     message: str | None = Field(default=None, max_length=16000)
     from_ref: str | None = None
     workspace: str | None = None
@@ -523,6 +524,8 @@ def register_open_routes(
                 create_fields["model_override"] = body.model
             if isinstance(body.reasoning_effort, str) and body.reasoning_effort:
                 create_fields["reasoning_effort"] = body.reasoning_effort
+            if body.speed is not None:
+                create_fields["labels"] = {"omnigent.speed_tier": body.speed}
             create_body = ProjectSessionCreateRequest(**create_fields)
             _, conv = await _create_session_from_existing_agent(
                 conversation_store,

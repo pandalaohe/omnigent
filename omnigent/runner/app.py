@@ -7375,6 +7375,15 @@ def create_runner_app(
                 server_client=server_client,
                 session_id=conv,
             )
+            speed = codex_labels.get(SPEED_TIER_LABEL_KEY)
+            if valid_speed_tier(speed, "codex-native"):
+                from omnigent.session_default_modes import codex_service_tier
+
+                response = await _handle_codex_native_settings_update(
+                    conv, {"serviceTier": codex_service_tier(str(speed))}
+                )
+                if response.status_code >= 300:
+                    raise RuntimeError("Codex could not apply the selected speed before this turn")
             codex_bid = codex_labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
             codex_bdir = codex_bridge_dir_for_id(codex_bid or conv)
             write_mcp_bridge_config(codex_bdir)

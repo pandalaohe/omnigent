@@ -262,7 +262,11 @@ from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_HEADER,
     admit_open,
 )
-from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
+from omnigent.session_default_modes import (
+    SPEED_TIER_LABEL_KEY,
+    SPEED_TIER_REQUESTED_LABEL_KEY,
+    valid_speed_tier,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -3504,9 +3508,8 @@ def register_core_routes(
         """
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
-        if (
-            not body.silent
-            and {"reasoning_effort", "model_override", "speed_tier"} & body.model_fields_set
+        if "speed_tier" in body.model_fields_set or (
+            not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set
         ):
             live_change = _live_settings_change(session_id)
             async with live_change.lock:
@@ -4596,12 +4599,15 @@ def register_core_routes(
                 {"type": "speed_tier_change", "speed_tier": requested_speed},
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
-            if _speed_result is None or not (200 <= _speed_result.status_code < 300):
+            if _speed_result is not None and not (
+                200 <= _speed_result.status_code < 300 or _speed_result.status_code in {404, 504}
+            ):
                 raise OmnigentError(
-                    "speed tier was not applied by the runner; try again",
+                    "Unable to change speed; the runner refused the update. Try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             labels_to_set[SPEED_TIER_LABEL_KEY] = requested_speed
+            labels_to_set[SPEED_TIER_REQUESTED_LABEL_KEY] = requested_speed
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

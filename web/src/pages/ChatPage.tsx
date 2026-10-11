@@ -3141,8 +3141,11 @@ function ComposerImpl(
         chatQueryClient()?.setQueryData(["session", composerSessionId], updated);
       }
     } catch (error) {
-      if (useChatStore.getState().conversationId === composerSessionId)
-        setCommandError(error instanceof Error ? error.message : "Unable to change speed");
+      if (useChatStore.getState().conversationId === composerSessionId) {
+        const message = error instanceof Error ? error.message : "Unable to change speed";
+        setCommandError(message);
+        toast.error(message);
+      }
     } finally {
       configBusyRef.current = false;
       setConfigBusy(false);

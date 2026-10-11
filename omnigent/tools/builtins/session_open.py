@@ -64,6 +64,8 @@ class SysSessionOpenTool(Tool):
             "setting) and you get one system line when it opens, fails or "
             "expires. Top-level sessions only. Every open counts toward the "
             "open-rate setting."
+            " speed selects standard or fast, overriding calling defaults; "
+            "unsupported harnesses are refused."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -136,6 +138,14 @@ class SysSessionOpenTool(Tool):
                                 "Optional first message, delivered as a peer "
                                 "message from you; replies come back as peer "
                                 "messages. Omit to open an idle session."
+                            ),
+                        },
+                        "speed": {
+                            "type": "string",
+                            "enum": ["standard", "fast"],
+                            "description": (
+                                "Explicit session speed, overriding calling defaults; "
+                                "unsupported harnesses are refused."
                             ),
                         },
                         "from_ref": {

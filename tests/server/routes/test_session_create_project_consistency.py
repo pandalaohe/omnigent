@@ -39,6 +39,16 @@ from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
 
+
+@pytest.mark.parametrize("speed", ["standard", "fast"])
+async def test_child_tool_passes_explicit_speed_as_a_create_label(speed: str) -> None:
+    from omnigent.runner.tool_dispatch import _build_session_create_body
+
+    body = _build_session_create_body("agent_child", "session_parent", "Child", speed=speed)
+    assert body["parent_session_id"] == "session_parent"
+    assert body["labels"] == {"omnigent.speed_tier": speed}
+
+
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CUSTOM_AGENT_ID = "187b7cb7ac30abf4debfaa578d052ec6"
@@ -1207,8 +1217,7 @@ async def test_claude_child_explicit_speed_wins(
     assert parent.status_code == 201, parent.text
     from omnigent.runner.tool_dispatch import _build_session_create_body
 
-    body = _build_session_create_body(None, parent.json()["id"], "child")
-    body["labels"] = {"omnigent.speed_tier": "standard"}
+    body = _build_session_create_body(None, parent.json()["id"], "child", speed="standard")
     child = await calling_client.post("/v1/sessions", json=body, headers=_headers())
     assert child.status_code == 201, child.text
     persisted = await calling_client.get(f"/v1/sessions/{child.json()['id']}", headers=_headers())

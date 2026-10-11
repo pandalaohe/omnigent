@@ -12783,7 +12783,7 @@ async def test_patch_collaboration_mode_persists_label_and_forwards_event(
     assert mode_events[0]["mode"] == "plan"
 
 
-@pytest.mark.parametrize("runner_status", [200, 503])
+@pytest.mark.parametrize("runner_status", [200, 404, 503, 504])
 async def test_patch_codex_speed_commits_only_after_runner_accepts(
     client: httpx.AsyncClient, runner_status: int
 ) -> None:
@@ -12807,11 +12807,107 @@ async def test_patch_codex_speed_commits_only_after_runner_accepts(
         snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
 
     assert forwarded == [{"type": "speed_tier_change", "speed_tier": "ultrafast"}]
-    assert changed.status_code == (200 if runner_status == 200 else 503), changed.text
-    if runner_status == 200:
+    assert changed.status_code == (503 if runner_status == 503 else 200), changed.text
+    if runner_status != 503:
         assert snapshot["labels"]["omnigent.speed_tier"] == "ultrafast"
     else:
         assert "omnigent.speed_tier" not in snapshot["labels"]
+
+
+@pytest.mark.parametrize("harness", ["codex", "codex-native"])
+async def test_patch_speed_is_saved_for_an_asleep_session(
+    client: httpx.AsyncClient, harness: str
+) -> None:
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(
+        client, agent["id"], labels={"omnigent.speed_tier": "standard"}
+    )
+    for speed in ("fast", "standard"):
+        changed = await client.patch(f"/v1/sessions/{session['id']}", json={"speed_tier": speed})
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["labels"]["omnigent.speed_tier"] == speed
+
+
+@pytest.mark.parametrize("previous", [None, "standard", "fast"])
+async def test_stale_native_speed_echo_cannot_revert_a_new_selection(
+    client: httpx.AsyncClient, previous: str | None
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "codex-native-ui",
+            "omnigent.speed_tier": "fast",
+        },
+    )
+    for speed in ("fast", "standard", "fast"):
+        changed = await client.patch(f"/v1/sessions/{session['id']}", json={"speed_tier": speed})
+        assert changed.status_code == 200, changed.text
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_speed_tier_change",
+            "data": {"speed_tier": "default", "previous_speed_tier": previous},
+        },
+    )
+    assert response.status_code == 202, response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.speed_tier"] == "fast"
+
+
+async def test_silent_speed_selection_waits_for_an_inflight_native_observation(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "codex-native-ui",
+            "omnigent.speed_tier": "fast",
+        },
+    )
+    sid = session["id"]
+    observed = threading.Event()
+    release = threading.Event()
+    original = SqlAlchemyConversationStore.set_labels
+
+    def paused_write(
+        store: SqlAlchemyConversationStore, session_id: str, labels: dict[str, str]
+    ) -> None:
+        if session_id == sid and labels == {"omnigent.speed_tier": "standard"}:
+            observed.set()
+            assert release.wait(5), "native observation was not released"
+        original(store, session_id, labels)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", paused_write)
+    event = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "external_speed_tier_change", "data": {"speed_tier": "standard"}},
+        )
+    )
+    change = None
+    try:
+        assert await asyncio.to_thread(observed.wait, 5)
+        change = asyncio.create_task(
+            client.patch(f"/v1/sessions/{sid}", json={"speed_tier": "fast", "silent": True})
+        )
+        completed, _ = await asyncio.wait({change}, timeout=0.1)
+        assert not completed, "speed selection overtook the in-flight observation"
+    finally:
+        release.set()
+        await event
+        if change is not None:
+            changed = await change
+            assert changed.status_code == 200, changed.text
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snapshot["labels"]["omnigent.speed_tier"] == "fast"
 
 
 @pytest.mark.parametrize("harness", ["claude-sdk", "claude-native", "cursor-native"])

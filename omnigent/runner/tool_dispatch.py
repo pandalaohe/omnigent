@@ -5211,6 +5211,7 @@ def _build_session_create_body(
     model: object = None,
     reasoning_effort: object = None,
     placement: _CreatePlacement | None = None,
+    speed: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -5243,6 +5244,7 @@ def _build_session_create_body(
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
     :param placement: Resolved placement; omitted fields are not sent.
+    :param speed: Explicit session speed; the server validates the resolved harness.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -5256,6 +5258,8 @@ def _build_session_create_body(
         body["model_override"] = model
     if isinstance(reasoning_effort, str) and reasoning_effort:
         body["reasoning_effort"] = reasoning_effort
+    if speed is not None:
+        body["labels"] = {"omnigent.speed_tier": speed}
     if placement is not None:
         if placement.host_id is not None:
             body["host_id"] = placement.host_id
@@ -5432,6 +5436,7 @@ _SESSION_OPEN_ALLOWED_ARGS = frozenset(
         "agent",
         "model",
         "reasoning_effort",
+        "speed",
         "message",
         "from_ref",
         "workspace",
@@ -5614,6 +5619,9 @@ async def _execute_session_create(
         return json.dumps({"error": "sys_session_create requires server access"})
     if conversation_id is None:
         return json.dumps({"error": "sys_session_create requires a session id"})
+    speed = args.get("speed")
+    if speed is not None and speed not in ("standard", "fast"):
+        return json.dumps({"error": "speed must be standard or fast"})
     agent_id = args.get("agent_id")
     config_path = args.get("config_path")
     has_agent_id = isinstance(agent_id, str) and bool(agent_id)
@@ -5652,6 +5660,8 @@ async def _execute_session_create(
             )
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
+        if args.get("speed") is not None:
+            return json.dumps({"error": "speed requires an existing or default agent"})
         if args.get("reasoning_effort") is not None:
             return json.dumps(
                 {
@@ -5694,6 +5704,7 @@ async def _execute_session_create(
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
         placement=placement,
+        speed=args.get("speed"),
     )
     try:
         resp = await server_client.post(

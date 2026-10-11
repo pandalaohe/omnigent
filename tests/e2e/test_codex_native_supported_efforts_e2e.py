@@ -175,7 +175,14 @@ class _Session:
 
 
 @contextmanager
-def _session(rig: _Rig, model: str, effort: str, *, inherited: bool = False) -> Iterator[_Session]:
+def _session(
+    rig: _Rig,
+    model: str,
+    effort: str,
+    *,
+    inherited: bool = False,
+    speed_before_launch: str | None = None,
+) -> Iterator[_Session]:
     source_effort = effort if inherited else "medium"
     source_config = f'model = "{model}"\nmodel_reasoning_effort = "{source_effort}"\n'
     # Record the user's choice to keep the model instead of accepting an upgrade.
@@ -198,6 +205,12 @@ def _session(rig: _Rig, model: str, effort: str, *, inherited: bool = False) -> 
     bridge_id = hashlib.sha256(session_id.encode()).hexdigest()[:32]
     bridge = rig.stack.runner_home / ".omnigent" / "codex-native" / bridge_id
     try:
+        if speed_before_launch is not None:
+            _json(
+                rig.api.patch(
+                    f"/v1/sessions/{session_id}", json={"speed_tier": speed_before_launch}
+                )
+            )
         _json(rig.api.patch(f"/v1/sessions/{session_id}", json={"runner_id": rig.stack.runner_id}))
         session = _Session(session_id, bridge, {})
         session.ensure_terminal(rig)
@@ -236,7 +249,13 @@ async def _native_settings(session: _Session, model: str) -> dict[str, Any]:
 
 
 def _assert_turn(
-    rig: _Rig, session: _Session, model: str, expected: str, *, terminal: bool = False
+    rig: _Rig,
+    session: _Session,
+    model: str,
+    expected: str,
+    *,
+    terminal: bool = False,
+    service_tier: str | None = None,
 ) -> None:
     marker = f"EFFORT_OK_{uuid.uuid4().hex}"
     prompt = f"Reply with {marker}"
@@ -318,6 +337,9 @@ def _assert_turn(
     ]
     (rig.stack.root / f"{marker}-requests.json").write_text(json.dumps(requests, indent=2))
     assert requests, "The real Codex process must send a Responses request for this turn"
+    if service_tier is not None:
+        expected_tier = None if service_tier == "default" else service_tier
+        assert {request.get("service_tier") for request in requests} == {expected_tier}, requests
     assert {request["model"] for request in requests} == {model}
     efforts = [request.get("reasoning", {}).get("effort") for request in requests]
     settings = asyncio.run(_native_settings(session, model))
@@ -344,6 +366,7 @@ def _assert_turn(
         "model": model,
         "expected": expected,
         "wire_efforts": efforts,
+        "wire_service_tiers": [request.get("service_tier") for request in requests],
         "config_effort": config.get("model_reasoning_effort"),
         "native_effort": native_effort,
         "native_effort_source": effort_source,
@@ -363,6 +386,29 @@ def _assert_turn(
         time.sleep(0.2)
         snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
     assert snapshot.get("reasoning_effort") == expected, snapshot
+
+
+@pytest.mark.parametrize("asleep", [False, True])
+def test_codex_live_speed_reaches_the_next_web_and_terminal_turn(
+    codex_effort_rig: _Rig, asleep: bool
+) -> None:
+    rig = codex_effort_rig
+    with _session(
+        rig, "gpt-6-sol", "medium", speed_before_launch="fast" if asleep else None
+    ) as session:
+        for speed, tier, terminal in (("fast", "priority", True), ("standard", "default", False)):
+            if asleep and speed == "fast":
+                changed = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            else:
+                changed = _json(
+                    rig.api.patch(f"/v1/sessions/{session.id}", json={"speed_tier": speed})
+                )
+            assert changed["labels"]["omnigent.speed_tier"] == speed
+            state = read_bridge_state(session.bridge)
+            assert state is not None
+            config = tomllib.loads((Path(state.codex_home) / "config.toml").read_text())
+            assert config["service_tier"] == tier
+            _assert_turn(rig, session, "gpt-6-sol", "medium", terminal=terminal, service_tier=tier)
 
 
 @pytest.mark.parametrize("entry_point", ["launch", "inherited", "existing"])

@@ -5,6 +5,7 @@ import re
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 
 SPEED_TIER_LABEL_KEY = "omnigent.speed_tier"
+SPEED_TIER_REQUESTED_LABEL_KEY = "omnigent.speed_tier_requested"
 SPEED_TIER_VALUES = frozenset({"standard", "fast"})
 _SERVICE_TIER_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 

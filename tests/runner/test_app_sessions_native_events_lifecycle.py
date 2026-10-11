@@ -236,6 +236,11 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     )
     assert fake_client.connected
     assert fake_client.closed
+    if event_payload["type"] == "speed_tier_change":
+        import tomllib
+
+        config = tomllib.loads((tmp_path / "codex-home" / "config.toml").read_text())
+        assert config["service_tier"] == expected_params["serviceTier"]
     if event_payload["type"] == "effort_change":
         assert "effort change without a known model skips validation" in caplog.text
     assert fake_client.requests == [
@@ -262,6 +267,26 @@ async def test_speed_tier_change_rejects_unsupported_live_harness(harness: str) 
         )
     assert response.status_code == 400, response.text
     assert response.json()["detail"] == "Live speed changes require a Codex session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex", "codex-native"])
+async def test_speed_change_is_accepted_without_a_loaded_bridge(
+    harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
+    app, _ = await _build_app_for_spec(_harness_spec(harness, model="test-model"))
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": uuid.uuid4().hex}
+        )
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "speed_tier_change", "speed_tier": "fast"},
+        )
+    assert response.status_code in {200, 202}, response.text
 
 
 @pytest.mark.asyncio

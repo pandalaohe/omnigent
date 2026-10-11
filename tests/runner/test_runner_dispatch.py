@@ -8696,7 +8696,9 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
         try:
             output = await execute_tool(
                 tool_name="sys_session_create",
-                arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+                arguments=json.dumps(
+                    {"agent_id": "ag_x", "title": "auth", "message": "start", "speed": "fast"}
+                ),
                 server_client=server_client,
                 conversation_id="conv_caller",
             )
@@ -8710,6 +8712,7 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
+    assert captured["labels"] == {"omnigent.speed_tier": "fast"}
     assert "initial_items" not in captured
     # The message posts after the work entry exists.
     assert len(event_posts) == 1

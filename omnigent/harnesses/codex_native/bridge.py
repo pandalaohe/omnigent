@@ -719,7 +719,7 @@ def read_unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
     return {
         key: value
         for key, value in settings.items()
-        if key in ("model", "effort") and isinstance(value, str) and value
+        if key in ("model", "effort", "service_tier") and isinstance(value, str) and value
     }
 
 
@@ -1029,16 +1029,22 @@ def write_codex_config_effort(bridge_dir: Path, effort: str) -> bool:
 
 
 def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) -> dict[str, str]:
-    """Write a model and effort Codex applied into ``config.toml``, recording any that fail.
+    """Write applied Codex settings into ``config.toml``, recording any that fail.
 
     The model is written first, since that write clamps a stale effort. Settings
     recorded earlier that *applied* does not replace stay recorded.
 
     :param bridge_dir: The session's native-Codex bridge directory.
-    :param applied: Applied values keyed ``"model"`` / ``"effort"``.
+    :param applied: Applied values keyed ``model``, ``effort``, or ``service_tier``.
     :returns: The values whose write failed.
     """
-    writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
+    writers = {
+        "model": write_codex_config_model,
+        "effort": write_codex_config_effort,
+        "service_tier": lambda bridge, tier: _upsert_top_level_config_key(
+            codex_home_for_bridge_dir(bridge) / "config.toml", "service_tier", tier
+        ),
+    }
     failed: dict[str, str] = {}
     # The runner, hook, and executor run in separate processes; one must not stamp
     # another's superseded record against the config revision it just wrote.

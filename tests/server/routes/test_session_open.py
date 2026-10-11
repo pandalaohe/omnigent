@@ -730,12 +730,14 @@ async def test_open_model_and_effort_stay_explicit(
             env["sender_token"],
             model="databricks-claude-sonnet-4-6",
             reasoning_effort="high",
+            speed="fast",
         )
     assert data["state"] == "opened"
     body = captured["body"]
     assert body.model_fields_set >= {"model_override", "reasoning_effort"}
     assert body.model_override == "databricks-claude-sonnet-4-6"
     assert body.reasoning_effort == "high"
+    assert body.labels["omnigent.speed_tier"] == "fast"
 
 
 @pytest.mark.asyncio

@@ -1063,6 +1063,8 @@ class SysSessionCreateTool(Tool):
             ".tar.gz bundle in your working directory (e.g. authored "
             "with sys_os_write) and launches it. Omit both to launch "
             "the parent project's default agent for the child's host. "
+            "speed selects standard or fast, overriding calling defaults; "
+            "unsupported harnesses are refused. "
             "Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
@@ -1176,6 +1178,14 @@ class SysSessionCreateTool(Tool):
                                 "'config_path', and only for harnesses "
                                 "with effort plumbing; omit to use the "
                                 "agent's default."
+                            ),
+                        },
+                        "speed": {
+                            "type": "string",
+                            "enum": ["standard", "fast"],
+                            "description": (
+                                "Explicit child speed, overriding calling defaults; "
+                                "unsupported harnesses are refused. Not valid with config_path."
                             ),
                         },
                         "host": {

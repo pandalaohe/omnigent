@@ -3156,7 +3156,12 @@ def register_events_routes(
                 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
                 _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
             )
-            from omnigent.session_default_modes import SPEED_TIER_LABEL_KEY, valid_speed_tier
+            from omnigent.server.routes._sessions.helpers import _live_settings_change
+            from omnigent.session_default_modes import (
+                SPEED_TIER_LABEL_KEY,
+                SPEED_TIER_REQUESTED_LABEL_KEY,
+                valid_speed_tier,
+            )
 
             speed = body.data.get("speed_tier") if isinstance(body.data, dict) else None
             if not isinstance(speed, str) or not valid_speed_tier(speed, "codex-native"):
@@ -3168,11 +3173,20 @@ def register_events_routes(
                 raise OmnigentError(
                     "speed event requires Codex native", code=ErrorCode.INVALID_INPUT
                 )
-            if conv.labels.get(SPEED_TIER_LABEL_KEY) != speed:
-                await asyncio.to_thread(
-                    conversation_store.set_labels, session_id, {SPEED_TIER_LABEL_KEY: speed}
-                )
-                _publish_speed_tier(session_id, speed)
+            live_change = _live_settings_change(session_id)
+            async with live_change.lock:
+                latest = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if latest is None:
+                    raise _session_not_found()
+                # Native reports are observations; an explicit session selection
+                # remains the desired speed even when delayed reports arrive.
+                if SPEED_TIER_REQUESTED_LABEL_KEY in latest.labels:
+                    return {"queued": False}
+                if latest.labels.get(SPEED_TIER_LABEL_KEY) != speed:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels, session_id, {SPEED_TIER_LABEL_KEY: speed}
+                    )
+                    _publish_speed_tier(session_id, speed)
             return {"queued": False}
         if body.type == _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE:
             await _persist_external_codex_collaboration_mode_change(

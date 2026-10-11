@@ -332,6 +332,8 @@ def build_native_controls(
 
         state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
         if state is None:
+            if set(settings) == {"serviceTier"}:
+                return JSONResponse(status_code=202, content={"deferred": True}), settings
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
             # app-server never saw.
@@ -458,6 +460,9 @@ def build_native_controls(
         if isinstance(effort, str) and effort:
             _session_reasoning_effort[conv_id] = effort
             applied["effort"] = effort
+        tier = settings.get("serviceTier")
+        if isinstance(tier, str):
+            applied["service_tier"] = tier
         if applied:
             failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, applied)
             for key in failed:
