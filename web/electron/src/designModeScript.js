@@ -130,6 +130,23 @@ function buildDesignModeScript(nonce) {
     return null;
   }
 
+  function nodeAddress(el) {
+    const parts = [];
+    for (let node = el; node; node = node.parentElement) {
+      const tag = node.localName;
+      if (!/^[a-z][a-z0-9-]*$/i.test(tag)) return '';
+      let index = 1;
+      for (let sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+        if (sibling.localName === tag) index++;
+      }
+      parts.unshift(tag + ':nth-of-type(' + index + ')');
+    }
+    const selector = parts.join(' > ');
+    if (selector.length > 700) return '';
+    const matches = document.querySelectorAll(selector);
+    return matches.length === 1 && matches[0] === el ? selector : '';
+  }
+
   function getElementInfo(el) {
     const rect = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
@@ -142,6 +159,10 @@ function buildDesignModeScript(nonce) {
       ariaLabel: el.getAttribute('aria-label') || '',
       role: el.getAttribute('role') || '',
       component: getReactComponent(el),
+      selector: nodeAddress(el),
+      pageUrl: location.origin + location.pathname,
+      prefix: (el.previousElementSibling?.textContent || '').trim().slice(-32),
+      suffix: (el.nextElementSibling === layer ? '' : el.nextElementSibling?.textContent || '').trim().slice(0, 32),
       rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       styles: { color: cs.color, backgroundColor: cs.backgroundColor, fontSize: cs.fontSize, fontWeight: cs.fontWeight, padding: cs.padding, margin: cs.margin, display: cs.display, position: cs.position }
     };
