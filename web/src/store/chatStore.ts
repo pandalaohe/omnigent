@@ -54,7 +54,12 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
-import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import {
+  isTerminalCommandInput,
+  LIVE_ITEM_PREFIX,
+  PENDING_FILE_PREFIX,
+  structuredErrorFields,
+} from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
@@ -5366,6 +5371,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  pendingAtReconnectStart: Set<string>,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -5376,6 +5382,32 @@ async function rehydrateWindowOnReconnect(
     return;
   }
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  // Keep the display window capped, but recover input receipts beyond it when
+  // sends are still pending. Item ids also protect identical later commands.
+  let settlementItems = fresh.items;
+  let hasMore = fresh.hasMore;
+  /* oxlint-disable no-await-in-loop */
+  while (
+    pendingAtReconnectStart.size > 0 &&
+    hasMore &&
+    !settlementItems.some((item) => preGapIds.has(item.id))
+  ) {
+    const cursor = settlementItems[0]?.id;
+    if (!cursor) break;
+    let older: SessionItemsPage;
+    try {
+      older = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, olderThan: cursor });
+    } catch {
+      return;
+    }
+    if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+    if (older.items.length === 0) break;
+    settlementItems = [...older.items, ...settlementItems];
+    hasMore = older.hasMore;
+  }
+  /* oxlint-enable no-await-in-loop */
+  const overlap = settlementItems.findLastIndex((item) => preGapIds.has(item.id));
+  const settlementBlocks = itemsToBlocks(settlementItems.slice(overlap + 1));
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -5393,16 +5425,23 @@ async function rehydrateWindowOnReconnect(
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
+    const seen = new Set(s.blocks.map((b) => b.ctx.itemId));
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
     const merged = mergeReconnectWindow(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
+    );
+    const pendingPatch = recoveredPendingInputPatch(
+      s,
+      settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+      pendingAtReconnectStart,
     );
     return {
       ...reconnectStatusPatch(session, s, todosAtReconnectStart, launchBeforeFetch),
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...pendingPatch,
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -5468,6 +5507,7 @@ async function reconcileOnReconnect(
   // `reconcileElicitationBlocks`.
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
   const todosAtReconnectStart = get().todos;
+  const pendingAtReconnectStart = new Set(get().pendingUserMessages.map((p) => p.tempId));
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
@@ -5531,11 +5571,14 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       launchBeforeFetch,
+      pendingAtReconnectStart,
     );
     return;
   }
 
   const snapshotBlocks = itemsToBlocks(items);
+  const overlap = items.findLastIndex((item) => preGapIds.has(item.id));
+  const settlementBlocks = itemsToBlocks(items.slice(overlap + 1));
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = new Set(items.map((it) => it.id));
   set((s) => {
@@ -5555,14 +5598,14 @@ async function reconcileOnReconnect(
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
       ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
     };
-    // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
-    const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
-    if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
-    }
+    Object.assign(
+      patch,
+      recoveredPendingInputPatch(
+        s,
+        settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+        pendingAtReconnectStart,
+      ),
+    );
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
@@ -7205,7 +7248,10 @@ function messageContentText(content: MessageContentBlock[]): string {
  * @param bubble - A queued optimistic bubble.
  * @param command - The mirrored command, without its leading `!`.
  */
-function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
+function isShellCommandBubble(
+  bubble: Pick<PendingUserMessage, "content" | "initialDraft">,
+  command: string,
+): boolean {
   const wanted = command.replace(/\s+/g, " ").trim();
   if (bubble.initialDraft || wanted === "") return false;
   const text = messageContentText(bubble.content);
@@ -7214,6 +7260,71 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
 
 /** Bound replay protection to the server's maximum pending queue size. */
 const MAX_SETTLED_SHELL_INPUTS = 64;
+
+type PendingInputState = Pick<ConversationState, "pendingUserMessages" | "settledShellInputs">;
+
+function settledShellInputPatch(
+  s: PendingInputState,
+  itemId: string,
+  command: string,
+): Partial<PendingInputState> {
+  if (s.settledShellInputs.some((entry) => entry.itemId === itemId)) return {};
+  const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+  const popped = s.pendingUserMessages[at];
+  return {
+    pendingUserMessages: popped
+      ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
+      : s.pendingUserMessages,
+    settledShellInputs: [
+      ...s.settledShellInputs,
+      {
+        itemId,
+        tempId: popped?.tempId,
+        pendingId: popped?.pendingId,
+        contentKey: popped ? contentKeyOf(popped.content) : undefined,
+      },
+    ].slice(-MAX_SETTLED_SHELL_INPUTS),
+  };
+}
+
+// Lost stream receipts have durable equivalents in the recovered input blocks.
+function recoveredPendingInputPatch(
+  s: PendingInputState,
+  recovered: AnyBlock[],
+  pendingAtReconnectStart: Set<string>,
+): PendingInputState {
+  let state: PendingInputState = {
+    pendingUserMessages: s.pendingUserMessages,
+    settledShellInputs: s.settledShellInputs,
+  };
+  for (const block of recovered) {
+    if (isTerminalCommandInput(block) && block.ctx.itemId) {
+      state = { ...state, ...settledShellInputPatch(state, block.ctx.itemId, block.input) };
+    } else if (block.type === "slash_command" && block.kind === "command") {
+      const text = `/${block.name} ${block.arguments}`.replace(/\s+/g, " ").trim();
+      const at = state.pendingUserMessages.findIndex(
+        (p) => !p.initialDraft && messageContentText(p.content) === text,
+      );
+      if (at >= 0)
+        state = {
+          ...state,
+          pendingUserMessages: state.pendingUserMessages.filter((_, i) => i !== at),
+        };
+    } else if (
+      block.type === "user_message" &&
+      !isSystemUserContent(block.content) &&
+      pendingAtReconnectStart.has(state.pendingUserMessages[0]?.tempId ?? "") &&
+      !state.settledShellInputs.some((entry) => entry.contentKey === contentKeyOf(block.content)) &&
+      !recovered.some(
+        (input) => isTerminalCommandInput(input) && isShellCommandBubble(block, input.input),
+      ) &&
+      !state.pendingUserMessages[0]?.initialDraft
+    ) {
+      state = { ...state, pendingUserMessages: state.pendingUserMessages.slice(1) };
+    }
+  }
+  return state;
+}
 
 /**
  * Normalized texts of the committed user-message blocks in `blocks`,
@@ -8042,6 +8153,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // send; observing clients and drafts still held locally cannot
       // acknowledge a send, so they just render the block.
       applyToConversation((s) => {
+        if (event.kind === "command" && hasCommittedItem(s.blocks, event.itemId)) return {};
         if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
@@ -8051,25 +8163,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Shell inputs have no consumed receipt; remove only the matching sent bubble.
       const command = event.kind === "input" ? event.input : null;
       if (command === null) return;
-      applyToConversation((s) => {
-        if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
-        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
-        const popped = s.pendingUserMessages[at];
-        return {
-          pendingUserMessages: popped
-            ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
-            : s.pendingUserMessages,
-          settledShellInputs: [
-            ...s.settledShellInputs,
-            {
-              itemId: event.itemId,
-              tempId: popped?.tempId,
-              pendingId: popped?.pendingId,
-              contentKey: popped ? contentKeyOf(popped.content) : undefined,
-            },
-          ].slice(-MAX_SETTLED_SHELL_INPUTS),
-        };
-      });
+      applyToConversation((s) => settledShellInputPatch(s, event.itemId, command));
       return;
     }
     case "session_interrupted":

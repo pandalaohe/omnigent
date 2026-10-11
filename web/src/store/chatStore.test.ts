@@ -14645,6 +14645,334 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it.each(
+    (["shell", "command", "skill", "queued"] as const).flatMap((kind) =>
+      ["backfill", "window"].map((recovery) => ({ kind, recovery })),
+    ),
+  )(
+    "settles a recovered $kind input during $recovery without taking the later queued message",
+    async ({ kind, recovery }) => {
+      const before = userMessage("gap_pre", "before the gap");
+      const recovered: ConversationItem =
+        kind === "shell"
+          ? {
+              id: "gap_input",
+              response_id: "gap_turn",
+              type: "terminal_command",
+              status: "completed",
+              kind: "input",
+              input: "echo gap",
+            }
+          : kind === "queued"
+            ? userMessage("gap_turn", "queued prompt")
+            : {
+                id: "gap_input",
+                response_id: "gap_turn",
+                type: "slash_command",
+                status: "completed",
+                kind,
+                name: "review",
+                arguments: "gap",
+              };
+      const text =
+        kind === "shell" ? "! echo gap" : kind === "queued" ? "queued prompt" : "/review gap";
+      seedSession("conv_gap_input", [before]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const later = {
+        tempId: "later",
+        content: [{ type: "input_text" as const, text: kind === "shell" ? text : "later prompt" }],
+        posted: true,
+      };
+      useChatStore.setState({
+        conversationId: "conv_gap_input",
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [
+          {
+            tempId: "gap",
+            pendingId: "pending-gap",
+            content: [{ type: "input_text", text }],
+            posted: true,
+          },
+          {
+            tempId: "queued-second",
+            content: [{ type: "input_text", text: "second queued prompt" }],
+            posted: true,
+          },
+          later,
+        ],
+      });
+      const loop = startStreamPump("conv_gap_input", controller, setState, getState);
+      await drainAsync();
+      seedSessionItems("conv_gap_input", [
+        before,
+        ...(recovery === "window"
+          ? Array.from({ length: 100 }, (_, i) => assistantMessage(`gap_filler_${i}`, "gap filler"))
+          : []),
+        recovered,
+        assistantMessage("gap_turn", "after the input"),
+        userMessage("second_gap_turn", "second queued prompt"),
+      ]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([later]);
+      if (kind === "command") {
+        handleSessionEvent({
+          type: "slash_command",
+          kind: "command",
+          name: "review",
+          arguments: "gap",
+          output: null,
+          agentName: "test-agent",
+          itemId: recovered.id,
+          responseId: "gap_turn",
+        });
+        expect(useChatStore.getState().pendingUserMessages).toEqual([later]);
+      }
+      if (kind === "shell") {
+        handleSessionEvent({
+          type: "terminal_command",
+          kind: "input",
+          input: "echo gap",
+          stdout: null,
+          stderr: null,
+          itemId: recovered.id,
+          responseId: "gap_turn",
+        });
+        expect(useChatStore.getState().settledShellInputs).toMatchObject([
+          { itemId: recovered.id, pendingId: "pending-gap" },
+        ]);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([later]);
+      }
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each(["shell", "command", "draft-shell", "draft-command", "output"])(
+    "preserves unrelated sends or unsent drafts when recovering %s",
+    async (kind) => {
+      const before = userMessage("guard_pre", "before the gap");
+      seedSession("conv_gap_guard", [before]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const pending: PendingUserMessage = {
+        tempId: "held",
+        content: [
+          {
+            type: "input_text",
+            text:
+              kind === "draft-shell"
+                ? "! echo gap"
+                : kind === "draft-command"
+                  ? "/review gap"
+                  : "unrelated prompt",
+          },
+        ],
+        ...(kind.startsWith("draft")
+          ? { initialDraft: { text: "draft", files: [] } }
+          : { posted: true }),
+      };
+      useChatStore.setState({
+        conversationId: "conv_gap_guard",
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [pending],
+      });
+      const loop = startStreamPump("conv_gap_guard", controller, setState, getState);
+      await drainAsync();
+      const recovered: ConversationItem = kind.includes("command")
+        ? {
+            id: "guard_input",
+            response_id: "guard_turn",
+            status: "completed",
+            type: "slash_command",
+            kind: "command",
+            name: "review",
+            arguments: "gap",
+          }
+        : {
+            id: "guard_input",
+            response_id: "guard_turn",
+            status: "completed",
+            type: "terminal_command",
+            kind: kind === "output" ? "output" : "input",
+            input: kind === "output" ? undefined : "echo gap",
+            stdout: kind === "output" ? "gap" : undefined,
+          };
+      seedSessionItems("conv_gap_guard", [before, recovered]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each(["backfill", "window", "outside-window", "window-cut-input"])(
+    "keeps later sends through legacy shell records in %s recovery",
+    async (recovery) => {
+      const before = userMessage("legacy_pre", "before the gap");
+      const oldHistory = Array.from({ length: 100 }, (_, i) =>
+        userMessage(`legacy_old_${i}`, "older message"),
+      );
+      seedSession("conv_legacy_gap", [...oldHistory, before]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const pending = ["!echo hi", "thanks", "!echo hi"].map((text, i) => ({
+        tempId: `legacy_${i}`,
+        pendingId: `pending_legacy_${i}`,
+        posted: true,
+        content: [{ type: "input_text" as const, text }],
+      }));
+      useChatStore.setState({
+        conversationId: "conv_legacy_gap",
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: pending,
+      });
+      const loop = startStreamPump("conv_legacy_gap", controller, setState, getState);
+      await drainAsync();
+      const shell: ConversationItem = {
+        id: "legacy_shell",
+        response_id: "legacy_shell_turn",
+        status: "completed",
+        type: "terminal_command",
+        kind: "input",
+        input: "echo hi",
+      };
+      const fillers = Array.from({ length: 101 }, (_, i) =>
+        assistantMessage(`legacy_filler_${i}`, "gap output"),
+      );
+      seedSessionItems("conv_legacy_gap", [
+        ...oldHistory,
+        before,
+        ...(recovery === "window" ? fillers : []),
+        shell,
+        userMessage("legacy_skip", "!echo hi"),
+        userMessage("legacy_thanks", "thanks"),
+        ...(recovery === "outside-window" ? fillers : []),
+        ...(recovery === "window-cut-input" ? fillers.slice(0, 98) : []),
+      ]);
+      sessionPendingInputs.set("conv_legacy_gap", [
+        { pending_id: pending[2]!.pendingId, content: pending[2]!.content },
+      ]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending[2]]);
+      handleSessionEvent({
+        type: "terminal_command",
+        kind: "input",
+        input: "echo hi",
+        stdout: null,
+        stderr: null,
+        itemId: shell.id,
+        responseId: "legacy_shell_turn",
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending[2]]);
+      // A legacy consumed receipt must not take the remaining queue entry either.
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "late_legacy_skip",
+        itemType: "message",
+        clearedPendingId: pending[0]!.pendingId,
+        data: { role: "user", content: pending[0]!.content, user_authored: true },
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending[2]]);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each([false, true])(
+    "keeps newer sends unless their committed shell receipt was recovered (%s)",
+    async (committed) => {
+      const before = userMessage("race_pre", "before the gap");
+      seedSession("conv_pending_snapshot_race", [before]);
+      const sinks = routeStreamOpens();
+      const routed = fetchMock.getMockImplementation()!;
+      let hold = false;
+      let release: ((response: Response) => void) | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (hold && String(input).includes("/items")) {
+          hold = false;
+          return new Promise<Response>((resolve) => {
+            release = resolve;
+          });
+        }
+        return routed(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_pending_snapshot_race",
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+      });
+      const loop = startStreamPump("conv_pending_snapshot_race", controller, setState, getState);
+      await drainAsync();
+      seedSessionItems("conv_pending_snapshot_race", [
+        before,
+        ...Array.from({ length: 101 }, (_, i) =>
+          assistantMessage(`race_filler_${i}`, "gap output"),
+        ),
+      ]);
+      hold = true;
+      sinks[0]!.error();
+      await drainAsync();
+      expect(release).toBeDefined();
+      const newer = {
+        tempId: "newer",
+        pendingId: "pending-newer",
+        posted: true,
+        content: [{ type: "input_text" as const, text: "!echo newer" }],
+      };
+      useChatStore.setState({ pendingUserMessages: [newer] });
+      const mirror: ConversationItem = {
+        id: "newer-shell-item",
+        response_id: "newer-shell-turn",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "echo newer",
+      };
+      if (committed)
+        seedSessionItems("conv_pending_snapshot_race", [
+          before,
+          ...Array.from({ length: 101 }, (_, i) =>
+            assistantMessage(`race_filler_${i}`, "gap output"),
+          ),
+          mirror,
+        ]);
+      release!(
+        defaultFetchHandler("/v1/sessions/conv_pending_snapshot_race/items?limit=20&order=desc"),
+      );
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual(committed ? [] : [newer]);
+      handleSessionEvent({
+        type: "terminal_command",
+        kind: "input",
+        input: "echo newer",
+        stdout: null,
+        stderr: null,
+        itemId: mirror.id,
+        responseId: "newer-shell-turn",
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
   // A restored failed-send draft reconciles against the snapshot too: its
   // `session_input_consumed` proof is never replayed after a reconnect.
   it("retracts an ack-lost restored draft when the reconnect snapshot holds its item", async () => {

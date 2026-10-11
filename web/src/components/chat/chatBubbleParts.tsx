@@ -730,15 +730,16 @@ function UserBubble({
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const text = extractUserText(bubble.content);
-  const annotation = parseAnnotationMessage(text);
+  const isShellCommand = bubble.shellCommand !== undefined;
+  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const annotation = isShellCommand ? null : parseAnnotationMessage(text);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
-  const mentionedChips = extractAttachedPaths(bubble.content);
+  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
   const keyedContent = (() => {
     const seen = new Map<string, number>();
     return bubble.content.map((block) => {
@@ -869,10 +870,18 @@ function UserBubble({
               let budget = isCollapsed ? COLLAPSE_THRESHOLD : Number.POSITIVE_INFINITY;
               const blocks = keyedContent.map(({ block, key }) => {
                 if (isTextBlock(block)) {
-                  const full = block.text.replace(ATTACHED_RE, "").trim();
+                  const full = isShellCommand
+                    ? block.text
+                    : block.text.replace(ATTACHED_RE, "").trim();
                   if (!full || budget <= 0) return null;
                   const visible = budget < full.length ? sliceByCodePoint(full, budget) : full;
                   budget -= visible.length;
+                  if (isShellCommand)
+                    return (
+                      <pre key={key} className="whitespace-pre-wrap break-words font-mono text-sm">
+                        <code>{visible}</code>
+                      </pre>
+                    );
                   return (
                     <FilePathAwareMessageResponse
                       key={key}
