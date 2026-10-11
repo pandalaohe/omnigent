@@ -23,6 +23,7 @@ import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
 const codeViewerRenders = vi.hoisted(() => vi.fn());
+const codeViewerComments = vi.hoisted(() => vi.fn());
 const addCommentMutateAsync = vi.hoisted(() => vi.fn());
 
 // ── Mock heavy child components ───────────────────────────────────────────────
@@ -42,6 +43,7 @@ vi.mock("./CodeViewer", () => ({
     onDirtyChange,
     onSetActiveSelection,
     onFrameChange,
+    comments,
     previewKey,
   }: {
     path: string;
@@ -55,9 +57,11 @@ vi.mock("./CodeViewer", () => ({
       anchor_content: string;
     }) => void;
     onFrameChange?: (frame: { path: string; source: string } | null) => void;
+    comments?: Comment[];
     previewKey?: number;
   }) => {
     codeViewerRenders({ path, position });
+    codeViewerComments(comments);
     return (
       <div
         data-testid="code-viewer"
@@ -152,11 +156,15 @@ vi.mock("./MonacoDiffViewer", () => ({
     wrapLines,
     hideWhitespace,
     searchOpen,
+    comments,
+    activeSelection,
   }: {
     position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
+    comments?: Comment[];
+    activeSelection?: { anchor_content: string } | null;
   }) => (
     <div
       data-testid="diff-viewer"
@@ -164,6 +172,8 @@ vi.mock("./MonacoDiffViewer", () => ({
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
       data-search-open={String(!!searchOpen)}
+      data-comment-ids={comments?.map((c) => c.id).join(",")}
+      data-active-anchor={activeSelection?.anchor_content ?? ""}
     />
   ),
 }));
@@ -256,11 +266,13 @@ import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { type ElementAnchorV1, encodeElementAnchor } from "./annotationAnchor";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
+import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as identityModule from "@/lib/identity";
 import { hasOmnigentHostFetcher } from "@/lib/host";
+import { useFileContent } from "@/hooks/useFileContent";
 import type * as hostModule from "@/lib/host";
 import { toast } from "sonner";
 import type * as sonnerModule from "sonner";
@@ -787,6 +799,20 @@ describe("FileViewer URL sync — diff param", () => {
     // Failure: diffActive was not initialized from the URL param (remained false).
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.queryByTestId("code-viewer")).toBeNull();
+  });
+
+  it("keeps rendered positions out of raw diff decorations while source comments remain", async () => {
+    const source = makeComment("source");
+    const rendered = {
+      ...makeComment("rendered"),
+      anchor_content:
+        '__text__{"v":1,"kind":"markdown","text":"Code","occ":1,"prefix":"Beta ","suffix":""}',
+    };
+    useCommentsMock.mockReturnValue(makeCommentsQuery([source, rendered]));
+    renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1&comment=rendered" });
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-comment-ids", "source");
+    expect(diff).toHaveAttribute("data-active-anchor", "");
   });
 
   it("writes ?diff=1 to the URL when the diff toggle button is clicked", async () => {
@@ -1329,6 +1355,36 @@ function makeAnchoredComment(
 }
 
 describe("classifyAndRemapComments", () => {
+  it("keeps a legacy 0–0 HTML quote unknown when a script contains the text", () => {
+    const comment = makeAnchoredComment({
+      id: "legacy-html",
+      start_index: 0,
+      end_index: 0,
+      anchor_content: "Code",
+    });
+    const source = '<script>const first = "Code";</script><p>Alpha Code</p><p>Beta Code</p>';
+    expect(classifyAndRemapComments([comment], source).open).toEqual([comment]);
+  });
+
+  it("does not remap rendered HTML text into a script string or raw source", () => {
+    const typed = encodeRenderedTextAnchor({
+      v: 1,
+      kind: "html",
+      text: "Code",
+      occ: 1,
+      prefix: "Alpha Code Beta ",
+      suffix: "",
+    })!;
+    const comment = makeAnchoredComment({
+      id: "rendered",
+      start_index: 0,
+      end_index: 0,
+      anchor_content: typed,
+    });
+    const source = '<script>const label = "Code"</script><p>Code</p><p>Code</p>';
+    expect(classifyAndRemapComments([comment], source).open).toEqual([comment]);
+  });
+
   it("buckets addressed comments separately and never remaps them", () => {
     const fileContent = "AAAA\nhello world\n";
     const addressed = makeAnchoredComment({
@@ -1542,6 +1598,28 @@ describe("classifyAndRemapComments", () => {
     const flagged = result.open[0] as Comment & { detached?: boolean; stale?: boolean };
     expect(flagged.detached ?? flagged.stale).toBe(true);
   });
+});
+
+it("passes a legacy HTML 0–0 quote through classification to the preview unchanged", () => {
+  const legacy = makeAnchoredComment({
+    id: "legacy-html-preview",
+    start_index: 0,
+    end_index: 0,
+    anchor_content: "Code",
+  });
+  const source = '<script>const first = "Code";</script><p>Alpha Code</p><p>Beta Code</p>';
+  vi.mocked(useFileContent).mockReturnValue({
+    data: { content: source, path: "page.html" },
+  } as ReturnType<typeof useFileContent>);
+  useCommentsMock.mockReturnValue(makeCommentsQuery([legacy]));
+  try {
+    renderViewer({ open: true, path: "page.html" });
+    expect(codeViewerComments).toHaveBeenLastCalledWith([legacy]);
+  } finally {
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: "", path: "file1.py" },
+    } as ReturnType<typeof useFileContent>);
+  }
 });
 
 // ── Header close affordance ─────────────────────────────────────────────────

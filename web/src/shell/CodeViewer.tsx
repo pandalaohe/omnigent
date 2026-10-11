@@ -57,6 +57,7 @@ import {
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { isRenderedTextAnchor } from "./renderedTextAnchor";
 import {
   type ActiveSelection,
   type SaveStatus,
@@ -445,8 +446,8 @@ export interface CodeViewerProps {
    */
   onFrameChange?: (frame: { path: string; source: string } | null) => void;
   /**
-   * Lifts the ids of the HTML preview's element annotations that no longer
-   * resolve on the page it shows.
+   * Lifts comment ids whose rendered HTML or Markdown location cannot be
+   * confirmed in the current document.
    */
   onAnnotationOrphansChange?: (ids: ReadonlySet<string>) => void;
   /**
@@ -486,6 +487,14 @@ export function CodeViewer({
     () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],
     [comments, addressedComments, activeCommentId],
   );
+  const sourceComments = useMemo(
+    () => comments.filter((c) => !isRenderedTextAnchor(c.anchor_content)),
+    [comments],
+  );
+  const sourceActiveSelection =
+    activeSelection && !isRenderedTextAnchor(activeSelection.anchor_content)
+      ? activeSelection
+      : null;
 
   const [tokenLines, setTokenLines] = useState<ThemedToken[][] | null>(null);
 
@@ -509,10 +518,10 @@ export function CodeViewer({
   const selectAllPendingRef = useRef(false);
   // Stable refs so the mouseup handler can access current values without
   // being recreated on every change (avoids stale closure bugs).
-  const commentsRef = useRef(comments);
+  const commentsRef = useRef(sourceComments);
   useEffect(() => {
-    commentsRef.current = comments;
-  }, [comments]);
+    commentsRef.current = sourceComments;
+  }, [sourceComments]);
   const onSetActiveSelectionRef = useRef(onSetActiveSelection);
   useEffect(() => {
     onSetActiveSelectionRef.current = onSetActiveSelection;
@@ -596,10 +605,10 @@ export function CodeViewer({
   // Scroll to the line containing the active selection when it changes
   // (e.g. user clicked a comment in the panel).
   useEffect(() => {
-    if (activeSelection == null) return;
-    const lineNum = indexToLine(activeSelection.start_index, rawLines);
+    if (sourceActiveSelection == null) return;
+    const lineNum = indexToLine(sourceActiveSelection.start_index, rawLines);
     matchLineRefs.current.get(lineNum - 1)?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [activeSelection]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sourceActiveSelection]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setCurrentMatchIdx(0);
@@ -867,6 +876,7 @@ export function CodeViewer({
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
         searchInputRef={searchInputRef}
+        onOrphansChange={onAnnotationOrphansChange}
       />
     );
   }
@@ -934,8 +944,8 @@ export function CodeViewer({
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
           onSearchHandled={handleSearchHandled}
-          comments={comments}
-          activeSelection={activeSelection}
+          comments={sourceComments}
+          activeSelection={sourceActiveSelection}
           onSetActiveSelection={onSetActiveSelection}
           pendingBodyRef={pendingBodyRef}
         />
@@ -953,7 +963,7 @@ export function CodeViewer({
 
   // Build a map: line number → first comment starting on that line.
   const commentByLine = new Map<number, Comment>();
-  for (const c of comments) {
+  for (const c of sourceComments) {
     const ln = indexToLine(c.start_index, rawLines);
     if (!commentByLine.has(ln)) commentByLine.set(ln, c);
   }
@@ -1043,34 +1053,35 @@ export function CodeViewer({
           const isCurrentMatch = isMatchLine && matches[safeMatchIdx] === idx;
           const commentOnLine = commentByLine.get(lineNum);
           const isActiveRange =
-            activeSelection != null &&
+            sourceActiveSelection != null &&
             lineOverlapsSelection(
               idx,
               rawLines,
-              activeSelection.start_index,
-              activeSelection.end_index,
+              sourceActiveSelection.start_index,
+              sourceActiveSelection.end_index,
             );
           const tokens = tokenLines?.[idx] ?? null;
 
           // Column offsets within this line for character-level highlight overlay.
           const lineAbsStart = lineStarts[idx] ?? 0;
           const selStartCol = isActiveRange
-            ? Math.max(0, activeSelection!.start_index - lineAbsStart)
+            ? Math.max(0, sourceActiveSelection!.start_index - lineAbsStart)
             : 0;
           const selEndCol = isActiveRange
-            ? Math.min(rawLine.length, activeSelection!.end_index - lineAbsStart)
+            ? Math.min(rawLine.length, sourceActiveSelection!.end_index - lineAbsStart)
             : 0;
 
           // Per-comment overlays for this line (shown whenever comments exist).
-          const commentOverlays = comments
+          const commentOverlays = sourceComments
             .filter((c) => lineOverlapsSelection(idx, rawLines, c.start_index, c.end_index))
             .map((c) => ({
               id: c.id,
               startCol: Math.max(0, c.start_index - lineAbsStart),
               endCol: Math.min(rawLine.length, c.end_index - lineAbsStart),
               isSelected:
-                activeSelection?.start_index === c.start_index &&
-                activeSelection?.end_index === c.end_index,
+                sourceActiveSelection?.start_index === c.start_index &&
+                sourceActiveSelection?.end_index === c.end_index &&
+                sourceActiveSelection?.anchor_content === c.anchor_content,
             }))
             .filter((o) => o.endCol > o.startCol);
           const hasAnyHighlight = commentOverlays.length > 0 || isActiveRange;
@@ -1144,10 +1155,11 @@ export function CodeViewer({
                   {/* New selection (not yet saved as a comment) gets the active color. */}
                   {isActiveRange &&
                     selEndCol > selStartCol &&
-                    !comments.some(
+                    !sourceComments.some(
                       (c) =>
-                        c.start_index === activeSelection!.start_index &&
-                        c.end_index === activeSelection!.end_index,
+                        c.start_index === sourceActiveSelection!.start_index &&
+                        c.end_index === sourceActiveSelection!.end_index &&
+                        c.anchor_content === sourceActiveSelection!.anchor_content,
                     ) && (
                       <span
                         aria-hidden

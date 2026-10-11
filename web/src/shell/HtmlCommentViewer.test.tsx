@@ -29,6 +29,7 @@ import {
 } from "./codeViewerHelpers";
 import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 import { ANNOTATE_SOURCE } from "./htmlAnnotateBridge";
+import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
@@ -334,6 +335,48 @@ afterEach(() => {
 });
 
 describe("HtmlCommentViewer standalone (artifact URL)", () => {
+  it("reloads typed anchors in the frame and leaves legacy 0–0 text unresolved", async () => {
+    const typed = encodeRenderedTextAnchor({
+      v: 1,
+      kind: "html",
+      text: "Code",
+      occ: 1,
+      prefix: "Alpha Code Beta ",
+      suffix: "",
+      selector: "p:nth-of-type(2)",
+    })!;
+    const base = elementComment("typed", ENTRY_PATH, 100);
+    const comments = [
+      { ...base, start_index: 0, end_index: 0, anchor_content: typed },
+      { ...base, id: "legacy-zero", start_index: 0, end_index: 0, anchor_content: "Code" },
+      elementComment("element", ENTRY_PATH, 120),
+      { ...base, id: "whole-page", start_index: 0, end_index: 0, anchor_content: null },
+    ];
+    const { onAnnotationOrphansChange } = renderViewer({ comments });
+    const { postMessage } = await openFrame();
+    const init = initPosts(postMessage, BRIDGE_MSG.init)[0]!;
+    const port = init[2][0] as MessagePort;
+    const messages: { type: string; comments?: unknown[] }[] = [];
+    port.onmessage = (event) => messages.push(event.data);
+    await sendFromFrame(postMessage, { type: BRIDGE_MSG.ready, pathname: ENTRY_URL });
+    await waitFor(() => expect(messages.some((m) => m.type === BRIDGE_MSG.setComments)).toBe(true));
+    expect(messages.find((m) => m.type === BRIDGE_MSG.setComments)?.comments).toEqual([
+      {
+        id: "typed",
+        anchor_content: "Code",
+        anchor: expect.objectContaining({ occ: 1, prefix: "Alpha Code Beta " }),
+      },
+      { id: "legacy-zero", anchor_content: "", occ: -1 },
+    ]);
+    await sendFromFrame(postMessage, {
+      type: BRIDGE_MSG.orphans,
+      ids: ["typed", "legacy-zero", "whole-page"],
+    });
+    await waitFor(() =>
+      expect(onAnnotationOrphansChange).toHaveBeenLastCalledWith(new Set(["typed", "legacy-zero"])),
+    );
+  });
+
   it("mints the panel view and loads the URL as the iframe src, never srcdoc", async () => {
     window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
     artifactResponses.set("/proxy/6767" + ENTRY_URL, new Response(ENTRY_BODY, { status: 200 }));
@@ -602,23 +645,24 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       ),
     );
 
-    // The second occurrence of the anchor only resolves against page2's source;
-    // against the entry's source findAnchorInSource would fall back to 0.
+    // The second occurrence belongs to the linked page's rendered document.
     await sendFromFrame(postMessage, {
       type: BRIDGE_MSG.selection,
       text: "page two",
       occ: 1,
+      prefix: "",
+      suffix: "",
       rect: { left: 0, top: 0, right: 1, bottom: 1 },
     });
     fireEvent.click(await screen.findByRole("button", { name: /add comment/i }));
 
-    const expectedStart = LINKED_SOURCE.lastIndexOf("page two");
-    expect(expectedStart).toBeGreaterThan(0);
-    expect(onSetActiveSelection).toHaveBeenCalledWith({
-      start_index: expectedStart,
-      end_index: expectedStart + "page two".length,
-      anchor_content: "page two",
-    });
+    expect(onSetActiveSelection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        start_index: 0,
+        end_index: 0,
+        anchor_content: expect.stringContaining('"text":"page two","occ":1'),
+      }),
+    );
   });
 
   it("re-fetches a linked page on a revisit and reports the new source", async () => {
@@ -687,6 +731,8 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       type: BRIDGE_MSG.selection,
       text: "page two",
       occ: 1,
+      prefix: "",
+      suffix: "",
       rect: { left: 0, top: 0, right: 1, bottom: 1 },
     });
 
@@ -716,17 +762,19 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       type: BRIDGE_MSG.selection,
       text: "page two",
       occ: 1,
+      prefix: "",
+      suffix: "",
       rect: { left: 0, top: 0, right: 1, bottom: 1 },
     });
     fireEvent.click(await screen.findByRole("button", { name: /add comment/i }));
 
-    const expectedStart = LINKED_SOURCE.lastIndexOf("page two");
-    expect(expectedStart).toBeGreaterThan(0);
-    expect(onSetActiveSelection).toHaveBeenCalledWith({
-      start_index: expectedStart,
-      end_index: expectedStart + "page two".length,
-      anchor_content: "page two",
-    });
+    expect(onSetActiveSelection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        start_index: 0,
+        end_index: 0,
+        anchor_content: expect.stringContaining('"text":"page two","occ":1'),
+      }),
+    );
   });
 
   it("clears the previous page's selection when a load replaces the document", async () => {
@@ -738,6 +786,8 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
       type: BRIDGE_MSG.selection,
       text: "entry",
       occ: 0,
+      prefix: "",
+      suffix: "",
       rect: { left: 0, top: 0, right: 1, bottom: 1 },
     });
     expect(await screen.findByRole("button", { name: /add comment/i })).toBeTruthy();
@@ -755,6 +805,8 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
         type: BRIDGE_MSG.selection,
         text: "entry",
         occ: 0,
+        prefix: "",
+        suffix: "",
         rect: { left: 0, top: 0, right: 1, bottom: 1 },
       },
       1,

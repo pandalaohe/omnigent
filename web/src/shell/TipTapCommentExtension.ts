@@ -1,7 +1,7 @@
 // ProseMirror Plugin + TipTap Extension for comment decorations.
 //
 // Decorations are used (not marks) so highlights never affect markdown serialisation
-// and remap automatically through editing transactions.
+// and revalidate rendered anchors through editing transactions.
 //
 // stateRef is closed over directly in createCommentDecorationExtension() rather
 // than passed through configure()/addOptions(): TipTap deep-merges options, which
@@ -15,6 +15,7 @@ import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { findPmRangeForComment } from "./TipTapEditorHelpers";
+import { isRenderedTextAnchor } from "./renderedTextAnchor";
 
 export const commentDecorationKey = new PluginKey<DecorationSet>("commentDecoration");
 
@@ -37,7 +38,8 @@ function buildDecorations(doc: ProseMirrorNode, state: CommentDecorationState): 
     if (!range) continue;
     const isActive =
       activeSelection?.start_index === comment.start_index &&
-      activeSelection?.end_index === comment.end_index;
+      activeSelection?.end_index === comment.end_index &&
+      activeSelection?.anchor_content === comment.anchor_content;
     decos.push(
       Decoration.inline(range.from, range.to, {
         class: isActive ? "md-comment md-comment-active" : "md-comment",
@@ -90,6 +92,19 @@ export function createCommentDecorationExtension(
                   stateRef.current.pendingRange = meta.pendingRange;
                 }
                 return buildDecorations(newState.doc, stateRef.current);
+              }
+              if (
+                tr.docChanged &&
+                stateRef.current?.comments.some((c) => isRenderedTextAnchor(c.anchor_content))
+              ) {
+                const current = stateRef.current;
+                if (current.pendingRange) {
+                  current.pendingRange = {
+                    from: tr.mapping.map(current.pendingRange.from),
+                    to: tr.mapping.map(current.pendingRange.to),
+                  };
+                }
+                return buildDecorations(newState.doc, current);
               }
               // Remap existing decorations through the transaction automatically.
               return decorations.map(tr.mapping, newState.doc);

@@ -59,6 +59,7 @@ export const BRIDGE_MSG = {
   selectionCleared: "omni:selectionCleared",
   /** iframe → parent: a panel-mode link that names a workspace file. */
   openPath: "omni:openPath",
+  orphans: "omni:orphans",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -77,6 +78,9 @@ export interface BridgeSelection {
   /** Which occurrence (0-based, document order) of `text` was selected, so the
    * parent anchors to the copy the user picked rather than the first match. */
   occ: number;
+  prefix: string;
+  suffix: string;
+  selector?: string;
   rect: BridgeRect;
 }
 
@@ -108,9 +112,19 @@ export interface BridgeReady {
   pathname?: string;
 }
 
+export interface BridgeOrphans {
+  type: typeof BRIDGE_MSG.orphans;
+  ids: string[];
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
-  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared | BridgeOpenPath;
+  | BridgeReady
+  | BridgeSelection
+  | BridgeCommentClick
+  | BridgeSelectionCleared
+  | BridgeOpenPath
+  | BridgeOrphans;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -124,9 +138,13 @@ function isRect(r: unknown): r is BridgeRect {
   const o = r as Record<string, unknown>;
   return (
     typeof o.left === "number" &&
+    Number.isFinite(o.left) &&
     typeof o.top === "number" &&
+    Number.isFinite(o.top) &&
     typeof o.right === "number" &&
-    typeof o.bottom === "number"
+    Number.isFinite(o.right) &&
+    typeof o.bottom === "number" &&
+    Number.isFinite(o.bottom)
   );
 }
 
@@ -149,11 +167,29 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
         ? { type: BRIDGE_MSG.ready, pathname: d.pathname }
         : { type: BRIDGE_MSG.ready };
     case BRIDGE_MSG.selection:
-      if (typeof d.text === "string" && d.text.trim() !== "" && isRect(d.rect)) {
-        // occ is optional for resilience against older frames — default to the
-        // first occurrence, which is the pre-occurrence behavior.
-        const occ = typeof d.occ === "number" && d.occ >= 0 ? d.occ : 0;
-        return { type: BRIDGE_MSG.selection, text: d.text, occ, rect: d.rect };
+      if (
+        typeof d.text === "string" &&
+        !!d.text.trim() &&
+        d.text.length <= 16000 &&
+        Number.isSafeInteger(d.occ) &&
+        (d.occ as number) >= 0 &&
+        typeof d.prefix === "string" &&
+        d.prefix.length <= 32 &&
+        typeof d.suffix === "string" &&
+        d.suffix.length <= 32 &&
+        (d.selector === undefined ||
+          (typeof d.selector === "string" && d.selector.length > 0 && d.selector.length <= 700)) &&
+        isRect(d.rect)
+      ) {
+        return {
+          type: BRIDGE_MSG.selection,
+          text: d.text,
+          occ: d.occ as number,
+          prefix: d.prefix,
+          suffix: d.suffix,
+          ...(d.selector ? { selector: d.selector } : {}),
+          rect: d.rect,
+        };
       }
       return null;
     case BRIDGE_MSG.commentClick:
@@ -173,13 +209,22 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
         return { type: BRIDGE_MSG.openPath, href: d.href, base: d.base };
       }
       return null;
+    case BRIDGE_MSG.orphans:
+      if (
+        Array.isArray(d.ids) &&
+        d.ids.length <= 1000 &&
+        d.ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 100)
+      ) {
+        return { type: BRIDGE_MSG.orphans, ids: d.ids };
+      }
+      return null;
     default:
       return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Source-offset resolution (parent side)
+// Historical source-offset occurrence recovery
 // ---------------------------------------------------------------------------
 
 function escapeRegExp(s: string): string {
@@ -226,49 +271,6 @@ function inNonRendered(index: number, ranges: [number, number][]): boolean {
     if (index < end) return true;
   }
   return false;
-}
-
-/**
- * Locate `anchor` (text selected in the *rendered* HTML) within the raw HTML
- * `source`, returning absolute character offsets so the comment anchors to the
- * source the agent actually edits — consistent with how Markdown/code comments
- * store offsets.
- *
- * Rendered prose may collapse whitespace the source spells out (newlines,
- * indentation between tags), so matching is always whitespace-tolerant — never
- * a plain `indexOf`. `occurrence` picks which copy (document order, counting
- * only *rendered* regions) the caller selected; matches inside non-rendered
- * source (tags/attributes, comments, `<script>`/`<style>`/`<title>`) are skipped
- * so this Nth match lines up with the Nth match the in-frame bridge counts.
- *
- * Returns `null` when the anchor can't be located at all; callers should still
- * keep `anchor_content`, which is the agent's primary locator (offsets are a
- * hint), and let `classifyAndRemapComments` re-anchor on a later load.
- */
-export function findAnchorInSource(
-  source: string,
-  anchor: string,
-  occurrence = 0,
-): { start_index: number; end_index: number } | null {
-  const trimmed = anchor.trim();
-  if (!trimmed) return null;
-
-  const skip = nonRenderedRanges(source);
-  try {
-    const re = new RegExp(anchorPattern(trimmed), "g");
-    let i = 0;
-    for (const m of source.matchAll(re)) {
-      if (m.index === undefined) break;
-      if (inNonRendered(m.index, skip)) continue;
-      if (i === occurrence) {
-        return { start_index: m.index, end_index: m.index + m[0].length };
-      }
-      i += 1;
-    }
-  } catch {
-    // Pathological anchor produced an invalid pattern — fall through to null.
-  }
-  return null;
 }
 
 /**

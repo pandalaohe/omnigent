@@ -10,6 +10,7 @@ import {
   isPdfAnchor,
 } from "./pdfCommentHelpers";
 import type { Comment } from "@/hooks/useComments";
+import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
 
 function makeComment(overrides: Partial<Comment> = {}): Comment {
   return {
@@ -48,6 +49,18 @@ describe("encodePdfAnchor / decodePdfAnchor", () => {
 });
 
 describe("displayAnchorContent", () => {
+  it("shows the quote for rendered anchors and a notice for malformed typed data", () => {
+    const typed = encodeRenderedTextAnchor({
+      v: 1,
+      kind: "html",
+      text: "Beta Code",
+      occ: 1,
+      prefix: "Alpha Code ",
+      suffix: "",
+    })!;
+    expect(displayAnchorContent(typed)).toBe("Beta Code");
+    expect(displayAnchorContent("__text__invalid")).toBe("Text location unavailable");
+  });
   it("returns the selected text for PDF anchors", () => {
     const sel = encodePdfAnchor(1, [{ x: 0, y: 0, w: 1, h: 0.1 }], "Hello");
     expect(displayAnchorContent(sel.anchor_content)).toBe("Hello");

@@ -121,6 +121,7 @@ import { draftSelection, getCommentDraft } from "./commentDrafts";
 import { useScrollRestore } from "./useScrollRestore";
 import { isElementAnchor } from "./annotationAnchor";
 import { isPdfAnchor } from "./pdfCommentHelpers";
+import { isRenderedTextAnchor } from "./renderedTextAnchor";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
 // actually shown.
@@ -160,6 +161,12 @@ export function classifyAndRemapComments(
       open.push(c);
       continue;
     }
+    // A historical rendered HTML selection may have failed source lookup and
+    // saved 0–0. Its raw quote cannot safely be remapped into script text.
+    if (c.start_index === 0 && c.end_index === 0) {
+      open.push(c);
+      continue;
+    }
     // PDF anchors store geometry in anchor_content; byte-offset remapping does
     // not apply to binary PDF content.
     if (isPdfAnchor(c.anchor_content)) {
@@ -169,6 +176,10 @@ export function classifyAndRemapComments(
     // Element anchors carry page geometry instead of a source range; the frame
     // resolves them, so stored offsets stand as-is.
     if (isElementAnchor(c.anchor_content)) {
+      open.push(c);
+      continue;
+    }
+    if (isRenderedTextAnchor(c.anchor_content)) {
       open.push(c);
       continue;
     }
@@ -736,7 +747,10 @@ function FileViewerBody({
     let nextSelection = selection;
     if (selection && selection.comment_id == null) {
       const comment = openComments.find(
-        (c) => c.start_index === selection.start_index && c.end_index === selection.end_index,
+        (c) =>
+          c.start_index === selection.start_index &&
+          c.end_index === selection.end_index &&
+          c.anchor_content === selection.anchor_content,
       );
       if (comment) nextSelection = { ...selection, comment_id: comment.id };
     }
@@ -1864,8 +1878,12 @@ function FileViewerBody({
                   hideWhitespace={hideWhitespace}
                   wrapLines={wrapLines}
                   conversationId={conversationId}
-                  comments={openComments}
-                  activeSelection={activeSelection}
+                  comments={openComments.filter((c) => !isRenderedTextAnchor(c.anchor_content))}
+                  activeSelection={
+                    activeSelection && !isRenderedTextAnchor(activeSelection.anchor_content)
+                      ? activeSelection
+                      : null
+                  }
                   onSetActiveSelection={handleSetActiveSelection}
                   pendingBodyRef={pendingBodyRef}
                   searchOpen={searchOpen}
@@ -1968,7 +1986,8 @@ function FileViewerBody({
                 (activeSelection?.comment_id === deleted.id ||
                   (activeSelection?.comment_id == null &&
                     activeSelection?.start_index === deleted.start_index &&
-                    activeSelection?.end_index === deleted.end_index))
+                    activeSelection?.end_index === deleted.end_index &&
+                    activeSelection?.anchor_content === deleted.anchor_content))
               )
                 setActiveSelection(null);
             }}
