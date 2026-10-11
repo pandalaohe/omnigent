@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.db_models import SqlConversation, current_workspace_id
@@ -584,7 +585,7 @@ async def test_fallback_archive_stop_keeps_runner_shared_with_live_parent(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("archive_mode", ["delete_safe", "never", None])
+@pytest.mark.parametrize("archive_mode", ["delete_safe", "never", None, "one_time"])
 async def test_coordinator_deletes_worktree_once_after_every_target_completes(
     db_uri: str,
     archive_mode: str | None,
@@ -616,6 +617,7 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         archived=True,
         close_cli_on_archive=True,
         delete_worktree=True,
+        worktree_archive_mode="yellow_too" if archive_mode == "one_time" else None,
     )
     assert archived is not None
     assert archived.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(archived.archive_revision)
@@ -634,7 +636,7 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         preferences.patch_namespace(
             collab_owner_for(archived, conversations, None),
             "worktree_archive",
-            {"mode": archive_mode},
+            {"mode": "never" if archive_mode == "one_time" else archive_mode},
         )
     coordinator.set_archive_preferences(preferences, None)
     remove = AsyncMock(return_value=True)
@@ -658,7 +660,7 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         for conversation in (root, child):
             _sessions_common._intentional_stop_sessions.pop(conversation.id, None)
 
-    if archive_mode != "never":
+    if archive_mode not in ("never", None):
         remove.assert_awaited_once()
         kwargs = remove.await_args.kwargs
         assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/root"
@@ -666,12 +668,73 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
         assert kwargs["delete_branch"] is False
         assert kwargs["exclude_conversation_id"] == root.id
         assert kwargs["safe_only"] is True
+        assert kwargs["archive_mode"] == (
+            "yellow_too" if archive_mode == "one_time" else "green_only"
+        )
         assert kwargs["expected_archive_revision"] == archived.archive_revision
     else:
         remove.assert_not_awaited()
     settled = conversations.get_conversation(root.id)
     assert settled is not None
     assert settled.archive_close_completed_revision == settled.archive_revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["database", "malformed"])
+async def test_recorded_archive_tier_does_not_cleanup_without_valid_saved_paths(
+    db_uri: str, failure: str
+) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = conversations.create_conversation(
+        host_id="a4b2c3d4e5f61234567890abcdef0123",
+        workspace="/opt/work/sample-app/recovery",
+        git_branch="feature/recovery",
+    )
+    archived = conversations.update_conversation(
+        root.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="yellow_too",
+    )
+    assert archived is not None
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "worktree_archive",
+        {"mode": "yellow_too", "ask_before_archive": True, "rebuildable_paths": []},
+    )
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=conversations,
+        host_store=None,
+        host_registry=_Registry(),
+        runner_router=None,
+        intent_store=CliReleaseIntentStore(db_uri),
+    )
+    coordinator.set_archive_preferences(preferences, None)
+    broken = (
+        OperationalError("read", {}, Exception("database unavailable"))
+        if failure == "database"
+        else {"settings": {"worktree_archive": {"mode": "yellow_too"}}}
+    )
+    removal = AsyncMock(return_value=True)
+    read_patch = (
+        patch.object(preferences, "get", side_effect=broken)
+        if isinstance(broken, Exception)
+        else patch.object(preferences, "get", return_value=broken)
+    )
+    with (
+        read_patch,
+        patch(
+            "omnigent.server.routes._sessions.helpers.remove_archived_worktree_best_effort",
+            removal,
+        ),
+    ):
+        await coordinator._remove_archived_worktree(root.id, archived.archive_revision)
+    removal.assert_not_awaited()
 
 
 def test_host_pool_selection_lease_is_single_owner_without_touching_liveness(

@@ -47,6 +47,7 @@ from omnigent.server.user_preferences_store import (
     read_collab_settings,
     read_keep_warm_settings,
     read_worktree_archive_mode,
+    read_worktree_archive_preference_for_cleanup,
     read_worktree_path_template,
     touch_runner_log_warning_dismissals,
     validate_preferences_envelope,
@@ -130,30 +131,51 @@ def test_store_preserves_uninitialized_vs_initialized_defaults(db_uri: str) -> N
 
 def test_worktree_archive_preference_validates_and_migrates_once(db_uri: str) -> None:
     store = SqlAlchemyUserPreferencesStore(db_uri)
-    assert read_worktree_archive_mode(store, "alice@example.com") == "delete_safe"
-    assert read_worktree_archive_mode(store, None) == "delete_safe"
+    assert read_worktree_archive_mode(store, "alice@example.com") == "never"
+    assert read_worktree_archive_mode(store, None) == "never"
     assert read_worktree_archive_mode(None, "alice@example.com") == "never"
     store.patch_namespace(RESERVED_USER_LOCAL, "worktree_archive", {"mode": "never"})
     assert read_worktree_archive_mode(store, None) == "never"
     store.patch_namespace("bob@example.com", "usage_context", {"visible": True})
-    assert read_worktree_archive_mode(store, "bob@example.com") == "delete_safe"
-    assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "delete_safe"}
-    assert store.migrate_worktree_archive("alice@example.com", False) == {"mode": "delete_safe"}
-    assert read_worktree_archive_mode(store, "alice@example.com") == "delete_safe"
-    assert read_worktree_archive_mode(store, "bob@example.com") == "delete_safe"
+    assert read_worktree_archive_mode(store, "bob@example.com") == "never"
+    assert store.migrate_worktree_archive("alice@example.com", True)["mode"] == "green_only"
+    assert store.migrate_worktree_archive("alice@example.com", False)["mode"] == "green_only"
+    assert read_worktree_archive_mode(store, "alice@example.com") == "green_only"
+    assert read_worktree_archive_mode(store, "bob@example.com") == "never"
     with pytest.raises(UserPreferencesValidationError):
         store.patch_namespace("alice@example.com", "worktree_archive", {"mode": "force"})
     with pytest.raises(UserPreferencesValidationError):
         store.patch_namespace("alice@example.com", "worktree_archive", {"extra": True})
+    for incomplete_mode in ("green_only", "yellow_too"):
+        with pytest.raises(UserPreferencesValidationError):
+            store.patch_namespace(
+                "alice@example.com", "worktree_archive", {"mode": incomplete_mode}
+            )
+    for invalid_path in ("/tmp/cache/", "../cache/", ".git/objects/", "./", "*"):
+        with pytest.raises(UserPreferencesValidationError):
+            store.patch_namespace(
+                "alice@example.com",
+                "worktree_archive",
+                {
+                    "mode": "yellow_too",
+                    "ask_before_archive": True,
+                    "rebuildable_paths": [invalid_path],
+                },
+            )
     store.patch_namespace("alice@example.com", "worktree_archive", {"mode": "never"})
-    assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "never"}
+    retained = store.migrate_worktree_archive("alice@example.com", True)
+    assert retained["mode"] == "never"
+    assert retained["ask_before_archive"] is False
     with workspace_scope(101):
-        assert store.migrate_worktree_archive("alice@example.com", True) == {"mode": "delete_safe"}
+        assert store.migrate_worktree_archive("alice@example.com", True)["mode"] == "green_only"
     assert read_worktree_archive_mode(store, "alice@example.com") == "never"
 
 
 def test_worktree_archive_reader_keeps_invalid_data_and_read_errors_safe(db_uri: str) -> None:
     store = SqlAlchemyUserPreferencesStore(db_uri)
+    unset = read_worktree_archive_preference_for_cleanup(store, "new@example.com")
+    assert unset is not None and unset["mode"] == "never"
+    assert read_worktree_archive_preference_for_cleanup(None, "new@example.com") is None
     with Session(get_or_create_engine(db_uri)) as session:
         session.add(
             SqlPreference(
@@ -165,6 +187,7 @@ def test_worktree_archive_reader_keeps_invalid_data_and_read_errors_safe(db_uri:
         )
         session.commit()
     assert read_worktree_archive_mode(store, "corrupt@example.com") == "never"
+    assert read_worktree_archive_preference_for_cleanup(store, "corrupt@example.com") is None
     with pytest.raises(UserPreferencesValidationError):
         store.migrate_worktree_archive("corrupt@example.com", True)
     assert read_worktree_archive_mode(store, "corrupt@example.com") == "never"
@@ -174,6 +197,9 @@ def test_worktree_archive_reader_keeps_invalid_data_and_read_errors_safe(db_uri:
             raise OperationalError("select", {}, Exception("database unavailable"))
 
     assert read_worktree_archive_mode(_RaisingStore(), "alice@example.com") == "never"
+    assert (
+        read_worktree_archive_preference_for_cleanup(_RaisingStore(), "alice@example.com") is None
+    )
 
 
 @pytest.mark.asyncio
@@ -189,19 +215,21 @@ async def test_worktree_archive_preference_api_is_scoped_and_first_value_wins(
             json={"delete_safe": True},
         )
         assert first.status_code == 200
-        assert first.json() == {"mode": "delete_safe"}
+        assert first.json()["mode"] == "green_only"
+        assert first.json()["ask_before_archive"] is True
         second = await client.post(
             "/v1/me/preferences/worktree_archive/migrate",
             headers={"x-test-user": "alice@example.com"},
             json={"delete_safe": False},
         )
-        assert second.json() == {"mode": "delete_safe"}
+        assert second.json() == first.json()
         other = await client.post(
             "/v1/me/preferences/worktree_archive/migrate",
             headers={"x-test-user": "bob@example.com"},
             json={"delete_safe": False},
         )
-        assert other.json() == {"mode": "never"}
+        assert other.json()["mode"] == "never"
+        assert other.json()["ask_before_archive"] is False
         invalid = await client.patch(
             "/v1/me/preferences/worktree_archive",
             headers={"x-test-user": "alice@example.com"},

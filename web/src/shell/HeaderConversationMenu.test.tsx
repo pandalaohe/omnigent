@@ -32,6 +32,7 @@ const mocks = vi.hoisted(() => ({
   moveToProject: vi.fn(),
   archive: vi.fn(),
   archivePreference: vi.fn(),
+  saveArchivePreference: vi.fn(),
   worktreeStatus: vi.fn(),
   deleteConversation: vi.fn(),
   stopSession: vi.fn(),
@@ -51,8 +52,12 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
 vi.mock("@/lib/archiveWorktreePreferences", () => ({
   fetchArchiveWorktreePreference: mocks.archivePreference,
+  saveArchiveWorktreePreference: mocks.saveArchivePreference,
 }));
-vi.mock("@/hooks/useWorktreeStatus", () => ({ fetchSessionWorktreeStatus: mocks.worktreeStatus }));
+vi.mock("@/hooks/useWorktreeStatus", () => ({
+  fetchSessionWorktreeStatus: mocks.worktreeStatus,
+  useWorktreeStatus: () => ({ data: null, supported: false, isError: false, isFetching: false }),
+}));
 
 // The post-archive confirmation is upstream's Undo pill, driven by module state
 // plus the app-level Toaster. Its own rendering is covered by
@@ -195,7 +200,12 @@ beforeEach(() => {
   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
   mocks.deleteComments = [];
   vi.clearAllMocks();
-  mocks.archivePreference.mockResolvedValue("never");
+  mocks.archivePreference.mockResolvedValue({
+    mode: "never",
+    ask_before_archive: false,
+    rebuildable_paths: ["node_modules/"],
+  });
+  mocks.saveArchivePreference.mockResolvedValue(undefined);
   mocks.worktreeStatus.mockResolvedValue({
     own: {
       state: "dirty",
@@ -395,10 +405,22 @@ describe("HeaderConversationMenu", () => {
       "Add to project",
       "Stop session",
       "Archive",
+      "Archive and keep worktree",
+      "Worktree details",
       "Delete",
     ]);
     expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
+  });
+
+  it("opens worktree details for a session without a recorded branch", async () => {
+    renderMenu({ conversation: { ...CONVERSATION, git_branch: null, worktree: null } });
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Worktree details" }));
+    expect(await screen.findByTestId("worktree-details-dialog")).toBeInTheDocument();
+    expect(
+      screen.getByText("Worktree details are unavailable on this server."),
+    ).toBeInTheDocument();
   });
 
   it("opens from the keyboard and focuses the first action", () => {
@@ -500,18 +522,23 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("runs archive and delete actions for the active session", async () => {
-    mocks.archivePreference.mockResolvedValue("delete_safe");
+    mocks.archivePreference.mockResolvedValue({
+      mode: "green_only",
+      ask_before_archive: true,
+      rebuildable_paths: ["node_modules/"],
+    });
     const view = renderMenu();
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // The warning names the unsafe tree before archiving it without deletion.
+    // The one-time choice is required before the archive request.
     expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: "Archive only" }));
+    fireEvent.click(await screen.findByTestId("archive-worktree-confirm"));
     expect(mocks.archive).toHaveBeenCalledWith({
       id: "conv-1",
       archived: true,
-      keepWorktree: true,
+      keepWorktree: false,
+      worktreeArchiveMode: "green_only",
     });
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
@@ -560,17 +587,22 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("archives from the distinctly labelled mobile action, then returns home", async () => {
-    mocks.archivePreference.mockResolvedValue("delete_safe");
+    mocks.archivePreference.mockResolvedValue({
+      mode: "green_only",
+      ask_before_archive: true,
+      rebuildable_paths: ["node_modules/"],
+    });
     mocks.isMobile = true;
     renderMenu();
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive this session" }));
     expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("button", { name: "Archive only" }));
+    fireEvent.click(await screen.findByTestId("archive-worktree-confirm"));
     expect(mocks.archive).toHaveBeenCalledWith({
       id: "conv-1",
       archived: true,
-      keepWorktree: true,
+      keepWorktree: false,
+      worktreeArchiveMode: "green_only",
     });
     await waitFor(() => {
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/");
@@ -811,6 +843,8 @@ describe("HeaderConversationMenu", () => {
       "Add to project",
       "Stop session",
       "Archive this session",
+      "Archive and keep worktree",
+      "Worktree details",
       "Delete",
     ]);
   });
@@ -837,6 +871,8 @@ describe("HeaderConversationMenu", () => {
       "Files",
       "Stop session",
       "Archive this session",
+      "Archive and keep worktree",
+      "Worktree details",
       "Delete",
     ]);
   });

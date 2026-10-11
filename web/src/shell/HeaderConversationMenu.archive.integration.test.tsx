@@ -6,6 +6,8 @@ import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -103,25 +105,33 @@ interface HarnessProps {
   client: QueryClient;
   conversation?: Conversation;
   showMenu?: boolean;
+  worktreeStatus?: boolean;
 }
 
-function harness({ client, conversation = CONVERSATION, showMenu = true }: HarnessProps) {
+function harness({
+  client,
+  conversation = CONVERSATION,
+  showMenu = true,
+  worktreeStatus = false,
+}: HarnessProps) {
   return (
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[`/c/${CONVERSATION.id}`]}>
-        {showMenu && (
-          <HeaderConversationMenu
-            conversation={conversation}
-            currentProject={null}
-            canShare={false}
-            canFork={false}
-            onShare={() => {}}
-            onFork={() => {}}
-          />
-        )}
-        <NavigateElsewhere />
-        <LocationProbe />
-      </MemoryRouter>
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, worktree_status: worktreeStatus }}>
+        <MemoryRouter initialEntries={[`/c/${CONVERSATION.id}`]}>
+          {showMenu && (
+            <HeaderConversationMenu
+              conversation={conversation}
+              currentProject={null}
+              canShare={false}
+              canFork={false}
+              onShare={() => {}}
+              onFork={() => {}}
+            />
+          )}
+          <NavigateElsewhere />
+          <LocationProbe />
+        </MemoryRouter>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -181,6 +191,7 @@ async function settleMutation(client: QueryClient) {
 beforeEach(() => {
   mocks.fetch.mockReset();
   mocks.showToast.mockReset();
+  mocks.showArchiveUndoToast.mockReset();
   vi.stubGlobal("fetch", mocks.fetch);
   setOmnigentHostConfig({
     serverId: "test-server",
@@ -195,6 +206,63 @@ afterEach(() => {
 });
 
 describe("HeaderConversationMenu archive integration", () => {
+  it("sends the selected one-time tier in PATCH without saving the preference", async () => {
+    mocks.fetch.mockImplementation(async (url: string) =>
+      url === "/v1/me"
+        ? response({
+            preferences: {
+              settings: {
+                worktree_archive: {
+                  mode: "green_only",
+                  ask_before_archive: true,
+                  rebuildable_paths: ["node_modules/"],
+                },
+              },
+            },
+          })
+        : response({ ...CONVERSATION, archived: true }),
+    );
+    const client = createClient();
+    seedConversation(client);
+    render(harness({ client, worktreeStatus: true }));
+
+    clickArchive();
+    await screen.findByTestId("archive-worktree-dialog");
+    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    expect(screen.getByTestId("archive-worktree-remember")).not.toBeChecked();
+    fireEvent.click(screen.getByTestId("archive-worktree-confirm"));
+
+    await waitFor(() =>
+      expect(mocks.fetch.mock.calls.some(([url]) => url === "/v1/sessions/conv-1")).toBe(true),
+    );
+    const [, patch] = mocks.fetch.mock.calls.find(([url]) => url === "/v1/sessions/conv-1") as [
+      string,
+      RequestInit,
+    ];
+    expect(JSON.parse(patch.body as string)).toEqual({
+      archived: true,
+      worktree_archive_mode: "yellow_too",
+    });
+    expect(
+      mocks.fetch.mock.calls.some(([url]) => url === "/v1/me/preferences/worktree_archive"),
+    ).toBe(false);
+  });
+
+  it("archives once while keeping the worktree without opening the preference prompt", async () => {
+    mocks.fetch.mockResolvedValue(response({ ...CONVERSATION, archived: true }));
+    const client = createClient();
+    seedConversation(client);
+    render(harness({ client, worktreeStatus: true }));
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive and keep worktree" }));
+
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    const [, init] = mocks.fetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ archived: true, keep_worktree: true });
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+  });
+
   it("sends the archive PATCH once, waits for success, confirms it, and returns home", async () => {
     const pending = deferred<Response>();
     mocks.fetch.mockReturnValueOnce(pending.promise);

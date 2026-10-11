@@ -327,6 +327,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     PINNED_LABEL_KEY,
@@ -10536,6 +10537,8 @@ async def remove_archived_worktree_best_effort(
     project_host_binding_store: Any,
     conversation_store: ConversationStore,
     exclude_conversation_id: str,
+    archive_mode: str = "green_only",
+    rebuildable_paths: list[str] | None = None,
 ) -> bool:
     """
     Remove an archived session's disposable worktree, best-effort.
@@ -10592,6 +10595,8 @@ async def remove_archived_worktree_best_effort(
             conversation_store=conversation_store,
             exclude_conversation_id=exclude_conversation_id,
             safe_only=True,
+            archive_mode=archive_mode,
+            rebuildable_paths=rebuildable_paths,
             project_host_binding_store=project_host_binding_store,
             expected_archive_revision=conv.archive_revision,
         )
@@ -10622,6 +10627,8 @@ async def _remove_session_worktree_best_effort(
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
     safe_only: bool = False,
+    archive_mode: str | None = None,
+    rebuildable_paths: list[str] | None = None,
     project_host_binding_store: Any = None,
     expected_archive_revision: int | None = None,
     _admission_lease_held: bool = False,
@@ -10673,8 +10680,11 @@ async def _remove_session_worktree_best_effort(
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
     from omnigent.stores.conversation_store import (
+        ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+        ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
         ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
         ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+        ARCHIVE_WORKTREE_MODE_LABEL_KEY,
         worktree_admission_fingerprint,
     )
 
@@ -10705,6 +10715,17 @@ async def _remove_session_worktree_best_effort(
             and (current.worktree or current.workspace) == recorded_path
             and current.git_branch == branch
             and current.labels.get(WORKTREE_ROOT_LABEL_KEY) == expected_root_fingerprint
+            and (
+                archive_mode is None
+                or (
+                    current.labels.get(ARCHIVE_DELETE_WORKTREE_LABEL_KEY)
+                    == str(expected_archive_revision)
+                    and current.labels.get(ARCHIVE_KEEP_WORKTREE_LABEL_KEY)
+                    != str(expected_archive_revision)
+                    and current.labels.get(ARCHIVE_WORKTREE_MODE_LABEL_KEY)
+                    in (None, f"{expected_archive_revision}:{archive_mode}")
+                )
+            )
         )
 
     if safe_only and not _admission_lease_held:
@@ -10732,6 +10753,8 @@ async def _remove_session_worktree_best_effort(
                     fail_if_unavailable=fail_if_unavailable,
                     expected_root_fingerprint=expected_root_fingerprint,
                     safe_only=True,
+                    archive_mode=archive_mode,
+                    rebuildable_paths=rebuildable_paths,
                     project_host_binding_store=project_host_binding_store,
                     expected_archive_revision=expected_archive_revision,
                     _admission_lease_held=True,
@@ -10893,6 +10916,8 @@ async def _remove_session_worktree_best_effort(
                 branch=branch,
                 delete_branch=delete_branch,
                 safe_only=safe_only,
+                archive_mode=archive_mode,
+                rebuildable_paths=rebuildable_paths,
             )
         except WorktreeHostRefusalError:
             if fence_set:
@@ -11431,6 +11456,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
 
     for key in (
         ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
+        ARCHIVE_WORKTREE_MODE_LABEL_KEY,
         ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
         ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
     ):
@@ -11951,6 +11977,7 @@ def _persist_stored_session_bundle(
     inference_model: str | None = None,
     created_by: str | None = None,
     worktree: str | None = None,
+    git_branch: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -11995,6 +12022,7 @@ def _persist_stored_session_bundle(
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
             worktree=worktree,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -12055,6 +12083,8 @@ def _persist_session_for_uploaded_agent(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    worktree: str | None = None,
+    git_branch: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -12077,6 +12107,8 @@ def _persist_session_for_uploaded_agent(
             runner_id=runner_id,
             host_id=metadata.host_id,
             workspace=metadata.workspace,
+            worktree=worktree,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,

@@ -3945,6 +3945,8 @@ class HostProcess:
                     branch=frame.branch,
                     delete_branch=frame.delete_branch,
                     safe_only=frame.safe_only,
+                    archive_mode=frame.archive_mode,
+                    rebuildable_paths=frame.rebuildable_paths,
                 ),
                 worktree_operation=True,
             )

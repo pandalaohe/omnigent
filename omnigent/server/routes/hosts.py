@@ -1471,7 +1471,11 @@ def create_hosts_router(
             )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             try:
-                if worktree is not None or (body.git is not None and body.git.existing_worktree):
+                if (
+                    worktree is not None
+                    or worktree_root is not None
+                    or (body.git is not None and body.git.existing_worktree)
+                ):
                     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
                     previous_root = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
@@ -1632,9 +1636,20 @@ def create_hosts_router(
                         raise
                     git_branch = worktree.branch
 
+            if body.git is None:
+                from omnigent.server.routes._host_worktree import existing_linked_worktree
+
+                bound_worktree = await existing_linked_worktree(
+                    host_registry=host_registry,
+                    host_id=host_id,
+                    workspace=workspace,
+                )
+                if bound_worktree is not None:
+                    worktree_root, git_branch = bound_worktree
+
             _, placed_worktree = _place_project_session(
                 target=workspace,
-                git_used=body.git is not None,
+                git_used=body.git is not None or git_branch is not None,
                 worktree_root=worktree_root,
             )
 
@@ -1685,7 +1700,7 @@ def create_hosts_router(
 
             async def persist_binding() -> None:
                 """Record cleanup identity before making the new binding visible."""
-                if worktree is not None:
+                if worktree is not None or worktree_root is not None:
                     from omnigent.server.routes._host_worktree import (
                         WORKTREE_ROOT_LABEL_KEY,
                         worktree_root_fingerprint,
@@ -1694,7 +1709,10 @@ def create_hosts_router(
                     # Fingerprint the canonical root the session records, not
                     # the raw host path: delete cleanup recovers the root from
                     # recorded ancestors and misses when the two differ.
-                    root = worktree_root or worktree.worktree_path
+                    root = worktree_root
+                    if root is None:
+                        assert worktree is not None
+                        root = worktree.worktree_path
                     await asyncio.to_thread(
                         conversation_store.set_labels,
                         body.session_id,

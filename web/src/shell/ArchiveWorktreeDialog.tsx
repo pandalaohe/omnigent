@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { ArchiveWorktreeTierChoices } from "@/components/ArchiveWorktreeTierChoices";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -9,24 +11,25 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
-import { fetchSessionWorktreeStatus, type SessionWorktreeStatus } from "@/hooks/useWorktreeStatus";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { fetchArchiveWorktreePreference } from "@/lib/archiveWorktreePreferences";
+import {
+  fetchArchiveWorktreePreference,
+  saveArchiveWorktreePreference,
+  type ArchiveWorktreeMode,
+  type ArchiveWorktreePreference,
+} from "@/lib/archiveWorktreePreferences";
 import { getOmnigentHostGeneration } from "@/lib/host";
 
-/** Explicit keep overrides the server policy for the selected unsafe sessions. */
-type ProceedFn = (keepWorktreeIds: ReadonlySet<string>) => void;
-interface Warning {
-  id: string;
-  title: string;
-  own: SessionWorktreeStatus["own"] | null;
-}
+type ProceedFn = (keepWorktreeIds: ReadonlySet<string>, mode?: ArchiveWorktreeMode) => void;
 interface PendingPrompt {
-  warnings: Warning[];
-  proceed: ProceedFn;
-  cancel?: () => void;
+  worktreeCount: number;
+  preference: ArchiveWorktreePreference;
+  active: () => boolean;
+  choose: (mode: ArchiveWorktreeMode) => void;
+  cancel: () => void;
 }
 
+/** Ask for a tier until the account preference disables archive prompts. */
 export function useArchiveWorktreePrompt(scope?: string): {
   requestArchive: (
     conversations: readonly Conversation[],
@@ -39,194 +42,201 @@ export function useArchiveWorktreePrompt(scope?: string): {
   const checking = useRef(false);
   const epoch = useRef(0);
   const mounted = useRef(false);
-  const cancelPrompt = useRef<(() => void) | null>(null);
-  const warningList = useRef<HTMLDivElement>(null);
+  const cancellation = useRef<(() => void) | null>(null);
+  const generation = getOmnigentHostGeneration();
   const serverInfo = useServerInfo();
   const supported = serverInfo !== "loading" && serverInfo.worktree_status === true;
   useEffect(() => {
-    const lifecycle = mounted;
-    const requestEpoch = epoch;
-    const cancellation = cancelPrompt;
+    epoch.current++;
     mounted.current = true;
     checking.current = false;
     setPending(null);
     return () => {
-      lifecycle.current = false;
-      requestEpoch.current++;
+      mounted.current = false;
       cancellation.current?.();
       cancellation.current = null;
     };
-  }, [scope]);
-  useEffect(() => {
-    if (!pending) return;
-    // Opening from a menu must wait for that menu's focus restoration.
-    const timer = setTimeout(
-      () =>
-        warningList.current?.parentElement
-          ?.querySelector<HTMLButtonElement>("[data-testid='archive-worktree-keep']")
-          ?.focus(),
-      0,
-    );
-    return () => clearTimeout(timer);
-  }, [pending]);
+  }, [scope, generation]);
 
   const requestArchive = useCallback(
     (conversations: readonly Conversation[], proceed: ProceedFn, cancel?: () => void) => {
-      if (checking.current || pending !== null) {
+      if (checking.current) {
         cancel?.();
         return;
       }
-      if (!supported || conversations.length === 0) {
+      const worktreeCount = conversations.filter(
+        (conversation) => conversation.git_branch != null || Boolean(conversation.worktree),
+      ).length;
+      if (!supported || worktreeCount === 0) {
         proceed(new Set());
         return;
       }
       checking.current = true;
-      cancelPrompt.current = cancel ?? null;
-      const request = epoch.current;
-      const generation = getOmnigentHostGeneration();
+      let cancelled = false;
+      const cancelRequest = () => {
+        if (!cancelled) {
+          cancelled = true;
+          cancel?.();
+        }
+      };
+      cancellation.current = cancelRequest;
+      const request = ++epoch.current;
+      const hostGeneration = getOmnigentHostGeneration();
       const active = () =>
-        mounted.current && epoch.current === request && getOmnigentHostGeneration() === generation;
+        mounted.current &&
+        epoch.current === request &&
+        getOmnigentHostGeneration() === hostGeneration;
+      const finish = () => {
+        checking.current = false;
+        cancellation.current = null;
+        setPending(null);
+      };
       void (async () => {
-        let prompted = false;
         try {
-          // Read afresh so another device's preference applies to this archive.
-          const mode = await fetchArchiveWorktreePreference();
+          const preference = await fetchArchiveWorktreePreference();
           if (!active()) {
-            cancel?.();
+            cancelRequest();
             return;
           }
-          if (mode === "never") {
+          if (!preference.ask_before_archive) {
+            finish();
             proceed(new Set());
             return;
           }
-          const warnings = (
-            await Promise.all(
-              conversations.map(async (conversation): Promise<Warning | null> => {
-                let own: SessionWorktreeStatus["own"] | null = null;
-                try {
-                  own = (await fetchSessionWorktreeStatus(conversation.id, true)).own;
-                } catch {
-                  // A failed read is not proof that a folder is clean.
-                }
-                if (own && ["clean", "none", "removed"].includes(own.state)) return null;
-                return {
-                  id: conversation.id,
-                  title: conversation.title || "Untitled session",
-                  own,
-                };
-              }),
-            )
-          ).filter((warning): warning is Warning => warning !== null);
-          if (!active()) {
-            cancel?.();
-            return;
-          }
-          if (warnings.length === 0) proceed(new Set());
-          else {
-            prompted = true;
-            setPending({ warnings, proceed, cancel });
-          }
+          setPending({
+            worktreeCount,
+            preference,
+            active,
+            choose: (mode) => {
+              if (!active()) return;
+              finish();
+              proceed(new Set(), mode);
+            },
+            cancel: () => {
+              epoch.current++;
+              finish();
+              cancelRequest();
+            },
+          });
         } catch {
-          // No readable preference: archive conservatively, retaining every tree.
-          if (active()) proceed(new Set(conversations.map((conversation) => conversation.id)));
-          else cancel?.();
-        } finally {
-          if (epoch.current === request) checking.current = false;
-          if (!prompted && epoch.current === request) cancelPrompt.current = null;
+          if (active()) {
+            finish();
+            proceed(new Set(conversations.map((conversation) => conversation.id)));
+          } else cancelRequest();
         }
       })();
     },
-    [supported, pending],
+    [supported],
   );
 
-  return {
-    requestArchive,
-    dialog: (
-      <Dialog
-        open={pending !== null}
-        onOpenChange={(open) => {
-          if (!open) {
-            pending?.cancel?.();
-            cancelPrompt.current = null;
-            setPending(null);
-          }
+  return { requestArchive, dialog: pending ? <ArchiveWorktreeDialog pending={pending} /> : null };
+}
+
+function ArchiveWorktreeDialog({ pending }: { pending: PendingPrompt }) {
+  const [mode, setMode] = useState(pending.preference.mode);
+  const [remember, setRemember] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const checkboxId = useId();
+  const confirm = useRef<HTMLButtonElement>(null);
+  const choosing = useRef(false);
+  useEffect(() => {
+    // Wait for the opening menu's focus restoration.
+    const timer = setTimeout(() => confirm.current?.focus(), 0);
+    return () => clearTimeout(timer);
+  }, []);
+
+  async function choose() {
+    if (choosing.current || !pending.active()) return;
+    choosing.current = true;
+    setError(null);
+    setSaving(true);
+    try {
+      if (remember)
+        await saveArchiveWorktreePreference({
+          ...pending.preference,
+          mode,
+          ask_before_archive: false,
+        });
+      pending.choose(mode);
+    } catch (failure) {
+      if (pending.active())
+        setError(failure instanceof Error ? failure.message : "Saving archive preferences failed.");
+    } finally {
+      choosing.current = false;
+      if (pending.active()) setSaving(false);
+    }
+  }
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) pending.cancel();
+      }}
+    >
+      <DialogContent
+        className="sm:max-w-lg"
+        onClick={(event) => event.stopPropagation()}
+        data-testid="archive-worktree-dialog"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          confirm.current?.focus();
         }}
       >
-        {pending && (
-          <DialogContent
-            className="sm:max-w-lg"
-            onClick={(event) => event.stopPropagation()}
-            data-testid="archive-worktree-dialog"
-            onOpenAutoFocus={(event) => {
-              event.preventDefault();
-              if (event.target instanceof HTMLElement)
-                event.target
-                  .querySelector<HTMLButtonElement>("[data-testid='archive-worktree-keep']")
-                  ?.focus();
-            }}
-          >
-            <DialogHeader>
-              <DialogTitle>Keep these worktrees when archiving</DialogTitle>
-              <DialogDescription>
-                These worktrees cannot be safely deleted. Deleting a worktree would lose its
-                uncommitted and untracked files. Archive only keeps the files and branches.
-              </DialogDescription>
-            </DialogHeader>
-            <div ref={warningList} className="max-h-72 space-y-3 overflow-y-auto">
-              {pending.warnings.map(({ id, title, own }) => (
-                <div key={id} className="rounded-md border border-border p-3 text-ui">
-                  <p className="font-medium">{title}</p>
-                  {own?.path && (
-                    <p className="break-all text-sm text-muted-foreground">{own.path}</p>
-                  )}
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {own?.reason || "Worktree state could not be checked."}
-                  </p>
-                  {!!own?.files.length && (
-                    <ul
-                      className="mt-2 space-y-1 text-sm"
-                      aria-label={`Files that would be lost in ${title}`}
-                    >
-                      {own.files.map((file) => (
-                        <li key={`${file.status}-${file.path}`} className="break-all font-mono">
-                          {file.status} {file.path}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              ))}
-            </div>
-            <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => {
-                  pending.cancel?.();
-                  cancelPrompt.current = null;
-                  setPending(null);
-                }}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                autoFocus
-                data-testid="archive-worktree-keep"
-                componentId="archive.worktree_prompt.archive_only"
-                onClick={() => {
-                  const current = pending;
-                  cancelPrompt.current = null;
-                  setPending(null);
-                  current.proceed(new Set(current.warnings.map((warning) => warning.id)));
-                }}
-              >
-                Archive only
-              </Button>
-            </DialogFooter>
-          </DialogContent>
+        <DialogHeader>
+          <DialogTitle>Worktrees on archive</DialogTitle>
+          <DialogDescription>
+            {pending.worktreeCount === 1
+              ? "This session has a git worktree."
+              : pending.worktreeCount + " of these sessions have git worktrees."}{" "}
+            Choose which worktree directories to remove. Branches are kept. Uncommitted source
+            changes are never deleted.
+          </DialogDescription>
+        </DialogHeader>
+        <fieldset disabled={saving} aria-label="Worktree deletion tier">
+          <ArchiveWorktreeTierChoices mode={mode} onChange={setMode} />
+        </fieldset>
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id={checkboxId}
+              checked={remember}
+              disabled={saving}
+              onCheckedChange={(checked) => setRemember(checked === true)}
+              data-testid="archive-worktree-remember"
+              componentId="archive.worktree_prompt.remember"
+            />
+            <label htmlFor={checkboxId} className="cursor-pointer text-ui">
+              Don't ask again
+            </label>
+          </div>
+          <p className="pl-6 text-sm text-muted-foreground">
+            Change the tier, rebuildable files, or Ask before archiving in Settings › Git.
+          </p>
+        </div>
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
         )}
-      </Dialog>
-    ),
-  };
+        <DialogFooter className="border-t-0 bg-transparent">
+          <Button type="button" variant="ghost" onClick={pending.cancel}>
+            Cancel
+          </Button>
+          <Button
+            ref={confirm}
+            type="button"
+            disabled={saving}
+            variant={mode === "never" ? "default" : "destructive"}
+            data-testid="archive-worktree-confirm"
+            componentId="archive.worktree_prompt.confirm"
+            onClick={() => void choose()}
+          >
+            {saving ? "Saving…" : "Archive"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
 }

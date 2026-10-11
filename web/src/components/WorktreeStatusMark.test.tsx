@@ -26,7 +26,12 @@ function show(state: string, overrides: Record<string, unknown> = {}) {
     supported: true,
     isError: false,
     isFetching: false,
-    data: { ...base, aggregate: { state, reason: null }, ...overrides },
+    data: {
+      ...base,
+      own: { ...base.own, state },
+      aggregate: { state, reason: null },
+      ...overrides,
+    },
   } as unknown as ReturnType<typeof useWorktreeStatus>);
   return render(
     <TooltipProvider delayDuration={0}>
@@ -44,8 +49,9 @@ afterEach(() => {
 
 describe("WorktreeStatusMark", () => {
   it.each([
-    ["clean", "Worktrees clean", "text-success"],
-    ["dirty", "Worktree has uncommitted changes", "text-warning"],
+    ["clean", "Clean or rebuildable worktree", "text-success"],
+    ["local", "Worktree has local files", "text-warning"],
+    ["dirty", "Worktree has uncommitted changes", "text-destructive"],
     ["unknown", "Worktree status unknown", "text-muted-foreground"],
     ["protected", "Worktree kept by rule", "text-foreground"],
     ["shared", "Worktree shared with another session", "text-foreground"],
@@ -92,19 +98,30 @@ describe("WorktreeStatusMark", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
-  it("renders mother's aggregate and names a blocking Past child on hover", async () => {
-    show("dirty", {
+  it("keeps mother's own state and lists only two relevant children without root duplication", async () => {
+    show("protected", {
+      own: { ...base.own, state: "protected", reason: "project entry" },
+      aggregate: { state: "dirty", reason: "descendant worktree needs attention" },
       blockers: [
+        { session_id: "one", title: "Mother", state: "protected", reason: "project entry" },
         { session_id: "past", title: "Past child", state: "dirty", reason: "Untracked notes" },
+        { session_id: "second", title: "Second child", state: "local", reason: "local files" },
+        { session_id: "third", title: "Third child", state: "unknown", reason: "offline" },
       ],
-      session_count: 2,
+      session_count: 4,
     });
-    const mark = screen.getByRole("img", { name: "Worktree has uncommitted changes" });
+    const mark = screen.getByRole("img", {
+      name: "Worktree kept by rule; 3 child worktrees need attention",
+    });
     fireEvent.focus(mark);
-    expect(await screen.findByText("This session: Worktrees clean")).toBeInTheDocument();
+    expect(await screen.findByText("Worktree kept by rule · kept on archive")).toBeInTheDocument();
     expect(
       await screen.findByText(/Past child: Worktree has uncommitted changes/),
-    ).toHaveTextContent("Untracked notes");
+    ).not.toHaveTextContent("Untracked notes");
+    expect(screen.getByText("1 more child worktrees")).toBeInTheDocument();
+    expect(screen.queryByText(/Third child/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Mother:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Branch:/)).not.toBeInTheDocument();
     expect(mark.closest("a")).toHaveAttribute("href", "/sessions/one");
   });
 
@@ -133,5 +150,14 @@ describe("WorktreeStatusMark", () => {
       </TooltipProvider>,
     );
     expect(screen.getByRole("img")).toHaveAttribute("data-worktree-state", "unknown");
+  });
+
+  it("still signals a child problem when the mother has no worktree", () => {
+    show("none", {
+      blockers: [{ session_id: "child", title: "Child", state: "dirty", reason: "source changes" }],
+    });
+    expect(
+      screen.getByRole("img", { name: "No worktree; 1 child worktrees need attention" }),
+    ).toBeInTheDocument();
   });
 });

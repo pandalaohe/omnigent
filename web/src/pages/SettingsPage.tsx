@@ -270,7 +270,11 @@ import {
   fetchWorktreePathTemplate,
   saveWorktreePathTemplate,
 } from "@/lib/worktreeLocationPreference";
-import { useArchiveWorktreePreference } from "@/lib/archiveWorktreePreferences";
+import {
+  DEFAULT_REBUILDABLE_PATHS,
+  useArchiveWorktreePreference,
+} from "@/lib/archiveWorktreePreferences";
+import { ArchiveWorktreeTierChoices } from "@/components/ArchiveWorktreeTierChoices";
 import {
   archivedAtSeconds,
   readRetentionDays,
@@ -1934,30 +1938,103 @@ function AlwaysUseWorktreeControl() {
 function DeleteWorktreesOnArchiveControl() {
   const { preference, save } = useArchiveWorktreePreference();
   const labelId = useId();
+  const [pathsDraft, setPathsDraft] = useState("");
+  const previousPaths = useRef<string | null>(null);
+  useEffect(() => {
+    if (!preference.data) return;
+    const next = preference.data.rebuildable_paths.join("\n");
+    const previous = previousPaths.current;
+    setPathsDraft((draft) => (previous === null || draft === previous ? next : draft));
+    previousPaths.current = next;
+  }, [preference.data]);
   const disabled = preference.isPending || preference.isError || save.isPending;
+  const current = preference.data;
+  const parsedPaths = pathsDraft
+    .split(/\r?\n/)
+    .map((path) => path.trim())
+    .filter(Boolean);
+  const pathsChanged = current && pathsDraft !== current.rebuildable_paths.join("\n");
   return (
-    <fieldset disabled={disabled} aria-describedby={`${labelId}-help`} className="space-y-2">
+    <fieldset
+      disabled={disabled}
+      aria-describedby={`${labelId}-help`}
+      className="min-w-0 space-y-4"
+    >
       <legend className="text-ui font-medium">Worktrees on archive</legend>
       <p id={`${labelId}-help`} className="text-ui text-muted-foreground">
-        Safe worktrees have no uncommitted or untracked files and are not used by another live
-        session. Branches are always kept.
+        Choose which worktrees Omnigent may remove when their sessions are archived. Source changes
+        are always kept, and Git branches are never deleted.
       </p>
-      {(["delete_safe", "never"] as const).map((mode) => (
-        <label key={mode} className="flex items-center gap-2 text-ui">
-          <input
-            type="radio"
-            name={labelId}
-            value={mode}
-            checked={preference.data === mode}
-            onChange={() => save.mutate(mode)}
-            className="accent-primary"
-          />
-          {mode === "delete_safe" ? "Delete safe worktrees on archive" : "Never delete"}
+      <ArchiveWorktreeTierChoices
+        name={labelId}
+        mode={current?.mode ?? "never"}
+        onChange={(mode) => {
+          if (current) save.mutate({ ...current, mode });
+        }}
+        disabled={disabled}
+      />
+      {current?.mode === "yellow_too" && (
+        <p className="text-sm text-destructive" role="note">
+          Ignored local files outside the rebuildable list can be lost when a worktree is removed.
+        </p>
+      )}
+      <div className="flex items-start justify-between gap-4">
+        <label htmlFor={`${labelId}-ask`} className="text-ui font-medium">
+          Ask before archiving
         </label>
-      ))}
-      <p className="text-sm text-muted-foreground">
-        Unsafe worktrees are kept. With safe deletion enabled, archiving them shows a warning first.
-      </p>
+        <Switch
+          id={`${labelId}-ask`}
+          checked={current?.ask_before_archive ?? false}
+          onCheckedChange={(ask_before_archive) => {
+            if (current) save.mutate({ ...current, ask_before_archive });
+          }}
+          disabled={disabled}
+          data-testid="settings-archive-worktree-ask"
+          componentId="settings.git.archive_worktree_ask"
+        />
+      </div>
+      <div className="space-y-2">
+        <label htmlFor={`${labelId}-paths`} className="text-ui font-medium">
+          Rebuildable ignored directories
+        </label>
+        <p className="text-sm text-muted-foreground">
+          One entry per line. Plain names match ignored directories at any depth; paths with slashes
+          are relative to the worktree root. Untracked source files never qualify.
+        </p>
+        <Textarea
+          id={`${labelId}-paths`}
+          className="min-h-32 w-full min-w-0 font-mono text-sm"
+          value={pathsDraft}
+          onChange={(event) => setPathsDraft(event.target.value)}
+          disabled={disabled}
+          spellCheck={false}
+          data-testid="settings-archive-worktree-paths"
+        />
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            size="sm"
+            disabled={disabled || !pathsChanged}
+            onClick={() => {
+              if (current) save.mutate({ ...current, rebuildable_paths: parsedPaths });
+            }}
+            data-testid="settings-archive-worktree-paths-save"
+          >
+            Save list
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={disabled}
+            onClick={() => {
+              setPathsDraft(DEFAULT_REBUILDABLE_PATHS.join("\n"));
+            }}
+          >
+            Restore defaults
+          </Button>
+        </div>
+      </div>
       {(preference.error || save.error) && (
         <p role="alert" className="text-sm text-destructive">
           {(preference.error || save.error)?.message}

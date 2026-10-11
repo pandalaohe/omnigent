@@ -593,7 +593,7 @@ def register_core_routes(
         session_id: str, request: Request, refresh: bool = False
     ) -> dict[str, Any]:
         """Return filename-only Git state for this session and its descendants."""
-        from omnigent.host.frames import CAP_WORKTREE_SAFE_ARCHIVE
+        from omnigent.host.frames import CAP_WORKTREE_ARCHIVE_CONTENT, CAP_WORKTREE_SAFE_ARCHIVE
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
             list_worktrees_on_host,
@@ -604,7 +604,9 @@ def register_core_routes(
             _collect_descendant_conversation_ids,
         )
         from omnigent.server.routes._workspace_validation import _is_subpath_of
+        from omnigent.server.user_preferences_store import read_worktree_archive_preference
         from omnigent.stores.conversation_store import ARCHIVE_REMOVED_WORKTREE_LABEL_KEY
+        from omnigent.worktree_archive import file_kind, worktree_state
 
         del refresh  # Every request reads the host afresh; no stale state cache.
         user_id = _require_user(request, auth_provider)
@@ -718,6 +720,11 @@ def register_core_routes(
             if conn is None or CAP_WORKTREE_SAFE_ARCHIVE not in conn.hello.capabilities:
                 result.update(state="unknown", reason="host unavailable or status unsupported")
                 return result
+            if CAP_WORKTREE_ARCHIVE_CONTENT not in conn.hello.capabilities:
+                result.update(
+                    state="unknown", reason="host update required for archive content policy"
+                )
+                return result
             assert registry is not None
             try:
                 async with semaphore:
@@ -753,16 +760,29 @@ def register_core_routes(
             elif match.get("status_error") or not isinstance(match.get("files"), list):
                 result.update(state="unknown", reason="Git status unavailable")
             else:
-                files = match["files"]
+                owner = _get_session_owner_id(conv.id, permission_store) or RESERVED_USER_LOCAL
+                preference = await asyncio.to_thread(
+                    read_worktree_archive_preference,
+                    getattr(request.app.state, "user_preferences_store", None),
+                    owner,
+                )
+                files = [
+                    {
+                        **file,
+                        "kind": file_kind(
+                            file["path"], file["status"], preference["rebuildable_paths"]
+                        ),
+                    }
+                    for file in match["files"]
+                ]
+                state = worktree_state(files)
                 result.update(
-                    state="dirty"
-                    if files
-                    else "protected"
-                    if conv.git_branch is None
-                    else "clean",
+                    state="protected" if conv.git_branch is None else state,
                     reason=(
-                        "uncommitted files"
-                        if files
+                        "uncommitted source files"
+                        if state == "dirty"
+                        else "other ignored local files"
+                        if state == "local"
                         else "branch binding unrecorded"
                         if conv.git_branch is None
                         else "clean worktree"
@@ -804,12 +824,17 @@ def register_core_routes(
                 "reason": state["reason"],
             }
             for row, state in zip(rows, states, strict=True)
-            if state["state"] in {"dirty", "unknown", "protected", "shared"}
+            if state["state"] in {"dirty", "local", "unknown", "protected", "shared"}
+            and not (
+                row.id != session_id
+                and state["state"] == "protected"
+                and state["reason"] == "project entry"
+            )
         ]
         aggregate = next(
             (
                 state["state"]
-                for priority in ("dirty", "unknown", "protected", "shared")
+                for priority in ("dirty", "unknown", "protected", "shared", "local")
                 for state in states
                 if state["state"] == priority
             ),
@@ -1643,6 +1668,41 @@ def register_core_routes(
             git_used=False,
             parent=inherit_parent,
         )
+        bound_branch: str | None = None
+        if inherit_parent is None and parsed_metadata.host_id is not None:
+            from omnigent.server.routes._host_worktree import (
+                WORKTREE_ROOT_LABEL_KEY,
+                existing_linked_worktree,
+                refresh_worktree_admission_fence,
+                worktree_root_fingerprint,
+            )
+
+            registry = getattr(request.app.state, "host_registry", None)
+            bound = await existing_linked_worktree(
+                host_registry=registry,
+                host_id=parsed_metadata.host_id,
+                workspace=parsed_metadata.workspace,
+            )
+            if bound is not None:
+                placed_worktree, bound_branch = bound
+                conn = registry.get(parsed_metadata.host_id) if registry is not None else None
+                if registry is not None and conn is not None:
+                    await refresh_worktree_admission_fence(
+                        host_registry=registry,
+                        host_conn=conn,
+                        conversation_store=conversation_store,
+                        host_id=parsed_metadata.host_id,
+                        workspace=placed_worktree,
+                        branch=bound_branch,
+                    )
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "labels": {
+                            **(parsed_metadata.labels or {}),
+                            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(placed_worktree),
+                        }
+                    }
+                )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
@@ -1724,6 +1784,7 @@ def register_core_routes(
                 inference_model,
                 created_by=user_id,
                 worktree=placed_worktree,
+                git_branch=bound_branch,
                 agent_store=agent_store,
             )
         session_created(
@@ -3526,7 +3587,9 @@ def register_core_routes(
         """Apply the PATCH that :func:`update_session` documents."""
         began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
-        if (body.delete_worktree or body.keep_worktree) and body.archived is not True:
+        if (
+            body.delete_worktree or body.keep_worktree or body.worktree_archive_mode
+        ) and body.archived is not True:
             raise OmnigentError(
                 "delete_worktree is only valid with archived=true",
                 code=ErrorCode.INVALID_INPUT,
@@ -4143,22 +4206,29 @@ def register_core_routes(
                         ):
                             close_on_archive = policy_host.cli_retention_policy.close_on_archive
         safe_archive_cleanup = False
+        effective_mode = "never"
+        archive_paths: list[str] | None = None
         if (
             body.archived is True
-            and (not conv.archived or body.delete_worktree)
+            and (not conv.archived or body.delete_worktree or body.worktree_archive_mode)
             and not body.keep_worktree
             and conv.git_branch
         ):
-            from omnigent.server.user_preferences_store import read_worktree_archive_mode
+            from omnigent.server.user_preferences_store import (
+                read_worktree_archive_preference_for_cleanup,
+            )
 
-            mode = await asyncio.to_thread(
-                read_worktree_archive_mode,
+            archive_preference = await asyncio.to_thread(
+                read_worktree_archive_preference_for_cleanup,
                 getattr(request.app.state, "user_preferences_store", None),
                 _get_session_owner_id(session_id, permission_store) or RESERVED_USER_LOCAL,
             )
-            if mode == "delete_safe":
-                close_on_archive = True
-                safe_archive_cleanup = True
+            if archive_preference is not None:
+                effective_mode = body.worktree_archive_mode or archive_preference["mode"]
+                archive_paths = archive_preference["rebuildable_paths"]
+                if effective_mode != "never":
+                    close_on_archive = True
+                    safe_archive_cleanup = True
 
         live_model_change = not body.silent and (model_override is not None or clear_model)
         wake_for_model_change = (
@@ -4183,8 +4253,18 @@ def register_core_routes(
         delete_worktree_kwargs: dict[str, Any] = (
             {"delete_worktree": True} if safe_archive_cleanup else {}
         )
+        archive_mode_kwargs: dict[str, Any] = (
+            {
+                "worktree_archive_mode": effective_mode,
+                "override_keep_worktree": body.delete_worktree,
+            }
+            if safe_archive_cleanup
+            else {}
+        )
         keep_worktree_kwargs: dict[str, Any] = (
-            {"keep_worktree": True} if body.keep_worktree else {}
+            {"keep_worktree": True}
+            if body.keep_worktree or body.worktree_archive_mode == "never"
+            else {}
         )
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
@@ -4208,6 +4288,7 @@ def register_core_routes(
             close_cli_on_archive=close_on_archive,
             **archive_stop_when_idle_kwargs,
             **delete_worktree_kwargs,
+            **archive_mode_kwargs,
             **keep_worktree_kwargs,
         )
         if update_result is None:
@@ -4269,6 +4350,8 @@ def register_core_routes(
                     getattr(request.app.state, "host_registry", None),
                     getattr(request.app.state, "archive_close_coordinator", None),
                     delete_worktree=safe_archive_cleanup,
+                    archive_mode=effective_mode if safe_archive_cleanup else None,
+                    rebuildable_paths=archive_paths if safe_archive_cleanup else None,
                     project_host_binding_store=getattr(
                         request.app.state, "project_host_binding_store", None
                     ),

@@ -4,11 +4,12 @@ import { getOmnigentHostGeneration, getOmnigentServerIdentity } from "@/lib/host
 import { authenticatedFetch } from "@/lib/identity";
 
 export type WorktreeState =
-  "none" | "clean" | "dirty" | "unknown" | "protected" | "shared" | "removed";
+  "none" | "clean" | "local" | "dirty" | "unknown" | "protected" | "shared" | "removed";
 
 export interface WorktreeFile {
   path: string;
   status: string;
+  kind?: "rebuildable" | "local" | "source";
 }
 
 export interface WorktreeOwnStatus {
@@ -43,6 +44,7 @@ export interface SessionWorktreeStatus {
 const STATES: ReadonlySet<string> = new Set([
   "none",
   "clean",
+  "local",
   "dirty",
   "unknown",
   "protected",
@@ -76,7 +78,14 @@ function parseStatus(value: unknown): SessionWorktreeStatus {
     !nullableString(own.merge_target) ||
     !Array.isArray(own.files) ||
     !own.files.every(
-      (file) => record(file) && typeof file.path === "string" && typeof file.status === "string",
+      (file) =>
+        record(file) &&
+        typeof file.path === "string" &&
+        typeof file.status === "string" &&
+        (file.kind === undefined ||
+          file.kind === "rebuildable" ||
+          file.kind === "local" ||
+          file.kind === "source"),
     ) ||
     !state(aggregate.state) ||
     !nullableString(aggregate.reason) ||

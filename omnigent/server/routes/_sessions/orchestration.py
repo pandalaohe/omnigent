@@ -1818,6 +1818,8 @@ async def _archive_stop(
     host_registry: Any,
     *,
     delete_worktree: bool = False,
+    archive_mode: str | None = None,
+    rebuildable_paths: list[str] | None = None,
     project_host_binding_store: Any = None,
 ) -> bool:
     """
@@ -2033,6 +2035,8 @@ async def _archive_stop(
             project_host_binding_store=project_host_binding_store,
             conversation_store=conversation_store,
             exclude_conversation_id=session_id,
+            archive_mode=archive_mode or "green_only",
+            rebuildable_paths=rebuildable_paths,
         )
     return result
 
@@ -2045,6 +2049,8 @@ def _spawn_archive_stop(
     archive_close_coordinator: Any = None,
     *,
     delete_worktree: bool = False,
+    archive_mode: str | None = None,
+    rebuildable_paths: list[str] | None = None,
     project_host_binding_store: Any = None,
 ) -> None:
     """
@@ -2143,6 +2149,8 @@ def _spawn_archive_stop(
                 runner_router,
                 host_registry,
                 delete_worktree=delete_worktree,
+                archive_mode=archive_mode,
+                rebuildable_paths=rebuildable_paths,
                 project_host_binding_store=project_host_binding_store,
             )
         finally:
@@ -12596,9 +12604,32 @@ async def _create_session_from_existing_agent(
     ):
         inherit_parent = parent_conv
 
+    if body.git is None and inherit_parent is None and body.host_id is not None:
+        from omnigent.server.routes._host_worktree import (
+            existing_linked_worktree,
+            refresh_worktree_admission_fence,
+        )
+
+        registry = getattr(request.app.state, "host_registry", None)
+        bound = await existing_linked_worktree(
+            host_registry=registry, host_id=body.host_id, workspace=canonical_workspace
+        )
+        if bound is not None:
+            canonical_worktree_root, git_branch = bound
+            conn = registry.get(body.host_id) if registry is not None else None
+            if registry is not None and conn is not None:
+                await refresh_worktree_admission_fence(
+                    host_registry=registry,
+                    host_conn=conn,
+                    conversation_store=conversation_store,
+                    host_id=body.host_id,
+                    workspace=canonical_worktree_root,
+                    branch=git_branch,
+                )
+
     workspace, worktree = _place_project_session(
         target=canonical_workspace,
-        git_used=body.git is not None,
+        git_used=body.git is not None or git_branch is not None,
         parent=inherit_parent,
         worktree_root=canonical_worktree_root,
     )
@@ -12757,14 +12788,14 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
-    if created_worktree_path is not None:
+    if canonical_worktree_root is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
             worktree_root_fingerprint,
         )
 
         initial_labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(
-            canonical_worktree_root or created_worktree_path
+            canonical_worktree_root
         )
     if native_agent is not None:
         initial_labels.update(native_agent.presentation_labels)
@@ -13136,6 +13167,7 @@ def _create_session_from_bundle(
     inference_model: str | None = None,
     created_by: str | None = None,
     worktree: str | None = None,
+    git_branch: str | None = None,
     agent_store: AgentStore | None = None,
 ) -> CreatedSessionResponse:
     """
@@ -13242,6 +13274,8 @@ def _create_session_from_bundle(
                 runner_id=runner_id,
                 inference_snapshot=inference_snapshot,
                 inference_model=inference_model,
+                worktree=worktree,
+                git_branch=git_branch,
             )
 
     agent_id = generate_agent_id()
@@ -13267,6 +13301,7 @@ def _create_session_from_bundle(
         inference_model=inference_model,
         created_by=created_by,
         worktree=worktree,
+        git_branch=git_branch,
     )
 
 

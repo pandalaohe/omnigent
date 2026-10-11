@@ -2555,6 +2555,28 @@ describe("useBulkArchiveConversations", () => {
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
+  it("sends the one-time tier to every archive while honoring per-session keep", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", labels: {} }));
+    const { rendered } = renderBulkArchiveHook();
+    rendered.result.current.mutate({
+      ids: ["conv_a", "conv_b"],
+      archived: true,
+      keepWorktreeIds: new Set(["conv_b"]),
+      worktreeArchiveMode: "yellow_too",
+    });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      archived: true,
+      worktree_archive_mode: "yellow_too",
+    });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      archived: true,
+      keep_worktree: true,
+      worktree_archive_mode: "yellow_too",
+    });
+  });
+
   it("throws with failed ids when some archives fail", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -3485,21 +3507,32 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
-  it("sends archive-only retention to the server and ignores it on unarchive", async () => {
+  it("sends the selected worktree tier for one archive and omits it on unarchive", async () => {
     fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", labels: {} }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useArchiveConversation(), { wrapper });
     await act(async () => {
-      await result.current.mutateAsync({ id: "conv_a", archived: true, keepWorktree: true });
+      await result.current.mutateAsync({
+        id: "conv_a",
+        archived: true,
+        keepWorktree: true,
+        worktreeArchiveMode: "yellow_too",
+      });
     });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       archived: true,
       keep_worktree: true,
+      worktree_archive_mode: "yellow_too",
     });
     await act(async () => {
-      await result.current.mutateAsync({ id: "conv_a", archived: false, keepWorktree: true });
+      await result.current.mutateAsync({
+        id: "conv_a",
+        archived: false,
+        keepWorktree: true,
+        worktreeArchiveMode: "yellow_too",
+      });
     });
     expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ archived: false });
   });

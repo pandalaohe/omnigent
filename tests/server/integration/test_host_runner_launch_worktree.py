@@ -34,6 +34,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
@@ -248,6 +249,8 @@ async def register_host(
         launch_status: str = "launched",
         stat_fails_for: Callable[[str], bool] | None = None,
         workspace: str | None = None,
+        existing_branch: str | None = None,
+        existing_root: str | None = None,
         owner: str = RESERVED_USER_LOCAL,
         app_override: FastAPI | None = None,
     ) -> _HostCapture:
@@ -256,7 +259,12 @@ async def register_host(
         conn = target_app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
-            hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
+            hello=HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="wt-host",
+                capabilities=["worktree_archive_content_v1"] if existing_branch else [],
+            ),
             owner=owner,
         )
         cap = _HostCapture()
@@ -338,6 +346,22 @@ async def register_host(
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         resolver_tasks.append(asyncio.create_task(_resolve_create(frame, fut)))
+                elif isinstance(frame, HostListWorktreesFrame):
+                    fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": "ok",
+                                "worktrees": [
+                                    {
+                                        "path": existing_root or frame.repo_path,
+                                        "branch": existing_branch,
+                                        "is_main": False,
+                                        "detached": False,
+                                    }
+                                ],
+                            }
+                        )
                 elif isinstance(frame, HostLaunchRunnerFrame):
                     cap.launch.append(frame)
                     fut = conn.pending_launches.pop(frame.request_id, None)
@@ -507,6 +531,52 @@ async def test_launch_runner_without_git_binds_source_dir_no_worktree(
     assert conv.workspace == _SOURCE_REPO
     assert conv.git_branch is None
     assert conv.host_id == _HOST_ID
+
+
+async def test_workspace_only_launch_binds_existing_linked_root_and_branch(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    root = "/opt/work/sample-app/topic"
+    workspace = f"{root}/src"
+    cap = register_host(existing_branch="feature/topic", existing_root=root)
+    session_id = await _bare_session(client, "workspace-launch-agent")
+    response = await _launch(client, session_id, workspace=workspace)
+    assert response.status_code == 200, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == workspace
+    assert conv.worktree == root
+    assert conv.git_branch == "feature/topic"
+    assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(root)
+    assert cap.create == []
+    assert cap.remove == []
+
+
+async def test_workspace_only_failed_launch_never_removes_existing_tree(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    cap = register_host(
+        existing_branch="feature/existing",
+        existing_root="/opt/work/sample-app/existing",
+        launch_status="failed",
+    )
+    session_id = await _bare_session(client, "workspace-failed-launch-agent")
+    response = await _launch(client, session_id, workspace="/opt/work/sample-app/existing/src")
+    assert response.status_code != 200
+    row = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert row is not None
+    assert row.worktree is None
+    assert row.git_branch is None
+    assert cap.remove == []
 
 
 async def test_concurrent_source_launch_cannot_overtake_worktree_launch(

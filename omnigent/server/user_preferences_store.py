@@ -81,35 +81,60 @@ WORKTREE_ARCHIVE_NAMESPACE = "worktree_archive"
 
 
 def _validate_worktree_archive(value: Any) -> None:
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"mode"}
-        or value["mode"] not in ("delete_safe", "never")
-    ):
-        raise UserPreferencesValidationError(
-            "worktree_archive must contain mode delete_safe or never"
-        )
+    from omnigent.worktree_archive import normalize_archive_preference
+
+    if value is None:
+        raise UserPreferencesValidationError("worktree_archive must be an object")
+    try:
+        normalize_archive_preference(value)
+    except ValueError as exc:
+        raise UserPreferencesValidationError(str(exc)) from exc
+
+
+def _read_worktree_archive_preference(
+    store: SqlAlchemyUserPreferencesStore | None, owner: str | None
+) -> dict[str, Any]:
+    from omnigent.worktree_archive import normalize_archive_preference
+
+    if store is None:
+        raise ValueError("worktree archive preferences unavailable")
+    envelope = store.get(owner or RESERVED_USER_LOCAL)
+    if envelope is None:
+        return normalize_archive_preference(None)
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("settings"), dict):
+        raise ValueError("malformed worktree archive preferences")
+    settings = envelope["settings"]
+    if WORKTREE_ARCHIVE_NAMESPACE not in settings:
+        return normalize_archive_preference(None)
+    value = settings[WORKTREE_ARCHIVE_NAMESPACE]
+    _validate_worktree_archive(value)
+    return normalize_archive_preference(value)
+
+
+def read_worktree_archive_preference_for_cleanup(
+    store: SqlAlchemyUserPreferencesStore | None, owner: str | None
+) -> dict[str, Any] | None:
+    try:
+        return _read_worktree_archive_preference(store, owner)
+    except (ValueError, SQLAlchemyError, AttributeError, TypeError, KeyError):
+        return None
+
+
+def read_worktree_archive_preference(
+    store: SqlAlchemyUserPreferencesStore | None, owner: str | None
+) -> dict[str, Any]:
+    from omnigent.worktree_archive import normalize_archive_preference
+
+    preference = read_worktree_archive_preference_for_cleanup(store, owner)
+    if preference is None:
+        return normalize_archive_preference(None)
+    return preference
 
 
 def read_worktree_archive_mode(
     store: SqlAlchemyUserPreferencesStore | None, owner: str | None
 ) -> str:
-    if store is None:
-        return "never"
-    try:
-        envelope = store.get(owner or RESERVED_USER_LOCAL)
-        if envelope is None:
-            return "delete_safe"
-        settings = envelope["settings"]
-        if not isinstance(settings, dict):
-            return "never"
-        if WORKTREE_ARCHIVE_NAMESPACE not in settings:
-            return "delete_safe"
-        value = settings[WORKTREE_ARCHIVE_NAMESPACE]
-        _validate_worktree_archive(value)
-        return value["mode"]
-    except (ValueError, SQLAlchemyError, AttributeError, TypeError, KeyError):
-        return "never"
+    return read_worktree_archive_preference(store, owner)["mode"]
 
 
 class UserPreferencesValidationError(ValueError):
@@ -1201,12 +1226,14 @@ class SqlAlchemyUserPreferencesStore:
 
     def migrate_worktree_archive(
         self, user_id: str, delete_safe: bool, *, create_if_missing: bool = True
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Initialize the archive namespace once under the preference write lock."""
         if type(delete_safe) is not bool:
             raise UserPreferencesValidationError("delete_safe must be a boolean")
 
-        def write(session: Session) -> dict[str, str]:
+        from omnigent.worktree_archive import normalize_archive_preference
+
+        def write(session: Session) -> dict[str, Any]:
             _require_user_row(session, user_id, create_if_missing)
             self._upsert_row(
                 session,
@@ -1218,8 +1245,10 @@ class SqlAlchemyUserPreferencesStore:
             if WORKTREE_ARCHIVE_NAMESPACE in settings:
                 existing = settings[WORKTREE_ARCHIVE_NAMESPACE]
                 _validate_worktree_archive(existing)
-                return existing
-            value = {"mode": "delete_safe" if delete_safe else "never"}
+                return normalize_archive_preference(existing)
+            value = normalize_archive_preference(
+                {"mode": "delete_safe" if delete_safe else "never"}
+            )
             self._upsert_row(
                 session,
                 user_id=user_id,

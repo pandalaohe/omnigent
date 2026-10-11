@@ -187,7 +187,7 @@ def test_safe_archive_preserves_dirty_and_untracked_then_keeps_branch(git_repo: 
     worktree = Path(created.worktree_path)
     (worktree / "untracked.txt").write_text("keep")
     assert read_worktree_status(str(worktree))["files"] == [
-        {"path": "untracked.txt", "status": "??"}
+        {"path": "untracked.txt", "status": "??", "kind": "source"}
     ]
     with pytest.raises(WorktreeError, match="dirty"):
         remove_worktree(worktree_path=str(worktree), branch="feature/safe", safe_only=True)
@@ -218,6 +218,175 @@ def test_safe_archive_rejects_main_and_binding_mismatch(git_repo: Path) -> None:
     with pytest.raises(WorktreeError, match="protected"):
         remove_worktree(worktree_path=created.worktree_path, branch="feature/safe", safe_only=True)
     assert Path(created.worktree_path).exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "ignored_name", "removes"),
+    [
+        ("never", "node_modules", False),
+        ("green_only", "node_modules", True),
+        ("green_only", "private-cache", False),
+        ("yellow_too", "private-cache", True),
+    ],
+)
+def test_archive_tiers_remove_only_allowed_ignored_content(
+    git_repo: Path, mode: str, ignored_name: str, removes: bool
+) -> None:
+    (git_repo / ".gitignore").write_text("node_modules/\nprivate-cache/\n")
+    _git(git_repo, "add", ".gitignore")
+    _git(git_repo, "commit", "-qm", "ignore caches")
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/tier")
+    tree = Path(created.worktree_path)
+    cache = tree / ignored_name
+    cache.mkdir()
+    (cache / "generated.txt").write_text("cache")
+    status = read_worktree_status(str(tree))
+    assert status["files"] == [
+        {
+            "path": f"{ignored_name}/",
+            "status": "!!",
+            "kind": "rebuildable" if ignored_name == "node_modules" else "local",
+        }
+    ]
+    if removes:
+        remove_worktree(
+            worktree_path=str(tree),
+            branch="feature/tier",
+            safe_only=True,
+            archive_mode=mode,
+        )
+        assert not tree.exists()
+        assert _branch_exists(git_repo, "feature/tier")
+    else:
+        with pytest.raises(WorktreeError, match="archive tier"):
+            remove_worktree(
+                worktree_path=str(tree),
+                branch="feature/tier",
+                safe_only=True,
+                archive_mode=mode,
+            )
+        assert (cache / "generated.txt").exists()
+
+
+def test_locked_worktree_refusal_keeps_ignored_local_file(git_repo: Path) -> None:
+    (git_repo / ".gitignore").write_text("local-notes.md\n")
+    _git(git_repo, "add", ".gitignore")
+    _git(git_repo, "commit", "-qm", "ignore local notes")
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/locked")
+    tree = Path(created.worktree_path)
+    note = tree / "local-notes.md"
+    note.write_text("keep this note")
+    _git(git_repo, "worktree", "lock", str(tree))
+
+    with pytest.raises(WorktreeError, match="worktree remove failed"):
+        remove_worktree(
+            worktree_path=str(tree),
+            branch="feature/locked",
+            safe_only=True,
+            archive_mode="yellow_too",
+            rebuildable_paths=[],
+        )
+    assert tree.is_dir()
+    assert note.read_text() == "keep this note"
+    assert _branch_exists(git_repo, "feature/locked")
+
+
+@pytest.mark.parametrize(
+    ("ignored_file", "pattern"),
+    [
+        ("node_modules", "node_modules/"),
+        ("dist", "dist/"),
+        ("cache/generated", "cache/generated/"),
+    ],
+)
+def test_ignored_file_named_like_rebuildable_directory_is_local(
+    git_repo: Path, ignored_file: str, pattern: str
+) -> None:
+    (git_repo / ".gitignore").write_text(f"/{ignored_file}\n")
+    _git(git_repo, "add", ".gitignore")
+    _git(git_repo, "commit", "-qm", "ignore local file")
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/ignored-file")
+    tree = Path(created.worktree_path)
+    local_file = tree / ignored_file
+    local_file.parent.mkdir(parents=True, exist_ok=True)
+    local_file.write_text("local")
+
+    assert read_worktree_status(str(tree), [pattern])["files"] == [
+        {"path": ignored_file, "status": "!!", "kind": "local"}
+    ]
+    with pytest.raises(WorktreeError, match="archive tier"):
+        remove_worktree(
+            worktree_path=str(tree),
+            branch="feature/ignored-file",
+            safe_only=True,
+            archive_mode="green_only",
+            rebuildable_paths=[pattern],
+        )
+    assert local_file.read_text() == "local"
+
+
+def test_generated_directory_name_does_not_hide_source_changes(git_repo: Path) -> None:
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/source")
+    tree = Path(created.worktree_path)
+    source_dir = tree / "node_modules"
+    source_dir.mkdir()
+    (source_dir / "source.ts").write_text("source")
+    assert read_worktree_status(str(tree))["files"][0]["kind"] == "source"
+    with pytest.raises(WorktreeError, match="dirty"):
+        remove_worktree(
+            worktree_path=str(tree),
+            branch="feature/source",
+            safe_only=True,
+            archive_mode="yellow_too",
+        )
+    assert (source_dir / "source.ts").exists()
+
+
+def test_tracked_source_inside_ignored_cache_is_never_removed(git_repo: Path) -> None:
+    (git_repo / ".gitignore").write_text("node_modules/\n")
+    source = git_repo / "node_modules" / "source.ts"
+    source.parent.mkdir()
+    source.write_text("committed")
+    _git(git_repo, "add", ".gitignore")
+    _git(git_repo, "add", "-f", "node_modules/source.ts")
+    _git(git_repo, "commit", "-qm", "keep source")
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/tracked-source")
+    tree = Path(created.worktree_path)
+    (tree / "node_modules" / "source.ts").write_text("edited")
+    assert read_worktree_status(str(tree))["files"][0]["kind"] == "source"
+    with pytest.raises(WorktreeError, match="dirty"):
+        remove_worktree(
+            worktree_path=str(tree),
+            branch="feature/tracked-source",
+            safe_only=True,
+            archive_mode="yellow_too",
+        )
+    assert (tree / "node_modules" / "source.ts").read_text() == "edited"
+
+
+def test_multisegment_rebuildable_path_is_root_relative(git_repo: Path) -> None:
+    (git_repo / ".gitignore").write_text("cache/custom/\nother/cache/custom/\n")
+    _git(git_repo, "add", ".gitignore")
+    _git(git_repo, "commit", "-qm", "ignore caches")
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/path-list")
+    tree = Path(created.worktree_path)
+    chosen = tree / "cache" / "custom"
+    other = tree / "other" / "cache" / "custom"
+    chosen.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (chosen / "one.txt").write_text("one")
+    (other / "two.txt").write_text("two")
+    files = read_worktree_status(str(tree), ["cache/custom/"])["files"]
+    assert {file["kind"] for file in files} == {"rebuildable", "local"}
+    with pytest.raises(WorktreeError, match="archive tier"):
+        remove_worktree(
+            worktree_path=str(tree),
+            branch="feature/path-list",
+            safe_only=True,
+            archive_mode="green_only",
+            rebuildable_paths=["cache/custom/"],
+        )
+    assert (chosen / "one.txt").exists() and (other / "two.txt").exists()
 
 
 @pytest.mark.parametrize("linked", [False, True])

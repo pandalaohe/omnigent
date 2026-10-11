@@ -254,6 +254,7 @@ ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY = "omnigent.archive_stop_when_idle"
 # revision so unarchive or re-archive voids it.
 ARCHIVE_DELETE_WORKTREE_LABEL_KEY = "omnigent.archive_delete_worktree"
 ARCHIVE_KEEP_WORKTREE_LABEL_KEY = "omnigent.archive_keep_worktree"
+ARCHIVE_WORKTREE_MODE_LABEL_KEY = "omnigent.archive_worktree_mode"
 ARCHIVE_REMOVED_WORKTREE_LABEL_KEY = "omnigent.archive_removed_worktree"
 ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY = "omnigent.archive_worktree_admission_fence"
 
@@ -1308,6 +1309,8 @@ class ConversationStore(ABC):
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
         keep_worktree: bool = False,
+        worktree_archive_mode: str | None = None,
+        override_keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> Conversation | None:
         """
@@ -1510,6 +1513,8 @@ class ConversationStore(ABC):
         archive_stop_when_idle: bool = False,
         delete_worktree: bool = False,
         keep_worktree: bool = False,
+        worktree_archive_mode: str | None = None,
+        override_keep_worktree: bool = False,
         reported_model: str | None = None,
     ) -> ConversationUpdateResult | None:
         """Update a conversation and report requested model-setting changes.
@@ -2557,6 +2562,7 @@ class ConversationStore(ABC):
         model_override: str | None = None,
         workspace: str | None = None,
         worktree: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,

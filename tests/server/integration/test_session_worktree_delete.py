@@ -25,6 +25,7 @@ from fastapi import FastAPI
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
+    CAP_WORKTREE_ARCHIVE_CONTENT,
     CAP_WORKTREE_SAFE_ARCHIVE,
     HostCreateWorktreeFrame,
     HostHelloFrame,
@@ -51,8 +52,11 @@ from omnigent.server.routes._host_worktree import (
 )
 from omnigent.server.routes._sessions.helpers import _remove_session_worktree_best_effort
 from omnigent.stores.conversation_store import (
+    ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
+    ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     worktree_admission_fingerprint,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -64,11 +68,137 @@ from omnigent.stores.project_host_binding_store.sqlalchemy_store import (
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.host.test_git_worktree import _branch_exists, _git
+from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "a65b7d8e4613a95946c9134383308ac7"
 _OTHER_HOST_ID = "b65b7d8e4613a95946c9134383308ac7"
+
+
+@pytest.mark.parametrize("late_change", ["keep", "delete", "tier"])
+async def test_late_archive_intent_change_before_host_remove_cancels_cleanup(
+    db_uri: str, late_change: str
+) -> None:
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "late-keep", RESERVED_USER_LOCAL)
+    store = SqlAlchemyConversationStore(db_uri)
+    root = "/opt/work/sample-app/late-keep"
+    session = store.create_conversation(
+        host_id=_HOST_ID, workspace=root, git_branch="feature/late-keep"
+    )
+    archived = store.update_conversation(
+        session.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="yellow_too",
+    )
+    assert archived is not None
+    listed = asyncio.Event()
+    release_list = asyncio.Event()
+
+    async def staged_list(**_kwargs):
+        listed.set()
+        await release_list.wait()
+        return [{"path": root, "branch": "feature/late-keep", "is_main": False}]
+
+    removed = AsyncMock()
+    registry = SimpleNamespace(get=lambda _host_id: SimpleNamespace())
+    with (
+        patch("omnigent.server.routes._host_worktree.list_worktrees_on_host", staged_list),
+        patch("omnigent.server.routes._host_worktree.remove_worktree_on_host", removed),
+    ):
+        cleanup = asyncio.create_task(
+            _remove_session_worktree_best_effort(
+                host_id=_HOST_ID,
+                worktree_path=root,
+                branch="feature/late-keep",
+                delete_branch=False,
+                host_registry=registry,
+                reason="session-archive",
+                conversation_store=store,
+                exclude_conversation_id=session.id,
+                safe_only=True,
+                archive_mode="yellow_too",
+                rebuildable_paths=[],
+            )
+        )
+        await asyncio.wait_for(listed.wait(), 3)
+        if late_change == "keep":
+            store.set_labels(
+                session.id, {ARCHIVE_KEEP_WORKTREE_LABEL_KEY: str(archived.archive_revision)}
+            )
+        elif late_change == "delete":
+            store.delete_label(session.id, ARCHIVE_DELETE_WORKTREE_LABEL_KEY)
+        else:
+            store.set_labels(
+                session.id,
+                {ARCHIVE_WORKTREE_MODE_LABEL_KEY: f"{archived.archive_revision}:green_only"},
+            )
+        release_list.set()
+        assert await asyncio.wait_for(cleanup, 3) is False
+    removed.assert_not_awaited()
+
+
+@pytest.mark.parametrize("intent", ["keep", "delete"])
+async def test_archive_intent_write_conflicts_with_inflight_removal(
+    db_uri: str, intent: str
+) -> None:
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "intent-lease", RESERVED_USER_LOCAL)
+    store = SqlAlchemyConversationStore(db_uri)
+    root = "/opt/work/sample-app/intent-lease"
+    session = store.create_conversation(
+        host_id=_HOST_ID, workspace=root, git_branch="feature/intent-lease"
+    )
+    archived = store.update_conversation(
+        session.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="yellow_too",
+    )
+    assert archived is not None
+    listed = asyncio.Event()
+    release_list = asyncio.Event()
+
+    async def staged_list(**_kwargs):
+        listed.set()
+        await release_list.wait()
+        return [{"path": root, "branch": "feature/intent-lease", "is_main": False}]
+
+    registry = SimpleNamespace(get=lambda _host_id: SimpleNamespace())
+    with (
+        patch("omnigent.server.routes._host_worktree.list_worktrees_on_host", staged_list),
+        patch("omnigent.server.routes._host_worktree.remove_worktree_on_host", AsyncMock()),
+    ):
+        cleanup = asyncio.create_task(
+            _remove_session_worktree_best_effort(
+                host_id=_HOST_ID,
+                worktree_path=root,
+                branch="feature/intent-lease",
+                delete_branch=False,
+                host_registry=registry,
+                reason="session-archive",
+                conversation_store=store,
+                exclude_conversation_id=session.id,
+                safe_only=True,
+                archive_mode="yellow_too",
+                rebuildable_paths=[],
+            )
+        )
+        await asyncio.wait_for(listed.wait(), 3)
+        try:
+            with pytest.raises(OmnigentError, match="lease is busy"):
+                await asyncio.to_thread(
+                    store.update_conversation,
+                    session.id,
+                    archived=True,
+                    keep_worktree=intent == "keep",
+                    delete_worktree=intent == "delete",
+                )
+        finally:
+            release_list.set()
+        assert await asyncio.wait_for(cleanup, 3) is True
 
 
 async def test_safe_cleanup_blocks_admission_during_and_after_removal(db_uri: str) -> None:
@@ -893,6 +1023,67 @@ async def test_safe_cleanup_fence_distinguishes_host_refusal_from_uncertain_resu
     if uncertain:
         with pytest.raises(OmnigentError, match="Worktree removal is unresolved"):
             await store.delete_conversation(archived.id)
+
+
+async def test_old_host_archive_refusal_leaves_no_fence_or_remove_rpc(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "old-host", RESERVED_USER_LOCAL)
+    created = await create_test_session(client, name="old-host-archive")
+    store = SqlAlchemyConversationStore(db_uri)
+    root = "/opt/work/sample-app/old-host-topic"
+    store.set_host_id(created["id"], _HOST_ID, workspace=root, git_branch="feature/old-host")
+    archived = store.update_conversation(
+        created["id"],
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="green_only",
+    )
+    assert archived is not None
+    conn = SimpleNamespace(hello=SimpleNamespace(capabilities=[CAP_WORKTREE_SAFE_ARCHIVE]))
+    registry = SimpleNamespace(get=lambda _host_id: conn)
+    remove_rpc = AsyncMock()
+    with (
+        patch(
+            "omnigent.server.routes._host_worktree.list_worktrees_on_host",
+            AsyncMock(
+                return_value=[
+                    {
+                        "path": root,
+                        "branch": "feature/old-host",
+                        "is_main": False,
+                    }
+                ]
+            ),
+        ),
+        patch("omnigent.server.routes._host_worktree._await_host_worktree_result", remove_rpc),
+    ):
+        removed = await _remove_session_worktree_best_effort(
+            host_id=_HOST_ID,
+            worktree_path=root,
+            branch="feature/old-host",
+            delete_branch=False,
+            host_registry=registry,
+            reason="session-archive",
+            conversation_store=store,
+            exclude_conversation_id=created["id"],
+            safe_only=True,
+            archive_mode="green_only",
+            rebuildable_paths=[],
+        )
+    assert removed is False
+    remove_rpc.assert_not_awaited()
+    current = store.get_conversation(created["id"])
+    assert current is not None
+    assert ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY not in current.labels
+
+    conn.hello.capabilities.append(CAP_WORKTREE_ARCHIVE_CONTENT)
+    url = f"/v1/sessions/{created['id']}"
+    keep = await client.patch(url, json={"archived": True, "keep_worktree": True})
+    assert keep.status_code == 200, keep.text
+    never = await client.patch(url, json={"archived": True, "worktree_archive_mode": "never"})
+    assert never.status_code == 200, never.text
 
 
 async def test_stale_host_admission_lease_can_be_reclaimed(db_uri: str) -> None:

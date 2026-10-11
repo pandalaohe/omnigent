@@ -6,6 +6,7 @@
 import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -30,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   bulkLockMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
+  worktreeStatusEnabled: false,
   importSessionsPanel: vi.fn(() => null),
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
@@ -67,6 +69,7 @@ vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => false }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
+    worktree_status: mocks.worktreeStatusEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
   }),
@@ -274,13 +277,16 @@ function LocationProbe() {
 }
 
 function renderPage(path = "/settings") {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={[path]}>
-        <SettingsPage />
-        <LocationProbe />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <SettingsPage />
+          <LocationProbe />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -316,6 +322,7 @@ beforeEach(() => {
   mocks.bulkDeleteMutate.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
+  mocks.worktreeStatusEnabled = false;
   mocks.importSessionsPanel.mockClear();
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
@@ -1434,6 +1441,92 @@ describe("SettingsPage", () => {
       }),
     );
     await waitFor(() => expect(input).toHaveValue(""));
+  });
+
+  it("reenables the archive prompt and saves the rebuildable list only on request", async () => {
+    mocks.worktreeStatusEnabled = true;
+    mocks.authenticatedFetch.mockImplementation(async (_url, init) => {
+      if ((init as RequestInit | undefined)?.method === "PATCH") {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({
+          preferences: {
+            settings: {
+              worktree_archive: {
+                mode: "green_only",
+                ask_before_archive: false,
+                rebuildable_paths: ["node_modules/"],
+              },
+            },
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    renderPage("/settings/git");
+
+    const ask = await screen.findByTestId("settings-archive-worktree-ask");
+    await waitFor(() => expect(ask).not.toBeDisabled());
+    fireEvent.click(ask);
+    await waitFor(() =>
+      expect(mocks.authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/me/preferences/worktree_archive",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({
+            value: {
+              mode: "green_only",
+              ask_before_archive: true,
+              rebuildable_paths: ["node_modules/"],
+            },
+          }),
+        }),
+      ),
+    );
+
+    const list = screen.getByTestId("settings-archive-worktree-paths");
+    const patchCount = mocks.authenticatedFetch.mock.calls.filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+    ).length;
+    fireEvent.change(list, { target: { value: "node_modules/\n.generated/" } });
+    expect(
+      mocks.authenticatedFetch.mock.calls.filter(
+        ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+      ),
+    ).toHaveLength(patchCount);
+    fireEvent.click(screen.getByTestId("settings-archive-worktree-paths-save"));
+    await waitFor(() =>
+      expect(mocks.authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/me/preferences/worktree_archive",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({
+            value: {
+              mode: "green_only",
+              ask_before_archive: true,
+              rebuildable_paths: ["node_modules/", ".generated/"],
+            },
+          }),
+        }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    await waitFor(() =>
+      expect(mocks.authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/me/preferences/worktree_archive",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({
+            value: {
+              mode: "yellow_too",
+              ask_before_archive: true,
+              rebuildable_paths: ["node_modules/", ".generated/"],
+            },
+          }),
+        }),
+      ),
+    );
   });
 
   it("lists archived sessions and unarchives on click", () => {

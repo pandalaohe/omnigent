@@ -2643,13 +2643,15 @@ class UpdateSessionRequest(BaseModel):
         ``True`` locks it, ``False`` unlocks it, and ``None`` leaves the
         current lock unchanged. Owner-only.
     :param delete_worktree: Legacy archive request flag. Deletion still
-        requires the owner's ``worktree_archive`` preference to be
-        ``delete_safe`` and the host's safe cleanup checks. Rejected (400)
+        requires an effective archive tier permitting removal and the host's
+        safe cleanup checks. Rejected (400)
         without ``archived=True``.
     :param keep_worktree: Explicitly preserve this archive revision's bound
-        worktree even when the owner's preference is ``delete_safe`` and the
+        worktree even when the owner's preference permits cleanup and the
         directory becomes clean after the caller's warning. Requires
         ``archived=True``.
+    :param worktree_archive_mode: Optional tier for this archive request only;
+        leaves the saved account preference unchanged.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2686,6 +2688,7 @@ class UpdateSessionRequest(BaseModel):
     archive_locked: bool | None = None
     delete_worktree: bool = False
     keep_worktree: bool = False
+    worktree_archive_mode: Literal["never", "green_only", "yellow_too"] | None = None
     project_id: str | None = None
     silent: bool = False
     stop_when_idle: bool = False
