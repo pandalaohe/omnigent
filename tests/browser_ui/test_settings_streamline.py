@@ -432,5 +432,10 @@ def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
     for width in (1440, 390):
         page.set_viewport_size({"width": width, "height": 900})
         tokens.evaluate("element => element.scrollIntoView({block: 'center'})")
+        if width == 390:
+            expect(page.locator('[data-sidebar-open="true"]')).to_have_count(0)
+            expect(page.get_by_test_id("settings-nav-general")).not_to_be_in_viewport()
+            tokens.click()
+            tokens.blur()
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         page.screenshot(path=str(output / f"buffer-manual-{width}.png"), full_page=True)
