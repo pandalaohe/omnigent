@@ -274,6 +274,42 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.queryByLabelText(/of context used/)).toBeNull();
   });
 
+  it("uses the selected manual percentage for the compact ring", () => {
+    localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
+    const sourceKey = usageContextSourceKey({
+      hostId: "",
+      agentName: "polly",
+      harness: "pi",
+      model: "model-a",
+    });
+    localStorage.setItem(
+      USAGE_CONTEXT_STORAGE_KEY,
+      JSON.stringify({
+        version: 5,
+        showProviderUsageLimits: true,
+        overrides: {
+          [sourceKey]: {
+            contextWindowTokens: 100_000,
+            autoCompactBufferTokens: 50_000,
+            autoCompactBufferPercent: 20,
+            compactBufferMode: "percent",
+          },
+        },
+        lastProviderUsageLimits: {},
+      }),
+    );
+    useChatStore.setState({
+      contextWindow: 100_000,
+      autoCompactTokenLimit: 70_000,
+      tokensUsed: 20_000,
+      boundAgentName: "polly",
+      sessionHarness: "pi",
+      llmModel: "model-a",
+    });
+    renderComposer();
+    expect(screen.getByLabelText("25% of compact budget used")).toBeInTheDocument();
+  });
+
   it("keeps the compact tooltip to token counts without repeating the percentage", async () => {
     localStorage.setItem(CONTEXT_INDICATOR_STORAGE_KEY, "compact");
     useChatStore.setState({

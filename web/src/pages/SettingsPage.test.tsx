@@ -591,11 +591,12 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("keeps compact progress and usage status in their own section", () => {
+  it("opens the moved context controls from the old deep link", async () => {
     renderPage("/settings/context-usage");
-    const toggle = screen.getByTestId("compact-progress-indicator-toggle");
+    const toggle = await screen.findByTestId("compact-progress-indicator-toggle");
 
-    expect(screen.getByRole("heading", { name: "Context & usage" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Display & usage" })).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("/settings/general");
     expect(screen.getByTestId("context-usage-settings")).toHaveTextContent(
       "Context source and overrides",
     );
@@ -611,13 +612,14 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem(CONTEXT_INDICATOR_STORAGE_KEY)).toBe("compact");
   });
 
-  it("renders Host CLI retention in Runtime & resources", () => {
+  it("opens Host CLI retention from the old deep link", async () => {
     renderPage("/settings/runtime-resources");
 
-    expect(screen.getByRole("heading", { name: "Runtime & resources" })).toBeInTheDocument();
-    expect(screen.getByTestId("cli-retention-settings")).toHaveTextContent(
+    expect(screen.getByRole("heading", { name: "Background processes" })).toBeInTheDocument();
+    expect(await screen.findByTestId("cli-retention-settings")).toHaveTextContent(
       "Host-scoped idle CLI retention",
     );
+    expect(screen.getByTestId("location")).toHaveTextContent("/settings/general");
   });
 
   it("keeps polling and mobile controls together under shortcuts", () => {
@@ -952,9 +954,14 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
   });
 
-  it("resets every appearance preference back to product defaults", () => {
+  it("resets device theme, layout and typography without clearing harness or panel widths", () => {
     localStorage.clear();
+    localStorage.setItem(
+      "omnigent:panel-size-preferences",
+      JSON.stringify({ inlinePanelWidthPx: 640, inlinePanelChatReserveWidthPx: 720 }),
+    );
     renderPage("/settings/appearance");
+    expect(screen.getByRole("spinbutton", { name: "Chat reserve width" })).toHaveValue(720);
 
     // Tweak a representative set of appearance preferences.
     mocks.theme = "dark";
@@ -966,8 +973,12 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    fireEvent.click(
+      screen.getByRole("switch", {
+        name: "Use last explicitly selected right rail tab for new sessions",
+      }),
+    );
     fireEvent.click(screen.getByTestId("widen-workspace-for-content-toggle"));
-    fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -986,9 +997,11 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
+    expect(localStorage.getItem("omnigent:new-session-inherit-right-rail-tab")).toBe("0");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+    localStorage.setItem("omnigent:hide-unconfigured-harnesses", "true");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -1012,7 +1025,7 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
+    // Terminal theme, transcript view and workspace defaults are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
@@ -1027,10 +1040,17 @@ describe("SettingsPage", () => {
       "true",
     );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
-    expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+    expect(localStorage.getItem("omnigent:new-session-inherit-right-rail-tab")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("omnigent:panel-size-preferences") ?? "{}")).toEqual({
+      inlinePanelWidthPx: 640,
+    });
+    expect(screen.getByRole("spinbutton", { name: "Chat reserve width" })).toHaveValue(600);
+    expect(
+      screen.getByRole("switch", {
+        name: "Use last explicitly selected right rail tab for new sessions",
+      }),
+    ).toBeChecked();
+    expect(localStorage.getItem("omnigent:hide-unconfigured-harnesses")).toBe("true");
     expect(screen.getByTestId("widen-workspace-for-content-toggle")).toHaveAttribute(
       "aria-checked",
       "true",

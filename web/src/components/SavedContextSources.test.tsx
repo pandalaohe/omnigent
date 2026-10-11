@@ -37,6 +37,7 @@ function renderSources(options: {
   preferences: UsageContextPreferences;
   currentSourceKey?: string;
   currentOverride?: UsageContextOverride;
+  reportedContextWindow?: number | null;
 }) {
   return render(
     <SavedContextSources
@@ -44,6 +45,7 @@ function renderSources(options: {
       currentSourceKey={options.currentSourceKey ?? ""}
       hosts={HOSTS}
       currentOverride={options.currentOverride ?? override(null, null)}
+      reportedContextWindow={options.reportedContextWindow}
     />,
   );
 }
@@ -263,6 +265,202 @@ describe("SavedContextSources", () => {
     expect(saved[claude]).toEqual({
       contextWindowTokens: 200_000,
       autoCompactBufferTokens: 20_000,
+    });
+  });
+
+  it("retains a saved token buffer when editing its percentage and rejects a smaller total", () => {
+    renderSources({ preferences: preferencesWith({ [polly]: override(100_000, 20_000) }) });
+    fireEvent.click(screen.getByRole("button", { name: "Edit Alpha polly model-a" }));
+    const context = screen.getByLabelText("Edit context total");
+    fireEvent.change(context, { target: { value: "20000" } });
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("less than the context total");
+    fireEvent.change(context, { target: { value: "100000" } });
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Edit buffer unit" })).getByRole("button", {
+        name: "Percent",
+      }),
+    );
+    const percent = screen.getByLabelText("Edit compact buffer percent");
+    fireEvent.change(percent, { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readUsageContextPreferences().overrides[polly]).toEqual({
+      contextWindowTokens: 100_000,
+      autoCompactBufferTokens: 20_000,
+      autoCompactBufferPercent: 10,
+      compactBufferMode: "percent",
+    });
+  });
+
+  it("rejects a saved row buffer at the known current source's reported total", () => {
+    renderSources({
+      preferences: preferencesWith({ [polly]: override(null, 20_000) }),
+      currentSourceKey: polly,
+      reportedContextWindow: 100_000,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Edit Alpha polly model-a" }));
+    fireEvent.change(screen.getByLabelText("Edit compact buffer"), { target: { value: "100000" } });
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(readUsageContextPreferences().overrides).toEqual({});
+  });
+
+  it("rejects a batch buffer at the known current source's reported total", () => {
+    renderSources({
+      preferences: preferencesWith({ [polly]: override(null, 20_000) }),
+      currentSourceKey: polly,
+      reportedContextWindow: 100_000,
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
+    fireEvent.change(screen.getByLabelText("Compact buffer"), { target: { value: "100000" } });
+    expect(screen.getByRole("button", { name: "Apply to 1 selected" })).toBeDisabled();
+    expect(readUsageContextPreferences().overrides).toEqual({});
+  });
+
+  it("applies zero percent to selected sources without copying their token buffers", () => {
+    renderSources({
+      preferences: preferencesWith({
+        [polly]: override(100_000, 20_000),
+        [claude]: override(200_000, 30_000),
+      }),
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all shown" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Selected buffer unit" })).getByRole("button", {
+        name: "Percent",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 2 selected" }));
+    expect(readUsageContextPreferences().overrides[polly]).toEqual({
+      contextWindowTokens: 100_000,
+      autoCompactBufferTokens: 20_000,
+      autoCompactBufferPercent: 0,
+      compactBufferMode: "percent",
+    });
+    expect(readUsageContextPreferences().overrides[claude]).toEqual({
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: 30_000,
+      autoCompactBufferPercent: 0,
+      compactBufferMode: "percent",
+    });
+  });
+
+  it("rejects a batch context total that would meet a selected source's token buffer", () => {
+    renderSources({
+      preferences: preferencesWith({
+        [polly]: override(100_000, 20_000),
+        [claude]: override(200_000, 30_000),
+      }),
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all shown" }));
+    fireEvent.change(screen.getByLabelText("Context total"), { target: { value: "30000" } });
+    expect(screen.getByRole("button", { name: "Apply to 2 selected" })).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("less than every selected context total");
+    expect(readUsageContextPreferences().overrides).toEqual({});
+  });
+
+  it("applies the visible Percent unit to a token source in the next batch", () => {
+    writeUsageContextPreferences(
+      preferencesWith({
+        [polly]: override(100_000, 20_000),
+        [claude]: override(200_000, 30_000),
+      }),
+    );
+    render(<LiveSources />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Selected buffer unit" })).getByRole("button", {
+        name: "Percent",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+    expect(readUsageContextPreferences().overrides[claude]).toMatchObject({
+      autoCompactBufferTokens: 30_000,
+      autoCompactBufferPercent: 5,
+      compactBufferMode: "percent",
+    });
+  });
+
+  it("applies the visible Tokens unit to a percent source in the next batch", () => {
+    writeUsageContextPreferences(
+      preferencesWith({
+        [polly]: override(100_000, 20_000),
+        [claude]: {
+          ...override(200_000, 30_000),
+          autoCompactBufferPercent: 5,
+          compactBufferMode: "percent",
+        },
+      }),
+    );
+    render(<LiveSources />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
+    fireEvent.change(screen.getByLabelText("Compact buffer"), { target: { value: "10000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.change(screen.getByLabelText("Compact buffer"), { target: { value: "4000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+    expect(readUsageContextPreferences().overrides[claude]).toMatchObject({
+      autoCompactBufferTokens: 4_000,
+      autoCompactBufferPercent: 5,
+      compactBufferMode: "tokens",
+    });
+  });
+
+  it("applies the visible Percent unit when Auto is chosen in the next batch", () => {
+    writeUsageContextPreferences(
+      preferencesWith({
+        [polly]: override(100_000, 20_000),
+        [claude]: override(200_000, 30_000),
+      }),
+    );
+    render(<LiveSources />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha polly model-a" }));
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Selected buffer unit" })).getByRole("button", {
+        name: "Percent",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("Compact buffer percent"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Alpha claude opus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Auto compact buffer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+    expect(readUsageContextPreferences().overrides[claude]).toEqual({
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: 30_000,
+      compactBufferMode: "percent",
+    });
+  });
+
+  it("keeps each selected source's buffer unit when a batch changes only context total", () => {
+    const preferences = preferencesWith({
+      [polly]: override(100_000, 20_000),
+      [claude]: {
+        ...override(200_000, 30_000),
+        autoCompactBufferPercent: 5,
+        compactBufferMode: "percent",
+      },
+    });
+    renderSources({ preferences });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all shown" }));
+    fireEvent.change(screen.getByLabelText("Context total"), { target: { value: "300000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 2 selected" }));
+    expect(readUsageContextPreferences().overrides[polly]).toEqual({
+      contextWindowTokens: 300_000,
+      autoCompactBufferTokens: 20_000,
+    });
+    expect(readUsageContextPreferences().overrides[claude]).toEqual({
+      contextWindowTokens: 300_000,
+      autoCompactBufferTokens: 30_000,
+      autoCompactBufferPercent: 5,
+      compactBufferMode: "percent",
     });
   });
 

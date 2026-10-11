@@ -175,6 +175,93 @@ async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
     assert body["updated_at"] is not None
 
 
+async def test_patch_calling_defaults_changes_only_selected_fields(
+    project_client: httpx.AsyncClient,
+) -> None:
+    original = {
+        "workspace": "/opt/work/example",
+        "base_branch": "main",
+        "calling_defaults": {
+            "h1": {
+                "agent_id": "ag_keep",
+                "harnesses": {
+                    "codex": {"model": "old", "effort": "high"},
+                    "claude-native": {"model": "sonnet"},
+                },
+            },
+            "h2": {"harnesses": {"codex": {"model": "other-host"}}},
+        },
+    }
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "config": original})
+    ).json()
+    response = await project_client.patch(
+        f"/v1/projects/{created['id']}/calling-defaults",
+        json={
+            "expected_revision": created["config_revision"],
+            "host_id": "h1",
+            "harness": "codex",
+            "fields": {"model": None, "permission": "read-only"},
+        },
+    )
+    assert response.status_code == 200
+    expected = {
+        **original,
+        "calling_defaults": {
+            **original["calling_defaults"],
+            "h1": {
+                "agent_id": "ag_keep",
+                "harnesses": {
+                    "codex": {"effort": "high", "permission": "read-only"},
+                    "claude-native": {"model": "sonnet"},
+                },
+            },
+        },
+    }
+    assert response.json()["config"] == expected
+    assert (await project_client.get(f"/v1/projects/{created['id']}")).json()["config"] == expected
+
+
+async def test_patch_calling_defaults_rejects_stale_revision_and_invalid_field(
+    project_client: httpx.AsyncClient,
+) -> None:
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "config": {"workspace": "/opt/work/example"}}
+        )
+    ).json()
+    path = f"/v1/projects/{created['id']}/calling-defaults"
+    stale = created["config_revision"]
+    changed = await project_client.patch(
+        f"/v1/projects/{created['id']}",
+        json={"config": {"workspace": "/opt/work/changed"}},
+    )
+    assert changed.status_code == 200
+    conflict = await project_client.patch(
+        path,
+        json={
+            "expected_revision": stale,
+            "host_id": "h1",
+            "harness": "codex",
+            "fields": {"model": "m"},
+        },
+    )
+    assert conflict.status_code == 409
+    invalid = await project_client.patch(
+        path,
+        json={
+            "expected_revision": changed.json()["config_revision"],
+            "host_id": "h1",
+            "harness": "codex",
+            "fields": {"workspace": "/opt/work/other"},
+        },
+    )
+    assert invalid.status_code == 422
+    assert (await project_client.get(f"/v1/projects/{created['id']}")).json()["config"] == {
+        "workspace": "/opt/work/changed"
+    }
+
+
 async def test_patch_without_config_preserves_it(project_client: httpx.AsyncClient) -> None:
     """A PATCH that omits config (e.g. a rename) leaves the stored config intact."""
     created = (

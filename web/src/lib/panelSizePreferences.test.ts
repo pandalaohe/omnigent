@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   readPanelSizePreference,
   readPanelSizePreferences,
+  readInlinePanelChatReserveWidth,
   writePanelSizePreference,
 } from "./panelSizePreferences";
 
@@ -12,6 +13,21 @@ afterEach(() => {
 });
 
 describe("panelSizePreferences", () => {
+  it("validates the browser chat reserve without changing remembered widths", () => {
+    expect(readInlinePanelChatReserveWidth()).toBe(600);
+    writePanelSizePreference("inlinePanelWideWidthPx", 840);
+    writePanelSizePreference("inlinePanelChatReserveWidthPx", 800);
+    expect(readInlinePanelChatReserveWidth()).toBe(800);
+    for (const invalid of [0, 479, 1201, 600.5, NaN]) {
+      writePanelSizePreference("inlinePanelChatReserveWidthPx", invalid);
+      expect(readInlinePanelChatReserveWidth()).toBe(800);
+    }
+    expect(readPanelSizePreference("inlinePanelWideWidthPx")).toBe(840);
+    writePanelSizePreference("inlinePanelChatReserveWidthPx", null);
+    expect(readInlinePanelChatReserveWidth()).toBe(600);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ inlinePanelChatReserveWidthPx: 2000 }));
+    expect(readInlinePanelChatReserveWidth()).toBe(600);
+  });
   it("returns an empty object when nothing is stored", () => {
     // Empty storage must be a clean "no preferences yet" state, not an error.
     expect(readPanelSizePreferences()).toEqual({});

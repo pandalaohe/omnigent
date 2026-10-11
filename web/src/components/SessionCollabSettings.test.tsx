@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import { readHostColorPreferences } from "@/lib/hostColorPreferences";
 import { readSessionCollabPreferences } from "@/lib/sessionCollabPreferences";
-import { SessionCollabSettings } from "./SessionCollabSettings";
+import { HostColorsSettings, SessionCollabSettings } from "./SessionCollabSettings";
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
@@ -58,19 +58,6 @@ describe("SessionCollabSettings", () => {
     expect(screen.getByRole("switch", { name: "Timed flows" })).toBeDisabled();
   });
 
-  it("points at the Keep-warm settings section instead of the old controls", () => {
-    renderSettings();
-
-    expect(screen.queryByRole("switch", { name: "Keep idle children warm" })).toBeNull();
-    expect(screen.getByTestId("keep-warm-moved")).toHaveTextContent(
-      "Keep-warm moved to Settings > Keep-warm",
-    );
-    expect(screen.getByRole("link", { name: "Settings > Keep-warm" })).toHaveAttribute(
-      "href",
-      "/settings/keep-warm",
-    );
-  });
-
   it("writes a valid relay depth while typing", () => {
     renderSettings();
     const input = screen.getByLabelText("Relay depth limit");
@@ -109,7 +96,11 @@ describe("SessionCollabSettings", () => {
   });
 
   it("renders a colour row per host, automatic until a swatch is picked", () => {
-    renderSettings();
+    render(
+      <MemoryRouter>
+        <HostColorsSettings />
+      </MemoryRouter>,
+    );
 
     const rows = screen.getAllByTestId("host-color-row");
     expect(rows).toHaveLength(2);
@@ -121,7 +112,11 @@ describe("SessionCollabSettings", () => {
   });
 
   it("picks one host colour and resets it to automatic", () => {
-    renderSettings();
+    render(
+      <MemoryRouter>
+        <HostColorsSettings />
+      </MemoryRouter>,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "TMB colour: purple" }));
 

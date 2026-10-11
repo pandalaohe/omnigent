@@ -84,6 +84,19 @@ afterEach(() => {
 });
 
 describe("CallingDefaultsSection", () => {
+  it("keeps a saved offline host editable", async () => {
+    mocks.hosts = [{ ...HOST, status: "offline" }];
+    localStorage.setItem(DEFAULTS_KEY, JSON.stringify({ "host-a": { "codex-native": {} } }));
+    render(<CallingDefaultsSection />);
+
+    expect(screen.getByTestId("calling-defaults-host-host-a")).toHaveTextContent("offline");
+    expect(screen.getByTestId("calling-defaults-row-codex-native")).toBeInTheDocument();
+    await pickOption("calling-defaults-model-codex-native", "GPT-6-Astra");
+    await waitFor(() =>
+      expect(readMaster()["host-a"]["codex-native"]).toEqual({ model: "gpt-6-astra" }),
+    );
+  });
+
   it("adds, edits, and deletes a harness row", async () => {
     render(<CallingDefaultsSection />);
 

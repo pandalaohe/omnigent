@@ -71,6 +71,92 @@ describe("usage/context preferences", () => {
     });
   });
 
+  it("uses a saved percentage as the compact denominator and retains zero", () => {
+    const preferences = {
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: {
+        [source]: {
+          contextWindowTokens: 100_000,
+          autoCompactBufferTokens: 15_000,
+          autoCompactBufferPercent: 20,
+          compactBufferMode: "percent" as const,
+        },
+      },
+    };
+    writeUsageContextPreferences(preferences);
+    const saved = readUsageContextPreferences();
+    expect(saved.overrides[source]).toEqual(preferences.overrides[source]);
+    expect(queueUserPreferencePatch).toHaveBeenCalledWith("usage_context", saved);
+    expect(resolveUsageContextLimits(saved, source, 90_000, 72_000)).toEqual({
+      contextWindow: 100_000,
+      autoCompactTokenLimit: 80_000,
+    });
+    writeUsageContextOverride(saved, source, {
+      ...saved.overrides[source],
+      autoCompactBufferPercent: 10,
+    });
+    expect(
+      resolveUsageContextLimits(readUsageContextPreferences(), source, 90_000, 72_000)
+        .autoCompactTokenLimit,
+    ).toBe(90_000);
+    writeUsageContextOverride(readUsageContextPreferences(), source, {
+      ...readUsageContextPreferences().overrides[source],
+      autoCompactBufferPercent: 0,
+      autoCompactBufferTokens: 0,
+    });
+    expect(readUsageContextPreferences().overrides[source]).toMatchObject({
+      autoCompactBufferPercent: 0,
+      autoCompactBufferTokens: 0,
+    });
+    expect(
+      resolveUsageContextLimits(readUsageContextPreferences(), source, 90_000, 72_000)
+        .autoCompactTokenLimit,
+    ).toBe(100_000);
+  });
+
+  it("migrates a token-only source without changing its compact behavior", () => {
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({
+        version: 5,
+        showProviderUsageLimits: true,
+        overrides: { [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 20_000 } },
+        lastProviderUsageLimits: {},
+      }),
+    );
+    const preferences = readUsageContextPreferences();
+    expect(preferences.overrides[source]).toEqual({
+      contextWindowTokens: 100_000,
+      autoCompactBufferTokens: 20_000,
+    });
+    expect(resolveUsageContextLimits(preferences, source, 90_000, 70_000)).toEqual({
+      contextWindow: 100_000,
+      autoCompactTokenLimit: 80_000,
+    });
+  });
+
+  it("drops invalid percentages without erasing a valid token buffer", () => {
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({
+        version: 5,
+        overrides: {
+          [source]: {
+            contextWindowTokens: 100_000,
+            autoCompactBufferTokens: 20_000,
+            autoCompactBufferPercent: 100,
+            compactBufferMode: "tokens",
+          },
+        },
+      }),
+    );
+    expect(readUsageContextPreferences().overrides[source]).toEqual({
+      contextWindowTokens: 100_000,
+      autoCompactBufferTokens: 20_000,
+      compactBufferMode: "tokens",
+    });
+  });
+
   it("does not leak a manual override into a different Host or model", () => {
     writeUsageContextPreferences({
       version: 5,

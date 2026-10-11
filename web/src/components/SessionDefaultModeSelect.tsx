@@ -24,6 +24,7 @@ export function SessionDefaultModeSelect({
   model = null,
   onOpenChange,
   onChange,
+  inheritLabel = "Default",
 }: {
   harness: string;
   field: "speed" | "permission";
@@ -35,6 +36,7 @@ export function SessionDefaultModeSelect({
   model?: string | null;
   onOpenChange?: (open: boolean) => void;
   onChange: (value: string | null) => void;
+  inheritLabel?: string;
 }) {
   const options = sessionDefaultModeOptions(harness, field, models, model);
   if (options.length === 0) return null;
@@ -53,7 +55,7 @@ export function SessionDefaultModeSelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value="__default__">Default</SelectItem>
+        <SelectItem value="__default__">{inheritLabel}</SelectItem>
         {!available && selected && (
           <SelectItem value={selected} disabled>
             Unavailable ({value})

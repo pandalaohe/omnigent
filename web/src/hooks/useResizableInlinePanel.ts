@@ -15,7 +15,13 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import {
+  CHAT_RESERVE_DEFAULT_PX,
+  readInlinePanelChatReserveWidth,
+  readPanelSizePreference,
+  subscribePanelSizePreferences,
+  writePanelSizePreference,
+} from "@/lib/panelSizePreferences";
 import { browserViewOwnerId } from "@/hooks/useBrowserTabs";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
@@ -27,7 +33,6 @@ const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.99;
 /** The center chat column never shrinks past this, whatever the rail wants. */
 const CHAT_MIN_WIDTH_PX = 480;
-const CHAT_READING_WIDTH_PX = 600;
 const BROWSER_TARGET_WIDTH_PX = 1024;
 /** Visual gap between the chat column and the rail. */
 const GAP_PX = 8;
@@ -55,7 +60,12 @@ function wideDefaultWidthPx(normal: number, reservedPx: number): number {
 // Width the panel may not eat into: the sidebar when it's open. Passed down
 // from AppShell so opening the sidebar tightens the ceiling instead of
 // squeezing the chat.
-function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
+function clamp(
+  w: number,
+  minPx = MIN_WIDTH_PX,
+  reservedPx = 0,
+  chatMinPx = CHAT_MIN_WIDTH_PX,
+): number {
   // No viewport ceiling available off the DOM (SSR / node test env) — this runs
   // during render, so guard before reading `window` to avoid a hard throw.
   if (typeof window === "undefined") return Math.max(minPx, w);
@@ -65,10 +75,10 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
     0,
     Math.min(
       window.innerWidth * MAX_WIDTH_RATIO,
-      window.innerWidth - reservedPx - CHAT_MIN_WIDTH_PX - GAP_PX,
+      window.innerWidth - reservedPx - chatMinPx - GAP_PX,
     ),
   );
-  // The chat's 480px floor wins over the panel's own comfort minimum: when the
+  // The chat's width floor wins over the panel's own comfort minimum: when the
   // viewport (with the sidebar open) is too small to grant both, the panel
   // yields below `minPx` rather than let the chat break its minimum. Clamping
   // the floor to the ceiling keeps the range valid so `Math.max` can't push the
@@ -218,6 +228,11 @@ export function useResizableInlinePanel(
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   const rawWide = useSyncExternalStore(subscribe, getWideSnapshot, getServerSnapshot);
   const rawBrowser = useSyncExternalStore(subscribe, getBrowserSnapshot, getServerSnapshot);
+  const chatReserve = useSyncExternalStore(
+    subscribePanelSizePreferences,
+    readInlinePanelChatReserveWidth,
+    () => CHAT_RESERVE_DEFAULT_PX,
+  );
   const widenEnabled = useSyncExternalStore(
     subscribeWidenWorkspaceForContent,
     readWidenWorkspaceForContent,
@@ -246,13 +261,18 @@ export function useResizableInlinePanel(
     const opening = browser?.open && !previousBrowser.current.open;
     if (!browser?.maximized && browser?.open && (savedWidth === undefined || opening)) {
       const available = typeof window === "undefined" ? Infinity : window.innerWidth - reservedPx;
-      contentWidth = Math.max(
-        previousWidth.current === null
-          ? clamp(normalWidth, minWidthPx, reservedPx)
-          : opening
-            ? 0
-            : previousWidth.current,
-        Math.min(rawBrowser ?? BROWSER_TARGET_WIDTH_PX, available - CHAT_READING_WIDTH_PX),
+      contentWidth = clamp(
+        Math.max(
+          previousWidth.current === null
+            ? clamp(normalWidth, minWidthPx, reservedPx)
+            : opening
+              ? 0
+              : previousWidth.current,
+          Math.min(rawBrowser ?? BROWSER_TARGET_WIDTH_PX, available - chatReserve - GAP_PX),
+        ),
+        minWidthPx,
+        reservedPx,
+        chatReserve,
       );
     } else {
       contentWidth = savedWidth ?? previousWidth.current ?? normalWidth;
@@ -260,7 +280,11 @@ export function useResizableInlinePanel(
   }
   // Clamped at render time only — the stores keep the user's preferred widths,
   // so a temporary squeeze (sidebar opening) is undone when the space returns.
-  const resolvedWidth = clamp(contentWidth, minWidthPx, reservedPx);
+  const resolvedWidth = clamp(
+    contentWidth,
+    browserId !== null && contentWidth < MIN_WIDTH_PX ? contentWidth : minWidthPx,
+    reservedPx,
+  );
   // Drives the drag listeners' lifecycle: they mount only while a drag is
   // live, so there's no idle window-level mousemove handler firing during
   // ordinary page use.

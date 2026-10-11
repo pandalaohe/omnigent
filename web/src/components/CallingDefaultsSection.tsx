@@ -1,5 +1,5 @@
-// Settings › Calling defaults: the per-host × harness master table of model /
-// effort defaults, the model-catalog sync that fills its dropdowns, and the
+// Settings › Harnesses: the per-host × harness master table of calling defaults,
+// the model-catalog sync that fills its dropdowns, and the
 // web-only carry-over switch. The resolution chain itself is server-side; this
 // surface edits only the master layer and the cached catalogs.
 
@@ -677,11 +677,28 @@ export function CallingDefaultsSection() {
           {error}
         </p>
       )}
+      <div className="space-y-2 text-sm text-muted-foreground">
+        <p>
+          Model, effort, speed and permission are resolved separately: explicit choice → project on
+          this host and harness → this master table → SDK&apos;s Native project and master defaults
+          → the Agent or harness default. A matching legacy project model can also take precedence
+          over the master model.
+        </p>
+        <p>
+          New Chat can reuse the last Agent, model, effort and speed for a project on this host;
+          permission is resolved independently. Ordinary child sessions use the parent&apos;s
+          project and host as context, without copying its running model. Named members use their
+          saved settings and snapshot; empty model or effort can inherit when that snapshot is made.
+          Smart Routing skips fixed model, effort, speed and permission defaults on automatic
+          routes.
+        </p>
+      </div>
       <div className="flex min-w-0 items-start justify-between gap-6">
         <div className="min-w-0 flex-1">
           <span className="text-ui font-medium">Carry over last settings</span>
           <span className="mt-0.5 block text-sm text-muted-foreground">
-            New Chat in a project starts from the model and effort you last used on that host.
+            When enabled, New Chat reuses the last Agent, model, effort and speed for this project
+            and host. It does not save permission.
           </span>
         </div>
         <Switch

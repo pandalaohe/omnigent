@@ -260,7 +260,7 @@ describe("Workspace rail content width", () => {
 
   it.each([
     [1920, "1024px"],
-    [1440, "560px"],
+    [1440, "552px"],
   ])("sizes only browser tabs at a %i px viewport with the sidebar open", (viewport, expected) => {
     setInnerWidth(viewport);
     writePanelSizePreference("sidebarWidthPx", 280);
@@ -277,7 +277,7 @@ describe("Workspace rail content width", () => {
     expect(screen.getByTestId("sidebar-width")).toHaveTextContent("280");
     const handle = screen.getByRole("separator", { name: "Resize panel" });
     fireEvent.keyDown(handle, { key: "ArrowRight" });
-    const draggedWidth = viewport === 1920 ? "1004px" : "540px";
+    const draggedWidth = viewport === 1920 ? "1004px" : "532px";
     expect(rail().style.width).toBe(draggedWidth);
     fireEvent.click(screen.getByRole("tab", { name: "Browser 2" }));
     fireEvent.keyDown(handle, { key: "ArrowRight" });
@@ -293,7 +293,7 @@ describe("Workspace rail content width", () => {
     expect(rail().style.width).toBe(draggedWidth);
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
-    expect(rail().style.width).toBe(viewport === 1920 ? "984px" : "520px");
+    expect(rail().style.width).toBe(viewport === 1920 ? "984px" : "512px");
   });
 
   it("widens for an opened file and returns to the normal width on another tab", () => {

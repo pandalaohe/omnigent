@@ -5631,3 +5631,22 @@ class UpdateProjectRequest(BaseModel):
         if len(trimmed) > 100:
             raise ValueError("name must be at most 100 characters")
         return trimmed
+
+
+class PatchProjectCallingDefaultsRequest(BaseModel):
+    """Revision-checked changes to one project's host and harness defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    host_id: str = Field(min_length=1)
+    harness: str = Field(min_length=1)
+    fields: dict[Literal["model", "effort", "speed", "permission"], str | None]
+    copy_agent: bool = False
+    agent_id: str | None = None
+
+    @model_validator(mode="after")
+    def _require_change(self) -> Self:
+        if not self.fields and not self.copy_agent:
+            raise ValueError("At least one field or agent change is required")
+        return self

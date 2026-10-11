@@ -8,6 +8,7 @@ import {
   readCallingDefaults,
   readCallingLast,
   readCallingLastEnabled,
+  resolveProjectInheritedField,
   recordCallingLast,
   removeCallingDefaultEntry,
   setCallingDefaultField,
@@ -24,6 +25,43 @@ afterEach(() => {
 });
 
 describe("calling_defaults master table", () => {
+  it("resolves legacy model and SDK Native fallback with their real sources", () => {
+    const master = {
+      h1: {
+        codex: { model: "sdk-master", effort: "medium" },
+        "codex-native": { model: "native-master", speed: "fast", permission: "read-only" },
+      },
+    };
+    const config = {
+      agent_id: "ag_codex",
+      model: "project-wide",
+      calling_defaults: {
+        h1: { harnesses: { "codex-native": { model: "native-project", effort: "high" } } },
+      },
+    };
+    expect(
+      resolveProjectInheritedField(config, master, "h1", "codex", "model", "ag_codex"),
+    ).toEqual({ value: "project-wide", source: "project_legacy" });
+    expect(resolveProjectInheritedField(config, master, "h1", "codex", "model", "another")).toEqual(
+      { value: "sdk-master", source: "master" },
+    );
+    expect(
+      resolveProjectInheritedField(config, master, "h1", "codex", "effort", "another"),
+    ).toEqual({ value: "medium", source: "master" });
+    expect(
+      resolveProjectInheritedField(
+        config,
+        { h1: { "codex-native": master.h1["codex-native"] } },
+        "h1",
+        "codex",
+        "model",
+        "another",
+      ),
+    ).toEqual({ value: "native-project", source: "project_host_native" });
+    expect(
+      resolveProjectInheritedField(config, master, "h1", "codex", "permission", "another"),
+    ).toEqual({ value: "read-only", source: "master_native" });
+  });
   it("treats a malformed table as empty and drops malformed entries", () => {
     localStorage.setItem(DEFAULTS_KEY, '"nope"');
     expect(readCallingDefaults()).toEqual({});

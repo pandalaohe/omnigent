@@ -13,8 +13,10 @@ Projects have no ACL of their own (PRD §9): every method is scoped by
 from __future__ import annotations
 
 import builtins
+import hashlib
+import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
@@ -23,6 +25,12 @@ from omnigent.entities import Project
 class ProjectOrderPreference(TypedDict):
     sort_mode: Literal["alphabetical", "manual"]
     ordered_project_ids: list[str] | None
+
+
+def project_config_revision(config: dict[str, Any]) -> str:
+    """Content revision independent of the project's second-granularity timestamp."""
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class ProjectStore(ABC):
@@ -112,6 +120,22 @@ class ProjectStore(ABC):
         :raises OmnigentError: ``ALREADY_EXISTS`` if the new name collides with
             another of the owner's projects.
         """
+        ...
+
+    @abstractmethod
+    def patch_calling_defaults(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        expected_revision: str,
+        host_id: str,
+        harness: str,
+        fields: Mapping[Literal["model", "effort", "speed", "permission"], str | None],
+        agent_id: str | None = None,
+        copy_agent: bool = False,
+    ) -> Project | None:
+        """Patch selected host/harness fields after checking the config revision."""
         ...
 
     @abstractmethod

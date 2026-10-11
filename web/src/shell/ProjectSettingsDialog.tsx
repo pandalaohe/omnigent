@@ -36,7 +36,15 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isSdkAgent, selectableSessionAgents } from "@/lib/agentGrouping";
-import { CALLING_DEFAULT_HARNESSES, callingHarnessLabel } from "@/lib/callingDefaults";
+import {
+  CALLING_DEFAULT_HARNESSES,
+  callingHarnessLabel,
+  resolveProjectInheritedField,
+  setCallingDefaultField,
+  useCallingDefaults,
+  type CallingDefaultField,
+  type ProjectDefaultSource,
+} from "@/lib/callingDefaults";
 import {
   listCallingDefaultCatalogs,
   syncCallingDefaults,
@@ -58,11 +66,15 @@ import {
   createProject,
   deleteProjectEntry,
   getProjectCollaboration,
+  getProject,
+  listProjects,
   listProjectEntries,
+  patchProjectCallingDefaults,
   putProjectEntry,
   type PostBindResult,
   type ProjectConfig,
   type ProjectHostEntry,
+  type Project,
 } from "@/lib/projectsApi";
 import { ApiError } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
@@ -140,6 +152,18 @@ interface HostRowDraft extends DirectoryRow {
   harnesses: Record<string, HarnessSetDraft>;
 }
 
+interface CopySelection {
+  hostId: string;
+  harness: string;
+  source: Project;
+  targets: Project[];
+  checked: Record<string, boolean>;
+  fields: Record<CallingDefaultField, boolean>;
+  agent: boolean;
+  targetEntries: Record<string, ProjectHostEntry[] | null>;
+  entryErrors: Record<string, string>;
+}
+
 /**
  * Seed the directory rows from the project's stored entries. With no entry
  * yet, the config's legacy `workspace` stands in when it names a concrete
@@ -160,6 +184,20 @@ function seedDirectoryRows(entries: ProjectHostEntry[], config: ProjectConfig): 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sameDefaults(left: unknown, right: unknown): boolean {
+  const canonical = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (isRecord(value)) {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+  };
+  return canonical(left) === canonical(right);
 }
 
 function sanitizeHarnessSet(value: unknown): HarnessSetDraft {
@@ -310,6 +348,23 @@ function catalogModelLabel(
     (candidate) => candidate.id === model,
   );
   return option ? nativeModelLabel(option) : model;
+}
+
+const CALLING_FIELDS = ["model", "effort", "speed", "permission"] as const;
+const SOURCE_LABELS: Record<ProjectDefaultSource, string> = {
+  project_legacy: "project-wide setting",
+  master: "master table",
+  project_host_native: "project Native setting",
+  master_native: "master Native setting",
+  none: "harness default",
+};
+
+function inheritedLabel(
+  source: ProjectDefaultSource,
+  value: string | null,
+  label: string | null = null,
+): string {
+  return `Inherit ${SOURCE_LABELS[source]} · ${label ?? value ?? "automatic"}`;
 }
 
 /** The list row's chip: agent · model · effort, or the unset fallback. */
@@ -467,6 +522,7 @@ function HostModelSelect({
   onOpen,
   onOpenChange,
   onChange,
+  inheritLabel,
 }: {
   value: string | null;
   models: readonly NativeModelOption[];
@@ -475,6 +531,7 @@ function HostModelSelect({
   onOpen?: () => void;
   onOpenChange?: (open: boolean) => void;
   onChange: (model: string | null) => void;
+  inheritLabel?: string;
 }) {
   const options = models.map((model) => ({ id: model.id, label: nativeModelLabel(model) }));
   if (value && !options.some((option) => option.id === value)) {
@@ -494,7 +551,7 @@ function HostModelSelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+        <SelectItem value={MODEL_SELECT_DEFAULT}>{inheritLabel ?? "Default"}</SelectItem>
         {options.map((option) => (
           <SelectItem key={option.id} value={option.id}>
             <span className="block min-w-0 truncate" title={option.label}>
@@ -516,6 +573,7 @@ function HostEffortSelect({
   onOpen,
   onOpenChange,
   onChange,
+  inheritLabel,
 }: {
   value: string | null;
   levels: readonly string[];
@@ -524,6 +582,7 @@ function HostEffortSelect({
   onOpen?: () => void;
   onOpenChange?: (open: boolean) => void;
   onChange: (effort: string | null) => void;
+  inheritLabel?: string;
 }) {
   return (
     <Select
@@ -539,7 +598,7 @@ function HostEffortSelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+        <SelectItem value={EFFORT_SELECT_NONE}>{inheritLabel ?? "Default"}</SelectItem>
         {levels.map((level) => (
           <SelectItem key={level} value={level}>
             {normalizeEffortLabel(level)}
@@ -658,6 +717,16 @@ export function ProjectSettingsDialog({
   // a native harness with a model choice; NONE stores no default (unset key).
   const [model, setModel] = useState<string>(NONE);
   const [activeTab, setActiveTab] = useState("defaults");
+  const masterDefaults = useCallingDefaults();
+  const [copySelection, setCopySelection] = useState<CopySelection | null>(null);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const [copyResults, setCopyResults] = useState<string[]>([]);
+  const [copyFeedbackFor, setCopyFeedbackFor] = useState<string | null>(null);
+  const [masterSelection, setMasterSelection] = useState<{
+    hostId: string;
+    harness: string;
+  } | null>(null);
   const tabsId = useId();
   const { catalogs, ensureCatalog, refreshing } = useCallingDefaultCatalogs(open);
   // The single host-row set. A label-only folder has no stored project yet, so
@@ -693,6 +762,11 @@ export function ProjectSettingsDialog({
   useEffect(() => {
     if (open) {
       setActiveTab("defaults");
+      setCopySelection(null);
+      setMasterSelection(null);
+      setCopyResults([]);
+      setCopyMessage(null);
+      setCopyFeedbackFor(null);
       // Outcomes are dialog-session state; a refetch must not wipe a warning
       // the user still needs to see.
       setEntryHookOutcomes(new Map());
@@ -1093,6 +1167,293 @@ export function ProjectSettingsDialog({
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
+  const draftConfig: ProjectConfig = {
+    ...(stored ?? {}),
+    calling_defaults: buildCallingDefaults(hostRows),
+    agent_id: agentId ?? undefined,
+    model: model === NONE ? undefined : model,
+  };
+  const sourceSaved =
+    !isLoading &&
+    !entriesLoading &&
+    !loadFailed &&
+    !entriesLoadFailed &&
+    changedRows.length === 0 &&
+    removedHostIds.length === 0 &&
+    hostId === (stored?.host_id ?? NONE) &&
+    agentId === (stored?.agent_id ?? null) &&
+    model === (stored?.model ?? NONE) &&
+    worktreeOverride === stored?.use_worktree &&
+    baseBranch === (stored?.base_branch ?? "") &&
+    sameDefaults(
+      buildCallingDefaults(hostRows) ?? {},
+      buildCallingDefaults(seedHostRows([], stored ?? {})) ?? {},
+    );
+
+  const inheritedFor = (row: HostRowDraft, harness: string, field: CallingDefaultField) =>
+    resolveProjectInheritedField(
+      draftConfig,
+      masterDefaults,
+      row.hostId,
+      harness,
+      field,
+      row.agentId ?? agentId,
+    );
+
+  const planCopyTarget = (
+    selection: CopySelection,
+    target: Project,
+    targetEntries: ProjectHostEntry[] | null,
+  ) => {
+    const { hostId: sourceHost, harness, source } = selection;
+    const fields: Partial<Record<CallingDefaultField, string | null>> = {};
+    const skipped: string[] = [];
+    if (targetEntries === null) {
+      return { fields, skipped, copyAgent: false, blocked: "entry folders unavailable" };
+    }
+    const hasEntry =
+      targetEntries.some((entry) => entry.host_id === sourceHost && entry.workspace) ||
+      (target.config?.host_id === sourceHost && !!target.config.workspace);
+    if (!hasEntry) {
+      return { fields, skipped, copyAgent: false, blocked: "no entry folder on this host" };
+    }
+    const targetHost = hostsById.get(sourceHost);
+    if (!harnessReadinessOnHost(harness, targetHost).selectable) {
+      return {
+        fields,
+        skipped,
+        copyAgent: false,
+        blocked: "matching harness is unavailable on this host",
+      };
+    }
+    if (!target.config_revision) {
+      return { fields, skipped, copyAgent: false, blocked: "this server has no project revision" };
+    }
+    const sourceSet = source.config?.calling_defaults?.[sourceHost]?.harnesses?.[harness] ?? {};
+    const targetSet = target.config?.calling_defaults?.[sourceHost]?.harnesses?.[harness] ?? {};
+    const catalog = catalogFor(catalogs, sourceHost, harness);
+    const options = catalog?.models ?? [];
+    const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
+    let copyAgent = selection.agent;
+    if (copyAgent && sourceAgent) {
+      const selected = agentList.find((agent) => agent.id === sourceAgent);
+      if (
+        !selected ||
+        selectedHarnessFor(selected) !== harness ||
+        !agentUsableOnHost(selected, targetHost)
+      ) {
+        copyAgent = false;
+        skipped.push("Agent unavailable");
+      }
+    }
+    const targetAgent = copyAgent
+      ? (sourceAgent ?? target.config?.agent_id ?? null)
+      : (target.config?.calling_defaults?.[sourceHost]?.agent_id ??
+        target.config?.agent_id ??
+        null);
+    const inheritedModel = resolveProjectInheritedField(
+      target.config ?? {},
+      masterDefaults,
+      sourceHost,
+      harness,
+      "model",
+      targetAgent,
+    ).value;
+    let targetModel = targetSet.model ?? inheritedModel;
+    for (const field of CALLING_FIELDS) {
+      if (!selection.fields[field]) continue;
+      const value = sourceSet[field] ?? null;
+      if (value === null) {
+        fields[field] = null;
+        if (field === "model") targetModel = inheritedModel;
+        continue;
+      }
+      const supported =
+        field === "model"
+          ? !!catalog && catalog.error === null && catalogAccepts(catalog, value)
+          : field === "effort"
+            ? (effortLevelsFor(harness, options, targetModel ?? null)?.length ?? 0) > 0 &&
+              effortLevelsFor(harness, options, targetModel ?? null)?.includes(value) === true
+            : sessionDefaultModeOptions(harness, field, options, targetModel ?? null).length > 0 &&
+              sessionDefaultModeOptions(harness, field, options, targetModel ?? null).some(
+                (option) => option.value === value,
+              );
+      if (!supported) {
+        skipped.push(`${field} unavailable`);
+        continue;
+      }
+      fields[field] = value;
+      if (field === "model") targetModel = value;
+    }
+    return { fields, skipped, copyAgent, blocked: null };
+  };
+
+  const resetHarnessRow = (rowHostId: string, harness: string) => {
+    setHostRows((rows) =>
+      rows.map((row) => {
+        if (row.hostId !== rowHostId) return row;
+        const next = { ...row.harnesses };
+        Reflect.deleteProperty(next, harness);
+        return { ...row, harnesses: next };
+      }),
+    );
+  };
+
+  const openCopy = async (row: HostRowDraft, harness: string) => {
+    setCopyFeedbackFor(pairKey(row.hostId, harness));
+    if (projectId === null || !sourceSaved) {
+      setCopyMessage("Save this project's changes before applying its saved defaults.");
+      return;
+    }
+    setCopyMessage(null);
+    setCopyResults([]);
+    setCopyBusy(true);
+    try {
+      const [source, projects] = await Promise.all([getProject(projectId), listProjects()]);
+      if (
+        !source.config_revision ||
+        !sameDefaults(
+          buildCallingDefaults(seedHostRows([], source.config ?? {}))?.[row.hostId] ?? {},
+          buildCallingDefaults([row])?.[row.hostId] ?? {},
+        )
+      ) {
+        setCopyMessage("The source project changed. Reopen its settings before applying defaults.");
+        return;
+      }
+      const targets = projects.filter((project) => project.id !== source.id);
+      const entryReads = await Promise.allSettled(
+        targets.map((target) => listProjectEntries(target.id)),
+      );
+      const targetEntries: Record<string, ProjectHostEntry[] | null> = {};
+      const entryErrors: Record<string, string> = {};
+      targets.forEach((target, index) => {
+        const result = entryReads[index];
+        targetEntries[target.id] = result.status === "fulfilled" ? result.value : null;
+        if (result.status === "rejected") entryErrors[target.id] = errorMessage(result.reason);
+      });
+      setCopySelection({
+        hostId: row.hostId,
+        harness,
+        source,
+        targets,
+        checked: Object.fromEntries(targets.map((target) => [target.id, true])),
+        fields: { model: true, effort: true, speed: true, permission: true },
+        agent: false,
+        targetEntries,
+        entryErrors,
+      });
+      setMasterSelection(null);
+    } catch (error) {
+      setCopyMessage(errorMessage(error));
+    } finally {
+      setCopyBusy(false);
+    }
+  };
+
+  const applyCopy = async () => {
+    if (!copySelection || copyBusy) return;
+    if (!sourceSaved) {
+      setCopyResults(["Save this project before applying its defaults."]);
+      return;
+    }
+    setCopyBusy(true);
+    const results: string[] = [];
+    const { hostId: sourceHost, harness, source } = copySelection;
+    try {
+      const currentSource = await getProject(source.id);
+      if (currentSource.config_revision !== source.config_revision) {
+        setCopyResults(["Source project changed. Reopen its settings before applying defaults."]);
+        setCopyBusy(false);
+        return;
+      }
+    } catch (error) {
+      setCopyResults([`Source project: failed — ${errorMessage(error)}`]);
+      setCopyBusy(false);
+      return;
+    }
+    const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
+    for (const target of copySelection.targets.filter((item) => copySelection.checked[item.id])) {
+      try {
+        // Read each target immediately before writing; the server checks this
+        // revision again inside the transaction.
+        // eslint-disable-next-line no-await-in-loop
+        const [fresh, targetEntries] = await Promise.all([
+          getProject(target.id),
+          listProjectEntries(target.id),
+        ]);
+        if (fresh.config_revision !== target.config_revision) {
+          results.push(`${target.name}: failed — settings changed since preview.`);
+          continue;
+        }
+        const { fields, skipped, copyAgent, blocked } = planCopyTarget(
+          copySelection,
+          fresh,
+          targetEntries,
+        );
+        if (blocked) {
+          results.push(`${target.name}: skipped — ${blocked}.`);
+          continue;
+        }
+        if (Object.keys(fields).length === 0 && !copyAgent) {
+          results.push(`${target.name}: skipped — ${skipped.join(", ") || "no fields selected"}.`);
+          continue;
+        }
+        // eslint-disable-next-line no-await-in-loop
+        const updated = await patchProjectCallingDefaults(target.id, {
+          expected_revision: fresh.config_revision as string,
+          host_id: sourceHost,
+          harness,
+          fields,
+          copy_agent: copyAgent,
+          ...(copyAgent ? { agent_id: sourceAgent } : {}),
+        });
+        queryClient.setQueryData(["project-config", target.id], updated.config ?? {});
+        results.push(
+          `${target.name}: applied ${[...Object.keys(fields), ...(copyAgent ? ["Agent"] : [])].join(", ")}${skipped.length ? `; skipped ${skipped.join(", ")}` : ""}.`,
+        );
+      } catch (error) {
+        results.push(`${target.name}: failed — ${errorMessage(error)}`);
+      }
+    }
+    setCopyResults(results.length ? results : ["No projects selected."]);
+    setCopyBusy(false);
+  };
+
+  const applyMaster = async (row: HostRowDraft, harness: string) => {
+    if (!projectId) return;
+    if (!sourceSaved) {
+      setCopyMessage("Save this project before updating master defaults.");
+      return;
+    }
+    setCopyBusy(true);
+    try {
+      const source = await getProject(projectId);
+      if (
+        !source.config_revision ||
+        !sameDefaults(
+          buildCallingDefaults(seedHostRows([], source.config ?? {}))?.[row.hostId] ?? {},
+          buildCallingDefaults([row])?.[row.hostId] ?? {},
+        ) ||
+        source.config?.agent_id !== stored?.agent_id ||
+        source.config?.model !== stored?.model
+      ) {
+        setCopyMessage(
+          "The source project changed. Reopen its settings before updating master defaults.",
+        );
+        return;
+      }
+      for (const field of CALLING_FIELDS) {
+        const value = row.harnesses[harness]?.[field] ?? inheritedFor(row, harness, field).value;
+        setCallingDefaultField(row.hostId, harness, field, value ?? null);
+      }
+      setMasterSelection(null);
+      setCopyMessage("Master defaults updated. Existing project overrides still take priority.");
+    } catch (error) {
+      setCopyMessage(errorMessage(error));
+    } finally {
+      setCopyBusy(false);
+    }
+  };
 
   const allHostsSummary =
     [
@@ -1250,51 +1611,280 @@ export function ProjectSettingsDialog({
     const set = row.harnesses[harness] ?? { model: null, effort: null };
     const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
     const levels = effortLevelsForSet(harness, models, set);
+    const inherit = (field: CallingDefaultField) => {
+      const resolved = inheritedFor(row, harness, field);
+      const label =
+        field === "model"
+          ? catalogModelLabel(catalogs, row.hostId, harness, resolved.value)
+          : field === "effort" && resolved.value
+            ? normalizeEffortLabel(resolved.value)
+            : (field === "speed" || field === "permission") && resolved.value
+              ? (sessionDefaultModeOptions(harness, field, models, set.model).find(
+                  (option) => option.value === resolved.value,
+                )?.label ?? resolved.value)
+              : null;
+      return inheritedLabel(resolved.source, resolved.value, label);
+    };
+    const resetField = (field: CallingDefaultField) => (
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-8 shrink-0"
+        onClick={() => setHarnessField(row.hostId, harness, field, null)}
+        disabled={isLoading || saving || !set[field]}
+        data-testid={`project-settings-host-reset-${field}-${row.hostId}`}
+        aria-label={`Reset ${field} to inherited value`}
+      >
+        Reset
+      </Button>
+    );
     return (
       <>
         <Field label="Model" hint="Default model for new sessions on this host">
-          <HostModelSelect
-            value={set.model}
-            models={models}
-            testId={`project-settings-host-model-${row.hostId}`}
-            disabled={isLoading || saving}
-            onOpen={() => ensureCatalog(row.hostId, harness)}
-            onOpenChange={onDropdownOpenChange}
-            onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
-          />
+          <div className="flex min-w-0 gap-1">
+            <HostModelSelect
+              value={set.model}
+              models={models}
+              inheritLabel={inherit("model")}
+              testId={`project-settings-host-model-${row.hostId}`}
+              disabled={isLoading || saving}
+              onOpen={() => ensureCatalog(row.hostId, harness)}
+              onOpenChange={onDropdownOpenChange}
+              onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
+            />
+            {resetField("model")}
+          </div>
         </Field>
         <Field label="Effort" hint="Default thinking effort for new sessions on this host">
-          <HostEffortSelect
-            value={set.effort}
-            levels={levels}
-            testId={`project-settings-host-effort-${row.hostId}`}
-            disabled={isLoading || saving}
-            onOpen={() => ensureCatalog(row.hostId, harness)}
-            onOpenChange={onDropdownOpenChange}
-            onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
-          />
+          <div className="flex min-w-0 gap-1">
+            <HostEffortSelect
+              value={set.effort}
+              levels={levels}
+              inheritLabel={inherit("effort")}
+              testId={`project-settings-host-effort-${row.hostId}`}
+              disabled={isLoading || saving}
+              onOpen={() => ensureCatalog(row.hostId, harness)}
+              onOpenChange={onDropdownOpenChange}
+              onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
+            />
+            {resetField("effort")}
+          </div>
         </Field>
         {(["speed", "permission"] as const).map((field) =>
           sessionDefaultModeOptions(harness, field, models, set.model).length > 0 ? (
             <Field key={field} label={field === "speed" ? "Speed" : "Permission"}>
-              <SessionDefaultModeSelect
-                harness={harness}
-                field={field}
-                value={set[field]}
-                models={models}
-                model={set.model}
-                label={field === "speed" ? "Speed" : "Permission"}
-                testId={`project-settings-host-${field}-${row.hostId}`}
-                disabled={isLoading || saving}
-                onOpenChange={onDropdownOpenChange}
-                onChange={(next) => setHarnessField(row.hostId, harness, field, next)}
-              />
+              <div className="flex min-w-0 gap-1">
+                <SessionDefaultModeSelect
+                  harness={harness}
+                  field={field}
+                  value={set[field]}
+                  models={models}
+                  model={set.model}
+                  inheritLabel={inherit(field)}
+                  label={field === "speed" ? "Speed" : "Permission"}
+                  testId={`project-settings-host-${field}-${row.hostId}`}
+                  disabled={isLoading || saving}
+                  onOpenChange={onDropdownOpenChange}
+                  onChange={(next) => setHarnessField(row.hostId, harness, field, next)}
+                />
+                {resetField(field)}
+              </div>
             </Field>
           ) : null,
         )}
       </>
     );
   };
+
+  const renderHarnessActions = (row: HostRowDraft, harness: string) => (
+    <div className="flex min-w-0 flex-col gap-2">
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          disabled={saving || copyBusy}
+          onClick={() => resetHarnessRow(row.hostId, harness)}
+          data-testid={`project-settings-host-reset-row-${row.hostId}-${harness}`}
+        >
+          Reset this harness row
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={saving || copyBusy || !sourceSaved || projectId === null}
+          onClick={() => void openCopy(row, harness)}
+          data-testid={`project-settings-host-copy-${row.hostId}-${harness}`}
+        >
+          Apply to other projects…
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={saving || copyBusy || !sourceSaved || projectId === null}
+          onClick={() => {
+            setCopyFeedbackFor(pairKey(row.hostId, harness));
+            setMasterSelection({ hostId: row.hostId, harness });
+            setCopySelection(null);
+            setCopyMessage(null);
+          }}
+          data-testid={`project-settings-host-master-${row.hostId}-${harness}`}
+        >
+          Make this the master default…
+        </Button>
+      </div>
+      {!sourceSaved && <p className="text-xs text-muted-foreground">Save this project first.</p>}
+      {copySelection?.hostId === row.hostId && copySelection.harness === harness && (
+        <div
+          className="flex min-w-0 flex-col gap-2 rounded-md border p-3"
+          data-testid="project-settings-copy-panel"
+        >
+          <p className="text-ui font-medium">Apply saved {callingHarnessLabel(harness)} defaults</p>
+          <p className="text-xs text-muted-foreground">
+            Same host and harness. Inherited fields remove target overrides. Entry folders stay as
+            they are.
+          </p>
+          {!sourceSaved && (
+            <p className="text-xs text-muted-foreground">Save this project first.</p>
+          )}
+          <div className="flex flex-wrap gap-3">
+            {CALLING_FIELDS.map((field) => (
+              <label key={field} className="flex items-center gap-1 text-ui">
+                <input
+                  type="checkbox"
+                  checked={copySelection.fields[field]}
+                  onChange={(event) =>
+                    setCopySelection((current) =>
+                      current
+                        ? {
+                            ...current,
+                            fields: { ...current.fields, [field]: event.target.checked },
+                          }
+                        : null,
+                    )
+                  }
+                  data-testid={`project-settings-copy-field-${field}`}
+                />
+                {field}
+              </label>
+            ))}
+            <label className="flex items-center gap-1 text-ui">
+              <input
+                type="checkbox"
+                checked={copySelection.agent}
+                onChange={(event) =>
+                  setCopySelection((current) =>
+                    current ? { ...current, agent: event.target.checked } : null,
+                  )
+                }
+                data-testid="project-settings-copy-field-agent"
+              />
+              Agent
+            </label>
+          </div>
+          {copySelection.targets.map((target) => (
+            <div key={target.id} className="min-w-0 rounded-md border px-2 py-1.5">
+              <label className="flex items-center gap-2 text-ui">
+                <input
+                  type="checkbox"
+                  checked={copySelection.checked[target.id]}
+                  onChange={(event) =>
+                    setCopySelection((current) =>
+                      current
+                        ? {
+                            ...current,
+                            checked: { ...current.checked, [target.id]: event.target.checked },
+                          }
+                        : null,
+                    )
+                  }
+                  data-testid={`project-settings-copy-target-${target.id}`}
+                />
+                {target.name}
+              </label>
+              {(() => {
+                const plan = planCopyTarget(
+                  copySelection,
+                  target,
+                  copySelection.targetEntries[target.id],
+                );
+                const summary = !copySelection.checked[target.id]
+                  ? "Excluded"
+                  : plan.blocked
+                    ? `Skip: ${copySelection.entryErrors[target.id] ?? plan.blocked}`
+                    : `Apply: ${
+                        [...Object.keys(plan.fields), ...(plan.copyAgent ? ["Agent"] : [])].join(
+                          ", ",
+                        ) || "none"
+                      }${plan.skipped.length ? ` · Skip: ${plan.skipped.join(", ")}` : ""}`;
+                return <p className="ml-5 text-xs text-muted-foreground">{summary}</p>;
+              })()}
+            </div>
+          ))}
+          {copySelection.targets.length === 0 && <p className="text-ui">No other projects.</p>}
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => setCopySelection(null)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void applyCopy()}
+              disabled={copyBusy || !sourceSaved}
+            >
+              Apply selected fields
+            </Button>
+          </div>
+        </div>
+      )}
+      {masterSelection?.hostId === row.hostId && masterSelection.harness === harness && (
+        <div
+          className="flex min-w-0 flex-col gap-2 rounded-md border p-3"
+          data-testid="project-settings-master-panel"
+        >
+          <p className="text-ui font-medium">Update master defaults for this host and harness</p>
+          <p className="text-xs text-muted-foreground">
+            Project overrides will keep their current values.
+          </p>
+          {CALLING_FIELDS.map((field) => {
+            const value =
+              row.harnesses[harness]?.[field] ?? inheritedFor(row, harness, field).value;
+            return (
+              <p key={field} className="text-ui">
+                {field}: {value ?? "automatic"}
+              </p>
+            );
+          })}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => setMasterSelection(null)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void applyMaster(row, harness)}
+              disabled={copyBusy || !sourceSaved}
+            >
+              Update master defaults
+            </Button>
+          </div>
+        </div>
+      )}
+      {copyFeedbackFor === pairKey(row.hostId, harness) && copyMessage && (
+        <p role="status" className="text-ui">
+          {copyMessage}
+        </p>
+      )}
+      {copyFeedbackFor === pairKey(row.hostId, harness) && copyResults.length > 0 && (
+        <div role="status" className="text-ui" data-testid="project-settings-copy-results">
+          {copyResults.map((result) => (
+            <p key={result}>{result}</p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
   const renderOtherHarnessSection = (row: HostRowDraft, selectedHarness: string | null) => {
     const otherRows = Object.entries(row.harnesses).filter(
@@ -1357,6 +1947,16 @@ export function ProjectSettingsDialog({
                     <HostModelSelect
                       value={set.model}
                       models={models}
+                      inheritLabel={inheritedLabel(
+                        inheritedFor(row, harness, "model").source,
+                        inheritedFor(row, harness, "model").value,
+                        catalogModelLabel(
+                          catalogs,
+                          row.hostId,
+                          harness,
+                          inheritedFor(row, harness, "model").value,
+                        ),
+                      )}
                       testId={`project-settings-host-other-model-${row.hostId}-${harness}`}
                       disabled={disabled}
                       onOpen={() => ensureCatalog(row.hostId, harness)}
@@ -1366,6 +1966,10 @@ export function ProjectSettingsDialog({
                     <HostEffortSelect
                       value={set.effort}
                       levels={levels}
+                      inheritLabel={inheritedLabel(
+                        inheritedFor(row, harness, "effort").source,
+                        inheritedFor(row, harness, "effort").value,
+                      )}
                       testId={`project-settings-host-other-effort-${row.hostId}-${harness}`}
                       disabled={disabled}
                       onOpen={() => ensureCatalog(row.hostId, harness)}
@@ -1380,6 +1984,10 @@ export function ProjectSettingsDialog({
                         value={set[field]}
                         models={models}
                         model={set.model}
+                        inheritLabel={inheritedLabel(
+                          inheritedFor(row, harness, field).source,
+                          inheritedFor(row, harness, field).value,
+                        )}
                         label={field === "speed" ? "Speed" : "Permission"}
                         testId={`project-settings-host-other-${field}-${row.hostId}-${harness}`}
                         disabled={disabled}
@@ -1388,6 +1996,7 @@ export function ProjectSettingsDialog({
                       />
                     ))}
                   </div>
+                  {renderHarnessActions(row, harness)}
                 </div>
               );
             })}
@@ -1454,7 +2063,10 @@ export function ProjectSettingsDialog({
             </span>
           </Field>
         ) : harness ? (
-          renderHarnessSetFields(row, harness)
+          <>
+            {renderHarnessSetFields(row, harness)}
+            {renderHarnessActions(row, harness)}
+          </>
         ) : null}
         {renderOtherHarnessSection(row, harness)}
         {renderEntryOutcome(row)}

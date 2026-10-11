@@ -2,7 +2,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { readSessionNavigationPreferences } from "@/lib/sessionNavigationPreferences";
-import { MobileSessionTitleSetting, SessionNavigationSettings } from "./SessionNavigationSettings";
+import {
+  GoalMarkersSetting,
+  MobileSessionTitleSetting,
+  SessionNavigationSettings,
+} from "./SessionNavigationSettings";
 
 describe("SessionNavigationSettings", () => {
   beforeEach(() => localStorage.clear());
@@ -37,7 +41,7 @@ describe("SessionNavigationSettings", () => {
   });
 
   it("shows Goal markers by default and lets the user hide them", async () => {
-    render(<SessionNavigationSettings />);
+    render(<GoalMarkersSetting />);
     const toggle = screen.getByRole("switch", {
       name: "Show Goal markers in the session list",
     });
