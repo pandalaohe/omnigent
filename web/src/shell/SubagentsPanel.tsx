@@ -192,6 +192,7 @@ function ChildRowActions({ childId, className }: { childId: string; className?: 
       onShare={() => {}}
       onFork={() => forkDialog?.openForkDialog({ sourceSessionId: childId })}
       trigger={trigger}
+      surface="row"
       initiallyOpen
       canManage={isOwnerLevel(conversation.permission_level)}
     />

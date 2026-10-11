@@ -113,6 +113,7 @@ describe("WorktreeStatusMark", () => {
     const mark = screen.getByRole("img", {
       name: "Worktree kept by rule; 3 child worktrees need attention",
     });
+    expect(mark).toHaveTextContent(/^$/);
     fireEvent.focus(mark);
     expect(await screen.findByText("Worktree kept by rule · kept on archive")).toBeInTheDocument();
     expect(
@@ -158,6 +159,6 @@ describe("WorktreeStatusMark", () => {
     });
     expect(
       screen.getByRole("img", { name: "No worktree; 1 child worktrees need attention" }),
-    ).toBeInTheDocument();
+    ).toHaveTextContent(/^$/);
   });
 });

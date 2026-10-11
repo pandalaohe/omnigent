@@ -5416,7 +5416,6 @@ function ConversationMenuItems({
   setWorktreeDetailsOpen,
   setMenuOpen,
   runArchive,
-  runArchiveAndKeepWorktree,
 }: {
   components: MenuComponents;
   conversation: Conversation;
@@ -5455,7 +5454,6 @@ function ConversationMenuItems({
   // (uncontrolled) context menu, which Radix closes on select automatically.
   setMenuOpen: (open: boolean) => void;
   runArchive: () => void;
-  runArchiveAndKeepWorktree: () => void;
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -5594,6 +5592,10 @@ function ConversationMenuItems({
       >
         <CopyIcon className="size-3.5" />
         Copy session ID
+      </C.Item>
+      <C.Item data-testid="worktree-details" onSelect={() => setWorktreeDetailsOpen(true)}>
+        <FolderGit2Icon className="size-3.5" />
+        Worktree details
       </C.Item>
       {isOwner ? (
         <C.Item
@@ -5780,16 +5782,6 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
-      {!isArchived && isOwner && (
-        <C.Item data-testid="archive-keep-worktree" onSelect={runArchiveAndKeepWorktree}>
-          <FolderOpenIcon className="size-3.5" />
-          Archive and keep worktree
-        </C.Item>
-      )}
-      <C.Item data-testid="worktree-details" onSelect={() => setWorktreeDetailsOpen(true)}>
-        <FolderGit2Icon className="size-3.5" />
-        Worktree details
-      </C.Item>
       {/* One destructive slot, resolved by ownership — NOT two items. The owner
           deletes the session; a shared-with viewer leaves it (gives up their own
           grant). Non-owners used to get Delete rendered disabled here, an
@@ -6424,10 +6416,6 @@ function ConversationRowImpl({
     showArchiveUndoToast(queryClient, [conversation], navigate);
   }
 
-  function runArchiveAndKeepWorktree() {
-    if (!isArchived) archiveNow(true);
-  }
-
   function runUnarchive() {
     const nextArchived = !isArchived;
     archive.mutate({ id: conversation.id, archived: nextArchived });
@@ -6490,7 +6478,6 @@ function ConversationRowImpl({
     setLeaveOpen,
     setWorktreeDetailsOpen,
     runArchive,
-    runArchiveAndKeepWorktree,
   };
 
   // The clickable row surface. Extracted so it can be rendered bare (selection

@@ -451,6 +451,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
     contract.json("/v1/sessions", lambda _request: list_payload([handle._session()]))
     session_api = f"/v1/sessions/{handle.session_id}"
     contract.json(session_api, lambda _request: handle._session())
+    contract.json(f"{session_api}/model-options", lambda _request: {"models": handle.models})
 
     def patch_session(route: Route) -> None:
         if route.request.method != "PATCH":
