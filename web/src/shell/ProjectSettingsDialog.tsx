@@ -186,6 +186,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function sameDefaults(left: unknown, right: unknown): boolean {
+  const canonical = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (isRecord(value)) {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+  };
+  return canonical(left) === canonical(right);
+}
+
 function sanitizeHarnessSet(value: unknown): HarnessSetDraft {
   const set: HarnessSetDraft = { model: null, effort: null };
   if (!isRecord(value)) return set;
@@ -1171,8 +1185,10 @@ export function ProjectSettingsDialog({
     model === (stored?.model ?? NONE) &&
     worktreeOverride === stored?.use_worktree &&
     baseBranch === (stored?.base_branch ?? "") &&
-    JSON.stringify(buildCallingDefaults(hostRows) ?? {}) ===
-      JSON.stringify(buildCallingDefaults(seedHostRows([], stored ?? {})) ?? {});
+    sameDefaults(
+      buildCallingDefaults(hostRows) ?? {},
+      buildCallingDefaults(seedHostRows([], stored ?? {})) ?? {},
+    );
 
   const inheritedFor = (row: HostRowDraft, harness: string, field: CallingDefaultField) =>
     resolveProjectInheritedField(
@@ -1202,11 +1218,7 @@ export function ProjectSettingsDialog({
       return { fields, skipped, copyAgent: false, blocked: "no entry folder on this host" };
     }
     const targetHost = hostsById.get(sourceHost);
-    if (
-      !targetHost ||
-      targetHost.status !== "online" ||
-      targetHost.configured_harnesses?.[harness] !== true
-    ) {
+    if (!harnessReadinessOnHost(harness, targetHost).selectable) {
       return {
         fields,
         skipped,
@@ -1221,14 +1233,41 @@ export function ProjectSettingsDialog({
     const targetSet = target.config?.calling_defaults?.[sourceHost]?.harnesses?.[harness] ?? {};
     const catalog = catalogFor(catalogs, sourceHost, harness);
     const options = catalog?.models ?? [];
+    const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
+    let copyAgent = selection.agent;
+    if (copyAgent && sourceAgent) {
+      const selected = agentList.find((agent) => agent.id === sourceAgent);
+      if (
+        !selected ||
+        selectedHarnessFor(selected) !== harness ||
+        !agentUsableOnHost(selected, targetHost)
+      ) {
+        copyAgent = false;
+        skipped.push("Agent unavailable");
+      }
+    }
+    const targetAgent = copyAgent
+      ? (sourceAgent ?? target.config?.agent_id ?? null)
+      : (target.config?.calling_defaults?.[sourceHost]?.agent_id ??
+        target.config?.agent_id ??
+        null);
+    const inheritedModel = resolveProjectInheritedField(
+      target.config ?? {},
+      masterDefaults,
+      sourceHost,
+      harness,
+      "model",
+      targetAgent,
+    ).value;
+    let targetModel = targetSet.model ?? inheritedModel;
     for (const field of CALLING_FIELDS) {
       if (!selection.fields[field]) continue;
       const value = sourceSet[field] ?? null;
       if (value === null) {
         fields[field] = null;
+        if (field === "model") targetModel = inheritedModel;
         continue;
       }
-      const targetModel = "model" in fields ? fields.model : targetSet.model;
       const supported =
         field === "model"
           ? !!catalog && catalog.error === null && catalogAccepts(catalog, value)
@@ -1244,19 +1283,7 @@ export function ProjectSettingsDialog({
         continue;
       }
       fields[field] = value;
-    }
-    const sourceAgent = source.config?.calling_defaults?.[sourceHost]?.agent_id ?? null;
-    let copyAgent = selection.agent;
-    if (copyAgent && sourceAgent) {
-      const selected = agentList.find((agent) => agent.id === sourceAgent);
-      if (
-        !selected ||
-        selectedHarnessFor(selected) !== harness ||
-        !agentUsableOnHost(selected, targetHost)
-      ) {
-        copyAgent = false;
-        skipped.push("Agent unavailable");
-      }
+      if (field === "model") targetModel = value;
     }
     return { fields, skipped, copyAgent, blocked: null };
   };
@@ -1285,9 +1312,10 @@ export function ProjectSettingsDialog({
       const [source, projects] = await Promise.all([getProject(projectId), listProjects()]);
       if (
         !source.config_revision ||
-        JSON.stringify(
+        !sameDefaults(
           buildCallingDefaults(seedHostRows([], source.config ?? {}))?.[row.hostId] ?? {},
-        ) !== JSON.stringify(buildCallingDefaults([row])?.[row.hostId] ?? {})
+          buildCallingDefaults([row])?.[row.hostId] ?? {},
+        )
       ) {
         setCopyMessage("The source project changed. Reopen its settings before applying defaults.");
         return;
@@ -1324,6 +1352,10 @@ export function ProjectSettingsDialog({
 
   const applyCopy = async () => {
     if (!copySelection || copyBusy) return;
+    if (!sourceSaved) {
+      setCopyResults(["Save this project before applying its defaults."]);
+      return;
+    }
     setCopyBusy(true);
     const results: string[] = [];
     const { hostId: sourceHost, harness, source } = copySelection;
@@ -1388,15 +1420,20 @@ export function ProjectSettingsDialog({
   };
 
   const applyMaster = async (row: HostRowDraft, harness: string) => {
-    if (!projectId || !sourceSaved) return;
+    if (!projectId) return;
+    if (!sourceSaved) {
+      setCopyMessage("Save this project before updating master defaults.");
+      return;
+    }
     setCopyBusy(true);
     try {
       const source = await getProject(projectId);
       if (
         !source.config_revision ||
-        JSON.stringify(
+        !sameDefaults(
           buildCallingDefaults(seedHostRows([], source.config ?? {}))?.[row.hostId] ?? {},
-        ) !== JSON.stringify(buildCallingDefaults([row])?.[row.hostId] ?? {}) ||
+          buildCallingDefaults([row])?.[row.hostId] ?? {},
+        ) ||
         source.config?.agent_id !== stored?.agent_id ||
         source.config?.model !== stored?.model
       ) {
@@ -1710,6 +1747,9 @@ export function ProjectSettingsDialog({
             Same host and harness. Inherited fields remove target overrides. Entry folders stay as
             they are.
           </p>
+          {!sourceSaved && (
+            <p className="text-xs text-muted-foreground">Save this project first.</p>
+          )}
           <div className="flex flex-wrap gap-3">
             {CALLING_FIELDS.map((field) => (
               <label key={field} className="flex items-center gap-1 text-ui">
@@ -1789,7 +1829,11 @@ export function ProjectSettingsDialog({
             <Button type="button" variant="ghost" onClick={() => setCopySelection(null)}>
               Cancel
             </Button>
-            <Button type="button" onClick={() => void applyCopy()} disabled={copyBusy}>
+            <Button
+              type="button"
+              onClick={() => void applyCopy()}
+              disabled={copyBusy || !sourceSaved}
+            >
               Apply selected fields
             </Button>
           </div>
@@ -1820,7 +1864,7 @@ export function ProjectSettingsDialog({
             <Button
               type="button"
               onClick={() => void applyMaster(row, harness)}
-              disabled={copyBusy}
+              disabled={copyBusy || !sourceSaved}
             >
               Update master defaults
             </Button>
