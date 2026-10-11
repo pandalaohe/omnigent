@@ -1044,6 +1044,8 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Pull Requests",
       "Agents1",
       "Archive this session",
+      "Archive and keep worktree",
+      "Worktree details",
       "Delete",
     ]);
   });

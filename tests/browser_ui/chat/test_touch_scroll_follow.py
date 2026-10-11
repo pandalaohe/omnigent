@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import suppress
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
@@ -117,9 +118,49 @@ def test_one_approval_tap_while_reply_streams(
     chat = chat_session_contract
     _open_stream(page, chat, harness)
     resolved: list[dict] = []
+
+    def resolve(request: Request) -> dict[str, bool]:
+        verdict = request.post_data_json
+        resolved.append(verdict)
+        if card_kind != "approval":
+            key = "route-choice" if card_kind == "question-form" else "answer"
+            answer = {
+                "question": "Choose a route."
+                if card_kind == "question-form"
+                else "Approve this operation?\nanswer",
+                "answer": verdict["content"][key],
+            }
+            if card_kind == "question-form":
+                answer["id"] = key
+            text = "[System: Question answered]\n" + json.dumps(
+                {
+                    "elicitation_id": "touch-approval",
+                    "action": verdict["action"],
+                    "answers": [answer],
+                }
+            )
+            chat.emit(
+                {
+                    "event": "session.input.consumed",
+                    "data": {
+                        "type": "session.input.consumed",
+                        "data": {
+                            "item_id": "touch-answer-history",
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "user_authored": True,
+                                "content": [{"type": "input_text", "text": text}],
+                            },
+                        },
+                    },
+                }
+            )
+        return {"queued": True}
+
     chat.contract.json(
         f"/v1/sessions/{chat.session_id}/elicitations/touch-approval/resolve",
-        lambda request: resolved.append(request.post_data_json) or {"queued": True},
+        resolve,
         method="POST",
     )
     wrong_verdicts: list[dict] = []
@@ -200,9 +241,16 @@ def test_one_approval_tap_while_reply_streams(
         expect(page.get_by_text("A second operation needs approval.", exact=True)).to_be_attached()
         page.wait_for_timeout(80)
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-        expect(
-            page.locator('[data-testid="approval-card"][data-state="responded"]')
-        ).to_contain_text("Approved" if card_kind == "approval" else "First choice")
+        responded = page.locator('[data-testid="approval-card"][data-state="responded"]')
+        expect(responded).to_contain_text(
+            {"approval": "Approved", "question": "Selected", "question-form": "Submitted"}[
+                card_kind
+            ]
+        )
+        if card_kind != "approval":
+            history_record = page.locator('[data-system-kind="question_answer"]')
+            expect(history_record).to_have_count(1)
+            expect(history_record).to_contain_text("First choice")
         expected = {"action": "accept"}
         if card_kind == "question":
             expected["content"] = {"answer": "First choice"}
