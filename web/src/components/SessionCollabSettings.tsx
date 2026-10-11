@@ -10,7 +10,6 @@ import {
   type HostColorPreferences,
 } from "@/lib/hostColors";
 import { patchHostColor } from "@/lib/hostColorPreferences";
-import { Link } from "@/lib/routing";
 import {
   SESSION_COLLAB_BOUNDS,
   writeSessionCollabPreferences,
@@ -81,8 +80,6 @@ function HostColorRow({ host, preferences }: { host: Host; preferences: HostColo
 
 export function SessionCollabSettings() {
   const preferences = useSessionCollabPreferences();
-  const { data: hosts } = useHosts();
-  const hostColorPreferences = useHostColorPreferences();
   const update = (patch: Partial<SessionCollabPreferences>) =>
     writeSessionCollabPreferences({ ...preferences, ...patch });
   const disabled = !preferences.enabled;
@@ -225,49 +222,28 @@ export function SessionCollabSettings() {
           />
         </SettingRow>
       </div>
+    </div>
+  );
+}
 
-      <h2 className="mt-3 text-ui font-medium">Keeping children warm</h2>
-      <div className="rounded-xl border border-border bg-card p-4" data-testid="keep-warm-moved">
-        <p className="text-sm text-muted-foreground">
-          Keep-warm moved to{" "}
-          <Link
-            to="/settings/keep-warm"
-            className="font-medium text-foreground underline underline-offset-2"
-          >
-            Settings &gt; Keep-warm
-          </Link>
-        </p>
-      </div>
-
-      <h2 className="mt-3 text-ui font-medium">Host colours</h2>
-      <div
-        className="rounded-xl border border-border bg-card p-4"
-        data-testid="host-colors-settings"
-      >
-        <p className="mb-3 text-sm text-muted-foreground">
-          The badge beside a sub-agent in the Agents rail takes its colour from the host that runs
-          it. Hosts without a pick get a stable automatic colour derived from their name.
-        </p>
-        {hosts && hosts.length > 0 ? (
-          <div className="flex flex-col gap-3">
-            {hosts.map((host) => (
-              <HostColorRow key={host.host_id} host={host} preferences={hostColorPreferences} />
-            ))}
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">No hosts are connected yet.</p>
-        )}
-      </div>
-
-      <p className="text-sm text-muted-foreground">
-        Stopping the session runner when a session is archived is set per host in{" "}
-        <Link
-          to="/settings/runtime-resources"
-          className="font-medium text-foreground underline underline-offset-2"
-        >
-          Runtime &amp; resources
-        </Link>
+export function HostColorsSettings() {
+  const { data: hosts } = useHosts();
+  const preferences = useHostColorPreferences();
+  return (
+    <div data-testid="host-colors-settings">
+      <p className="mb-3 text-sm text-muted-foreground">
+        The badge beside a sub-agent in the Agents rail takes its colour from its host. Hosts
+        without a pick get a stable automatic colour from their name.
       </p>
+      {hosts && hosts.length > 0 ? (
+        <div className="flex flex-col gap-3">
+          {hosts.map((host) => (
+            <HostColorRow key={host.host_id} host={host} preferences={preferences} />
+          ))}
+        </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">No hosts are connected yet.</p>
+      )}
     </div>
   );
 }

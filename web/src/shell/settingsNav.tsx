@@ -13,18 +13,14 @@ import {
   BotIcon,
   ArrowLeftIcon,
   BlocksIcon,
-  CpuIcon,
   DownloadIcon,
   FileTextIcon,
-  FlameIcon,
-  GaugeIcon,
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
   SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
-  SlidersHorizontalIcon,
   TerminalIcon,
   UserCogIcon,
   UsersIcon,
@@ -40,18 +36,13 @@ import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
-  | "agents"
-  | "keep-warm"
+  | "custom-agents"
   | "appearance"
-  | "calling-defaults"
-  | "session-collab"
   | "harnesses"
   | "general"
   | "git"
   | "integrations"
   | "shortcuts"
-  | "context-usage"
-  | "runtime-resources"
   | "import"
   | "account"
   | "members"
@@ -64,18 +55,13 @@ export type SettingsSectionId =
   | "updates";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
-  "agents",
-  "keep-warm",
+  "custom-agents",
   "appearance",
-  "calling-defaults",
-  "session-collab",
   "harnesses",
   "general",
   "git",
   "integrations",
   "shortcuts",
-  "context-usage",
-  "runtime-resources",
   "import",
   "account",
   "members",
@@ -116,35 +102,18 @@ export function settingsNavGroups(
   isAdmin = false,
   isSingleUser = false,
   integrationsEnabled = false,
-  sessionCollabEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
-    { id: "agents", label: "Agents", icon: BotIcon },
-    { id: "keep-warm", label: "Keep-warm", icon: FlameIcon },
-    { id: "calling-defaults", label: "Calling defaults", icon: SlidersHorizontalIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
-    { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon },
-    { id: "context-usage", label: "Context & usage", icon: GaugeIcon },
-    { id: "runtime-resources", label: "Runtime & resources", icon: CpuIcon },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
-  // Gated on the `session_peer_messaging` release feature; slots right after
-  // Calling defaults when enabled.
-  if (sessionCollabEnabled) {
-    const afterCallingDefaults = general.findIndex((item) => item.id === "calling-defaults") + 1;
-    general.splice(afterCallingDefaults, 0, {
-      id: "session-collab",
-      label: "Session collaboration",
-      icon: UsersIcon,
-    });
-  }
   // Sandbox Integrations appears once any connection provider is wired
   // (enabled_connections non-empty). Slots right after Git.
   if (integrationsEnabled) {
-    general.splice(2, 0, {
+    general.splice(general.findIndex((item) => item.id === "git") + 1, 0, {
       id: "integrations",
       label: "Sandbox Integrations",
       icon: BlocksIcon,
@@ -156,6 +125,13 @@ export function settingsNavGroups(
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
+  groups.push({
+    title: "Customize",
+    items: [
+      { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon },
+      { id: "custom-agents", label: "Custom agents", icon: BotIcon },
+    ],
+  });
   // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
@@ -217,6 +193,13 @@ export function useSettingsRoute(): {
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
+  const legacySection = LEGACY_SETTINGS_SECTIONS[next];
+  if (
+    legacySection &&
+    (next !== "session-collab" || isFeatureEnabled(info, "session_peer_messaging"))
+  ) {
+    return { inSettings: true, section: legacySection.section };
+  }
   // Preserve old deep links after Navigation and Mobile controls moved into
   // Keyboard shortcuts. They no longer appear as duplicate sidebar sections.
   if (next === "navigation" || next === "mobile-controls") {
@@ -230,13 +213,31 @@ export function useSettingsRoute(): {
   const singleUser = isSingleUserMode(info);
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
-    !(singleUser && (next === "members" || next === "sharing")) &&
-    // Session collaboration is gated on `session_peer_messaging`: a deep link to it while disabled
-    // falls back to the default section rather than an empty page, keeping content, nav and header in agreement.
-    !(next === "session-collab" && !isFeatureEnabled(info, "session_peer_messaging"));
+    !(singleUser && (next === "members" || next === "sharing"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
+}
+
+const LEGACY_SETTINGS_SECTIONS: Record<string, { section: SettingsSectionId; anchor?: string }> = {
+  agents: { section: "custom-agents" },
+  "keep-warm": { section: "general", anchor: "keep-warm" },
+  "calling-defaults": { section: "harnesses", anchor: "calling-defaults" },
+  "session-collab": { section: "general", anchor: "session-collab" },
+  "context-usage": { section: "general", anchor: "context-usage" },
+  "runtime-resources": { section: "general", anchor: "runtime-resources" },
+};
+
+export function settingsLegacyDestination(
+  pathname: string,
+  sessionCollabEnabled: boolean,
+): string | null {
+  const segments = pathname.split("/");
+  const index = segments.lastIndexOf("settings");
+  const legacy = LEGACY_SETTINGS_SECTIONS[segments[index + 1]];
+  if (index < 0 || !legacy || (segments[index + 1] === "session-collab" && !sessionCollabEnabled))
+    return null;
+  return `${segments.slice(0, index + 1).join("/")}/${legacy.section}${legacy.anchor ? `#${legacy.anchor}` : ""}`;
 }
 
 // Last location the user was on before entering /settings — path + search so
@@ -277,7 +278,6 @@ export function SettingsSidebarBody({
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
   const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
-  const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
@@ -285,7 +285,6 @@ export function SettingsSidebarBody({
     isAdmin,
     isSingleUserMode(info),
     integrationsEnabled,
-    sessionCollabEnabled,
   );
 
   return (

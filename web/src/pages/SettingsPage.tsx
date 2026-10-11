@@ -30,7 +30,9 @@
  *   Unarchive opens the restored session.
  */
 
-import { AgentsSettings } from "@/components/AgentsSettings";
+import { AgentBadgeDisplaySetting, AgentsSettings } from "@/components/AgentsSettings";
+import { ChatReserveWidthSetting } from "@/components/ChatReserveWidthSetting";
+import { writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { HelpTip } from "@/components/HelpTip";
 import {
   type ComponentType,
@@ -128,15 +130,15 @@ import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutEditor } from "@/components/KeyboardShortcutEditor";
 import { ApprovalTimeoutSettings } from "@/components/ApprovalTimeoutSettings";
 import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
-import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { KeepWarmSettings } from "@/components/KeepWarmSettings";
 import { CliRetentionSettings } from "@/components/CliRetentionSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
-import { SessionCollabSettings } from "@/components/SessionCollabSettings";
+import { HostColorsSettings, SessionCollabSettings } from "@/components/SessionCollabSettings";
 import { SoundAlertSettings } from "@/components/SoundAlertSettings";
 import {
   MobileSessionTitleSetting,
+  GoalMarkersSetting,
   SessionNavigationSettings,
 } from "@/components/SessionNavigationSettings";
 import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
@@ -166,6 +168,7 @@ import {
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -185,12 +188,12 @@ import { useHosts } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
-import { useNavigate } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import {
   readInheritLastRightRailTab,
   writeInheritLastRightRailTab,
 } from "@/lib/sessionWorkspaceState";
-import { useSettingsRoute } from "@/shell/settingsNav";
+import { settingsLegacyDestination, useSettingsRoute } from "@/shell/settingsNav";
 import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import { isThemeMode, normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -277,11 +280,6 @@ import {
   writeRetentionDays,
 } from "@/lib/retentionPreferences";
 import {
-  DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
-  readHideUnconfiguredHarnesses,
-  writeHideUnconfiguredHarnesses,
-} from "@/lib/harnessVisibilityPreferences";
-import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -353,17 +351,33 @@ const SharingPage = lazy(() =>
  */
 export function SettingsPage() {
   const info = useServerInfo();
+  const location = useLocation();
+  const navigate = useNavigate();
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
   const { section } = useSettingsRoute();
+  useEffect(() => {
+    const destination = settingsLegacyDestination(
+      location.pathname,
+      isFeatureEnabled(info, "session_peer_messaging"),
+    );
+    if (destination) navigate(destination, { replace: true });
+  }, [info, location.pathname, navigate]);
+  useEffect(() => {
+    const id = location.hash.slice(1);
+    if (!id) return;
+    const target = document.getElementById(id);
+    if (target instanceof HTMLDetailsElement) target.open = true;
+    target?.scrollIntoView?.();
+  }, [location.hash, section]);
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
 
   const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses") {
+    if (section === "harnesses" || section === "custom-agents") {
       return {
         maxWidthClassName: "max-w-4xl",
         contentClassName: "px-4 md:px-8",
@@ -416,17 +430,12 @@ export function SettingsPage() {
       {...pageWrapperSettings}
     >
       {section === "appearance" && <AppearanceSection />}
-      {section === "agents" && <AgentsSettings />}
-      {section === "keep-warm" && <KeepWarmSettingsSection />}
-      {section === "calling-defaults" && <CallingDefaultsSettingsSection />}
-      {section === "session-collab" && <SessionCollabSettingsSection />}
+      {section === "custom-agents" && <AgentsSettings />}
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
-      {section === "context-usage" && <ContextUsageSection />}
-      {section === "runtime-resources" && <RuntimeResourcesSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
@@ -898,6 +907,35 @@ function Section({
   );
 }
 
+function ExpandableSettings({
+  id,
+  title,
+  children,
+  className,
+}: {
+  id: string;
+  title: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  const { hash } = useLocation();
+  const [open, setOpen] = useState(hash === `#${id}`);
+  useEffect(() => {
+    if (hash === `#${id}`) setOpen(true);
+  }, [hash, id]);
+  return (
+    <details
+      id={id}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+      className={className}
+    >
+      <summary className="cursor-pointer font-medium">{title}</summary>
+      {open && <div className="mt-4">{children}</div>}
+    </details>
+  );
+}
+
 const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
   { mode: "system", label: "System", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
@@ -1126,6 +1164,25 @@ function WorkspaceTabDefaultControl() {
   );
 }
 
+function InheritLastRightRailTabSetting() {
+  const [inheritLastTab, setInheritLastTab] = useState(readInheritLastRightRailTab);
+  return (
+    <div className="flex items-center gap-3 text-ui">
+      <span className="min-w-0 flex-1">
+        New sessions use the last right rail tab you explicitly selected
+      </span>
+      <Switch
+        checked={inheritLastTab}
+        aria-label="Use last explicitly selected right rail tab for new sessions"
+        onCheckedChange={(checked) => {
+          setInheritLastTab(checked);
+          writeInheritLastRightRailTab(checked);
+        }}
+      />
+    </div>
+  );
+}
+
 /** Toggle for using a separate rail width while Workspace shows browser/file content. */
 function WidenWorkspaceForContentControl() {
   const [value, setValue] = useState(() => readWidenWorkspaceForContent());
@@ -1323,38 +1380,6 @@ function ColorThemeControl() {
   );
 }
 
-/**
- * Opt-in filter for the new-chat harness picker: when on, harnesses that
- * aren't set up on the selected host (missing CLI / auth) are hidden instead
- * of badged. Off by default so the picker keeps surfacing harnesses to set up.
- * Fails open — with no connected host or readiness info, nothing is hidden.
- */
-function HideUnconfiguredHarnessesControl() {
-  const [value, setValue] = useState(() => readHideUnconfiguredHarnesses());
-  const labelId = useId();
-  const toggle = useCallback((next: boolean) => {
-    setValue(next);
-    writeHideUnconfiguredHarnesses(next);
-  }, []);
-  return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Hide unconfigured harnesses"
-        labelId={labelId}
-        description="Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses needing a CLI install or sign-in are hidden instead of badged."
-      />
-      <Switch
-        aria-labelledby={labelId}
-        checked={value}
-        onCheckedChange={toggle}
-        data-testid="hide-unconfigured-harnesses-toggle"
-        className="mt-0.5 shrink-0"
-        componentId="settings.appearance.hide_unconfigured_harnesses"
-      />
-    </div>
-  );
-}
-
 function CompactProgressIndicatorControl() {
   const enabled = useContextIndicatorMode() === "compact";
   const labelId = useId();
@@ -1401,7 +1426,7 @@ function AppearanceSection() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetAppearance = () => {
-    // Reset every appearance preference back to the product default.
+    // Reset device theme, layout, and typography choices.
     setTheme("system");
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
@@ -1416,10 +1441,10 @@ function AppearanceSection() {
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+    writeInheritLastRightRailTab(true);
+    writePanelSizePreference("inlinePanelChatReserveWidthPx", null);
 
     writeWidenWorkspaceForContent(true);
-
-    writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     writeSessionNavigationPreferences({
       ...readSessionNavigationPreferences(),
@@ -1452,7 +1477,7 @@ function AppearanceSection() {
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:default-workspace-tab",
-          "omnigent:hide-unconfigured-harnesses",
+          "omnigent:new-session-inherit-right-rail-tab",
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -1521,6 +1546,8 @@ function AppearanceSection() {
                           {" "}
                           <a
                             href={themeSettingsUrl}
+                            target="_blank"
+                            rel="noreferrer"
                             className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
                           >
                             Click to open Databricks user preferences page.
@@ -1534,6 +1561,8 @@ function AppearanceSection() {
                 {themeSettingsUrl && (
                   <a
                     href={themeSettingsUrl}
+                    target="_blank"
+                    rel="noreferrer"
                     className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
                   >
                     Open Databricks preferences
@@ -1551,11 +1580,14 @@ function AppearanceSection() {
             </div>
           </SettingsGroup>
 
-          <SettingsGroup title="Chat defaults" testId="settings-group-chat">
+          <SettingsGroup title="Session defaults" testId="settings-group-chat">
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
               <WorkspacePanelDefaultControl />
             </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Workspace layout" testId="settings-group-workspace-layout">
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabDefaultControl />
             </div>
@@ -1563,10 +1595,23 @@ function AppearanceSection() {
               <WidenWorkspaceForContentControl />
             </div>
             <div className="mt-4 border-t border-border pt-4">
-              <HideUnconfiguredHarnessesControl />
+              <ChatReserveWidthSetting />
             </div>
             <div className="mt-4 border-t border-border pt-4">
+              <InheritLastRightRailTabSetting />
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Session markers" testId="settings-group-session-markers">
+            <AgentBadgeDisplaySetting />
+            <div className="mt-4 border-t border-border pt-4">
               <MobileSessionTitleSetting />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <GoalMarkersSetting />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <HostColorsSettings />
             </div>
           </SettingsGroup>
 
@@ -1619,14 +1664,14 @@ function AppearanceSection() {
                   data-testid="reset-appearance-button"
                   componentId="settings.appearance.open_reset_dialog"
                 >
-                  Reset to defaults
+                  Reset theme, layout &amp; fonts
                 </Button>
               </DialogTrigger>
               <DialogContent>
                 <DialogHeader>
-                  <DialogTitle>Reset appearance?</DialogTitle>
+                  <DialogTitle>Reset theme, layout and fonts?</DialogTitle>
                   <DialogDescription>
-                    This will reset every appearance choice back to its default.
+                    This resets device theme, workspace layout, mobile title and font choices.
                   </DialogDescription>
                 </DialogHeader>
                 <DialogFooter>
@@ -2306,9 +2351,29 @@ function TerminalClipboardControl() {
 
 /** App-wide behavior settings. */
 function GeneralSection() {
+  const sessionCollabEnabled = isFeatureEnabled(useServerInfo(), "session_peer_messaging");
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
+        <nav
+          aria-label="General settings sections"
+          className="flex flex-wrap gap-x-4 gap-y-2 text-sm"
+        >
+          <Link to="#keep-warm" className="text-primary underline underline-offset-2">
+            Keep-warm
+          </Link>
+          {sessionCollabEnabled && (
+            <Link to="#session-collab" className="text-primary underline underline-offset-2">
+              Session collaboration
+            </Link>
+          )}
+          <Link to="#context-usage" className="text-primary underline underline-offset-2">
+            Display &amp; usage
+          </Link>
+          <Link to="#runtime-resources" className="text-primary underline underline-offset-2">
+            Background processes
+          </Link>
+        </nav>
         <SettingsGroup title="Composer" testId="settings-group-composer">
           <ComposerSendShortcutControl />
           <div className="mt-4 border-t border-border pt-4">
@@ -2317,6 +2382,35 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          <ExpandableSettings
+            id="keep-warm"
+            title="Keep-warm"
+            className="mt-4 border-t border-border pt-4"
+          >
+            <KeepWarmSettings />
+          </ExpandableSettings>
+          {sessionCollabEnabled && (
+            <ExpandableSettings
+              id="session-collab"
+              title="Session collaboration"
+              className="mt-4 border-t border-border pt-4"
+            >
+              <SessionCollabSettings />
+            </ExpandableSettings>
+          )}
+        </SettingsGroup>
+        <SettingsGroup title="Display & usage" testId="settings-group-display-usage">
+          <ExpandableSettings id="context-usage" title="Context & usage">
+            <div className="flex flex-col gap-6">
+              <CompactProgressIndicatorControl />
+              <ContextUsageSettings />
+            </div>
+          </ExpandableSettings>
+        </SettingsGroup>
+        <SettingsGroup title="Background processes" testId="settings-group-background-processes">
+          <ExpandableSettings id="runtime-resources" title="Runtime & resources">
+            <CliRetentionSettings />
+          </ExpandableSettings>
         </SettingsGroup>
         <SettingsGroup title="Approvals & Questions" testId="settings-group-approvals">
           <ApprovalTimeoutSettings />
@@ -2913,61 +3007,6 @@ function ShortcutsSection() {
           </div>
         </div>
       </div>
-    </Section>
-  );
-}
-
-function ContextUsageSection() {
-  return (
-    <Section title="Context & usage" description="Context and usage limits.">
-      <div className="flex flex-col gap-6">
-        <CompactProgressIndicatorControl />
-        <ContextUsageSettings />
-      </div>
-    </Section>
-  );
-}
-
-function CallingDefaultsSettingsSection() {
-  return (
-    <Section
-      title="Calling defaults"
-      description="Model and reasoning effort defaults per host and harness. Projects can override them per host."
-    >
-      <CallingDefaultsSection />
-    </Section>
-  );
-}
-
-function KeepWarmSettingsSection() {
-  return (
-    <Section
-      title="Keep-warm"
-      description="Keep each agent's prompt cache warm so its next real turn starts fast."
-    >
-      <KeepWarmSettings />
-    </Section>
-  );
-}
-
-function SessionCollabSettingsSection() {
-  return (
-    <Section
-      title="Session collaboration"
-      description="How your agents work with other sessions, hosts and agents."
-    >
-      <SessionCollabSettings />
-    </Section>
-  );
-}
-
-function RuntimeResourcesSection() {
-  return (
-    <Section
-      title="Runtime & resources"
-      description="Control Host-scoped runtime lifetimes and inspect their current state."
-    >
-      <CliRetentionSettings />
     </Section>
   );
 }
@@ -3650,7 +3689,6 @@ function ArchivedListPane({
   const [view, setView] = useState<ArchivedViewPreferences>(readArchivedViewPreferences);
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState(view.searchQuery ?? "");
   const [pageCursors, setPageCursors] = useState<(string | undefined)[]>([undefined]);
-  const [inheritLastTab, setInheritLastTab] = useState(readInheritLastRightRailTab);
   const [retentionDays, setRetentionDays] = useState<number | null>(readRetentionDays);
   const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
   const bulkDelete = useBulkDeleteConversations();
@@ -3952,20 +3990,6 @@ function ArchivedListPane({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      <div className="flex min-h-8 items-center gap-2 border-b px-2 text-[11px] text-muted-foreground">
-        <span className="min-w-0 flex-1 truncate">
-          New sessions use the last right rail tab you explicitly selected
-        </span>
-        <Switch
-          checked={inheritLastTab}
-          aria-label="Use last explicitly selected right rail tab for new sessions"
-          onCheckedChange={(checked) => {
-            setInheritLastTab(checked);
-            writeInheritLastRightRailTab(checked);
-          }}
-        />
-      </div>
 
       {selectionMode && (
         <div className="px-2 pt-2">

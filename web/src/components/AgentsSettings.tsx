@@ -141,7 +141,6 @@ export function AgentsSettings() {
   const queryClient = useQueryClient();
   const catalog = useCustomAgents();
   const available = useAvailableAgents();
-  const preferences = useAgentBadgePreferences();
   const harnessLabels = useBrainHarnessLabels();
   // The Built-in list is the picker's built-in partition, harness rows
   // included; only the member-Agent rows carry the layer's controls.
@@ -238,21 +237,9 @@ export function AgentsSettings() {
   }
 
   return (
-    <section aria-label="Agents" className="mx-auto w-full max-w-3xl space-y-7">
+    <section aria-label="Custom agents" className="mx-auto w-full max-w-3xl space-y-7">
       <div>
-        <h1 className="text-lg font-semibold">Agents</h1>
-      </div>
-      <div className="flex items-center justify-between gap-4 border-b pb-5">
-        <label htmlFor="show-agent-badges" className="text-sm">
-          Show Agent badges
-        </label>
-        <Switch
-          id="show-agent-badges"
-          checked={preferences.enabled}
-          onCheckedChange={(enabled) =>
-            writeAgentBadgePreferences({ ...readAgentBadgePreferences(), enabled })
-          }
-        />
+        <h1 className="settings-page-title text-2xl font-semibold">Custom agents</h1>
       </div>
       <div>
         <h2 className="mb-2 text-sm text-muted-foreground">Built-in</h2>
@@ -541,6 +528,24 @@ export function AgentsSettings() {
         </DialogContent>
       </Dialog>
     </section>
+  );
+}
+
+export function AgentBadgeDisplaySetting() {
+  const preferences = useAgentBadgePreferences();
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <label htmlFor="show-agent-badges" className="text-sm">
+        Show Agent badges
+      </label>
+      <Switch
+        id="show-agent-badges"
+        checked={preferences.enabled}
+        onCheckedChange={(enabled) =>
+          writeAgentBadgePreferences({ ...readAgentBadgePreferences(), enabled })
+        }
+      />
+    </div>
   );
 }
 

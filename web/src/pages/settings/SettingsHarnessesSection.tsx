@@ -1,7 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { ChevronDownIcon, KeyRoundIcon, Plus, SearchIcon, SettingsIcon } from "lucide-react";
-import { Link, useNavigate } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
+import { SettingsLabel } from "@/components/SettingsLabel";
+import { Switch } from "@/components/ui/switch";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -24,6 +27,10 @@ import {
   harnessWarningBadgeText,
 } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
+import {
+  readHideUnconfiguredHarnesses,
+  writeHideUnconfiguredHarnesses,
+} from "@/lib/harnessVisibilityPreferences";
 import { BackButton, HarnessCatalog } from "./HarnessCatalog";
 import { useSettingsRoute } from "../../shell/settingsNav";
 
@@ -78,6 +85,11 @@ const HARNESS_ENTRIES: HarnessEntry[] = [...NATIVE_CODING_AGENTS]
  */
 export const SettingsHarnessesSection = () => {
   const { harness } = useSettingsRoute();
+  const { hash } = useLocation();
+  const [defaultsOpen, setDefaultsOpen] = useState(hash === "#calling-defaults");
+  useEffect(() => {
+    if (hash === "#calling-defaults") setDefaultsOpen(true);
+  }, [hash]);
   const [query, setQuery] = useState("");
   const [installedOnly, setInstalledOnly] = useState(false);
   const info = useServerInfo();
@@ -185,6 +197,29 @@ export const SettingsHarnessesSection = () => {
               />
             ))}
           </div>
+          <section className="mt-8 flex flex-col gap-3">
+            <h2 className="text-ui font-medium">Session picker</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <HideUnconfiguredHarnessesControl />
+            </div>
+          </section>
+          <details
+            id="calling-defaults"
+            open={defaultsOpen}
+            onToggle={(event) => setDefaultsOpen(event.currentTarget.open)}
+            className="mt-8 border-t border-border pt-5"
+          >
+            <summary className="cursor-pointer text-ui font-medium">New session defaults</summary>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Set model, effort, speed and permission for each host and harness. Project settings
+              can override these defaults on a host.
+            </p>
+            {defaultsOpen && (
+              <div className="mt-5">
+                <CallingDefaultsSection />
+              </div>
+            )}
+          </details>
         </>
       )}
       <HarnessSetupDialog
@@ -197,6 +232,31 @@ export const SettingsHarnessesSection = () => {
     </div>
   );
 };
+
+function HideUnconfiguredHarnessesControl() {
+  const [value, setValue] = useState(readHideUnconfiguredHarnesses);
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Hide unconfigured harnesses"
+        labelId={labelId}
+        description="Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses needing a CLI install or sign-in are hidden instead of badged."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={(next) => {
+          setValue(next);
+          writeHideUnconfiguredHarnesses(next);
+        }}
+        data-testid="hide-unconfigured-harnesses-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.harnesses.hide_unconfigured_harnesses"
+      />
+    </div>
+  );
+}
 
 function NoHostNotice() {
   return (

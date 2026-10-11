@@ -14,6 +14,10 @@ import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 
+vi.mock("@/components/CallingDefaultsSection", () => ({
+  CallingDefaultsSection: () => <div data-testid="calling-defaults-section">Master defaults</div>,
+}));
+
 let pluginMetadataRequested = false;
 const CONTENT: SkillContent = {
   name: "review",
@@ -212,6 +216,15 @@ afterEach(() => {
 });
 
 describe("Harnesses grid", () => {
+  it("opens the master defaults without depending on catalog host readiness", async () => {
+    hosts = [{ ...ONLINE, status: "offline" }];
+    renderHarnesses();
+    expect(screen.queryByTestId("calling-defaults-section")).toBeNull();
+    fireEvent.click(screen.getByText("New session defaults"));
+    expect(await screen.findByTestId("calling-defaults-section")).toBeInTheDocument();
+    expect(screen.getByTestId("harness-no-host")).toBeInTheDocument();
+  });
+
   it("shows Installed (no Set-up) for a ready harness and a badge + Set-up for a not-ready one", () => {
     hosts = [ONLINE];
     renderHarnesses();

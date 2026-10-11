@@ -10,7 +10,7 @@ import {
 } from "@/lib/agentBadgePreferences";
 import type { CustomAgent, CustomAgentDetail, CustomAgentMember } from "@/lib/customAgentsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { AgentsSettings } from "./AgentsSettings";
+import { AgentBadgeDisplaySetting, AgentsSettings } from "./AgentsSettings";
 
 const mocks = vi.hoisted(() => ({
   available: undefined as AvailableAgent[] | undefined,
@@ -183,7 +183,7 @@ const builtinAcp: AvailableAgent = {
   acpHarness: true,
 };
 
-function renderSettings() {
+function renderSettings(withBadgeDisplay = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
@@ -192,6 +192,7 @@ function renderSettings() {
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <AgentsSettings />
+        {withBadgeDisplay && <AgentBadgeDisplaySetting />}
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -300,7 +301,7 @@ describe("AgentsSettings", () => {
       enabled: true,
       entries,
     });
-    renderSettings();
+    renderSettings(true);
     expect(screen.getAllByTestId("agent-badge")).toHaveLength(2);
 
     fireEvent.click(screen.getByRole("switch", { name: "Show Agent badges" }));

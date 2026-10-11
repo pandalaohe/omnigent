@@ -43,6 +43,7 @@ vi.mock("@/hooks/useIsAdmin", () => ({
 import {
   SettingsSidebarBody,
   settingsNavGroups,
+  settingsLegacyDestination,
   useSettingsRoute,
   useTrackSettingsReturn,
 } from "./settingsNav";
@@ -77,7 +78,12 @@ describe("settingsNavGroups", () => {
       icon: SettingsIcon,
     });
     const ids = general?.items.map((item) => item.id) ?? [];
-    expect(ids.indexOf("harnesses")).toBe(ids.indexOf("appearance") + 1);
+    expect(ids).toEqual(["general", "appearance", "git", "shortcuts", "import"]);
+    expect(
+      settingsNavGroups(false, false)
+        .find((group) => group.title === "Customize")
+        ?.items.map((item) => item.id),
+    ).toEqual(["harnesses", "custom-agents"]);
   });
 
   it("keeps Keyboard shortcuts reachable on mobile for floating-assistant setup", () => {
@@ -85,7 +91,7 @@ describe("settingsNavGroups", () => {
     const shortcuts = items.find((i) => i.id === "shortcuts");
     expect(shortcuts?.hideOnMobile).toBeFalsy();
     expect(items.map((item) => item.id)).toEqual(
-      expect.arrayContaining(["shortcuts", "context-usage"]),
+      expect.arrayContaining(["shortcuts", "custom-agents"]),
     );
     for (const item of items) expect(item.hideOnMobile).toBeFalsy();
   });
@@ -120,6 +126,7 @@ describe("settingsNavGroups", () => {
   it("places Desktop immediately after General", () => {
     expect(settingsNavGroups(false, true).map((group) => group.title)).toEqual([
       "General",
+      "Customize",
       "Desktop",
       "Archived",
     ]);
@@ -180,26 +187,21 @@ describe("settingsNavGroups", () => {
     expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
   });
 
-  it("includes Keep-warm for every deploy, right after Agents and not gated on peer messaging", () => {
-    const ids = settingsNavGroups(false, false)
-      .find((group) => group.title === "General")
-      ?.items.map((item) => item.id);
-    expect(ids).toContain("keep-warm");
-    expect(ids?.indexOf("keep-warm")).toBe((ids?.indexOf("agents") ?? -1) + 1);
-  });
-
-  it("includes Session collaboration right after Calling defaults only when peer messaging is on", () => {
-    // 6th arg is sessionCollabEnabled (the `session_peer_messaging` feature).
-    const generalIds = (sessionCollabEnabled: boolean) =>
-      (
-        settingsNavGroups(false, false, false, false, false, sessionCollabEnabled).find(
-          (group) => group.title === "General",
-        )?.items ?? []
-      ).map((item) => item.id);
-    expect(generalIds(false)).not.toContain("session-collab");
-    const withCollab = generalIds(true);
-    expect(withCollab).toContain("session-collab");
-    expect(withCollab.indexOf("session-collab")).toBe(withCollab.indexOf("calling-defaults") + 1);
+  it("keeps the same 17 navigation destinations with collaboration on", () => {
+    const ids = settingsNavGroups(true, true, true, false, true).flatMap((group) =>
+      group.items.map((item) => item.id),
+    );
+    expect(ids).toHaveLength(17);
+    expect(new Set(ids).size).toBe(17);
+    expect(ids).not.toEqual(
+      expect.arrayContaining([
+        "keep-warm",
+        "calling-defaults",
+        "session-collab",
+        "context-usage",
+        "runtime-resources",
+      ]),
+    );
   });
 });
 
@@ -376,17 +378,18 @@ describe("SettingsSidebarBody", () => {
     expect(screen.queryByTestId("settings-nav-global-instructions")).toBeNull();
   });
 
-  it("shows the Session collaboration nav item only with the peer-messaging feature", () => {
+  it("keeps collaboration in General and the Custom agents library in Customize", () => {
     renderBody();
     expect(screen.queryByTestId("settings-nav-session-collab")).toBeNull();
+    expect(screen.getByTestId("settings-nav-custom-agents")).toHaveAttribute(
+      "href",
+      "/settings/custom-agents",
+    );
 
     cleanup();
     mocks.sessionCollabEnabled = true;
     renderBody();
-    expect(screen.getByTestId("settings-nav-session-collab")).toHaveAttribute(
-      "href",
-      "/settings/session-collab",
-    );
+    expect(screen.queryByTestId("settings-nav-session-collab")).toBeNull();
   });
 });
 
@@ -474,7 +477,7 @@ describe("useSettingsRoute", () => {
     });
     expect(routeHook("/settings/context-usage")).toEqual({
       inSettings: true,
-      section: "context-usage",
+      section: "general",
     });
     expect(routeHook("/settings/global-instructions")).toEqual({
       inSettings: true,
@@ -498,8 +501,25 @@ describe("useSettingsRoute", () => {
     });
   });
 
-  it("keeps the keep-warm deep link valid in every deploy", () => {
-    expect(routeHook("/settings/keep-warm")).toEqual({ inSettings: true, section: "keep-warm" });
+  it("maps removed section links to their new section and anchor", () => {
+    expect(routeHook("/settings/keep-warm")).toEqual({ inSettings: true, section: "general" });
+    expect(routeHook("/settings/calling-defaults")).toEqual({
+      inSettings: true,
+      section: "harnesses",
+    });
+    expect(routeHook("/settings/agents")).toEqual({ inSettings: true, section: "custom-agents" });
+    expect(settingsLegacyDestination("/settings/keep-warm", false)).toBe(
+      "/settings/general#keep-warm",
+    );
+    expect(settingsLegacyDestination("/ml/omnigent-embed/settings/calling-defaults", false)).toBe(
+      "/ml/omnigent-embed/settings/harnesses#calling-defaults",
+    );
+    expect(settingsLegacyDestination("/settings/runtime-resources", false)).toBe(
+      "/settings/general#runtime-resources",
+    );
+    expect(settingsLegacyDestination("/settings/context-usage", false)).toBe(
+      "/settings/general#context-usage",
+    );
   });
 
   it("gates the session-collab deep link on the peer-messaging feature", () => {
@@ -511,8 +531,12 @@ describe("useSettingsRoute", () => {
     mocks.sessionCollabEnabled = true;
     expect(routeHook("/settings/session-collab")).toEqual({
       inSettings: true,
-      section: "session-collab",
+      section: "general",
     });
+    expect(settingsLegacyDestination("/settings/session-collab", true)).toBe(
+      "/settings/general#session-collab",
+    );
+    expect(settingsLegacyDestination("/settings/session-collab", false)).toBeNull();
   });
 
   it("keeps General as the bare settings default when a login session exists", () => {

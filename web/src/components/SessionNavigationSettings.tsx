@@ -92,25 +92,6 @@ export function SessionNavigationSettings() {
       </div>
       <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
         <div className="min-w-0 flex-1">
-          <span className="text-sm font-medium text-foreground">Goal markers</span>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Show unofficial Goal outlines and G badges in the session list.
-          </p>
-        </div>
-        <Switch
-          aria-label="Show Goal markers in the session list"
-          checked={preferences.showGoalSessionMarkers}
-          onCheckedChange={(enabled) =>
-            writeSessionNavigationPreferences({
-              ...preferences,
-              showGoalSessionMarkers: enabled,
-            })
-          }
-          className="shrink-0"
-        />
-      </div>
-      <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
-        <div className="min-w-0 flex-1">
           <span className="text-sm font-medium text-foreground">Background and Goal sessions</span>
           <p
             className="mt-1 text-sm text-muted-foreground"
@@ -132,6 +113,28 @@ export function SessionNavigationSettings() {
         />
       </div>
     </section>
+  );
+}
+
+export function GoalMarkersSetting() {
+  const preferences = useSessionNavigationPreferences();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="min-w-0 flex-1">
+        <span className="text-sm font-medium text-foreground">Goal markers</span>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Show unofficial Goal outlines and G badges in the session list.
+        </p>
+      </div>
+      <Switch
+        aria-label="Show Goal markers in the session list"
+        checked={preferences.showGoalSessionMarkers}
+        onCheckedChange={(enabled) =>
+          writeSessionNavigationPreferences({ ...preferences, showGoalSessionMarkers: enabled })
+        }
+        className="shrink-0"
+      />
+    </div>
   );
 }
 

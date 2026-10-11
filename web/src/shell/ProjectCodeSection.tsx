@@ -917,6 +917,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
             targets, credentials and network access in Git on each host.
           </HelpTip>
         </h3>
+        <p className="text-sm text-muted-foreground">
+          A repository is identified by its Git address across hosts. Set the folder where its code
+          lives separately on each host. Agents receive these locations as a code note. Registering
+          an address does not clone the repository.
+        </p>
         {repositories.length === 0 && (
           <p className="text-sm text-muted-foreground">No repositories yet.</p>
         )}
