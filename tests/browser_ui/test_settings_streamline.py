@@ -1,4 +1,4 @@
-"""Browser contracts for settings navigation, reserve width and safe keep-warm copying."""
+"""Browser contracts for consolidated settings and safe per-source edits."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
@@ -302,3 +302,135 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")
     panel.evaluate("element => element.scrollIntoView({block: 'center'})")
     page.screenshot(path=str(output / f"project-copy-{width}.png"), full_page=True)
+
+
+def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    request: pytest.FixtureRequest,
+) -> None:
+    storage_key = "omnigent:usage-context-preferences"
+    source_key = '["host-friendly","polly","pi","model-a"]'
+    legacy = {
+        "version": 5,
+        "showProviderUsageLimits": True,
+        "overrides": {
+            source_key: {"contextWindowTokens": 100000, "autoCompactBufferTokens": 20000}
+        },
+        "lastProviderUsageLimits": {},
+    }
+    synced = {"value": legacy}
+
+    def save_preferences(incoming: Request) -> dict[str, bool]:
+        synced["value"] = incoming.post_data_json["value"]
+        return {"ok": True}
+
+    browser_contract.json(
+        "/v1/me",
+        lambda _: {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {"version": 1, "settings": {"usage_context": synced["value"]}},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/preferences",
+        lambda _: {
+            "user_id": "local",
+            "preferences": {"version": 1, "settings": {"usage_context": synced["value"]}},
+        },
+    )
+    browser_contract.json("/v1/me/preferences/usage_context", save_preferences, method="PATCH")
+    browser_contract.response("/v1/me/preferences/session_collab", method="PATCH")
+    browser_contract.json("/v1/hosts/host-friendly/mcp-servers", {"servers": []})
+    browser_contract.json(
+        "/v1/hosts",
+        {
+            "hosts": [
+                {
+                    "host_id": "host-friendly",
+                    "name": "Example host",
+                    "status": "online",
+                    "configured_harnesses": {"pi": True},
+                }
+            ]
+        },
+    )
+    browser_contract.json(
+        "/v1/agents",
+        {"data": [{"id": "polly-agent", "name": "polly", "harness": "pi"}], "has_more": False},
+    )
+    page.add_init_script(
+        f"if (!localStorage.getItem({json.dumps(storage_key)})) "
+        f"localStorage.setItem({json.dumps(storage_key)}, {json.dumps(json.dumps(legacy))})"
+    )
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{appearance_url}/settings/context-usage")
+    section = page.locator("#context-usage")
+    edit = section.get_by_role("button", name="Edit Example host polly model-a", exact=True)
+    edit.click()
+    capacity = section.get_by_role("spinbutton", name="Edit context total", exact=True)
+    tokens = section.get_by_role("spinbutton", name="Edit compact buffer", exact=True)
+    percent = section.get_by_role("spinbutton", name="Edit compact buffer percent", exact=True)
+    expect(capacity).to_have_value("100000")
+    expect(tokens).to_have_value("20000")
+
+    def saved() -> dict[str, object]:
+        return page.evaluate(
+            "([key, source]) => JSON.parse(localStorage.getItem(key)).overrides[source]",
+            [storage_key, source_key],
+        )
+
+    section.get_by_role("button", name="Percent", exact=True).last.click()
+    percent.fill("10")
+    percent.blur()
+    section.get_by_role("button", name="Tokens", exact=True).last.click()
+    expect(tokens).to_have_value("20000")
+    save = section.get_by_role("button", name="Save", exact=True)
+    save.click()
+    assert saved()["autoCompactBufferPercent"] == 10
+    assert saved()["autoCompactBufferTokens"] == 20000
+    edit.click()
+    tokens.fill("100000")
+    tokens.blur()
+    expect(section.get_by_role("alert")).to_be_visible()
+    expect(save).to_be_disabled()
+    assert saved()["autoCompactBufferTokens"] == 20000
+    tokens.fill("20000")
+    tokens.blur()
+    capacity.fill("20000")
+    capacity.blur()
+    expect(section.get_by_role("alert")).to_be_visible()
+    expect(save).to_be_disabled()
+    assert saved()["contextWindowTokens"] == 100000
+    capacity.fill("100000")
+    capacity.blur()
+    tokens.fill("0")
+    tokens.blur()
+    section.get_by_role("button", name="Percent", exact=True).last.click()
+    expect(percent).to_have_value("10")
+    percent.fill("0")
+    percent.blur()
+    section.get_by_role("button", name="Tokens", exact=True).last.click()
+    expect(tokens).to_have_value("0")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith("/v1/me/preferences/usage_context")
+        )
+    ):
+        save.click()
+    assert saved()["autoCompactBufferPercent"] == 0
+    assert saved()["autoCompactBufferTokens"] == 0
+    page.reload()
+    edit.click()
+    expect(tokens).to_have_value("0")
+    assert saved()["autoCompactBufferPercent"] == 0
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    for width in (1440, 390):
+        page.set_viewport_size({"width": width, "height": 900})
+        tokens.evaluate("element => element.scrollIntoView({block: 'center'})")
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        page.screenshot(path=str(output / f"buffer-manual-{width}.png"), full_page=True)

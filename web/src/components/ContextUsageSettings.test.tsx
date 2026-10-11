@@ -1,7 +1,11 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { readUsageContextPreferences, usageContextSourceKey } from "@/lib/usageContextPreferences";
+import {
+  readUsageContextPreferences,
+  usageContextSourceKey,
+  USAGE_CONTEXT_STORAGE_KEY,
+} from "@/lib/usageContextPreferences";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 
 const mocks = vi.hoisted(() => ({
@@ -122,7 +126,7 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-a");
     expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("model-b");
     expect(screen.getByText(/2 sources saved/)).toBeInTheDocument();
-    expect(screen.getByText(/does not learn after a Compact/)).toBeInTheDocument();
+    expect(screen.getByText(/Manual values change only this indicator/)).toBeInTheDocument();
   });
 
   it("clears the current source inputs when its saved row is deleted", async () => {
@@ -158,6 +162,110 @@ describe("ContextUsageSettings", () => {
       "placeholder",
       "33000",
     );
+  });
+
+  it("keeps both manual buffer units, accepts zero, and rejects a token buffer at capacity", async () => {
+    mocks.contextWindow = 100_000;
+    render(<ContextUsageSettings />);
+    const key = usageContextSourceKey({
+      hostId: "host-friendly",
+      agentName: "polly",
+      harness: "pi",
+      model: "model-a",
+    });
+    const context = screen.getByLabelText("Context window override in tokens");
+    fireEvent.change(context, { target: { value: "100000" } });
+    fireEvent.blur(context);
+    const tokens = screen.getByLabelText("Automatic Compact buffer in tokens");
+    fireEvent.change(tokens, { target: { value: "20000" } });
+    fireEvent.blur(tokens);
+
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Buffer unit" })).getByRole("button", {
+        name: "Percent",
+      }),
+    );
+    const percent = screen.getByLabelText("Compact buffer percent");
+    fireEvent.change(percent, { target: { value: "10" } });
+    fireEvent.blur(percent);
+    await waitFor(() =>
+      expect(readUsageContextPreferences().overrides[key]).toMatchObject({
+        autoCompactBufferTokens: 20_000,
+        autoCompactBufferPercent: 10,
+        compactBufferMode: "percent",
+      }),
+    );
+    expect(screen.getByText(/Compact 90k/)).toBeInTheDocument();
+
+    fireEvent.change(percent, { target: { value: "0" } });
+    fireEvent.blur(percent);
+    await waitFor(() =>
+      expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferPercent).toBe(0),
+    );
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Buffer unit" })).getByRole("button", {
+        name: "Tokens",
+      }),
+    );
+    const tokensAgain = screen.getByLabelText("Automatic Compact buffer in tokens");
+    expect(tokensAgain).toHaveValue(20000);
+    fireEvent.change(tokensAgain, { target: { value: "100000" } });
+    fireEvent.blur(tokensAgain);
+    expect(screen.getByRole("alert")).toHaveTextContent("less than the context total");
+    expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferTokens).toBe(20_000);
+
+    fireEvent.change(tokensAgain, { target: { value: "50000" } });
+    fireEvent.blur(tokensAgain);
+    await waitFor(() =>
+      expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferTokens).toBe(50_000),
+    );
+    fireEvent.change(context, { target: { value: "50000" } });
+    fireEvent.blur(context);
+    expect(screen.getByRole("alert")).toHaveTextContent("must exceed");
+    expect(readUsageContextPreferences().overrides[key]?.contextWindowTokens).toBe(100_000);
+
+    fireEvent.change(context, { target: { value: "100000" } });
+    fireEvent.blur(context);
+    fireEvent.change(tokensAgain, { target: { value: "0" } });
+    fireEvent.blur(tokensAgain);
+    await waitFor(() =>
+      expect(readUsageContextPreferences().overrides[key]).toMatchObject({
+        autoCompactBufferTokens: 0,
+        autoCompactBufferPercent: 0,
+        compactBufferMode: "tokens",
+      }),
+    );
+  });
+
+  it("validates a buffer edit against the saved total after rejecting an invalid total draft", () => {
+    const key = usageContextSourceKey({
+      hostId: "host-friendly",
+      agentName: "polly",
+      harness: "pi",
+      model: "model-a",
+    });
+    localStorage.setItem(
+      USAGE_CONTEXT_STORAGE_KEY,
+      JSON.stringify({
+        version: 5,
+        showProviderUsageLimits: true,
+        overrides: { [key]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 20_000 } },
+        lastProviderUsageLimits: {},
+      }),
+    );
+    mocks.contextWindow = 330_000;
+    render(<ContextUsageSettings />);
+
+    const context = screen.getByLabelText("Context window override in tokens");
+    fireEvent.change(context, { target: { value: "0" } });
+    fireEvent.blur(context);
+    expect(readUsageContextPreferences().overrides[key]?.contextWindowTokens).toBe(100_000);
+
+    const buffer = screen.getByLabelText("Automatic Compact buffer in tokens");
+    fireEvent.change(buffer, { target: { value: "150000" } });
+    fireEvent.blur(buffer);
+    expect(screen.getByRole("alert")).toHaveTextContent("less than the context total");
+    expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferTokens).toBe(20_000);
   });
 
   it("does not present an expired cached usage snapshot as current", () => {

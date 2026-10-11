@@ -5,6 +5,7 @@ import { useSession } from "@/hooks/useSession";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { SavedContextSources } from "@/components/SavedContextSources";
 import { Switch } from "@/components/ui/switch";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
@@ -15,6 +16,7 @@ import {
   type ProviderUsageLimitsSnapshot,
 } from "@/lib/providerUsageLimits";
 import {
+  fixedBufferFitsCapacity,
   usageContextOverrideFor,
   usageContextSourceKey,
   writeUsageContextOverride,
@@ -25,7 +27,17 @@ import { useChatStore } from "@/store/chatStore";
 function optionalNumber(value: string): number | null {
   if (value.trim() === "") return null;
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function bufferNumber(value: string, percent: boolean): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) &&
+    parsed >= 0 &&
+    (percent ? parsed < 100 : Number.isInteger(parsed))
+    ? parsed
+    : null;
 }
 
 function SourceValue({ label, value }: { label: string; value: string }) {
@@ -54,6 +66,11 @@ export function ContextUsageSettings() {
   const [bufferDraft, setBufferDraft] = useState(
     activeOverride.autoCompactBufferTokens?.toString() ?? "",
   );
+  const [percentDraft, setPercentDraft] = useState(
+    activeOverride.autoCompactBufferPercent?.toString() ?? "",
+  );
+  const [inputError, setInputError] = useState("");
+  const bufferMode = activeOverride.compactBufferMode ?? "tokens";
   const reportedContextWindow = useChatStore((state) => state.contextWindow);
   const reportedCompactLimit = useChatStore((state) => state.autoCompactTokenLimit);
   const codexSession = harness === "codex" || harness === "codex-native";
@@ -65,26 +82,73 @@ export function ContextUsageSettings() {
   useEffect(() => {
     setContextWindowDraft(activeOverride.contextWindowTokens?.toString() ?? "");
     setBufferDraft(activeOverride.autoCompactBufferTokens?.toString() ?? "");
-  }, [activeOverride.contextWindowTokens, activeOverride.autoCompactBufferTokens, sourceKey]);
+    setPercentDraft(activeOverride.autoCompactBufferPercent?.toString() ?? "");
+    setInputError("");
+  }, [
+    activeOverride.contextWindowTokens,
+    activeOverride.autoCompactBufferTokens,
+    activeOverride.autoCompactBufferPercent,
+    sourceKey,
+  ]);
 
   const writeOverride = (patch: Partial<typeof activeOverride>) =>
     writeUsageContextOverride(preferences, sourceKey, { ...activeOverride, ...patch });
   const commitContextWindow = () => {
     const next = optionalNumber(contextWindowDraft);
-    writeOverride({ contextWindowTokens: next === null ? null : Math.round(next) });
+    if (contextWindowDraft.trim() !== "" && next === null) {
+      setInputError("Enter a positive context total.");
+      return;
+    }
+    const fixed = bufferNumber(bufferDraft, false);
+    if (bufferDraft.trim() !== "" && fixed === null) {
+      setInputError("Enter a non-negative token buffer.");
+      return;
+    }
+    if (!fixedBufferFitsCapacity(fixed, next ?? reportedContextWindow)) {
+      setInputError("Context total must exceed the saved token buffer.");
+      return;
+    }
+    setInputError("");
+    writeOverride({ contextWindowTokens: next });
   };
   const commitBuffer = () => {
-    const next = optionalNumber(bufferDraft);
-    writeOverride({ autoCompactBufferTokens: next === null ? null : Math.round(next) });
+    const draft = bufferMode === "percent" ? percentDraft : bufferDraft;
+    const next = bufferNumber(draft, bufferMode === "percent");
+    if (draft.trim() !== "" && next === null) {
+      setInputError(
+        bufferMode === "percent"
+          ? "Enter a percentage from 0 to less than 100."
+          : "Enter a non-negative token buffer.",
+      );
+      return;
+    }
+    if (
+      bufferMode === "tokens" &&
+      !fixedBufferFitsCapacity(next, activeOverride.contextWindowTokens ?? reportedContextWindow)
+    ) {
+      setInputError("Token buffer must be less than the context total.");
+      return;
+    }
+    setInputError("");
+    writeOverride(
+      bufferMode === "percent"
+        ? { autoCompactBufferPercent: next }
+        : { autoCompactBufferTokens: next },
+    );
   };
 
   const effectiveContextWindow = optionalNumber(contextWindowDraft) ?? reportedContextWindow;
-  const effectiveBuffer = optionalNumber(bufferDraft);
+  const effectiveBuffer =
+    bufferMode === "percent"
+      ? effectiveContextWindow != null && bufferNumber(percentDraft, true) != null
+        ? (effectiveContextWindow * bufferNumber(percentDraft, true)!) / 100
+        : null
+      : bufferNumber(bufferDraft, false);
   const calculatedCompactPoint =
     effectiveContextWindow != null &&
     effectiveBuffer != null &&
     effectiveContextWindow > effectiveBuffer
-      ? Math.round(effectiveContextWindow - effectiveBuffer)
+      ? effectiveContextWindow - effectiveBuffer
       : reportedCompactLimit;
   const reportedBufferPlaceholder =
     reportedContextWindow != null &&
@@ -155,21 +219,55 @@ export function ContextUsageSettings() {
               aria-label="Context window override in tokens"
             />
           </label>
-          <label className="grid gap-1.5 text-sm">
-            Compact buffer (tokens)
+          <div className="grid gap-1.5 text-sm">
+            <span>Compact buffer</span>
+            <div className="flex gap-1" role="group" aria-label="Buffer unit">
+              <Button
+                type="button"
+                size="xs"
+                variant={bufferMode === "tokens" ? "secondary" : "outline"}
+                aria-pressed={bufferMode === "tokens"}
+                onClick={() => writeOverride({ compactBufferMode: "tokens" })}
+              >
+                Tokens
+              </Button>
+              <Button
+                type="button"
+                size="xs"
+                variant={bufferMode === "percent" ? "secondary" : "outline"}
+                aria-pressed={bufferMode === "percent"}
+                onClick={() => writeOverride({ compactBufferMode: "percent" })}
+              >
+                Percent
+              </Button>
+            </div>
             <Input
               type="number"
-              min={1}
-              step={1000}
-              value={bufferDraft}
-              placeholder={reportedBufferPlaceholder}
-              onChange={(event) => setBufferDraft(event.target.value)}
+              min={0}
+              max={bufferMode === "percent" ? 99.999 : undefined}
+              step={bufferMode === "percent" ? "any" : 1}
+              value={bufferMode === "percent" ? percentDraft : bufferDraft}
+              placeholder={bufferMode === "percent" ? "Auto" : reportedBufferPlaceholder}
+              onChange={(event) =>
+                bufferMode === "percent"
+                  ? setPercentDraft(event.target.value)
+                  : setBufferDraft(event.target.value)
+              }
               onBlur={commitBuffer}
               onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
-              aria-label="Automatic Compact buffer in tokens"
+              aria-label={
+                bufferMode === "percent"
+                  ? "Compact buffer percent"
+                  : "Automatic Compact buffer in tokens"
+              }
             />
-          </label>
+          </div>
         </div>
+        {inputError ? (
+          <p role="alert" className="text-xs text-destructive">
+            {inputError}
+          </p>
+        ) : null}
         <p
           className="text-xs tabular-nums text-muted-foreground"
           title={`${effectiveContextWindow?.toLocaleString() ?? "No context total"} total${calculatedCompactPoint != null ? `; Compact at ${calculatedCompactPoint.toLocaleString()}` : "; Compact point unavailable"}`}
@@ -185,15 +283,15 @@ export function ContextUsageSettings() {
             : ""}
         </p>
         <p className="text-xs text-muted-foreground">
-          Compact point = context total minus the buffer. Auto follows values reported by the active
-          session. It does not learn after a Compact or change when the agent compacts; manual
-          values only correct this indicator.
+          Compact point = context total minus the selected buffer. Empty fields follow the active
+          session’s reported values. Manual values change only this indicator.
         </p>
         <SavedContextSources
           preferences={preferences}
           currentSourceKey={sourceKey}
           hosts={hosts}
           currentOverride={activeOverride}
+          reportedContextWindow={reportedContextWindow}
         />
       </div>
 

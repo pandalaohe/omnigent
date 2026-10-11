@@ -22,6 +22,7 @@ import type { Host } from "@/hooks/useHosts";
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import {
   deleteUsageContextOverrides,
+  fixedBufferFitsCapacity,
   patchUsageContextOverrides,
   usageContextSourceFromKey,
   writeUsageContextOverride,
@@ -38,6 +39,16 @@ function positiveNumber(value: string): number | null {
   if (value.trim() === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+}
+
+function bufferValue(value: string, percent: boolean): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) &&
+    parsed >= 0 &&
+    (percent ? parsed < 100 : Number.isInteger(parsed))
+    ? parsed
+    : null;
 }
 
 interface SavedContextSourceRow {
@@ -67,11 +78,13 @@ export function SavedContextSources({
   currentSourceKey,
   hosts,
   currentOverride,
+  reportedContextWindow = null,
 }: {
   preferences: UsageContextPreferences;
   currentSourceKey: string;
   hosts: Host[];
   currentOverride: UsageContextOverride;
+  reportedContextWindow?: number | null;
 }) {
   const rows: SavedContextSourceRow[] = Object.entries(preferences.overrides).flatMap(
     ([key, override]) => {
@@ -101,6 +114,8 @@ export function SavedContextSources({
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [editContext, setEditContext] = useState("");
   const [editBuffer, setEditBuffer] = useState("");
+  const [editPercent, setEditPercent] = useState("");
+  const [editMode, setEditMode] = useState<"tokens" | "percent">("tokens");
   const editBaselineRef = useRef<UsageContextOverride>({
     contextWindowTokens: null,
     autoCompactBufferTokens: null,
@@ -108,6 +123,9 @@ export function SavedContextSources({
   const [deleteKeys, setDeleteKeys] = useState<string[] | null>(null);
   const [batchContext, setBatchContext] = useState("");
   const [batchBuffer, setBatchBuffer] = useState("");
+  const [batchPercent, setBatchPercent] = useState("");
+  const [batchMode, setBatchMode] = useState<"tokens" | "percent">("tokens");
+  const [batchModeSelected, setBatchModeSelected] = useState(false);
   const [batchContextAuto, setBatchContextAuto] = useState(false);
   const [batchBufferAuto, setBatchBufferAuto] = useState(false);
 
@@ -136,6 +154,8 @@ export function SavedContextSources({
   const editingRowExists = editingRow !== null;
   const editingRowContext = editingRow?.override.contextWindowTokens;
   const editingRowBuffer = editingRow?.override.autoCompactBufferTokens;
+  const editingRowPercent = editingRow?.override.autoCompactBufferPercent;
+  const editingRowMode = editingRow?.override.compactBufferMode;
 
   useEffect(() => {
     if (editingKey === null) return;
@@ -143,11 +163,20 @@ export function SavedContextSources({
     if (
       !editingRowExists ||
       editingRowContext !== baseline.contextWindowTokens ||
-      editingRowBuffer !== baseline.autoCompactBufferTokens
+      editingRowBuffer !== baseline.autoCompactBufferTokens ||
+      editingRowPercent !== baseline.autoCompactBufferPercent ||
+      editingRowMode !== baseline.compactBufferMode
     ) {
       setEditingKey(null);
     }
-  }, [editingKey, editingRowExists, editingRowContext, editingRowBuffer]);
+  }, [
+    editingKey,
+    editingRowExists,
+    editingRowContext,
+    editingRowBuffer,
+    editingRowPercent,
+    editingRowMode,
+  ]);
 
   if (rows.length === 0) return null;
 
@@ -158,11 +187,60 @@ export function SavedContextSources({
     !allShownSelected && visibleRows.some((row) => selectedKeySet.has(row.key));
   const currentHasOverride =
     currentOverride.contextWindowTokens !== null ||
-    currentOverride.autoCompactBufferTokens !== null;
+    currentOverride.autoCompactBufferTokens !== null ||
+    currentOverride.autoCompactBufferPercent != null ||
+    currentOverride.compactBufferMode === "percent";
   const contextWouldKeep = !batchContextAuto && positiveNumber(batchContext) === null;
-  const bufferWouldKeep = !batchBufferAuto && positiveNumber(batchBuffer) === null;
+  const bufferWouldKeep =
+    !batchBufferAuto &&
+    bufferValue(batchMode === "percent" ? batchPercent : batchBuffer, batchMode === "percent") ===
+      null &&
+    !batchModeSelected;
+  const editContextValue = positiveNumber(editContext);
+  const editTokenValue = bufferValue(editBuffer, false);
+  const editPercentValue = bufferValue(editPercent, true);
+  const editInvalid =
+    (editContext.trim() !== "" && editContextValue === null) ||
+    (editBuffer.trim() !== "" && editTokenValue === null) ||
+    (editPercent.trim() !== "" && editPercentValue === null) ||
+    !fixedBufferFitsCapacity(
+      editTokenValue,
+      editContextValue ?? (editingRow?.key === currentSourceKey ? reportedContextWindow : null),
+    );
   const editSaveDisabled =
-    positiveNumber(editContext) === null && positiveNumber(editBuffer) === null;
+    editInvalid ||
+    (editContextValue === null &&
+      editTokenValue === null &&
+      editPercentValue === null &&
+      editMode !== "percent");
+  const batchContextValue = batchContextAuto ? null : positiveNumber(batchContext);
+  const batchTokenValue = batchBufferAuto ? null : bufferValue(batchBuffer, false);
+  const batchPercentValue = batchBufferAuto ? null : bufferValue(batchPercent, true);
+  const batchInvalid =
+    (!batchContextAuto && batchContext.trim() !== "" && batchContextValue === null) ||
+    (!batchBufferAuto &&
+      batchBuffer.trim() !== "" &&
+      batchMode === "tokens" &&
+      batchTokenValue === null) ||
+    (!batchBufferAuto &&
+      batchPercent.trim() !== "" &&
+      batchMode === "percent" &&
+      batchPercentValue === null) ||
+    selectedKeys.some((key) => {
+      const override = preferences.overrides[key];
+      if (!override) return false;
+      const context =
+        batchContextValue ??
+        (batchContextAuto ? null : override.contextWindowTokens) ??
+        (key === currentSourceKey ? reportedContextWindow : null);
+      const tokenBuffer =
+        batchMode === "tokens" && batchTokenValue !== null
+          ? batchTokenValue
+          : batchMode === "tokens" && batchBufferAuto
+            ? null
+            : override.autoCompactBufferTokens;
+      return !fixedBufferFitsCapacity(tokenBuffer, context);
+    });
   const anyFilterRendered = hostOptions.length >= 2 || agentOptions.length >= 2;
   const anyFilterActive = effectiveHostFilter !== ALL_FILTER || effectiveAgentFilter !== ALL_FILTER;
   const deleteTargets = (deleteKeys ?? []).flatMap((key) => {
@@ -196,22 +274,32 @@ export function SavedContextSources({
     editBaselineRef.current = {
       contextWindowTokens: row.override.contextWindowTokens,
       autoCompactBufferTokens: row.override.autoCompactBufferTokens,
+      autoCompactBufferPercent: row.override.autoCompactBufferPercent,
+      compactBufferMode: row.override.compactBufferMode,
     };
     setEditingKey(row.key);
     setEditContext(row.override.contextWindowTokens?.toString() ?? "");
     setEditBuffer(row.override.autoCompactBufferTokens?.toString() ?? "");
+    setEditPercent(row.override.autoCompactBufferPercent?.toString() ?? "");
+    setEditMode(row.override.compactBufferMode ?? "tokens");
   };
 
   const saveEdit = () => {
     if (!editingRow) return;
+    if (editSaveDisabled) return;
     writeUsageContextOverride(preferences, editingRow.key, {
-      contextWindowTokens: positiveNumber(editContext),
-      autoCompactBufferTokens: positiveNumber(editBuffer),
+      contextWindowTokens: editContextValue,
+      autoCompactBufferTokens: editTokenValue,
+      autoCompactBufferPercent: editPercentValue,
+      ...(editMode === "percent" || editingRow.override.compactBufferMode
+        ? { compactBufferMode: editMode }
+        : {}),
     });
     setEditingKey(null);
   };
 
   const applyToSelected = () => {
+    if (batchInvalid) return;
     const patch: UsageContextOverridePatch = {};
     if (batchContextAuto) {
       patch.contextWindowTokens = null;
@@ -220,15 +308,22 @@ export function SavedContextSources({
       if (value !== null) patch.contextWindowTokens = value;
     }
     if (batchBufferAuto) {
-      patch.autoCompactBufferTokens = null;
+      if (batchMode === "percent") patch.autoCompactBufferPercent = null;
+      else patch.autoCompactBufferTokens = null;
     } else {
-      const value = positiveNumber(batchBuffer);
-      if (value !== null) patch.autoCompactBufferTokens = value;
+      const value = batchMode === "percent" ? batchPercentValue : batchTokenValue;
+      if (value !== null) {
+        if (batchMode === "percent") patch.autoCompactBufferPercent = value;
+        else patch.autoCompactBufferTokens = value;
+      }
     }
+    if (batchModeSelected) patch.compactBufferMode = batchMode;
     patchUsageContextOverrides(preferences, selectedKeys, patch);
     setSelectedKeys([]);
     setBatchContext("");
     setBatchBuffer("");
+    setBatchPercent("");
+    setBatchModeSelected(false);
     setBatchContextAuto(false);
     setBatchBufferAuto(false);
   };
@@ -236,8 +331,15 @@ export function SavedContextSources({
   const useCurrentSource = () => {
     setBatchContextAuto(currentOverride.contextWindowTokens === null);
     setBatchContext(currentOverride.contextWindowTokens?.toString() ?? "");
-    setBatchBufferAuto(currentOverride.autoCompactBufferTokens === null);
+    setBatchBufferAuto(
+      (currentOverride.compactBufferMode === "percent"
+        ? currentOverride.autoCompactBufferPercent
+        : currentOverride.autoCompactBufferTokens) == null,
+    );
     setBatchBuffer(currentOverride.autoCompactBufferTokens?.toString() ?? "");
+    setBatchPercent(currentOverride.autoCompactBufferPercent?.toString() ?? "");
+    setBatchMode(currentOverride.compactBufferMode ?? "tokens");
+    setBatchModeSelected(true);
   };
 
   const confirmDelete = () => {
@@ -349,16 +451,45 @@ export function SavedContextSources({
           </div>
           <div className="grid gap-1 text-xs text-muted-foreground">
             <span>Compact buffer</span>
+            <div className="flex gap-1" role="group" aria-label="Selected buffer unit">
+              <Button
+                size="xs"
+                variant={batchMode === "tokens" ? "secondary" : "outline"}
+                aria-pressed={batchMode === "tokens"}
+                onClick={() => {
+                  setBatchMode("tokens");
+                  setBatchModeSelected(true);
+                }}
+              >
+                Tokens
+              </Button>
+              <Button
+                size="xs"
+                variant={batchMode === "percent" ? "secondary" : "outline"}
+                aria-pressed={batchMode === "percent"}
+                onClick={() => {
+                  setBatchMode("percent");
+                  setBatchModeSelected(true);
+                }}
+              >
+                Percent
+              </Button>
+            </div>
             <div className="flex items-center gap-1">
               <Input
                 type="number"
-                min={1}
-                step={1000}
-                value={batchBufferAuto ? "" : batchBuffer}
+                min={0}
+                max={batchMode === "percent" ? 99.999 : undefined}
+                step={batchMode === "percent" ? "any" : 1}
+                value={batchBufferAuto ? "" : batchMode === "percent" ? batchPercent : batchBuffer}
                 placeholder={batchBufferAuto ? "Auto" : "Keep"}
                 disabled={batchBufferAuto}
-                onChange={(event) => setBatchBuffer(event.target.value)}
-                aria-label="Compact buffer"
+                onChange={(event) => {
+                  if (batchMode === "percent") setBatchPercent(event.target.value);
+                  else setBatchBuffer(event.target.value);
+                  setBatchModeSelected(true);
+                }}
+                aria-label={batchMode === "percent" ? "Compact buffer percent" : "Compact buffer"}
                 className="w-32"
               />
               <Button
@@ -369,6 +500,7 @@ export function SavedContextSources({
                 onClick={() => {
                   setBatchBufferAuto((auto) => !auto);
                   setBatchBuffer("");
+                  setBatchModeSelected(true);
                 }}
               >
                 Auto
@@ -386,7 +518,7 @@ export function SavedContextSources({
             </Button>
             <Button
               size="sm"
-              disabled={contextWouldKeep && bufferWouldKeep}
+              disabled={batchInvalid || (contextWouldKeep && bufferWouldKeep)}
               onClick={applyToSelected}
             >
               Apply to {selectedKeys.length} selected
@@ -402,6 +534,11 @@ export function SavedContextSources({
               Clear selection
             </Button>
           </div>
+          {batchInvalid ? (
+            <p role="alert" className="text-xs text-destructive">
+              Token buffer must be less than every selected context total; enter valid numbers.
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -471,14 +608,41 @@ export function SavedContextSources({
                   </div>
                   <div className="grid gap-1 text-muted-foreground">
                     <span>Compact buffer</span>
+                    <div className="flex gap-1" role="group" aria-label="Edit buffer unit">
+                      <Button
+                        size="xs"
+                        variant={editMode === "tokens" ? "secondary" : "outline"}
+                        aria-pressed={editMode === "tokens"}
+                        onClick={() => setEditMode("tokens")}
+                      >
+                        Tokens
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant={editMode === "percent" ? "secondary" : "outline"}
+                        aria-pressed={editMode === "percent"}
+                        onClick={() => setEditMode("percent")}
+                      >
+                        Percent
+                      </Button>
+                    </div>
                     <Input
                       type="number"
-                      min={1}
-                      step={1000}
-                      value={editBuffer}
+                      min={0}
+                      max={editMode === "percent" ? 99.999 : undefined}
+                      step={editMode === "percent" ? "any" : 1}
+                      value={editMode === "percent" ? editPercent : editBuffer}
                       placeholder="Auto"
-                      onChange={(event) => setEditBuffer(event.target.value)}
-                      aria-label="Edit compact buffer"
+                      onChange={(event) =>
+                        editMode === "percent"
+                          ? setEditPercent(event.target.value)
+                          : setEditBuffer(event.target.value)
+                      }
+                      aria-label={
+                        editMode === "percent"
+                          ? "Edit compact buffer percent"
+                          : "Edit compact buffer"
+                      }
                     />
                   </div>
                   <div className="flex flex-wrap items-center gap-2 sm:col-span-2">
@@ -490,6 +654,11 @@ export function SavedContextSources({
                     </Button>
                     <span className="text-muted-foreground">Use Delete to remove this source.</span>
                   </div>
+                  {editInvalid ? (
+                    <span role="alert" className="text-destructive sm:col-span-2">
+                      Token buffer must be less than the context total; enter valid numbers.
+                    </span>
+                  ) : null}
                 </div>
               ) : (
                 <div className="grid gap-1 sm:grid-cols-2">
@@ -498,7 +667,12 @@ export function SavedContextSources({
                   </span>
                   <span className="tabular-nums text-muted-foreground sm:text-right">
                     Context {row.override.contextWindowTokens?.toLocaleString() ?? "Auto"} · Compact
-                    buffer {row.override.autoCompactBufferTokens?.toLocaleString() ?? "Auto"}
+                    buffer{" "}
+                    {row.override.compactBufferMode === "percent"
+                      ? row.override.autoCompactBufferPercent == null
+                        ? "Auto"
+                        : `${row.override.autoCompactBufferPercent.toLocaleString()}%`
+                      : (row.override.autoCompactBufferTokens?.toLocaleString() ?? "Auto")}
                   </span>
                 </div>
               )}

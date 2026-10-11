@@ -12,12 +12,16 @@ export interface UsageContextOverride {
   contextWindowTokens: number | null;
   /** Tokens reserved before the context total; compact point = total - buffer. */
   autoCompactBufferTokens: number | null;
+  autoCompactBufferPercent?: number | null;
+  compactBufferMode?: "tokens" | "percent";
 }
 
 /** Only present fields are applied; `null` clears the field to Auto. */
 export interface UsageContextOverridePatch {
   contextWindowTokens?: number | null;
   autoCompactBufferTokens?: number | null;
+  autoCompactBufferPercent?: number | null;
+  compactBufferMode?: "tokens" | "percent";
 }
 
 export interface UsageContextPreferences {
@@ -50,6 +54,22 @@ function positiveInteger(value: unknown): number | null {
     : null;
 }
 
+function nonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : null;
+}
+
+function bufferPercent(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value < 100
+    ? value
+    : null;
+}
+
+export function fixedBufferFitsCapacity(buffer: number | null, capacity: number | null): boolean {
+  return buffer === null || capacity === null || buffer < capacity;
+}
+
 export function normalizeUsageContextPreferences(value: unknown): UsageContextPreferences {
   if (!value || typeof value !== "object") return { ...DEFAULT_USAGE_CONTEXT_PREFERENCES };
   const raw = value as {
@@ -68,7 +88,7 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
         autoCompactThresholdPercent?: unknown;
       };
       const contextWindowTokens = positiveInteger(source.contextWindowTokens);
-      const storedBufferTokens = positiveInteger(source.autoCompactBufferTokens);
+      const storedBufferTokens = nonNegativeInteger(source.autoCompactBufferTokens);
       const legacyPercent = source.autoCompactThresholdPercent;
       const migratedBuffer =
         storedBufferTokens === null &&
@@ -82,8 +102,25 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
       const autoCompactBufferTokens =
         storedBufferTokens ??
         (migratedBuffer !== null && migratedBuffer > 0 ? migratedBuffer : null);
-      const normalized = { contextWindowTokens, autoCompactBufferTokens };
-      if (normalized.contextWindowTokens !== null || normalized.autoCompactBufferTokens !== null) {
+      const autoCompactBufferPercent = bufferPercent(source.autoCompactBufferPercent);
+      const compactBufferMode =
+        source.compactBufferMode === "percent"
+          ? "percent"
+          : source.compactBufferMode === "tokens"
+            ? "tokens"
+            : undefined;
+      const normalized: UsageContextOverride = {
+        contextWindowTokens,
+        autoCompactBufferTokens,
+        ...(autoCompactBufferPercent !== null ? { autoCompactBufferPercent } : {}),
+        ...(compactBufferMode ? { compactBufferMode } : {}),
+      };
+      if (
+        contextWindowTokens !== null ||
+        autoCompactBufferTokens !== null ||
+        autoCompactBufferPercent !== null ||
+        compactBufferMode === "percent"
+      ) {
         overrides[key] = normalized;
       }
     }
@@ -211,14 +248,20 @@ export function writeUsageContextOverride(
   sourceKey: string,
   override: UsageContextOverride,
 ): void {
-  const normalizedOverride = {
+  const normalizedOverride: UsageContextOverride = {
     contextWindowTokens: positiveInteger(override.contextWindowTokens),
-    autoCompactBufferTokens: positiveInteger(override.autoCompactBufferTokens),
+    autoCompactBufferTokens: nonNegativeInteger(override.autoCompactBufferTokens),
+    ...(override.autoCompactBufferPercent !== undefined
+      ? { autoCompactBufferPercent: bufferPercent(override.autoCompactBufferPercent) }
+      : {}),
+    ...(override.compactBufferMode ? { compactBufferMode: override.compactBufferMode } : {}),
   };
   const overrides = { ...preferences.overrides };
   if (
     normalizedOverride.contextWindowTokens === null &&
-    normalizedOverride.autoCompactBufferTokens === null
+    normalizedOverride.autoCompactBufferTokens === null &&
+    normalizedOverride.autoCompactBufferPercent == null &&
+    normalizedOverride.compactBufferMode !== "percent"
   ) {
     Reflect.deleteProperty(overrides, sourceKey);
   } else {
@@ -244,6 +287,10 @@ export function patchUsageContextOverrides(
       contextWindowTokens: null,
       autoCompactBufferTokens: null,
     };
+    const compactBufferMode =
+      patch.compactBufferMode === "tokens" && existing.compactBufferMode === undefined
+        ? undefined
+        : (patch.compactBufferMode ?? existing.compactBufferMode);
     const next: UsageContextOverride = {
       contextWindowTokens:
         patch.contextWindowTokens !== undefined
@@ -251,10 +298,26 @@ export function patchUsageContextOverrides(
           : positiveInteger(existing.contextWindowTokens),
       autoCompactBufferTokens:
         patch.autoCompactBufferTokens !== undefined
-          ? positiveInteger(patch.autoCompactBufferTokens)
-          : positiveInteger(existing.autoCompactBufferTokens),
+          ? nonNegativeInteger(patch.autoCompactBufferTokens)
+          : nonNegativeInteger(existing.autoCompactBufferTokens),
+      ...(patch.autoCompactBufferPercent !== undefined ||
+      existing.autoCompactBufferPercent !== undefined
+        ? {
+            autoCompactBufferPercent: bufferPercent(
+              patch.autoCompactBufferPercent !== undefined
+                ? patch.autoCompactBufferPercent
+                : existing.autoCompactBufferPercent,
+            ),
+          }
+        : {}),
+      ...(compactBufferMode ? { compactBufferMode } : {}),
     };
-    if (next.contextWindowTokens === null && next.autoCompactBufferTokens === null) {
+    if (
+      next.contextWindowTokens === null &&
+      next.autoCompactBufferTokens === null &&
+      next.autoCompactBufferPercent == null &&
+      next.compactBufferMode !== "percent"
+    ) {
       Reflect.deleteProperty(overrides, sourceKey);
     } else {
       overrides[sourceKey] = next;
@@ -344,7 +407,12 @@ export function resolveUsageContextLimits(
 ): { contextWindow: number | null; autoCompactTokenLimit: number | null } {
   const override = usageContextOverrideFor(preferences, sourceKey);
   const contextWindow = override.contextWindowTokens ?? reportedContextWindow;
-  const buffer = override.autoCompactBufferTokens;
+  const buffer =
+    override.compactBufferMode === "percent"
+      ? override.autoCompactBufferPercent == null || contextWindow == null
+        ? null
+        : (contextWindow * override.autoCompactBufferPercent) / 100
+      : override.autoCompactBufferTokens;
   const manualCompactLimit =
     contextWindow != null && buffer != null && contextWindow > buffer
       ? contextWindow - buffer
