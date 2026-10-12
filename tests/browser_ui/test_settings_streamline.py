@@ -294,6 +294,10 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     menu = page.get_by_role("menu")
     assert menu.evaluate("element => element.scrollWidth <= element.clientWidth")
     page.keyboard.press("Escape")
+    expect(menu).not_to_be_visible()
+    expect(page.get_by_role("dialog", name="Project settings", exact=True)).to_be_visible()
+    expect(model).to_contain_text("Host default · Master model")
+    expect(page.get_by_test_id("project-settings-host-reset-model-host-a")).to_be_disabled()
     page.get_by_role("button", name="Cancel", exact=True).click()
     open_project()
     expect(model).to_have_text("Project model")
@@ -325,6 +329,8 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")
     panel.evaluate("element => element.scrollIntoView({block: 'center'})")
     page.screenshot(path=str(output / f"project-copy-{width}.png"), full_page=True)
+    page.keyboard.press("Escape")
+    expect(dialog).not_to_be_visible()
 
 
 def test_manual_compact_buffer_modes_preserve_values_and_validate_both_edits(
