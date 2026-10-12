@@ -298,11 +298,15 @@ export function sameQuestionAnswer(a: ParsedSystemMessage, b: ParsedSystemMessag
   if (aRef && bRef && aRef !== bRef) return false;
   if (a.cardRef || b.cardRef) {
     if (!aRef || !bRef) return false;
-    const rendered = (message: ParsedSystemMessage) =>
-      message.cardRef
-        ? message.body
-        : message.answers?.map(({ question, answer }) => `${question} → ${answer}`).join("\n");
-    return rendered(a) === rendered(b);
+    const legacy = a.cardRef ? a : b;
+    const other = a.cardRef ? b : a;
+    const rendered = other.cardRef
+      ? other.body
+      : other.answers?.map(({ question, answer }) => `${question} → ${answer}`).join("\n");
+    // Claude's terminal transcript can append a newline to the delivered marker.
+    return (
+      legacy.body === rendered || Boolean(other.elicitationId && legacy.body === `${rendered}\n`)
+    );
   }
   const keyed = Boolean(
     (a.elicitationId && b.elicitationId) ||

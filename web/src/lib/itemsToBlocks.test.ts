@@ -230,6 +230,37 @@ describe("itemsToBlocks — flat shape", () => {
     ).toEqual(["receipt", "legacy"]);
   });
 
+  it.each(["SQLite", "First paragraph\n\nSecond paragraph with A → B"])(
+    "dedupes a Claude async answer with a terminal newline on reload: %s",
+    (answer) => {
+      const question = "Choose a library.\nExplain why.";
+      const receipt = userMessage(
+        "r1",
+        `[System: Question answered]\n${JSON.stringify({
+          elicitation_id: "elicit_abcdef123",
+          action: "accept",
+          answers: [{ question, answer }],
+        })}`,
+        "receipt",
+      );
+      const echo = userMessage(
+        "r2",
+        `[System: answers to your question card #qabcdef]\n${question} → ${answer}\n`,
+        "echo",
+      );
+      for (const items of [
+        [receipt, echo],
+        [echo, receipt],
+      ]) {
+        const blocks = itemsToBlocks(items);
+        expect(blocks.map((block) => block.ctx.itemId)).toEqual(["receipt"]);
+        expect((blocks[0] as UserMessageBlock).content).toEqual(
+          (receipt as { content: unknown[] }).content,
+        );
+      }
+    },
+  );
+
   it("dedupes a batched Codex echo only when separate receipts cover every answer", () => {
     const receipt = (id: string, question: string, answer: string, elicitationId: string) =>
       userMessage(
