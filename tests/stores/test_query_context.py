@@ -163,13 +163,11 @@ def test_conversation_store_names_create_and_get_queries(
             title="child",
             parent_conversation_id=parent.id,
         )
-        # Fork mod: the parent lookup is an ancestor WALK inside the child's
-        # write transaction (archive-close serialization), so it costs two
-        # statements per ancestor — the lock and the row read — and the
-        # parent's routing snapshot is read before that transaction opens
-        # rather than inside it. Same names, different multiplicity and order.
+        # Read ancestry, lock root-first, then refresh to reject moved parents.
+        # The routing snapshot is read before that write transaction opens.
         assert query_names == [
             "omnigent.conversation_store.select_conversation_metadata_by_id",
+            "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_parent_conversation",
             "omnigent.conversation_store.select_duplicate_child_title",
