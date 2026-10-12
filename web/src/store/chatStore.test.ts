@@ -9013,6 +9013,44 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual(["receipt"]);
     });
 
+    it.each([false, true])(
+      "keeps one live Claude async answer with a terminal newline (echo first = %s)",
+      (echoFirst) => {
+        const question = "Choose a library.";
+        const answer = "First paragraph\n\nSecond paragraph with A → B";
+        const receipt = `[System: Question answered]\n${JSON.stringify({
+          elicitation_id: "elicit_abcdef123",
+          action: "accept",
+          answers: [{ question, answer }],
+        })}`;
+        const echo = `[System: answers to your question card #qabcdef]\n${question} → ${answer}\n`;
+        useChatStore.setState({
+          blocks: [],
+          pendingUserMessages: [
+            { tempId: "pending", content: [{ type: "input_text", text: "Later message" }] },
+          ],
+        });
+        const messages = [
+          ["receipt", receipt],
+          ["echo", echo],
+        ];
+        for (const [itemId, text] of echoFirst ? messages.reverse() : messages) {
+          handleSessionEvent({
+            type: "session_input_consumed",
+            itemId: itemId!,
+            itemType: "message",
+            data: { role: "user", content: [{ type: "input_text", text: text! }] },
+          });
+        }
+        const after = useChatStore.getState();
+        expect(after.blocks.map((block) => block.ctx.itemId)).toEqual(["receipt"]);
+        expect((after.blocks[0] as UserMessageBlock).content).toEqual([
+          { type: "input_text", text: receipt },
+        ]);
+        expect(after.pendingUserMessages).toHaveLength(1);
+      },
+    );
+
     it("keeps a batched echo until all separate live receipts cover it", () => {
       const consume = (itemId: string, text: string) =>
         handleSessionEvent({

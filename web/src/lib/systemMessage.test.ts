@@ -502,6 +502,27 @@ describe("Codex question replies", () => {
     ).toBe(false);
   });
 
+  it.each(["Selected option", "First\n\nSecond → third\n"])(
+    "correlates only the final transport newline of a keyed Claude echo: %s",
+    (answer) => {
+      const receipt = parseSystemMessage(
+        `[System: Question answered]\n${JSON.stringify({
+          elicitation_id: "elicit_abcdef123",
+          answers: [{ question: "Why?", answer }],
+        })}`,
+      )!;
+      const legacy = (suffix: string) =>
+        parseSystemMessage(
+          `[System: answers to your question card #qabcdef]\nWhy? → ${answer}${suffix}`,
+        )!;
+      expect(sameQuestionAnswer(receipt, legacy("\n"))).toBe(true);
+      expect(sameQuestionAnswer(legacy("\n"), receipt)).toBe(true);
+      expect(sameQuestionAnswer(receipt, legacy(" \n"))).toBe(false);
+      expect(sameQuestionAnswer(receipt, legacy("\n\n"))).toBe(false);
+      expect(receipt.answers?.[0]?.answer).toBe(answer);
+    },
+  );
+
   it.each([
     [
       "malformed JSON",
