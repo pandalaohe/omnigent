@@ -156,7 +156,16 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
         {"id": "project-model", "displayName": "Project model"},
         {"id": "master-model", "displayName": "Master model", "isDefault": True},
     ]
-    master = {"host-a": {"codex-native": {"model": "master-model"}}}
+    master = {
+        "host-a": {
+            "codex-native": {
+                "model": "master-model",
+                "effort": "xhigh",
+                "speed": "standard",
+                "permission": "read-only",
+            }
+        }
+    }
     browser_contract.json("/v1/hosts", {"hosts": [host]})
     browser_contract.json("/v1/skills", {"skills": []})
     browser_contract.json("/v1/hosts/host-a/mcp-servers", {"servers": []})
@@ -278,7 +287,19 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     model = page.get_by_test_id("project-settings-host-model-host-a")
     expect(model).to_have_text("Project model")
     page.get_by_test_id("project-settings-host-reset-model-host-a").click()
-    expect(model).to_contain_text("Host default · Master model")
+    expect(model).to_have_text("Master model")
+    for field, label in [("effort", "xHigh"), ("speed", "Standard"), ("permission", "Read Only")]:
+        expect(page.get_by_test_id(f"project-settings-host-{field}-host-a")).to_have_text(label)
+    model.click()
+    expect(page.get_by_role("option", name="Default", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    explicit = page.get_by_role("option", name="Master model", exact=True)
+    expect(explicit).to_have_attribute("aria-selected", "false")
+    explicit.click()
+    expect(model).to_have_text("Master model")
+    expect(page.get_by_test_id("project-settings-host-reset-model-host-a")).to_be_enabled()
+    page.get_by_test_id("project-settings-host-reset-model-host-a").click()
     output = Path(request.config.getoption("--output"))
     output.mkdir(parents=True, exist_ok=True)
     detail = page.get_by_test_id("project-settings-host-detail-host-a")
@@ -296,7 +317,14 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     page.keyboard.press("Escape")
     expect(menu).not_to_be_visible()
     expect(page.get_by_role("dialog", name="Project settings", exact=True)).to_be_visible()
-    expect(model).to_contain_text("Host default · Master model")
+    expect(model).to_have_text("Master model")
+    if width == 390:
+        page.set_viewport_size({"width": width, "height": 1200})
+    detail.scroll_into_view_if_needed()
+    for field in ("model", "effort", "speed", "permission"):
+        expect(page.get_by_test_id(f"project-settings-host-{field}-host-a")).to_be_in_viewport()
+    page.screenshot(path=str(output / f"project-values-only-{width}.png"), full_page=True)
+    page.set_viewport_size({"width": width, "height": 900})
     expect(page.get_by_test_id("project-settings-host-reset-model-host-a")).to_be_disabled()
     page.get_by_role("button", name="Cancel", exact=True).click()
     open_project()
