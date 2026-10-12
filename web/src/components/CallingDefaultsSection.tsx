@@ -8,6 +8,7 @@ import { PlusIcon, Trash2Icon } from "lucide-react";
 
 import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
@@ -254,7 +255,7 @@ function AddHarnessControl({
         data-testid="calling-defaults-add-row"
       >
         <PlusIcon />
-        Add harness row
+        Add harness settings
       </Button>
     );
   }
@@ -268,7 +269,7 @@ function AddHarnessControl({
     >
       <SelectTrigger
         className="h-8 w-full max-w-56"
-        aria-label="Add harness row"
+        aria-label="Add harness settings"
         data-testid="calling-defaults-add-harness"
       >
         <SelectValue placeholder="Choose a harness" />
@@ -701,32 +702,35 @@ export function CallingDefaultsSection() {
           {error}
         </p>
       )}
-      <div className="space-y-2 text-sm text-muted-foreground">
-        <p>
-          Model, effort, speed and permission are resolved separately: explicit choice → project on
-          this host and harness → this master table → SDK&apos;s Native project and master defaults
-          → the Agent or harness default. A matching legacy project model can also take precedence
-          over the master model.
-        </p>
-        <p>
-          New Chat can reuse the last Agent, model, effort and speed for a project on this host;
-          permission is resolved independently. Ordinary child sessions use the parent&apos;s
-          project and host as context, without copying its running model. Named members use their
-          saved settings and snapshot; empty model or effort can inherit when that snapshot is made.
-          Smart Routing skips fixed model, effort, speed and permission defaults on automatic
-          routes.
-        </p>
+      <div className="flex items-start gap-2 text-sm text-muted-foreground">
+        <p>Defaults by host and harness. Projects can override them.</p>
+        <HelpTip label="How session defaults are chosen">
+          <p>
+            Model, effort, speed and permission are resolved separately: explicit choice → project
+            on this host and harness → this master table → SDK&apos;s Native project and master
+            defaults → the Agent or harness default. A matching legacy project model can also take
+            precedence over the master model.
+          </p>
+          <p>
+            New Chat can reuse the last Agent, model, effort and speed for a project on this host;
+            permission is resolved independently. Ordinary child sessions use the parent&apos;s
+            project and host as context, without copying its running model. Named members use their
+            saved settings and snapshot; empty model or effort can inherit when that snapshot is
+            made. Smart Routing skips fixed model, effort, speed and permission defaults on
+            automatic routes.
+          </p>
+        </HelpTip>
       </div>
       <div className="flex min-w-0 items-start justify-between gap-6">
         <div className="min-w-0 flex-1">
-          <span className="text-ui font-medium">Carry over last settings</span>
+          <span className="text-ui font-medium">Reuse last session choices</span>
           <span className="mt-0.5 block text-sm text-muted-foreground">
-            When enabled, New Chat reuses the last Agent, model, effort and speed for this project
-            and host. It does not save permission.
+            Reuses agent, model, effort and speed for this project and host; permission uses its
+            defaults.
           </span>
         </div>
         <Switch
-          aria-label="Carry over last settings"
+          aria-label="Reuse last session choices"
           checked={carryOver}
           onCheckedChange={writeCallingLastEnabled}
           className="shrink-0"
