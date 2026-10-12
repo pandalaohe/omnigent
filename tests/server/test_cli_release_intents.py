@@ -12,10 +12,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy import update as sql_update
 from sqlalchemy.exc import OperationalError
 
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.db_models import SqlConversation, current_workspace_id
+from omnigent.errors import OmnigentError
 from omnigent.server.archive_close import ArchiveCloseCoordinator
 from omnigent.server.cli_release_store import CliReleaseIntentStore
 from omnigent.server.cli_retention import (
@@ -37,7 +39,11 @@ def _no_archive_undo_grace() -> Iterator[None]:
     """Expand archive roots at once; the Undo grace has its own tests."""
     from omnigent.server.routes import sessions as _sessions_facade
 
-    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
+    with (
+        patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.0),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.01),
+    ):
         yield
 
 
@@ -213,9 +219,8 @@ def test_postgres_child_create_waits_for_archived_ancestor_lock(db_uri: str) -> 
             return
         with attempts_lock:
             for_update_attempts += 1
-            # The new descendant locks its direct parent first and then the
-            # archived root. The second statement is the one that must wait.
-            if for_update_attempts >= 2:
+            # Ancestor locks are acquired from the root down.
+            if for_update_attempts >= 1:
                 root_lock_attempted.set()
 
     def _hold_archived_root_until_released() -> None:
@@ -257,6 +262,41 @@ def test_postgres_child_create_waits_for_archived_ancestor_lock(db_uri: str) -> 
             "before_cursor_execute",
             _observe_for_update,
         )
+
+
+@pytest.mark.parametrize("operation", ["create", "archive"])
+def test_parent_move_during_lock_rejects_stale_create_and_archive(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    old_root = store.create_conversation()
+    new_root = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=old_root.id)
+    original_lock = store._lock_conversation
+    moved = False
+
+    def lock(session, conversation_id):
+        nonlocal moved
+        if not moved:
+            moved = True
+            # Inject the result of a succession between ancestry read and lock.
+            session.execute(
+                sql_update(SqlConversation)
+                .where(SqlConversation.id == child.id)
+                .values(parent_conversation_id=new_root.id, root_conversation_id=new_root.id)
+            )
+        original_lock(session, conversation_id)
+
+    monkeypatch.setattr(store, "_lock_conversation", lock)
+    monkeypatch.setattr(store, "_supports_for_update", True)
+    error = ConversationArchiveClosingError if operation == "create" else OmnigentError
+    with pytest.raises(error, match="ancestry changed"):
+        if operation == "create":
+            store.create_conversation(parent_conversation_id=child.id)
+        else:
+            store.update_conversation(child.id, archived=True, close_cli_on_archive=True)
+    assert moved
+    assert not store.get_conversation(child.id).archived
 
 
 def test_archive_without_close_allows_inflight_child_creation(db_uri: str) -> None:
@@ -641,6 +681,8 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
     coordinator.set_archive_preferences(preferences, None)
     remove = AsyncMock(return_value=True)
     stop_runner = AsyncMock(return_value="acked")
+    for conversation in (root, child):
+        _sessions_common._session_status_cache[conversation.id] = "idle"
     try:
         with (
             patch.object(sessions_facade, "_remove_session_worktree_best_effort", remove),
@@ -659,10 +701,15 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
     finally:
         for conversation in (root, child):
             _sessions_common._intentional_stop_sessions.pop(conversation.id, None)
+            _sessions_common._session_status_cache.pop(conversation.id, None)
 
     if archive_mode not in ("never", None):
-        remove.assert_awaited_once()
-        kwargs = remove.await_args.kwargs
+        assert remove.await_count == 2
+        assert {call.kwargs["exclude_conversation_id"] for call in remove.await_args_list} == {
+            root.id,
+            child.id,
+        }
+        kwargs = remove.await_args_list[0].kwargs
         assert kwargs["worktree_path"] == "/opt/work/omnigent/fork/root"
         assert kwargs["branch"] == "feature/root"
         assert kwargs["delete_branch"] is False
@@ -677,6 +724,9 @@ async def test_coordinator_deletes_worktree_once_after_every_target_completes(
     settled = conversations.get_conversation(root.id)
     assert settled is not None
     assert settled.archive_close_completed_revision == settled.archive_revision
+    settled_child = conversations.get_conversation(child.id)
+    assert settled_child.archived
+    assert settled_child.archive_close_completed_revision == settled_child.archive_revision
 
 
 @pytest.mark.asyncio

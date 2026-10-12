@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { ArchiveWorktreeTierChoices } from "@/components/ArchiveWorktreeTierChoices";
+import { WORKTREE_LABELS } from "@/components/WorktreeStatusMark";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -11,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import { fetchSessionWorktreeStatus, type ArchiveWorktreeEntry } from "@/hooks/useWorktreeStatus";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   fetchArchiveWorktreePreference,
@@ -22,7 +24,7 @@ import { getOmnigentHostGeneration } from "@/lib/host";
 
 type ProceedFn = (keepWorktreeIds: ReadonlySet<string>, mode?: ArchiveWorktreeMode) => void;
 interface PendingPrompt {
-  worktreeCount: number;
+  worktrees: ArchiveWorktreeEntry[];
   preference: ArchiveWorktreePreference;
   active: () => boolean;
   choose: (mode: ArchiveWorktreeMode) => void;
@@ -64,10 +66,7 @@ export function useArchiveWorktreePrompt(scope?: string): {
         cancel?.();
         return;
       }
-      const worktreeCount = conversations.filter(
-        (conversation) => conversation.git_branch != null || Boolean(conversation.worktree),
-      ).length;
-      if (!supported || worktreeCount === 0) {
+      if (!supported) {
         proceed(new Set());
         return;
       }
@@ -103,14 +102,61 @@ export function useArchiveWorktreePrompt(scope?: string): {
             proceed(new Set());
             return;
           }
+          const statuses = await Promise.allSettled(
+            conversations.map((conversation) => fetchSessionWorktreeStatus(conversation.id, true)),
+          );
+          if (!active()) {
+            cancelRequest();
+            return;
+          }
+          const keepWorktreeIds = new Set<string>();
+          const entries = statuses.flatMap((result, index) => {
+            if (result.status === "rejected") {
+              keepWorktreeIds.add(conversations[index].id);
+              return [
+                {
+                  session_id: conversations[index].id,
+                  title: conversations[index].title || "Session and descendants",
+                  state: "unknown" as const,
+                  path: null,
+                  reason: "worktree status unavailable; descendant directories kept",
+                  kept: true,
+                },
+              ];
+            }
+            const status = result.value;
+            return (
+              status.worktrees ??
+              (status.own.state === "none"
+                ? []
+                : [
+                    {
+                      session_id: conversations[index].id,
+                      title: conversations[index].title || "Untitled session",
+                      state: status.own.state,
+                      reason: status.own.reason,
+                      path: status.own.path,
+                      kept: false,
+                    },
+                  ])
+            );
+          });
+          const worktrees = [
+            ...new Map(entries.map((entry) => [entry.session_id, entry])).values(),
+          ];
+          if (worktrees.length === 0) {
+            finish();
+            proceed(new Set());
+            return;
+          }
           setPending({
-            worktreeCount,
+            worktrees,
             preference,
             active,
             choose: (mode) => {
               if (!active()) return;
               finish();
-              proceed(new Set(), mode);
+              proceed(keepWorktreeIds, mode);
             },
             cancel: () => {
               epoch.current++;
@@ -187,16 +233,42 @@ function ArchiveWorktreeDialog({ pending }: { pending: PendingPrompt }) {
         <DialogHeader>
           <DialogTitle>Worktrees on archive</DialogTitle>
           <DialogDescription>
-            {pending.worktreeCount === 1
-              ? "This session has a git worktree."
-              : pending.worktreeCount + " of these sessions have git worktrees."}{" "}
-            Choose which worktree directories to remove. Branches are kept. Uncommitted source
-            changes are never deleted.
+            This action archives the selected sessions and their active descendants. Choose which
+            worktree directories to remove. Branches are kept. Uncommitted source changes are never
+            deleted.
           </DialogDescription>
         </DialogHeader>
         <fieldset disabled={saving} aria-label="Worktree deletion tier">
           <ArchiveWorktreeTierChoices mode={mode} onChange={setMode} />
         </fieldset>
+        <ul
+          aria-label="Worktrees in this archive"
+          className="max-h-56 space-y-3 overflow-y-auto rounded-md border p-3 text-sm"
+        >
+          {pending.worktrees.map((entry) => {
+            const removable =
+              !entry.kept &&
+              mode !== "never" &&
+              (entry.state === "clean" || (entry.state === "local" && mode === "yellow_too"));
+            return (
+              <li key={entry.session_id}>
+                <p className="font-medium">
+                  {entry.title} · {WORKTREE_LABELS[entry.state]}
+                </p>
+                {entry.path && (
+                  <p className="break-all font-mono text-xs text-muted-foreground">{entry.path}</p>
+                )}
+                <p className="text-muted-foreground">
+                  {removable
+                    ? "Remove after safety checks"
+                    : entry.state === "unknown" && !entry.kept && mode !== "never"
+                      ? `Keep unless a fresh safety check permits removal: ${entry.reason || "status unknown"}`
+                      : `Keep: ${mode === "never" && !entry.kept ? "selected tier keeps all worktrees" : entry.state === "local" && !entry.kept ? "selected tier keeps local files" : entry.reason || "safety check required"}`}
+                </p>
+              </li>
+            );
+          })}
+        </ul>
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
             <Checkbox

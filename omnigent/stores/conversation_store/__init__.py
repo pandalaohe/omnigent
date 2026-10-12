@@ -1,6 +1,7 @@
 """Conversation store — manages conversations and their items."""
 
 import hashlib
+import json
 import math
 import time
 import unicodedata
@@ -257,6 +258,20 @@ ARCHIVE_KEEP_WORKTREE_LABEL_KEY = "omnigent.archive_keep_worktree"
 ARCHIVE_WORKTREE_MODE_LABEL_KEY = "omnigent.archive_worktree_mode"
 ARCHIVE_REMOVED_WORKTREE_LABEL_KEY = "omnigent.archive_removed_worktree"
 ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY = "omnigent.archive_worktree_admission_fence"
+ARCHIVE_CASCADE_LABEL_KEY = "omnigent.archive_cascade"
+
+
+def archive_cascade_members(conv: Conversation) -> dict[str, int]:
+    """Return the child generations archived by this exact root revision."""
+    raw = conv.labels.get(ARCHIVE_CASCADE_LABEL_KEY)
+    if raw is None:
+        return {}
+    value = json.loads(raw)
+    if value["revision"] != conv.archive_revision:
+        return {}
+    return json.loads(
+        "".join(conv.labels[f"{ARCHIVE_CASCADE_LABEL_KEY}.{i}"] for i in range(value["chunks"]))
+    )
 
 
 def worktree_admission_fingerprint(host_id: str, path: str) -> str:
@@ -438,6 +453,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 # fails loudly here.
 _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+    ARCHIVE_CASCADE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -1668,6 +1684,10 @@ class ConversationStore(ABC):
     def finalize_archive_close(self, conversation_id: str, revision: int) -> bool:
         """Mark a current root request complete after every target completed."""
         ...
+
+    def complete_archive_descendants(self, conversation_id: str, revision: int) -> None:
+        """Record resource release for the children in a current cascade."""
+        raise NotImplementedError
 
     @abstractmethod
     def rename_conversation_if_title_matches(

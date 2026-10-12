@@ -10610,6 +10610,78 @@ async def remove_archived_worktree_best_effort(
         return False
 
 
+async def remove_archived_tree_worktrees_best_effort(
+    root: Conversation,
+    *,
+    conversation_store: ConversationStore,
+    host_registry: Any,
+    project_host_binding_store: Any,
+    archive_mode: str,
+    rebuildable_paths: list[str] | None,
+) -> None:
+    """Clean only the generations in this cascade after the tree released its resources."""
+    from omnigent.stores.conversation_store import archive_cascade_members
+
+    members = {root.id: root.archive_revision, **archive_cascade_members(root)}
+    removed: set[tuple[str | None, str | None, str | None, str | None]] = set()
+    for target_id, revision in members.items():
+        current_root = await asyncio.to_thread(conversation_store.get_conversation, root.id)
+        if (
+            current_root is None
+            or not current_root.archived
+            or current_root.archive_revision != root.archive_revision
+        ):
+            return
+        target = await asyncio.to_thread(conversation_store.get_conversation, target_id)
+        if target is None or not target.archived or target.archive_revision != revision:
+            continue
+        if target.labels.get(ARCHIVE_DELETE_WORKTREE_LABEL_KEY) != str(
+            revision
+        ) or target.labels.get(ARCHIVE_KEEP_WORKTREE_LABEL_KEY) == str(revision):
+            continue
+        if target.labels.get(ARCHIVE_REMOVED_WORKTREE_LABEL_KEY) == str(revision):
+            continue
+        mode = target.labels.get(ARCHIVE_WORKTREE_MODE_LABEL_KEY, f"{revision}:{archive_mode}")
+        if not mode.startswith(f"{revision}:") or mode == f"{revision}:never":
+            continue
+        path = await asyncio.to_thread(
+            cleanup_worktree,
+            target,
+            is_entry=lambda h, p: (
+                project_host_binding_store is not None
+                and project_host_binding_store.entry_at_or_under(h, p)
+            ),
+        )
+        if path is None:
+            continue
+        from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+        binding = (
+            target.host_id,
+            path,
+            target.git_branch,
+            target.labels.get(WORKTREE_ROOT_LABEL_KEY),
+        )
+        success = binding in removed or await remove_archived_worktree_best_effort(
+            target,
+            host_registry=host_registry,
+            project_host_binding_store=project_host_binding_store,
+            conversation_store=conversation_store,
+            exclude_conversation_id=target.id,
+            archive_mode=mode.split(":", 1)[1],
+            rebuildable_paths=rebuildable_paths,
+        )
+        if success:
+            removed.add(binding)
+            current = await asyncio.to_thread(conversation_store.get_conversation, target.id)
+            if current is not None and current.archived and current.archive_revision == revision:
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    target.id,
+                    {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(revision)},
+                )
+
+
 # custom-lint: disable-next=workspace-scoped-cache -- task identities keep in-flight work alive
 _safe_archive_cleanup_tasks: set[asyncio.Task[bool]] = set()
 
@@ -10741,7 +10813,7 @@ async def _remove_session_worktree_best_effort(
                 wait_timeout_s=15.0,
             )
             try:
-                return await _remove_session_worktree_best_effort(
+                success = await _remove_session_worktree_best_effort(
                     host_id=host_id,
                     worktree_path=worktree_path,
                     branch=branch,
@@ -10759,6 +10831,18 @@ async def _remove_session_worktree_best_effort(
                     expected_archive_revision=expected_archive_revision,
                     _admission_lease_held=True,
                 )
+                if (
+                    success
+                    and expected_archive_revision is not None
+                    and exclude_conversation_id is not None
+                ):
+                    assert conversation_store is not None
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        exclude_conversation_id,
+                        {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(expected_archive_revision)},
+                    )
+                return success
             finally:
                 await asyncio.to_thread(host_store.release_cli_retention, host_id, token)
 
@@ -11452,9 +11536,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             "set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    from omnigent.stores.conversation_store import ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY
+    from omnigent.stores.conversation_store import (
+        ARCHIVE_CASCADE_LABEL_KEY,
+        ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    )
 
     for key in (
+        ARCHIVE_CASCADE_LABEL_KEY,
         ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
         ARCHIVE_WORKTREE_MODE_LABEL_KEY,
         ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
@@ -11465,6 +11553,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
                 f"label {key!r} is server-internal and cannot be set by clients",
                 code=ErrorCode.INVALID_INPUT,
             )
+    if any(key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.") for key in labels):
+        raise OmnigentError(
+            "archive cascade labels are server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Pins are per-user: the client may only write the bare canonical
     # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
     # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting

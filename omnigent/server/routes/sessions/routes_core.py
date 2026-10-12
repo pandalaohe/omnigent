@@ -605,7 +605,10 @@ def register_core_routes(
         )
         from omnigent.server.routes._workspace_validation import _is_subpath_of
         from omnigent.server.user_preferences_store import read_worktree_archive_preference
-        from omnigent.stores.conversation_store import ARCHIVE_REMOVED_WORKTREE_LABEL_KEY
+        from omnigent.stores.conversation_store import (
+            ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
+            ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+        )
         from omnigent.worktree_archive import file_kind, worktree_state
 
         del refresh  # Every request reads the host afresh; no stale state cache.
@@ -861,6 +864,26 @@ def register_core_routes(
                 ),
             },
             "blockers": blockers,
+            "worktrees": [
+                {
+                    "session_id": row.id,
+                    "title": "Restricted session"
+                    if state["reason"] == "descendant access unavailable"
+                    else row.title or "Untitled session",
+                    "state": state["state"],
+                    "path": state["path"],
+                    "reason": "already archived"
+                    if row.id != session_id and row.archived
+                    else "kept by archive choice"
+                    if row.labels.get(ARCHIVE_KEEP_WORKTREE_LABEL_KEY) == str(row.archive_revision)
+                    else state["reason"],
+                    "kept": (row.id != session_id and row.archived)
+                    or row.labels.get(ARCHIVE_KEEP_WORKTREE_LABEL_KEY)
+                    == str(row.archive_revision),
+                }
+                for row, state in zip(rows, states, strict=True)
+                if state["state"] != "none"
+            ],
             "session_count": len(rows),
         }
 
@@ -4212,7 +4235,6 @@ def register_core_routes(
             body.archived is True
             and (not conv.archived or body.delete_worktree or body.worktree_archive_mode)
             and not body.keep_worktree
-            and conv.git_branch
         ):
             from omnigent.server.user_preferences_store import (
                 read_worktree_archive_preference_for_cleanup,
@@ -4294,6 +4316,13 @@ def register_core_routes(
         if update_result is None:
             raise _session_not_found()
         updated = update_result.conversation
+        if body.archived is not None:
+            from omnigent.stores.conversation_store import archive_cascade_members
+
+            for child_id in archive_cascade_members(updated if body.archived else conv):
+                _publish_child_status_to_parent(child_id, None)
+                if body.archived:
+                    _prune_session_read_state(child_id)
         effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:

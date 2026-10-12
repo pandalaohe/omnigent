@@ -16,7 +16,6 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_CLOSE_CLAIM_STALE_AFTER_S,
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
-    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
 )
 from omnigent.stores.host_store import host_is_live
@@ -698,6 +697,18 @@ class ArchiveCloseCoordinator:
         else:
             release_claim = False
         try:
+            from omnigent.stores.conversation_store import archive_cascade_members
+
+            root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
+            if (
+                root is not None
+                and root.archived
+                and root.archive_revision == revision
+                and archive_cascade_members(root)
+            ):
+                await asyncio.to_thread(
+                    self._conversation_store.complete_archive_descendants, root_id, revision
+                )
             await self._remove_archived_worktree(root_id, revision)
             await asyncio.to_thread(
                 self._conversation_store.finalize_archive_close, root_id, revision
@@ -720,7 +731,7 @@ class ArchiveCloseCoordinator:
         a project entry is never removed; best-effort, like the direct path.
         """
         from omnigent.server.routes._sessions.helpers import (
-            remove_archived_worktree_best_effort,
+            remove_archived_tree_worktrees_best_effort,
         )
 
         root = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
@@ -751,23 +762,14 @@ class ArchiveCloseCoordinator:
         )
         if mode == "never":
             return
-        removed = await remove_archived_worktree_best_effort(
+        await remove_archived_tree_worktrees_best_effort(
             root,
             host_registry=self._host_registry,
             project_host_binding_store=self._project_host_binding_store,
             conversation_store=self._conversation_store,
-            exclude_conversation_id=root_id,
             archive_mode=mode,
             rebuildable_paths=preference["rebuildable_paths"],
         )
-        if removed:
-            current = await asyncio.to_thread(self._conversation_store.get_conversation, root_id)
-            if current is not None and current.archived and current.archive_revision == revision:
-                await asyncio.to_thread(
-                    self._conversation_store.set_labels,
-                    root_id,
-                    {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(revision)},
-                )
 
     async def _execute_idle_intent_locked(
         self,

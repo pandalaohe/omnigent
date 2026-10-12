@@ -394,7 +394,6 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
     effective_host_id,
-    remove_archived_worktree_best_effort,
 )
 from omnigent.server.routes._workspace_validation import validate_workspace
 from omnigent.server.runner_session_init import (
@@ -2029,16 +2028,28 @@ async def _archive_stop(
             release_results[target_id] = True
     result = all(release_results.get(target_id, False) for target_id in targets)
     # Runs after the runner teardown so the agent isn't left in a deleted cwd.
-    if delete_worktree:
-        await remove_archived_worktree_best_effort(
-            root_conv,
-            host_registry=host_registry,
-            project_host_binding_store=project_host_binding_store,
-            conversation_store=conversation_store,
-            exclude_conversation_id=session_id,
-            archive_mode=archive_mode or "green_only",
-            rebuildable_paths=rebuildable_paths,
-        )
+    if result:
+        from omnigent.stores.conversation_store import archive_cascade_members
+
+        if archive_cascade_members(root_conv):
+            await asyncio.to_thread(
+                conversation_store.complete_archive_descendants,
+                session_id,
+                root_conv.archive_revision,
+            )
+        if delete_worktree:
+            from omnigent.server.routes._sessions.helpers import (
+                remove_archived_tree_worktrees_best_effort,
+            )
+
+            await remove_archived_tree_worktrees_best_effort(
+                root_conv,
+                host_registry=host_registry,
+                project_host_binding_store=project_host_binding_store,
+                conversation_store=conversation_store,
+                archive_mode=archive_mode or "green_only",
+                rebuildable_paths=rebuildable_paths,
+            )
     return result
 
 

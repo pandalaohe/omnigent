@@ -69,6 +69,91 @@ def test_archive_preference_is_server_side(
     expect(never).to_be_checked()
 
 
+def test_archive_confirmation_lists_child_worktrees_without_a_parent_worktree(
+    page: Page, seeded_session: tuple[str, str], request: pytest.FixtureRequest
+) -> None:
+    base_url, parent_id = seeded_session
+    _mode(base_url, "green_only", ask=True)
+    parent = httpx.get(f"{base_url}/v1/sessions/{parent_id}", timeout=10).json()
+    agent_id = httpx.get(f"{base_url}/v1/sessions/{parent_id}/agent", timeout=10).json()["id"]
+    entries = []
+    child_ids = []
+    for title, state, reason in (
+        ("Clean implementation", "clean", "clean worktree"),
+        ("Local research files", "local", "other ignored local files"),
+        ("Uncommitted edits", "dirty", "uncommitted source files"),
+    ):
+        response = httpx.post(
+            f"{base_url}/v1/sessions",
+            json={"agent_id": agent_id, "parent_session_id": parent_id, "title": title},
+            timeout=10,
+        )
+        response.raise_for_status()
+        child_id = response.json()["id"]
+        child_ids.append(child_id)
+        entries.append(
+            {
+                "session_id": child_id,
+                "title": title,
+                "state": state,
+                "reason": reason,
+                "path": f"/opt/work/sample-app/{state}",
+                "kept": False,
+            }
+        )
+    assert not parent.get("git_branch") and not parent.get("worktree")
+
+    def status(route: Route) -> None:
+        route.fulfill(
+            json={
+                "own": {
+                    "state": "none",
+                    "reason": "no bound worktree",
+                    "path": None,
+                    "branch": None,
+                    "merged": None,
+                    "merge_target": None,
+                    "files": [],
+                },
+                "aggregate": {"state": "dirty", "reason": "descendant worktree needs attention"},
+                "blockers": [
+                    {key: entry[key] for key in ("session_id", "title", "state", "reason")}
+                    for entry in entries
+                    if entry["state"] != "clean"
+                ],
+                "session_count": 4,
+                "worktrees": entries,
+            }
+        )
+
+    page.route("**/v1/sessions/*/worktree-status*", status)
+    try:
+        page.goto(f"{base_url}/c/{parent_id}")
+        page.get_by_test_id("header-conversation-actions").click(timeout=30_000)
+        page.get_by_role("menuitem", name="Archive", exact=True).click()
+        dialog = page.get_by_test_id("archive-worktree-dialog")
+        expect(dialog).to_be_visible()
+        for entry in entries:
+            expect(dialog.get_by_text(entry["title"], exact=False)).to_be_visible()
+            expect(dialog.get_by_text(entry["path"], exact=True)).to_be_visible()
+        expect(dialog.get_by_text("Remove after safety checks", exact=True)).to_have_count(1)
+        expect(
+            dialog.get_by_text("Keep: selected tier keeps local files", exact=True)
+        ).to_be_visible()
+        expect(dialog.get_by_text("Keep: uncommitted source files", exact=True)).to_be_visible()
+        _shot(page, request, "archive-child-worktrees")
+        # Keep all directories in this UI drive; the server/host suites prove deletion.
+        dialog.get_by_role("radio", name="Never delete worktrees").click()
+        dialog.get_by_role("button", name="Archive", exact=True).click()
+        expect(page).to_have_url(f"{base_url}/", timeout=15_000)
+        for child_id in child_ids:
+            assert httpx.get(f"{base_url}/v1/sessions/{child_id}", timeout=10).json()["archived"]
+    finally:
+        for child_id in child_ids:
+            httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10).raise_for_status()
+        _mode(base_url, "never")
+
+
 def test_worktree_marks_past_aggregate_and_archive_prompt(
     page: Page, seeded_session: tuple[str, str], request: pytest.FixtureRequest
 ) -> None:

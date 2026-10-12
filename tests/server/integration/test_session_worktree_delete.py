@@ -264,7 +264,8 @@ async def test_unarchive_after_safe_removal_does_not_admit_old_worktree(db_uri: 
     archived = store.create_conversation(
         host_id=_HOST_ID, workspace=root, git_branch="feature/topic"
     )
-    store.update_conversation(archived.id, archived=True)
+    archived = store.update_conversation(archived.id, archived=True)
+    assert archived is not None
     registry = SimpleNamespace(get=lambda _host_id: SimpleNamespace())
     with (
         patch(
@@ -286,23 +287,13 @@ async def test_unarchive_after_safe_removal_does_not_admit_old_worktree(db_uri: 
         )
     undone = store.update_conversation(archived.id, archived=False)
     assert undone is not None and undone.archived is False
-    with pytest.raises(OmnigentError, match="unresolved"):
+    assert undone.labels[ARCHIVE_REMOVED_WORKTREE_LABEL_KEY] == str(archived.archive_revision)
+    with pytest.raises(OmnigentError, match="Worktree was removed"):
         store.set_runner_id(archived.id, "0123456789abcdef0123456789abcdef")
-    with pytest.raises(OmnigentError, match="unresolved"):
+    with pytest.raises(OmnigentError, match="Worktree was removed"):
         store.replace_runner_id(archived.id, "0123456789abcdef0123456789abcdef")
-    with pytest.raises(OmnigentError, match="unresolved"):
+    with pytest.raises(OmnigentError, match="Worktree was removed"):
         store.set_worktree(archived.id, f"{root}/packages/app")
-    with pytest.raises(OmnigentError, match="unresolved"):
-        store.set_runner_id(
-            archived.id,
-            "0123456789abcdef0123456789abcdef",
-            admission_host_id=_HOST_ID,
-            admission_workspace="/opt/work/sample-app/new-topic",
-        )
-    store.set_labels(
-        archived.id,
-        {ARCHIVE_REMOVED_WORKTREE_LABEL_KEY: str(archived.archive_revision)},
-    )
     assert store.set_runner_id(
         archived.id,
         "0123456789abcdef0123456789abcdef",

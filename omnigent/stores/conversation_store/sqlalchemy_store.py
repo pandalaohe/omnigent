@@ -105,6 +105,7 @@ from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
+    ARCHIVE_CASCADE_LABEL_KEY,
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_LOCK_LABEL_KEY,
@@ -179,6 +180,11 @@ def _host_binding_admission(method: _BindingWrite) -> _BindingWrite:
         conversation_id = bound.arguments.get("conversation_id")
         while True:
             before = self._get_meta(conversation_id) if conversation_id is not None else None
+            cascade_bindings = (
+                self._archive_cascade_bindings(conversation_id)
+                if undo_archive or archive_intent
+                else {}
+            )
             previous_host_id = before.host_id if before is not None else None
             host_id = (
                 bound.arguments.get("admission_host_id")
@@ -191,22 +197,28 @@ def _host_binding_admission(method: _BindingWrite) -> _BindingWrite:
                     for candidate in (previous_host_id, host_id)
                     if isinstance(candidate, str)
                 }
+                lease_hosts.update(host for host in cascade_bindings.values() if host is not None)
                 for lease_host_id in sorted(lease_hosts):
                     leases.enter_context(self._host_admission_lease(lease_host_id))
                 current = self._get_meta(conversation_id) if conversation_id is not None else None
                 if (current.host_id if current is not None else None) != previous_host_id:
                     continue
+                if (undo_archive or archive_intent) and self._archive_cascade_bindings(
+                    conversation_id
+                ) != cascade_bindings:
+                    continue
                 if conversation_id is not None and not undo_archive:
-                    owner = self.get_conversation(conversation_id)
-                    if (
-                        owner is not None
-                        and ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in owner.labels
-                        and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in owner.labels
-                    ):
-                        raise OmnigentError(
-                            "Worktree removal is unresolved; wait for host confirmation",
-                            code=ErrorCode.CONFLICT,
-                        )
+                    for owner_id in (conversation_id, *cascade_bindings):
+                        owner = self.get_conversation(owner_id)
+                        if (
+                            owner is not None
+                            and ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in owner.labels
+                            and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in owner.labels
+                        ):
+                            raise OmnigentError(
+                                "Worktree removal is unresolved; wait for host confirmation",
+                                code=ErrorCode.CONFLICT,
+                            )
                 path = (
                     bound.arguments.get("admission_workspace")
                     or bound.arguments.get("worktree")
@@ -1186,6 +1198,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             if token is not None:
                 self._host_binding_store.release_cli_retention(host_id, token)
 
+    def _archive_cascade_bindings(self, conversation_id: str | None) -> dict[str, str | None]:
+        from omnigent.stores.conversation_store import archive_cascade_members
+
+        if conversation_id is None:
+            return {}
+        root = self.get_conversation(conversation_id)
+        if root is None:
+            return {}
+        return {
+            child_id: child.host_id
+            for child_id, revision in archive_cascade_members(root).items()
+            if (child := self.get_conversation(child_id)) is not None
+            and child.archived
+            and child.archive_revision == revision
+        }
+
     def _worktree_admission_fenced(self, host_id: str, path: str) -> bool:
         fingerprints = worktree_admission_ancestor_fingerprints(host_id, path)
         with self._conv_session("check_worktree_admission_fence") as session:
@@ -1429,9 +1457,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ):
                         ancestor_id: str | None = parent_conversation_id
                         seen_ancestors: set[str] = set()
+                        seen_ancestors_order: list[str] = []
+                        ancestor_parents: dict[str, str | None] = {}
                         while ancestor_id is not None and ancestor_id not in seen_ancestors:
                             seen_ancestors.add(ancestor_id)
-                            self._lock_conversation(ap_sess, ancestor_id)
+                            seen_ancestors_order.append(ancestor_id)
                             ancestor = ap_sess.get(
                                 SqlConversation,
                                 (current_workspace_id(), ancestor_id),
@@ -1440,21 +1470,39 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 raise ConversationNotFoundError(
                                     f"ancestor conversation {ancestor_id!r} does not exist"
                                 )
-                            if ancestor_id == parent_conversation_id:
-                                root_id = ancestor.root_conversation_id
+                            ancestor_parents[ancestor_id] = ancestor.parent_conversation_id
+                            ancestor_id = ancestor.parent_conversation_id
+                        if ancestor_id is not None:
+                            raise ConversationArchiveClosingError(
+                                "conversation ancestry contains a cycle"
+                            )
+                        for locked_ancestor_id in reversed(seen_ancestors_order):
+                            self._lock_conversation(ap_sess, locked_ancestor_id)
+                            ancestor = ap_sess.get(
+                                SqlConversation,
+                                (current_workspace_id(), locked_ancestor_id),
+                                populate_existing=True,
+                            )
+                            if ancestor is None:
+                                raise ConversationNotFoundError(
+                                    f"ancestor conversation {locked_ancestor_id!r} does not exist"
+                                )
+                            if (
+                                ancestor.parent_conversation_id
+                                != ancestor_parents[locked_ancestor_id]
+                            ):
+                                raise ConversationArchiveClosingError(
+                                    "conversation ancestry changed; retry session creation"
+                                )
                             if (
                                 ancestor.archived
                                 and ancestor.archive_close_requested_revision
                                 == ancestor.archive_revision
                             ):
                                 raise ConversationArchiveClosingError(
-                                    f"ancestor conversation {ancestor_id!r} is archived"
+                                    f"ancestor conversation {locked_ancestor_id!r} is archived"
                                 )
-                            ancestor_id = ancestor.parent_conversation_id
-                        if ancestor_id is not None:
-                            raise ConversationArchiveClosingError(
-                                "conversation ancestry contains a cycle"
-                            )
+                        root_id = seen_ancestors_order[-1]
                 # Application-level (parent, title) uniqueness — there is no DB
                 # unique constraint. Only children are scoped; top-level sessions
                 # (NULL parent) may reuse titles freely. The SELECT seeks this
@@ -2257,6 +2305,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ),
             )
             return result.rowcount > 0
+
+    def complete_archive_descendants(self, conversation_id: str, revision: int) -> None:
+        """Mark cascaded generations released while leaving root cleanup retryable."""
+        from omnigent.stores.conversation_store import archive_cascade_members
+
+        with self._conv_session("complete_archive_descendants") as session:
+            root = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if root is None or not root.archived or root.archive_revision != revision:
+                return
+            root_labels = _fetch_labels(session, conversation_id)
+            members = archive_cascade_members(_to_conversation(root, None, root_labels))
+            for child_id, child_revision in members.items():
+                session.execute(
+                    update(SqlConversation)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == child_id,
+                        SqlConversation.archived.is_(True),
+                        SqlConversation.archive_revision == child_revision,
+                    )
+                    .values(archive_close_completed_revision=child_revision)
+                )
 
     def release_conversation_deletion(self, conversation_id: str, token: str) -> bool:
         """Clear a claim only when the opaque owner token still matches."""
@@ -4903,13 +4973,43 @@ class SqlAlchemyConversationStore(ConversationStore):
         def update_ap(
             ap_sess: Session,
         ) -> tuple[SqlConversation, dict[str, str], bool, bool] | None:
+            if archived is not None and self._supports_for_update:
+                ancestors: list[str] = []
+                ancestor_parents: dict[str, str | None] = {}
+                ancestor_id = conversation_id
+                while ancestor_id not in ancestors:
+                    ancestor = ap_sess.get(SqlConversation, (current_workspace_id(), ancestor_id))
+                    if ancestor is None:
+                        break
+                    ancestors.append(ancestor_id)
+                    ancestor_parents[ancestor_id] = ancestor.parent_conversation_id
+                    if ancestor.parent_conversation_id is None:
+                        break
+                    ancestor_id = ancestor.parent_conversation_id
+                # Child creation and every subtree archive take the common
+                # ancestor first, before descending to their target rows.
+                for ancestor_id in reversed(ancestors):
+                    self._lock_conversation(ap_sess, ancestor_id)
+                    ancestor = ap_sess.get(
+                        SqlConversation,
+                        (current_workspace_id(), ancestor_id),
+                        populate_existing=True,
+                    )
+                    if (
+                        ancestor is None
+                        or ancestor.parent_conversation_id != ancestor_parents[ancestor_id]
+                    ):
+                        raise OmnigentError(
+                            "Conversation ancestry changed; retry the archive operation",
+                            code=ErrorCode.CONFLICT,
+                        )
             row_query = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == conversation_id,
             )
             if self._supports_for_update:
                 row_query = row_query.with_for_update()
-            row = ap_sess.scalar(row_query)
+            row = ap_sess.scalar(row_query.execution_options(populate_existing=True))
             if not row:
                 return None
             ap_changed = False
@@ -4967,20 +5067,61 @@ class SqlAlchemyConversationStore(ConversationStore):
             if overrides_changed:
                 row.session_overrides = _encode_session_overrides(overrides)
                 ap_changed = True
+            root_row = row
+            archive_targets = [row]
+            cascade_members: dict[str, int] = {}
+            defer_tree_close = archive_stop_when_idle
             if archived is not None:
+                from omnigent.stores.conversation_store import archive_cascade_members
+
+                cascade_members = archive_cascade_members(
+                    _to_conversation(row, None, _fetch_labels(ap_sess, row.id))
+                )
+                if archived and not row.archived:
+                    frontier = [row.id]
+                    seen = {row.id}
+                    while frontier:
+                        children_query = select(SqlConversation).where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.parent_conversation_id.in_(frontier),
+                        )
+                        if self._supports_for_update:
+                            children_query = children_query.with_for_update()
+                        children = list(ap_sess.scalars(children_query))
+                        frontier = []
+                        for child in children:
+                            if child.id in seen:
+                                continue
+                            seen.add(child.id)
+                            frontier.append(child.id)
+                            if not child.archived:
+                                archive_targets.append(child)
+                                cascade_members[child.id] = child.archive_revision + 1
+                    defer_tree_close = defer_tree_close or len(seen) > 1
+                else:
+                    for child_id, child_revision in cascade_members.items():
+                        self._lock_conversation(ap_sess, child_id)
+                        child = ap_sess.get(SqlConversation, (current_workspace_id(), child_id))
+                        if (
+                            child is not None
+                            and child.archived
+                            and child.archive_revision == child_revision
+                        ):
+                            archive_targets.append(child)
+            for row in archive_targets:
+                if archived is None:
+                    continue
                 # archived lives on the AP conversations row; a visible state change.
                 if row.archived != archived:
                     if archived:
-                        _upsert_labels(
-                            ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
-                        )
+                        _upsert_labels(ap_sess, row.id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now)
                         # Archive revokes every artifact link: old tokens then
                         # mismatch the missing stored key (410), and unarchive
                         # leaves it absent so the next mint creates a new key.
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARTIFACT_LINK_KEY_LABEL,
                             )
                         )
@@ -4988,7 +5129,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
                             )
                         )
@@ -5000,17 +5141,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # worker cannot mark success, while the retained token keeps
                     # new work fenced until in-flight teardown returns.
                     row.archive_close_last_error = None
-                    if archived and close_cli_on_archive:
+                    if archived and close_cli_on_archive and row.id == conversation_id:
                         row.archive_close_requested_revision = row.archive_revision
                     elif not archived:
                         row.archive_close_requested_revision = None
-                    if archived and close_cli_on_archive and archive_stop_when_idle:
+                    if (
+                        archived
+                        and close_cli_on_archive
+                        and defer_tree_close
+                        and row.id == conversation_id
+                    ):
                         # The deferral names this revision in the same commit as
                         # the transition, so recovery can never observe the
                         # archive without its idle marker.
                         _upsert_labels(
                             ap_sess,
-                            conversation_id,
+                            row.id,
                             {ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY: str(row.archive_revision)},
                             now,
                         )
@@ -5020,7 +5166,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
                             )
                         )
@@ -5030,7 +5176,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         # the archive without its worktree-delete intent.
                         _upsert_labels(
                             ap_sess,
-                            conversation_id,
+                            row.id,
                             {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(row.archive_revision)},
                             now,
                         )
@@ -5038,7 +5184,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             mode_intent = f"{row.archive_revision}:{worktree_archive_mode}"
                             _upsert_labels(
                                 ap_sess,
-                                conversation_id,
+                                row.id,
                                 {ARCHIVE_WORKTREE_MODE_LABEL_KEY: mode_intent},
                                 now,
                             )
@@ -5048,21 +5194,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
                             )
                         )
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARCHIVE_WORKTREE_MODE_LABEL_KEY,
                             )
                         )
                     if archived and keep_worktree:
                         _upsert_labels(
                             ap_sess,
-                            conversation_id,
+                            row.id,
                             {ARCHIVE_KEEP_WORKTREE_LABEL_KEY: str(row.archive_revision)},
                             now,
                         )
@@ -5070,7 +5216,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
                             )
                         )
@@ -5078,7 +5224,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 elif archived and row.archived and keep_worktree:
                     _upsert_labels(
                         ap_sess,
-                        conversation_id,
+                        row.id,
                         {ARCHIVE_KEEP_WORKTREE_LABEL_KEY: str(row.archive_revision)},
                         now,
                     )
@@ -5092,15 +5238,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # the revision the teardown must act on.
                     _upsert_labels(
                         ap_sess,
-                        conversation_id,
+                        row.id,
                         {ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(row.archive_revision)},
                         now,
                     )
-                    if override_keep_worktree:
+                    if override_keep_worktree and row.id == conversation_id:
                         ap_sess.execute(
                             delete(SqlConversationLabel).where(
                                 SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.conversation_id == conversation_id,
+                                SqlConversationLabel.conversation_id == row.id,
                                 SqlConversationLabel.key == ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
                             )
                         )
@@ -5108,14 +5254,53 @@ class SqlAlchemyConversationStore(ConversationStore):
                         mode_intent = f"{row.archive_revision}:{worktree_archive_mode}"
                         _upsert_labels(
                             ap_sess,
-                            conversation_id,
+                            row.id,
                             {ARCHIVE_WORKTREE_MODE_LABEL_KEY: mode_intent},
                             now,
                         )
-                    row.archive_close_requested_revision = row.archive_revision
+                    if row.id == conversation_id:
+                        row.archive_close_requested_revision = row.archive_revision
                     row.archive_close_completed_revision = None
                     row.archive_close_last_error = None
                     ap_changed = True
+                row.updated_at = now
+            row = root_row
+            if archived is not None:
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == row.id,
+                        SqlConversationLabel.key.like(f"{ARCHIVE_CASCADE_LABEL_KEY}.%"),
+                    )
+                )
+            if archived is True and row.archived and cascade_members:
+                encoded_members = json.dumps(cascade_members)
+                chunks = [
+                    encoded_members[i : i + LABEL_VALUE_MAX_LEN]
+                    for i in range(0, len(encoded_members), LABEL_VALUE_MAX_LEN)
+                ]
+                _upsert_labels(
+                    ap_sess,
+                    row.id,
+                    {
+                        ARCHIVE_CASCADE_LABEL_KEY: json.dumps(
+                            {"revision": row.archive_revision, "chunks": len(chunks)}
+                        ),
+                        **{
+                            f"{ARCHIVE_CASCADE_LABEL_KEY}.{i}": chunk
+                            for i, chunk in enumerate(chunks)
+                        },
+                    },
+                    now,
+                )
+            elif archived is False:
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == row.id,
+                        SqlConversationLabel.key == ARCHIVE_CASCADE_LABEL_KEY,
+                    )
+                )
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)
@@ -7237,6 +7422,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(f"{TOUCHED_LABEL_KEY}.")
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
+                and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None
