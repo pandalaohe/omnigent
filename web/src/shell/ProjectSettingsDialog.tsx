@@ -803,6 +803,10 @@ export function ProjectSettingsDialog({
   // trade-off that keeps that modal dropdown from closing the settings dialog.
   const dropdownOpenCountRef = useRef(0);
   const dropdownClosedAtRef = useRef(0);
+  const [moreOpenFor, setMoreOpenFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) setMoreOpenFor(null);
+  }, [open]);
   const onDropdownOpenChange = (isOpen: boolean) => {
     if (isOpen) {
       dropdownOpenCountRef.current += 1;
@@ -1765,7 +1769,13 @@ export function ProjectSettingsDialog({
           </Button>
           <HelpTip label={DEFAULT_LABELS.resetHelp}>{resetDefaultsHelp(harness)}</HelpTip>
         </div>
-        <DropdownMenu onOpenChange={onDropdownOpenChange}>
+        <DropdownMenu
+          open={moreOpenFor === pairKey(row.hostId, harness)}
+          onOpenChange={(nextOpen) => {
+            setMoreOpenFor(nextOpen ? pairKey(row.hostId, harness) : null);
+            onDropdownOpenChange(nextOpen);
+          }}
+        >
           <DropdownMenuTrigger asChild>
             <Button
               type="button"
@@ -2418,6 +2428,14 @@ export function ProjectSettingsDialog({
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
+        onEscapeKeyDown={(event) => {
+          // Escape from More must not discard the dialog's unsaved draft.
+          if (moreOpenFor !== null) {
+            event.preventDefault();
+            setMoreOpenFor(null);
+            onDropdownOpenChange(false);
+          }
+        }}
       >
         <DialogHeader className="shrink-0 border-b px-5 pt-5 sm:px-6 sm:pt-6">
           <DialogTitle>Project settings</DialogTitle>
