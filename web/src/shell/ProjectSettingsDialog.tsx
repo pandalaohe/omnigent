@@ -686,6 +686,7 @@ export function ProjectSettingsDialog({
   // Non-entry save failures (project promotion / config PATCH) — rendered with
   // the same alert as `updateConfig.error`.
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [initializationNotice, setInitializationNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // Post-bind outcome per host from the last Save, so the row can show a
   // warning under its path.
@@ -849,6 +850,7 @@ export function ProjectSettingsDialog({
     setOtherHarnessOpenFor(null);
     setEntriesError(null);
     setSaveError(null);
+    setInitializationNotice(null);
   }, [open, projectId, stored, isLoading, loadFailed, entriesLoadFailed, entriesLoading, entries]);
 
   // Entry sync derived from the persisted baseline + draft rows: PUTs for
@@ -991,6 +993,7 @@ export function ProjectSettingsDialog({
 
     setEntriesError(null);
     setSaveError(null);
+    setInitializationNotice(null);
     setSaving(true);
     let id = projectId;
     // Whether any entry PUT / DELETE committed this run: the finally block
@@ -1018,8 +1021,12 @@ export function ProjectSettingsDialog({
         const path = row.path.trim();
         let written: ProjectHostEntry & { post_bind?: PostBindResult };
         try {
+          const entryArgs: Parameters<typeof putProjectEntry> =
+            !savedEntries.has(row.hostId) && (row.agentId || agentId !== (stored?.agent_id ?? null))
+              ? [id, row.hostId, path, { agent_id: row.agentId, project_agent_id: agentId }]
+              : [id, row.hostId, path];
           // eslint-disable-next-line no-await-in-loop
-          written = await putProjectEntry(id, row.hostId, path);
+          written = await putProjectEntry(...entryArgs);
         } catch (error) {
           // Select the row so its detail (where the message renders) is on
           // screen; the user may have been editing another host.
@@ -1029,6 +1036,25 @@ export function ProjectSettingsDialog({
           return;
         }
         entryWriteCommitted = true;
+        if (
+          written.host_agent_id &&
+          !savedEntries.has(row.hostId) &&
+          !stored?.calling_defaults?.[row.hostId]?.agent_id &&
+          !row.agentId &&
+          !agentId
+        ) {
+          config.calling_defaults ??= {};
+          config.calling_defaults[row.hostId] = {
+            ...config.calling_defaults[row.hostId],
+            agent_id: written.host_agent_id,
+          };
+          setRowAgent(row.hostId, written.host_agent_id);
+        }
+        if (written.initialization_notice) {
+          setInitializationNotice(written.initialization_notice);
+          setSelectedRowId(row.hostId);
+          hookWarningSeen = true;
+        }
         setSavedEntries((current) => new Map(current).set(row.hostId, path));
         const postBind = written.post_bind;
         if (postBind && WARNING_HOOK_STATUSES.has(postBind.status)) {
@@ -2522,7 +2548,11 @@ export function ProjectSettingsDialog({
             </div>
           </div>
         )}
-        {(loadFailed || entriesLoadFailed || saveError || updateConfig.isError) && (
+        {(loadFailed ||
+          entriesLoadFailed ||
+          saveError ||
+          initializationNotice ||
+          updateConfig.isError) && (
           <div className="px-5 py-2 sm:px-6">
             {loadFailed && (
               <p
@@ -2542,6 +2572,11 @@ export function ProjectSettingsDialog({
               >
                 Couldn't load this project's directories. Close and reopen to try again — saving is
                 disabled so they aren't overwritten.
+              </p>
+            )}
+            {initializationNotice && (
+              <p className="text-muted-foreground text-ui" role="alert">
+                {initializationNotice}
               </p>
             )}
             {(saveError ??

@@ -832,7 +832,7 @@ def create_project_collaboration_router(
             repository or bad path.
         """
         user_id = require_user(request, auth_provider)
-        await _require_owned_project(project_store, project_id, user_id)
+        project = await _require_owned_project(project_store, project_id, user_id)
         _validate_ref_name(name, kind="binding")
         repository = await asyncio.to_thread(
             repository_store.get_by_name,
@@ -852,6 +852,15 @@ def create_project_collaboration_router(
             host_store=host_store,
             host_registry=host_registry,
         )
+        from omnigent.server.project_host_agents import resolve_project_host_template
+
+        initial_agent_id, notice = await resolve_project_host_template(
+            request,
+            project,
+            host_id,
+            user_id,
+            binding_store,
+        )
         binding = await asyncio.to_thread(
             binding_store.apply_binding,
             project_id=project_id,
@@ -861,8 +870,11 @@ def create_project_collaboration_router(
             workspace=workspace,
             enabled=body.enabled,
             verified=checked,
+            initial_agent_id=initial_agent_id,
         )
         response = {**_binding_to_response(binding), "checked": checked}
+        if notice:
+            response["initialization_notice"] = notice
         if not checked:
             return response
         # The binding itself is the admission, so the hook runs for enabled

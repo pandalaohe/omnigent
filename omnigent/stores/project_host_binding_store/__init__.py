@@ -48,6 +48,7 @@ class ProjectHostBindingStore(ABC):
         workspace: str,
         enabled: bool = True,
         verified: bool = True,
+        initial_agent_id: str | None = None,
     ) -> ProjectHostBinding:
         """
         Register a binding or revise it, then derive the host's primary.
@@ -178,7 +179,15 @@ class ProjectHostBindingStore(ABC):
         ...
 
     @abstractmethod
-    def put_entry(self, project_id: str, host_id: str, workspace: str) -> ProjectHostEntry:
+    def put_entry(
+        self,
+        project_id: str,
+        host_id: str,
+        workspace: str,
+        *,
+        initial_agent_id: str | None = None,
+        project_has_agent: bool | None = None,
+    ) -> ProjectHostEntry:
         """
         Register a host's entry path or move it.
 
@@ -190,6 +199,9 @@ class ProjectHostBindingStore(ABC):
         :param project_id: The project the entry belongs to.
         :param host_id: The host the directory lives on.
         :param workspace: Absolute path as the host canonicalised it.
+        :param initial_agent_id: Validated template for a new entry only.
+        :param project_has_agent: A saving client's proposed All hosts choice;
+            ``None`` checks the persisted project choice under the lock.
         :returns: The inserted or updated :class:`ProjectHostEntry`.
         :raises OmnigentError: ``NOT_FOUND`` when the project does not exist.
         """

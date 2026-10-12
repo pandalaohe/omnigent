@@ -1,5 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CustomAgent } from "@/lib/customAgentsApi";
+import type * as CustomAgentsApi from "@/lib/customAgentsApi";
 
 const mocks = vi.hoisted(() => ({
   hosts: [] as Record<string, unknown>[],
@@ -7,6 +9,24 @@ const mocks = vi.hoisted(() => ({
   listCatalogs: vi.fn(),
   sync: vi.fn(),
   queuePatch: vi.fn(),
+  customAgents: [] as CustomAgent[],
+  agents: [
+    {
+      id: "agent-claude",
+      name: "claude-native",
+      display_name: "Claude Code",
+      harness: "claude-native",
+      skills: [],
+      description: null,
+    },
+  ],
+}));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: () => ({ data: mocks.agents }),
+}));
+vi.mock("@/lib/customAgentsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof CustomAgentsApi>()),
+  useCustomAgents: () => ({ data: mocks.customAgents }),
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -76,6 +96,7 @@ beforeEach(() => {
   mocks.listCatalogs.mockReset().mockResolvedValue(mocks.catalogRows);
   mocks.sync.mockReset().mockResolvedValue(mocks.catalogRows);
   mocks.queuePatch.mockReset();
+  mocks.customAgents = [];
 });
 
 afterEach(() => {
@@ -84,6 +105,66 @@ afterEach(() => {
 });
 
 describe("CallingDefaultsSection", () => {
+  it("offers library agents only when all member targets are ready", async () => {
+    const member = {
+      name: "Lead",
+      description: null,
+      harness: "claude-native",
+      model: null,
+      reasoning_effort: null,
+      lead: true,
+      host_id: "host-b",
+    };
+    const saved = {
+      id: "ca_ready",
+      name: "Review team",
+      description: null,
+      harness: null,
+      model: null,
+      members: [member],
+      version: 1,
+      created_at: 1,
+      updated_at: null,
+    };
+    mocks.customAgents = [
+      saved,
+      {
+        ...saved,
+        id: "ca_missing",
+        name: "Missing host",
+        members: [{ ...member, host_id: "missing" }],
+      },
+    ];
+    mocks.hosts = [HOST, { ...HOST, host_id: "host-b", name: "Beta" }];
+    render(<CallingDefaultsSection />);
+    fireEvent.click(screen.getByTestId("new-project-agent"));
+    expect(await screen.findByRole("option", { name: "Review team" })).toBeVisible();
+    expect(screen.queryByRole("option", { name: "Missing host" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Review team" }));
+    expect(mocks.queuePatch).toHaveBeenCalledWith("project_host_agents", { "host-a": "ca_ready" });
+  });
+  it("edits the new-project agent per host without changing harness defaults", async () => {
+    mocks.hosts = [HOST, { ...HOST, host_id: "host-b", name: "Beta" }];
+    localStorage.setItem(
+      DEFAULTS_KEY,
+      JSON.stringify({ "host-a": { "codex-native": { model: "saved" } } }),
+    );
+    render(<CallingDefaultsSection />);
+    await pickOption("new-project-agent", "Claude Code");
+    expect(mocks.queuePatch).toHaveBeenCalledWith("project_host_agents", {
+      "host-a": "agent-claude",
+    });
+    expect(readMaster()["host-a"]["codex-native"]).toEqual({ model: "saved" });
+    fireEvent.click(screen.getByTestId("calling-defaults-host-host-b"));
+    expect(screen.getByTestId("new-project-agent")).toHaveTextContent("No template");
+    await pickOption("new-project-agent", "Claude Code");
+    expect(JSON.parse(localStorage.getItem("omnigent:project-host-agents")!)).toEqual({
+      "host-a": "agent-claude",
+      "host-b": "agent-claude",
+    });
+    await pickOption("new-project-agent", "No template");
+    expect(mocks.queuePatch).toHaveBeenLastCalledWith("project_host_agents", { "host-b": null });
+  });
   it("keeps a saved offline host editable", async () => {
     mocks.hosts = [{ ...HOST, status: "offline" }];
     localStorage.setItem(DEFAULTS_KEY, JSON.stringify({ "host-a": { "codex-native": {} } }));

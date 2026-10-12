@@ -44,6 +44,11 @@ import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffort
 import { relativeTime } from "@/lib/relativeTime";
 import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
+import { setProjectHostAgent, useProjectHostAgents } from "@/lib/projectHostAgents";
+import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -588,6 +593,9 @@ export function CallingDefaultsSection() {
   const { data: hosts } = useHosts();
   const master = useCallingDefaults();
   const carryOver = useCallingLastEnabled();
+  const { data: agents } = useAvailableAgents();
+  const customCatalog = useCustomAgents();
+  const templates = useProjectHostAgents();
   const isMobile = useIsMobileViewport();
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [catalogs, setCatalogs] = useState<CallingDefaultsCatalogRow[]>([]);
@@ -646,6 +654,22 @@ export function CallingDefaultsSection() {
 
   const hostList = hosts ?? [];
   const host = hostList.find((candidate) => candidate.host_id === selectedHostId) ?? hostList[0];
+  const templateAgents = selectableSessionAgents([
+    ...(agents ?? []).filter((agent) => !agent.templateId),
+    ...(customCatalog.data ?? []).map(customAgentForPicker),
+  ]).filter((agent) =>
+    agent.members?.length
+      ? agent.members.every(
+          (member) =>
+            harnessReadinessOnHost(
+              member.harness,
+              member.host_id
+                ? hostList.find((candidate) => candidate.host_id === member.host_id)
+                : host,
+            ).selectable,
+        )
+      : harnessReadinessOnHost(agent.harness, host).selectable,
+  );
   const lastFetchedAt = useMemo(() => {
     let newest: number | null = null;
     for (const row of catalogs) {
@@ -739,6 +763,45 @@ export function CallingDefaultsSection() {
               );
             })}
           </div>
+          {host && (
+            <div className="flex min-w-0 flex-col gap-2 rounded-md border p-3">
+              <label className="text-ui font-medium" htmlFor="new-project-agent">
+                New project agent
+              </label>
+              <Select
+                value={templates[host.host_id] ?? "__none__"}
+                onValueChange={(value) =>
+                  setProjectHostAgent(host.host_id, value === "__none__" ? null : value)
+                }
+              >
+                <SelectTrigger
+                  id="new-project-agent"
+                  className="w-full min-w-0"
+                  data-testid="new-project-agent"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" className="w-(--radix-select-trigger-width)">
+                  <SelectItem value="__none__">No template</SelectItem>
+                  {templateAgents.map((agent) => (
+                    <SelectItem key={agent.id} value={agent.id}>
+                      {agent.display_name}
+                    </SelectItem>
+                  ))}
+                  {templates[host.host_id] &&
+                    !templateAgents.some((agent) => agent.id === templates[host.host_id]) && (
+                      <SelectItem value={templates[host.host_id]!} disabled>
+                        Unavailable agent
+                      </SelectItem>
+                    )}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                Used for new bindings when the project has no All hosts agent. Existing bindings
+                keep their agent.
+              </p>
+            </div>
+          )}
           {host && (
             <HostDefaultsTable
               host={host}

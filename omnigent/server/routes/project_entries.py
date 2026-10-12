@@ -10,6 +10,7 @@ gated.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Request, Response, status
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict
 from omnigent.entities import ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
+from omnigent.server.project_host_agents import resolve_project_host_template
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.project_collaboration import (
     _DEFAULT_MANIFEST_PATH,
@@ -38,11 +40,15 @@ class EntryPutRequest(BaseModel):
     :param workspace: Absolute path on the host. Validated live via
         ``host.stat``; the canonical path the host returns is stored. An
         offline host stores the typed path after string checks.
+    :param agent_id: A saving client's explicit host Agent; skips template seeding.
+    :param project_agent_id: The proposed All hosts Agent when edited in the same Save.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     workspace: str
+    agent_id: str | None = None
+    project_agent_id: str | None = None
 
 
 def _entry_to_response(entry: ProjectHostEntry) -> dict[str, Any]:
@@ -132,7 +138,7 @@ def create_project_entries_router(
             path inside a worktree folder.
         """
         user_id = require_user(request, auth_provider)
-        await _require_owned_project(project_id, user_id)
+        project = await _require_owned_project(project_id, user_id)
         if host_id == _SANDBOX_HOST_ID:
             raise OmnigentError(
                 "the sandbox host has no project directory",
@@ -152,13 +158,34 @@ def create_project_entries_router(
                 "(.worktrees or .omnigent/worktrees)",
                 code=ErrorCode.INVALID_INPUT,
             )
+        config = dict(project.config or {})
+        has_project_agent = None
+        if "project_agent_id" in body.model_fields_set:
+            config["agent_id"] = body.project_agent_id
+            has_project_agent = bool(body.project_agent_id)
+        initial_agent_id = None
+        notice = None
+        if not body.agent_id:
+            initial_agent_id, notice = await resolve_project_host_template(
+                request,
+                replace(project, config=config),
+                host_id,
+                user_id,
+                binding_store,
+            )
         entry = await asyncio.to_thread(
             binding_store.put_entry,
             project_id,
             host_id,
             workspace,
+            initial_agent_id=initial_agent_id,
+            project_has_agent=has_project_agent,
         )
         response = {**_entry_to_response(entry), "checked": checked}
+        if entry.host_agent_id:
+            response["host_agent_id"] = entry.host_agent_id
+        if notice:
+            response["initialization_notice"] = notice
         if not checked:
             return response
         # The entry is stored before the hook runs and is never refused by

@@ -8,6 +8,7 @@ export type UserPreferenceNamespace =
   | "agent_badges"
   | "agent_pins"
   | "calling_defaults"
+  | "project_host_agents"
   | "calling_last"
   | "session_collab"
   | "host_colors"
@@ -71,6 +72,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     calling_defaults: {
       storageKey: "omnigent:calling-defaults",
       eventName: "omnigent:calling-defaults-changed",
+    },
+    project_host_agents: {
+      storageKey: "omnigent:project-host-agents",
+      eventName: "omnigent:project-host-agents-changed",
     },
     calling_last: {
       storageKey: "omnigent:calling-last",

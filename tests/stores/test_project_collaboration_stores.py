@@ -22,9 +22,83 @@ from omnigent.stores.project_repository_store.sqlalchemy_store import (
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 
+def test_entry_initializes_agent_once_preserving_host_fields(db_uri: str) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    bindings = SqlAlchemyProjectHostBindingStore(db_uri)
+    host_id = _uid("host-a")
+    project = projects.create(
+        _uid("initial"),
+        "Initial defaults",
+        None,
+        config={"calling_defaults": {host_id: {"harnesses": {"codex": {"model": "saved"}}}}},
+    )
+    first = bindings.put_entry(
+        project.id, host_id, "/opt/work/example", initial_agent_id="template-a"
+    )
+    assert first.host_agent_id == "template-a"
+    assert projects.get(project.id, user_id=None).config["calling_defaults"][host_id] == {
+        "agent_id": "template-a",
+        "harnesses": {"codex": {"model": "saved"}},
+    }
+    retry = bindings.put_entry(project.id, host_id, "/opt/work/example")
+    assert retry.host_agent_id == "template-a"
+    moved = bindings.put_entry(
+        project.id, host_id, "/opt/work/moved", initial_agent_id="template-b"
+    )
+    assert moved.host_agent_id == "template-a"
+    assert (
+        projects.get(project.id, user_id=None).config["calling_defaults"][host_id]["agent_id"]
+        == "template-a"
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{"agent_id": "project-agent"}, {"calling_defaults": {"host-a": {"agent_id": "host-agent"}}}],
+)
+def test_entry_template_does_not_override_project_agent(db_uri: str, config: dict) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    bindings = SqlAlchemyProjectHostBindingStore(db_uri)
+    host_id = _uid("host-a")
+    if "calling_defaults" in config:
+        config = {"calling_defaults": {host_id: config["calling_defaults"]["host-a"]}}
+    project = projects.create(_uid("project-default"), "Project defaults", None, config=config)
+    result = bindings.put_entry(
+        project.id, host_id, "/opt/work/example", initial_agent_id="template"
+    )
+    assert result.host_agent_id == ("host-agent" if "calling_defaults" in config else None)
+    assert projects.get(project.id, user_id=None).config == config
+
+
 def _uid(seed: str) -> str:
     """Deterministic bare 32-char hex UUID string from a short readable seed."""
     return uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex
+
+
+def test_entry_does_not_seed_an_existing_host_binding(db_uri: str) -> None:
+    projects = SqlAlchemyProjectStore(db_uri)
+    bindings = SqlAlchemyProjectHostBindingStore(db_uri)
+    repositories = SqlAlchemyProjectRepositoryStore(db_uri)
+    project = projects.create(_uid("existing-binding"), "Existing connection", None)
+    repository, _changed = repositories.apply_repository(
+        project_id=project.id,
+        name="code",
+        remote_url="https://github.com/example/project.git",
+        default_branch="main",
+    )
+    host_id = _uid("host-a")
+    bindings.apply_binding(
+        project_id=project.id,
+        host_id=host_id,
+        name="code",
+        repository_id=repository.id,
+        workspace="/opt/work/code",
+    )
+    result = bindings.put_entry(
+        project.id, host_id, "/opt/work/example", initial_agent_id="template"
+    )
+    assert result.host_agent_id is None
+    assert projects.get(project.id, user_id=None).config == {}
 
 
 @pytest.fixture()

@@ -239,6 +239,100 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
+it("retains the first-entry agent initialization when saving the project draft", async () => {
+  getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
+  putEntryMock.mockResolvedValue({
+    ...entry("h3", "/opt/work/example"),
+    host_agent_id: "ag_1",
+  });
+  renderDialog();
+  fireEvent.change(await screen.findByTestId("project-settings-entry-path-h3"), {
+    target: { value: "/opt/work/example" },
+  });
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith(
+      "p_1",
+      expect.objectContaining({ calling_defaults: { h3: { agent_id: "ag_1" } } }),
+    ),
+  );
+});
+
+it("keeps a saved entry's unusable-template notice visible", async () => {
+  getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
+  putEntryMock.mockResolvedValue({
+    ...entry("h3", "/opt/work/example"),
+    initialization_notice: "Template unavailable; using project defaults.",
+  });
+  const { onOpenChange } = renderDialog();
+  fireEvent.change(await screen.findByTestId("project-settings-entry-path-h3"), {
+    target: { value: "/opt/work/example" },
+  });
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() => expect(updateMock).toHaveBeenCalled());
+  expect(screen.getByRole("alert")).toHaveTextContent("Template unavailable");
+  expect(onOpenChange).not.toHaveBeenCalledWith(false);
+});
+
+it("retains the initialized agent after a committed entry PUT loses its response", async () => {
+  getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
+  putEntryMock.mockRejectedValueOnce(new Error("Connection lost")).mockResolvedValue({
+    ...entry("h3", "/opt/work/example"),
+    host_agent_id: "ag_1",
+  });
+  renderDialog();
+  fireEvent.change(await screen.findByTestId("project-settings-entry-path-h3"), {
+    target: { value: "/opt/work/example" },
+  });
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await screen.findByText("Connection lost");
+  expect(updateMock).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() =>
+    expect(updateMock).toHaveBeenCalledWith(
+      "p_1",
+      expect.objectContaining({ calling_defaults: { h3: { agent_id: "ag_1" } } }),
+    ),
+  );
+});
+
+it("shows a config save failure alongside a template fallback notice", async () => {
+  getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
+  putEntryMock.mockResolvedValue({
+    ...entry("h3", "/opt/work/example"),
+    initialization_notice: "Template unavailable; using project defaults.",
+  });
+  updateMock.mockRejectedValue(new Error("Config save failed"));
+  const { onOpenChange } = renderDialog();
+  fireEvent.change(await screen.findByTestId("project-settings-entry-path-h3"), {
+    target: { value: "/opt/work/example" },
+  });
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await screen.findByText("Config save failed");
+  expect(screen.getByText("Template unavailable; using project defaults.")).toBeVisible();
+  expect(onOpenChange).not.toHaveBeenCalledWith(false);
+});
+
+it("keeps an explicit host Agent clear when registering its first directory", async () => {
+  hostsMock.mockReturnValue({ data: [{ ...LAPTOP, status: "offline" }] });
+  getProjectMock.mockResolvedValue({
+    id: "p_1",
+    name: "Work",
+    config: {
+      calling_defaults: { h1: { agent_id: "ag_1" } },
+    },
+  });
+  putEntryMock.mockResolvedValue({ ...entry("h1", "/opt/work/example"), host_agent_id: "ag_1" });
+  renderDialog();
+  await screen.findByTestId("project-settings-host-agent-h1");
+  await pickOption("project-settings-host-agent-h1", "Default (none)");
+  fireEvent.change(screen.getByTestId("project-settings-entry-path-h1"), {
+    target: { value: "/opt/work/example" },
+  });
+  fireEvent.click(screen.getByTestId("project-settings-save"));
+  await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+});
+
 describe("ProjectSettingsDialog", () => {
   it("keeps inheritance when the account default refreshes during editing", async () => {
     writeAlwaysUseWorktree(false);

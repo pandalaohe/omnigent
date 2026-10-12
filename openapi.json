@@ -2911,6 +2911,30 @@
         "additionalProperties": false,
         "description": "Request body for `PUT /v1/projects/{project_id}/entries/{host_id}`.",
         "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A saving client's explicit host Agent; skips template seeding.",
+            "title": "Agent Id"
+          },
+          "project_agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The proposed All hosts Agent when edited in the same Save.",
+            "title": "Project Agent Id"
+          },
           "workspace": {
             "description": "Absolute path on the host. Validated live via `host.stat`; the canonical path the host returns is stored. An offline host stores the typed path after string checks.",
             "title": "Workspace",
@@ -14345,6 +14369,7 @@
                         "keep_warm",
                         "keyboard_shortcuts",
                         "mobile_assistant",
+                        "project_host_agents",
                         "runner_log_warnings",
                         "session_collab",
                         "session_navigation",

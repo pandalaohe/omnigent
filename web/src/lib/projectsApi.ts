@@ -152,6 +152,8 @@ export interface ProjectHostEntry {
    * stored-but-unchecked path means the host was offline.
    */
   checked?: boolean;
+  host_agent_id?: string;
+  initialization_notice?: string;
 }
 
 interface ProjectEntryListResponse {
@@ -174,13 +176,14 @@ export async function putProjectEntry(
   id: string,
   hostId: string,
   workspace: string,
+  agentContext?: { agent_id: string | null; project_agent_id: string | null },
 ): Promise<ProjectHostEntry & { post_bind?: PostBindResult }> {
   const res = await authenticatedFetch(
     `/v1/projects/${encodeURIComponent(id)}/entries/${encodeURIComponent(hostId)}`,
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace }),
+      body: JSON.stringify({ workspace, ...agentContext }),
     },
   );
   return readCollaborationJsonOrThrow<ProjectHostEntry & { post_bind?: PostBindResult }>(res);
@@ -309,6 +312,7 @@ export interface ProjectHostBinding {
   path_verified_at: number | null;
   created_at: number;
   updated_at: number | null;
+  initialization_notice?: string;
   /** Hook outcome from the PUT/verify that returned this binding, if any. */
   post_bind?: PostBindResult;
   /**
