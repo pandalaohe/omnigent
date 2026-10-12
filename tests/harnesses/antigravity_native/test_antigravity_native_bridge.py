@@ -1484,10 +1484,88 @@ def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
     assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
 
 
-def test_seed_isolated_agy_home_seeds_platform_credentials_and_state(
+def test_agy_enabled_tools_match_native_relay_surface() -> None:
+    from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS, _OS_ENV_TOOLS
+
+    assert set(_mod._AGY_ENABLED_TOOLS) == set(_NATIVE_RELAY_BUILTIN_TOOLS | _OS_ENV_TOOLS)
+    assert sorted(_mod._AGY_ENABLED_TOOLS) == _mod._AGY_ENABLED_TOOLS
+    assert len(_mod._AGY_ENABLED_TOOLS) == len(set(_mod._AGY_ENABLED_TOOLS))
+    assert "ask_user_async" in _mod._AGY_ENABLED_TOOLS
+    assert "sys_read_inbox" in _mod._AGY_ENABLED_TOOLS
+    assert "sys_session_handover" in _mod._AGY_ENABLED_TOOLS
+
+
+def test_seed_isolated_agy_home_links_global_instructions_and_rules(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """seed_isolated_agy_home copies platform OAuth markers + state."""
+    """Global instructions and both rule trees remain visible under --gemini_dir."""
+    fake_home = tmp_path / "real-home"
+    real_gemini = fake_home / ".gemini"
+    contents = {
+        Path("AGENTS.md"): "# global agents",
+        Path("GEMINI.md"): "# global gemini",
+        Path("config/rules/a.md"): "# global rule a",
+        Path("antigravity-cli/rules/b.md"): "# global rule b",
+    }
+    for rel, content in contents.items():
+        source = real_gemini / rel
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(content, encoding="utf-8")
+    real_listing = sorted(p.relative_to(real_gemini) for p in real_gemini.rglob("*"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    for _ in range(2):
+        seed_isolated_agy_home(bridge_dir)
+        for rel in (
+            Path("AGENTS.md"),
+            Path("GEMINI.md"),
+            Path("config/rules"),
+            Path("antigravity-cli/rules"),
+        ):
+            link = iso_gemini / rel
+            assert link.is_symlink()
+            assert link.resolve() == real_gemini / rel
+        for rel, content in contents.items():
+            assert (iso_gemini / rel).read_text(encoding="utf-8") == content
+            assert (real_gemini / rel).read_text(encoding="utf-8") == content
+        assert sorted(p.relative_to(real_gemini) for p in real_gemini.rglob("*")) == real_listing
+
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: empty_home))
+    empty_bridge = tmp_path / "empty-bridge"
+    seed_isolated_agy_home(empty_bridge)
+    missing = agy_gemini_dir(empty_bridge) / "AGENTS.md"
+    assert not missing.exists()
+    assert not missing.is_symlink()
+
+
+def test_seed_isolated_agy_home_links_symlinked_global_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_home = tmp_path / "real-home"
+    real_gemini = fake_home / ".gemini"
+    real_gemini.mkdir(parents=True)
+    generation = tmp_path / "generation.md"
+    generation.write_text("# published global agents", encoding="utf-8")
+    (real_gemini / "AGENTS.md").symlink_to(generation)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    seed_isolated_agy_home(bridge_dir)
+
+    isolated_agents = agy_gemini_dir(bridge_dir) / "AGENTS.md"
+    assert isolated_agents.is_symlink()
+    assert isolated_agents.read_text(encoding="utf-8") == "# published global agents"
+
+
+def test_seed_isolated_agy_home_seeds_markers_but_never_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Account, installation and onboarding markers seed without copying tokens."""
     fake_home = tmp_path / "real-home"
     (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
     (fake_home / ".gemini" / "oauth_creds.json").write_text(
@@ -1508,11 +1586,10 @@ def test_seed_isolated_agy_home_seeds_platform_credentials_and_state(
 
     iso_gemini = agy_gemini_dir(bridge_dir)
     assert env == {}
-    # OAuth credentials are COPIED (never moved) into the isolated tree.
     macos_token = iso_gemini / "oauth_creds.json"
     linux_token = iso_gemini / "antigravity-cli" / "antigravity-oauth-token"
-    assert macos_token.read_text(encoding="utf-8") == '{"access_token":"mac-token"}'
-    assert linux_token.read_text(encoding="utf-8") == "linux-token"
+    assert not macos_token.exists()
+    assert not linux_token.exists()
     assert (iso_gemini / "installation_id").read_text(encoding="utf-8") == "root-install-id"
     assert (iso_gemini / "antigravity-cli" / "installation_id").read_text(
         encoding="utf-8"
@@ -1724,7 +1801,7 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
 
     iso_gemini = agy_gemini_dir(bridge_dir)
     assert env == {}
-    # No token copied (none existed), but the isolated Gemini dir + markers still exist.
+    # Missing tokens do not prevent the isolated Gemini dir and markers from seeding.
     assert not (iso_gemini / "antigravity-cli" / "antigravity-oauth-token").exists()
     assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
 
@@ -2154,7 +2231,7 @@ def test_seeding_and_mcp_config_never_mutate_real_gemini_dir(
     This is the central promise of the ``--gemini_dir`` design: keeping the real
     ``HOME`` must NOT reintroduce the clobber/concurrency footgun the prior
     isolated-HOME design avoided. Both setup steps that touch the real
-    ``~/.gemini`` — ``seed_isolated_agy_home`` (COPIES the OAuth markers out) and
+    ``~/.gemini`` — ``seed_isolated_agy_home`` (copies account/installation markers out) and
     ``write_mcp_config`` (writes the relay config) — must leave a fully populated
     real ``~/.gemini`` (interactive-agy user with their own MCP config) byte-for-byte
     untouched, writing only under the per-session isolated Gemini dir.

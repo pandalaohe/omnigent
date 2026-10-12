@@ -302,8 +302,8 @@ def prune_orphaned_bridge_dirs() -> int:
 # a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
 # This (1) NEVER touches the user's real ``~/.gemini/config/mcp_config.json`` and
 # (2) gives each session its own config so concurrent sessions never clobber one
-# another. Known file-based OAuth markers are copied best-effort for platforms
-# whose agy auth provider uses them, but HOME is deliberately not relocated.
+# another. Only account and installation markers are copied; OAuth token files
+# stay in the real tree, and HOME is deliberately not relocated.
 #
 # WHY NOT RELOCATE HOME (#1477). An earlier isolation design pointed ``HOME`` at
 # the per-session tree. That broke auth on macOS: agy stores its OAuth token in
@@ -322,59 +322,73 @@ _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_SERVER_NAME = "omnigent"
-# agy auto-approves a relay tool when it is named in the server's ``enabledTools``
-# allowlist (agy's per-server MCP schema; mirrors cursor's ``autoApprove``).
-# Omnigent's own TOOL_CALL policy + elicitation gate still applies on the server
-# side, so auto-approving the agy-side MCP gate only avoids a hidden in-terminal
-# prompt blocking the call before Omnigent ever sees it.
+# agy only exposes relay tools named in this per-server allowlist, so it must name
+# the whole native relay surface; a test keeps the two equal.
 _AGY_ENABLED_TOOLS = [
+    "ask_user_async",
+    "browser_click",
+    "browser_navigate",
+    "browser_screenshot",
+    "browser_snapshot",
+    "browser_type",
+    "hindsight_recall",
+    "hindsight_reflect",
+    "hindsight_retain",
     "list_comments",
+    "load_skill",
+    "open_in_panel",
+    "read_skill_file",
     "sys_add_policy",
+    "sys_advise_models",
     "sys_agent_download",
     "sys_agent_get",
     "sys_agent_list",
     "sys_call_async",
     "sys_cancel_async",
     "sys_cancel_task",
+    "sys_flow_cancel",
+    "sys_flow_list",
+    "sys_flow_start",
     "sys_list_models",
     "sys_os_edit",
     "sys_os_read",
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_read_inbox",
+    "sys_scheduled_task_create",
+    "sys_scheduled_task_delete",
+    "sys_scheduled_task_list",
+    "sys_scheduled_task_update",
     "sys_session_archive",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
+    "sys_session_handover",
     "sys_session_list",
     "sys_session_open",
+    "sys_session_rename",
     "sys_session_send",
+    "sys_session_share",
     "sys_session_unarchive",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
     "sys_terminal_read",
     "sys_terminal_send",
+    "sys_timer_cancel",
+    "sys_timer_set",
     "update_comment",
 ]
 
-# Files copied from the user's real ``~/.gemini`` into the per-session isolated
-# Gemini dir for platforms whose agy auth provider uses file-backed credentials,
-# plus installation markers. Keep the OAuth credential paths in sync with
-# ``omnigent.onboarding.gemini_auth``: macOS writes ``oauth_creds.json`` while
-# Linux writes ``antigravity-cli/antigravity-oauth-token``. The OAuth credential
-# is the only secret; it is COPIED (the real file is never moved or modified).
-# Missing files are skipped (agy regenerates onboarding/migration state, and a
-# missing credential only means agy re-auths in that session — never corruption
-# of the real tree).
+# Only account and installation markers are copied, never OAuth token files.
+# macOS/Windows use the OS keyring through the real HOME; Linux file-stored tokens
+# are not copied, so those sessions sign in on their own.
 _AGY_SEED_FILES = (
-    Path("oauth_creds.json"),
-    # Account identity agy writes beside the credential. Without it agy can hold a
-    # valid token yet still prompt for account selection in a fresh Gemini dir,
-    # which reads as "not signed in" on a headless launch (#1477).
+    # Without the account identity a fresh Gemini dir can prompt for account
+    # selection, which reads as "not signed in" on a headless launch (#1477).
     Path("google_accounts.json"),
-    Path("antigravity-cli") / "antigravity-oauth-token",
     Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
 )
@@ -405,6 +419,16 @@ _AGY_HOOKS_FILE = "hooks.json"
 _AGY_SKILL_DIRS = (
     Path("antigravity-cli") / "skills",
     Path("skills"),
+)
+
+
+# agy reads global instructions and rules from its Gemini dir, so a session under
+# ``--gemini_dir`` would otherwise miss them.
+_AGY_INSTRUCTION_PATHS = (
+    Path("AGENTS.md"),
+    Path("GEMINI.md"),
+    Path("config") / "rules",
+    Path("antigravity-cli") / "rules",
 )
 
 
@@ -546,11 +570,13 @@ def seed_isolated_agy_home(
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies known file-based agy OAuth markers, the user's ``settings.json``
+    Copies account and installation markers, the user's ``settings.json``
     (backend config such as the GCP project/location block), the user's global
     lifecycle hooks (``config/hooks.json``), and onboarding/migration state
     (NEVER moving or modifying the real files) into
-    ``<bridge_dir>/agy-home/.gemini``.
+    ``<bridge_dir>/agy-home/.gemini``. Links the user's global instruction files
+    and rule directories, skill trees, and imported plugins into that directory.
+    OAuth token files are never copied.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
     auth that is not portable to a relocated ``HOME``. The relay's
@@ -572,8 +598,7 @@ def seed_isolated_agy_home(
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
     (iso_gemini / _MCP_CONFIG_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    # Copy the auth token + installation id (best-effort: a missing token only
-    # means agy re-auths this session; the real files are never touched).
+    # Missing account/installation markers are harmless; agy regenerates them.
     for rel in _AGY_SEED_FILES:
         src = real_home / ".gemini" / rel
         if not src.is_file():
@@ -594,6 +619,8 @@ def seed_isolated_agy_home(
 
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
+    for rel in _AGY_INSTRUCTION_PATHS:
+        _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
     _seed_isolated_agy_hooks(real_home, iso_gemini)
 
     if trusted_workspace is not None:
@@ -739,17 +766,17 @@ def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
 
 
 def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
-    """Symlink *link* at the isolated Gemini dir to the real tree *real*.
+    """Symlink *link* in the isolated Gemini dir to a real file or directory *real*.
 
     Linking rather than copying keeps a tree the user edits mid-session (a
     ``/plugin install``, a newly authored skill) visible instead of pinning a
     stale snapshot. A missing source seeds nothing.
 
-    :param real: Source directory in the user's real ``~/.gemini``.
+    :param real: Source file or directory in the user's real ``~/.gemini``.
     :param link: Path to create under the bridge-owned ``--gemini_dir``.
     :returns: None.
     """
-    if not real.is_dir():
+    if not (real.is_dir() or real.is_file()):
         return
     with contextlib.suppress(OSError):
         # Re-seeding an existing bridge dir must not fail on the prior link;
@@ -758,7 +785,7 @@ def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
             link.unlink()
         if not link.exists():
             link.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            link.symlink_to(real.resolve(), target_is_directory=True)
+            link.symlink_to(real.resolve(), target_is_directory=real.is_dir())
 
 
 # agy's periodic engagement survey ("How's the CLI experience so far?") is gated by

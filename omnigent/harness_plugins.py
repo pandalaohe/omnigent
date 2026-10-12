@@ -440,9 +440,10 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
+    # agy's WAITING prompts are polled over its local RPC and mirrored to web elicitations.
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
-        _EL.NONE,
+        _EL.APPROVAL_MIRROR,
         _RS.WARM_REATTACH,
         _EF.GEMINI,
         _MF.GEMINI,
