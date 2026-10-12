@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 
 from sqlalchemy import asc, or_, select
 from sqlalchemy.orm import Session
 
+from omnigent.calling_defaults import default_agent_for_host
 from omnigent.db.db_models import (
     SqlConversationLabel,
     SqlProject,
@@ -30,6 +32,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.project_host_binding_store import ProjectHostBindingStore
+from omnigent.stores.project_store.sqlalchemy_store import _decode_config, _encode_config
 
 
 def _to_entity(row: SqlProjectHostBinding) -> ProjectHostBinding:
@@ -75,7 +78,7 @@ def _entry_to_entity(row: SqlProjectHostEntry) -> ProjectHostEntry:
     )
 
 
-def _lock_project(session: Session, *, project_id: str) -> None:
+def _lock_project(session: Session, *, project_id: str) -> SqlProject:
     """Lock the project row; raise ``NOT_FOUND`` when it is absent.
 
     :param session: The active SQLAlchemy session.
@@ -95,6 +98,38 @@ def _lock_project(session: Session, *, project_id: str) -> None:
     )
     if project is None:
         raise OmnigentError(f"project {project_id} not found", code=ErrorCode.NOT_FOUND)
+    return project
+
+
+def _initialize_host_agent(
+    session: Session,
+    project: SqlProject,
+    host_id: str,
+    candidate: str | None,
+    project_has_agent: bool | None = None,
+) -> str | None:
+    if not candidate:
+        return None
+    entry = session.get(SqlProjectHostEntry, (current_workspace_id(), project.id, host_id))
+    binding = session.scalar(
+        select(SqlProjectHostBinding.id)
+        .where(
+            SqlProjectHostBinding.workspace_id == current_workspace_id(),
+            SqlProjectHostBinding.project_id == project.id,
+            SqlProjectHostBinding.host_id == host_id,
+        )
+        .limit(1)
+    )
+    config = _decode_config(project.config)
+    has_agent = bool(config.get("agent_id")) if project_has_agent is None else project_has_agent
+    if entry or binding or has_agent or default_agent_for_host(config, host_id):
+        return None
+    defaults = dict(config.get("calling_defaults") or {})
+    defaults[host_id] = {**defaults.get(host_id, {}), "agent_id": candidate}
+    config["calling_defaults"] = defaults
+    project.config = _encode_config(config)
+    project.updated_at = now_epoch()
+    return candidate
 
 
 def derive_primary_bindings(session: Session, *, project_id: str) -> list[ProjectHostBinding]:
@@ -224,6 +259,7 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
         workspace: str,
         enabled: bool = True,
         verified: bool = True,
+        initial_agent_id: str | None = None,
     ) -> ProjectHostBinding:
         """Register a binding or revise it, then derive the host's primary.
 
@@ -237,7 +273,8 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
         def write(session: Session) -> ProjectHostBinding:
             # Project row first, binding row second: one lock order per
             # project, so concurrent writers serialize instead of racing.
-            _lock_project(session, project_id=project_id)
+            project = _lock_project(session, project_id=project_id)
+            _initialize_host_agent(session, project, host_id, initial_agent_id)
             # Same SqlProject row the repository store locks, so a racing
             # repository delete serializes against this check, not past it.
             repository = session.execute(
@@ -425,15 +462,26 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
             rows = session.execute(stmt).scalars().all()
             return [_entry_to_entity(r) for r in rows]
 
-    def put_entry(self, project_id: str, host_id: str, workspace: str) -> ProjectHostEntry:
+    def put_entry(
+        self,
+        project_id: str,
+        host_id: str,
+        workspace: str,
+        *,
+        initial_agent_id: str | None = None,
+        project_has_agent: bool | None = None,
+    ) -> ProjectHostEntry:
         """Register a host's entry path or move it."""
 
         def write(session: Session) -> ProjectHostEntry:
             # Project row first: one lock order per project, and an unknown
             # project is refused rather than left with an orphan entry.
-            _lock_project(session, project_id=project_id)
+            project = _lock_project(session, project_id=project_id)
             row = session.get(SqlProjectHostEntry, (current_workspace_id(), project_id, host_id))
             if row is None:
+                _initialize_host_agent(
+                    session, project, host_id, initial_agent_id, project_has_agent
+                )
                 row = SqlProjectHostEntry(
                     project_id=project_id,
                     host_id=host_id,
@@ -443,13 +491,14 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
                 )
                 session.add(row)
                 session.flush()
-                return _entry_to_entity(row)
-            if row.workspace == workspace:
-                return _entry_to_entity(row)
-            row.workspace = workspace
-            row.updated_at = now_epoch()
-            session.flush()
-            return _entry_to_entity(row)
+            elif row.workspace != workspace:
+                row.workspace = workspace
+                row.updated_at = now_epoch()
+                session.flush()
+            return replace(
+                _entry_to_entity(row),
+                host_agent_id=default_agent_for_host(_decode_config(project.config), host_id),
+            )
 
         token = self._host_store.acquire_worktree_admission(host_id)
         try:

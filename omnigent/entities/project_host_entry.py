@@ -33,3 +33,5 @@ class ProjectHostEntry:
     created_at: int
     updated_at: int | None = None
     workspace_id: int = 0
+    # Response-only host Agent snapshot, replayed on PUT retries; not stored on the entry.
+    host_agent_id: str | None = None

@@ -102,9 +102,12 @@ def _build_app(
     *,
     enabled: bool = True,
     auth: bool = False,
+    preferences: bool = False,
 ) -> FastAPI:
     """Build a FastAPI app with the collaboration stores wired."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
     flags = resolve_feature_flags({"OMNIGENT_FEATURES": "project_assignments"} if enabled else {})
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -121,6 +124,7 @@ def _build_app(
         project_host_binding_store=SqlAlchemyProjectHostBindingStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header") if auth else None,
         feature_flags=flags,
+        user_preferences_store=SqlAlchemyUserPreferencesStore(db_uri) if preferences else None,
     )
 
 

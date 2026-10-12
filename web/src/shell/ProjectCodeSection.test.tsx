@@ -277,6 +277,19 @@ describe("ProjectCodeSection", () => {
     );
   });
 
+  it("shows an unavailable-template notice when adding from a folder", async () => {
+    getMock.mockResolvedValue(collaboration());
+    getFactsMock.mockResolvedValue({ state: "ok", facts: okFacts() });
+    putRepoMock.mockResolvedValue(repo());
+    putBindingMock.mockResolvedValue(binding({ initialization_notice: "Template unavailable" }));
+    renderSection();
+    await openAddForm();
+    await chooseFolder();
+    await waitFor(() => expect(screen.getByTestId("project-code-add-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("project-code-add-submit"));
+    expect(await screen.findByText("Template unavailable")).toBeVisible();
+  });
+
   it("offers a typed address only while no folder is chosen, and creates no binding", async () => {
     getMock.mockResolvedValue(collaboration());
     putRepoMock.mockResolvedValue(repo());

@@ -55,6 +55,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "approval_timeout",
         "agent_pins",
         "calling_defaults",
+        "project_host_agents",
         "calling_last",
         "session_collab",
         "host_colors",

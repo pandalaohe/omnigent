@@ -8,6 +8,7 @@ import { PlusIcon, Trash2Icon } from "lucide-react";
 
 import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
+import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
@@ -44,6 +45,11 @@ import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffort
 import { relativeTime } from "@/lib/relativeTime";
 import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
+import { setProjectHostAgent, useProjectHostAgents } from "@/lib/projectHostAgents";
+import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -249,7 +255,7 @@ function AddHarnessControl({
         data-testid="calling-defaults-add-row"
       >
         <PlusIcon />
-        Add harness row
+        Add harness settings
       </Button>
     );
   }
@@ -263,7 +269,7 @@ function AddHarnessControl({
     >
       <SelectTrigger
         className="h-8 w-full max-w-56"
-        aria-label="Add harness row"
+        aria-label="Add harness settings"
         data-testid="calling-defaults-add-harness"
       >
         <SelectValue placeholder="Choose a harness" />
@@ -588,6 +594,9 @@ export function CallingDefaultsSection() {
   const { data: hosts } = useHosts();
   const master = useCallingDefaults();
   const carryOver = useCallingLastEnabled();
+  const { data: agents } = useAvailableAgents();
+  const customCatalog = useCustomAgents();
+  const templates = useProjectHostAgents();
   const isMobile = useIsMobileViewport();
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [catalogs, setCatalogs] = useState<CallingDefaultsCatalogRow[]>([]);
@@ -646,6 +655,22 @@ export function CallingDefaultsSection() {
 
   const hostList = hosts ?? [];
   const host = hostList.find((candidate) => candidate.host_id === selectedHostId) ?? hostList[0];
+  const templateAgents = selectableSessionAgents([
+    ...(agents ?? []).filter((agent) => !agent.templateId),
+    ...(customCatalog.data ?? []).map(customAgentForPicker),
+  ]).filter((agent) =>
+    agent.members?.length
+      ? agent.members.every(
+          (member) =>
+            harnessReadinessOnHost(
+              member.harness,
+              member.host_id
+                ? hostList.find((candidate) => candidate.host_id === member.host_id)
+                : host,
+            ).selectable,
+        )
+      : harnessReadinessOnHost(agent.harness, host).selectable,
+  );
   const lastFetchedAt = useMemo(() => {
     let newest: number | null = null;
     for (const row of catalogs) {
@@ -677,32 +702,35 @@ export function CallingDefaultsSection() {
           {error}
         </p>
       )}
-      <div className="space-y-2 text-sm text-muted-foreground">
-        <p>
-          Model, effort, speed and permission are resolved separately: explicit choice → project on
-          this host and harness → this master table → SDK&apos;s Native project and master defaults
-          → the Agent or harness default. A matching legacy project model can also take precedence
-          over the master model.
-        </p>
-        <p>
-          New Chat can reuse the last Agent, model, effort and speed for a project on this host;
-          permission is resolved independently. Ordinary child sessions use the parent&apos;s
-          project and host as context, without copying its running model. Named members use their
-          saved settings and snapshot; empty model or effort can inherit when that snapshot is made.
-          Smart Routing skips fixed model, effort, speed and permission defaults on automatic
-          routes.
-        </p>
+      <div className="flex items-start gap-2 text-sm text-muted-foreground">
+        <p>Defaults by host and harness. Projects can override them.</p>
+        <HelpTip label="How session defaults are chosen">
+          <p>
+            Model, effort, speed and permission are resolved separately: explicit choice → project
+            on this host and harness → this master table → SDK&apos;s Native project and master
+            defaults → the Agent or harness default. A matching legacy project model can also take
+            precedence over the master model.
+          </p>
+          <p>
+            New Chat can reuse the last Agent, model, effort and speed for a project on this host;
+            permission is resolved independently. Ordinary child sessions use the parent&apos;s
+            project and host as context, without copying its running model. Named members use their
+            saved settings and snapshot; empty model or effort can inherit when that snapshot is
+            made. Smart Routing skips fixed model, effort, speed and permission defaults on
+            automatic routes.
+          </p>
+        </HelpTip>
       </div>
       <div className="flex min-w-0 items-start justify-between gap-6">
         <div className="min-w-0 flex-1">
-          <span className="text-ui font-medium">Carry over last settings</span>
+          <span className="text-ui font-medium">Reuse last session choices</span>
           <span className="mt-0.5 block text-sm text-muted-foreground">
-            When enabled, New Chat reuses the last Agent, model, effort and speed for this project
-            and host. It does not save permission.
+            Reuses agent, model, effort and speed for this project and host; permission uses its
+            defaults.
           </span>
         </div>
         <Switch
-          aria-label="Carry over last settings"
+          aria-label="Reuse last session choices"
           checked={carryOver}
           onCheckedChange={writeCallingLastEnabled}
           className="shrink-0"
@@ -739,6 +767,45 @@ export function CallingDefaultsSection() {
               );
             })}
           </div>
+          {host && (
+            <div className="flex min-w-0 flex-col gap-2 rounded-md border p-3">
+              <label className="text-ui font-medium" htmlFor="new-project-agent">
+                New project agent
+              </label>
+              <Select
+                value={templates[host.host_id] ?? "__none__"}
+                onValueChange={(value) =>
+                  setProjectHostAgent(host.host_id, value === "__none__" ? null : value)
+                }
+              >
+                <SelectTrigger
+                  id="new-project-agent"
+                  className="w-full min-w-0"
+                  data-testid="new-project-agent"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" className="w-(--radix-select-trigger-width)">
+                  <SelectItem value="__none__">No template</SelectItem>
+                  {templateAgents.map((agent) => (
+                    <SelectItem key={agent.id} value={agent.id}>
+                      {agent.display_name}
+                    </SelectItem>
+                  ))}
+                  {templates[host.host_id] &&
+                    !templateAgents.some((agent) => agent.id === templates[host.host_id]) && (
+                      <SelectItem value={templates[host.host_id]!} disabled>
+                        Unavailable agent
+                      </SelectItem>
+                    )}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                Used for new bindings when the project has no All hosts agent. Existing bindings
+                keep their agent.
+              </p>
+            </div>
+          )}
           {host && (
             <HostDefaultsTable
               host={host}

@@ -38,6 +38,146 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 
 
+@pytest.mark.parametrize("state", ["owned", "foreign", "deleted", "member-unready"])
+async def test_library_template_respects_owner_and_member_readiness(
+    db_uri: str, tmp_path: Path, state: str
+) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.custom_agents_store import CustomAgentsStore
+
+    app = _build_app(db_uri, tmp_path, preferences=True)
+    library = CustomAgentsStore(db_uri)
+    app.state.custom_agents_store = library
+    owner = BOB if state == "foreign" else RESERVED_USER_LOCAL
+    agent = library.create(
+        owner,
+        {
+            "id": "ca_review_team",
+            "name": "Review team",
+            "bundle_location": "library/review-team",
+            "harness": "codex-native",
+            "members": [
+                {"name": "Lead", "harness": "codex-native", "lead": True},
+                {"name": "Helper", "harness": "claude-native", "host_id": _HOST_B},
+            ],
+        },
+    )
+    if state == "deleted":
+        library.delete(owner, agent["id"])
+    for host_id, harness in [(_HOST_OFFLINE, "codex-native"), (_HOST_B, "claude-native")]:
+        app.state.host_store.upsert_on_connect(host_id, f"Template {harness}", "local")
+        app.state.host_store.set_offline(host_id)
+        app.state.host_store.update_harness_readiness(
+            host_id, {harness: state != "member-unready" or host_id != _HOST_B}
+        )
+    app.state.user_preferences_store.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "project_host_agents",
+        {_HOST_OFFLINE: agent["id"]},
+        create_if_missing=True,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        project_id = (await client.post("/v1/projects", json={"name": "Library template"})).json()[
+            "id"
+        ]
+        response = await client.put(
+            f"/v1/projects/{project_id}/entries/{_HOST_OFFLINE}",
+            json={"workspace": "/opt/work/example"},
+        )
+        assert response.status_code == 200, response.text
+        config = (await client.get(f"/v1/projects/{project_id}")).json()["config"]
+        if state == "owned":
+            assert config["calling_defaults"][_HOST_OFFLINE]["agent_id"] == agent["id"]
+            assert "initialization_notice" not in response.json()
+        else:
+            assert not config.get("calling_defaults")
+            assert "unavailable" in response.json()["initialization_notice"]
+
+
+@pytest.mark.parametrize(
+    "project_agent,usable", [(None, True), ("project-agent", True), (None, False)]
+)
+@pytest.mark.parametrize("connection", ["entry", "binding"])
+async def test_new_entry_uses_host_template_only_without_project_agent(
+    db_uri: str,
+    tmp_path: Path,
+    project_agent: str | None,
+    usable: bool,
+    connection: str,
+) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from tests.server.routes.test_calling_defaults_routes import AGENT_ID, _bundle
+
+    app = _build_app(db_uri, tmp_path, preferences=True)
+    LocalArtifactStore(str(tmp_path / "artifacts")).put("template/bundle", _bundle("codex-native"))
+    app.state.agent_store.create(AGENT_ID, "Project template", "template/bundle")
+    app.state.host_store.upsert_on_connect(_HOST_OFFLINE, "offline-box", "local")
+    app.state.host_store.set_offline(_HOST_OFFLINE)
+    app.state.host_store.update_harness_readiness(_HOST_OFFLINE, {"codex-native": usable})
+    app.state.user_preferences_store.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "project_host_agents",
+        {_HOST_OFFLINE: AGENT_ID},
+        create_if_missing=True,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/projects",
+            json={
+                "name": "Template test",
+                "config": {"agent_id": project_agent} if project_agent else {},
+            },
+        )
+        project_id = response.json()["id"]
+        if connection == "binding":
+            app.state.project_repository_store.apply_repository(
+                project_id=project_id,
+                name="code",
+                remote_url="https://github.com/example/project.git",
+                default_branch="main",
+            )
+        target = (
+            f"/v1/projects/{project_id}/entries/{_HOST_OFFLINE}"
+            if connection == "entry"
+            else f"/v1/projects/{project_id}/hosts/{_HOST_OFFLINE}/bindings/code"
+        )
+        body = {"workspace": "/opt/work/example"}
+        if connection == "binding":
+            body["repository_name"] = "code"
+        put = await client.put(
+            target,
+            json=body,
+        )
+        assert put.status_code == 200, put.text
+        config = (await client.get(f"/v1/projects/{project_id}")).json()["config"]
+        if project_agent:
+            assert config == {"agent_id": project_agent}
+            assert "initialization_notice" not in put.json()
+        elif usable:
+            assert config["calling_defaults"][_HOST_OFFLINE]["agent_id"] == AGENT_ID
+            if connection == "entry":
+                assert put.json()["host_agent_id"] == AGENT_ID
+        else:
+            assert not config.get("calling_defaults")
+            assert "unavailable" in put.json()["initialization_notice"]
+        app.state.user_preferences_store.patch_namespace(
+            RESERVED_USER_LOCAL, "project_host_agents", {_HOST_OFFLINE: None}
+        )
+        repeat = await client.put(
+            target,
+            json={**body, "workspace": "/opt/work/moved"},
+        )
+        assert repeat.status_code == 200
+        if connection == "entry" and not project_agent and usable:
+            assert repeat.json()["host_agent_id"] == AGENT_ID
+        assert (await client.get(f"/v1/projects/{project_id}")).json()["config"] == config
+
+
 @pytest.fixture()
 def entries_app(db_uri: str, tmp_path: Path) -> FastAPI:
     """App with the entries surface enabled (collaboration flag on)."""

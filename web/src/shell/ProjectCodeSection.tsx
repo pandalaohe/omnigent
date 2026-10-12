@@ -369,6 +369,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
   }, [addFactsQuery.data, addFactsPath, effectiveAddHostId]);
 
   const invalidate = (hostId?: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["project-config", projectId] });
     void queryClient.invalidateQueries({ queryKey: ["project-collaboration", projectId] });
     void queryClient.invalidateQueries({ queryKey: ["project-host-roots", projectId] });
     void queryClient.invalidateQueries({ queryKey: ["project-entries", projectId] });
@@ -430,6 +431,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         workspace,
         repository_name: repository.name,
       });
+      if (binding.initialization_notice) setActionError(binding.initialization_notice);
       markUnchecked(`${hostId}::${repository.name}`, binding.checked === false);
       invalidate(hostId);
     });
@@ -444,7 +446,8 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
 
   const runEntrySetup = (hostId: string, workspace: string) => {
     void runAction(async () => {
-      await putProjectEntry(projectId, hostId, workspace);
+      const entry = await putProjectEntry(projectId, hostId, workspace);
+      if (entry.initialization_notice) setActionError(entry.initialization_notice);
       invalidate(hostId);
     });
   };
@@ -589,10 +592,11 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         role,
       });
       try {
-        await putProjectHostBinding(projectId, effectiveAddHostId, name, {
+        const written = await putProjectHostBinding(projectId, effectiveAddHostId, name, {
           workspace: addFolder.trim(),
           repository_name: name,
         });
+        if (written.initialization_notice) setActionError(written.initialization_notice);
       } catch (error) {
         // The repository is committed already; refresh despite the failure.
         invalidate(effectiveAddHostId);
