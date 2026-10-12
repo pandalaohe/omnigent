@@ -81,6 +81,7 @@ def _capture_spawn_env(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
     """Record the env of the app-server spawn via a fake subprocess."""
 
     async def _fake_exec(*args: Any, **kwargs: Any) -> _FakeAppServerProcess:
+        captured["argv"] = args
         captured["env"] = kwargs["env"]
         stderr = asyncio.StreamReader()
         stderr.feed_eof()
@@ -171,6 +172,40 @@ async def test_start_drops_inherited_agent_pid_and_resolves_native_pid(
     finally:
         await server.close()
     assert server.agent_pid is None
+
+
+@pytest.mark.usefixtures("neutral_codex_source", "stubbed_startup")
+async def test_start_uses_current_session_id_over_inherited_value(
+    short_socket_dir: Path,
+    tmp_path: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    _capture_spawn_env(monkeypatch, captured)
+    server = _test_app_server(
+        short_socket_dir,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+        env={"OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "parent"},
+    )
+    server.session_id = "child"
+    await server.start()
+    try:
+        assert captured["env"]["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == "child"
+        assert (
+            'shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID="child"'
+            in captured["argv"]
+        )
+        assert (
+            codex_native_app_server.codex_terminal_env(server)[
+                "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
+            ]
+            == "child"
+        )
+    finally:
+        await server.close()
 
 
 @pytest.mark.usefixtures("neutral_codex_source", "stubbed_startup")

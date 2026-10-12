@@ -32,6 +32,7 @@ from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_en
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests.runner.conftest import (
     _build_app_for_spec,
@@ -2182,6 +2183,7 @@ async def test_action_required_marker_round_trips_to_relayed_frame() -> None:
 @pytest.mark.asyncio
 async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Session pre-spawn must include bundle-dir env for Codex skills.
 
@@ -2193,6 +2195,7 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     skills.
     """
     bundle_dir = tmp_path / "bundle"
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent")
     bundle_dir.mkdir()
     spec = AgentSpec(
         spec_version=1,
@@ -2233,6 +2236,10 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     assert env is not None
     assert env["HARNESS_CODEX_BUNDLE_DIR"] == str(bundle_dir)
     assert env["HARNESS_CODEX_SKILLS_FILTER"] == '["codex_e2e_xyz_greet_a3f9c2"]'
+    assert env["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == ("415c9954e2fe4b9276083a4d2c66f689")
+    assert _build_harness_spawn_env(env)["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == (
+        "415c9954e2fe4b9276083a4d2c66f689"
+    )
 
 
 @pytest.mark.asyncio

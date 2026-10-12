@@ -1318,6 +1318,7 @@ async def _prepare_codex_terminal(
                         app_server.codex_cli_version
                     ),
                     agent_pid=app_server.agent_pid,
+                    session_id=session_id,
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -2928,6 +2929,7 @@ async def _launch_codex_terminal(
         config_overrides=config_overrides,
         codex_cli_version=codex_cli_version,
         agent_pid=agent_pid,
+        session_id=session_id,
     )
     body = {
         "terminal": _TERMINAL_NAME,

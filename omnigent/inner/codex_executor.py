@@ -41,6 +41,7 @@ import psutil
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import IS_LINUX, resolve_cli_binary
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_egress import (
     CERTIFICATE_FAILURE_CODE,
@@ -258,6 +259,7 @@ _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 CODEX_AGENT_PID_ENV = "COLLAB_AGENT_PID"
 # Dotted Codex config key placing the app-server pid in a thread's shell env.
 CODEX_AGENT_PID_CONFIG_KEY = f"shell_environment_policy.set.{CODEX_AGENT_PID_ENV}"
+CODEX_PRIMARY_SESSION_ID_CONFIG_KEY = f"shell_environment_policy.set.{PRIMARY_SESSION_ID_ENV_VAR}"
 
 
 def strip_codex_agent_pid_env(env: MutableMapping[str, str]) -> None:
@@ -1911,6 +1913,7 @@ def codex_extended_catalog_requested(env: Mapping[str, str] | None = None) -> bo
 #: ``_clean_codex_env``'s filtered copy — so they must be allowed through it or
 #: both features silently never engage on the wrapped ``codex`` harness.
 _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
+    PRIMARY_SESSION_ID_ENV_VAR,
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     CODEX_EXTENDED_CATALOG_ENV_VAR,
@@ -4023,6 +4026,8 @@ class _CodexAppServerSession:
                     config["features.shell_tool"] = False
             if self._agent_pid is not None:
                 config[CODEX_AGENT_PID_CONFIG_KEY] = str(self._agent_pid)
+            if session_id := self._env.get(PRIMARY_SESSION_ID_ENV_VAR):
+                config[CODEX_PRIMARY_SESSION_ID_CONFIG_KEY] = session_id
             if config:
                 params["config"] = config
             response = await self._request("thread/start", params)

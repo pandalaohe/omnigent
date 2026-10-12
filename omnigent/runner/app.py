@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
+    PRIMARY_SESSION_ID_ENV_VAR,
     debug_event,
     phase_scope,
     runner_primary_session_id,
@@ -11098,6 +11099,7 @@ def _build_spawn_env_from_spec(
             env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "codex":
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env[PRIMARY_SESSION_ID_ENV_VAR] = session_id or ""
             env["HARNESS_CODEX_SKILLS_DIR"] = (
                 str(resource_registry.codex_skills_dir(session_id))
                 if resource_registry is not None and session_id is not None

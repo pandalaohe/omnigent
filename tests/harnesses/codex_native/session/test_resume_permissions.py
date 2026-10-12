@@ -185,6 +185,23 @@ def test_preload_codex_thread_agent_pid_beats_terminal_args(
     ]
 
 
+def test_preload_codex_thread_uses_current_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = _FakeCodexAppServerClient()
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876", "thread_test", session_id="child"
+        )
+    )
+    assert fake_client.requests[0][1]["config"] == {
+        "shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID": "child"
+    }
+
+
 @pytest.mark.parametrize("retain_client", [False, True])
 @pytest.mark.parametrize("stage", ["connect", "request"])
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
