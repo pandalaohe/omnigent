@@ -1396,7 +1396,7 @@ async def test_window_passed_while_runner_offline_goes_cold_silently(
 
 
 async def test_archived_mother_child_goes_cold_silently(harness: _Harness) -> None:
-    """A mother-archived child settles cold with no notice."""
+    """A cascaded child is archived and never receives a keep-warm ping or notice."""
     parent = _parent(harness)
     u = harness.now - 2 * 3600
     child = _child(
@@ -1411,7 +1411,8 @@ async def test_archived_mother_child_goes_cold_silently(harness: _Harness) -> No
 
     assert harness.forward.calls == []
     state = _read_label(harness, child.id)
-    assert state is not None and state.s == "c" and state.why == "exp"
+    assert harness.store.get_conversation(child.id).archived
+    assert state is not None and state.s == "w"
     assert harness.notices.lines == []
 
 

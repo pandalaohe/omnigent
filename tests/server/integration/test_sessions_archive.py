@@ -24,6 +24,7 @@ import httpx
 import pytest
 
 from omnigent.cli_retention import CliRetentionPolicy
+from omnigent.errors import OmnigentError
 from omnigent.server.archive_close import ArchiveCloseCoordinator
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.cli_release_store import CliReleaseIntentStore
@@ -36,11 +37,14 @@ from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.conversation_store import (
+    ARCHIVE_CASCADE_LABEL_KEY,
     ARCHIVE_DELETE_WORKTREE_LABEL_KEY,
     ARCHIVE_KEEP_WORKTREE_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
+    archive_cascade_members,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -61,11 +65,146 @@ def _no_archive_stop_grace() -> object:
     stop-skipped assertions fast. Tests that need the timer to stay pending
     (to observe or cancel it) set their own grace.
     """
-    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
+    with (
+        patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_SETTLE_S", 0.0),
+        patch.object(_sessions_facade, "_ARCHIVE_IDLE_POLL_S", 0.01),
+    ):
         yield
 
 
 # ── Archive / unarchive lifecycle ────────────────────────
+
+
+async def test_large_archive_cascade_survives_label_limits_and_undo(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent = await create_test_session(client, name="large-archive-family")
+    store = SqlAlchemyConversationStore(db_uri)
+    children = [
+        store.create_conversation(parent_conversation_id=parent["id"], title=f"Child {i}")
+        for i in range(32)
+    ]
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 3600):
+        assert (
+            await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": True})
+        ).status_code == 200
+        archived = store.get_conversation(parent["id"])
+        assert archive_cascade_members(archived) == {child.id: 1 for child in children}
+        assert all(len(value) <= 256 for value in archived.labels.values())
+        assert (
+            await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": False})
+        ).status_code == 200
+    restored = store.get_conversation(parent["id"])
+    assert not any(key.startswith(ARCHIVE_CASCADE_LABEL_KEY) for key in restored.labels)
+    assert all(not store.get_conversation(child.id).archived for child in children)
+
+
+async def test_transactional_cascade_defers_close_without_route_preflight(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    store.create_conversation(parent_conversation_id=parent.id)
+    archived = store.update_conversation(parent.id, archived=True, close_cli_on_archive=True)
+    assert archived.labels[ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY] == str(archived.archive_revision)
+
+
+@pytest.mark.parametrize("intent", ["undo", "keep", "delete"])
+async def test_rootless_cascade_intent_conflicts_with_child_cleanup_until_receipt(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    from omnigent.server.routes import _host_worktree as proxy
+    from omnigent.server.routes._sessions import helpers
+
+    host_id = "7a2b3c4d5e6f1234567890abcdef0123"
+    HostStore(db_uri).upsert_on_connect(host_id, "cascade-host", RESERVED_USER_LOCAL)
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    path = "/opt/work/sample-app/child"
+    child = store.create_conversation(
+        parent_conversation_id=root.id, host_id=host_id, workspace=path, git_branch="feature/child"
+    )
+    store.update_conversation(
+        root.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=True,
+        worktree_archive_mode="green_only",
+    )
+    archived = store.get_conversation(child.id)
+    remove_started = asyncio.Event()
+    allow_remove = asyncio.Event()
+
+    async def remove(**_kwargs):
+        remove_started.set()
+        await asyncio.wait_for(allow_remove.wait(), 5)
+
+    monkeypatch.setattr(
+        proxy,
+        "list_worktrees_on_host",
+        AsyncMock(return_value=[{"path": path, "branch": "feature/child", "is_main": False}]),
+    )
+    monkeypatch.setattr(proxy, "remove_worktree_on_host", remove)
+    registry = SimpleNamespace(get=lambda _: SimpleNamespace())
+    cleanup = asyncio.create_task(
+        helpers._remove_session_worktree_best_effort(
+            host_id=host_id,
+            worktree_path=path,
+            branch="feature/child",
+            delete_branch=False,
+            host_registry=registry,
+            reason="session-archive",
+            conversation_store=store,
+            exclude_conversation_id=child.id,
+            safe_only=True,
+            archive_mode="green_only",
+            expected_archive_revision=archived.archive_revision,
+        )
+    )
+    try:
+        await asyncio.wait_for(remove_started.wait(), 5)
+        with pytest.raises(OmnigentError, match="lease is busy"):
+            await asyncio.to_thread(
+                store.update_conversation,
+                root.id,
+                archived=intent != "undo",
+                keep_worktree=intent == "keep",
+                delete_worktree=intent == "delete",
+                close_cli_on_archive=intent == "delete",
+            )
+        assert store.get_conversation(child.id).archived
+        allow_remove.set()
+        assert await asyncio.wait_for(cleanup, 5)
+    finally:
+        allow_remove.set()
+        await cleanup
+    await asyncio.to_thread(store.update_conversation, root.id, archived=False)
+    restored = store.get_conversation(child.id)
+    assert not restored.archived
+    assert restored.labels[ARCHIVE_REMOVED_WORKTREE_LABEL_KEY] == str(archived.archive_revision)
+
+
+@pytest.mark.parametrize("intent", ["keep", "delete"])
+async def test_rootless_cascade_intent_preserves_unresolved_child_removal(
+    db_uri: str, intent: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=root.id)
+    store.update_conversation(root.id, archived=True, delete_worktree=True)
+    store.set_labels(child.id, {ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY: "unresolved"})
+    before = store.get_conversation(child.id)
+
+    with pytest.raises(OmnigentError, match="removal is unresolved"):
+        store.update_conversation(
+            root.id,
+            archived=True,
+            keep_worktree=intent == "keep",
+            delete_worktree=intent == "delete",
+        )
+
+    after = store.get_conversation(child.id)
+    assert after.archive_revision == before.archive_revision
+    assert after.labels == before.labels
 
 
 async def test_session_not_archived_by_default(
@@ -74,6 +213,189 @@ async def test_session_not_archived_by_default(
     """A freshly created session has ``archived=False``."""
     session = await create_test_session(client, name="archive-default")
     assert session["archived"] is False
+
+
+async def test_archive_cascades_and_undo_preserves_previously_archived_children(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent = await create_test_session(client, name="archive-family")
+    store = SqlAlchemyConversationStore(db_uri)
+    active = store.create_conversation(
+        agent_id=parent["agent_id"], title="Active child", parent_conversation_id=parent["id"]
+    )
+    old = store.create_conversation(
+        agent_id=parent["agent_id"], title="Old child", parent_conversation_id=parent["id"]
+    )
+    store.update_conversation(old.id, archived=True)
+    grandchild = store.create_conversation(
+        agent_id=parent["agent_id"], title="Grandchild", parent_conversation_id=active.id
+    )
+    response = await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": True})
+    assert response.status_code == 200
+    assert store.get_conversation(active.id).archived
+    assert store.get_conversation(grandchild.id).archived
+    assert store.get_conversation(old.id).archived
+    response = await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": False})
+    assert response.status_code == 200
+    assert not store.get_conversation(active.id).archived
+    assert not store.get_conversation(grandchild.id).archived
+    assert store.get_conversation(old.id).archived
+
+
+async def test_archive_cleanup_intent_reaches_children_when_parent_has_no_worktree(
+    app, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent = await create_test_session(client, name="archive-no-directory")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        agent_id=parent["agent_id"], title="Worktree child", parent_conversation_id=parent["id"]
+    )
+    store.set_host_id(
+        child.id,
+        "7a2b3c4d5e6f1234567890abcdef0123",
+        workspace="/opt/work/app/topic",
+        git_branch="topic",
+    )
+    store.set_worktree(child.id, "/opt/work/app/topic")
+    app.state.user_preferences_store = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store.patch_namespace(
+        RESERVED_USER_LOCAL, "worktree_archive", {"mode": "delete_safe"}
+    )
+    response = await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": True})
+    assert response.status_code == 200
+    archived = store.get_conversation(child.id)
+    assert archived.archived
+    assert archived.labels[ARCHIVE_DELETE_WORKTREE_LABEL_KEY] == str(archived.archive_revision)
+    assert (
+        archived.labels[ARCHIVE_WORKTREE_MODE_LABEL_KEY]
+        == f"{archived.archive_revision}:green_only"
+    )
+
+
+async def test_tool_archive_and_undo_cascade_through_the_real_route(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    import json
+
+    from omnigent.runner.tool_dispatch import _session_archive_via_rest
+
+    parent = await create_test_session(client, name="tool-archive-family")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        agent_id=parent["agent_id"], parent_conversation_id=parent["id"]
+    )
+    leaf = store.create_conversation(agent_id=parent["agent_id"], parent_conversation_id=child.id)
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 3600):
+        result = json.loads(
+            await _session_archive_via_rest(
+                "sys_session_archive",
+                {"session_id": parent["id"]},
+                conversation_id=leaf.id,
+                server_client=client,
+            )
+        )
+        assert result["archived"] is True
+        for session_id in (parent["id"], child.id, leaf.id):
+            assert store.get_conversation(session_id).archived
+        result = json.loads(
+            await _session_archive_via_rest(
+                "sys_session_unarchive",
+                {"session_id": parent["id"]},
+                conversation_id=leaf.id,
+                server_client=client,
+            )
+        )
+        assert result["archived"] is False
+        for session_id in (parent["id"], child.id, leaf.id):
+            assert not store.get_conversation(session_id).archived
+
+
+async def test_cascade_undo_does_not_restore_a_new_child_generation(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent = await create_test_session(client, name="undo-generations")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        agent_id=parent["agent_id"], parent_conversation_id=parent["id"]
+    )
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 3600):
+        assert (
+            await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": True})
+        ).status_code == 200
+        store.update_conversation(child.id, archived=False)
+        store.update_conversation(child.id, archived=True)
+        assert (
+            await client.patch(f"/v1/sessions/{parent['id']}", json={"archived": False})
+        ).status_code == 200
+    assert store.get_conversation(child.id).archived
+
+
+@pytest.mark.parametrize(
+    "mode,removed_names",
+    [("never", set()), ("green_only", {"clean"}), ("yellow_too", {"clean", "local"})],
+)
+async def test_restart_recovers_each_cascaded_worktree_and_keeps_explicit_choices(
+    db_uri: str, mode: str, removed_names: set[str]
+) -> None:
+    from omnigent.worktree_archive import archive_can_remove
+
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    children = {}
+    for name in ("clean", "local", "dirty", "kept", "old"):
+        child = store.create_conversation(title=name, parent_conversation_id=root.id)
+        store.set_host_id(
+            child.id,
+            "7a2b3c4d5e6f1234567890abcdef0123",
+            workspace=f"/opt/work/app/{name}",
+            git_branch=name,
+        )
+        children[name] = child.id
+    store.update_conversation(children["old"], archived=True)
+    store.update_conversation(
+        root.id,
+        archived=True,
+        close_cli_on_archive=True,
+        delete_worktree=mode != "never",
+        worktree_archive_mode=mode,
+    )
+    store.update_conversation(children["kept"], archived=True, keep_worktree=True)
+    recovered = SqlAlchemyConversationStore(db_uri)
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "worktree_archive",
+        {"mode": mode, "ask_before_archive": False, "rebuildable_paths": []},
+    )
+    coordinator = ArchiveCloseCoordinator(
+        conversation_store=recovered,
+        host_store=None,
+        host_registry=None,
+        runner_router=None,
+        intent_store=CliReleaseIntentStore(db_uri),
+    )
+    coordinator.set_archive_preferences(preferences, None)
+
+    async def remove(**kwargs):
+        branch = kwargs["branch"]
+        assert kwargs["safe_only"] and not kwargs["delete_branch"]
+        assert kwargs["archive_mode"] == mode
+        return archive_can_remove(branch, mode)
+
+    # Host state and RPC remain mocked here; the existing host suite exercises real Git safety.
+    removal = AsyncMock(side_effect=remove)
+    with patch.object(_sessions_facade, "_remove_session_worktree_best_effort", removal):
+        coordinator.trigger_pending()
+        await coordinator.wait_for_idle()
+    assert {call.kwargs["branch"] for call in removal.await_args_list} == (
+        set() if mode == "never" else {"clean", "local", "dirty"}
+    )
+    for name, child_id in children.items():
+        child = recovered.get_conversation(child_id)
+        assert child.archived
+        assert (
+            child.labels.get(ARCHIVE_REMOVED_WORKTREE_LABEL_KEY) == str(child.archive_revision)
+        ) == (name in removed_names)
 
 
 async def test_archive_hides_session_from_default_listing(
@@ -1134,6 +1456,10 @@ async def test_archive_stop_removes_worktree_when_requested(
         workspace="/repo-worktrees/feature-x",
         host_id="host_1",
         runner_id=None,
+        labels={
+            **real_conv.labels,
+            ARCHIVE_DELETE_WORKTREE_LABEL_KEY: str(real_conv.archive_revision),
+        },
     )
     mock_remove = AsyncMock()
     with (

@@ -1,4 +1,5 @@
 import { conversationPage } from "@/test/sidebarMockHelpers";
+import type * as WorktreeStatusMarkModule from "@/components/WorktreeStatusMark";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -47,7 +48,10 @@ vi.mock("@/hooks/useConversations", async () => {
   };
 });
 
-vi.mock("@/components/WorktreeStatusMark", () => ({ WorktreeStatusMark: () => null }));
+vi.mock("@/components/WorktreeStatusMark", async (original) => ({
+  ...(await original<typeof WorktreeStatusMarkModule>()),
+  WorktreeStatusMark: () => null,
+}));
 vi.mock("@/lib/archiveWorktreePreferences", () => ({
   fetchArchiveWorktreePreference: mocks.preference,
   saveArchiveWorktreePreference: mocks.savePreference,
@@ -130,7 +134,12 @@ beforeEach(() => {
     rebuildable_paths: ["node_modules/"],
   });
   mocks.savePreference.mockReset().mockResolvedValue(undefined);
-  mocks.status.mockReset();
+  mocks.status.mockReset().mockResolvedValue({
+    own: { state: "clean", reason: "clean worktree", path: "/opt/work/sample-app/feature-x" },
+    aggregate: { state: "clean", reason: null },
+    blockers: [],
+    session_count: 1,
+  });
 });
 
 afterEach(() => {
@@ -366,14 +375,17 @@ describe("worktree archive choice", () => {
   });
 
   it("skips the prompt for old sessions without a bound worktree", async () => {
+    mocks.status.mockResolvedValue({ own: { state: "none" }, worktrees: [] });
     mockConversations([CONV]);
     renderSidebar(CLEANUP_SERVER);
     clickArchive();
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({
-      id: "conv_1",
-      archived: true,
-      keepWorktree: false,
-    });
-    expect(mocks.preference).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(mocks.archive.mutate).toHaveBeenCalledWith({
+        id: "conv_1",
+        archived: true,
+        keepWorktree: false,
+      }),
+    );
+    expect(mocks.status).toHaveBeenCalledWith("conv_1", true);
   });
 });

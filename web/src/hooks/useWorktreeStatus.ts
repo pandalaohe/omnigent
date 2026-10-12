@@ -39,6 +39,12 @@ export interface SessionWorktreeStatus {
   aggregate: WorktreeAggregateStatus;
   blockers: WorktreeBlocker[];
   session_count: number;
+  worktrees?: ArchiveWorktreeEntry[];
+}
+
+export interface ArchiveWorktreeEntry extends WorktreeBlocker {
+  path: string | null;
+  kept: boolean;
 }
 
 const STATES: ReadonlySet<string> = new Set([
@@ -68,7 +74,7 @@ function parseStatus(value: unknown): SessionWorktreeStatus {
   if (!record(value) || !record(value.own) || !record(value.aggregate)) {
     throw new Error("Invalid worktree status response");
   }
-  const { own, aggregate, blockers, session_count } = value;
+  const { own, aggregate, blockers, session_count, worktrees } = value;
   if (
     !state(own.state) ||
     !nullableString(own.reason) ||
@@ -100,7 +106,19 @@ function parseStatus(value: unknown): SessionWorktreeStatus {
     ) ||
     !Number.isSafeInteger(session_count) ||
     typeof session_count !== "number" ||
-    session_count < 0
+    session_count < 0 ||
+    (worktrees !== undefined &&
+      (!Array.isArray(worktrees) ||
+        !worktrees.every(
+          (entry) =>
+            record(entry) &&
+            typeof entry.session_id === "string" &&
+            typeof entry.title === "string" &&
+            state(entry.state) &&
+            nullableString(entry.reason) &&
+            nullableString(entry.path) &&
+            typeof entry.kept === "boolean",
+        )))
   ) {
     throw new Error("Invalid worktree status response");
   }

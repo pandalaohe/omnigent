@@ -220,7 +220,22 @@ describe("HeaderConversationMenu archive integration", () => {
               },
             },
           })
-        : response({ ...CONVERSATION, archived: true }),
+        : url.includes("/worktree-status")
+          ? response({
+              own: {
+                state: "clean",
+                reason: "clean worktree",
+                path: "/opt/work/app/topic",
+                branch: "feature/quarterly-planning",
+                merged: false,
+                merge_target: "main",
+                files: [],
+              },
+              aggregate: { state: "clean", reason: null },
+              blockers: [],
+              session_count: 1,
+            })
+          : response({ ...CONVERSATION, archived: true }),
     );
     const client = createClient();
     seedConversation(client);

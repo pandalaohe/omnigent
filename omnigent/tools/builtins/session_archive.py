@@ -27,8 +27,11 @@ class SysSessionArchiveTool(Tool):
             "running turn is interrupted. Omit session_id to "
             "archive the session you are running in; its runner then stops only after "
             "your current turn ends (normally), so finish your reply in this turn. "
-            "Archiving a session also archives the sessions under it. Nothing is "
-            "deleted; undo with sys_session_unarchive or from the web Archive list. "
+            "Archiving also archives its active descendants. Each archived session's "
+            "worktree follows your account's archive deletion tier and safety checks; "
+            "uncommitted source changes and branches are kept. Undo restores only "
+            "the descendants archived by this action, using sys_session_unarchive "
+            "or the web Archive list. "
             "Returns access_denied for a session your user does not own."
         )
 

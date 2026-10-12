@@ -18,12 +18,15 @@ the header menu), and each place is a separate entry point.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
-  view, which can be filtered by project and paged.
+  view, which can be filtered by project and paged. Archiving also archives
+  active descendants; Undo restores only the generations archived by that action.
 - `archive-worktree-safety`: the account preference chooses never (default),
   green only, or green and yellow. Green has only committed/rebuildable local
   files; yellow also has other ignored local files. Source changes, unknown,
   protected and shared trees remain; branches remain. The first archive of a
-  worktree session prompts with the tiers and Don't ask again. Settings › Git
+  session tree with worktrees prompts with the tiers and Don't ask again,
+  listing each directory's state and why it will be kept or considered for removal.
+  Each newly archived descendant follows the same tier. Settings › Git
   can re-enable asking and edit the rebuildable ignored-directory list. The
   menu offers a single Archive action following these settings, plus Worktree
   details.
@@ -165,7 +168,8 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_worktree_safe_archive_ui.py` drives real preference
   and archive requests with injected host-status responses for dark/light
   sidebar, header, Agents/Past rows, blocking-child hover, details and mobile
-  first-archive coverage. Actual
+  first-archive coverage, including a mother with no worktree and clean/local/dirty
+  children. Actual
   Git safety/removal is checked by `tests/host/test_git_worktree.py`; server
   archive, tool and keep-warm policy by
   `tests/server/integration/test_sessions_archive.py` and
