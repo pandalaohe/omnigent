@@ -30,6 +30,7 @@ from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     parse_runner_session_init_envelope,
 )
+from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
@@ -216,6 +217,9 @@ async def test_archive_states_include_an_archived_intermediate_ancestor(
     assert archived_child is not None
     current_grandchild = conversations.get_conversation(grandchild.id)
     assert current_grandchild is not None
+    assert current_grandchild.archived is True
+    assert current_grandchild.archive_revision == 1
+    assert current_grandchild.archive_close_requested_revision is None
 
     states = await runner_archive_states_for_conversation(
         current_grandchild,
@@ -223,10 +227,28 @@ async def test_archive_states_include_an_archived_intermediate_ancestor(
     )
 
     assert [(state.scope_id, state.revision, state.archived) for state in states] == [
-        (grandchild.id, 0, False),
+        # The cascade changes persisted state; the ancestor owns the close fence.
+        (grandchild.id, 1, False),
         (child.id, 1, True),
         (root.id, 0, False),
     ]
+    lifecycle = SessionRuntimeLifecycle(boot_id="boot")
+    for state in states:
+        lifecycle.observe_archive_state(grandchild.id, **state.model_dump())
+    assert not lifecycle.runtime_start_allowed(grandchild.id)
+
+    conversations.update_conversation(child.id, archived=False)
+    restored = conversations.get_conversation(grandchild.id)
+    assert restored is not None and restored.archived is False
+    restored_states = await runner_archive_states_for_conversation(restored, conversations)
+    assert [(state.scope_id, state.revision, state.archived) for state in restored_states] == [
+        (grandchild.id, 2, False),
+        (child.id, 2, False),
+        (root.id, 0, False),
+    ]
+    for state in restored_states:
+        lifecycle.observe_archive_state(grandchild.id, **state.model_dump())
+    assert lifecycle.runtime_start_allowed(grandchild.id)
 
 
 @pytest.mark.asyncio
