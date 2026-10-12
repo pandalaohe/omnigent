@@ -120,6 +120,12 @@ def test_pi_harnesses_declare_the_pi_effort_family() -> None:
     assert PI_EFFORTS == EFFORT_VALUES
 
 
+def test_antigravity_native_declares_approval_mirror_elicitation() -> None:
+    assert (
+        harness_capabilities()["antigravity-native"].as_dict()["elicitation"] == "approval-mirror"
+    )
+
+
 def test_optional_bench_capabilities_default_to_unknown() -> None:
     capability = HarnessCapabilities(
         IntegrationMode.SDK_IN_PROCESS,
