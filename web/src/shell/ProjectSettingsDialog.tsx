@@ -49,7 +49,6 @@ import {
   setCallingDefaultField,
   useCallingDefaults,
   type CallingDefaultField,
-  type ProjectDefaultSource,
   SDK_NATIVE_PARENT,
 } from "@/lib/callingDefaults";
 import {
@@ -373,22 +372,6 @@ function catalogModelLabel(
 }
 
 const CALLING_FIELDS = ["model", "effort", "speed", "permission"] as const;
-const SOURCE_LABELS: Record<ProjectDefaultSource, string> = {
-  project_legacy: "Project default",
-  master: "Host default",
-  project_host_native: "Project Native default",
-  master_native: "Host Native default",
-  none: "Agent default",
-};
-
-function inheritedLabel(
-  source: ProjectDefaultSource,
-  value: string | null,
-  label: string | null = null,
-): string {
-  return `${SOURCE_LABELS[source]} · ${label ?? value ?? "automatic"}`;
-}
-
 /** The list row's chip: agent · model · effort, or the unset fallback. */
 function hostRowSummary(
   row: HostRowDraft,
@@ -564,10 +547,10 @@ function HostModelSelect({
       disabled={disabled}
     >
       <SelectTrigger className="h-8 w-full min-w-0" aria-label="Model" data-testid={testId}>
-        <SelectValue />
+        <SelectValue>{value === null ? (inheritLabel ?? "Default") : undefined}</SelectValue>
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value={MODEL_SELECT_DEFAULT}>{inheritLabel ?? "Default"}</SelectItem>
+        <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
         {options.map((option) => (
           <SelectItem key={option.id} value={option.id}>
             <span className="block min-w-0 truncate" title={option.label}>
@@ -611,10 +594,10 @@ function HostEffortSelect({
       disabled={disabled}
     >
       <SelectTrigger className="h-8 w-full min-w-0" aria-label="Effort" data-testid={testId}>
-        <SelectValue />
+        <SelectValue>{value === null ? (inheritLabel ?? "Default") : undefined}</SelectValue>
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value={EFFORT_SELECT_NONE}>{inheritLabel ?? "Default"}</SelectItem>
+        <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
         {levels.map((level) => (
           <SelectItem key={level} value={level}>
             {normalizeEffortLabel(level)}
@@ -1249,6 +1232,21 @@ export function ProjectSettingsDialog({
       row.agentId ?? agentId,
     );
 
+  const inheritedFieldLabel = (row: HostRowDraft, harness: string, field: CallingDefaultField) => {
+    const value = inheritedFor(row, harness, field).value;
+    if (value === null) return "Default";
+    if (field === "model") return catalogModelLabel(catalogs, row.hostId, harness, value) ?? value;
+    if (field === "effort") return normalizeEffortLabel(value);
+    const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
+    const effectiveModel =
+      row.harnesses[harness]?.model ?? inheritedFor(row, harness, "model").value;
+    return (
+      sessionDefaultModeOptions(harness, field, models, effectiveModel).find(
+        (option) => option.value === value,
+      )?.label ?? value
+    );
+  };
+
   const planCopyTarget = (
     selection: CopySelection,
     target: Project,
@@ -1667,20 +1665,6 @@ export function ProjectSettingsDialog({
     const models = catalogFor(catalogs, row.hostId, harness)?.models ?? [];
     const effectiveModel = set.model ?? inheritedFor(row, harness, "model").value;
     const levels = effortLevelsForSet(harness, models, { ...set, model: effectiveModel });
-    const inherit = (field: CallingDefaultField) => {
-      const resolved = inheritedFor(row, harness, field);
-      const label =
-        field === "model"
-          ? catalogModelLabel(catalogs, row.hostId, harness, resolved.value)
-          : field === "effort" && resolved.value
-            ? normalizeEffortLabel(resolved.value)
-            : (field === "speed" || field === "permission") && resolved.value
-              ? (sessionDefaultModeOptions(harness, field, models, effectiveModel).find(
-                  (option) => option.value === resolved.value,
-                )?.label ?? resolved.value)
-              : null;
-      return inheritedLabel(resolved.source, resolved.value, label);
-    };
     const resetField = (field: CallingDefaultField) => (
       <Button
         type="button"
@@ -1702,7 +1686,7 @@ export function ProjectSettingsDialog({
             <HostModelSelect
               value={set.model}
               models={models}
-              inheritLabel={inherit("model")}
+              inheritLabel={inheritedFieldLabel(row, harness, "model")}
               testId={`project-settings-host-model-${row.hostId}`}
               disabled={isLoading || saving}
               onOpen={() => ensureCatalog(row.hostId, harness)}
@@ -1717,7 +1701,7 @@ export function ProjectSettingsDialog({
             <HostEffortSelect
               value={set.effort}
               levels={levels}
-              inheritLabel={inherit("effort")}
+              inheritLabel={inheritedFieldLabel(row, harness, "effort")}
               testId={`project-settings-host-effort-${row.hostId}`}
               disabled={isLoading || saving}
               onOpen={() => ensureCatalog(row.hostId, harness)}
@@ -1737,7 +1721,7 @@ export function ProjectSettingsDialog({
                   value={set[field]}
                   models={models}
                   model={effectiveModel}
-                  inheritLabel={inherit(field)}
+                  inheritLabel={inheritedFieldLabel(row, harness, field)}
                   label={field === "speed" ? "Speed" : "Permission"}
                   testId={`project-settings-host-${field}-${row.hostId}`}
                   disabled={isLoading || saving}
@@ -2028,16 +2012,7 @@ export function ProjectSettingsDialog({
                     <HostModelSelect
                       value={set.model}
                       models={models}
-                      inheritLabel={inheritedLabel(
-                        inheritedFor(row, harness, "model").source,
-                        inheritedFor(row, harness, "model").value,
-                        catalogModelLabel(
-                          catalogs,
-                          row.hostId,
-                          harness,
-                          inheritedFor(row, harness, "model").value,
-                        ),
-                      )}
+                      inheritLabel={inheritedFieldLabel(row, harness, "model")}
                       testId={`project-settings-host-other-model-${row.hostId}-${harness}`}
                       disabled={disabled}
                       onOpen={() => ensureCatalog(row.hostId, harness)}
@@ -2047,10 +2022,7 @@ export function ProjectSettingsDialog({
                     <HostEffortSelect
                       value={set.effort}
                       levels={levels}
-                      inheritLabel={inheritedLabel(
-                        inheritedFor(row, harness, "effort").source,
-                        inheritedFor(row, harness, "effort").value,
-                      )}
+                      inheritLabel={inheritedFieldLabel(row, harness, "effort")}
                       testId={`project-settings-host-other-effort-${row.hostId}-${harness}`}
                       disabled={disabled}
                       onOpen={() => ensureCatalog(row.hostId, harness)}
@@ -2065,10 +2037,7 @@ export function ProjectSettingsDialog({
                         value={set[field]}
                         models={models}
                         model={effectiveModel}
-                        inheritLabel={inheritedLabel(
-                          inheritedFor(row, harness, field).source,
-                          inheritedFor(row, harness, field).value,
-                        )}
+                        inheritLabel={inheritedFieldLabel(row, harness, field)}
                         label={field === "speed" ? "Speed" : "Permission"}
                         testId={`project-settings-host-other-${field}-${row.hostId}-${harness}`}
                         disabled={disabled}

@@ -52,10 +52,10 @@ export function SessionDefaultModeSelect({
       }}
     >
       <SelectTrigger className="h-8 w-full min-w-0" aria-label={label} data-testid={testId}>
-        <SelectValue />
+        <SelectValue>{selected == null ? inheritLabel : undefined}</SelectValue>
       </SelectTrigger>
       <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value="__default__">{inheritLabel}</SelectItem>
+        <SelectItem value="__default__">Default</SelectItem>
         {!available && selected && (
           <SelectItem value={selected} disabled>
             Unavailable ({value})

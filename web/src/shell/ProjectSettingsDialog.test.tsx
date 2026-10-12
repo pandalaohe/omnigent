@@ -1908,9 +1908,7 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
     await screen.findByTestId("project-settings-host-model-h1");
     fireEvent.click(screen.getByTestId("project-settings-host-reset-model-h1"));
-    expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent(
-      "Host default · master-model",
-    );
+    expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent("master-model");
     fireEvent.click(screen.getByTestId("project-settings-host-reset-row-h1-codex"));
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
@@ -2042,6 +2040,99 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["model", "Shared model"],
+    ["effort", "xHigh"],
+    ["speed", "Standard"],
+    ["permission", "Read Only"],
+  ])("keeps inherited and explicit same-value %s selections distinct", async (field, label) => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: { h1: { agent_id: "ag_codex_sdk" } },
+      },
+    });
+    localStorage.setItem(
+      "omnigent:calling-defaults",
+      JSON.stringify({
+        h1: {
+          codex: {
+            model: "shared-model",
+            effort: "xhigh",
+            speed: "standard",
+            permission: "read-only",
+          },
+        },
+      }),
+    );
+    const rows = [
+      catalogRow("h1", "codex", [
+        {
+          id: "shared-model",
+          displayName: "Shared model",
+          supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+        },
+      ]),
+    ];
+    listCatalogsMock.mockResolvedValue(rows);
+    syncCatalogsMock.mockResolvedValue(rows);
+    renderDialog();
+    const trigger = await screen.findByTestId(`project-settings-host-${field}-h1`);
+    await waitFor(() => expect(trigger).toHaveTextContent(label));
+    const reset = screen.getByTestId(`project-settings-host-reset-${field}-h1`);
+    expect(reset).toBeDisabled();
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("option", { name: "Default" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const explicitOption = screen.getByRole("option", { name: label });
+    expect(explicitOption).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(explicitOption);
+    expect(trigger).toHaveTextContent(label);
+    expect(reset).toBeEnabled();
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("option", { name: label })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("option", { name: "Default" }));
+    expect(trigger).toHaveTextContent(label);
+    expect(reset).toBeDisabled();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: { h1: { agent_id: "ag_codex_sdk" } },
+      }),
+    );
+  });
+
+  it("shows Default for unresolved fields in primary and other harness rows", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: { h1: { agent_id: "ag_codex_sdk", harnesses: { "claude-native": {} } } },
+      },
+    });
+    renderDialog();
+    await screen.findByTestId("project-settings-host-model-h1");
+    for (const field of ["model", "effort", "speed", "permission"]) {
+      expect(screen.getByTestId(`project-settings-host-${field}-h1`)).toHaveTextContent("Default");
+    }
+    fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
+    for (const field of ["model", "effort", "speed", "permission"]) {
+      expect(
+        screen.getByTestId(`project-settings-host-other-${field}-h1-claude-native`),
+      ).toHaveTextContent("Default");
+    }
+  });
+
   it("shows the All hosts Agent instead of treating another harness row as the default", async () => {
     availableAgentsMock.mockReturnValue({ data: [codexSdkAgent(), claudeAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
@@ -2110,7 +2201,7 @@ describe("ProjectSettingsDialog", () => {
       await screen.findByTestId("project-settings-host-reset-model-h1");
       fireEvent.click(screen.getByTestId("project-settings-host-reset-model-h1"));
       expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent(
-        `${harness === "codex" ? "Host" : "Project"} default · project-model`,
+        "project-model",
       );
       await pickOption("project-settings-host-effort-h1", "High");
       fireEvent.click(screen.getByTestId("project-settings-host-speed-h1"));
