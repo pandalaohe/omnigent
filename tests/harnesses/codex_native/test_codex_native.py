@@ -8597,6 +8597,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
 
     client = SimpleNamespace(close=close_client)
     server = SimpleNamespace(
+        session_id="conv_test",
         start=AsyncMock(),
         close=close_server,
         codex_cli_version=(0, 154, 0),
@@ -9425,6 +9426,8 @@ def test_launch_codex_terminal_starts_fresh_remote_tui() -> None:
     assert client.posts[0][1]["spec"]["args"] == [
         "-c",
         "approval_policy=on-request",
+        "-c",
+        'shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID="conv_abc"',
         "--remote",
         "ws://127.0.0.1:9876",
     ]
@@ -9477,6 +9480,8 @@ def test_launch_codex_terminal_uses_remote_resume_order(
                     "command": "/opt/codex/bin/codex",
                     "args": [
                         *permission_args,
+                        "-c",
+                        'shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID="conv_abc"',
                         "resume",
                         "--remote",
                         "ws://127.0.0.1:9876",
