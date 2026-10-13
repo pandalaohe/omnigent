@@ -1203,6 +1203,42 @@ def test_inject_user_message_via_tui_replaces_idle_hints(
 
 
 @pytest.mark.parametrize(
+    "initial",
+    [
+        "> first line\n  second line\n? for shortcuts",
+        "collapsed",
+        "placeholder",
+        "> ↑ 9 more lines\n? for shortcuts",
+        "> ↑ 1 more line\n? for shortcuts",
+    ],
+)
+def test_paste_and_submit_rejects_unchanged_idle_drafts_before_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+    initial: str,
+) -> None:
+    pane = agy134_paste_captures.get(initial, initial)
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        assert "load-buffer" not in cmd and "paste-buffer" not in cmd
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="idle composer did not clear"):
+        _mod._paste_and_submit(tmp_path, "/tmp/ex/tmux.sock", "main", content="New message")
+    assert actions == ["C-a", "C-k", "C-w"]
+
+
+@pytest.mark.parametrize(
     "shape,tail_needle,expected",
     [
         ("collapsed", "Reply with exactly PONG_", True),

@@ -1807,8 +1807,8 @@ def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
 
 
 def _clear_idle_composer(socket_path: str, tmux_target: str, pane: str) -> str:
-    """Clear idle drafts in bounded batches; return unchanged placeholders for paste.
-    A composer that keeps changing without emptying exhausts the bound and raises.
+    """Clear idle drafts in bounded batches; allow unchanged one-line hints for paste.
+    A composer whose draft cannot be cleared raises.
     """
     if not pane:
         raise RuntimeError("agy idle composer capture-pane failed; captured_pane_empty=True")
@@ -1840,7 +1840,16 @@ def _clear_idle_composer(socket_path: str, tmux_target: str, pane: str) -> str:
         if not captured_pane_seen:
             raise RuntimeError("agy idle composer capture-pane failed; captured_pane_empty=True")
         if _agy_input_region(pane) == before_region:
-            return pane
+            candidates = _agy_draft_candidate_lines(before_region)
+            # C-a/C-k already empties a one-line editable draft; only a surviving
+            # single-line hint without draft markers can be treated as chrome.
+            if (
+                len(candidates) == 1
+                and not _AGY_PASTE_PLACEHOLDER_RE.search(candidates[0])
+                and not _AGY_COLLAPSED_LINES_RE.fullmatch(candidates[0])
+            ):
+                return pane
+            break
     raise RuntimeError(
         "agy idle composer did not clear; draft_candidates_empty=False; "
         f"composer_tail:\n{_format_pane_debug_tail(_agy_input_region(pane))}"
