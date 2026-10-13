@@ -422,6 +422,19 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
     contract.json("/v1/me", {"user_id": "local", "is_admin": True})
     contract.json("/v1/agents", lambda _request: list_payload([handle._agent()]))
     contract.json(
+        "/v1/calling-defaults/resolve",
+        lambda _request: {
+            "agent_id": handle.agent_id,
+            "harness": handle.harness,
+            "model": None,
+            "effort": None,
+            "speed": None,
+            "permission": None,
+            "sources": {},
+            "problems": [],
+        },
+    )
+    contract.json(
         "/v1/hosts",
         lambda _request: {
             "hosts": [

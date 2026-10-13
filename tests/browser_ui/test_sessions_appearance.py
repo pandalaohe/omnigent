@@ -243,7 +243,9 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
 
     # Reset, confirming through the dialog.
     page.get_by_test_id("reset-appearance-button").click()
-    expect(page.get_by_role("dialog", name="Reset appearance?")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("dialog", name="Reset theme, layout and fonts?")).to_be_visible(
+        timeout=30_000
+    )
     page.get_by_test_id("reset-appearance-confirm").click()
 
     # Both choices are back to the product defaults.
