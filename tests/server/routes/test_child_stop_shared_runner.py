@@ -64,7 +64,8 @@ async def test_stop_child_on_parent_runner_keeps_the_runner(
             )
             assert response.status_code == 202, response.text
             host_stop.assert_awaited_once()
-            assert host_stop.await_args.args[:3] == (parent.id, _HOST, _RUNNER)
+            host_args = host_stop.await_args
+            assert host_args is not None and host_args.args[:3] == (parent.id, _HOST, _RUNNER)
     finally:
         for row in (parent, child, sibling):
             sessions._session_status_cache.pop(row.id, None)
