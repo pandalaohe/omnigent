@@ -27,6 +27,7 @@ function PickerFixture({
   tooltipVariant = "default",
   nested = false,
   active = true,
+  description,
   modal,
 }: {
   modal?: boolean;
@@ -35,6 +36,7 @@ function PickerFixture({
   tooltipVariant?: "default" | "session-info";
   nested?: boolean;
   active?: boolean;
+  description?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -48,6 +50,7 @@ function PickerFixture({
       icon={<span>Icon</span>}
       label="Claude Code"
       summary="Opus 4.8 (1M)"
+      description={description}
       active={active}
       isMobile={mobile}
       open={configOpen}
@@ -124,6 +127,17 @@ function GraceAreaPicker() {
 }
 
 describe("HarnessPicker", () => {
+  it.each([false, true])("keeps the summary testid with a description on mobile=%s", (mobile) => {
+    render(<PickerFixture mobile={mobile} description="Checks deployments" />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    const summary = screen.getByTestId("model");
+    expect(summary).toHaveTextContent("Opus 4.8 (1M)");
+    expect(summary).toHaveAttribute("title", "Opus 4.8 (1M)");
+    expect(summary).toHaveClass("absolute", "inset-0", "text-right", "opacity-100");
+    expect(screen.getByTestId("entry")).toContainElement(summary);
+    expect(screen.getByText("Checks deployments")).toHaveClass("invisible");
+  });
+
   it.each(["right", "left"])(
     "keeps a %s submenu open while crossing a harness row toward its lower items",
     (side) => {
