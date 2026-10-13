@@ -116,11 +116,11 @@ def test_selecting_a_catalog_row_patches_its_exact_id(
     assert chat.session_patches == [{"model_override": "provider/alternate"}]
 
 
-def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
+def test_picker_open_refreshes_catalog_once_and_selection_does_not_refetch(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """Opening and using preloaded rows does not trigger a click-time GET."""
+    """Opening probes the catalog once; selection needs no further catalog or session GET."""
     chat = chat_session_contract
     chat.set_catalog(
         harness="opencode-native",
@@ -135,16 +135,24 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
     expect(page.get_by_test_id("composer-config-gear")).to_be_visible(timeout=20_000)
     page.wait_for_timeout(500)
 
-    unexpected_gets: list[str] = []
+    observed_gets: list[str] = []
     session_path = f"/v1/sessions/{chat.session_id}"
+    catalog_url = f"{chat.base_url}{session_path}/model-options?refresh=auto"
 
     def record_request(request: Request) -> None:
         path = urlparse(request.url).path
         if request.method == "GET" and (path == session_path or path.endswith("/model-options")):
-            unexpected_gets.append(request.url)
+            observed_gets.append(request.url)
 
     page.on("request", record_request)
-    _open_models(page)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "GET"
+            and response.url == catalog_url
+            and response.status == 200
+        )
+    ):
+        _open_models(page)
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -158,4 +166,4 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
 
     assert patch_info.value.request.post_data_json == {"model_override": "alternate"}
     assert chat.session_patches == [{"model_override": "alternate"}]
-    assert unexpected_gets == []
+    assert observed_gets == [catalog_url]
