@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
+import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Any
@@ -43,16 +45,20 @@ from starlette.requests import Request
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
-from omnigent.entities.conversation import Conversation, MessageData
+from omnigent.entities.conversation import Conversation, ErrorData, MessageData
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.routes.sessions.routes_peer import (
+    _NATIVE_ATTEMPT_REASON_PREFIX,
     _PEER_INBOUND_HOLD,
     _PEER_INBOUND_LABEL,
     _PEER_INBOUND_REFUSE,
     _PEER_RELEASED_REASON,
     _first_text_block,
+    _is_codex_native_harness,
+    _native_attempt_id,
     _peer_envelope_msg_id,
+    _released_peer_reason,
     effective_owner_id,
     format_peer_back_notice,
     has_older_undelivered,
@@ -355,7 +361,7 @@ class PeerSweeper:
             return
         if (
             record.state in ("pending", "queued")
-            and record.reason != _PEER_RELEASED_REASON
+            and not _released_peer_reason(record.reason)
             and (receiver.labels or {}).get(_PEER_INBOUND_LABEL) == _PEER_INBOUND_HOLD
         ):
             # The receiver switched to hold after the send queued: hold it
@@ -390,11 +396,15 @@ class PeerSweeper:
         # back the same mutable row on every read, so ``record.state``
         # itself can flip to ``delivering`` as a side effect of that CAS.
         origin_state = record.state
+        attempt_reason = None
+        if _is_codex_native_harness(receiver):
+            prefix = f"{_PEER_RELEASED_REASON}:" if _released_peer_reason(record.reason) else ""
+            attempt_reason = f"{prefix}{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
         state, _runner_online = await self._true_state(receiver, receiver=True)
         if state not in ("idle", "steerable"):
             return
         moved = await asyncio.to_thread(
-            self._store.transition, record.id, "delivering", None, (origin_state,)
+            self._store.transition, record.id, "delivering", attempt_reason, (origin_state,)
         )
         if not moved:
             # Lost the CAS race — another tick (or the inline route) already
@@ -405,7 +415,12 @@ class PeerSweeper:
         )
         if sender is None:
             await asyncio.to_thread(
-                self._store.transition, record.id, "failed", "closed", ("delivering",)
+                self._store.transition,
+                record.id,
+                "failed",
+                "closed",
+                ("delivering",),
+                expected_reason=attempt_reason,
             )
             return
         # Re-check immediately before delivering: the CAS above awaited a
@@ -415,7 +430,9 @@ class PeerSweeper:
         # non-steerable harness must not be interrupted mid-turn).
         recheck_state, _recheck_runner_online = await self._true_state(receiver, receiver=True)
         if recheck_state not in ("idle", "steerable"):
-            await self._revert_delivering(record, origin_state, "busy_recheck")
+            await self._revert_delivering(
+                record, origin_state, "busy_recheck", expected_reason=attempt_reason
+            )
             return
         request = self._synthetic_request(receiver.id, self._app)
         receiver_owner = effective_owner_id(
@@ -429,6 +446,7 @@ class PeerSweeper:
                 record.ref,
                 record.id,
                 record.text,
+                attempt_id=_native_attempt_id(attempt_reason),
                 acting_user_id=receiver_owner,
             )
         except Exception:
@@ -441,7 +459,9 @@ class PeerSweeper:
             # sweeper's call to end the record — the sender chose to wait.
             # Revert to the state it came from so the next tick retries;
             # only the closed check above ends a record from here.
-            await self._revert_delivering(record, origin_state, reason or "not_ready")
+            await self._revert_delivering(
+                record, origin_state, reason or "not_ready", expected_reason=attempt_reason
+            )
             return
         if result_state == "rejected":
             moved = await asyncio.to_thread(
@@ -450,6 +470,7 @@ class PeerSweeper:
                 "failed",
                 reason,
                 ("delivering",),
+                expected_reason=attempt_reason,
                 notice=True,
             )
             if moved:
@@ -470,11 +491,21 @@ class PeerSweeper:
             )
             return
         await asyncio.to_thread(
-            self._store.transition, record.id, result_state, reason, ("delivering",)
+            self._store.transition,
+            record.id,
+            result_state,
+            reason,
+            ("delivering",),
+            expected_reason=attempt_reason,
         )
 
     async def _revert_delivering(
-        self, record: SessionPeerMessage, origin_state: str, reason: str
+        self,
+        record: SessionPeerMessage,
+        origin_state: str,
+        reason: str,
+        *,
+        expected_reason: str | None = None,
     ) -> None:
         """Abandon a claimed ``delivering`` record without a terminal state.
 
@@ -490,8 +521,9 @@ class PeerSweeper:
             self._store.transition,
             record.id,
             origin_state,
-            None if record.reason == _PEER_RELEASED_REASON else reason,
+            _PEER_RELEASED_REASON if _released_peer_reason(record.reason) else reason,
             ("delivering",),
+            expected_reason=expected_reason,
         )
         _logger.warning(
             "Peer sweeper reverted delivering record %s to %s (%s)",
@@ -670,25 +702,77 @@ class PeerSweeper:
             return
         for record in records:
             age_from = record.updated_at if record.updated_at is not None else record.created_at
-            if now - age_from < _RECONCILE_GRACE_S:
+            if now - age_from < _RECONCILE_GRACE_S and _native_attempt_id(record.reason) is None:
                 continue
             try:
-                await self._reconcile_one(record, now)
+                await self._reconcile_one(record, now, age_from=age_from)
             except Exception:
                 _logger.exception("Peer sweeper reconciliation failed for record %s", record.id)
 
-    async def _reconcile_one(self, record: SessionPeerMessage, now: int) -> None:
-        matches = await asyncio.to_thread(
-            self._conversation_store.search_visible_items_literal,
-            record.receiver_session_id,
-            f"msg={record.id}",
-            5,
-        )
-        if any(_is_record_marker(match, record.id) for match in matches):
+    async def _reconcile_one(
+        self, record: SessionPeerMessage, now: int, *, age_from: int | None = None
+    ) -> None:
+        attempt_id = _native_attempt_id(record.reason)
+        native_attempt = attempt_id is not None
+        limit = 5
+        while True:
+            matches = await asyncio.to_thread(
+                self._conversation_store.search_visible_items_literal,
+                record.receiver_session_id,
+                f"msg={record.id}",
+                limit,
+            )
+            if any(
+                _is_record_marker(match, record.id)
+                and (
+                    not native_attempt
+                    or (
+                        isinstance(match.response_id, str)
+                        and match.response_id.startswith("codex_")
+                    )
+                )
+                for match in matches
+            ):
+                break
+            if not native_attempt or len(matches) < limit:
+                matches = []
+                break
+            limit *= 2
+        if matches:
             await asyncio.to_thread(
-                self._store.transition, record.id, "delivered", None, ("delivering",)
+                self._store.transition,
+                record.id,
+                "delivered",
+                None,
+                ("delivering",),
+                expected_reason=record.reason if native_attempt else None,
             )
             return
+        if native_attempt:
+            assert attempt_id is not None
+            refusal_id = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"codex-native-refusal:{record.receiver_session_id}:{attempt_id}",
+            ).hex
+            refusal = await asyncio.to_thread(
+                self._conversation_store.get_item, record.receiver_session_id, refusal_id
+            )
+            if (
+                refusal is not None
+                and refusal.type == "error"
+                and isinstance(refusal.data, ErrorData)
+            ):
+                await asyncio.to_thread(
+                    self._store.transition,
+                    record.id,
+                    "queued",
+                    _PEER_RELEASED_REASON
+                    if _released_peer_reason(record.reason)
+                    else "native_refused",
+                    ("delivering",),
+                    expected_reason=record.reason,
+                )
+                return
         if record.expires_at <= now:
             # Past its deadline with no marker: end the record instead of
             # granting another grace window, which would postpone expiry
@@ -699,6 +783,7 @@ class PeerSweeper:
                 "expired",
                 None,
                 ("delivering",),
+                expected_reason=record.reason if native_attempt else None,
                 notice=True,
             )
             if moved:
@@ -712,6 +797,12 @@ class PeerSweeper:
                     receiver.title if receiver is not None else None,
                     self._app,
                 )
+            return
+        if native_attempt:
+            # A lost RPC response may mean Codex already accepted the steer.
+            # Only an explicit refusal or native transcript permits settling it.
+            return
+        if age_from is not None and now - age_from < _RECONCILE_GRACE_S:
             return
         receiver = await asyncio.to_thread(
             self._conversation_store.get_conversation, record.receiver_session_id

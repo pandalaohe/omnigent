@@ -36,3 +36,14 @@ def test_claude_grant_key_binds_non_bash_tools_to_cwd() -> None:
     assert claude_grant_key("Write", tool_input, "/repo/app") != claude_grant_key(
         "Write", tool_input, "/repo/other"
     )
+
+
+def test_revoking_old_source_preserves_newer_same_key_grant() -> None:
+    grants = ApprovalGrants()
+    key = ("Bash", "pnpm build", "/repo")
+    old = ElicitationResult(action="accept", content={"feedback": "old"})
+    new = ElicitationResult(action="accept", content={"feedback": "new"})
+    grants.put("conv_a", key, old, 60, source_id="elicit_old")
+    grants.put("conv_a", key, new, 60, source_id="elicit_new")
+    grants.discard_if_source("conv_a", key, "elicit_old")
+    assert grants.consume_with_source("conv_a", key) == (new, "elicit_new")

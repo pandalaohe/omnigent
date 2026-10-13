@@ -242,8 +242,14 @@ def _events_of_type(server: _MemberServerClient, event_type: str) -> list[dict[s
 
 
 def _notices(server: _MemberServerClient) -> list[dict[str, Any]]:
-    """Every recorded visible notice item (``external_conversation_item``)."""
-    return _events_of_type(server, "external_conversation_item")
+    """Every recorded member obligation notice for the parent session."""
+    return [
+        payload
+        for url, payload in server.posts
+        if url.endswith(f"/v1/sessions/{PARENT}/events")
+        and payload.get("type") == "external_conversation_item"
+        and payload.get("data", {}).get("item_data", {}).get("code") == "member_did_not_run"
+    ]
 
 
 @pytest.fixture(autouse=True)

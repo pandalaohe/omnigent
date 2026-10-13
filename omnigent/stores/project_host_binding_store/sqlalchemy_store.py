@@ -27,6 +27,7 @@ from omnigent.db.utils import (
 from omnigent.entities import ProjectHostBinding, ProjectHostEntry
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import (
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX,
     ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
     worktree_admission_ancestor_fingerprints,
 )
@@ -241,7 +242,12 @@ class SqlAlchemyProjectHostBindingStore(ProjectHostBindingStore):
                     select(SqlConversationLabel.conversation_id)
                     .where(
                         SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                        or_(
+                            SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                            SqlConversationLabel.key.startswith(
+                                ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX, autoescape=True
+                            ),
+                        ),
                         SqlConversationLabel.value.in_(fingerprints),
                     )
                     .limit(1)

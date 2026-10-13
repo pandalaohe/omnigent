@@ -90,7 +90,11 @@ export function HarnessMenuRowContent({
             >
               {description}
             </span>
-            <span className={cn("absolute inset-0 truncate text-right", summaryVisibility)}>
+            <span
+              data-testid={summaryTestId}
+              title={summary}
+              className={cn("absolute inset-0 truncate text-right", summaryVisibility)}
+            >
               {summary}
             </span>
           </span>

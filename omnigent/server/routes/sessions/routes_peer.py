@@ -101,8 +101,7 @@ PEER_HOLD_LIFETIME = 24 * 3600
 # an identical resend is still a duplicate while the earlier copy sits here.
 _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
-# codex-native excluded: a refused steer drops the input; approval steer unverified.
-_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native"})
+_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
 
 # A dispatched child runs its own terminal turn, so a peer message reaches it;
 # other native harnesses are mirrors or SDK children without a result key.
@@ -114,6 +113,24 @@ _PEER_INBOUND_REFUSE = "refuse"
 # Marker on a record the user released from hold: the sweeper must not
 # re-hold it while the receiver's inbound policy is still ``hold``.
 _PEER_RELEASED_REASON = "released"
+_NATIVE_ATTEMPT_REASON_PREFIX = "native_attempt:"
+
+
+def _native_attempt_id(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    raw = reason.removeprefix(f"{_PEER_RELEASED_REASON}:")
+    if raw.startswith(_NATIVE_ATTEMPT_REASON_PREFIX):
+        return raw.removeprefix(_NATIVE_ATTEMPT_REASON_PREFIX)
+    return None
+
+
+def _released_peer_reason(reason: str | None) -> bool:
+    return reason == _PEER_RELEASED_REASON or bool(
+        reason and reason.startswith(f"{_PEER_RELEASED_REASON}:{_NATIVE_ATTEMPT_REASON_PREFIX}")
+    )
+
+
 _OWNER_CHAIN_MAX_HOPS = 32
 # A succession chain is at most a few rotations deep; the bound only stops a
 # cyclic map from looping forever.
@@ -395,6 +412,13 @@ def _is_steerable_harness(conv: Conversation) -> bool:
     except OmnigentError:
         return False
     return harness in _STEERABLE_NATIVE_HARNESSES
+
+
+def _is_codex_native_harness(conv: Conversation) -> bool:
+    try:
+        return _native_terminal_runtime(conv)[2] == "codex-native"
+    except OmnigentError:
+        return False
 
 
 def _peer_reachable_child(conv: Conversation) -> bool:
@@ -867,6 +891,12 @@ def effective_owner_id(
     return get_session_owner_id(top.id, permission_store)
 
 
+def _public_peer_reason(record: SessionPeerMessage) -> str | None:
+    if _native_attempt_id(record.reason) is not None:
+        return "awaiting_native_receipt" if record.state == "delivering" else None
+    return record.reason
+
+
 def _record_to_dict(record: SessionPeerMessage) -> dict[str, Any]:
     """Render a peer-message record for the API."""
     return {
@@ -877,7 +907,7 @@ def _record_to_dict(record: SessionPeerMessage) -> dict[str, Any]:
         "ref": record.ref,
         "text": record.text,
         "state": record.state,
-        "reason": record.reason,
+        "reason": _public_peer_reason(record),
         "reply_peer_id": record.reply_peer_id,
         "replied_at": record.replied_at,
         "created_at": record.created_at,
@@ -1082,6 +1112,7 @@ def register_peer_routes(
         peer_id: str,
         text: str,
         *,
+        attempt_id: str | None = None,
         acting_user_id: Any = _ACTING_USER_ID_NOT_GIVEN,
         require_init_success: bool = False,
     ) -> tuple[str, str | None]:
@@ -1125,6 +1156,8 @@ def register_peer_routes(
                     data={
                         "role": "user",
                         "content": [{"type": "input_text", "text": envelope}],
+                        "peer_message_id": peer_id,
+                        **({"stable_id": attempt_id} if attempt_id is not None else {}),
                     },
                 ),
                 **kwargs,
@@ -1165,6 +1198,11 @@ def register_peer_routes(
             # ``delivering`` where reconciliation could mark it delivered
             # from that persisted envelope.
             return "failed", "not_ready"
+        if native_receiver and _is_codex_native_harness(receiver):
+            # The events POST only confirms that the runner has the message.
+            # Codex accepts it later through turn/start or turn/steer; the
+            # durable peer record settles from the native transcript mirror.
+            return "uncertain", "awaiting_native_receipt"
         return "delivered", None
 
     @router.post(
@@ -1287,7 +1325,7 @@ def register_peer_routes(
                     "peer_id": existing.id,
                     "ref": existing.ref,
                     "state": existing.state,
-                    "reason": existing.reason,
+                    "reason": _public_peer_reason(existing),
                 }
             if target_id != receiver_id:
                 result["redirected_to"] = target_id
@@ -1327,7 +1365,7 @@ def register_peer_routes(
                     "peer_id": existing.id,
                     "ref": existing.ref,
                     "state": existing.state,
-                    "reason": existing.reason,
+                    "reason": _public_peer_reason(existing),
                 }
         receiver = await asyncio.to_thread(conversation_store.get_conversation, receiver_id)
         if receiver is None:
@@ -1451,7 +1489,7 @@ def register_peer_routes(
             reply_to = await _mark_reply_locked(queued, body.correlation_id)
             queued_response: dict[str, Any] = {
                 "disposition": "queued",
-                "reason": queued.reason,
+                "reason": _public_peer_reason(queued),
                 "peer_id": queued.id,
                 "ref": queued.ref,
                 "receiver": _receiver_summary(receiver, runner_online=runner_online),
@@ -1639,6 +1677,11 @@ def register_peer_routes(
                     ref=ref,
                     text=body.text,
                     state="delivering",
+                    reason=(
+                        f"{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
+                        if _is_codex_native_harness(receiver)
+                        else None
+                    ),
                     correlation_id=body.correlation_id,
                     relay_depth=depth,
                     created_at=now,
@@ -1671,6 +1714,7 @@ def register_peer_routes(
                 record.ref,
                 record.id,
                 body.text,
+                attempt_id=_native_attempt_id(record.reason),
                 acting_user_id=acting_user_id,
                 require_init_success=require_init_success,
             )

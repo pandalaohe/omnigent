@@ -61,6 +61,106 @@ from tests.server.helpers import create_test_agent
 pytestmark = pytest.mark.asyncio
 
 
+async def test_restart_preserves_long_subagent_failure_after_later_turn(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import create_runner_app, flows, subagent_work
+    from omnigent.spec.types import AgentSpec
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    for name in (
+        "_subagent_work_by_child",
+        "_subagent_work_by_parent",
+        "_drained_delivered_subagent_results",
+        "_in_flight_send_locks",
+        "_session_inboxes_ref",
+    ):
+        monkeypatch.setattr(subagent_work, name, {})
+    monkeypatch.setattr(flows, "hold_child_wake", lambda *args: True)
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    work_id = "subagent_long_failure"
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "labels": {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
+        },
+    )
+    assert created.status_code == 201
+    child_id = created.json()["id"]
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return AgentSpec(spec_version=1, name="reviewer")
+
+    app = create_runner_app(
+        server_client=client,
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+    )
+    subagent_work._session_inboxes_ref[parent["id"]] = asyncio.Queue()
+    subagent_work.register_subagent_work(
+        parent_session_id=parent["id"],
+        child_session_id=child_id,
+        agent="reviewer",
+        title="review",
+        work_id=work_id,
+    )
+    error = "Provider failed: " + "long error detail " * 100 + "END"
+    async with _runner_client(app) as runner:
+        response = await runner.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": error},
+            },
+        )
+        assert response.status_code == 204, response.text
+        for _ in range(100):
+            row = (await client.get(f"/v1/sessions/{child_id}")).json()
+            pin = row["labels"].get(subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY)
+            if pin is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert pin is not None and len(pin) <= 256
+        subagent_work.mark_subagent_work_started(child_id)
+        later = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "source_id": "later-self-turn",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "reviewer",
+                        "content": [{"type": "output_text", "text": "later answer"}],
+                    },
+                },
+            },
+        )
+        assert later.status_code == 202, later.text
+        _route_to_runner(monkeypatch, runner)
+        assert (
+            await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "completed", "output": "later answer"},
+                },
+            )
+        ).status_code == 202
+    subagent_work.unregister_subagent_work(child_id)
+    subagent_work._session_inboxes_ref[parent["id"]] = asyncio.Queue()
+    # The server's current status describes the later turn, while the pin owns the dispatch.
+    restarted = create_runner_app(server_client=client)
+    await restarted.state.recover_undrained_subagent_results(parent["id"])
+    result = subagent_work._session_inboxes_ref[parent["id"]].get_nowait()
+    assert (result["status"], result["output"]) == ("failed", error)
+
+
 # ── Helpers ──────────────────────────────────────────────
 
 
@@ -1658,6 +1758,65 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
     assert partial.applied == 1 and not partial.retryable
     items_after = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     assert len(items_after) == 1
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+async def test_runner_ingest_accepts_native_mirror_on_restarted_parent(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, depth: int
+) -> None:
+    from starlette.datastructures import Headers
+
+    from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(parent["id"], "runner-new")
+    parent_id = parent["id"]
+    for index in range(depth):
+        child = store.create_conversation(
+            kind="sub_agent",
+            title=f"Explore:child-{index}",
+            parent_conversation_id=parent_id,
+            agent_id=agent["id"],
+            runner_id="runner-old",
+        )
+        store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+        parent_id = child.id
+    event = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "native:live-redrive",
+            "item_type": "message",
+            "response_id": "r1",
+            "item_data": {
+                "role": "assistant",
+                "agent": "claude-native-ui",
+                "content": [{"type": "output_text", "text": "retained"}],
+            },
+        },
+    }
+    batch = EventBatchFrame(id="redrive", session_id=child.id, events=[event])
+    rejected = await app.state.runner_event_ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-foreign", batch=batch
+    )
+    assert rejected.applied == 0
+    accepted = await app.state.runner_event_ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-new", batch=batch
+    )
+    assert accepted.applied == 1, accepted
+    stale = await app.state.runner_event_ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-old", batch=batch
+    )
+    assert stale.applied == 0
+    items = (await client.get(f"/v1/sessions/{child.id}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items] == ["retained"]
+    # An independently dispatched child cannot inherit tunnel authority.
+    store.set_labels(child.id, {"omnigent.wrapper": "claude-native-ui"})
+    ordinary = await app.state.runner_event_ingest(
+        app=app, headers=Headers({}), owner=None, runner_id="runner-new", batch=batch
+    )
+    assert ordinary.applied == 0
 
 
 async def test_runner_batch_reports_prefix_after_unexpected_failure(

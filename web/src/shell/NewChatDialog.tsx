@@ -1741,7 +1741,10 @@ export function AgentHarnessPicker({
 
   const renderEntry = (agent: AvailableAgent, group: "harness" | "agent"): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
-    const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
+    const blurb =
+      agent.mine || agent.builtin === false || agent.id.startsWith("ca_")
+        ? (agent.description ?? undefined)
+        : (AGENT_PICKER_DESCRIPTIONS[agent.name] ?? agent.description ?? undefined);
     const details = active
       ? triggerDetails
           .map((detail) => compactModelTriggerLabel(detail.value))

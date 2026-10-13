@@ -699,10 +699,6 @@ async def _persist_approval_timeout_notice(
         _publish_external_conversation_item(session_id, persisted[0])
 
 
-#: Error code for the persisted "the answer never landed" notice.
-_UNDELIVERED_ANSWER_CODE = "answer_undelivered"
-
-
 def _delivery_reference(text: str) -> str | None:
     """
     Extract the ``#<id>`` correlation token from a system delivery message.
@@ -715,34 +711,44 @@ def _delivery_reference(text: str) -> str | None:
     return f"#{match.group(1)}" if match is not None else None
 
 
-async def _persist_undelivered_answer_notice(
+async def _persist_answer_delivery_notice(
     session_id: str,
     text: str,
     conversation_store: ConversationStore,
+    *,
+    status: Literal["waiting", "delivered", "expired", "undelivered"],
 ) -> None:
     """
-    Persist + publish the notice replacing an answer that could not land.
+    Persist + publish one deduplicated delivery status for a card answer.
 
     Uses the same stable-id dedupe as
-    :func:`_persist_approval_timeout_notice` so a retried delivery cannot
-    append a second notice for the same reference.
+    :func:`_persist_approval_timeout_notice` so repeated retry windows
+    cannot append the same status twice.
 
     :param session_id: Session/conversation identifier.
-    :param text: The undelivered ``[System: …]`` message, used for the
-        notice's correlation reference.
+    :param text: The ``[System: …]`` message, used for correlation.
     :param conversation_store: Store for the durable append.
+    :param status: Waiting, delivered, expired, or finally undelivered.
     """
     reference = _delivery_reference(text)
     subject = f"Answer to {reference}" if reference is not None else "An answer"
-    message = f"{subject} could not be delivered; re-ask."
-    notice_key = f"{_UNDELIVERED_ANSWER_CODE}:{reference or text}"
+    code = f"answer_{status}"
+    message = {
+        "waiting": f"{subject} was saved and is waiting for the agent; retrying.",
+        "delivered": f"{subject} reached the agent.",
+        "expired": (
+            f"{subject} expired before reaching the agent; approval must be requested again."
+        ),
+        "undelivered": f"{subject} could not be delivered; re-ask.",
+    }[status]
+    notice_key = f"{code}:{reference or text}"
     stable_id = hashlib.sha256(notice_key.encode()).hexdigest()[:32]
     item = NewConversationItem(
         type="error",
         response_id=generate_task_id(),
         data=ErrorData(
             source="harness",
-            code=_UNDELIVERED_ANSWER_CODE,
+            code=code,
             message=message,
             level="info",
         ),
@@ -756,7 +762,7 @@ async def _persist_undelivered_answer_notice(
         )
     except Exception:  # noqa: BLE001
         _logger.warning(
-            "Failed to persist undelivered-answer notice for session %s",
+            "Failed to persist answer-delivery notice for session %s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
@@ -790,6 +796,7 @@ async def _deliver_with_retry(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    persist_failure: bool = True,
 ) -> bool:
     """
     Post one system message, retrying until it lands or the window elapses.
@@ -806,6 +813,8 @@ async def _deliver_with_retry(
     :param conversation_store: Store used to resolve the runner and to
         persist the final-failure notice.
     :param runner_router: Router used to resolve the session's bound runner.
+    :param persist_failure: Whether an exhausted window records a visible
+        undelivered-answer notice. Detached cards keep retrying themselves.
     :returns: ``True`` when the message was dispatched, else ``False``.
     """
     started = time.monotonic()
@@ -846,7 +855,10 @@ async def _deliver_with_retry(
         session_id,
         extra={"session_id": session_id},
     )
-    await _persist_undelivered_answer_notice(session_id, text, conversation_store)
+    if persist_failure:
+        await _persist_answer_delivery_notice(
+            session_id, text, conversation_store, status="undelivered"
+        )
     return False
 
 
@@ -7479,6 +7491,13 @@ async def _forward_native_terminal_message(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed: {failure}",
         )
+    if body.data.get("peer_message_id"):
+        with contextlib.suppress(ValueError):
+            accepted = resp.json()
+            if isinstance(accepted, dict) and accepted.get("status") == "buffered":
+                # Keep the durable peer record until the CLI transcript proves
+                # acceptance; a process-local buffer can vanish on restart.
+                raise HTTPException(status_code=502, detail="Peer message is buffered")
     # Native-terminal counterpart to the SDK path's turn_dispatched (same event
     # name so a session reads uniformly across harnesses); the message was
     # injected into the live terminal rather than dispatched as a discrete turn.
@@ -10190,11 +10209,31 @@ async def _relay_runner_stream_once(
                         response_id=current_response_id,
                     )
                     if error_item is not None:
-                        await _relay_persist_error_once(
-                            conversation_store,
-                            session_id,
-                            error_item,
-                        )
+                        raw_input_stable_id = event.get("input_stable_id")
+                        if (
+                            isinstance(error_item.data, ErrorData)
+                            and _failed_event_undelivered(event)
+                            and isinstance(raw_input_stable_id, str)
+                            and re.fullmatch(r"[0-9a-f]{32}", raw_input_stable_id)
+                        ):
+                            error_item = error_item.model_copy(
+                                update={
+                                    "stable_id": uuid.uuid5(
+                                        uuid.NAMESPACE_URL,
+                                        f"codex-native-refusal:{session_id}:{raw_input_stable_id}",
+                                    ).hex
+                                }
+                            )
+                            # The stable id already deduplicates this attempt.
+                            # Payload-based error suppression could hide a
+                            # second refused attempt with the same text.
+                            await _relay_persist(conversation_store, session_id, error_item)
+                        else:
+                            await _relay_persist_error_once(
+                                conversation_store,
+                                session_id,
+                                error_item,
+                            )
 
                     # Persist resource lifecycle events
                     # (session.resource.created / .deleted) emitted by

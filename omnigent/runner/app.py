@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import itertools
 import json
 import logging
@@ -43,6 +44,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
+    PRIMARY_SESSION_ID_ENV_VAR,
     debug_event,
     phase_scope,
     runner_primary_session_id,
@@ -6258,6 +6260,9 @@ def create_runner_app(
     _async_result_waker = _wake_for_async_result
 
     def _wake_for_delivered_result(entry: _SubagentWorkEntry) -> None:
+        _stamp_subagent_result_item_soon(
+            entry.child_session_id, entry.work_id, entry.status, entry.delivered_result_key
+        )
         # A result for work a running flow dispatched is reported by the flow's
         # one end wake; re-wakes and stranded retries never consult the hold.
         if hold_child_wake(entry.parent_session_id, entry.child_session_id):
@@ -6522,27 +6527,103 @@ def create_runner_app(
                 payload[field] = value
         return payload
 
-    def _stamp_peer_copy_result_item_soon(
-        child_session_id: str, work_id: str, status: str, result_key: str
+    def _stamp_subagent_result_item_soon(
+        child_session_id: str, work_id: str, status: str, result_key: str | None
     ) -> None:
         """Best-effort pin an undrained mother result's terminal status and item.
 
-        A peer copy can arrive while the mother's own delivered result is still
-        undrained; without this label a restart would recover the child's newer
-        self-started turn instead of that result.
+        Later peer and self-started turns can finish before the mother drains
+        her result. Pin its item when it is delivered, before those turns land.
         """
         from omnigent.runner.tool_dispatch import _patch_subagent_label
 
+        entry = get_subagent_work(child_session_id)
+        if entry is None or entry.work_id != work_id:
+            return
+        previous = entry.recovery_result
+        if previous is not None:
+            if entry.recovery_turn_started:
+                return
+            if previous[1] != result_key and not (
+                previous[0] == "completed"
+                and status in {"failed", "stopped", "killed"}
+                and result_key is None
+            ):
+                return
+        snapshot_output = entry.output if result_key is None else None
+        entry.recovery_result = (status, result_key, snapshot_output)
+        lock = _subagent_work.in_flight_send_lock(child_session_id)
+        tracked_entry: _SubagentWorkEntry = entry
+
         async def _stamp() -> None:
-            error = await _patch_subagent_label(
-                server_client,
-                child_session_id,
-                _subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY,
-                f"{work_id}:{status}:{result_key}",
-            )
+            async with lock:
+                if get_subagent_work(child_session_id) is not tracked_entry:
+                    return
+                current = tracked_entry.recovery_result
+                assert current is not None
+                pinned_status, pinned_key, pinned_output = current
+                if pinned_key is None:
+                    text = pinned_output or (
+                        "[System: sub-agent completed with no output]"
+                        if pinned_status == "completed"
+                        else ""
+                    )
+                    is_error = pinned_status == "failed" and bool(text)
+                    item_data: _JsonObject = (
+                        {"source": "execution", "code": "subagent_result", "message": text}
+                        if is_error
+                        else {
+                            "role": "assistant",
+                            "agent": tracked_entry.agent,
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    )
+                    digest = hashlib.sha256(text.encode()).hexdigest()
+                    try:
+                        response = await server_client.post(
+                            f"/v1/sessions/{child_session_id}/events",
+                            json={
+                                "type": "external_conversation_item",
+                                "data": {
+                                    "item_type": "error" if is_error else "message",
+                                    "item_data": item_data,
+                                    "source_id": (
+                                        f"subagent-result:{work_id}:{pinned_status}:{digest}"
+                                    ),
+                                },
+                            },
+                            timeout=30.0,
+                        )
+                        response.raise_for_status()
+                        pinned_key = response.json().get("item_id")
+                    except (httpx.HTTPError, ValueError) as exc:
+                        _logger.warning(
+                            "Failed to persist sub-agent result for child=%s: %s",
+                            child_session_id,
+                            exc,
+                        )
+                        return
+                    if not isinstance(pinned_key, str) or not pinned_key:
+                        _logger.warning(
+                            "Missing persisted sub-agent result id for child=%s", child_session_id
+                        )
+                        return
+                if get_subagent_work(child_session_id) is not tracked_entry:
+                    return
+                if (
+                    tracked_entry.recovery_result == current
+                    and tracked_entry.delivered_result_key is None
+                ):
+                    tracked_entry.delivered_result_key = pinned_key
+                error = await _patch_subagent_label(
+                    server_client,
+                    child_session_id,
+                    _subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY,
+                    f"{work_id}:{pinned_status}:{pinned_key}",
+                )
             if error is not None:
                 _logger.warning(
-                    "Failed to stamp peer-copy result item for child=%s: %s",
+                    "Failed to stamp sub-agent result item for child=%s: %s",
                     child_session_id,
                     error,
                 )
@@ -6552,7 +6633,17 @@ def create_runner_app(
         except RuntimeError:
             return
         task = loop.create_task(_stamp())
-        task.add_done_callback(_background_tasks.discard)
+
+        def _finished(task: asyncio.Task[None]) -> None:
+            _background_tasks.discard(task)
+            if (
+                get_subagent_work(child_session_id) is None
+                and not lock.locked()
+                and _subagent_work._in_flight_send_locks.get(child_session_id) is lock
+            ):
+                _subagent_work._in_flight_send_locks.pop(child_session_id, None)
+
+        task.add_done_callback(_finished)
         _background_tasks.add(task)
 
     def _record_peer_turn_copy(
@@ -6592,7 +6683,7 @@ def create_runner_app(
             and entry.delivered_result_key is not None
             and child_session_id not in _subagent_work._drained_delivered_subagent_results
         ):
-            _stamp_peer_copy_result_item_soon(
+            _stamp_subagent_result_item_soon(
                 child_session_id, entry.work_id, entry.status, entry.delivered_result_key
             )
         if (
@@ -11119,6 +11210,7 @@ def _build_spawn_env_from_spec(
             env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "codex":
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env[PRIMARY_SESSION_ID_ENV_VAR] = session_id or ""
             env["HARNESS_CODEX_SKILLS_DIR"] = (
                 str(resource_registry.codex_skills_dir(session_id))
                 if resource_registry is not None and session_id is not None

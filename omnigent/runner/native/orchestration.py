@@ -4807,6 +4807,7 @@ async def _launch_codex_native_tui(
             or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
         ),
         agent_pid=app_server.agent_pid,
+        session_id=session_id,
     )
     # Apply configured wrappers to both cold start and recovery.
     from omnigent.config import load_effective_config
@@ -5601,6 +5602,7 @@ async def _auto_create_codex_terminal(
                     app_server.codex_cli_version
                 ),
                 agent_pid=app_server.agent_pid,
+                session_id=session_id,
             )
             if retained_resume_client is not None:
                 event_client = retained_resume_client

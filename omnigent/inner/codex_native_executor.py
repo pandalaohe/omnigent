@@ -566,7 +566,7 @@ class CodexNativeExecutor(Executor):
             # JSON-RPC -32600 error never reaches the user.
             length_error = goal_objective_length_error(goal_objective)
             if length_error is not None:
-                yield ExecutorError(message=length_error)
+                yield ExecutorError(message=length_error, preserve_session=True)
                 return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
@@ -574,7 +574,9 @@ class CodexNativeExecutor(Executor):
             else _content_to_input_items(latest_user_content, self._bridge_dir)
         )
         if not input_items:
-            yield ExecutorError(message="Codex native turn had no user input to send")
+            yield ExecutorError(
+                message="Codex native turn had no user input to send", preserve_session=True
+            )
             return
         # Wait for the bridge to boot OUTSIDE the injection lock. Poll quickly
         # during the expected startup window, then back off. Once state exists,
@@ -595,6 +597,7 @@ class CodexNativeExecutor(Executor):
                 )
 
         error_msg: str | None = None
+        refusal_code: str | None = None
         startup_failure: CodexStartupFailure | None = None
         undelivered = False
         while True:
@@ -712,6 +715,11 @@ class CodexNativeExecutor(Executor):
                             ),
                         )
                         error_msg = f"Codex native executor error: {exc}"
+                        if isinstance(exc, CodexAppServerResponseError):
+                            # Codex explicitly rejected the RPC. The native
+                            # input can be retried from its durable peer record.
+                            refusal_code = "codex_native_input_refused"
+                            undelivered = True
                         # Name the servers a still-unsettled MCP startup is
                         # blocked on — the most common cause of an injection
                         # failure this early in the session's life.
@@ -724,12 +732,15 @@ class CodexNativeExecutor(Executor):
         if error_msg is not None:
             yield ExecutorError(
                 message=error_msg,
-                code=startup_failure.code if startup_failure is not None else None,
+                code=startup_failure.code if startup_failure is not None else refusal_code,
                 title=startup_failure.title if startup_failure is not None else None,
                 remediation=startup_failure.remediation if startup_failure is not None else None,
-                # A failure once the app-server was asked to start the turn is
+                # Without an explicit refusal, submission failures are
                 # ambiguous: Codex may have accepted the message.
                 undelivered=undelivered,
+                # This bridge does not own the external native turn. An
+                # adapter cleanup interrupt would stop an unrelated turn.
+                preserve_session=True,
             )
         else:
             yield TurnComplete(response=None)

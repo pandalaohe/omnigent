@@ -70,6 +70,7 @@ class _DeliveryRecorder:
         *,
         conversation_store: Any,
         runner_router: Any,
+        persist_failure: bool = True,
     ) -> bool:
         self.calls.append((session_id, text))
         return True
@@ -434,12 +435,12 @@ async def test_delivery_retry_recovers_after_transient_miss(
     async def _no_sleep(_seconds: float) -> None:
         return
 
-    async def _record_persist(session_id: str, text: str, store: Any) -> None:
+    async def _record_persist(session_id: str, text: str, store: Any, *, status: str) -> None:
         persisted.append(text)
 
     monkeypatch.setattr(orchestration, "_post_system_message", _post_once_missing)
     monkeypatch.setattr(orchestration, "_delivery_retry_sleep", _no_sleep)
-    monkeypatch.setattr(orchestration, "_persist_undelivered_answer_notice", _record_persist)
+    monkeypatch.setattr(orchestration, "_persist_answer_delivery_notice", _record_persist)
 
     text = "[System: answers to your question card #q1a2b3c]"
     assert await orchestration._deliver_with_retry(
@@ -471,12 +472,13 @@ async def test_delivery_retry_persists_notice_on_final_failure(
     async def _no_sleep(_seconds: float) -> None:
         return
 
-    async def _record_persist(session_id: str, text: str, store: Any) -> None:
+    async def _record_persist(session_id: str, text: str, store: Any, *, status: str) -> None:
+        assert status == "undelivered"
         persisted.append((session_id, text))
 
     monkeypatch.setattr(orchestration, "_post_system_message", _post_never)
     monkeypatch.setattr(orchestration, "_delivery_retry_sleep", _no_sleep)
-    monkeypatch.setattr(orchestration, "_persist_undelivered_answer_notice", _record_persist)
+    monkeypatch.setattr(orchestration, "_persist_answer_delivery_notice", _record_persist)
     # Collapse the retry window so the exhaustion branch is reachable fast.
     monkeypatch.setattr(orchestration, "_DELIVER_RETRY_BACKOFFS_S", (0.0,))
     monkeypatch.setattr(orchestration, "_DELIVER_RETRY_INTERVAL_S", 0.0)
@@ -488,6 +490,148 @@ async def test_delivery_retry_persists_notice_on_final_failure(
     )
     assert persisted == [("conv_test", text)]
     assert attempts >= 1
+
+
+async def test_answer_survives_retry_window_until_runner_returns(
+    client: httpx.AsyncClient,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached answer remains owed after one exhausted window and dispatches once."""
+    online = False
+    first_attempt = asyncio.Event()
+    delivered: list[str] = []
+
+    async def _post(
+        session_id: str,
+        text: str,
+        *,
+        conversation_store: Any,
+        runner_router: Any,
+    ) -> bool:
+        first_attempt.set()
+        if online:
+            delivered.append(text)
+            return True
+        return False
+
+    monkeypatch.setattr(orchestration, "_post_system_message", _post)
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+    monkeypatch.setattr(hooks_routes, "_CARD_RETRY_INTERVAL_S", 0.01)
+    _, session_id = await _create_agent_session(client, "test-question-runner-return")
+    response = await client.post(
+        f"/v1/sessions/{session_id}/async-questions",
+        json={"questions": [{"question": "Which DB?"}]},
+    )
+    assert response.status_code == 200
+    elicitation_id = response.json()["elicitation_id"]
+    verdict = await _post_approval(
+        client, session_id, elicitation_id, "accept", content={"Which DB?": "SQLite"}
+    )
+    assert verdict.status_code == 202
+    await asyncio.wait_for(first_attempt.wait(), timeout=3)
+    assert any(card.elicitation_id == elicitation_id for card in conv_store.list_detached_cards())
+    async with asyncio.timeout(3):
+        while True:
+            items = await client.get(f"/v1/sessions/{session_id}/items")
+            waiting = [
+                item for item in items.json()["data"] if item.get("code") == "answer_waiting"
+            ]
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+    assert len(waiting) == 1
+    assert "saved" in waiting[0]["message"]
+    assert "retrying" in waiting[0]["message"]
+    online = True
+    await _wait_until(lambda: bool(delivered))
+    assert delivered == [
+        f"[System: answers to your question card #{response.json()['qid']}]\nWhich DB? → SQLite"
+    ]
+    async with asyncio.timeout(3):
+        while True:
+            items = await client.get(f"/v1/sessions/{session_id}/items")
+            statuses = [
+                item for item in items.json()["data"] if item.get("code") == "answer_delivered"
+            ]
+            if statuses:
+                break
+            await asyncio.sleep(0.01)
+    assert len(statuses) == 1
+    await _wait_until(
+        lambda: all(
+            card.elicitation_id != elicitation_id for card in conv_store.list_detached_cards()
+        )
+    )
+
+
+async def test_answer_record_write_retries_before_delivery(
+    client: httpx.AsyncClient,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient database write failure cannot arm or lose an unrecorded verdict."""
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+    monkeypatch.setattr(hooks_routes, "_CARD_RETRY_INTERVAL_S", 0.01)
+    original = SqlAlchemyConversationStore.update_detached_card
+    attempts = 0
+
+    def _fail_once(self: SqlAlchemyConversationStore, elicitation_id: str, **fields: Any) -> None:
+        nonlocal attempts
+        if fields.get("state") == "answered":
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient store failure")
+        original(self, elicitation_id, **fields)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "update_detached_card", _fail_once)
+    _, session_id = await _create_agent_session(client, "test-answer-write-retry")
+    response = await client.post(
+        f"/v1/sessions/{session_id}/async-questions",
+        json={"questions": [{"question": "Which DB?"}]},
+    )
+    assert response.status_code == 200
+    elicitation_id = response.json()["elicitation_id"]
+    verdict = await _post_approval(
+        client, session_id, elicitation_id, "accept", content={"Which DB?": "SQLite"}
+    )
+    assert verdict.status_code == 202
+    await _wait_until(lambda: bool(delivered.calls))
+    assert attempts == 2
+    assert "SQLite" in delivered.calls[0][1]
+    await _wait_until(
+        lambda: all(
+            card.elicitation_id != elicitation_id for card in conv_store.list_detached_cards()
+        )
+    )
+
+
+async def test_pending_delivery_exhaustion_does_not_post_answer_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable runner should not turn a pending hint into a lost-answer error."""
+    notices: list[str] = []
+
+    async def _offline(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    async def _notice(session_id: str, text: str, store: Any, *, status: str) -> None:
+        notices.append(text)
+
+    monkeypatch.setattr(orchestration, "_post_system_message", _offline)
+    monkeypatch.setattr(orchestration, "_persist_answer_delivery_notice", _notice)
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+    hooks_routes._start_background_delivery(
+        "conv_pending",
+        "Approval pending (#a123456): shell(pnpm test)",
+        conversation_store=object(),
+        runner_router=None,
+        elicitation_id="elicit_pending",
+    )
+    task = hooks_routes._pending_delivery_tasks["elicit_pending"]
+    assert not await asyncio.wait_for(task, timeout=3)
+    assert notices == []
 
 
 async def test_pending_delivery_is_cancelled_at_shutdown(
@@ -503,6 +647,7 @@ async def test_pending_delivery_is_cancelled_at_shutdown(
         *,
         conversation_store: Any,
         runner_router: Any,
+        persist_failure: bool = True,
     ) -> bool:
         started.set()
         await blocker.wait()

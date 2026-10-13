@@ -918,6 +918,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -971,6 +972,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -1302,6 +1304,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1437,6 +1440,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -1488,6 +1492,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.
