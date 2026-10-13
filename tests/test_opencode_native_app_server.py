@@ -182,7 +182,8 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     started: dict[str, object] = {}
 
     class _FakeProc:
-        pid = 4242
+        pid = None
+        returncode = None
 
         def poll(self) -> None:
             return None
@@ -201,7 +202,7 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert started["ready"] is True
     assert started["argv"][1] == "serve"
     assert server.process is not None
-    assert server.process.pid == 4242
+    assert server.process.pid is None
 
 
 async def test_start_closes_process_when_readiness_is_cancelled(
@@ -211,6 +212,7 @@ async def test_start_closes_process_when_readiness_is_cancelled(
     server = _server(monkeypatch, tmp_path)
 
     class _FakeProc:
+        pid = None
         returncode: int | None = None
         terminated = False
 
@@ -255,6 +257,7 @@ async def test_start_closes_process_when_readiness_fails(
     server = _server(monkeypatch, tmp_path)
 
     class _FakeProc:
+        pid = None
         returncode: int | None = None
         terminated = False
 

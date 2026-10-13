@@ -6754,6 +6754,8 @@ def create_runner_app(
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
         subagent_work_id_for_session=_subagent_work_id_for_session,
+        runtime_lock_for_session=_cli_runtime_lock,
+        cancel_session_turn=_cancel_inprocess_turn,
     )
 
     def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:

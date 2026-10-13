@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sys
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -371,6 +372,52 @@ def test_transfer_rejects_target_collision_without_moving_source(tmp_path: Path)
 
 # ── Real-tmux lifecycle tests ─────────────────────────────────
 
+
+async def test_failed_launch_cleanup_retains_ownership_without_replacing_racer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reg = TerminalRegistry()
+    created = TerminalInstance(
+        name="cli",
+        session_key="main",
+        socket_path=tmp_path / "old.sock",
+        private_dir=tmp_path / "old",
+    )
+    racer = TerminalInstance(
+        name="cli",
+        session_key="main",
+        socket_path=tmp_path / "new.sock",
+        private_dir=tmp_path / "new",
+        running=True,
+    )
+    racer_lock = threading.Lock()
+
+    async def cancelled_launch(**_kwargs: object) -> None:
+        reg._by_conversation["target"] = {("cli", "main"): racer}
+        reg._instance_locks[("target", "cli", "main")] = racer_lock
+        raise asyncio.CancelledError
+
+    created.launch = cancelled_launch  # type: ignore[method-assign]
+    created.close = AsyncMock(side_effect=RuntimeError("cleanup unavailable"))  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        registry_mod,
+        "create_terminal_instance",
+        lambda *_args, **_kwargs: TerminalCreateResult(instance=created, cwd=tmp_path),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await reg.launch("target", "cli", "main", TerminalEnvSpec(command="python"))
+    assert reg.get("target", "cli", "main") is racer
+    assert reg.get_instance_lock("target", "cli", "main") is racer_lock
+    retained = [
+        entry for entry in reg.list_for_conversation("target") if entry.instance is created
+    ]
+    assert len(retained) == 1
+    created.close = AsyncMock()  # type: ignore[method-assign]
+    assert await reg.close("target", retained[0].terminal_name, retained[0].session_key)
+    assert reg.get("target", "cli", "main") is racer
+
+
 pytestmark_tmux = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="tmux not installed; registry lifecycle tests need a real tmux on PATH",
@@ -414,6 +461,73 @@ async def cleanup(reg_with_tmux: TerminalRegistry) -> AsyncIterator[None]:
 def reg_with_tmux() -> TerminalRegistry:
     """Fresh registry for each tmux-backed test."""
     return TerminalRegistry()
+
+
+@pytestmark_tmux
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_cancel_unregistered_launch_cleans_only_its_process(
+    reg_with_tmux: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_fails: bool,
+) -> None:
+    import psutil
+
+    reg = reg_with_tmux
+    spec = TerminalEnvSpec(
+        command=sys.executable,
+        args=["-c", "import time; time.sleep(60)"],
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+    )
+    sibling = await reg.launch("sibling", "cli", "main", spec)
+    original_launch = TerminalInstance.launch
+    original_close = TerminalInstance.close
+    ready = asyncio.Event()
+    target: TerminalInstance | None = None
+    process: psutil.Process | None = None
+    fail_once = cleanup_fails
+
+    async def park_before_registration(instance: TerminalInstance, **kwargs: object) -> None:
+        nonlocal target, process
+        await original_launch(instance, **kwargs)
+        target = instance
+        pid = await asyncio.to_thread(instance.pane_pid_sync)
+        assert pid is not None
+        process = psutil.Process(pid)
+        # Launch can be cancelled before its advisory running flag is set.
+        instance.running = False
+        ready.set()
+        await asyncio.Event().wait()
+
+    async def close_with_failure(instance: TerminalInstance) -> None:
+        nonlocal fail_once
+        if instance is target and fail_once:
+            fail_once = False
+            raise RuntimeError("cleanup temporarily unavailable")
+        await original_close(instance)
+
+    monkeypatch.setattr(TerminalInstance, "launch", park_before_registration)
+    monkeypatch.setattr(TerminalInstance, "close", close_with_failure)
+    task = asyncio.create_task(reg.launch("target", "cli", "main", spec))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert target is not None and process is not None
+        if cleanup_fails:
+            assert reg.get("target", "cli", "main") is target
+            assert reg.get_instance_lock("target", "cli", "main") is not None
+            assert await reg.close("target", "cli", "main")
+        await asyncio.to_thread(process.wait, timeout=2)
+        assert not process.is_running()
+        assert reg.get("target", "cli", "main") is None
+        assert await sibling.is_alive()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if target is not None:
+            await original_close(target)
+        await reg.shutdown()
 
 
 @pytestmark_tmux

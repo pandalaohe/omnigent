@@ -19,11 +19,9 @@ interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods
 (so nine interrupt handlers total); claude stop is likewise special-cased and
 codex/pi alias stop to their interrupt handler (so seven stop handlers total).
 
-Coverage note: antigravity-native and opencode-native have no handler here and
-:meth:`interrupt` / :meth:`stop` return ``None`` for them, so the caller falls
-through to the in-process turn cancel — unchanged from before this seam. Wiring
-their native interrupt (agy ``interrupt_turn`` / opencode ``client.abort``) is a
-deferred follow-up.
+Antigravity/OpenCode stop closes the runner-owned terminal instance and
+OpenCode's per-session server. Their soft interrupt still falls through to
+in-process turn cancellation.
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ import asyncio
 import contextlib
 import importlib
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -53,6 +51,7 @@ from omnigent.runner.resource_registry import (
 if TYPE_CHECKING:
     from omnigent.harness_plugins import NativeCodingAgent
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLock
 
 
 class SubagentDeliveryAck(Protocol):
@@ -311,9 +310,9 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     Mirrors :meth:`NativeInterruptRunner.stop` instead of comparing one Claude
     wrapper label:
 
-    * ``"stop"`` — Claude's dedicated stop, or a key in :data:`_UNIFORM_STOP`
+    * ``"stop"`` — dedicated or uniform hard-stop handlers
     * ``"best_effort"`` — remaining native agents (Codex/Pi alias stop to
-      interrupt; Antigravity/OpenCode have no stop handler)
+      interrupt)
     * ``"inprocess"`` — no native agent for this label
 
     :param wrapper_label: The work entry's ``omnigent.wrapper`` value.
@@ -322,7 +321,7 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     agent = native_agent_for_cancel(wrapper_label)
     if agent is None:
         return "inprocess"
-    if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+    if agent.key in {"claude", "antigravity", "opencode"} or agent.key in _UNIFORM_STOP:
         return "stop"
     return "best_effort"
 
@@ -350,6 +349,8 @@ class NativeInterruptRunner:
         codex_bridge_state_for_session: CodexBridgeStateForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
+        runtime_lock_for_session: Callable[[str], SessionRuntimeLock],
+        cancel_session_turn: Callable[[str], Awaitable[None]],
         subagent_work_id_for_session: SubagentWorkIdForSession | None = None,
     ) -> None:
         self._server_client = server_client
@@ -361,6 +362,8 @@ class NativeInterruptRunner:
         self._codex_bridge_state_for_session = codex_bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
+        self._runtime_lock_for_session = runtime_lock_for_session
+        self._cancel_session_turn = cancel_session_turn
         self._subagent_work_id_for_session = subagent_work_id_for_session
         # Sessions whose native interrupt was injected but whose turn outcome is
         # still unknown; resolved by the next terminal edge or the grace timer,
@@ -413,6 +416,11 @@ class NativeInterruptRunner:
         key = agent.key
         if key == "claude":
             return await self._claude_stop(conv_id)
+        if key in {"antigravity", "opencode"}:
+            # Turns hold the runtime shared; cancel before waiting for exclusive ownership.
+            await self._cancel_session_turn(conv_id)
+            async with self._runtime_lock_for_session(conv_id).exclusive():
+                return await self._owned_native_stop(agent, conv_id)
         if key in ("codex", "pi"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
@@ -456,6 +464,79 @@ class NativeInterruptRunner:
             self._deliver_unconfirmed_interrupt_cancel,
             conv_id,
         )
+
+    async def _owned_native_stop(self, agent: NativeCodingAgent, conv_id: str) -> Response:
+        """Close only resources owned by this session, confirming cleanup before idle."""
+        from omnigent.entities.session_resources import terminal_resource_id
+        from omnigent.runner.native import orchestration
+        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+        terminal_registry = self._resource_registry.terminal_registry
+        server = (
+            orchestration._AUTO_OPENCODE_SERVERS.get(conv_id) if agent.key == "opencode" else None
+        )
+        forwarder = orchestration._AUTO_FORWARDER_TASKS.get(conv_id)
+        work_id = (
+            self._subagent_work_id_for_session(conv_id)
+            if self._subagent_work_id_for_session is not None
+            else None
+        )
+        try:
+            if terminal_registry is None:
+                raise RuntimeError("Terminal ownership registry is unavailable")
+            # Capture instance identity before yielding; never close a replacement pane.
+            entries = terminal_registry.list_for_conversation(conv_id)
+            for entry in entries:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                outcome = await self._resource_registry.close_terminal_detailed(
+                    conv_id, terminal_id, expected_instance=entry.instance
+                )
+                if outcome not in {"closed", "absent"} or await entry.instance.is_alive():
+                    raise RuntimeError(f"Terminal stop is unconfirmed: {terminal_id} ({outcome})")
+                _publish_terminal_deleted_event(
+                    conversation_id=conv_id,
+                    terminal_name=entry.terminal_name,
+                    session_key=entry.session_key,
+                    publish_event=self._publish_event,
+                )
+            if server is not None:
+                # The forwarder suppresses close errors; use the captured owner directly.
+                await server.close()
+                if orchestration._AUTO_OPENCODE_SERVERS.get(conv_id) is server:
+                    orchestration._AUTO_OPENCODE_SERVERS.pop(conv_id)
+            if forwarder is not None:
+                if orchestration._AUTO_FORWARDER_TASKS.get(conv_id) is forwarder:
+                    orchestration._AUTO_FORWARDER_TASKS.pop(conv_id)
+                if not forwarder.done():
+                    forwarder.cancel()
+                    _, pending = await asyncio.wait({forwarder}, timeout=1.0)
+                    if pending:
+                        raise RuntimeError("Native forwarder did not finish stopping")
+        except (RuntimeError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": f"{agent.key}_native_stop_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context=f"{agent.key}-native stop"
+                    ),
+                },
+            )
+        self.clear_pending_interrupt(conv_id)
+        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = self._mark_subagent_terminal_and_wake(
+            conv_id, status="cancelled", output=None, only_if_work_id=work_id
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
+        ):
+            self._logger.warning(
+                "%s-native stop: sub-agent delivery not confirmed; session=%s reason=%s",
+                agent.key,
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
 
     def take_pending_interrupt(self, conv_id: str) -> tuple[bool, str | None]:
         """Consume a recorded-but-unresolved interrupt for *conv_id*.

@@ -53,6 +53,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
 )
+from omnigent.inner import _proc
 
 _logger = logging.getLogger(__name__)
 
@@ -501,7 +502,9 @@ class OpenCodeNativeServer:
             env=self.env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **_proc.spawn_kwargs(),
         )
+        _proc.remember_process_group(self.process)
         try:
             await self._wait_until_ready()
         except BaseException:
@@ -551,19 +554,20 @@ class OpenCodeNativeServer:
             directory=directory or str(self.workspace),
         )
 
-    async def close(self) -> None:  # pragma: no cover
+    async def close(self) -> None:
         """Terminate the server subprocess if running."""
         process = self.process
         if process is None:
             return
-        if process.poll() is None:
-            process.terminate()
-            try:
-                await asyncio.to_thread(process.wait, 10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                await asyncio.to_thread(process.wait)
-        self.process = None
+        process.poll()
+        await asyncio.to_thread(_proc.terminate_tree, process)
+        try:
+            await asyncio.to_thread(process.wait, 1)
+        except subprocess.TimeoutExpired:
+            await asyncio.to_thread(_proc.kill_tree, process)
+            await asyncio.to_thread(process.wait, 1)
+        if self.process is process:
+            self.process = None
 
 
 def client_for_state(
