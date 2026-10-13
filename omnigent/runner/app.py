@@ -7494,6 +7494,7 @@ def create_runner_app(
         conv_id: str,
         dispatch: TurnDispatch | None = None,
     ) -> Response:
+        stream_epoch = _turn_bind_epoch.get(conv_id)
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
@@ -7774,7 +7775,7 @@ def create_runner_app(
                 return resolved, None
             return None, None
 
-        async def proxy_stream() -> AsyncIterator[bytes]:
+        async def proxy_stream_events() -> AsyncIterator[bytes]:
             import asyncio as _asyncio
             import json as _json
 
@@ -8376,6 +8377,15 @@ def create_runner_app(
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="harness")
 
+        async def proxy_stream() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in proxy_stream_events():
+                    yield chunk
+            finally:
+                # Cover instruction resolution as well as the harness connection.
+                if conv_id in _active_turns and _turn_bind_epoch.get(conv_id) == stream_epoch:
+                    _on_proxy_stream_end(conv_id)
+
         return StreamingResponse(
             proxy_stream(),
             media_type="text/event-stream",
@@ -8726,27 +8736,38 @@ def create_runner_app(
 
                 if stream:
                     expected_runtime_token = _cli_runtime_lifecycle.runtime_token(conversation_id)
+                    stream_epoch = _turn_bind_epoch.get(conversation_id)
                     # Shared for the same reason as the background turn above.
-                    async with _cli_runtime_lock(conversation_id).shared():
-                        if not _cli_runtime_lifecycle.runtime_start_allowed(
-                            conversation_id
-                        ) or not _cli_runtime_lifecycle.runtime_token_matches(
-                            conversation_id, expected_runtime_token
+                    try:
+                        async with _cli_runtime_lock(conversation_id).shared():
+                            if not _cli_runtime_lifecycle.runtime_start_allowed(
+                                conversation_id
+                            ) or not _cli_runtime_lifecycle.runtime_token_matches(
+                                conversation_id, expected_runtime_token
+                            ):
+                                _on_proxy_stream_end(
+                                    conversation_id,
+                                    error={"message": "turn superseded by session archive"},
+                                )
+                                return JSONResponse(
+                                    status_code=409,
+                                    content={
+                                        "error": "stale_generation",
+                                        "detail": "session is archiving",
+                                    },
+                                )
+                            _cli_runtime_lifecycle.mark_starting(conversation_id)
+                            _cli_runtime_lifecycle.mark_live(conversation_id)
+                            response = await _stream_message_to_harness(
+                                message_body, conversation_id
+                            )
+                    except BaseException:
+                        if (
+                            conversation_id in _active_turns
+                            and _turn_bind_epoch.get(conversation_id) == stream_epoch
                         ):
-                            _on_proxy_stream_end(
-                                conversation_id,
-                                error={"message": "turn superseded by session archive"},
-                            )
-                            return JSONResponse(
-                                status_code=409,
-                                content={
-                                    "error": "stale_generation",
-                                    "detail": "session is archiving",
-                                },
-                            )
-                        _cli_runtime_lifecycle.mark_starting(conversation_id)
-                        _cli_runtime_lifecycle.mark_live(conversation_id)
-                        response = await _stream_message_to_harness(message_body, conversation_id)
+                            _on_proxy_stream_end(conversation_id)
+                        raise
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,

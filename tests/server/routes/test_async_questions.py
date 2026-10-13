@@ -425,6 +425,7 @@ async def test_delivery_retry_recovers_after_transient_miss(
         *,
         conversation_store: Any,
         runner_router: Any,
+        confirm_delivery: bool,
     ) -> bool:
         nonlocal attempts
         attempts += 1
@@ -461,6 +462,7 @@ async def test_delivery_retry_persists_notice_on_final_failure(
         *,
         conversation_store: Any,
         runner_router: Any,
+        confirm_delivery: bool,
     ) -> bool:
         nonlocal attempts
         attempts += 1
