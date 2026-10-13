@@ -188,6 +188,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
 
     client = SimpleNamespace(close=close_client)
     server = SimpleNamespace(
+        session_id="conv_test",
         start=AsyncMock(),
         close=close_server,
         codex_cli_version=(0, 154, 0),
