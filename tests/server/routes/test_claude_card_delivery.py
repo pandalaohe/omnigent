@@ -101,12 +101,12 @@ async def test_card_delivery_retries_after_runner_accepts_failed_injection(
         async def no_sleep(_: float) -> None:
             await asyncio.sleep(0)
 
-        async def notice(_: str, text: str, store: Any) -> None:
+        async def notice(_: str, text: str, store: Any, *, status: str) -> None:
             notices.append(text)
 
         monkeypatch.setattr(orchestration, "_post_system_message", post_answer)
         monkeypatch.setattr(orchestration, "_delivery_retry_sleep", no_sleep)
-        monkeypatch.setattr(orchestration, "_persist_undelivered_answer_notice", notice)
+        monkeypatch.setattr(orchestration, "_persist_answer_delivery_notice", notice)
         try:
             assert await orchestration._deliver_with_retry(
                 "card_session",

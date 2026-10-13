@@ -7881,7 +7881,10 @@ def create_runner_app(
                 return resolved, None
             return None, None
 
+        _response_id: str | None = None
+
         async def proxy_stream_events() -> AsyncIterator[bytes]:
+            nonlocal _response_id
             import asyncio as _asyncio
             import json as _json
 
@@ -7977,7 +7980,6 @@ def create_runner_app(
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
-            _response_id: str | None = None
             try:
                 async with client.stream(
                     "POST",
@@ -8487,10 +8489,15 @@ def create_runner_app(
             try:
                 async for chunk in proxy_stream_events():
                     yield chunk
-            finally:
-                # Cover instruction resolution as well as the harness connection.
-                if conv_id in _active_turns and _turn_bind_epoch.get(conv_id) == stream_epoch:
-                    _on_proxy_stream_end(conv_id)
+            except BaseException:
+                # Background drains own cancellation cleanup and desync status tokens.
+                if (
+                    dispatch is None
+                    and conv_id in _active_turns
+                    and _turn_bind_epoch.get(conv_id) == stream_epoch
+                ):
+                    _on_proxy_stream_end(conv_id, owner_response_id=_response_id)
+                raise
 
         return StreamingResponse(
             proxy_stream(),
