@@ -130,6 +130,15 @@ class _PatchRecordingClient(_SnapshotServerClient):
         self.patches.append((url, kwargs))
         return self._Response()
 
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        body = kwargs.get("json", {})
+        if body.get("type") == "external_conversation_item":
+            data = body["data"]
+            item_id = f"item_snapshot_{len(self.items)}"
+            self.items.append({"id": item_id, "type": data["item_type"], **data["item_data"]})
+            return self._Resp({"item_id": item_id})
+        return await super().post(url, **kwargs)
+
 
 class _WindowRecoveryServerClient(_RecoveryServerClient):
     """Recovery client that also serves the item window endpoint by anchor id."""
@@ -791,6 +800,217 @@ async def test_undrained_delivered_mother_result_stamps_result_item_label(
     assert len(copies) == copy_count
     assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
     assert _wake_posts(server_client) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("self_status", "self_output"),
+    [
+        ("completed", "timer finished"),
+        ("completed", "keep-warm check\n[quiet]"),
+        ("failed", "later turn failed"),
+    ],
+)
+@pytest.mark.parametrize("peer_after_self", [False, True])
+async def test_restart_preserves_dispatch_result_after_self_started_turn(
+    _clean_subagent_registry: None,
+    self_status: str,
+    self_output: str,
+    peer_after_self: bool,
+) -> None:
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    app, server_client = _peer_app([_assistant_item("item_old", "dispatch answer")])
+    subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+    )
+    async with _runner_client(app) as client:
+        first = await _post_status(client, {"status": "completed", "output": "dispatch answer"})
+        assert first.status_code == 204
+        subagent_work.mark_subagent_work_started(CHILD_SESSION_ID)
+        server_client.items = [_assistant_item("item_self", self_output)]
+        second = await _post_status(client, {"status": self_status, "output": self_output})
+        assert second.status_code == 204
+        if peer_after_self:
+            peer = await _post_status(
+                client,
+                {
+                    "status": "completed",
+                    "output": "peer answer",
+                    "peer_turn": _peer_turn(),
+                },
+            )
+            assert peer.status_code == 204
+        for _ in range(20):
+            await asyncio.sleep(0)
+    labels = {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID}
+    for _, request in server_client.patches:
+        labels.update(request["json"]["labels"])
+    subagent_work.unregister_subagent_work(CHILD_SESSION_ID)
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    restarted = create_runner_app(
+        server_client=_WindowRecoveryServerClient(  # type: ignore[arg-type]
+            [_child_summary(labels=labels)],
+            child_items=[
+                _assistant_item("item_self", self_output),
+                _assistant_item("item_old", "dispatch answer"),
+            ],
+        ),
+    )
+    await restarted.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
+    assert inbox.qsize() == 1
+    assert inbox.get_nowait()["output"] == "dispatch answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_first_patch", [False, True])
+@pytest.mark.parametrize("failure_output", ["Error: BOOM from provider", "partial output"])
+async def test_restart_preserves_failure_upgrade(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    block_first_patch: bool,
+    failure_output: str,
+) -> None:
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    app, server_client = _peer_app([_assistant_item("item_partial", "partial output")])
+    subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+    real_patch = server_client.patch
+    calls = 0
+
+    async def delayed_patch(url: str, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1 and block_first_patch:
+            started.set()
+            await release.wait()
+        return await real_patch(url, **kwargs)
+
+    monkeypatch.setattr(server_client, "patch", delayed_patch)
+    async with _runner_client(app) as client:
+        assert (
+            await _post_status(client, {"status": "completed", "output": "partial output"})
+        ).status_code == 204
+        if block_first_patch:
+            await asyncio.wait_for(started.wait(), 2)
+        assert (
+            await _post_status(client, {"status": "failed", "output": failure_output})
+        ).status_code == 204
+        for _ in range(20):
+            await asyncio.sleep(0)
+        release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+    labels = {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID}
+    for _, request in server_client.patches:
+        labels.update(request["json"]["labels"])
+    subagent_work.unregister_subagent_work(CHILD_SESSION_ID)
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    restarted = create_runner_app(
+        server_client=_WindowRecoveryServerClient(  # type: ignore[arg-type]
+            [_child_summary(labels=labels, current_task_status="failed")],
+            child_items=server_client.items,
+        ),
+    )
+    await restarted.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert (payload["status"], payload["output"]) == ("failed", failure_output)
+
+
+@pytest.mark.asyncio
+async def test_unkeyed_result_backup_does_not_redeliver_terminal_replay(
+    _clean_subagent_registry: None,
+) -> None:
+    app, server = _peer_app([])
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+        work_id=DISPATCH_ID,
+    )
+    async with _runner_client(app) as runner:
+        data = {"status": "completed", "output": "unkeyed result"}
+        assert (await _post_status(runner, data)).status_code == 204
+        for _ in range(100):
+            if server.patches:
+                break
+            await asyncio.sleep(0.01)
+        assert server.patches and inbox.qsize() == 1
+        assert (await _post_status(runner, data)).status_code == 204
+    assert inbox.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_drained_dispatch_cannot_overwrite_new_dispatch_pin(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, server = _peer_app([_assistant_item("item_old", "old answer")])
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+
+    def register(work_id: str) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id=PARENT_SESSION_ID,
+            child_session_id=CHILD_SESSION_ID,
+            agent="reviewer",
+            title="review",
+            work_id=work_id,
+        )
+
+    register(DISPATCH_ID)
+    started, release = asyncio.Event(), asyncio.Event()
+    real_patch = server.patch
+    calls = 0
+
+    async def delay_old_patch(url: str, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+        return await real_patch(url, **kwargs)
+
+    monkeypatch.setattr(server, "patch", delay_old_patch)
+    async with _runner_client(app) as runner:
+        assert (
+            await _post_status(runner, {"status": "completed", "output": "old answer"})
+        ).status_code == 204
+        await asyncio.wait_for(started.wait(), 2)
+        subagent_work.unregister_subagent_work(CHILD_SESSION_ID)
+        register("subagent_new_dispatch")
+        server.items = [_assistant_item("item_new", "new answer")]
+        assert (
+            await _post_status(runner, {"status": "completed", "output": "new answer"})
+        ).status_code == 204
+        for _ in range(20):
+            await asyncio.sleep(0)
+        release.set()
+        for _ in range(100):
+            if len(server.patches) == 2:
+                break
+            await asyncio.sleep(0.01)
+    labels = {}
+    for _, request in server.patches:
+        labels.update(request["json"]["labels"])
+    assert labels[subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY] == (
+        "subagent_new_dispatch:completed:item_new"
+    )
+    subagent_work.unregister_subagent_work(CHILD_SESSION_ID)
+    await asyncio.sleep(0)
+    assert CHILD_SESSION_ID not in subagent_work._in_flight_send_locks
 
 
 @pytest.mark.asyncio

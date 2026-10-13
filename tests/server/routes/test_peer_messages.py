@@ -57,6 +57,47 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 
 
+@pytest.mark.parametrize("runner_status", ["buffered", "accepted"])
+async def test_native_peer_buffer_is_uncertain_until_transcript_acceptance(
+    peer_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import SessionEventInput
+
+    receiver = peer_env["receiver"]
+    monkeypatch.setattr(
+        orchestration, "_native_terminal_runtime", lambda _: ("Claude", None, "claude-native")
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(202, json={"status": runner_status})
+        ),
+    ) as runner:
+        body = SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "peer request"}],
+                "peer_message_id": "a" * 32,
+            },
+        )
+        if runner_status == "buffered":
+            with pytest.raises(HTTPException, match="buffered"):
+                await orchestration._forward_native_terminal_message(
+                    runner, receiver.id, receiver, body
+                )
+        else:
+            await orchestration._forward_native_terminal_message(
+                runner, receiver.id, receiver, body
+            )
+        # A human follow-up keeps the normal pending-input behavior.
+        body.data.pop("peer_message_id")
+        await orchestration._forward_native_terminal_message(runner, receiver.id, receiver, body)
+
+
 def _build_peer_app(
     *,
     conversation_store: SqlAlchemyConversationStore,

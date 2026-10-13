@@ -1156,7 +1156,9 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
         current_task_status="failed" if error_code else "in_progress",
         last_task_error={"code": error_code, "message": "runner lost"},
     )
-    server = _RecoveryServerClient([child])
+    server = _RecoveryServerClient(
+        [child], child_items=[_assistant_item("item_original", "review complete: LGTM")]
+    )
     server.patch = AsyncMock(return_value=server._Resp({}))
     app = create_runner_app(server_client=server)  # type: ignore[arg-type]
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
@@ -1196,7 +1198,18 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     assert payload["status"] == "completed"
     assert payload["output"] == "review complete: LGTM"
     await _cleanup_drained_subagent_work(payload, server_client=server)
-    server.patch.assert_awaited_once_with(
+    server.patch.assert_any_await(
+        f"/v1/sessions/{CHILD_SESSION_ID}",
+        json={
+            "labels": {
+                subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY: (
+                    f"{DISPATCH_ID}:completed:item_original"
+                )
+            }
+        },
+        timeout=30.0,
+    )
+    server.patch.assert_any_await(
         f"/v1/sessions/{CHILD_SESSION_ID}",
         json={"labels": {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID}},
         timeout=30.0,

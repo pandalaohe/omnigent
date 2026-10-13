@@ -183,6 +183,8 @@ class _SubagentWorkEntry:
     host_id: str | None = None
     placement_label: str | None = None
     delivered_result_key: str | None = None
+    recovery_result: tuple[str, str | None, str | None] | None = None
+    recovery_turn_started: bool = False
     registered_by: str | None = None
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
@@ -591,6 +593,8 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return None
+    if entry.recovery_result is not None:
+        entry.recovery_turn_started = True
     if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
@@ -633,7 +637,9 @@ def unregister_subagent_work(
         _drained_delivered_subagent_results[child_session_id] = entry.delivered_result_key
         _subagent_retained_state_parents[child_session_id] = entry.parent_session_id
     _subagent_work_by_child.pop(child_session_id, None)
-    _in_flight_send_locks.pop(child_session_id, None)
+    lock = _in_flight_send_locks.get(child_session_id)
+    if lock is not None and not lock.locked():
+        _in_flight_send_locks.pop(child_session_id, None)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
     if children is None:
         return
@@ -738,7 +744,7 @@ def _stamped_result_item_id(
     labels: Mapping[str, object], dispatch_id: str
 ) -> tuple[str, str] | None:
     """
-    Return the terminal status and item id a peer-copy restart label pins.
+    Return the original dispatch outcome pinned for restart recovery.
 
     The label reads ``"<work_id>:<status>:<item_id>"`` and only applies to the
     undelivered dispatch. Malformed labels and non-terminal statuses are inert.
@@ -858,7 +864,7 @@ async def _fetch_item_text_by_id(
     server_client: httpx.AsyncClient, session_id: str, item_id: str
 ) -> str | None:
     """
-    Return the joined text of the assistant item with *item_id*, or ``None``.
+    Return an assistant result or persisted sub-agent error by *item_id*.
 
     Reads the bounded item window around the anchor instead of paging the whole
     transcript. A 404, a 400 stale cursor, or a non-assistant item reads as
@@ -894,6 +900,9 @@ async def _fetch_item_text_by_id(
     for item in response.json().get("data", []):
         if item.get("id") != item_id:
             continue
+        if item.get("type") == "error" and item.get("code") == "subagent_result":
+            message = item.get("message")
+            return message if isinstance(message, str) else None
         if item.get("type") != "message" or item.get("role") != "assistant":
             return None
         return "\n".join(
@@ -958,8 +967,8 @@ async def _recover_subagent_results_from_server(
         stamped_result = _stamped_result_item_id(label_map, dispatch_id)
         if stamped_result is not None:
             recover_status, stamped_id = stamped_result
-            text = await _fetch_item_text_by_id(server_client, child_id, stamped_id)
-            if text is None:
+            output = await _fetch_item_text_by_id(server_client, child_id, stamped_id)
+            if output is None:
                 _logger.warning(
                     "Recovery result-item label names a missing item for child=%s "
                     "dispatch=%s item=%s; skipping.",
@@ -968,7 +977,7 @@ async def _recover_subagent_results_from_server(
                     stamped_id,
                 )
                 continue
-            result_key, output = stamped_id, text
+            result_key = stamped_id
             interrupted = False
         elif status == "failed":
             error = child.get("last_task_error")

@@ -1125,6 +1125,7 @@ def register_peer_routes(
                     data={
                         "role": "user",
                         "content": [{"type": "input_text", "text": envelope}],
+                        "peer_message_id": peer_id,
                     },
                 ),
                 **kwargs,

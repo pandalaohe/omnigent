@@ -7476,6 +7476,13 @@ async def _forward_native_terminal_message(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed: {failure}",
         )
+    if body.data.get("peer_message_id"):
+        with contextlib.suppress(ValueError):
+            accepted = resp.json()
+            if isinstance(accepted, dict) and accepted.get("status") == "buffered":
+                # Keep the durable peer record until the CLI transcript proves
+                # acceptance; a process-local buffer can vanish on restart.
+                raise HTTPException(status_code=502, detail="Peer message is buffered")
     # Native-terminal counterpart to the SDK path's turn_dispatched (same event
     # name so a session reads uniformly across harnesses); the message was
     # injected into the live terminal rather than dispatched as a discrete turn.
