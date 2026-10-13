@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
@@ -151,3 +152,80 @@ def test_async_questions_from_item_reads_live_async_calls() -> None:
 def test_async_questions_from_item_rejects_the_text_path(item: dict) -> None:
     """Malformed or non-async items keep the plain-text path."""
     assert fwd.async_questions_from_item(item) is None
+
+
+async def test_image_only_async_answer_keeps_protocol_reply_and_image_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = fwd._CodexAsyncQuestionTracker()
+    question = tracker.register(
+        call_id="call_a",
+        index=0,
+        title="Show the issue",
+        options=None,
+        thread_id=None,
+        turn_id=None,
+    )
+    assert question is not None
+    sent: list[dict] = []
+
+    async def fake_hook(*_args: object, **_kwargs: object) -> dict:
+        return {
+            "answers": {},
+            "_meta": {
+                "omnigent_question_images": {"call_a:0": ["image-a"]},
+                "omnigent_comment_ids": ["comment-a"],
+            },
+        }
+
+    async def fake_post(*_args: object, **kwargs: object) -> fwd._PostResult:
+        sent.append(kwargs)
+        return fwd._PostResult(response=httpx.Response(202))
+
+    monkeypatch.setattr(fwd, "_codex_elicitation_hook_result", fake_hook)
+    monkeypatch.setattr(fwd, "_post_session_event_result", fake_post)
+
+    await tracker._run_wait(None, "session-a", question, fwd._async_question_envelope(question))  # type: ignore[arg-type]
+
+    assert question.answered
+    assert len(sent) == 1
+    assert sent[0]["max_attempts"] == 1
+    assert sent[0]["data"]["content"][1] == {"type": "input_image", "file_id": "image-a"}
+    assert sent[0]["data"]["omnigent_comment_ids"] == ["comment-a"]
+    assert fwd.parse_question_reply(sent[0]["data"]["content"][0]["text"]) == [
+        ("call_a", "Show the issue", 0, "")
+    ]
+
+
+async def test_async_answer_reparks_when_server_reports_native_start_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = fwd._CodexAsyncQuestionTracker()
+    question = tracker.register(
+        call_id="call_a",
+        index=0,
+        title="Show the issue",
+        options=None,
+        thread_id=None,
+        turn_id=None,
+    )
+    assert question is not None
+    restarted: list[int] = []
+
+    async def fake_hook(*_args: object, **_kwargs: object) -> dict:
+        return {"answers": {"call_a:0": {"answers": ["Here"]}}}
+
+    async def fake_post(*_args: object, **_kwargs: object) -> fwd._PostResult:
+        return fwd._PostResult(response=httpx.Response(202, json={"forwarded": False}))
+
+    monkeypatch.setattr(fwd, "_codex_elicitation_hook_result", fake_hook)
+    monkeypatch.setattr(fwd, "_post_session_event_result", fake_post)
+    monkeypatch.setattr(
+        tracker, "_start_wait", lambda *_args: restarted.append(question.generation)
+    )
+
+    await tracker._run_wait(None, "session-a", question, fwd._async_question_envelope(question))  # type: ignore[arg-type]
+
+    assert not question.answered
+    assert question.generation == 1
+    assert restarted == [1]

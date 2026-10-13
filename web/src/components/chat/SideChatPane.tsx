@@ -47,6 +47,7 @@ import { usesNativeSideChatFork } from "@/lib/sideChat";
 import { serializeReplyDraft } from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { clearQuestionCardInputTarget } from "@/lib/questionCardInput";
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
@@ -460,6 +461,7 @@ function SideChatComposer({
           ref: textareaRef,
           value: text,
           onChange: (event) => setText(event.target.value),
+          onFocus: () => clearQuestionCardInputTarget(childId),
           placeholder: "Ask a side question...",
           disabled: !ready,
           "data-testid": "side-chat-input",

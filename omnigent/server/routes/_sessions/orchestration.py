@@ -790,6 +790,7 @@ async def _deliver_with_retry(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    image_ids: list[str] | None = None,
 ) -> bool:
     """
     Post one system message, retrying until it lands or the window elapses.
@@ -812,12 +813,21 @@ async def _deliver_with_retry(
     attempt = 0
     while True:
         try:
-            delivered = await _post_system_message(
-                session_id,
-                text,
-                conversation_store=conversation_store,
-                runner_router=runner_router,
-            )
+            if image_ids:
+                delivered = await _post_system_message(
+                    session_id,
+                    text,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                    image_ids=image_ids,
+                )
+            else:
+                delivered = await _post_system_message(
+                    session_id,
+                    text,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                )
         except Exception:  # noqa: BLE001
             # Broad: a delivery failure must never crash the background
             # verdict handler.
@@ -3655,6 +3665,86 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+def _question_card_image_ids(result: ElicitationResult) -> list[str]:
+    """Read the already-validated image ids in question order."""
+    raw = (result.meta or {}).get("omnigent_question_images")
+    if not isinstance(raw, dict):
+        return []
+    return [file_id for ids in raw.values() if isinstance(ids, list) for file_id in ids]
+
+
+def _validate_question_card_attachments(
+    result: ElicitationResult,
+    session_id: str,
+    params: dict[str, Any] | None,
+    file_store: FileStore | None,
+) -> None:
+    """Reject forged, foreign, or non-image references before resolving a card."""
+    meta = result.meta or {}
+    images = meta.get("omnigent_question_images")
+    comments = meta.get("omnigent_comment_ids")
+    if images is None and comments is None:
+        return
+    if (
+        result.action != "accept"
+        or not isinstance(params, dict)
+        or params.get("async_kind") != "question"
+    ):
+        raise OmnigentError(
+            "Attachments require an accepted async question.", code=ErrorCode.INVALID_INPUT
+        )
+    question_payload = params.get("ask_user_question")
+    questions = question_payload.get("questions") if isinstance(question_payload, dict) else None
+    allowed: set[str] = set()
+    if isinstance(questions, list):
+        for question in questions:
+            if isinstance(question, dict):
+                for name in (question.get("id"), question.get("question")):
+                    if isinstance(name, str) and name:
+                        allowed.add(name)
+    if images is not None:
+        if not isinstance(images, dict) or not images or not allowed or file_store is None:
+            raise OmnigentError("Invalid question images.", code=ErrorCode.INVALID_INPUT)
+        count = 0
+        for key, ids in images.items():
+            if key not in allowed or not isinstance(ids, list) or not ids:
+                raise OmnigentError(
+                    "Invalid question image mapping.", code=ErrorCode.INVALID_INPUT
+                )
+            for file_id in ids:
+                if not isinstance(file_id, str) or not file_id:
+                    raise OmnigentError("Invalid question image id.", code=ErrorCode.INVALID_INPUT)
+                file = file_store.get(file_id, session_id=session_id)
+                if file is None or not (file.content_type or "").startswith("image/"):
+                    raise OmnigentError(
+                        "Question image is missing or not owned by this session.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                count += 1
+        if count > 20:
+            raise OmnigentError("Too many question images.", code=ErrorCode.INVALID_INPUT)
+    if comments is not None:
+        from omnigent.runtime import get_comment_store
+
+        comment_store = get_comment_store()
+        if (
+            not isinstance(comments, list)
+            or not comments
+            or len(comments) > 100
+            or comment_store is None
+        ):
+            raise OmnigentError("Invalid question comments.", code=ErrorCode.INVALID_INPUT)
+        for comment_id in comments:
+            if (
+                not isinstance(comment_id, str)
+                or comment_store.get(comment_id, session_id) is None
+            ):
+                raise OmnigentError(
+                    "Question comment is missing or not owned by this session.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+
 async def _persist_elicitation_answer(
     session_id: str,
     elicitation_id: str,
@@ -3663,8 +3753,8 @@ async def _persist_elicitation_answer(
     conversation_store: ConversationStore,
 ) -> None:
     """Save the user's complete answer before resolving or delivering the card."""
-    content = result.content
-    if not content:
+    content = result.content or {}
+    if not content and not _question_card_image_ids(result):
         return
     answers: list[dict[str, str]] = []
     used: set[str] = set()
@@ -3725,7 +3815,15 @@ async def _persist_elicitation_answer(
         type="message",
         response_id=generate_task_id(),
         data=MessageData(
-            role="user", user_authored=True, content=[{"type": "input_text", "text": text}]
+            role="user",
+            user_authored=True,
+            content=[
+                {"type": "input_text", "text": text},
+                *(
+                    {"type": "input_image", "file_id": file_id}
+                    for file_id in _question_card_image_ids(result)
+                ),
+            ],
         ),
         stable_id=stable_id,
     )
@@ -3744,12 +3842,15 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    file_store: FileStore | None = None,
 ) -> None:
     """Serialize a card's durable receipt and verdict; unused locks are collected."""
     key = (session_id, str(data.get("elicitation_id", "")))
     lock = _elicitation_resolution_locks.setdefault(key, asyncio.Lock())
     async with lock:
-        await _resolve_elicitation_locked(session_id, data, runner_router, conversation_store)
+        await _resolve_elicitation_locked(
+            session_id, data, runner_router, conversation_store, file_store
+        )
 
 
 async def _resolve_elicitation_locked(
@@ -3757,6 +3858,7 @@ async def _resolve_elicitation_locked(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    file_store: FileStore | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -3859,6 +3961,31 @@ async def _resolve_elicitation_locked(
             }
         )
         reuse_verdict = True
+    if (
+        not reuse_verdict
+        and isinstance(data.get("_meta"), dict)
+        and (
+            "omnigent_question_images" in data["_meta"] or "omnigent_comment_ids" in data["_meta"]
+        )
+    ):
+        if pending_entry is None:
+            raise OmnigentError(
+                "Question card is no longer pending.", code=ErrorCode.INVALID_INPUT
+            )
+        try:
+            result_for_attachments = ElicitationResult.model_validate(
+                {key: value for key, value in data.items() if key != "elicitation_id"}
+            )
+        except ValidationError as exc:
+            raise OmnigentError(
+                "Invalid question attachment verdict.", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        _validate_question_card_attachments(
+            result_for_attachments,
+            session_id,
+            pending_entry.get("params"),
+            file_store,
+        )
     if conversation_store is not None and pending_entry is not None:
         params = pending_entry.get("params")
         try:
@@ -8945,7 +9072,7 @@ async def _dispatch_session_event_to_runner_impl(
                 runner_router,
                 created_by=created_by,
             )
-            return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+            return _SessionEventDispatchResult(item_id=item_id, pending_id=None, forwarded=False)
         if ensure_outcome.policy_notice is not None:
             # Terminal is up but policy enforcement is off (fail-open). Post
             # a durable, non-fatal banner; the user message still forwards.
@@ -11080,6 +11207,7 @@ async def _post_system_message(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    image_ids: list[str] | None = None,
 ) -> bool:
     """
     Deliver a synthetic ``[System: …]`` user message to a session's runner.
@@ -11136,9 +11264,22 @@ async def _post_system_message(
         type="message",
         data={
             "role": "user",
-            "content": [{"type": "input_text", "text": text}],
+            "content": [
+                {"type": "input_text", "text": text},
+                *({"type": "input_image", "file_id": file_id} for file_id in (image_ids or [])),
+            ],
         },
     )
+    if image_ids:
+        from omnigent.runtime import get_artifact_store, get_file_store
+
+        file_store = get_file_store()
+        artifact_store = get_artifact_store()
+        if file_store is None or artifact_store is None:
+            return False
+    else:
+        file_store = None
+        artifact_store = None
     agent = (
         await asyncio.to_thread(agent_store.get, conv.agent_id)
         if agent_store is not None and conv.agent_id
@@ -11147,15 +11288,15 @@ async def _post_system_message(
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the session's cached spec.
-        await _dispatch_session_event_to_runner(
+        dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
             body,
             conversation_store,
             runner_client,
             agent_name=None,
-            file_store=None,
-            artifact_store=None,
+            file_store=file_store,
+            artifact_store=artifact_store,
             runner_router=runner_router,
             agent_revision=agent.bundle_location if agent is not None else None,
         )
@@ -11166,7 +11307,7 @@ async def _post_system_message(
             exc_info=True,
         )
         return False
-    return True
+    return dispatch.forwarded
 
 
 async def _wake_parent_for_blocked_child(

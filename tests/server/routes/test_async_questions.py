@@ -13,6 +13,7 @@ Covers design Test Scenarios 1-4, 17 and 18.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -24,10 +25,13 @@ from omnigent.runtime import pending_elicitations, subagent_block_notifier
 from omnigent.runtime.subagent_block_notifier import SubagentBlockNotifier
 from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import routes_events as events_routes
 from omnigent.server.routes.sessions import routes_hooks as hooks_routes
+from omnigent.stores.conversation_store import DetachedCard
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
@@ -62,6 +66,7 @@ class _DeliveryRecorder:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.image_calls: list[list[str]] = []
 
     async def __call__(
         self,
@@ -70,8 +75,10 @@ class _DeliveryRecorder:
         *,
         conversation_store: Any,
         runner_router: Any,
+        image_ids: list[str] | None = None,
     ) -> bool:
         self.calls.append((session_id, text))
+        self.image_calls.append(image_ids or [])
         return True
 
 
@@ -87,10 +94,13 @@ async def _post_approval(
     elicitation_id: str,
     action: str,
     content: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> httpx.Response:
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
     if content is not None:
         data["content"] = content
+    if meta is not None:
+        data["_meta"] = meta
     return await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "approval", "data": data},
@@ -203,6 +213,216 @@ async def test_async_question_happy_path(
         )
     finally:
         await collector.stop()
+
+
+async def test_async_question_image_only_answer_keeps_references_and_rejects_foreign_files(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+    _, session_id = await _create_agent_session(client, "test-async-question-image")
+    _, other_id = await _create_agent_session(client, "test-async-question-other")
+    file_store = SqlAlchemyFileStore(db_uri)
+    image = file_store.create("diagram.png", 3, "image/png", session_id=session_id)
+    foreign = file_store.create("other.png", 3, "image/png", session_id=other_id)
+    non_image = file_store.create("notes.txt", 3, "text/plain", session_id=session_id)
+    collector = await start_session_stream_collector(session_id)
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/async-questions",
+            json={"questions": [{"question": "Show the issue"}]},
+        )
+        assert response.status_code == 200
+        elicitation_id = (await _next_elicitation(collector))["elicitation_id"]
+        for invalid_id in (foreign.id, non_image.id, "0" * 32):
+            rejected = await _post_approval(
+                client,
+                session_id,
+                elicitation_id,
+                "accept",
+                {"Show the issue": ""},
+                {"omnigent_question_images": {"Show the issue": [invalid_id]}},
+            )
+            assert rejected.status_code == 400, (invalid_id, rejected.text)
+            assert pending_elicitations.count_for(session_id) == 1
+        accepted = await _post_approval(
+            client,
+            session_id,
+            elicitation_id,
+            "accept",
+            {"Show the issue": ""},
+            {"omnigent_question_images": {"Show the issue": [image.id]}},
+        )
+        assert accepted.status_code == 202, accepted.text
+        await _wait_until(lambda: bool(delivered.calls))
+        assert delivered.image_calls == [[image.id]]
+        items = await client.get(f"/v1/sessions/{session_id}/items")
+        assert items.status_code == 200, items.text
+        answers = [
+            item
+            for item in items.json()["data"]
+            if item.get("role") == "user"
+            and any(
+                block.get("text", "").startswith("[System: Question answered]\n")
+                for block in item.get("content", [])
+            )
+        ]
+        assert len(answers) == 1
+        assert {"type": "input_image", "file_id": image.id} in answers[0]["content"]
+    finally:
+        await collector.stop()
+
+
+async def test_async_question_image_delivery_dispatches_image_with_file_store(
+    client: httpx.AsyncClient,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session_id = await _create_agent_session(client, "test-async-image-dispatch")
+    runner_client = object()
+    file_store = object()
+    artifact_store = object()
+    dispatched: list[tuple[list[dict[str, Any]], object, object]] = []
+
+    async def bound_runner(*_args: object) -> object:
+        return runner_client
+
+    async def dispatch(*args: Any, **kwargs: Any) -> Any:
+        dispatched.append(
+            (args[2].data["content"], kwargs["file_store"], kwargs["artifact_store"])
+        )
+        return orchestration._SessionEventDispatchResult(item_id=None, pending_id=None)
+
+    import omnigent.runtime as runtime
+
+    monkeypatch.setattr(orchestration, "_get_runner_client", bound_runner)
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(runtime, "get_file_store", lambda: file_store)
+    monkeypatch.setattr(runtime, "get_artifact_store", lambda: artifact_store)
+
+    delivered = await orchestration._post_system_message(
+        session_id,
+        "[System: answers to your question card]",
+        conversation_store=conv_store,
+        runner_router=None,
+        image_ids=["image-a"],
+    )
+
+    assert delivered
+    assert dispatched == [
+        (
+            [
+                {"type": "input_text", "text": "[System: answers to your question card]"},
+                {"type": "input_image", "file_id": "image-a"},
+            ],
+            file_store,
+            artifact_store,
+        )
+    ]
+
+    async def failed_dispatch(*_args: Any, **_kwargs: Any) -> Any:
+        return orchestration._SessionEventDispatchResult(
+            item_id="failure-item", pending_id=None, forwarded=False
+        )
+
+    monkeypatch.setattr(orchestration, "_dispatch_session_event_to_runner", failed_dispatch)
+    assert not await orchestration._post_system_message(
+        session_id,
+        "[System: answers to your question card]",
+        conversation_store=conv_store,
+        runner_router=None,
+        image_ids=["image-a"],
+    )
+
+
+async def test_restored_answered_card_redelivers_its_image_metadata(
+    client: httpx.AsyncClient,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session_id = await _create_agent_session(client, "test-async-image-restoration")
+    now = int(time.time())
+    conv_store.add_detached_card(
+        DetachedCard(
+            elicitation_id="restored-image-card",
+            session_id=session_id,
+            kind="question",
+            state="answered",
+            mirror=False,
+            params={},
+            payload={"qid": "q1", "questions": [{"question": "Show the issue"}]},
+            grant_key=None,
+            verdict={
+                "action": "accept",
+                "content": {"Show the issue": ""},
+                "_meta": {"omnigent_question_images": {"Show the issue": ["image-restored"]}},
+            },
+            delivery_text="[System: answers to your question card #q1]",
+            created_at=now,
+            expires_at=now + 60,
+        )
+    )
+    delivered = _DeliveryRecorder()
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", delivered)
+
+    await hooks_routes.restore_detached_cards(conv_store, runner_router=None)
+    await _wait_until(lambda: bool(delivered.calls))
+    await _wait_until(lambda: not conv_store.list_detached_cards())
+
+    assert delivered.calls == [(session_id, "[System: answers to your question card #q1]")]
+    assert delivered.image_calls == [["image-restored"]]
+
+
+async def test_failed_dispatch_does_not_mark_question_comments_addressed(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session_id = await _create_agent_session(client, "test-async-comment-dispatch-failure")
+    updated: list[str] = []
+
+    class Comments:
+        def get(self, comment_id: str, owner_session_id: str) -> object | None:
+            return (
+                object() if (comment_id, owner_session_id) == ("comment-a", session_id) else None
+            )
+
+        def update_comment(self, comment_id: str, *_args: Any, **_kwargs: Any) -> None:
+            updated.append(comment_id)
+
+    async def runner(*_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+    async def relay(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def failed_dispatch(*_args: Any, **_kwargs: Any) -> Any:
+        return orchestration._SessionEventDispatchResult(
+            item_id="failure-item", pending_id=None, forwarded=False
+        )
+
+    import omnigent.runtime as runtime
+
+    monkeypatch.setattr(runtime, "get_comment_store", lambda: Comments())
+    monkeypatch.setattr(events_routes, "_get_runner_client", runner)
+    monkeypatch.setattr(events_routes, "_ensure_runner_relay_ready", relay)
+    monkeypatch.setattr(events_routes, "_dispatch_session_event_to_runner", failed_dispatch)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "reply"}],
+                "omnigent_comment_ids": ["comment-a"],
+            },
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert updated == []
 
 
 async def test_async_question_shape_errors_and_many_questions(

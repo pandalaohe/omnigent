@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearQuestionCardInputTarget, setQuestionCardInputTarget } from "@/lib/questionCardInput";
 import { useChatStore } from "@/store/chatStore";
 import {
   commentsQueryKey,
@@ -67,6 +68,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearQuestionCardInputTarget("conv_1");
   vi.unstubAllGlobals();
 });
 
@@ -365,6 +367,103 @@ describe("useSendCommentsToAgent", () => {
     const files = sendMock.mock.calls[0][2] as File[];
     expect(files.map((file) => file.name)).toEqual(["shot-1.jpg", "shot-2.png"]);
     expect(files.map((file) => file.type)).toEqual(["image/jpeg", "image/png"]);
+  });
+
+  it("stages comments and screenshots in the focused async card without sending or marking them", async () => {
+    const field = document.createElement("textarea");
+    document.body.append(field);
+    const insert = vi.fn().mockReturnValue(true);
+    setQuestionCardInputTarget({
+      sessionId: "conv_1",
+      cardId: "card-a",
+      questionKey: "q1",
+      element: field,
+      insert,
+    });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse(attachedResponse))
+      .mockResolvedValueOnce(fileResponse("image/jpeg"))
+      .mockResolvedValueOnce(fileResponse("image/png"));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1", "c2"] });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toMatchObject({ staged: true });
+    expect(insert).toHaveBeenCalledOnce();
+    const [text, files, ids] = insert.mock.calls[0] as [string, File[], string[]];
+    expect(text).toBe("please address these");
+    expect(files.map((file) => file.name)).toEqual(["shot-1.jpg", "shot-2.png"]);
+    expect(ids).toEqual(["c1", "c2"]);
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueMock).not.toHaveBeenCalled();
+    expect(addressedPatchCalls()).toEqual([]);
+    field.remove();
+  });
+
+  it("never falls back to sending when the active card rejects a comment batch", async () => {
+    const field = document.createElement("textarea");
+    document.body.append(field);
+    setQuestionCardInputTarget({
+      sessionId: "conv_1",
+      cardId: "card-a",
+      questionKey: "q1",
+      element: field,
+      insert: () => false,
+    });
+    fetchMock.mockResolvedValueOnce(mockResponse(sendResponse));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1"], respectQueue: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect((result.current.error as Error).message).toContain("could not accept");
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueMock).not.toHaveBeenCalled();
+    expect(addressedPatchCalls()).toEqual([]);
+    field.remove();
+  });
+
+  it("does not redirect a pending comment format request into a newly focused card", async () => {
+    const oldField = document.createElement("textarea");
+    const newField = document.createElement("textarea");
+    document.body.append(oldField, newField);
+    const oldInsert = vi.fn().mockReturnValue(true);
+    const newInsert = vi.fn().mockReturnValue(true);
+    setQuestionCardInputTarget({
+      sessionId: "conv_1",
+      cardId: "old",
+      questionKey: "q1",
+      element: oldField,
+      insert: oldInsert,
+    });
+    let finish: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderSend(queryClient);
+    result.current.mutate({ comment_ids: ["c1"] });
+    await waitFor(() => expect(finish).not.toBeNull());
+    setQuestionCardInputTarget({
+      sessionId: "conv_1",
+      cardId: "new",
+      questionKey: "q2",
+      element: newField,
+      insert: newInsert,
+    });
+    finish!(mockResponse(sendResponse));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(oldInsert).not.toHaveBeenCalled();
+    expect(newInsert).not.toHaveBeenCalled();
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(addressedPatchCalls()).toEqual([]);
+    oldField.remove();
+    newField.remove();
   });
 
   it("aborts with nothing sent when an attachment fetch fails", async () => {

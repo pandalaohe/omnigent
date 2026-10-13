@@ -251,6 +251,11 @@ import { useComments } from "@/hooks/useComments";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
+import {
+  clearQuestionCardInputTarget,
+  insertIntoQuestionCard,
+  quoteForQuestionCard,
+} from "@/lib/questionCardInput";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -2070,7 +2075,14 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
             containerRef={conversationRef}
-            onReply={(text) => composerRef.current?.appendReplyQuote(text)}
+            onReply={(text) => {
+              if (
+                !conversationId ||
+                insertIntoQuestionCard(conversationId, quoteForQuestionCard(text)) === "absent"
+              ) {
+                composerRef.current?.appendReplyQuote(text);
+              }
+            }}
             onAskInSideChat={
               supportsSideChat(selectionSessionHarness)
                 ? (text) => composerRef.current?.startSideChat(text)
@@ -4343,6 +4355,7 @@ function ComposerImpl(
   };
 
   const handleTextFocus = (id: string | null, element: HTMLTextAreaElement) => {
+    if (conversationId) clearQuestionCardInputTarget(conversationId);
     textareaRef.current = element;
     focusedFieldRef.current = true;
     focusText(id);

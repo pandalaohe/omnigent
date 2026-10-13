@@ -108,6 +108,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _deliver_with_retry,
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
+    _question_card_image_ids,
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
     start_detached_elicitation,
@@ -437,6 +438,7 @@ async def _deliver_card_verdict(
     granted: bool,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    result: ElicitationResult | None = None,
 ) -> None:
     """
     Deliver an answered card's message, then drop what is no longer owed.
@@ -451,12 +453,40 @@ async def _deliver_card_verdict(
     :param runner_router: Router used to reach the runner.
     :returns: None.
     """
-    await _deliver_with_retry(
+    if result is None and card.verdict is not None:
+        result = ElicitationResult.model_validate(card.verdict)
+    image_ids = _question_card_image_ids(result) if result is not None else []
+    delivered = await _deliver_with_retry(
         card.session_id,
         text,
         conversation_store=conversation_store,
         runner_router=runner_router,
+        **({"image_ids": image_ids} if image_ids else {}),
     )
+    if delivered and result is not None:
+        comment_ids = (result.meta or {}).get("omnigent_comment_ids")
+        if isinstance(comment_ids, list):
+            from omnigent.runtime import get_comment_store
+
+            comment_store = get_comment_store()
+            if comment_store is not None:
+                for comment_id in comment_ids:
+                    try:
+                        await asyncio.to_thread(
+                            comment_store.update_comment,
+                            comment_id,
+                            card.session_id,
+                            status="addressed",
+                        )
+                    except Exception:
+                        # The answer has already reached the runner. A status
+                        # failure must not resend it during recovery.
+                        _logger.warning(
+                            "Question comment status update failed: session=%s comment=%s",
+                            card.session_id,
+                            comment_id,
+                            exc_info=True,
+                        )
     if granted:
         await _write_card_record(
             conversation_store.update_detached_card, card.elicitation_id, state="settled"
@@ -518,6 +548,7 @@ def _detached_card_callback(
             granted=granted,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            result=result,
         )
 
     return _on_result

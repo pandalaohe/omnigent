@@ -51,6 +51,7 @@ from omnigent.server.schemas import (
     ElicitationResult,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
 # Level needed to view or answer an elicitation. Elicitations carry
@@ -67,6 +68,7 @@ def register_elicitations_routes(
     *,
     conversation_store: ConversationStore,
     agent_store: AgentStore,
+    file_store: FileStore | None = None,
     runner_router: RunnerRouter | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
@@ -135,7 +137,9 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        await _resolve_elicitation(
+            session_id, _resolve_data, runner_router, conversation_store, file_store
+        )
         # A human answer counts as the caller's last interaction; a runner's
         # own resolve does not.
         if not _has_runner_tunnel_authority(request, conv, runner_tunnel_tokens):
