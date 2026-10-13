@@ -11,11 +11,17 @@ import yaml
 
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.harnesses.codex_native.bridge import build_codex_native_spawn_env
 from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
 _AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
+
+
+def test_native_spawn_env_uses_own_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent")
+    assert build_codex_native_spawn_env("child")["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == ("child")
 
 
 @pytest.mark.parametrize(
@@ -329,6 +335,25 @@ def test_build_codex_remote_args_omits_absent_agent_pid() -> None:
     )
 
     assert not any("COLLAB_AGENT_PID" in arg for arg in args)
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "codex_cli_version"),
+    [(None, None), ("thread_host", (0, 153, 1)), ("thread_host", (0, 154, 0))],
+)
+def test_build_codex_remote_args_uses_current_session_id(
+    thread_id: str | None, codex_cli_version: tuple[int, int, int] | None
+) -> None:
+    key = "shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID="
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("-c", f'{key}"parent"'),
+        thread_id=thread_id,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=codex_cli_version,
+        session_id="child",
+    )
+    assert [arg for arg in args if arg.startswith(key)][-1] == f'{key}"child"'
+    assert args.index(f'{key}"child"') < args.index("--remote")
 
 
 @pytest.mark.parametrize(

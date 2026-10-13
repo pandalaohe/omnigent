@@ -5597,8 +5597,9 @@ def test_app_server_negotiates_direct_tools_from_server_version(
 
 
 @pytest.mark.parametrize("with_tools", [True, False])
+@pytest.mark.parametrize("session_id", [None, "child"])
 def test_app_server_thread_start_config_carries_native_server_pid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_tools: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_tools: bool, session_id: str | None
 ) -> None:
     """The native app-server pid reaches shell tools via thread config."""
     monkeypatch.setattr(
@@ -5619,7 +5620,10 @@ def test_app_server_thread_start_config_carries_native_server_pid(
 
     async def _t() -> None:
         session = _CodexAppServerSession(
-            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+            codex_path="/fixture/codex",
+            cwd=str(tmp_path),
+            env={"OMNIGENT_RUNNER_PRIMARY_SESSION_ID": session_id} if session_id else {},
+            tool_executor=None,
         )
         session._request = AsyncMock(
             side_effect=[
@@ -5663,6 +5667,11 @@ def test_app_server_thread_start_config_carries_native_server_pid(
                 assert params["config"]["shell_environment_policy.set.COLLAB_AGENT_PID"] == (
                     "4242"
                 )
+                key = "shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
+                if session_id:
+                    assert params["config"][key] == session_id
+                else:
+                    assert key not in params["config"]
                 assert session._agent_pid == 4242
                 assert native_pid_calls == [(fake_process.pid, "app-server")]
             finally:
@@ -6255,6 +6264,11 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
     env = _clean_codex_env()
 
     assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
+def test_clean_codex_env_preserves_primary_session_id(monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "child")
+    assert _clean_codex_env()["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == "child"
 
 
 # ---------------------------------------------------------------------------

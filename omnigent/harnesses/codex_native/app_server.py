@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
 from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
@@ -83,6 +84,7 @@ from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     CODEX_AGENT_PID_CONFIG_KEY,
+    CODEX_PRIMARY_SESSION_ID_CONFIG_KEY,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -2349,11 +2351,20 @@ class CodexNativeAppServer:
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
+        if self.session_id:
+            self.env[PRIMARY_SESSION_ID_ENV_VAR] = self.session_id
+        else:
+            self.env.pop(PRIMARY_SESSION_ID_ENV_VAR, None)
+        config_overrides = [*self.config_overrides]
+        if self.session_id:
+            config_overrides.append(
+                f"{CODEX_PRIMARY_SESSION_ID_CONFIG_KEY}={json.dumps(self.session_id)}"
+            )
         argv = _build_native_codex_app_server_argv(
             codex_argv0=Path(self.codex_path).name,
             session_tag=self.process_registry_tag,
             listen_url=resolved_listen,
-            config_overrides=self.config_overrides,
+            config_overrides=config_overrides,
         )
         app_server_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         # An inherited value would name the parent's app-server, not this one.
@@ -4617,6 +4628,7 @@ async def preload_codex_thread_for_resume(
     retain_client: bool = False,
     cwd: Path | None = None,
     agent_pid: int | None = None,
+    session_id: str | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -4652,6 +4664,9 @@ async def preload_codex_thread_for_resume(
         if agent_pid is not None:
             config = cast(CodexParams, params.setdefault("config", {}))
             config[CODEX_AGENT_PID_CONFIG_KEY] = str(agent_pid)
+        if session_id:
+            config = cast(CodexParams, params.setdefault("config", {}))
+            config[CODEX_PRIMARY_SESSION_ID_CONFIG_KEY] = session_id
         args = canonical_codex_launch_args(terminal_launch_args or ())
         additional_roots: list[str] = []
         effective_cwd = cwd or Path.cwd()
@@ -4803,13 +4818,16 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
-    return {
+    env = {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
         if key
         in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
+    if app_server.session_id:
+        env[PRIMARY_SESSION_ID_ENV_VAR] = app_server.session_id
+    return env
 
 
 # Codex's full-bypass flag. Disables BOTH the approval prompts and the
@@ -4949,6 +4967,7 @@ def build_codex_remote_args(
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
     agent_pid: int | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -5034,6 +5053,10 @@ def build_codex_remote_args(
             "-c",
             f"{CODEX_AGENT_PID_CONFIG_KEY}={json.dumps(str(agent_pid))}",
         ]
+    if session_id:
+        agent_pid_args.extend(
+            ["-c", f"{CODEX_PRIMARY_SESSION_ID_CONFIG_KEY}={json.dumps(session_id)}"]
+        )
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
         # bypass flag (a global flag, so it precedes any ``resume``).

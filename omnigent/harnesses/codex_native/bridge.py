@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import tomllib
 
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.native import native_bridge_common
 
@@ -236,6 +237,7 @@ def build_codex_native_spawn_env(
     return {
         CODEX_NATIVE_BRIDGE_DIR_ENV_VAR: str(bridge_dir_for_bridge_id(resolved_bridge_id)),
         CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR: conversation_id,
+        PRIMARY_SESSION_ID_ENV_VAR: conversation_id,
     }
 
 
