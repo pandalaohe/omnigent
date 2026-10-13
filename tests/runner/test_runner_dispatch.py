@@ -6632,24 +6632,24 @@ def _assert_unconfirmed_hard_stop(output: Any, *, task_id: str) -> None:
             None,
         ),
         (
-            "opencode_running_best_effort",
+            "opencode_running_stop_session",
             "opencode-native-ui",
             "running",
             None,
             204,
-            "interrupt",
-            True,
+            "stop_session",
+            False,
             "running",
             None,
         ),
         (
-            "antigravity_running_best_effort",
+            "antigravity_running_stop_session",
             "antigravity-native-ui",
             "running",
             None,
             204,
-            "interrupt",
-            True,
+            "stop_session",
+            False,
             "running",
             None,
         ),
@@ -6739,9 +6739,8 @@ async def test_sys_cancel_task_native_harness_cancel_matrix(
     * ``claude_running_stop_session`` / ``goose_running_stop_session`` — both
       stop-capable natives must POST ``stop_session``. On main, Goose is
       routed to ``interrupt``.
-    * ``opencode_running_best_effort`` / ``antigravity_running_best_effort`` —
-      no runner-side hard-stop; result is best-effort/unconfirmed, not a
-      fake kill.
+    * ``opencode_running_stop_session`` / ``antigravity_running_stop_session`` —
+      both route to the runner-owned resource stop.
     * ``failed_dead_pane_cached_failure`` — a failed Claude entry whose pane
       is gone must return the cached failure. Routing ``stop_session`` at a
       dead pane answers 503; that must not replace the terminal status.

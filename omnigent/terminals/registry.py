@@ -43,6 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 from omnigent._platform import IS_POSIX
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -260,34 +261,46 @@ class TerminalRegistry:
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
         created.instance.lifecycle_trace.transfer_session(conversation_id)
-        await created.instance.launch(cwd=created.cwd)
-        if not await created.instance.is_alive():
-            created.instance.lifecycle_trace.note_exit()
+        try:
+            await created.instance.launch(cwd=created.cwd)
+            if not await created.instance.is_alive():
+                created.instance.lifecycle_trace.note_exit()
+                raise TerminalExitedDuringLaunch(created.instance)
+
+            if IS_POSIX:
+                # The daemonized tmux server needs an explicit owner record.
+                try:
+                    pid = await created.instance.server_pid()
+                    if pid is not None:
+                        await asyncio.to_thread(
+                            write_owner_entry,
+                            pid=pid,
+                            conversation_id=conversation_id,
+                            kind="tmux",
+                        )
+                except Exception:
+                    logger.debug("tmux owner-file write failed", exc_info=True)
+        except BaseException:
+            # Cancellation can arrive after spawning but before registration.
             try:
                 await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
+            except BaseException:
+                with self._lock:
+                    slot = self._by_conversation.setdefault(conversation_id, {})
+                    retry_key = key
+                    if retry_key in slot:
+                        retry_key = (terminal_name, f"{session_key}:cleanup:{uuid4().hex}")
+                    slot[retry_key] = created.instance
+                    self._instance_locks[(conversation_id, *retry_key)] = threading.Lock()
                 logger.warning(
-                    "Newly launched terminal close timed out for %s:%s in conv %s",
+                    "Unregistered terminal cleanup failed for %s:%s in conv %s; "
+                    "retained for retry",
                     terminal_name,
                     session_key,
                     conversation_id,
+                    exc_info=True,
                 )
-            raise TerminalExitedDuringLaunch(created.instance)
-
-        if IS_POSIX:
-            # The tmux server daemonizes away from this runner, so the host
-            # sampler can only attribute it through this record.
-            try:
-                pid = await created.instance.server_pid()
-                if pid is not None:
-                    await asyncio.to_thread(
-                        write_owner_entry,
-                        pid=pid,
-                        conversation_id=conversation_id,
-                        kind="tmux",
-                    )
-            except Exception:
-                logger.debug("tmux owner-file write failed", exc_info=True)
+            raise
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})

@@ -5,14 +5,17 @@ HTTP-path tests in ``test_app_sessions_native_events_lifecycle.py`` /
 ``test_app_sessions_native_supervision.py`` (which POST to ``/events`` and patch
 the bridge-module control functions). The focus here is the registry dispatch
 and the descriptor-collapsed uniform handlers: which harnesses route where, the
-no-handler fall-through contract (antigravity/opencode), and the 503 mapping.
+soft-interrupt fall-through contract, and the 503 mapping.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -45,6 +48,9 @@ class _FakeResourceRegistry:
 
     async def close_terminal(self, conv_id: str, terminal_id: str) -> bool:
         return True
+
+    async def close_terminal_detailed(self, *args: Any, **kwargs: Any) -> str:
+        return "closed"
 
 
 def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any]]:
@@ -93,6 +99,13 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
     def _work_id_for_session(conv_id: str) -> str | None:
         return captured["current_work_id"]
 
+    from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
+
+    lifecycle = SessionRuntimeLifecycle()
+
+    async def _cancel_turn(conv_id: str) -> None:
+        return None
+
     kwargs: dict[str, Any] = {
         "server_client": SimpleNamespace(),
         "resource_registry": _FakeResourceRegistry(),
@@ -104,6 +117,8 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         "client_safe_error_detail": _client_safe,
         "logger": logging.getLogger("test.interrupt"),
         "subagent_work_id_for_session": _work_id_for_session,
+        "runtime_lock_for_session": lifecycle.lock_for,
+        "cancel_session_turn": _cancel_turn,
     }
     kwargs.update(overrides)
     return NativeInterruptRunner(**kwargs), captured
@@ -119,7 +134,7 @@ def test_native_cancel_capability_follows_stop_registry() -> None:
 
     for agent in NATIVE_CODING_AGENTS:
         capability = native_cancel_capability(agent.wrapper_label)
-        if agent.key == "claude" or agent.key in _UNIFORM_STOP:
+        if agent.key in {"claude", "antigravity", "opencode"} or agent.key in _UNIFORM_STOP:
             assert capability == "stop", agent.key
         else:
             assert capability == "best_effort", agent.key
@@ -157,7 +172,235 @@ async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
     """Harnesses without an interrupt/stop handler return None (caller falls through)."""
     runner, _ = _make_runner()
     assert await runner.interrupt(harness, "conv_x") is None
-    assert await runner.stop(harness, "conv_x") is None
+    if harness in {"claude-sdk", None}:
+        assert await runner.stop(harness, "conv_x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native"])
+@pytest.mark.parametrize("already_exited", [False, True])
+async def test_owned_native_stop_ends_only_target_process(
+    harness: str, already_exited: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two sessions share a runner, but own separate CLI panes and servers."""
+
+    import psutil
+
+    from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.terminals import TerminalRegistry
+
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux is required for the process ownership check")
+    registry = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    servers = {}
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", servers)
+    monkeypatch.setattr(orchestration, "_AUTO_FORWARDER_TASKS", {})
+
+    async def ready(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", ready)
+    name = harness.removesuffix("-native")
+    spec = TerminalEnvSpec(command=sys.executable, args=["-c", "import time; time.sleep(60)"])
+    processes = []
+    try:
+        target = await registry.launch("conv_target", name, "main", spec)
+        sibling = await registry.launch("conv_sibling", name, "main", spec)
+        target_pid = target.pane_pid_sync()
+        sibling_pid = sibling.pane_pid_sync()
+        assert target_pid is not None and sibling_pid is not None
+        target_process = psutil.Process(target_pid)
+        sibling_process = psutil.Process(sibling_pid)
+        if harness == "opencode-native":
+            for session_id in ["conv_target", "conv_sibling"]:
+                server = OpenCodeNativeServer(
+                    bridge_dir=tmp_path / session_id,
+                    workspace=tmp_path,
+                    opencode_path=sys.executable,
+                    verify_version=False,
+                )
+                monkeypatch.setattr(
+                    server,
+                    "build_argv",
+                    lambda: [sys.executable, "-c", "import time; time.sleep(60)"],
+                )
+                await server.start()
+                process = server.process
+                assert process is not None
+                processes.append(process)
+                server.process = process
+                servers[session_id] = server
+        if already_exited:
+            target_process.terminate()
+            await asyncio.to_thread(target_process.wait, 2)
+            if processes:
+                processes[0].terminate()
+                await asyncio.to_thread(processes[0].wait, 2)
+        runner, captured = _make_runner(resource_registry=resources)
+        response = await runner.stop(harness, "conv_target")
+        assert response is not None and response.status_code == 204
+        await asyncio.to_thread(target_process.wait, 2)
+        assert sibling_process.is_running()
+        assert await sibling.is_alive()
+        if processes:
+            assert processes[0].poll() is not None
+            assert processes[1].poll() is None
+            assert "conv_sibling" in servers
+        assert captured["wakes"] == [("conv_target", "cancelled", None)]
+        response = await runner.stop(harness, "conv_target")
+        assert response is not None and response.status_code == 204
+    finally:
+        await registry.shutdown()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            await asyncio.to_thread(process.wait, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native"])
+async def test_owned_native_stop_failure_does_not_claim_idle(
+    harness: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    resources = _FakeResourceRegistry()
+    instance = SimpleNamespace(is_alive=AsyncMock(return_value=True))
+    entry = SimpleNamespace(terminal_name="native", session_key="main", instance=instance)
+    monkeypatch.setattr(resources.terminal_registry, "list_for_conversation", lambda _: [entry])
+    monkeypatch.setattr(
+        resources, "close_terminal_detailed", AsyncMock(return_value="close_failed")
+    )
+    runner, captured = _make_runner(resource_registry=resources)
+    response = await runner.stop(harness, "conv_target")
+    assert response is not None and response.status_code == 503
+    assert captured["wakes"] == []
+    assert captured["published"] == []
+    resources.close_terminal_detailed.assert_awaited_once_with(
+        "conv_target", "terminal_native_main", expected_instance=instance
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native"])
+async def test_owned_native_stop_waits_for_launch_registration(
+    harness: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.session_runtime_lifecycle import SessionRuntimeLifecycle
+
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_FORWARDER_TASKS", {})
+    resources = _FakeResourceRegistry()
+    entries = []
+    instance = SimpleNamespace(is_alive=AsyncMock(return_value=False))
+    monkeypatch.setattr(resources.terminal_registry, "list_for_conversation", lambda _: entries)
+    close = AsyncMock(return_value="closed")
+    monkeypatch.setattr(resources, "close_terminal_detailed", close)
+    lifecycle = SessionRuntimeLifecycle()
+    runner, captured = _make_runner(
+        resource_registry=resources, runtime_lock_for_session=lifecycle.lock_for
+    )
+    async with lifecycle.lock_for("conv_target").shared():
+        stop = asyncio.create_task(runner.stop(harness, "conv_target"))
+        await asyncio.sleep(0)
+        assert not stop.done()
+        assert captured["wakes"] == []
+        entries.append(
+            SimpleNamespace(terminal_name="native", session_key="main", instance=instance)
+        )
+    response = await stop
+    assert response is not None and response.status_code == 204
+    close.assert_awaited_once_with(
+        "conv_target", "terminal_native_main", expected_instance=instance
+    )
+
+
+@pytest.mark.asyncio
+async def test_owned_native_stop_keeps_replacement_forwarder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.native import orchestration
+
+    old_task = asyncio.create_task(asyncio.Event().wait())
+    new_task = asyncio.create_task(asyncio.Event().wait())
+    new_server = SimpleNamespace(close=AsyncMock())
+    servers = {}
+    tasks = {"conv_target": old_task}
+
+    async def close_old_server() -> None:
+        servers["conv_target"] = new_server
+        tasks["conv_target"] = new_task
+
+    old_server = SimpleNamespace(close=close_old_server)
+    servers["conv_target"] = old_server
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", servers)
+    monkeypatch.setattr(orchestration, "_AUTO_FORWARDER_TASKS", tasks)
+    runner, _ = _make_runner()
+    try:
+        response = await runner.stop("opencode-native", "conv_target")
+        assert response is not None and response.status_code == 204
+        assert old_task.cancelled()
+        assert not new_task.done()
+        assert tasks["conv_target"] is new_task
+        assert servers["conv_target"] is new_server
+        new_server.close.assert_not_awaited()
+    finally:
+        old_task.cancel()
+        new_task.cancel()
+        await asyncio.gather(old_task, new_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["antigravity-native", "opencode-native"])
+async def test_http_owned_native_stop_waits_for_runtime_registration(
+    harness: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runner.native import orchestration
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.helpers import make_test_terminal_instance
+    from tests.runner.native_helpers import _harness_spec
+
+    async def no_vendor_launch(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(orchestration, "_auto_create_antigravity_terminal", no_vendor_launch)
+    monkeypatch.setattr(orchestration, "_auto_create_opencode_terminal", no_vendor_launch)
+    monkeypatch.setattr(orchestration, "_AUTO_FORWARDER_TASKS", {})
+    monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {})
+    registry = TerminalRegistry()
+    app, _ = await _build_app_for_spec(_harness_spec(harness), terminal_registry=registry)
+    session_id = "conv_starting"
+    name = harness.removesuffix("-native")
+    instance = make_test_terminal_instance(name, "main", tmp_path)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "agent"}
+        )
+        assert created.status_code == 201
+        async with app.state.cli_runtime_lifecycle.lock_for(session_id).shared():
+            stop = asyncio.create_task(
+                client.post(f"/v1/sessions/{session_id}/events", json={"type": "stop_session"})
+            )
+            await asyncio.sleep(0)
+            assert not stop.done()
+            registry._by_conversation[session_id] = {(name, "main"): instance}
+        response = await stop
+        assert response.status_code == 204, response.text
+        assert not instance.running
+        assert registry.get(session_id, name, "main") is None
 
 
 @pytest.mark.asyncio
