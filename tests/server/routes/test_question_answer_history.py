@@ -218,16 +218,20 @@ async def test_claude_async_answer_is_saved_even_when_delivery_fails(
             "answers": [{"question": "What next?", "answer": "Check mobile first.\nThen review."}],
         }
     ]
-    if final_failure:
-        async with asyncio.timeout(3):
-            while True:
-                items = await client.get(f"/v1/sessions/{session_id}/items")
-                if any(item.get("code") == "answer_undelivered" for item in items.json()["data"]):
-                    break
-                await asyncio.sleep(0.01)
-        assert (await _records(client, session_id))[0]["answers"][0][
-            "answer"
-        ] == "Check mobile first.\nThen review."
+    async with asyncio.timeout(3):
+        while True:
+            items = await client.get(f"/v1/sessions/{session_id}/items")
+            waiting = [
+                item for item in items.json()["data"] if item.get("code") == "answer_waiting"
+            ]
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+    assert len(waiting) == 1
+    assert not any(item.get("code") == "answer_undelivered" for item in items.json()["data"])
+    assert (await _records(client, session_id))[0]["answers"][0][
+        "answer"
+    ] == "Check mobile first.\nThen review."
 
 
 async def test_claude_sdk_question_is_recorded_with_its_full_prompt(
