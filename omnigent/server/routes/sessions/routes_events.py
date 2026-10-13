@@ -784,6 +784,23 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
         )
 
 
+def _borrows_parent_runner(conversation_store: ConversationStore, conv: Conversation) -> bool:
+    """
+    Report whether a session runs on its parent's runner rather than its own.
+
+    A child co-located on its parent's runner may still carry a host binding,
+    so ``host_id`` alone cannot tell the runner's owner from a borrower.
+
+    :param conversation_store: Store used to read the parent row.
+    :param conv: The session row to classify.
+    :returns: ``True`` when the parent is bound to the same runner.
+    """
+    if conv.runner_id is None or conv.parent_conversation_id is None:
+        return False
+    parent = conversation_store.get_conversation(conv.parent_conversation_id)
+    return parent is not None and parent.runner_id == conv.runner_id
+
+
 async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
     """
     Report whether a session's user-run host has no live tunnel.
@@ -2260,7 +2277,14 @@ def register_events_routes(
                 stop_conv = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
                 )
-            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+            if (
+                stop_conv is not None
+                and stop_conv.host_id
+                and stop_conv.runner_id
+                and not await asyncio.to_thread(
+                    _borrows_parent_runner, conversation_store, stop_conv
+                )
+            ):
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
                 host_stopped = await _stop_host_runner_intentionally(
                     session_id,
