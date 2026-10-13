@@ -218,11 +218,13 @@ class _InjectTuiRecorder:
             branch.
         """
         self.calls: list[list[str]] = []
+        self.expected: list[PendingInteraction] = []
         self._error = error
 
-    async def __call__(self, keys: list[str]) -> None:
+    async def __call__(self, keys: list[str], expected: PendingInteraction) -> None:
         """Record one TUI key sequence, raising the scripted error if set."""
         self.calls.append(list(keys))
+        self.expected.append(expected)
         if self._error is not None:
             raise self._error
 
@@ -308,6 +310,37 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
     assert elicit_calls[0][0] == agy_elicitation_id(_CASCADE, _TRAJ, 3)
     # The TUI prompt was dismissed by typing the selected option id + Enter.
     assert inject_tui.calls == [["2", "Enter"]]
+    assert inject_tui.expected == [pending]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        ElicitationResult(action="decline", content=None),
+        ElicitationResult(action="cancel", content=None),
+        ElicitationResult(action="accept", content={"0": "Turquoise"}),
+    ],
+)
+async def test_question_without_numbered_selection_uses_expected_prompt_for_escape(
+    result: ElicitationResult,
+) -> None:
+    pending = _pending_question(step_index=3)
+    request, _ = _elicitation_returner(result)
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([_question_step(step_index=3)]),
+        request_elicitation=request,
+        deliver=_DeliverRecorder(),
+        inject_tui=inject_tui,
+    )
+
+    assert inject_tui.calls == [["Escape"]]
+    assert inject_tui.expected == [pending]
 
 
 # ---------------------------------------------------------------------------
@@ -733,14 +766,70 @@ def test_tui_injector_for_binds_an_explicit_bridge_dir(
     from omnigent.harnesses.antigravity_native.interactions import tui_injector_for
 
     monkeypatch.delenv("HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR", raising=False)
-    calls: list[tuple[Any, tuple[str, ...]]] = []
+    calls: list[tuple[Any, tuple[str, ...], PendingInteraction]] = []
+    expected = _pending_permission(step_index=2)
     monkeypatch.setattr(
         bridge_mod,
-        "send_interaction_keys_via_tui",
-        lambda bridge_dir, *keys: calls.append((bridge_dir, keys)),
+        "dismiss_interaction_prompt_via_tui",
+        lambda bridge_dir, *keys, expected: calls.append((bridge_dir, keys, expected)),
     )
 
     bridge_dir = tmp_path / "bridge"
-    asyncio.run(tui_injector_for(bridge_dir)(["1", "Enter"]))
+    asyncio.run(tui_injector_for(bridge_dir)(["1", "Enter"], expected))
 
-    assert calls == [(bridge_dir, ("1", "Enter"))]
+    assert calls == [(bridge_dir, ("1", "Enter"), expected)]
+
+
+def test_default_tui_injector_uses_guarded_dismissal(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
+    import omnigent.inner.antigravity_native_executor as executor_mod
+    from omnigent.harnesses.antigravity_native.interactions import _inject_via_tui
+
+    bridge_dir = tmp_path / "bridge"
+    calls: list[tuple[Any, tuple[str, ...], PendingInteraction]] = []
+    expected = _pending_permission(step_index=2)
+    monkeypatch.setattr(executor_mod, "_bridge_dir_from_env", lambda: bridge_dir)
+    monkeypatch.setattr(
+        bridge_mod,
+        "dismiss_interaction_prompt_via_tui",
+        lambda directory, *keys, expected: calls.append((directory, keys, expected)),
+    )
+
+    asyncio.run(_inject_via_tui(["4", "Enter"], expected))
+    assert calls == [(bridge_dir, ("4", "Enter"), expected)]
+
+
+def test_public_tui_injector_does_not_submit_after_rpc_closes_prompt(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.antigravity_native.bridge import write_tmux_target
+    from omnigent.harnesses.antigravity_native.interactions import tui_injector_for
+
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    sends: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "send-keys" in cmd:
+            sends.append(cmd)
+        if "capture-pane" in cmd:
+            # RPC has already answered the interaction; agy has mounted its idle composer.
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Question\n⎿  Answered from another device.\n────────────\n>\n"
+                "────────────\n? for shortcuts    Gemini · medium",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    asyncio.run(tui_injector_for(bridge_dir)(["2", "Enter"], _pending_question(step_index=2)))
+    assert sends == []
