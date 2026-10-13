@@ -791,10 +791,10 @@ function UserBubble({
       data-message-id={bubble.itemId}
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
-      <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+      <div className="ml-auto flex w-fit min-w-0 max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
             immediately left of the right-aligned bubble. */}
-        <div className="flex w-fit max-w-full items-center gap-1.5">
+        <div className="flex w-fit min-w-0 max-w-full items-center gap-1.5">
           {showAuthorBadge && author && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -816,7 +816,7 @@ function UserBubble({
             </Tooltip>
           )}
           <MessageContent
-            className={flashing ? "animate-message-highlight" : undefined}
+            className={cn("wrap-anywhere", flashing && "animate-message-highlight")}
             // Another contributor's bubble takes their avatar color at low
             // alpha instead of the default bg-muted.
             style={

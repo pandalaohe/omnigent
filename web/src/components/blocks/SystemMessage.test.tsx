@@ -1,10 +1,22 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { SystemMessageView } from "./SystemMessage";
 
 afterEach(cleanup);
 
 describe("SystemMessageView", () => {
+  it.each(["", "A".repeat(2000)])("contains long labels and expanded bodies (%s)", (body) => {
+    const label = "blocked awaiting human approval: " + "A".repeat(2000);
+    render(<SystemMessageView message={{ kind: "generic", label, body }} />);
+    const record = screen.getByTestId("system-message");
+    expect(record).toHaveClass("min-w-0", "max-w-full", "wrap-anywhere");
+    const heading = screen.getByText(label, { exact: false }).parentElement;
+    expect(heading).toHaveClass("min-w-0", "max-w-full");
+    if (body) {
+      fireEvent.click(screen.getByRole("button"));
+      expect(screen.getByText(body, { exact: true })).toHaveClass("wrap-anywhere", "max-w-full");
+    }
+  });
   it("hides sub-agent wake notices instead of rendering a centered System row", () => {
     const { container } = render(
       <SystemMessageView

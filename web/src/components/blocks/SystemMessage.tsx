@@ -47,7 +47,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
   if (message.kind === "question_answer") {
     return (
       <div
-        className="my-2 min-w-0 space-y-2 text-sm"
+        className="my-2 min-w-0 max-w-full wrap-anywhere space-y-2 text-sm"
         data-testid="system-message"
         data-system-kind="question_answer"
       >
@@ -69,7 +69,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
 
   return (
     <div
-      className="my-1 flex flex-col items-center gap-1 text-muted-foreground text-sm"
+      className="my-1 flex min-w-0 max-w-full wrap-anywhere flex-col items-center gap-1 text-muted-foreground text-sm"
       data-testid="system-message"
       data-system-kind={message.kind}
     >
@@ -77,11 +77,11 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
         <button
           type="button"
           onClick={() => setOpen((v) => !v)}
-          className="flex items-center gap-1.5 rounded px-1.5 py-0.5 hover:text-foreground"
+          className="flex min-w-0 max-w-full items-center gap-1.5 rounded px-1.5 py-0.5 hover:text-foreground"
           aria-expanded={open}
         >
           <Icon className="size-3.5 shrink-0" />
-          <span>
+          <span className="min-w-0">
             <strong className="font-semibold">System:</strong> {message.label}
           </span>
           <ChevronRightIcon
@@ -89,15 +89,15 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
           />
         </button>
       ) : (
-        <div className="flex items-center gap-1.5 px-1.5 py-0.5">
+        <div className="flex min-w-0 max-w-full items-center gap-1.5 px-1.5 py-0.5">
           <Icon className="size-3.5 shrink-0" />
-          <span>
+          <span className="min-w-0">
             <strong className="font-semibold">System:</strong> {message.label}
           </span>
         </div>
       )}
       {hasBody && open && (
-        <div className="mt-0.5 max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 text-left text-sm text-muted-foreground">
+        <div className="mt-0.5 min-w-0 max-h-64 max-w-full wrap-anywhere overflow-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 text-left text-sm text-muted-foreground">
           {message.body}
         </div>
       )}
