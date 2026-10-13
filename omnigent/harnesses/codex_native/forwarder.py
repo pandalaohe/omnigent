@@ -573,29 +573,54 @@ class _CodexAsyncQuestionTracker:
             return
         question_id = _async_question_id(question.call_id, question.index)
         answer = _first_async_question_answer(result, question_id)
-        if answer is None:
+        meta = result.get("_meta") if isinstance(result, dict) else None
+        images = meta.get("omnigent_question_images") if isinstance(meta, dict) else None
+        image_ids = images.get(question_id) if isinstance(images, dict) else None
+        if not isinstance(image_ids, list):
+            image_ids = []
+        image_ids = [file_id for file_id in image_ids if isinstance(file_id, str) and file_id]
+        comment_ids = meta.get("omnigent_comment_ids") if isinstance(meta, dict) else None
+        if answer is None and not image_ids:
             return
         reply = build_question_reply(
-            [(answer, question.title, question_item_id(question.call_id, question.index))]
+            [(answer or "", question.title, question_item_id(question.call_id, question.index))]
         )
         question.sending_reply = True
         post = await _post_session_event_result(
             client,
             session_id,
             event_type="message",
-            data={"role": "user", "content": [{"type": "input_text", "text": reply}]},
+            data={
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": reply},
+                    *({"type": "input_image", "file_id": file_id} for file_id in image_ids),
+                ],
+                **(
+                    {"omnigent_comment_ids": comment_ids}
+                    if isinstance(comment_ids, list) and comment_ids
+                    else {}
+                ),
+            },
             max_attempts=1,
         )
         response = post.response
+        forwarded = True
         if response is not None and response.status_code < 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            forwarded = not (isinstance(payload, dict) and payload.get("forwarded") is False)
+        if response is not None and response.status_code < 400 and forwarded:
             question.answered = True
             return
         # A 4xx, or a transport error that never reached the server, proves
         # Codex did not see the reply, so re-parking cannot produce two
         # answers. A 5xx or a response lost in transit is unknown delivery.
-        proven_non_delivery = (response is not None and response.status_code < 500) or (
-            response is None and not post.may_have_been_delivered
-        )
+        proven_non_delivery = (
+            response is not None and (response.status_code < 500 or not forwarded)
+        ) or (response is None and not post.may_have_been_delivered)
         if not proven_non_delivery:
             _logger.warning(
                 "Codex async question reply delivery unknown; not re-parking "

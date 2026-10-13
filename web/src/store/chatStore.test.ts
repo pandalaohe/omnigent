@@ -10903,6 +10903,40 @@ function elicitationBlock(id: string): ElicitationBlock {
 }
 
 describe("chatStore — submitApproval", () => {
+  it("keeps an async question draft visible until success and retryable after failure", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [{ ...elicitationBlock("elic_async"), asyncKind: "question" }],
+    });
+    let finish: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const content = { "Show the issue": "" };
+    const meta = { omnigent_question_images: { "Show the issue": ["image-a"] } };
+    const first = useChatStore.getState().submitApproval("elic_async", "accept", content, meta);
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "pending", response: null });
+    finish!(mockResponse({}, { ok: false, status: 500 }));
+    expect(await first).toBe(false);
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "pending", response: null });
+
+    expect(
+      await useChatStore.getState().submitApproval("elic_async", "accept", content, meta),
+    ).toBe(true);
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "responded" });
+    const posts = fetchMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/v1/sessions/conv_abc/elicitations/elic_async/resolve"),
+    );
+    expect(JSON.parse((posts.at(-1)![1] as RequestInit).body as string)).toEqual({
+      action: "accept",
+      content,
+      _meta: meta,
+    });
+  });
+
   it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",

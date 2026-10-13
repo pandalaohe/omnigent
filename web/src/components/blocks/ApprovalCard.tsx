@@ -139,7 +139,7 @@ export type SubmitApprovalFn = (
   action: "accept" | "decline",
   content?: Record<string, unknown>,
   meta?: Record<string, unknown>,
-) => void;
+) => void | boolean | Promise<void | boolean>;
 
 interface ApprovalCardProps {
   elicitationId: string;
@@ -224,6 +224,8 @@ interface ApprovalCardProps {
    * active session.
    */
   targetSessionId?: string | null;
+  /** Owning session when this card is shown outside the active chat. */
+  cardSessionId?: string;
   /**
    * Non-blocking card kind — ``"question"`` (async question) or
    * ``"approval"`` (deferred approval). Shows the ``Async`` pill and
@@ -275,6 +277,7 @@ export function ApprovalCard({
   context,
   approvalRef,
   targetSessionId,
+  cardSessionId,
   source,
   onSubmit,
   className,
@@ -293,11 +296,11 @@ export function ApprovalCard({
       // Keep the exact call shape for the main chat (no scope); pass the child
       // id only when scoped so a side-chat verdict targets the child.
       if (scopedConversationId) {
-        void store.submitApproval(id, action, content, meta, scopedConversationId);
+        return store.submitApproval(id, action, content, meta, scopedConversationId);
       } else if (meta === undefined) {
-        void store.submitApproval(id, action, content);
+        return store.submitApproval(id, action, content);
       } else {
-        void store.submitApproval(id, action, content, meta);
+        return store.submitApproval(id, action, content, meta);
       }
     });
   // Abort the elicitation and the turn it blocks. Offered only where the
@@ -322,13 +325,13 @@ export function ApprovalCard({
   const submitSchemaAnswers = (content: ElicitationAnswers) => {
     submit(elicitationId, "accept", content);
   };
-  const submitAnswers = (answers: AskUserQuestionAnswers) => {
+  const submitAnswers = (answers: AskUserQuestionAnswers, meta?: Record<string, unknown>) => {
     // ``content`` is MCP's ``ElicitResult.content``: a flat
     // ``{[field]: scalar | string[]}`` map, where each AskUserQuestion
     // question text is one "field". Wrapping in a nested ``answers``
     // object would fail server-side schema validation (content values
     // must be str / int / float / bool / list[str] / null).
-    submit(elicitationId, "accept", answers);
+    return submit(elicitationId, "accept", answers, meta);
   };
   const submitExecPolicyAmendment = (amendment: string[]) => {
     submit(elicitationId, "accept", { execpolicy_amendment: amendment });
@@ -817,6 +820,19 @@ export function ApprovalCard({
             onReject={() => submitBinary("decline")}
             context={context ?? askPayload.context}
             onAbort={abortTurn}
+            asyncTarget={
+              asyncKind === "question"
+                ? {
+                    sessionId:
+                      cardSessionId ??
+                      targetSessionId ??
+                      scopedConversationId ??
+                      useChatStore.getState().conversationId ??
+                      "",
+                    cardId: elicitationId,
+                  }
+                : undefined
+            }
           />
         ) : isCodexCommandApproval ? (
           <>

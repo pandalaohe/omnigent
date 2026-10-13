@@ -231,6 +231,12 @@ def _codex_request_user_input_response(
         if normalized:
             answers[question_id] = {"answers": normalized}
     response["answers"] = answers
+    if params.get("omnigentAsyncQuestion") and result.meta:
+        response["_meta"] = {
+            key: result.meta[key]
+            for key in ("omnigent_question_images", "omnigent_comment_ids")
+            if key in result.meta
+        }
     return response
 
 

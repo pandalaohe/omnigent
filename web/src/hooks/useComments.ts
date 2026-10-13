@@ -12,6 +12,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { authenticatedFetch } from "@/lib/identity";
 import { shouldQueueSend } from "@/lib/messageQueue";
+import { captureQuestionCardInputTarget, insertIntoQuestionCard } from "@/lib/questionCardInput";
 import { useChatStore } from "@/store/chatStore";
 
 export interface Comment {
@@ -183,6 +184,7 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
   return useMutation({
     mutationFn: async (payload: SendCommentsPayload) => {
       const { respectQueue, ...body } = payload;
+      const intendedCard = captureQuestionCardInputTarget(sessionId);
       const res = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(sessionId)}/comments/send`,
         {
@@ -219,6 +221,19 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
           }
         }),
       );
+      const cardInsert = insertIntoQuestionCard(
+        sessionId,
+        data.formatted_message,
+        files,
+        data.sent_comment_ids,
+        intendedCard,
+      );
+      if (cardInsert === "inserted") {
+        return { ...data, attachments, delivered: true, staged: true };
+      }
+      if (cardInsert === "rejected") {
+        throw new Error("The question answer could not accept these comments. Nothing was sent.");
+      }
       const chat = useChatStore.getState();
       if (respectQueue) {
         if (chat.conversationId !== sessionId) {

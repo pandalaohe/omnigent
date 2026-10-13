@@ -136,6 +136,8 @@ import type {
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
+import { mentionItemPath, mentionMarkerFor } from "@/lib/composerMentions";
+import { insertIntoQuestionCard } from "@/lib/questionCardInput";
 import {
   composerPartsToContentBlocks,
   legacyComposerParts,
@@ -1274,7 +1276,7 @@ export interface ChatActions {
     // the active conversation; a side-chat approval card passes its child id so
     // the verdict resolves the CHILD's elicitation, not the main conversation's.
     conversationId?: string,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   /**
    * Set the active session's effort. ``null`` clears the override.
    */
@@ -3061,7 +3063,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // in the CHILD's entry, so reading/writing the active conversation's blocks
     // would answer the wrong session and leave the child blocked.
     const sessionId = conversationId ?? get().conversationId;
-    if (!sessionId) return;
+    if (!sessionId) return false;
     const write = setterFor(sessionId);
     const targetSessionId = elicitationTargetSession(elicitationId, conversationId) ?? sessionId;
     // Optimistically flip the matching elicitation block to
@@ -3078,13 +3080,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...(content === undefined ? {} : { content }),
       ...(meta === undefined ? {} : { _meta: meta }),
     };
-    write((s) => ({
-      blocks: s.blocks.map((b) =>
-        b.type === "elicitation" && b.elicitationId === elicitationId
-          ? { ...b, status: "responded", response: responseValue }
-          : b,
-      ),
-    }));
+    const asyncQuestion = setterForState(sessionId)?.blocks.some(
+      (b) =>
+        b.type === "elicitation" && b.elicitationId === elicitationId && b.asyncKind === "question",
+    );
+    const markResponded = () =>
+      write((s) => ({
+        blocks: s.blocks.map((b) =>
+          b.type === "elicitation" && b.elicitationId === elicitationId
+            ? { ...b, status: "responded", response: responseValue }
+            : b,
+        ),
+      }));
+    if (!asyncQuestion) markResponded();
     // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
     // dismissed without deciding. Fires on the user's action (live only).
     emitInteractionPhase({
@@ -3099,6 +3107,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      if (asyncQuestion) markResponded();
+      return true;
     } catch (error) {
       // The prompt timed out before this verdict arrived and the server
       // refused it. Keep the block responded as timed out so the card
@@ -3115,7 +3125,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               : b,
           ),
         }));
-        return;
+        return false;
       }
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
@@ -3132,6 +3142,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             : b,
         ),
       }));
+      return false;
     }
   },
 
@@ -3145,6 +3156,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   addComposerAttachment: (attachment) => {
+    const sessionId = get().conversationId;
+    if (
+      sessionId &&
+      insertIntoQuestionCard(
+        sessionId,
+        mentionMarkerFor(get().sessionHarness, mentionItemPath(attachment)),
+      ) !== "absent"
+    )
+      return;
     setActive((s) => {
       const k = composerAttachmentKey(attachment);
       if (s.pendingComposerAttachments.some((a) => composerAttachmentKey(a) === k)) return s;

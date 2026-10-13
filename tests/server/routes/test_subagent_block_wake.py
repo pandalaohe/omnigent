@@ -32,6 +32,7 @@ import pytest_asyncio
 from omnigent.entities.conversation import Conversation
 from omnigent.runtime import pending_elicitations, subagent_block_notifier
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions.helpers import _SessionEventDispatchResult
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -163,7 +164,7 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # TypeErrors inside the notifier task and no wake lands.
         runner_router: Any | None = None,
         agent_revision: str | None = None,
-    ) -> str:
+    ) -> _SessionEventDispatchResult:
         delivered.append(
             _DispatchCall(
                 session_id=session_id,
@@ -172,7 +173,7 @@ async def test_record_publish_delivers_wake_message_to_parent(
             )
         )
         fired.set()
-        return "item_wake"
+        return _SessionEventDispatchResult(item_id="item_wake", pending_id=None)
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)

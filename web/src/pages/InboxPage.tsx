@@ -291,43 +291,44 @@ export function InboxPage() {
   // rollback on error. Success invalidates the session list so the row's
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
-    return (elicitationId, action, content, meta) => {
-      setResponded((prev) => ({
-        ...prev,
-        [elicitationId]: {
-          action,
-          ...(content === undefined ? {} : { content }),
-          ...(meta === undefined ? {} : { _meta: meta }),
-        },
-      }));
-      void approve(item.resolveSessionId, elicitationId, {
+    return async (elicitationId, action, content, meta) => {
+      const verdict = {
         action,
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
-      }).then(
-        () => {
-          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-        },
-        (error: unknown) => {
-          // The prompt timed out before this verdict arrived. Keep the
-          // responded entry with reason "timed_out" so ApprovalCard
-          // renders nothing — restoring the buttons would offer a retry
-          // the server can never accept.
-          if (error instanceof ApiError && error.code === "elicitation_timed_out") {
-            setResponded((prev) => ({
-              ...prev,
-              [elicitationId]: { action: "auto_resolved", reason: "timed_out" },
-            }));
-            return;
-          }
-          // Roll back to pending so the buttons reappear and the user
-          // can retry — same recovery the chat store uses.
+      };
+      const asyncQuestion = item.elicitation.asyncKind === "question";
+      if (!asyncQuestion) setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      try {
+        await approve(item.resolveSessionId, elicitationId, {
+          action,
+          ...(content === undefined ? {} : { content }),
+          ...(meta === undefined ? {} : { _meta: meta }),
+        });
+        if (asyncQuestion) setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+        void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        return true;
+      } catch (error: unknown) {
+        // The prompt timed out before this verdict arrived. Keep the
+        // responded entry with reason "timed_out" so ApprovalCard
+        // renders nothing — restoring the buttons would offer a retry
+        // the server can never accept.
+        if (error instanceof ApiError && error.code === "elicitation_timed_out") {
+          setResponded((prev) => ({
+            ...prev,
+            [elicitationId]: { action: "auto_resolved", reason: "timed_out" },
+          }));
+          return false;
+        }
+        // Roll back to pending so the buttons reappear and the user
+        // can retry — same recovery the chat store uses.
+        if (!asyncQuestion)
           setResponded((prev) => {
             const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
             return pendingVerdicts;
           });
-        },
-      );
+        return false;
+      }
     };
   };
 
@@ -383,6 +384,7 @@ export function InboxPage() {
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
             targetSessionId={item.elicitation.targetSessionId}
+            cardSessionId={item.resolveSessionId}
             asyncKind={item.elicitation.asyncKind}
             context={item.elicitation.context}
             approvalRef={item.elicitation.approvalRef}

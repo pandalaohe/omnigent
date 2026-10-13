@@ -29,17 +29,29 @@
 // answer}`` map matching MCP's ``ElicitResult.content`` shape and
 // passed to ``onSubmit``.
 
-import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, SquareIcon, XIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  ImagePlusIcon,
+  SquareIcon,
+  XIcon,
+} from "lucide-react";
 import {
   type ChangeEvent,
   type FocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { Button } from "@/components/ui/button";
+import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
+import { validateAttachments } from "@/lib/attachments";
+import { uploadFile } from "@/lib/filesApi";
+import { clearQuestionCardInputTarget, setQuestionCardInputTarget } from "@/lib/questionCardInput";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import {
   eventMatchesShortcutAction,
@@ -53,9 +65,18 @@ import { FilePathAwareMessageResponse } from "./ChatMarkdown";
  */
 export type AskUserQuestionAnswers = Record<string, string | string[]>;
 
+interface StagedCommentBlock {
+  text: string;
+  files: File[];
+  ids: string[];
+}
+
 interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
-  onSubmit: (answers: AskUserQuestionAnswers) => void;
+  onSubmit: (
+    answers: AskUserQuestionAnswers,
+    meta?: Record<string, unknown>,
+  ) => void | boolean | Promise<void | boolean>;
   onReject: () => void;
   /**
    * Free markdown the producer wants shown above the questions — the
@@ -72,6 +93,8 @@ interface AskUserQuestionFormProps {
    * interrupt (the Inbox), and the control is then not rendered.
    */
   onAbort?: () => void;
+  /** Only detached questions can carry image answer blocks. */
+  asyncTarget?: { sessionId: string; cardId: string };
 }
 
 /**
@@ -167,6 +190,7 @@ export function AskUserQuestionForm({
   onReject,
   context,
   onAbort,
+  asyncTarget,
 }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -195,6 +219,18 @@ export function AskUserQuestionForm({
     for (const q of questions) initial[questionKey(q)] = "";
     return initial;
   });
+  const customInputsRef = useRef(customInputs);
+  customInputsRef.current = customInputs;
+  const [images, setImages] = useState<Record<string, File[]>>({});
+  const [stagedComments, setStagedComments] = useState<Record<string, StagedCommentBlock[]>>({});
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const customInputRef = useRef<HTMLTextAreaElement>(null);
+  const caretRef = useRef<Record<string, { start: number; end: number }>>({});
+  const pendingCaretRef = useRef<{ key: string; offset: number } | null>(null);
 
   const rootRef = useRef<HTMLDivElement>(null);
   // Highlighted row: 0..options.length, the last index being the custom row.
@@ -202,6 +238,76 @@ export function AskUserQuestionForm({
   // True while focus is inside the card — the highlighted row shows then.
   const [keyboardActive, setKeyboardActive] = useState(false);
   const current = questions[currentIndex];
+  const activeQuestionKey = current ? questionKey(current) : null;
+  const asyncSessionId = asyncTarget?.sessionId;
+  const asyncCardId = asyncTarget?.cardId;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!asyncSessionId || !asyncCardId) return;
+    return () => clearQuestionCardInputTarget(asyncSessionId, asyncCardId);
+  }, [asyncSessionId, asyncCardId, activeQuestionKey]);
+
+  useLayoutEffect(() => {
+    const pending = pendingCaretRef.current;
+    if (!pending || !current || pending.key !== questionKey(current)) return;
+    customInputRef.current?.setSelectionRange(pending.offset, pending.offset);
+    pendingCaretRef.current = null;
+  }, [customInputs, current]);
+
+  const addImages = (key: string, incoming: File[]): boolean => {
+    if (submittingRef.current) return false;
+    const nonImages = incoming.filter((file) => !file.type.startsWith("image/"));
+    const { accepted, errors } = validateAttachments(
+      incoming.filter((file) => file.type.startsWith("image/")),
+    );
+    if (nonImages.length) errors.push("Only images can be attached to a question answer.");
+    setAttachmentError(errors.length ? errors.join("\n") : null);
+    if (errors.length) return false;
+    if (accepted.length)
+      setImages((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), ...accepted] }));
+    return true;
+  };
+
+  const activateCustomInput = (key: string) => {
+    const element = customInputRef.current;
+    if (!asyncTarget || !element || submittingRef.current) return;
+    setQuestionCardInputTarget({
+      ...asyncTarget,
+      questionKey: key,
+      element,
+      insert: (text, files, ids) => {
+        if (submittingRef.current) return false;
+        if (files.length && !addImages(key, files)) return false;
+        if (ids.length && text)
+          setStagedComments((prev) => ({
+            ...prev,
+            [key]: [...(prev[key] ?? []), { text, files: [...files], ids: [...ids] }],
+          }));
+        if (text) {
+          const value = customInputsRef.current[key] ?? "";
+          const { start, end } = caretRef.current[key] ?? {
+            start: value.length,
+            end: value.length,
+          };
+          const before = value.slice(0, start);
+          const after = value.slice(end);
+          const insertion = before && !before.endsWith("\n") ? `\n\n${text}` : text;
+          setCustomInputs((prev) => ({ ...prev, [key]: before + insertion + after }));
+          pendingCaretRef.current = { key, offset: before.length + insertion.length };
+        }
+        if (!current.multiSelect) handleCustomToggleSingle(key);
+        else setCustomSelected((prev) => ({ ...prev, [key]: true }));
+        return true;
+      },
+    });
+  };
 
   const enterCard = () => {
     if (!current) return;
@@ -225,6 +331,7 @@ export function AskUserQuestionForm({
   const isLast = currentIndex === questions.length - 1;
 
   const handleSingleSelect = (key: string, label: string) => {
+    if (submittingRef.current) return;
     // Single-select mutex: clicking a real option clears the
     // custom row selection so the radio group exposes exactly one
     // chosen value.
@@ -233,6 +340,7 @@ export function AskUserQuestionForm({
   };
 
   const handleCustomToggleSingle = (key: string) => {
+    if (submittingRef.current) return;
     // Selecting the custom row clears the real-option selection
     // for the same single-select mutex reason.
     setCustomSelected((prev) => ({ ...prev, [key]: true }));
@@ -240,6 +348,7 @@ export function AskUserQuestionForm({
   };
 
   const handleMultiToggle = (key: string, label: string) => {
+    if (submittingRef.current) return;
     setSelections((prev) => {
       const selected = prev[key];
       const set = new Set(Array.isArray(selected) ? selected : []);
@@ -253,10 +362,12 @@ export function AskUserQuestionForm({
   };
 
   const handleCustomToggleMulti = (key: string) => {
+    if (submittingRef.current) return;
     setCustomSelected((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
   const handleCustomInput = (key: string, e: ChangeEvent<HTMLTextAreaElement>) => {
+    if (submittingRef.current) return;
     const text = e.target.value;
     setCustomInputs((prev) => ({ ...prev, [key]: text }));
     // Typing implies intent to use the custom answer — auto-check
@@ -284,11 +395,13 @@ export function AskUserQuestionForm({
         selections[key] ?? "",
         customSelected[key] ?? false,
         customInputs[key] ?? "",
-      ) !== null
+      ) !== null ||
+      (asyncTarget !== undefined && (images[key]?.length ?? 0) > 0)
     );
   });
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    if (submittingRef.current) return;
     const finalAnswers: AskUserQuestionAnswers = {};
     for (const q of questions) {
       const key = questionKey(q);
@@ -298,26 +411,84 @@ export function AskUserQuestionForm({
         customSelected[key] ?? false,
         customInputs[key] ?? "",
       );
-      if (answer === null) return; // unreachable while ``allAnswered`` gates the button
-      finalAnswers[key] = answer;
+      if (answer === null && (!asyncTarget || !images[key]?.length)) return;
+      finalAnswers[key] = answer ?? "";
     }
-    onSubmit(finalAnswers);
+    if (!asyncTarget) {
+      await onSubmit(finalAnswers);
+      return;
+    }
+    submittingRef.current = true;
+    setSubmitting(true);
+    setAttachmentError(null);
+    try {
+      const imageIds: Record<string, string[]> = {};
+      await Promise.all(
+        questions.map(async (q) => {
+          const key = questionKey(q);
+          const files = images[key] ?? [];
+          if (files.length) {
+            imageIds[key] = await Promise.all(
+              files.map(async (file) => (await uploadFile(asyncTarget.sessionId, file)).id),
+            );
+          }
+        }),
+      );
+      if (!mountedRef.current) return;
+      const ids = [
+        ...new Set(
+          questions.flatMap((q) => {
+            const key = questionKey(q);
+            const customText = (customInputs[key] ?? "").trim();
+            const answer = finalAnswers[key];
+            if (
+              !customSelected[key] ||
+              !customText ||
+              !(typeof answer === "string" ? answer === customText : answer.includes(customText))
+            ) {
+              return [];
+            }
+            return (stagedComments[key] ?? [])
+              .filter(
+                (block) =>
+                  customText.includes(block.text) &&
+                  block.files.every((file) => (images[key] ?? []).includes(file)),
+              )
+              .flatMap((block) => block.ids);
+          }),
+        ),
+      ];
+      const meta = {
+        ...(Object.keys(imageIds).length ? { omnigent_question_images: imageIds } : {}),
+        ...(ids.length ? { omnigent_comment_ids: ids } : {}),
+      };
+      const accepted = await onSubmit(finalAnswers, Object.keys(meta).length ? meta : undefined);
+      if (accepted === false) setAttachmentError("Could not submit the answer. Try again.");
+    } catch (error) {
+      setAttachmentError(
+        error instanceof Error ? error.message : "Could not attach the image. Try again.",
+      );
+    } finally {
+      submittingRef.current = false;
+      if (mountedRef.current) setSubmitting(false);
+    }
   };
 
   // A keyboard-driven submit / cancel leaves the card first, so focus lands in
   // the composer instead of falling to <body> when the card unmounts.
   const submitAndLeave = () => {
-    leaveQuestionCard(rootRef.current);
-    handleSubmit();
+    if (!asyncTarget) leaveQuestionCard(rootRef.current);
+    void handleSubmit();
   };
 
   const rejectAndLeave = () => {
+    if (submittingRef.current) return;
     leaveQuestionCard(rootRef.current);
     onReject();
   };
 
   const abortAndLeave = () => {
-    if (!onAbort) return;
+    if (!onAbort || submittingRef.current) return;
     leaveQuestionCard(rootRef.current);
     onAbort();
   };
@@ -329,11 +500,13 @@ export function AskUserQuestionForm({
   };
 
   const goToQuestion = (index: number, focusRoot: boolean) => {
+    if (submittingRef.current) return;
     const question = questions[index];
     if (!question) return;
     // The fieldset is keyed by question, so the focused control unmounts with
     // it: move focus to the root, then seed the new question's highlight.
     if (focusRoot) rootRef.current?.focus();
+    if (asyncTarget) clearQuestionCardInputTarget(asyncTarget.sessionId, asyncTarget.cardId);
     setCurrentIndex(index);
     const key = questionKey(question);
     setHighlight(
@@ -378,7 +551,8 @@ export function AskUserQuestionForm({
           selections[key] ?? "",
           customSelected[key] ?? false,
           customInputs[key] ?? "",
-        ) === null
+        ) === null &&
+        (!asyncTarget || !images[key]?.length)
       );
     });
     if (unanswered >= 0) goToQuestion(unanswered, true);
@@ -398,6 +572,11 @@ export function AskUserQuestionForm({
   };
 
   const handleCardKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (submittingRef.current) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (e.nativeEvent.isComposing) return;
     const isCustomTextarea = e.target instanceof HTMLTextAreaElement;
     const isButtonLike = e.target instanceof Element && e.target.closest("button, a") !== null;
@@ -548,6 +727,7 @@ export function AskUserQuestionForm({
 
       <fieldset
         key={currentKey}
+        disabled={submitting}
         className="flex flex-col gap-2 mb-2"
         data-testid="ask-user-question-section"
       >
@@ -644,15 +824,85 @@ export function AskUserQuestionForm({
                 first line wraps and expands downward instead of
                 scrolling within a fixed single row. */}
             <textarea
+              ref={customInputRef}
               rows={1}
               placeholder="Type something"
               value={customRowValue}
               onChange={(e) => handleCustomInput(currentKey, e)}
-              onFocus={() => setHighlight(current.options.length)}
+              onFocus={(event) => {
+                setHighlight(current.options.length);
+                caretRef.current[currentKey] = {
+                  start: event.currentTarget.selectionStart,
+                  end: event.currentTarget.selectionEnd,
+                };
+                activateCustomInput(currentKey);
+              }}
+              onSelect={(event) => {
+                caretRef.current[currentKey] = {
+                  start: event.currentTarget.selectionStart,
+                  end: event.currentTarget.selectionEnd,
+                };
+              }}
+              onPaste={
+                asyncTarget
+                  ? (event) => {
+                      const pasted = Array.from(event.clipboardData?.items ?? [])
+                        .filter((item) => item.kind === "file")
+                        .map((item) => item.getAsFile())
+                        .filter((file): file is File => file !== null);
+                      if (pasted.length) {
+                        event.preventDefault();
+                        addImages(currentKey, pasted);
+                      }
+                    }
+                  : undefined
+              }
               data-testid="ask-user-question-custom-input"
               className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
             />
           </label>
+          {asyncTarget && (
+            <div className="flex flex-col gap-2 pl-6">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="sr-only"
+                aria-label="Choose answer images"
+                onChange={(event) => {
+                  addImages(currentKey, Array.from(event.currentTarget.files ?? []));
+                  event.currentTarget.value = "";
+                }}
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="self-start"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <ImagePlusIcon className="mr-1 size-3.5" />
+                Add image
+              </Button>
+              <ComposerAttachments
+                files={images[currentKey] ?? []}
+                onRemove={(index) => {
+                  if (submittingRef.current) return;
+                  setImages((prev) => ({
+                    ...prev,
+                    [currentKey]: (prev[currentKey] ?? []).filter((_, i) => i !== index),
+                  }));
+                  setAttachmentError(null);
+                }}
+              />
+              {attachmentError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {attachmentError}
+                </p>
+              )}
+            </div>
+          )}
         </div>
         {previewsToShow.length > 0 && (
           <div className="flex flex-col gap-1" data-testid="ask-user-question-previews">
@@ -676,7 +926,7 @@ export function AskUserQuestionForm({
           size="sm"
           variant="outline"
           onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
-          disabled={isFirst}
+          disabled={isFirst || submitting}
           data-testid="ask-user-question-prev"
           componentId="question.prev"
         >
@@ -688,6 +938,7 @@ export function AskUserQuestionForm({
             size="sm"
             variant="outline"
             onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
+            disabled={submitting}
             data-testid="ask-user-question-next"
             componentId="question.next"
           >
@@ -698,8 +949,8 @@ export function AskUserQuestionForm({
         {isLast && (
           <Button
             size="sm"
-            onClick={(event) => (event.detail === 0 ? submitAndLeave() : handleSubmit())}
-            disabled={!allAnswered}
+            onClick={(event) => void (event.detail === 0 ? submitAndLeave() : handleSubmit())}
+            disabled={!allAnswered || submitting}
             data-testid="ask-user-question-submit"
             componentId="question.submit"
           >
@@ -710,7 +961,12 @@ export function AskUserQuestionForm({
         <Button
           size="sm"
           variant="outline"
-          onClick={(event) => (event.detail === 0 ? rejectAndLeave() : onReject())}
+          onClick={(event) => {
+            if (submittingRef.current) return;
+            if (event.detail === 0) rejectAndLeave();
+            else onReject();
+          }}
+          disabled={submitting}
           className="ml-auto"
           componentId="question.cancel"
         >
@@ -721,7 +977,12 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             variant="outline"
-            onClick={(event) => (event.detail === 0 ? abortAndLeave() : onAbort())}
+            onClick={(event) => {
+              if (submittingRef.current) return;
+              if (event.detail === 0) abortAndLeave();
+              else onAbort();
+            }}
+            disabled={submitting}
             data-testid="ask-user-question-abort"
             componentId="question.abort"
             aria-label="Cancel & interrupt"

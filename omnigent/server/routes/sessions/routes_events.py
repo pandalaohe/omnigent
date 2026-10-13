@@ -2378,7 +2378,9 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id, body.data, runner_router, conversation_store, file_store
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
@@ -3964,6 +3966,28 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
+        comment_ids = body.data.pop("omnigent_comment_ids", None)
+        comment_store = None
+        if comment_ids is not None:
+            from omnigent.runtime import get_comment_store
+
+            comment_store = get_comment_store()
+            if (
+                body.type != "message"
+                or body.data.get("role") != "user"
+                or not isinstance(comment_ids, list)
+                or not comment_ids
+                or len(comment_ids) > 100
+                or comment_store is None
+                or any(
+                    not isinstance(comment_id, str)
+                    or comment_store.get(comment_id, session_id) is None
+                    for comment_id in comment_ids
+                )
+            ):
+                raise OmnigentError(
+                    "Invalid question reply comments.", code=ErrorCode.INVALID_INPUT
+                )
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -3986,6 +4010,30 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
         )
+        if not dispatch.forwarded and (
+            comment_ids
+            or any(
+                isinstance(block, dict) and block.get("type") == "input_image"
+                for block in (body.data.get("content") or [])
+            )
+        ):
+            raise OmnigentError(
+                "Question reply did not reach the runner.", code=ErrorCode.CONFLICT
+            )
+        if comment_ids:
+            assert comment_store is not None
+            for comment_id in comment_ids:
+                try:
+                    await asyncio.to_thread(
+                        comment_store.update_comment, comment_id, session_id, status="addressed"
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Question comment status update failed: session=%s comment=%s",
+                        session_id,
+                        comment_id,
+                        exc_info=True,
+                    )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}

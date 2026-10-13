@@ -8612,10 +8612,13 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param forwarded: ``False`` when native-terminal startup failed before
+        the message reached a runner, even though a failure item was persisted.
     """
 
     item_id: str | None
     pending_id: str | None
+    forwarded: bool = True
 
 
 def _extract_persistent_item_from_sse(
