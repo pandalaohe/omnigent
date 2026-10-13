@@ -83,7 +83,11 @@ describe("PeerHeldPanel", () => {
     render(<PeerHeldPanel sessionId="conv_receiver" open onOpenChange={() => {}} />);
 
     expect(await screen.findAllByTestId("peer-held-row")).toHaveLength(2);
-    expect(listPeerMessagesMock).toHaveBeenCalledWith("conv_receiver", ["held", "pending", "queued"]);
+    expect(listPeerMessagesMock).toHaveBeenCalledWith("conv_receiver", [
+      "held",
+      "pending",
+      "queued",
+    ]);
     expect(screen.getByText("Held")).toBeInTheDocument();
     expect(screen.getByText("Pending")).toBeInTheDocument();
     // "From <short id> · ref=<ref>" splits across sibling text nodes
@@ -183,7 +187,9 @@ describe("PeerHeldPanel", () => {
       isLoading: false,
       error: null,
     });
-    updateSessionMock.mockResolvedValue(sessionWith({ some_other_label: "x", peer_inbound: "refuse" }));
+    updateSessionMock.mockResolvedValue(
+      sessionWith({ some_other_label: "x", peer_inbound: "refuse" }),
+    );
 
     render(<PeerHeldPanel sessionId="conv_receiver" open onOpenChange={() => {}} />);
     const trigger = await screen.findByTestId("peer-inbound-policy");
