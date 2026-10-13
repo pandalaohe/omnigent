@@ -2005,6 +2005,7 @@ def test_host_stop_stops_sessions_before_daemon(
                 "limit": 1000,
                 "include_archived": "true",
                 "visibility": "all",
+                "host_id": "host_abc",
             }
             return cli._HostHttpResult(
                 status_code=200,
@@ -2566,6 +2567,55 @@ def test_host_http_json_remote_connect_failure_is_not_unreachable(
     assert result.status_code == 0
     assert result.unreachable is False
     assert "ConnectError" in str(result.body)
+
+
+@pytest.mark.parametrize("record_host_id", ["host_abc", None])
+@pytest.mark.parametrize("connected_only", [False, True])
+def test_daemon_session_pages_are_host_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+    record_host_id: str | None,
+    connected_only: bool,
+) -> None:
+    """Scope every page on the server while retaining the local ownership filter."""
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id=record_host_id,
+    )
+    cursors: list[str | None] = []
+
+    def _http(**kwargs: Any) -> cli._HostHttpResult:
+        assert kwargs["path"] == "/v1/sessions"
+        params = kwargs["params"]
+        assert params["host_id"] == "host_abc"
+        assert params["include_archived"] == "true"
+        assert params["visibility"] == "all"
+        assert params.get("connected") == ("true" if connected_only else None)
+        assert kwargs["timeout_s"] == 10.0
+        after = params.get("after")
+        cursors.append(after)
+        return cli._HostHttpResult(
+            status_code=200,
+            body={
+                "data": [
+                    {"id": "owned-1" if after is None else "owned-2", "host_id": "host_abc"},
+                    {"id": "foreign", "host_id": "other-host"},
+                ],
+                "last_id": "owned-1" if after is None else "owned-2",
+                "has_more": after is None,
+            },
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", _http)
+    result = cli._sessions_for_daemon(record, connected_only=connected_only)
+
+    assert result.error is None
+    assert [s["id"] for s in result.sessions] == ["owned-1", "owned-2"]
+    assert cursors == [None, "owned-1"]
 
 
 def test_fetch_session_pages_mid_pagination_failure_is_not_unreachable(

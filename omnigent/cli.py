@@ -673,6 +673,7 @@ _HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
 _UPGRADE_DRAIN_POLL_S = 2.0
 _CUSTOM_HOST_VCS_URL = "git+https://github.com/pandalaohe/omnigent.git"
 _CUSTOM_HOST_CHANNEL = "local/host-custom"
+_CUSTOM_HOST_SESSION_QUERY_TIMEOUT_S = 60.0
 _CUSTOM_HOST_RECONNECT_TIMEOUT_S = 60.0
 _CUSTOM_HOST_HELPER_START_TIMEOUT_S = 10.0
 # When reusing an existing daemon, how long to let a live-but-offline daemon
@@ -10060,7 +10061,9 @@ def _query_custom_host_sessions(
     """Query owned sessions once and fail before any destructive action."""
     snapshots: list[tuple[_HostDaemonRecord, _DaemonSessionsResult]] = []
     for record in records:
-        result = _sessions_for_daemon(record, connected_only=True)
+        result = _sessions_for_daemon(
+            record, connected_only=True, timeout_s=_CUSTOM_HOST_SESSION_QUERY_TIMEOUT_S
+        )
         if result.error is not None:
             raise click.ClickException(
                 f"Cannot verify sessions for {_host_display_url(record.target)}: {result.error}. "
@@ -10592,6 +10595,7 @@ def _daemon_session_request_params(
     *,
     connected_only: bool,
     after: str | None,
+    host_id: str | None = None,
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10600,6 +10604,7 @@ def _daemon_session_request_params(
         sessions only.
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
+    :param host_id: Restrict the server query to this Host when provided.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
@@ -10609,6 +10614,8 @@ def _daemon_session_request_params(
     }
     if connected_only:
         params["connected"] = "true"
+    if host_id is not None:
+        params["host_id"] = host_id
     if after is not None:
         params["after"] = after
     return params
@@ -10671,6 +10678,8 @@ def _fetch_session_pages(
     *,
     base_url: str,
     connected_only: bool,
+    host_id: str | None = None,
+    timeout_s: float = 10.0,
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10679,6 +10688,8 @@ def _fetch_session_pages(
         ``"https://example.databricksapps.com"``.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
+    :param host_id: Restrict every page to this Host when provided.
+    :param timeout_s: Timeout in seconds for each page request.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10691,7 +10702,9 @@ def _fetch_session_pages(
             params=_daemon_session_request_params(
                 connected_only=connected_only,
                 after=after,
+                host_id=host_id,
             ),
+            timeout_s=timeout_s,
         )
         page = _decode_sessions_page(page_result)
         if page.error is not None:
@@ -10738,6 +10751,7 @@ def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
     connected_only: bool = False,
+    timeout_s: float = 10.0,
 ) -> _DaemonSessionsResult:
     """
     Fetch sessions owned by a daemon's host id.
@@ -10745,6 +10759,7 @@ def _sessions_for_daemon(
     :param record: Daemon record whose sessions should be listed.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
+    :param timeout_s: Timeout in seconds for each page request.
     :returns: Sessions result. ``error`` is ``None`` on success.
     """
     base_url = _daemon_base_url(record)
@@ -10769,6 +10784,8 @@ def _sessions_for_daemon(
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
+        host_id=host_id,
+        timeout_s=timeout_s,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
