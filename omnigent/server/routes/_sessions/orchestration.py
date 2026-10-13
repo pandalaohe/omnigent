@@ -826,6 +826,7 @@ async def _deliver_with_retry(
                 text,
                 conversation_store=conversation_store,
                 runner_router=runner_router,
+                confirm_delivery=True,
             )
         except Exception:  # noqa: BLE001
             # Broad: a delivery failure must never crash the background
@@ -7435,7 +7436,9 @@ async def _forward_native_terminal_message(
             )
     try:
         resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
+            f"/v1/sessions/{session_id}/events?stream=true"
+            if harness == "claude-native" and body.data.get("confirm_delivery") is True
+            else f"/v1/sessions/{session_id}/events",
             json=event,
             timeout=_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
         )
@@ -11119,6 +11122,7 @@ async def _post_system_message(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    confirm_delivery: bool = False,
 ) -> bool:
     """
     Deliver a synthetic ``[System: …]`` user message to a session's runner.
@@ -11141,6 +11145,8 @@ async def _post_system_message(
         consulted as a fallback).
     :param agent_store: Resolves the session agent's current bundle, so a
         reinstall since its last turn reaches this wake turn too.
+    :param confirm_delivery: Wait for Claude's injection result before settling
+        an async card verdict, rather than accepting a queued turn as delivered.
     :returns: ``True`` when the message was dispatched to the runner;
         ``False`` when delivery could not happen (session gone, no runner
         bound, or the forward raised a transport error).
@@ -11178,6 +11184,8 @@ async def _post_system_message(
             "content": [{"type": "input_text", "text": text}],
         },
     )
+    if confirm_delivery:
+        body.data["confirm_delivery"] = True
     agent = (
         await asyncio.to_thread(agent_store.get, conv.agent_id)
         if agent_store is not None and conv.agent_id
