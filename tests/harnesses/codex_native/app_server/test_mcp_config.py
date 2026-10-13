@@ -81,6 +81,7 @@ args = []
     assert parsed["mcp_servers"]["other"]["command"] == "other"
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
+        "tool_timeout_sec": 330,
         "args": [
             "-I",
             "-m",
@@ -447,6 +448,7 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
     parsed = tomllib.loads(rendered)
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
+        "tool_timeout_sec": 330,
         "args": [
             "-I",
             "-m",

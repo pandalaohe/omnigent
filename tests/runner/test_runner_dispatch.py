@@ -8584,6 +8584,118 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bundle", [False, True])
+async def test_sys_session_create_waits_for_slow_creation_and_sends_message(
+    tmp_path: Path, bundle: bool
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    posts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "caller"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={})
+        posts.append(request.url.path)
+        if request.url.path == "/v1/sessions":
+            # Model a host operation completing after 65 seconds without a
+            # wall-clock sleep: enforce the HTTP client's configured budget.
+            read_timeout = request.extensions["timeout"]["read"]
+            if read_timeout is not None and read_timeout < 65:
+                raise httpx.ReadTimeout("", request=request)
+            return httpx.Response(
+                201, json={"id": "slow_child", "session_id": "slow_child", "agent_id": "ag_x"}
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    (tmp_path / "agent.tar.gz").write_bytes(b"bundle")
+    args = {"config_path": "agent.tar.gz"} if bundle else {"agent_id": "ag_x"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({**args, "message": "start", "title": "Research: details"}),
+                server_client=client,
+                conversation_id="caller",
+                runner_workspace=tmp_path,
+            )
+        finally:
+            subagent_work.unregister_subagent_work("slow_child")
+    info = json.loads(output)
+    assert info["conversation_id"] == "slow_child"
+    assert "error" not in info
+    assert info["initial_message"] == {"status": "sent"}
+    assert info["title"] == "Research: details"
+    from omnigent.runner.tool_dispatch import _parse_session_title
+
+    parsed = _parse_session_title(info["title"])
+    assert (parsed.agent, parsed.title) == ("Research", " details")
+    assert posts == ["/v1/sessions", "/v1/sessions/slow_child/events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 404, 409, 500])
+@pytest.mark.parametrize("bundle", [False, True])
+async def test_sys_session_create_preserves_server_error_detail(
+    tmp_path: Path, status: int, bundle: bool
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    detail = "sub-agent name already exists under parent 'caller': " + "long title " * 30
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "caller"})
+        return httpx.Response(status, json={"error": {"code": "conflict", "message": detail}})
+
+    (tmp_path / "agent.tar.gz").write_bytes(b"bundle")
+    args = {"config_path": "agent.tar.gz"} if bundle else {"agent_id": "ag_x"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(args),
+            server_client=client,
+            conversation_id="caller",
+            runner_workspace=tmp_path,
+        )
+    assert detail in json.loads(output)["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bundle", [False, True])
+async def test_sys_session_create_empty_transport_error_names_exception(
+    tmp_path: Path, bundle: bool
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": "caller"})
+        raise httpx.ReadTimeout("", request=request)
+
+    (tmp_path / "agent.tar.gz").write_bytes(b"bundle")
+    args = {"config_path": "agent.tar.gz"} if bundle else {"agent_id": "ag_x"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(args),
+            server_client=client,
+            conversation_id="caller",
+            runner_workspace=tmp_path,
+        )
+    info = json.loads(output)
+    assert "ReadTimeout" in info["error"]
+    assert "unknown" in info["message"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_maps_agent_not_found() -> None:
     """
     A 404 from the create maps to ``agent_not_found`` so the LLM gets a
@@ -14883,10 +14995,10 @@ async def test_sys_session_create_unknown_host_lists_known_names() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_remote_post_failure_is_child_not_ready(
+async def test_sys_session_create_remote_post_failure_keeps_created_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A remote child whose runner never comes online fails child_not_ready.
+    """A remote child's first-message failure preserves the created handle.
 
     The work entry is marked failed and is never marked started.
     """
@@ -14902,6 +15014,8 @@ async def test_sys_session_create_remote_post_failure_is_child_not_ready(
 
     bodies: list[dict[str, Any]] = []
     event_posts = 0
+    failure_detail = "No runner: " + "launch diagnosis " * 30
+    created_events: list[dict[str, Any]] = []
 
     async def _handler(request: httpx.Request) -> httpx.Response:
         nonlocal event_posts
@@ -14938,7 +15052,7 @@ async def test_sys_session_create_remote_post_failure_is_child_not_ready(
         if request.method == "POST" and path == "/v1/sessions/conv_notready/events":
             event_posts += 1
             return httpx.Response(
-                503, json={"error": {"code": "runner_unavailable", "message": "No runner"}}
+                503, json={"error": {"code": "runner_unavailable", "message": failure_detail}}
             )
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -14959,6 +15073,7 @@ async def test_sys_session_create_remote_post_failure_is_child_not_ready(
                 ),
                 server_client=server_client,
                 conversation_id="conv_placement_caller",
+                publish_event=lambda _cid, event: created_events.append(event),
             )
             entry = runner_app.get_subagent_work("conv_notready")
             entry_status = entry.status if entry is not None else None
@@ -14967,7 +15082,11 @@ async def test_sys_session_create_remote_post_failure_is_child_not_ready(
             runner_app._session_inboxes_ref.pop("conv_placement_caller", None)
 
     info = json.loads(output)
-    assert info["error"] == "child_not_ready"
+    assert "error" not in info
+    assert info["initial_message"]["error"] == "child_not_ready"
+    assert info["initial_message"]["status"] == "failed"
+    assert failure_detail in info["initial_message"]["detail"]
+    assert created_events[0]["child_session_id"] == "conv_notready"
     assert info["conversation_id"] == "conv_notready"
     assert len(bodies) == 1, "the create itself still happens"
     assert event_posts == 1, "the readiness wait only retries after an online signal"
@@ -15308,13 +15427,13 @@ async def test_sys_session_create_stamp_failure_fails_closed() -> None:
         )
         entry = runner_app.get_subagent_work("conv_new_fail")
 
-    assert json.loads(output) == {
+    info = json.loads(output)
+    assert "error" not in info
+    assert info["conversation_id"] == "conv_new_fail"
+    assert info["initial_message"] == {
+        "status": "failed",
         "error": "dispatch_stamp_failed",
-        "conversation_id": "conv_new_fail",
-        "message": (
-            "child session created but its first message was not sent "
-            "(could not record the dispatch); retry with sys_session_send"
-        ),
+        "detail": '500 {"error":"boom"}',
     }
     assert entry is None, "a failed stamp must not register the dispatch"
     assert ops == ["create", "patch"], "a failed stamp must not post the first message"
