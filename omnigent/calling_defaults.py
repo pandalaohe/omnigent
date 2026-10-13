@@ -43,6 +43,7 @@ MODEL_OPTION_HARNESSES: tuple[str, ...] = (
     "claude-sdk",
     "pi-native",
     "devin-native",
+    "antigravity-native",
 )
 
 _EXPLICIT_SOURCES = frozenset({"explicit", "none"})

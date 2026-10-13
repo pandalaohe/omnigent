@@ -267,9 +267,11 @@ import {
 } from "@/lib/claudePermissionMode";
 import { sdkInitialPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
 import {
-  AGY_NATIVE_DEFAULT_SKIP_MODE,
-  AGY_NATIVE_SKIP_MODES,
-  AGY_NATIVE_SKIP_VALUE,
+  AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+  AGY_NATIVE_PERMISSION_TIER_LABEL_KEY,
+  normalizeAgyPermissionTier,
+  AGY_NATIVE_PERMISSION_TIERS,
+  AGY_NATIVE_FULL_PERMISSION_TIER,
   AUTO_PERMISSION_MODE,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
@@ -418,7 +420,7 @@ function createdHarnessOptions({
   supportsPermissionMode,
   supportsApprovalMode,
   supportsCursorMode,
-  supportsAgySkipPermissions,
+  supportsAgyPermissionTier,
   supportsDevinMode,
   supportsModelPicker,
   supportsEffortPicker,
@@ -438,7 +440,7 @@ function createdHarnessOptions({
   supportsPermissionMode: boolean;
   supportsApprovalMode: boolean;
   supportsCursorMode: boolean;
-  supportsAgySkipPermissions: boolean;
+  supportsAgyPermissionTier: boolean;
   supportsDevinMode: boolean;
   supportsModelPicker: boolean;
   supportsEffortPicker: boolean;
@@ -467,8 +469,10 @@ function createdHarnessOptions({
     options.mode = bypassSandbox ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : approvalMode;
   } else if (supportsCursorMode) {
     options.mode = cursorExecMode;
-  } else if (supportsAgySkipPermissions) {
+  } else if (supportsAgyPermissionTier) {
     options.mode = agySkipMode;
+    options.model = pickedModel;
+    options.effort = pickedEffort;
   } else if (supportsDevinMode) {
     // Devin's permission mode rides `terminal_launch_args`, not the gated
     // `permission_mode` field, so it is remembered like any other mode knob.
@@ -1358,6 +1362,7 @@ function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
     nativeAgentHasCapability(agent, "modelPicker") ||
     // devinMode owns Devin's own Model + Effort rows (see nativeCodingAgents).
     nativeAgentHasCapability(agent, "devinMode") ||
+    nativeAgentHasCapability(agent, "agyMode") ||
     nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
   );
 }
@@ -1372,7 +1377,7 @@ function agentHasAdvancedSettings(
     !nativeAgentHasCapability(agent, "permissionMode") &&
     !nativeAgentHasCapability(agent, "approvalMode") &&
     !nativeAgentHasCapability(agent, "cursorMode") &&
-    !nativeAgentHasCapability(agent, "skipPermissions") &&
+    !nativeAgentHasCapability(agent, "agyPermissionTier") &&
     !nativeAgentHasCapability(agent, "devinPermission")
   );
 }
@@ -2891,10 +2896,9 @@ export function NewChatLandingScreen() {
   const [cursorExecMode, setCursorExecMode] = useState<string>(
     () => restoredDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
-  // agy's all-or-nothing `--dangerously-skip-permissions` toggle. Only
-  // meaningful for the antigravity-native wrapper; ignored otherwise.
   const [agySkipMode, setAgySkipMode] = useState<string>(
-    () => restoredDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
+    () =>
+      normalizeAgyPermissionTier(restoredDraft?.agySkipMode) ?? AGY_NATIVE_DEFAULT_PERMISSION_TIER,
   );
   // Devin's `--permission-mode`. Only meaningful for the devin-native wrapper.
   const [devinPermissionMode, setDevinPermissionMode] = useState<string>(
@@ -3614,6 +3618,18 @@ export function NewChatLandingScreen() {
   } = useHostModelOptions(selectedHostId, "devin-native", canLoadHostModels("devin-native"), {
     poll: selectedNativeHarness === "devin-native",
   });
+  const {
+    data: hostAgyModelOptions,
+    isLoading: hostAgyModelsLoading,
+    error: hostAgyModelsError,
+  } = useHostModelOptions(
+    selectedHostId,
+    "antigravity-native",
+    canLoadHostModels("antigravity-native"),
+    {
+      poll: selectedNativeHarness === "antigravity-native",
+    },
+  );
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
@@ -3677,6 +3693,10 @@ export function NewChatLandingScreen() {
     () => (sandboxSelected ? (sandboxCatalog ?? []) : (hostDevinModelOptions ?? [])),
     [hostDevinModelOptions, sandboxSelected, sandboxCatalog],
   );
+  const agyModelOptions = useMemo(
+    () => (sandboxSelected ? (sandboxCatalog ?? []) : (hostAgyModelOptions ?? [])),
+    [hostAgyModelOptions, sandboxSelected, sandboxCatalog],
+  );
   const piModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -3691,11 +3711,12 @@ export function NewChatLandingScreen() {
     [availablePiModels, sandboxSelected, sandboxCatalog],
   );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
+  const supportsAgyMode = nativeAgentHasCapability(selectedAgent, "agyMode");
   const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsDevinPermission = nativeAgentHasCapability(selectedAgent, "devinPermission");
-  const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
+  const supportsAgyPermissionTier = nativeAgentHasCapability(selectedAgent, "agyPermissionTier");
   const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // Smart Routing as a Model choice is offered on the two native harnesses
@@ -3861,10 +3882,22 @@ export function NewChatLandingScreen() {
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
       return [{ label: "Mode", value: modeValue }, ...routingRow];
     }
-    if (supportsAgySkipPermissions) {
+    if (supportsAgyPermissionTier) {
       const skipValue =
-        AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
-      return [{ label: "Permission mode", value: skipValue }, ...routingRow];
+        AGY_NATIVE_PERMISSION_TIERS.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
+      return [
+        {
+          label: "Model",
+          value: pickedModel
+            ? nativeModelLabel(
+                agyModelOptions.find((row) => row.id === pickedModel) ?? { id: pickedModel },
+              )
+            : defaultModelLabel(agyModelOptions),
+        },
+        ...(pickedEffort ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }] : []),
+        { label: "Permission mode", value: skipValue },
+        ...routingRow,
+      ];
     }
     if (supportsDevinPermission) {
       const devinValue =
@@ -3918,7 +3951,7 @@ export function NewChatLandingScreen() {
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
-    supportsAgySkipPermissions,
+    supportsAgyPermissionTier,
     supportsDevinPermission,
     devinPermissionMode,
     supportsModelPicker,
@@ -3929,6 +3962,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    agyModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3954,15 +3988,17 @@ export function NewChatLandingScreen() {
     ? (sandboxCatalog ?? [])
     : supportsPermissionMode
       ? claudeModelOptions
-      : selectedNativeHarness === "devin-native"
-        ? devinModelOptions
-        : selectedNativeHarness === "pi-native"
-          ? piModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : sdkHarness
-              ? sdkModelOptions
-              : [];
+      : selectedNativeHarness === "antigravity-native"
+        ? agyModelOptions
+        : selectedNativeHarness === "devin-native"
+          ? devinModelOptions
+          : selectedNativeHarness === "pi-native"
+            ? piModelOptions
+            : selectedNativeHarness === "codex-native"
+              ? codexModelOptions
+              : sdkHarness
+                ? sdkModelOptions
+                : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const [modelRefreshBusy, setModelRefreshBusy] = useState(false);
   const [modelRefreshError, setModelRefreshError] = useState<string | null>(null);
@@ -4003,11 +4039,13 @@ export function NewChatLandingScreen() {
           ? hostCodexModelsLoading
           : selectedNativeHarness === "pi-native"
             ? hostPiModelsLoading
-            : selectedNativeHarness === "devin-native"
-              ? hostDevinModelsLoading
-              : sdkHarness !== null
-                ? hostSdkModelsLoading
-                : false));
+            : selectedNativeHarness === "antigravity-native"
+              ? hostAgyModelsLoading
+              : selectedNativeHarness === "devin-native"
+                ? hostDevinModelsLoading
+                : sdkHarness !== null
+                  ? hostSdkModelsLoading
+                  : false));
   const pickerModelsError = sandboxSelected
     ? sandboxCatalogError
       ? new Error(sandboxCatalogError)
@@ -4016,11 +4054,13 @@ export function NewChatLandingScreen() {
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
-        : selectedNativeHarness === "devin-native"
-          ? hostDevinModelsError
-          : sdkHarness !== null
-            ? hostSdkModelsError
-            : null;
+        : selectedNativeHarness === "antigravity-native"
+          ? hostAgyModelsError
+          : selectedNativeHarness === "devin-native"
+            ? hostDevinModelsError
+            : sdkHarness !== null
+              ? hostSdkModelsError
+              : null;
   const pickerDataLoading =
     sandboxCatalogPending ||
     agentsLoading ||
@@ -4124,9 +4164,11 @@ export function NewChatLandingScreen() {
   const pickerEffortRows =
     sdkHarness !== null
       ? sdkModelOptions
-      : selectedNativeHarness === "devin-native"
-        ? devinModelOptions
-        : codexModelOptions;
+      : selectedNativeHarness === "antigravity-native"
+        ? agyModelOptions
+        : selectedNativeHarness === "devin-native"
+          ? devinModelOptions
+          : codexModelOptions;
   const pickerEffortOptions = (
     effortLevelsFor(
       selectionHarness,
@@ -4345,6 +4387,7 @@ export function NewChatLandingScreen() {
             supportsModelPicker ||
             supportsPermissionMode ||
             supportsDevinMode ||
+            supportsAgyMode ||
             selectedNativeHarness === "codex-native" ||
             sdkHarness !== null
               ? {
@@ -4503,6 +4546,7 @@ export function NewChatLandingScreen() {
     "codex-native": availableCodexModels,
     "pi-native": availablePiModels,
     "devin-native": hostDevinModelOptions,
+    "antigravity-native": hostAgyModelOptions,
   };
   const pickerEntrySummaries = Object.fromEntries(
     [...harnessEntries, ...agentEntries].map((agent) => {
@@ -4522,9 +4566,11 @@ export function NewChatLandingScreen() {
             ? codexModelOptions
             : native.iconKind === "pi"
               ? piModelOptions
-              : native.iconKind === "devin"
-                ? devinModelOptions
-                : [];
+              : native.iconKind === "antigravity"
+                ? agyModelOptions
+                : native.iconKind === "devin"
+                  ? devinModelOptions
+                  : [];
       const savedFusion = fusionOption(catalog)?.fusion;
       // Preserve saved IDs while host data is absent; an empty result is authoritative.
       const hostCatalogUnavailable =
@@ -4562,8 +4608,8 @@ export function NewChatLandingScreen() {
             : CODEX_NATIVE_APPROVAL_MODES
           : supportsCursorMode
             ? CURSOR_NATIVE_EXEC_MODES
-            : supportsAgySkipPermissions
-              ? AGY_NATIVE_SKIP_MODES
+            : supportsAgyPermissionTier
+              ? AGY_NATIVE_PERMISSION_TIERS
               : supportsDevinPermission
                 ? DEVIN_NATIVE_PERMISSION_MODES
                 : [];
@@ -4591,7 +4637,7 @@ export function NewChatLandingScreen() {
       setApprovalMode(mode);
       setBypassSandbox(false);
     } else if (supportsCursorMode) setCursorExecMode(mode);
-    else if (supportsAgySkipPermissions) setAgySkipMode(mode);
+    else if (supportsAgyPermissionTier) setAgySkipMode(mode);
     else if (supportsDevinPermission) setDevinPermissionMode(mode);
     rememberPickerOptions(selectedNativeHarness, { mode });
   };
@@ -4769,8 +4815,30 @@ export function NewChatLandingScreen() {
       }
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
-    } else if (supportsAgySkipPermissions) {
-      setAgySkipMode(resolve(AGY_NATIVE_SKIP_MODES, AGY_NATIVE_DEFAULT_SKIP_MODE));
+    } else if (supportsAgyPermissionTier) {
+      const savedTier = normalizeAgyPermissionTier(seededPermission ?? stored.mode);
+      setAgySkipMode(
+        AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === savedTier)
+          ? savedTier!
+          : AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+      );
+      if (!projectVisit) {
+        const model =
+          stored.model && agyModelOptions.some((row) => row.id === stored.model)
+            ? stored.model
+            : "";
+        setPickedModel(model);
+        setPickedEffort(
+          stored.effort &&
+            effortLevelsFor(
+              "antigravity-native",
+              agyModelOptions,
+              model || agyModelOptions.find((row) => row.isDefault)?.id,
+            )?.includes(stored.effort)
+            ? stored.effort
+            : "",
+        );
+      }
     } else if (supportsDevinPermission) {
       setDevinPermissionMode(
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
@@ -4788,6 +4856,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    agyModelOptions,
     configProjectId,
   ]);
   useEffect(() => {
@@ -5214,6 +5283,7 @@ export function NewChatLandingScreen() {
     const seedFromSpeed = pickedSpeed;
     const seedFromApprovalMode = approvalMode;
     const seedFromClaudeMode = permissionMode;
+    const seedFromAgySkipMode = agySkipMode;
     const seedFromPermission =
       selectionHarness === "codex" || selectionHarness === "codex-native"
         ? approvalMode
@@ -5290,6 +5360,12 @@ export function NewChatLandingScreen() {
           if (seedHarness === "codex" || seedHarness === "codex-native") {
             setApprovalMode((current) =>
               current === seedFromApprovalMode ? seed.permission! : current,
+            );
+          } else if (seedHarness === "antigravity-native") {
+            setAgySkipMode((current) =>
+              current === seedFromAgySkipMode
+                ? (normalizeAgyPermissionTier(seed.permission) ?? current)
+                : current,
             );
           } else if (seedHarness === "claude-sdk" || seedHarness === "claude-native") {
             setPermissionMode((current) =>
@@ -6132,7 +6208,7 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
-      const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
+      const agentSupportsAgyPermissionTier = nativeAgentHasCapability(agent, "agyPermissionTier");
       const agentSupportsDevinPermission = nativeAgentHasCapability(agent, "devinPermission");
       const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
@@ -6185,6 +6261,7 @@ export function NewChatLandingScreen() {
           agentSupportsModelPicker ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native" ||
+          nativeAgent?.harness === "antigravity-native" ||
           sdkHarness !== null) &&
         submittedModel
           ? submittedModel
@@ -6196,6 +6273,7 @@ export function NewChatLandingScreen() {
           selectedNativeHarness === "pi-native" ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native" ||
+          nativeAgent?.harness === "antigravity-native" ||
           sdkHarness !== null) &&
         pickedEffort
           ? pickedEffort
@@ -6278,6 +6356,9 @@ export function NewChatLandingScreen() {
               ...composerContextLabels,
             }
           : { ...(inheritedLabels ?? {}), ...composerContextLabels };
+      if (agentSupportsAgyPermissionTier) {
+        createLabels[AGY_NATIVE_PERMISSION_TIER_LABEL_KEY] = agySkipMode;
+      }
       if (speedHarness && !routingOwnsModel && explicitSpeed) {
         createLabels["omnigent.speed_tier"] = explicitSpeed;
       }
@@ -6443,14 +6524,11 @@ export function NewChatLandingScreen() {
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                    : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
-                      ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
-                      : agentSupportsDevinPermission &&
-                          devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
-                        ? (DEVIN_NATIVE_PERMISSION_MODES.find(
-                            (m) => m.value === devinPermissionMode,
-                          )?.args ?? [])
-                        : undefined,
+                    : agentSupportsDevinPermission &&
+                        devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
+                      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === devinPermissionMode)
+                          ?.args ?? [])
+                      : undefined,
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. An unselected ("") knob is normally omitted;
             // on a project visit a knob the user touched and cleared must ride
@@ -6545,7 +6623,7 @@ export function NewChatLandingScreen() {
           supportsDevinMode,
           supportsApprovalMode: agentSupportsApprovalMode || sdkHarness === "codex",
           supportsCursorMode: agentSupportsCursorMode,
-          supportsAgySkipPermissions: agentSupportsAgySkip,
+          supportsAgyPermissionTier: agentSupportsAgyPermissionTier,
           supportsModelPicker:
             agentSupportsModelPicker ||
             nativeAgent?.harness === "codex-native" ||
@@ -7982,9 +8060,9 @@ export function NewChatLandingScreen() {
           />
         </div>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
-          {supportsAgySkipPermissions &&
+          {supportsAgyPermissionTier &&
             !autoRoutingSelected &&
-            agySkipMode === AGY_NATIVE_SKIP_VALUE && (
+            agySkipMode === AGY_NATIVE_FULL_PERMISSION_TIER && (
               <div
                 role="alert"
                 data-testid="new-chat-landing-agy-skip-banner"

@@ -695,6 +695,13 @@ def test_submit_needle_uses_first_substantial_line() -> None:
     assert _mod._submit_needle("hi") == ""
 
 
+def test_submit_needle_uses_last_substantial_line_for_collapsed_draft() -> None:
+    content = "<omnigent_agent_instructions>\nbe terse\nReply with exactly PONG_FINAL\nhi\n"
+    assert _mod._submit_needle(content) == "<omnigent_agent_instruct"
+    assert _mod._submit_needle(content, from_tail=True) == "Reply with exactly PONG_"
+    assert _mod._submit_needle("hi", from_tail=True) == ""
+
+
 # ---------------------------------------------------------------------------
 # First-turn TUI delivery (inject_user_message_via_tui)
 # ---------------------------------------------------------------------------
@@ -705,6 +712,8 @@ def _fast_tmux_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shrink the TUI delivery polls/timeouts so subprocess tests run fast."""
     monkeypatch.setattr(_mod, "_TMUX_POLL_INTERVAL_S", 0.001)
     monkeypatch.setattr(_mod, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(_mod, "_IDLE_CLEAR_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(_mod, "_BASELINE_CAPTURE_TIMEOUT_S", 0.1)
     monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.3)
     monkeypatch.setattr(_mod, "_SUBMIT_VERIFY_TIMEOUT_S", 0.1)
     monkeypatch.setattr(_mod, "_VERIFY_PROBE_TIMEOUT_S", 0.05)
@@ -1057,6 +1066,614 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def agy134_paste_captures() -> dict[str, str]:
+    return {
+        "mode_hint": """\
+────────────────────────────────────────────────────────────────────────────────
+> Accept-edits mode: file edits auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                         accept-edits · Gemini 3.8 Flash · medium
+""",
+        "idle_empty": """\
+────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                         accept-edits · Gemini 3.8 Flash · medium
+""",
+        "placeholder": """\
+────────────────────────────────────────────────────────────────────────────────
+> [Pasted text #1 +15 lines]
+────────────────────────────────────────────────────────────────────────────────
+                                        accept-edits · Gemini 3.8 Flash · medium
+""",
+        "collapsed": """\
+────────────────────────────────────────────────────────────────────────────────
+> ↑ 9 more lines
+
+  Paragraph 4: the quick brown fox jumps over the lazy dog while the runtime
+  posts routine status messages into this session; treat them as status.
+
+  Paragraph 5: the quick brown fox jumps over the lazy dog while the runtime
+  posts routine status messages into this session; treat them as status.
+
+  Paragraph 6: the quick brown fox jumps over the lazy dog while the runtime
+  posts routine status messages into this session; treat them as status.
+
+  </omnigent_agent_instructions>
+  Reply with exactly PONG_FINAL
+────────────────────────────────────────────────────────────────────────────────
+                                        accept-edits · Gemini 3.8 Flash · medium
+""",
+    }
+
+
+def test_agy_draft_candidate_lines_ignore_mode_hint(agy134_paste_captures: dict[str, str]) -> None:
+    pane = agy134_paste_captures["mode_hint"]
+    assert _mod._agy_draft_candidate_lines(_mod._agy_input_region(pane)) == []
+
+
+def test_agy_draft_candidate_lines_keep_shortcut_suffix() -> None:
+    pane = "> Explain the shortcut (shift+tab to cycle)\n? for shortcuts"
+    assert _mod._agy_draft_candidate_lines(_mod._agy_input_region(pane)) == [
+        "Explain the shortcut (shift+tab to cycle)"
+    ]
+
+
+def test_inject_user_message_via_tui_submits_shortcut_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    pane = agy134_paste_captures["mode_hint"]
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "Enter":
+                assert pane == "> Explain the shortcut (shift+tab to cycle)\n? for shortcuts"
+                pane = agy134_paste_captures["idle_empty"]
+        elif "paste-buffer" in cmd:
+            actions.append("paste")
+            pane = "> Explain the shortcut (shift+tab to cycle)\n? for shortcuts"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    inject_user_message_via_tui(
+        tmp_path, content="Explain the shortcut (shift+tab to cycle)", timeout_s=0.01
+    )
+    assert actions == ["C-a", "C-k", "paste", "Enter"]
+    assert pane == agy134_paste_captures["idle_empty"]
+
+
+@pytest.mark.parametrize(
+    "initial,submitted,expected_batches",
+    [
+        ("mode_hint", "mode_hint", 0),
+        ("mode_hint", "idle_empty", 0),
+        ("read_only_hint", "idle_empty", 1),
+    ],
+)
+def test_inject_user_message_via_tui_replaces_idle_hints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+    initial: str,
+    submitted: str,
+    expected_batches: int,
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    pane = (
+        agy134_paste_captures["idle_empty"].replace(">\n", "> Some read-only hint\n")
+        if initial == "read_only_hint"
+        else agy134_paste_captures[initial]
+    )
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+            elif cmd[-1] == "Enter":
+                pane = agy134_paste_captures[submitted]
+        elif "paste-buffer" in cmd:
+            actions.append("paste")
+            pane = agy134_paste_captures["collapsed"]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    inject_user_message_via_tui(
+        tmp_path,
+        content="<omnigent_agent_instructions>\nbe terse\nReply with exactly PONG_FINAL",
+        timeout_s=0.01,
+    )
+    assert actions == ["C-a", "C-k", *(["C-w"] * expected_batches), "paste", "Enter"]
+    assert pane == agy134_paste_captures[submitted]
+
+
+@pytest.mark.parametrize(
+    "shape,tail_needle,expected",
+    [
+        ("collapsed", "Reply with exactly PONG_", True),
+        ("collapsed", "", False),
+        ("unrelated", "Reply with exactly PONG_", False),
+        ("placeholder", "Reply with exactly PONG_", True),
+        ("idle_empty", "Reply with exactly PONG_", False),
+        ("plain", "Reply with exactly PONG_", True),
+        ("singular", "Reply with exactly PONG_", True),
+        ("no_marker", "Reply with exactly PONG_", False),
+    ],
+)
+def test_draft_in_input_region_agy134_shapes(
+    agy134_paste_captures: dict[str, str], shape: str, tail_needle: str, expected: bool
+) -> None:
+    panes = {
+        **agy134_paste_captures,
+        "plain": (
+            "────────\n> <omnigent_agent_instructions>\n  be terse\n"
+            "  </omnigent_agent_instructions>\n  Reply with exactly PONG_FINAL\n"
+            "────────\n? for shortcuts\n"
+        ),
+        "singular": agy134_paste_captures["collapsed"].replace("↑ 9 more lines", "↑ 1 more line"),
+        "no_marker": agy134_paste_captures["collapsed"].replace("> ↑ 9 more lines", ">"),
+        "unrelated": agy134_paste_captures["collapsed"].replace(
+            "Reply with exactly PONG_FINAL", "unrelated visible tail"
+        ),
+    }
+    assert (
+        _mod._draft_in_input_region(
+            panes[shape], "<omnigent_agent_instructi", ">", tail_needle=tail_needle
+        )
+        is expected
+    )
+
+
+def test_draft_in_input_region_rejects_unchanged_captured_baseline(
+    agy134_paste_captures: dict[str, str],
+) -> None:
+    pane = agy134_paste_captures["collapsed"]
+    baseline = pane.split("\n", 1)[1].rsplit("\n────────", 1)[0]
+    assert not _mod._draft_in_input_region(
+        pane, "<omnigent_agent_instructi", baseline, tail_needle="Reply with exactly PONG_"
+    )
+
+
+@pytest.mark.parametrize(
+    "pane,expected",
+    [
+        ("esc to cancel\n────────\n>\n────────\n? for shortcuts", False),
+        ("────────\n> esc to cancel\n────────\n? for shortcuts", False),
+        (
+            "────────\n>\n────────\nesc to cancel                    "
+            "accept-edits · Gemini 3.8 Flash · high",
+            True,
+        ),
+        ("────────\n>\n────────\nstatus\nesc to cancel", True),
+        ("> \nesc to cancel", True),
+        ("> esc to cancel\n? for shortcuts", True),
+        ("> \n? for shortcuts", False),
+    ],
+)
+def test_agy_turn_running_uses_footer_when_separators_exist(pane: str, expected: bool) -> None:
+    assert _mod._agy_turn_running(pane) is expected
+
+
+@pytest.mark.parametrize("location", ["draft", "transcript"])
+@pytest.mark.parametrize("footer,expected", [("? for shortcuts", False), ("esc to cancel", True)])
+def test_agy_turn_running_ignores_embedded_separator(
+    location: str, footer: str, expected: bool
+) -> None:
+    text = "esc to cancel\n────────\nmore text"
+    pane = (
+        f"────────\n> {text}\n────────\n{footer}"
+        if location == "draft"
+        else f"{text}\n────────\n>\n────────\n{footer}"
+    )
+    assert _mod._agy_turn_running(pane) is expected
+
+
+@pytest.mark.parametrize("initial", ["draft_marker", "history_marker", "active", "capture_retry"])
+def test_inject_user_message_via_tui_distinguishes_footer_and_retries_baseline_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+    initial: str,
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    idle = agy134_paste_captures["idle_empty"]
+    draft = agy134_paste_captures["collapsed"].replace(
+        "Paragraph 4:", "Paragraph 4: esc to cancel"
+    )
+    draft += "? for shortcuts\n"
+    history = "Earlier text: esc to cancel\n" if initial == "history_marker" else ""
+    active = initial == "active"
+    pane = (
+        idle.replace("? for shortcuts", "esc to cancel")
+        if active
+        else history
+        + (agy134_paste_captures["collapsed"] + "? for shortcuts\n" if history else draft)
+    )
+    actions: list[str] = []
+    baseline_pending = False
+    failed_captures = 0
+    enters = 0
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane, baseline_pending, failed_captures, enters
+        if "capture-pane" in cmd:
+            if baseline_pending and initial == "capture_retry" and failed_captures == 0:
+                failed_captures += 1
+                return SimpleNamespace(returncode=1, stdout="", stderr="capture failed")
+            baseline_pending = False
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-k":
+                baseline_pending = True
+            elif cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+                pane = history + idle
+            elif cmd[-1] == "Enter":
+                enters += 1
+                if active or enters == 2:
+                    pane = history + idle.replace("? for shortcuts", "esc to cancel")
+        elif "paste-buffer" in cmd:
+            actions.append("paste")
+            if not active:
+                assert pane == history + idle, "leftover draft must clear before paste"
+            pane = history + draft
+            if active:
+                pane = pane.replace("? for shortcuts", "esc to cancel")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    inject_user_message_via_tui(
+        tmp_path,
+        content="<omnigent_agent_instructions>\nesc to cancel\nReply with exactly PONG_FINAL",
+        timeout_s=0.01,
+    )
+    assert actions == (
+        ["C-a", "C-k", "paste", "Enter"]
+        if active
+        else ["C-a", "C-k", "C-w", "paste", "Enter", "Enter"]
+    )
+    assert failed_captures == (1 if initial == "capture_retry" else 0)
+
+
+@pytest.mark.parametrize("marker_location", ["draft", "history"])
+def test_submit_and_verify_rejects_draft_with_marker_outside_footer(
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    marker_location: str,
+) -> None:
+    pane = "────────\n> Keep this draft\n────────\n? for shortcuts"
+    if marker_location == "draft":
+        pane = pane.replace("Keep this draft", "Keep this draft esc to cancel")
+    else:
+        pane = "Earlier text: esc to cancel\n" + pane
+    enters: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        if "send-keys" in cmd:
+            enters.append(cmd[-1])
+        return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="draft_visible=True"):
+        _mod._submit_and_verify(
+            "/tmp/ex/tmux.sock",
+            "main",
+            needle="Keep this draft",
+            baseline_region=">",
+            draft_seen=True,
+        )
+    assert enters == ["Enter", "Enter", "Enter"]
+
+
+def test_paste_and_submit_rejects_failed_baseline_capture_before_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fast_tmux_timeouts: None
+) -> None:
+    captures = 0
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal captures
+        assert "load-buffer" not in cmd and "paste-buffer" not in cmd
+        if "capture-pane" in cmd:
+            captures += 1
+            return SimpleNamespace(returncode=1, stdout="", stderr="capture failed")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="baseline capture-pane failed before paste"):
+        _mod._paste_and_submit(tmp_path, "/tmp/ex/tmux.sock", "main", content="New message")
+    assert captures >= 2, "failed capture must be retried within the budget"
+    assert actions == ["C-a", "C-k"]
+
+
+def test_clear_idle_composer_rejects_empty_capture() -> None:
+    with pytest.raises(RuntimeError, match="capture-pane failed; captured_pane_empty=True"):
+        _mod._clear_idle_composer("/tmp/ex/tmux.sock", "main", "")
+
+
+def test_paste_and_submit_rejects_failed_capture_after_idle_clear_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fast_tmux_timeouts: None
+) -> None:
+    pane = "────────\n> [Pasted text #1 +17 lines]\n────────\n? for shortcuts"
+    failed_captures = 0
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane, failed_captures
+        assert "load-buffer" not in cmd and "paste-buffer" not in cmd
+        if "capture-pane" in cmd:
+            if not pane:
+                failed_captures += 1
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+                pane = ""
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="capture-pane failed; captured_pane_empty=True"):
+        _mod._paste_and_submit(tmp_path, "/tmp/ex/tmux.sock", "main", content="New message")
+    assert failed_captures >= 2, "failed capture must be retried within the batch window"
+    assert actions == ["C-a", "C-k", "C-w"]
+
+
+@pytest.mark.parametrize("marker_location", ["draft", "history"])
+def test_paste_and_submit_does_not_treat_idle_marker_text_as_mid_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    marker_location: str,
+) -> None:
+    monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.01)
+    idle = "────────\n>\n────────\n? for shortcuts"
+    pane = idle
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "paste-buffer" in cmd:
+            actions.append("paste")
+            pane = idle.replace(">", "> unrelated tail")
+            if marker_location == "draft":
+                pane = pane.replace("> unrelated tail", "> unrelated tail esc to cancel")
+            else:
+                pane = "Earlier text: esc to cancel\n" + pane
+        elif "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                pane = idle
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="did not render the pasted message"):
+        _mod._paste_and_submit(tmp_path, "/tmp/ex/tmux.sock", "main", content="New message")
+    assert actions == ["C-a", "C-k", "paste", "C-w"]
+    assert pane == idle
+
+
+@pytest.mark.parametrize("marker_location", ["draft", "history"])
+def test_account_verification_rejected_ignores_marker_outside_footer(
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    marker_location: str,
+) -> None:
+    pane = _VERIFYING_PANE
+    if marker_location == "draft":
+        pane = pane.replace("> ", "> esc to cancel")
+    else:
+        pane = "Earlier text: esc to cancel\n" + pane
+    monkeypatch.setattr(_mod, "_capture_pane", lambda *_: pane)
+    assert _mod._account_verification_rejected("/tmp/ex/tmux.sock", "main")
+
+
+@pytest.mark.parametrize(
+    "initial,expected_batches,submit_attempts,clear_delay",
+    [
+        ("leftover", 1, 1, 0),
+        ("leftover", 1, 1, 2),
+        ("placeholder", 1, 1, 0),
+        ("active", 0, 1, 0),
+        ("empty", 0, 1, 0),
+        ("empty", 0, 2, 0),
+    ],
+)
+def test_inject_user_message_via_tui_clears_idle_leftovers_and_submits_visible_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+    initial: str,
+    expected_batches: int,
+    submit_attempts: int,
+    clear_delay: int,
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    active = initial == "active"
+    shape = (
+        "idle_empty"
+        if initial == "empty"
+        else "placeholder"
+        if initial == "placeholder"
+        else "collapsed"
+    )
+    pane = agy134_paste_captures[shape]
+    if active:
+        pane += "esc to cancel\n"
+    actions: list[str] = []
+    enters = 0
+    clearing = False
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane, enters, clearing, clear_delay
+        assert "Escape" not in cmd and "C-c" not in cmd
+        if "capture-pane" in cmd:
+            if clearing:
+                if clear_delay:
+                    clear_delay -= 1
+                else:
+                    pane = agy134_paste_captures["idle_empty"]
+                    clearing = False
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+                clearing = True
+            elif cmd[-1] == "Enter":
+                enters += 1
+                if enters == submit_attempts:
+                    pane = agy134_paste_captures["idle_empty"]
+        elif "paste-buffer" in cmd:
+            actions.append("paste")
+            if not active:
+                assert pane == agy134_paste_captures["idle_empty"]
+            pane = agy134_paste_captures["collapsed"] + ("esc to cancel\n" if active else "")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    content = "<omnigent_agent_instructions>\nbe terse\nReply with exactly PONG_FINAL"
+    inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+    assert actions == [
+        "C-a",
+        "C-k",
+        *(["C-w"] * expected_batches),
+        "paste",
+        *(["Enter"] * submit_attempts),
+    ]
+
+
+def test_inject_user_message_via_tui_rejects_uncleared_idle_composer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    actions: list[str] = []
+    pane = agy134_paste_captures["collapsed"]
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane
+        assert "Escape" not in cmd and "C-c" not in cmd
+        assert "load-buffer" not in cmd and "paste-buffer" not in cmd
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+                pane = pane.replace("Paragraph 4:", "Paragraph 4: remaining")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="draft_candidates_empty=False") as exc:
+        inject_user_message_via_tui(
+            tmp_path, content="Reply with exactly PONG_FINAL", timeout_s=0.01
+        )
+    assert actions == ["C-a", "C-k", "C-w", "C-w", "C-w", "C-w"]
+    assert "composer_tail:" in str(exc.value)
+    assert "Reply with exactly PONG_FINAL" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "after_wait,expected_batches",
+    [
+        ("draft", 1),
+        ("stuck", 4),
+        ("clear_error", 1),
+        ("active", 0),
+        ("empty", 0),
+        ("empty_capture", 0),
+    ],
+)
+def test_inject_user_message_via_tui_cleans_failed_idle_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy134_paste_captures: dict[str, str],
+    after_wait: str,
+    expected_batches: int,
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.01)
+    pane = agy134_paste_captures["idle_empty"]
+    actions: list[str] = []
+    checks = 0
+    recognize_draft = _mod._draft_in_input_region
+
+    def recognize_and_advance(
+        captured_pane: str, needle: str, baseline_region: str, *, tail_needle: str = ""
+    ) -> bool:
+        nonlocal checks, pane
+        checks += 1
+        if after_wait == "active":
+            pane += "esc to cancel\n"
+        elif after_wait == "empty_capture":
+            pane = ""
+        return recognize_draft(captured_pane, needle, baseline_region, tail_needle=tail_needle)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane
+        assert "Escape" not in cmd and "C-c" not in cmd
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "C-w":
+                assert cmd[3:] == ["send-keys", "-t", "main", "-N", "300", "C-w"]
+                assert checks > 0, "cleanup must follow the failed render wait"
+                if after_wait == "clear_error":
+                    return SimpleNamespace(returncode=1, stdout="", stderr="word deletion failed")
+                if after_wait == "draft":
+                    pane = agy134_paste_captures["idle_empty"]
+                elif after_wait == "stuck":
+                    pane = pane.replace(
+                        "unrelated visible tail", "unrelated visible tail shrinking"
+                    )
+        elif "paste-buffer" in cmd:
+            actions.append("paste")
+            if after_wait != "empty":
+                pane = agy134_paste_captures["collapsed"].replace(
+                    "Reply with exactly PONG_FINAL", "unrelated visible tail"
+                )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(_mod, "_draft_in_input_region", recognize_and_advance)
+    with pytest.raises(RuntimeError, match="did not render the pasted message"):
+        inject_user_message_via_tui(
+            tmp_path,
+            content="<omnigent_agent_instructions>\nReply with exactly PONG_FINAL",
+            timeout_s=0.01,
+        )
+    assert actions == ["C-a", "C-k", "paste", *(["C-w"] * expected_batches)]
+    if after_wait == "draft":
+        assert pane == agy134_paste_captures["idle_empty"]
+
+
 def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
     """
     agy's collapsed-paste placeholder counts as a rendered draft.
@@ -1122,7 +1739,7 @@ _VERIFYING_PANE = (
     "⚠ Verifying your account...\n"
     "  ⎿  We're finishing verifying your account eligibility.\n"
     "     This usually takes a moment. Please try again shortly.\n"
-    "> \n? for shortcuts"
+    "────────\n> \n────────\n? for shortcuts"
 )
 
 
@@ -2634,3 +3251,449 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert held_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "label,args,expected",
+    [
+        (None, [], "ask"),
+        (None, ["--dangerously-skip-permissions"], "full"),
+        ("invalid", [], "ask"),
+        ("invalid", ["--dangerously-skip-permissions"], "full"),
+        ("ask", ["--dangerously-skip-permissions"], "ask"),
+        ("plan", [], "plan"),
+        ("accept-edits", [], "accept-edits"),
+        ("auto-strict", [], "auto-strict"),
+        ("auto-standard", [], "auto-standard"),
+        ("auto-relaxed", [], "auto-relaxed"),
+        ("full", [], "full"),
+    ],
+)
+def test_permission_tier_resolution(label: str | None, args: list[str], expected: str) -> None:
+    labels = {_mod.AGY_PERMISSION_TIER_LABEL_KEY: label} if label is not None else None
+    assert _mod.resolve_agy_permission_tier(labels, args) == expected
+
+
+@pytest.mark.parametrize(
+    "tier,expected",
+    [
+        ("ask", []),
+        ("plan", ["--mode", "plan"]),
+        ("accept-edits", ["--mode", "accept-edits"]),
+        ("auto-strict", ["--mode", "accept-edits"]),
+        ("auto-standard", ["--mode", "accept-edits"]),
+        ("auto-relaxed", ["--mode", "accept-edits"]),
+        ("full", ["--dangerously-skip-permissions"]),
+    ],
+)
+def test_tier_launch_args(tier: str, expected: list[str]) -> None:
+    assert _mod.agy_tier_launch_args(tier) == expected
+
+
+@pytest.mark.parametrize("original", [None, False, True])
+def test_permission_settings_snapshot_restore_and_hooks_merge(
+    bridge_dir: Path, original: bool | None
+) -> None:
+    settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    user = {
+        "custom": {"keep": 1},
+        "agentMode": "plan",
+        "toolPermission": "strict",
+        "permissions": {
+            "allow": ["command(echo safe)"],
+            "ask": ["mcp(omnigent/sys_os_shell)"],
+            "deny": ["mcp(omnigent/sys_os_write)"],
+            "custom": True,
+        },
+    }
+    if original is not None:
+        user["allowNonWorkspaceAccess"] = original
+    settings.write_text(json.dumps(user))
+    hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    user_hook = {
+        "enabled": True,
+        "SessionStart": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": "echo hello"}]}
+        ],
+    }
+    hooks.write_text(json.dumps({"user": user_hook, "omnigent-guard": {"enabled": False}}))
+    _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+    merged = json.loads(settings.read_text())
+    assert merged["toolPermission"] == "always-proceed"
+    assert merged["allowNonWorkspaceAccess"] is True
+    assert "agentMode" not in merged
+    assert merged["custom"] == {"keep": 1}
+    assert merged["permissions"] == {
+        "allow": ["command(echo safe)", "mcp(omnigent/*)"],
+        "ask": ["mcp(omnigent/sys_os_shell)"],
+        "deny": ["mcp(omnigent/sys_os_write)"],
+        "custom": True,
+    }
+    snapshot = bridge_dir / "agy_user_settings.json"
+    saved = snapshot.read_bytes()
+    assert json.loads(saved) == {
+        "allowNonWorkspaceAccess": {"present": original is not None, "value": original}
+    }
+    guard_hook = json.loads(hooks.read_text())
+    assert guard_hook["user"] == user_hook
+    entry = guard_hook["omnigent-guard"]
+    assert entry["enabled"] is True
+    assert entry["PreToolUse"][0]["matcher"] == ".*"
+    command_hook = entry["PreToolUse"][0]["hooks"][0]
+    assert command_hook["type"] == "command"
+    assert command_hook["timeout"] == 10
+    import sys
+
+    assert shlex.split(command_hook["command"]) == [
+        sys.executable,
+        "-I",
+        str(Path(_mod.__file__).with_name("guard.py").resolve()),
+        "--tier-file",
+        str(bridge_dir / "permission_tier"),
+    ]
+    files = [settings, hooks, snapshot, bridge_dir / "permission_tier"]
+    contents = [path.read_bytes() for path in files]
+    _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+    assert [path.read_bytes() for path in files] == contents
+    for tier in ["ask", "plan", "accept-edits", "full"]:
+        _mod.apply_agy_permission_tier(bridge_dir, tier)
+        merged = json.loads(settings.read_text())
+        assert merged.get("toolPermission") == (None if tier == "full" else "request-review")
+        assert ("allowNonWorkspaceAccess" in merged) == (original is not None)
+        if original is not None:
+            assert merged["allowNonWorkspaceAccess"] is original
+        assert snapshot.read_bytes() == saved
+        assert (bridge_dir / "permission_tier").read_text() == tier + "\n"
+        assert json.loads(hooks.read_text())["user"] == user_hook
+        assert ("omnigent-guard" in json.loads(hooks.read_text())) == (tier != "full")
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "agy-home/.gemini/antigravity-cli/settings.json",
+        "agy-home/.gemini/config/hooks.json",
+        "agy_user_settings.json",
+        "permission_tier",
+    ],
+)
+def test_apply_tier_refuses_symlink_destination(
+    bridge_dir: Path, tmp_path: Path, relative: str
+) -> None:
+    target = tmp_path / "user.json"
+    target.write_text("{}")
+    destination = bridge_dir / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+    assert destination.is_symlink()
+    assert target.read_text() == "{}"
+    assert (
+        not (bridge_dir / "agy_user_settings.json").exists()
+        or relative == "agy_user_settings.json"
+    )
+
+
+def test_tier_reassert_repairs_drift_without_churning(bridge_dir: Path) -> None:
+    tier = bridge_dir / "permission_tier"
+    _mod.reassert_agy_permission_tier(bridge_dir, "auto-strict")
+    assert tier.read_text() == "auto-strict\n"
+    before = tier.stat().st_mtime_ns
+    _mod.reassert_agy_permission_tier(bridge_dir, "auto-strict")
+    assert tier.stat().st_mtime_ns == before
+    tier.write_text("ask\n")
+    _mod.reassert_agy_permission_tier(bridge_dir, "auto-strict")
+    assert tier.read_text() == "auto-strict\n"
+
+
+def test_apply_creates_missing_hooks(bridge_dir: Path) -> None:
+    _mod.apply_agy_permission_tier(bridge_dir, "ask")
+    hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
+    assert list(json.loads(hooks.read_text())) == ["omnigent-guard"]
+
+
+def test_invalid_tier_and_malformed_settings_refused(bridge_dir: Path) -> None:
+    with pytest.raises(ValueError, match="Unknown agy permission tier"):
+        _mod.apply_agy_permission_tier(bridge_dir, "invalid")
+    with pytest.raises(ValueError, match="Unknown agy permission tier"):
+        _mod.agy_tier_launch_args("invalid")
+    settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("[]")
+    with pytest.raises(ValueError, match="Expected JSON object"):
+        _mod.apply_agy_permission_tier(bridge_dir, "auto-relaxed")
+    assert settings.read_text() == "[]"
+
+
+@pytest.fixture
+def agy_controls_captures():
+    return json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "fixtures" / "antigravity" / "agy_controls.json"
+        ).read_text()
+    )
+
+
+def test_agy_config_and_footer_captured_screens(agy_controls_captures):
+    assert _mod.parse_agy_config_row(agy_controls_captures["settings"], "Agent Mode") == "default"
+    assert (
+        _mod.parse_agy_config_row(agy_controls_captures["tool-search"], "Tool Permission")
+        == "request-review"
+    )
+    assert (
+        _mod.parse_agy_config_row(agy_controls_captures["non-workspace"], "Non-Workspace Access")
+        == "off"
+    )
+    modes = agy_controls_captures["modes"].split("--press ")[1:]
+    assert [_mod.parse_agy_agent_mode(pane) for pane in modes] == [
+        "accept-edits",
+        "plan",
+        "default",
+    ]
+    assert _mod.parse_agy_agent_mode("") is None
+
+
+@pytest.mark.parametrize(
+    "previous,tier,expected",
+    [
+        (
+            "ask",
+            "auto-relaxed",
+            [
+                ("tier", "auto-relaxed"),
+                ("Tool Permission", "always-proceed"),
+                ("Non-Workspace Access", "on"),
+                ("mode", "accept-edits"),
+            ],
+        ),
+        (
+            "auto-standard",
+            "plan",
+            [
+                ("Tool Permission", "request-review"),
+                ("Non-Workspace Access", "off"),
+                ("mode", "plan"),
+                ("tier", "plan"),
+            ],
+        ),
+        ("auto-strict", "auto-relaxed", [("tier", "auto-relaxed")]),
+        ("ask", "plan", [("mode", "plan")]),
+    ],
+)
+def test_agy_live_switch_order(tmp_path, monkeypatch, previous, tier, expected):
+    calls = []
+    (tmp_path / "agy_user_settings.json").write_text(
+        '{"allowNonWorkspaceAccess": {"present": false, "value": null}}'
+    )
+    monkeypatch.setattr(_mod, "_require_agy_idle", lambda _: "? for shortcuts    Gemini · high")
+    monkeypatch.setattr(
+        _mod, "reassert_agy_permission_tier", lambda _, value: calls.append(("tier", value))
+    )
+    monkeypatch.setattr(
+        _mod, "_set_agy_config_row", lambda _, row, target, **kw: calls.append((row, target))
+    )
+    monkeypatch.setattr(
+        _mod, "_set_agy_agent_mode", lambda _, target, **kw: calls.append(("mode", target))
+    )
+    monkeypatch.setattr(
+        _mod, "apply_agy_permission_tier", lambda _, value: calls.append(("settings", value))
+    )
+    assert (
+        _mod.switch_agy_permission_tier(tmp_path, tier=tier, previous=previous, timeout_s=0.1)
+        == tier
+    )
+    assert calls == [*expected, ("settings", tier)]
+
+
+@pytest.mark.parametrize("undo_fails", [False, True])
+def test_agy_live_switch_reverse_undo(tmp_path, monkeypatch, undo_fails):
+    calls = []
+    (tmp_path / "agy_user_settings.json").write_text(
+        '{"allowNonWorkspaceAccess": {"present": false, "value": null}}'
+    )
+    monkeypatch.setattr(_mod, "_require_agy_idle", lambda _: "? for shortcuts    Gemini · high")
+    monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: "settings verification failed")
+
+    def config(_, row, value, **kw):
+        calls.append((row, value))
+        if row == "Non-Workspace Access" and value == "off":
+            raise RuntimeError("Non-Workspace Access: expected off, observed on")
+        if undo_fails and row == "Tool Permission" and value == "always-proceed":
+            raise RuntimeError("Tool Permission: expected always-proceed, observed request-review")
+
+    monkeypatch.setattr(_mod, "_set_agy_config_row", config)
+    monkeypatch.setattr(
+        _mod, "apply_agy_permission_tier", lambda _, tier: calls.append(("settings", tier))
+    )
+    with pytest.raises(_mod.AgyPermissionRollbackError if undo_fails else RuntimeError):
+        _mod.switch_agy_permission_tier(
+            tmp_path, tier="ask", previous="auto-relaxed", timeout_s=0.1
+        )
+    assert calls[:4] == [
+        ("Tool Permission", "request-review"),
+        ("Non-Workspace Access", "off"),
+        ("Non-Workspace Access", "on"),
+        ("Tool Permission", "always-proceed"),
+    ]
+    if undo_fails:
+        assert (tmp_path / "permission_tier").read_text() == "auto-strict\n"
+    else:
+        assert calls[-1] == ("settings", "auto-relaxed")
+
+
+def test_agy_busy_and_full_refuse_before_mutation(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: "esc to cancel")
+    with pytest.raises(RuntimeError, match="busy"):
+        _mod.switch_agy_permission_tier(
+            tmp_path, tier="auto-relaxed", previous="ask", timeout_s=0.1
+        )
+    with pytest.raises(ValueError, match="create-only"):
+        _mod.switch_agy_permission_tier(tmp_path, tier="ask", previous="full", timeout_s=0.1)
+    assert not (tmp_path / "permission_tier").exists()
+
+
+def test_agy_live_switch_requires_user_settings_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, "_require_agy_idle", lambda _: "? for shortcuts    Gemini · high")
+    with pytest.raises(ValueError, match="missing user settings snapshot"):
+        _mod.switch_agy_permission_tier(
+            tmp_path, tier="auto-relaxed", previous="ask", timeout_s=0.1
+        )
+    assert not (tmp_path / "agy_user_settings.json").exists()
+
+
+def test_agy_config_driver_verifies_reopen(tmp_path, monkeypatch, agy_controls_captures):
+    calls = []
+    state = {"opened": False, "filter": False, "value": "request-review"}
+
+    def slash(_, command, **kw):
+        calls.append(command)
+        state["opened"] = True
+        return "Settings"
+
+    def keys(_, *keys):
+        calls.extend(keys)
+        if keys == ("Right",):
+            state["value"] = {
+                "request-review": "proceed-in-sandbox",
+                "proceed-in-sandbox": "always-proceed",
+            }[state["value"]]
+        elif keys == ("Escape",):
+            if state["filter"]:
+                state["filter"] = False
+            else:
+                state["opened"] = False
+
+    def run(_, *args):
+        assert args[-2:] == ("-l", "tool perm")
+        calls.append("tool perm")
+        state["filter"] = True
+
+    monkeypatch.setattr(_mod, "run_agy_slash_command", slash)
+    monkeypatch.setattr(_mod, "send_interaction_keys_via_tui", keys)
+    monkeypatch.setattr(
+        _mod, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(_mod, "_run_tmux", run)
+    monkeypatch.setattr(_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        _mod,
+        "_agy_control_pane",
+        lambda _: (
+            agy_controls_captures["tool-search"].replace("request-review", state["value"])
+            if state["opened"]
+            else "? for shortcuts    Gemini · high"
+        ),
+    )
+    _mod._set_agy_config_row(tmp_path, "Tool Permission", "always-proceed", timeout_s=0.1)
+    assert calls == [
+        "/config",
+        "tool perm",
+        "Right",
+        "Right",
+        "Escape",
+        "Escape",
+        "/config",
+        "tool perm",
+        "Escape",
+        "Escape",
+    ]
+
+
+def test_agy_slash_command_requires_fresh_confirmation(
+    tmp_path, monkeypatch, agy_controls_captures
+):
+    baseline = "? for shortcuts    Gemini · high"
+    panes = iter([baseline, agy_controls_captures["model-effort"]])
+    monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: next(panes))
+    monkeypatch.setattr(
+        _mod, "read_tmux_info", lambda _: {"socket_path": "socket", "tmux_target": "main"}
+    )
+    commands = []
+    monkeypatch.setattr(_mod, "_paste_and_submit", lambda *a, **kw: commands.append(kw["content"]))
+    assert (
+        _mod.run_agy_slash_command(
+            tmp_path, "/model claude-sonnet-5-5-medium", expect="Model set to", timeout_s=0.1
+        )
+        == "⎿  Model set to Claude Sonnet 5.5 (Medium)"
+    )
+    assert commands == ["/model claude-sonnet-5-5-medium"]
+
+
+def test_agy_agent_mode_cycles_captured_footers(tmp_path, monkeypatch, agy_controls_captures):
+    panes = agy_controls_captures["modes"].split("--press ")[1:]
+    state = {"index": 2}
+    calls = []
+
+    def keys(_, *keys):
+        assert keys == ("BTab",)
+        calls.append(keys)
+        state["index"] = (state["index"] + 1) % 3
+
+    monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: panes[state["index"]])
+    monkeypatch.setattr(_mod, "send_interaction_keys_via_tui", keys)
+    _mod._set_agy_agent_mode(tmp_path, "plan", timeout_s=0.1)
+    assert calls == [("BTab",), ("BTab",)]
+
+
+def test_agy_controls_do_not_treat_old_footer_as_idle(
+    tmp_path, monkeypatch, agy_controls_captures
+):
+    pane = "? for shortcuts    Gemini · high\n" + agy_controls_captures["tool-search"]
+    monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: pane)
+    assert _mod.parse_agy_agent_mode(pane) is None
+    with pytest.raises(RuntimeError, match="input is not idle"):
+        _mod.run_agy_slash_command(
+            tmp_path, "/effort low", expect="Effort set to low", timeout_s=0.1
+        )
+
+
+def test_agy_unwritable_safe_tier_still_requests_cold_resume(tmp_path, monkeypatch):
+    (tmp_path / "agy_user_settings.json").write_text(
+        '{"allowNonWorkspaceAccess": {"present": false, "value": null}}'
+    )
+    monkeypatch.setattr(_mod, "_require_agy_idle", lambda _: "? for shortcuts    Gemini · high")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Tool Permission verification failed")
+
+    def fail_tier(*args, **kwargs):
+        raise ValueError("Refusing symlink permission file")
+
+    monkeypatch.setattr(_mod, "_set_agy_config_row", fail)
+    monkeypatch.setattr(_mod, "reassert_agy_permission_tier", fail_tier)
+    monkeypatch.setattr(_mod, "_agy_control_pane", fail)
+    with pytest.raises(
+        _mod.AgyPermissionRollbackError, match="deny-safe tier could not be written"
+    ):
+        _mod.switch_agy_permission_tier(
+            tmp_path, tier="ask", previous="auto-relaxed", timeout_s=0.1
+        )
+
+
+def test_agy_old_active_marker_does_not_block_idle_footer(tmp_path, monkeypatch):
+    pane = "Old tool output: esc to cancel\n? for shortcuts    Gemini · high"
+    monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: pane)
+    assert _mod._require_agy_idle(tmp_path) == pane

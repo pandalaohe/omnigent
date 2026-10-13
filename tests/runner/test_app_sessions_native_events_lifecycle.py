@@ -5053,3 +5053,314 @@ async def test_events_codex_side_chat_message_failure_is_structured(
     if detail is not None:
         assert response.json()["detail"] == detail
     assert fake_client.closed
+
+
+@pytest.fixture
+def isolate_antigravity_controls_launch(monkeypatch):
+    from omnigent.runner.native import orchestration
+
+    async def create(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(orchestration, "_auto_create_antigravity_terminal", create)
+
+
+@pytest.mark.parametrize(
+    "event,expected",
+    [
+        (
+            {"type": "model_change", "model": "claude-sonnet-5-5", "effort": "medium"},
+            "/model claude-sonnet-5-5-medium",
+        ),
+        ({"type": "effort_change", "effort": "low"}, "/effort low"),
+    ],
+)
+async def test_antigravity_control_dispatch_sends_one_command(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch, event, expected
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+
+    async def snapshot(*args, **kwargs):
+        return {"labels": {}, "terminal_launch_args": [], "reasoning_effort": "high"}
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    calls = []
+
+    def command(_, text, **kwargs):
+        calls.append(text)
+        return "Model set to Claude Sonnet 5.5 (Medium)"
+
+    monkeypatch.setattr(agy, "run_agy_slash_command", command)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_control", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post("/v1/sessions/conv_agy_control/events", json=event)
+    assert response.status_code == 200, response.text
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("rollback_failure", [False, True])
+async def test_antigravity_tier_failure_recovers_only_unverified_undo(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch, rollback_failure
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.native_controls import build_native_controls
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(orchestration, "_AGY_CONFIRMED_PERMISSION_TIERS", {})
+
+    async def snapshot(*a, **kw):
+        return {"labels": {agy.AGY_PERMISSION_TIER_LABEL_KEY: "ask"}, "terminal_launch_args": []}
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    relaunch = AsyncMock()
+    close = AsyncMock()
+
+    def controls(**kwargs):
+        kwargs["_ensure_native_terminal_for_turn"] = relaunch
+        monkeypatch.setattr(kwargs["resource_registry"], "close_terminal", close)
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", controls)
+
+    def switch(directory, **kw):
+        assert kw["previous"] == "ask"
+        if rollback_failure:
+            agy.reassert_agy_permission_tier(directory, "auto-strict")
+            raise agy.AgyPermissionRollbackError(
+                "undo unverified; pane: Tool Permission always-proceed"
+            )
+        raise RuntimeError("switch failed; restored ask")
+
+    monkeypatch.setattr(agy, "switch_agy_permission_tier", switch)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(
+                "/v1/sessions", json={"session_id": "conv_agy_tier", "agent_id": "agent_agy"}
+            )
+        ).status_code == 201
+        response = await client.post(
+            "/v1/sessions/conv_agy_tier/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto-relaxed"},
+        )
+    assert response.status_code == 503, response.text
+    if rollback_failure:
+        # The failed undo left the tier file deny-safe; the record pins
+        # auto-strict until a real launch confirms the pane again.
+        expected_record = {agy.bridge_dir_for_bridge_id("conv_agy_tier").resolve(): "auto-strict"}
+        assert expected_record == orchestration._AGY_CONFIRMED_PERMISSION_TIERS
+        assert (
+            agy.bridge_dir_for_bridge_id("conv_agy_tier") / "permission_tier"
+        ).read_text() == "auto-strict\n"
+        close.assert_awaited_once_with("conv_agy_tier", "terminal_antigravity_main")
+        relaunch.assert_awaited_once_with(
+            "conv_agy_tier", "antigravity-native", lifecycle_locked=True
+        )
+    else:
+        assert not orchestration._AGY_CONFIRMED_PERMISSION_TIERS
+        close.assert_not_awaited()
+        relaunch.assert_not_awaited()
+
+
+async def test_antigravity_tier_failed_relaunch_keeps_auto_strict_record(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.native_controls import build_native_controls
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(orchestration, "_AGY_CONFIRMED_PERMISSION_TIERS", {})
+
+    async def snapshot(*a, **kw):
+        return {"labels": {agy.AGY_PERMISSION_TIER_LABEL_KEY: "ask"}, "terminal_launch_args": []}
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    relaunch = AsyncMock(side_effect=RuntimeError("terminal did not come back"))
+    close = AsyncMock()
+
+    def controls(**kwargs):
+        kwargs["_ensure_native_terminal_for_turn"] = relaunch
+        monkeypatch.setattr(kwargs["resource_registry"], "close_terminal", close)
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", controls)
+
+    def switch(directory, **kw):
+        agy.reassert_agy_permission_tier(directory, "auto-strict")
+        raise agy.AgyPermissionRollbackError(
+            "undo unverified; pane: Tool Permission always-proceed"
+        )
+
+    monkeypatch.setattr(agy, "switch_agy_permission_tier", switch)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(
+                "/v1/sessions", json={"session_id": "conv_agy_tier", "agent_id": "agent_agy"}
+            )
+        ).status_code == 201
+        response = await client.post(
+            "/v1/sessions/conv_agy_tier/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto-relaxed"},
+        )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "antigravity_native_permission_mode_failed"
+    expected_record = {agy.bridge_dir_for_bridge_id("conv_agy_tier").resolve(): "auto-strict"}
+    assert expected_record == orchestration._AGY_CONFIRMED_PERMISSION_TIERS
+
+
+async def test_antigravity_tier_success_records_confirmed_tier(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(orchestration, "_AGY_CONFIRMED_PERMISSION_TIERS", {})
+
+    async def snapshot(*a, **kw):
+        return {"labels": {agy.AGY_PERMISSION_TIER_LABEL_KEY: "ask"}, "terminal_launch_args": []}
+
+    monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
+    monkeypatch.setattr(agy, "switch_agy_permission_tier", lambda *a, **kw: "auto-relaxed")
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(
+                "/v1/sessions", json={"session_id": "conv_agy_tier", "agent_id": "agent_agy"}
+            )
+        ).status_code == 201
+        response = await client.post(
+            "/v1/sessions/conv_agy_tier/events",
+            json={"type": "permission_mode_change", "permission_mode": "auto-relaxed"},
+        )
+    assert response.status_code == 200, response.text
+    assert (
+        orchestration._AGY_CONFIRMED_PERMISSION_TIERS[
+            agy.bridge_dir_for_bridge_id("conv_agy_tier").resolve()
+        ]
+        == "auto-relaxed"
+    )
+
+
+@pytest.mark.parametrize(
+    "labels,record,expected",
+    [
+        # The confirmed record wins over the create-time label.
+        ({"omnigent.antigravity_native.permission_tier": "auto-relaxed"}, "ask", "ask\n"),
+        ({}, "auto-standard", "auto-standard\n"),
+        ({}, None, "drifted\n"),
+    ],
+)
+async def test_antigravity_turn_reasserts_known_tier(
+    monkeypatch, tmp_path, isolate_antigravity_controls_launch, labels, record, expected
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
+    bdir = agy.bridge_dir_for_bridge_id("conv_agy_turn")
+    bdir.mkdir(parents=True)
+    (bdir / "permission_tier").write_text("drifted\n")
+    monkeypatch.setattr(
+        orchestration,
+        "_AGY_CONFIRMED_PERMISSION_TIERS",
+        {bdir.resolve(): record} if record else {},
+    )
+
+    async def get_labels(**kwargs):
+        return labels
+
+    monkeypatch.setattr(runner_app, "_session_labels_for_runner_spawn", get_labels)
+    seen = asyncio.Event()
+
+    def config(directory):
+        assert directory == bdir
+        assert (bdir / "permission_tier").read_text() == expected
+        seen.set()
+
+    monkeypatch.setattr(agy, "write_mcp_bridge_config", config)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_agy_turn/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent_agy",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 202, response.text
+        await asyncio.wait_for(seen.wait(), 3)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_antigravity_runner_model_catalog_routes(
+    monkeypatch, isolate_antigravity_controls_launch, failure
+):
+    from omnigent.harnesses.antigravity_native import main as agy
+
+    def models():
+        if failure:
+            raise RuntimeError("agy models exit 1")
+        return [{"id": "gpt-oss-120b", "efforts": ["medium"], "isDefault": False}]
+
+    monkeypatch.setattr(agy, "list_agy_model_options", models)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(
+                "/v1/sessions", json={"session_id": "conv_agy_models", "agent_id": "agent_agy"}
+            )
+        ).status_code == 201
+        for endpoint in ["model-options", "antigravity-model-options"]:
+            response = await client.get(f"/v1/sessions/conv_agy_models/{endpoint}")
+            assert response.status_code == (503 if failure else 200), response.text
+            if not failure:
+                assert response.json()["models"][0]["efforts"] == ["medium"]
+
+
+async def test_antigravity_controls_refuse_during_turn_setup(
+    monkeypatch, isolate_antigravity_controls_launch
+):
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import build_native_controls
+
+    lifecycle = []
+
+    def controls(**kwargs):
+        lifecycle.append(kwargs["_cli_runtime_lifecycle"])
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", controls)
+    app, _ = await _build_app_for_spec(_harness_spec("antigravity-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_agy_busy", "agent_id": "agent_agy"}
+        )
+        assert created.status_code == 201, created.text
+        async with lifecycle[0].lock_for("conv_agy_busy").shared():
+            response = await client.post(
+                "/v1/sessions/conv_agy_busy/events",
+                json={"type": "effort_change", "effort": "low"},
+            )
+        assert response.status_code == 503, response.text
+        assert "busy" in response.json()["detail"]

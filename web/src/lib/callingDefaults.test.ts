@@ -194,3 +194,24 @@ describe("calling_last memory", () => {
     expect(queuePatchMock).not.toHaveBeenCalled();
   });
 });
+
+it.each([
+  ["default", "ask"],
+  ["skip", "full"],
+])("migrates Antigravity permission default %s", (legacy, tier) => {
+  localStorage.setItem(
+    DEFAULTS_KEY,
+    JSON.stringify({ host_1: { "antigravity-native": { permission: legacy } } }),
+  );
+  expect(readCallingDefaults()).toEqual({ host_1: { "antigravity-native": { permission: tier } } });
+  expect(
+    resolveProjectInheritedField(
+      {},
+      { host_1: { "antigravity-native": { permission: legacy } } },
+      "host_1",
+      "antigravity-native",
+      "permission",
+      null,
+    ),
+  ).toEqual({ value: tier, source: "master" });
+});

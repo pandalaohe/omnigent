@@ -319,43 +319,6 @@ class TestBuildAgyLaunch:
         )
         assert argv[-2:] == ["--print-timeout", "30"]
 
-    # ------------------------------------------------------------------
-    # Permission-mode → --dangerously-skip-permissions (phase 4 task 1)
-    # ------------------------------------------------------------------
-
-    def test_bypass_mode_appends_skip_flag(self, fake_agy: str) -> None:
-        """bypassPermissions → the skip flag is present in argv."""
-        argv, _ = build_agy_launch(
-            conversation_id=None,
-            model=None,
-            resume=False,
-            permission_mode="bypassPermissions",
-            headless=False,
-        )
-        assert _SKIP_FLAG in argv
-
-    def test_non_bypass_interactive_omits_skip_flag(self, fake_agy: str) -> None:
-        """Non-bypass mode + interactive (attended) → the skip flag is absent."""
-        argv, _ = build_agy_launch(
-            conversation_id=None,
-            model=None,
-            resume=False,
-            permission_mode="default",
-            headless=False,
-        )
-        assert _SKIP_FLAG not in argv
-
-    def test_non_bypass_headless_appends_skip_flag(self, fake_agy: str) -> None:
-        """Non-bypass mode + headless → the skip flag is auto-added (no hang)."""
-        argv, _ = build_agy_launch(
-            conversation_id=None,
-            model=None,
-            resume=False,
-            permission_mode="default",
-            headless=True,
-        )
-        assert _SKIP_FLAG in argv
-
     def test_skip_flag_defaults_absent(self, fake_agy: str) -> None:
         """Defaults (no permission_mode, not headless) omit the skip flag."""
         argv, _ = build_agy_launch(
@@ -371,7 +334,6 @@ class TestBuildAgyLaunch:
             conversation_id=None,
             model=None,
             resume=False,
-            headless=True,
             extra_args=(_SKIP_FLAG,),
         )
         assert argv.count(_SKIP_FLAG) == 1
@@ -404,3 +366,35 @@ class TestShouldSkipPermissions:
     def test_none_mode_headless_true(self) -> None:
         """``None`` mode + headless skips (headless wins regardless of mode)."""
         assert should_skip_permissions(permission_mode=None, headless=True) is True
+
+
+def test_effort_and_repeated_skip_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(
+        conversation_id=None,
+        model="gemini-3.8-flash",
+        effort="high",
+        resume=False,
+        extra_args=(_SKIP_FLAG, _SKIP_FLAG, "--print-timeout", "30"),
+    )
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv.count(_SKIP_FLAG) == 1
+    assert argv[-2:] == ["--print-timeout", "30"]
+
+
+@pytest.mark.parametrize(
+    "model,effort,expected_model",
+    [
+        ("claude-sonnet-5-5", "medium", "claude-sonnet-5-5"),
+        ("claude-sonnet-5-5-high", "medium", "claude-sonnet-5-5"),
+        ("claude-sonnet-5-5-high", None, "claude-sonnet-5-5-high"),
+    ],
+)
+def test_launch_model_effort_pair(monkeypatch, model, effort, expected_model):
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+    argv, _ = build_agy_launch(conversation_id=None, resume=False, model=model, effort=effort)
+    assert argv[argv.index("--model") + 1] == expected_model
+    if effort:
+        assert argv[argv.index("--effort") + 1] == "medium"
+    else:
+        assert "--effort" not in argv

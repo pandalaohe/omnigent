@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { CODEX_NATIVE_APPROVAL_MODES, permissionModeConcept } from "./nativeHarnessModes";
+import {
+  AGY_NATIVE_PERMISSION_TIERS,
+  AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+  agyPermissionTierFromSession,
+  normalizeAgyPermissionTier,
+  CODEX_NATIVE_APPROVAL_MODES,
+  permissionModeConcept,
+} from "./nativeHarnessModes";
 import { CODEX_APPROVAL_PRESETS, CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
 import { sdkPermissionOptions } from "./sdkPermissionModes";
 import { sessionDefaultModeOptions } from "./sessionDefaultModes";
@@ -52,5 +59,69 @@ describe("permissionModeConcept", () => {
   it("falls back safely for missing or future values", () => {
     expect(permissionModeConcept(null, "default")).toBe("default");
     expect(permissionModeConcept("codex-native", "future-mode")).toBe("default");
+  });
+});
+
+describe("Antigravity tiers", () => {
+  it("offers the seven tiers in contract order with no client launch flags", () => {
+    expect(AGY_NATIVE_DEFAULT_PERMISSION_TIER).toBe("auto-relaxed");
+    expect(
+      AGY_NATIVE_PERMISSION_TIERS.map(({ value, label, args }) => [value, label, args]),
+    ).toEqual([
+      ["ask", "Ask every time", []],
+      ["plan", "Plan only", []],
+      ["accept-edits", "Accept edits", []],
+      ["auto-strict", "Auto · strict", []],
+      ["auto-standard", "Auto · standard", []],
+      ["auto-relaxed", "Auto · relaxed", []],
+      ["full", "Skip permissions", []],
+    ]);
+    expect(
+      sessionDefaultModeOptions("antigravity-native", "permission").map((row) => row.value),
+    ).toEqual([
+      "ask",
+      "plan",
+      "accept-edits",
+      "auto-strict",
+      "auto-standard",
+      "auto-relaxed",
+      "full",
+    ]);
+    expect(sessionDefaultModeOptions("antigravity-native", "speed")).toEqual([]);
+  });
+  it.each([
+    ["default", "ask"],
+    ["skip", "full"],
+    ["auto-standard", "auto-standard"],
+  ])("migrates %s", (value, expected) => {
+    expect(normalizeAgyPermissionTier(value)).toBe(expected);
+  });
+  it("resolves server labels before legacy launch arguments", () => {
+    expect(
+      agyPermissionTierFromSession({
+        labels: { "omnigent.antigravity_native.permission_tier": "plan" },
+        terminalLaunchArgs: ["--dangerously-skip-permissions"],
+      }),
+    ).toBe("plan");
+    expect(
+      agyPermissionTierFromSession({ terminalLaunchArgs: ["--dangerously-skip-permissions"] }),
+    ).toBe("full");
+    expect(
+      agyPermissionTierFromSession({
+        labels: { "omnigent.antigravity_native.permission_tier": "invalid" },
+      }),
+    ).toBe("ask");
+    expect(agyPermissionTierFromSession(null)).toBe("ask");
+  });
+  it.each([
+    ["ask", "manual"],
+    ["plan", "read-only"],
+    ["accept-edits", "edit-automatic"],
+    ["auto-strict", "automatic"],
+    ["auto-standard", "automatic"],
+    ["auto-relaxed", "automatic"],
+    ["full", "full-access"],
+  ])("presents %s with its shared concept", (tier, concept) => {
+    expect(permissionModeConcept("antigravity-native", tier)).toBe(concept);
   });
 });

@@ -56,7 +56,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -15240,3 +15240,337 @@ async def test_external_goal_state_rejects_unknown_value(
         json={"type": "external_goal_state", "data": data},
     )
     assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize(
+    "labels,args,default,expected",
+    [
+        ({}, [], None, "auto-relaxed"),
+        ({}, ["--dangerously-skip-permissions"], None, "full"),
+        ({}, ["--dangerously-skip-permissions"], "plan", "plan"),
+        (
+            {"omnigent.antigravity_native.permission_tier": "ask"},
+            ["--dangerously-skip-permissions"],
+            "plan",
+            "ask",
+        ),
+        ({"omnigent.antigravity_native.permission_tier": "full"}, [], "plan", "full"),
+    ],
+)
+async def test_antigravity_create_stamping(client, monkeypatch, labels, args, default, expected):
+    import dataclasses
+
+    from omnigent.server.routes import _session_create_validation as validation
+
+    original = validation.resolve_project_session_create
+
+    async def resolve(*a, **kw):
+        result = await original(*a, **kw)
+        return dataclasses.replace(result, permission=default)
+
+    monkeypatch.setattr(validation, "resolve_project_session_create", resolve)
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "antigravity-native",
+            "labels": {"omnigent.wrapper": "antigravity-native-ui", **labels},
+            "terminal_launch_args": args,
+        },
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["labels"]["omnigent.antigravity_native.permission_tier"] == expected
+    assert ("--dangerously-skip-permissions" in body["terminal_launch_args"]) == (
+        expected == "full"
+    )
+    assert "--permission-mode" not in body["terminal_launch_args"]
+
+
+async def test_antigravity_bundle_create_stamps_default_tier(client):
+    agent = await create_test_agent(
+        client,
+        name="agy-bundle-default",
+        executor={"type": "omnigent", "config": {"harness": "antigravity-native"}},
+    )
+    owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
+    assert owning.status_code == 200, owning.text
+    body = owning.json()
+    assert body["labels"]["omnigent.antigravity_native.permission_tier"] == "auto-relaxed"
+    assert "--dangerously-skip-permissions" not in (body["terminal_launch_args"] or [])
+
+
+async def test_antigravity_bundle_create_keeps_explicit_tier_label(client):
+    bundle = build_agent_bundle(
+        name="agy-bundle-explicit",
+        executor={"type": "omnigent", "config": {"harness": "antigravity-native"}},
+    )
+    response = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {"labels": {"omnigent.antigravity_native.permission_tier": "ask"}}
+            )
+        },
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    owning = await client.get(f"/v1/sessions/{response.json()['session_id']}")
+    assert owning.status_code == 200, owning.text
+    body = owning.json()
+    assert body["labels"]["omnigent.antigravity_native.permission_tier"] == "ask"
+    assert "--dangerously-skip-permissions" not in (body["terminal_launch_args"] or [])
+
+
+async def test_antigravity_bundle_create_skip_flag_resolves_full_tier(client):
+    bundle = build_agent_bundle(
+        name="agy-bundle-bypass",
+        executor={"type": "omnigent", "config": {"harness": "antigravity-native"}},
+    )
+    response = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps({"terminal_launch_args": ["--dangerously-skip-permissions"]})
+        },
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    owning = await client.get(f"/v1/sessions/{response.json()['session_id']}")
+    assert owning.status_code == 200, owning.text
+    body = owning.json()
+    assert body["labels"]["omnigent.antigravity_native.permission_tier"] == "full"
+    assert body["terminal_launch_args"] == ["--dangerously-skip-permissions"]
+
+
+@pytest.mark.parametrize(
+    "sub_executor,expected_tier,expect_flag",
+    [
+        (
+            {"config": {"harness": "antigravity-native", "permission_mode": "bypassPermissions"}},
+            "full",
+            True,
+        ),
+        ({"config": {"harness": "antigravity-native"}}, "auto-relaxed", False),
+    ],
+)
+async def test_antigravity_subagent_create_stamps_tier_from_spec(
+    client, sub_executor, expected_tier, expect_flag
+):
+    agent = await create_test_agent(
+        client,
+        name="agy-parent",
+        sub_agents=[{"name": "agy-worker", "executor": sub_executor}],
+    )
+    parent = await _create_session(client, agent["id"])
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "sub_agent_name": "agy-worker",
+        },
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["labels"]["omnigent.antigravity_native.permission_tier"] == expected_tier
+    assert ("--dangerously-skip-permissions" in (body["terminal_launch_args"] or [])) == (
+        expect_flag
+    )
+
+
+async def _create_agy_controls_session(client, tier="auto-relaxed"):
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "antigravity-native",
+            "labels": {
+                "omnigent.wrapper": "antigravity-native-ui",
+                "omnigent.antigravity_native.permission_tier": tier,
+            },
+            "model_override": "claude-opus-5-5",
+            "reasoning_effort": "high",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize(
+    "tier,payload",
+    [
+        ("ask", {"labels": {"omnigent.antigravity_native.permission_tier": "full"}}),
+        ("ask", {"terminal_launch_args": ["--dangerously-skip-permissions"]}),
+        ("full", {"terminal_launch_args": []}),
+    ],
+)
+async def test_antigravity_generic_patch_refuses_authority_tamper(client, tier, payload):
+    created = await _create_agy_controls_session(client, tier)
+    response = await client.patch(f"/v1/sessions/{created['id']}", json=payload)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_input"
+    snapshot = (await client.get(f"/v1/sessions/{created['id']}")).json()
+    assert snapshot["labels"]["omnigent.antigravity_native.permission_tier"] == tier
+    assert snapshot["terminal_launch_args"] == created["terminal_launch_args"]
+
+
+async def test_antigravity_subagent_wrapper_patch_refuses_skip_flag_flip(client):
+    agent = await create_test_agent(client)
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "antigravity-native",
+            "labels": {"omnigent.wrapper": "antigravity-native-ui-subagent"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    created = response.json()
+    response = await client.patch(
+        f"/v1/sessions/{created['id']}",
+        json={"terminal_launch_args": ["--dangerously-skip-permissions"]},
+    )
+    assert response.status_code == 400, response.text
+    assert "Skip permissions is create-only" in response.text
+
+
+async def test_claude_native_with_inert_tier_label_flips_skip_flag(client):
+    # A non-antigravity fork of an agy session keeps the inert tier label; it
+    # must still own its claude-native launch args.
+    agent = await create_test_agent(client)
+    created = await _create_session(
+        client,
+        agent["id"],
+        labels={
+            "omnigent.wrapper": "claude-code-native-ui",
+            "omnigent.antigravity_native.permission_tier": "ask",
+        },
+    )
+    response = await client.patch(
+        f"/v1/sessions/{created['id']}",
+        json={"terminal_launch_args": ["--dangerously-skip-permissions"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["terminal_launch_args"] == ["--dangerously-skip-permissions"]
+    response = await client.patch(
+        f"/v1/sessions/{created['id']}",
+        json={"terminal_launch_args": []},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["terminal_launch_args"] == []
+
+
+@pytest.mark.parametrize("status", [200, 204, 503])
+async def test_antigravity_permission_patch_requires_confirmation(client, status):
+    created = await _create_agy_controls_session(client)
+    events = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content)
+        if body.get("type") == "permission_mode_change":
+            events.append(body)
+            return httpx.Response(status, json={"permission_mode": "ask", "detail": "busy"})
+        return httpx.Response(204)
+
+    async with _runtime_runner(handler):
+        response = await client.patch(
+            f"/v1/sessions/{created['id']}", json={"permission_mode": "ask"}
+        )
+    assert response.status_code == (200 if status == 200 else 503), response.text
+    snapshot = (await client.get(f"/v1/sessions/{created['id']}")).json()
+    assert snapshot["labels"]["omnigent.antigravity_native.permission_tier"] == (
+        "ask" if status == 200 else "auto-relaxed"
+    )
+    assert snapshot["terminal_launch_args"] == []
+    assert events == [{"type": "permission_mode_change", "permission_mode": "ask"}]
+
+
+async def test_antigravity_permission_patch_forward_uses_switch_timeout(client, monkeypatch):
+    # The runner's tier switch drives several TUI sweeps, so the forward must
+    # outlast the 20 s budget other TUI-driving forwards use.
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes.sessions import routes_core
+
+    created = await _create_agy_controls_session(client)
+    timeouts = []
+    real_forward = sessions_facade._forward_session_change_to_runner
+
+    async def spy(session_id, runner_router, event, **kwargs):
+        if event.get("type") == "permission_mode_change":
+            timeouts.append(kwargs.get("timeout_s"))
+        return await real_forward(session_id, runner_router, event, **kwargs)
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", spy)
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content)
+        if body.get("type") == "permission_mode_change":
+            return httpx.Response(200, json={"permission_mode": "ask"})
+        return httpx.Response(204)
+
+    async with _runtime_runner(handler):
+        response = await client.patch(
+            f"/v1/sessions/{created['id']}", json={"permission_mode": "ask"}
+        )
+    assert response.status_code == 200, response.text
+    assert timeouts == [routes_core._AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S]
+    assert timeouts[0] > 20
+
+
+@pytest.mark.parametrize("previous,requested", [("ask", "full"), ("full", "ask")])
+async def test_antigravity_live_full_is_create_only(client, previous, requested):
+    created = await _create_agy_controls_session(client, previous)
+    response = await client.patch(
+        f"/v1/sessions/{created['id']}", json={"permission_mode": requested}
+    )
+    assert response.status_code == 400, response.text
+    assert "Skip permissions is create-only" in response.text
+
+
+@pytest.mark.parametrize(
+    "status,confirmed", [(200, True), (200, False), (204, False), (503, False), (504, False)]
+)
+async def test_antigravity_combined_settings_forward_and_rollback(client, status, confirmed):
+    created = await _create_agy_controls_session(client)
+    events = []
+
+    def handler(request):
+        if request.method != "POST":
+            return httpx.Response(204)
+        body = json.loads(request.content)
+        if body.get("type") in ("model_change", "effort_change"):
+            events.append(body)
+            return httpx.Response(
+                status,
+                json=(
+                    {"model": "claude-sonnet-5-5-medium"}
+                    if confirmed
+                    else {"detail": "change refused"}
+                ),
+            )
+        return httpx.Response(204)
+
+    async with _runtime_runner(handler):
+        response = await client.patch(
+            f"/v1/sessions/{created['id']}",
+            json={"model_override": "claude-sonnet-5-5", "reasoning_effort": "medium"},
+        )
+    assert response.status_code == (200 if confirmed else 503), response.text
+    assert events == [
+        {
+            "type": "model_change",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium",
+            "rollback_on_refusal": True,
+        }
+    ]
+    snapshot = (await client.get(f"/v1/sessions/{created['id']}")).json()
+    assert (snapshot["model_override"], snapshot["reasoning_effort"]) == (
+        ("claude-sonnet-5-5", "medium") if confirmed else ("claude-opus-5-5", "high")
+    )

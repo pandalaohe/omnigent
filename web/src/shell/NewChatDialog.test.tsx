@@ -4395,13 +4395,26 @@ describe("NewChatLandingScreen", () => {
           harness: native.harness,
         }),
       ]);
+      if (native.key === "antigravity") {
+        mockModelQueries(() => ({
+          ...CLAUDE_MODEL_OPTIONS_RESULT,
+          data: [
+            {
+              id: "claude-sonnet-5-5",
+              displayName: "Claude Sonnet",
+              isDefault: true,
+              efforts: ["low", "medium", "high"],
+            },
+          ],
+        }));
+      }
       renderLanding();
       fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
       if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi", "devin"].includes(native.key)) {
+      if (["claude", "codex", "pi", "devin", "antigravity"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
         expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();

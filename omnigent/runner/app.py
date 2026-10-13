@@ -7394,7 +7394,10 @@ def create_runner_app(
             )
         elif harness_name == "antigravity-native":
             from omnigent.harnesses.antigravity_native.bridge import (
+                AGY_PERMISSION_TIER_LABEL_KEY,
+                AGY_PERMISSION_TIERS,
                 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+                reassert_agy_permission_tier,
                 write_mcp_bridge_config,
             )
             from omnigent.harnesses.antigravity_native.bridge import (
@@ -7407,6 +7410,16 @@ def create_runner_app(
             )
             antigravity_bid = antigravity_labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
+            from omnigent.runner.native.orchestration import _AGY_CONFIRMED_PERMISSION_TIERS
+
+            # The confirmed record wins: a live switch or rollback can settle
+            # on a tier the create-time label never saw.
+            tier = _AGY_CONFIRMED_PERMISSION_TIERS.get(antigravity_bdir.resolve())
+            if tier is None:
+                label_tier = antigravity_labels.get(AGY_PERMISSION_TIER_LABEL_KEY)
+                tier = label_tier if label_tier in AGY_PERMISSION_TIERS else None
+            if tier is not None:
+                reassert_agy_permission_tier(antigravity_bdir, tier)
             write_mcp_bridge_config(antigravity_bdir)
             await _ensure_comment_relay_started(
                 conv,
@@ -9115,6 +9128,15 @@ def create_runner_app(
                     # Confirm the refusal was not kept, so the server may roll it back.
                     return _acknowledge_settings_rollback(response)
                 return response
+            if harness == "antigravity-native":
+                lock = _cli_runtime_lifecycle.lock_for(conversation_id)
+                if lock.locked():
+                    return JSONResponse(
+                        status_code=503,
+                        content={"detail": "Antigravity is busy; wait for the active turn"},
+                    )
+                async with lock.exclusive():
+                    return await _handle_antigravity_native_effort_change(conversation_id, effort)
             # In-process harnesses apply the effort on their next turn, from the
             # forwarded turn body (see ``_turn_reasoning``).
             if effort:
@@ -9173,6 +9195,7 @@ def create_runner_app(
                 "kiro-native",
                 "devin-native",
                 "pi-native",
+                "antigravity-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
@@ -9200,6 +9223,26 @@ def create_runner_app(
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
                     return response
+                if harness == "antigravity-native":
+                    effort = body.get("effort")
+                    if (
+                        "effort" in body
+                        and (invalid := _invalid_effort_response(effort)) is not None
+                    ):
+                        return invalid
+                    lock = _cli_runtime_lifecycle.lock_for(conversation_id)
+                    if lock.locked():
+                        return JSONResponse(
+                            status_code=503,
+                            content={"detail": "Antigravity is busy; wait for the active turn"},
+                        )
+                    async with lock.exclusive():
+                        return await _handle_antigravity_native_model_change(
+                            conversation_id,
+                            model,
+                            effort=effort,
+                            effort_set="effort" in body,
+                        )
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(
                         conversation_id,
@@ -9260,7 +9303,7 @@ def create_runner_app(
                     )
                 _session_permission_mode[conversation_id] = mode
                 return JSONResponse(content={"permission_mode": mode})
-            if harness in ("claude-native", "devin-native"):
+            if harness in ("claude-native", "devin-native", "antigravity-native"):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):
                     return JSONResponse(
@@ -9270,6 +9313,17 @@ def create_runner_app(
                             "detail": "Body 'permission_mode' must be a string or null",
                         },
                     )
+                if harness == "antigravity-native":
+                    lock = _cli_runtime_lifecycle.lock_for(conversation_id)
+                    if lock.locked():
+                        return JSONResponse(
+                            status_code=503,
+                            content={"detail": "Antigravity is busy; wait for the active turn"},
+                        )
+                    async with lock.exclusive():
+                        return await _handle_antigravity_native_permission_mode_change(
+                            conversation_id, mode
+                        )
                 if harness == "devin-native":
                     return await _handle_devin_native_permission_mode_change(
                         conversation_id,
@@ -9799,6 +9853,15 @@ def create_runner_app(
         server_client=server_client,
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
+    _handle_antigravity_native_permission_mode_change = (
+        _native_controls.handle_antigravity_native_permission_mode_change
+    )
+    _handle_antigravity_native_model_change = (
+        _native_controls.handle_antigravity_native_model_change
+    )
+    _handle_antigravity_native_effort_change = (
+        _native_controls.handle_antigravity_native_effort_change
+    )
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
     _handle_claude_native_cost_popup = _native_controls.handle_claude_native_cost_popup

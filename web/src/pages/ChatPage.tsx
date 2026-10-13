@@ -143,7 +143,11 @@ import {
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
-import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
+import {
+  AGY_NATIVE_PERMISSION_TIERS,
+  agyPermissionTierFromSession,
+  DEVIN_NATIVE_PERMISSION_MODES,
+} from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { eventMatchesShortcutAction } from "@/lib/keyboardShortcutPreferences";
 import {
@@ -935,9 +939,11 @@ export function ChatPage() {
       ? "codex-native"
       : fallbackPickerKind === "claude"
         ? "claude-native"
-        : fallbackPickerKind === "devin"
-          ? "devin-native"
-          : null;
+        : fallbackPickerKind === "antigravity"
+          ? "antigravity-native"
+          : fallbackPickerKind === "devin"
+            ? "devin-native"
+            : null;
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
@@ -2523,6 +2529,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   if (modelPickerKind === "devin") return "Devin";
+  if (modelPickerKind === "antigravity") return "Antigravity";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -3114,7 +3121,12 @@ function ComposerImpl(
     agents?.[0]?.name ??
     null;
   const composerBranch = useChatStore((s) => s.gitBranch);
-  const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const storedPermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const agyPermissionControl = modelPickerKind === "antigravity";
+  const claudePermissionMode = agyPermissionControl
+    ? agyPermissionTierFromSession(composerSession)
+    : storedPermissionMode;
+  const permissionLocked = agyPermissionControl && claudePermissionMode === "full";
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
@@ -3192,27 +3204,35 @@ function ComposerImpl(
   const permissionOptions =
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
     (showClaudePermissionMode
-      ? devinPermissionControl
-        ? DEVIN_NATIVE_PERMISSION_MODES
-        : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+      ? agyPermissionControl
+        ? AGY_NATIVE_PERMISSION_TIERS.filter((tier) => tier.value !== "full" || permissionLocked)
+        : devinPermissionControl
+          ? DEVIN_NATIVE_PERMISSION_MODES
+          : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
       : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS);
   const permissionLabel = showClaudePermissionMode
-    ? devinPermissionControl
-      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+    ? agyPermissionControl
+      ? (AGY_NATIVE_PERMISSION_TIERS.find((tier) => tier.value === claudePermissionMode)?.label ??
         claudePermissionMode)
-      : claudePermissionModeLabel(claudePermissionMode)
+      : devinPermissionControl
+        ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+          claudePermissionMode)
+        : claudePermissionModeLabel(claudePermissionMode)
     : sdkPermissionControl
       ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
         codexApprovalMode)
       : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
-    if (isReadOnly || unreachable || configBusyRef.current) return;
+    if (isReadOnly || unreachable || permissionLocked || configBusyRef.current) return;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
     try {
       const store = useChatStore.getState();
-      if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
+      if (agyPermissionControl && sourceSessionId) {
+        const updated = await updateSession(sourceSessionId, { claudePermissionMode: mode });
+        chatQueryClient()?.setQueryData(["session", sourceSessionId], updated);
+      } else if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
     } catch (error) {
       if (useChatStore.getState().conversationId === sourceSessionId)
@@ -4754,7 +4774,7 @@ function ComposerImpl(
                   disabledOptions={
                     showCodexApprovalMode && sessionHarness === "codex-native" ? ["read-only"] : []
                   }
-                  disabled={isReadOnly || unreachable || configBusy}
+                  disabled={isReadOnly || unreachable || configBusy || permissionLocked}
                   onSelect={(mode) => void changePermission(mode)}
                 />
               )}
@@ -5130,6 +5150,7 @@ type NativeModelPickerKind =
   | "opencode"
   | "pi"
   | "devin"
+  | "antigravity"
   | "acp"
   | "configured"
   | "sdk";
@@ -5272,6 +5293,8 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "antigravity-native-ui":
+      return "antigravity";
     case "devin-native-ui":
       // Like opencode/pi: Devin mirrors its live model into ``model_override``
       // (the executor types ``/model`` when a routed model changes).
@@ -5357,6 +5380,7 @@ export function shouldShowPermissionModeControl(
   return (
     isClaudeNativeSession(conv) ||
     modelPickerKindForConv(conv) === "devin" ||
+    modelPickerKindForConv(conv) === "antigravity" ||
     (isSdkHarnessSession(conv) && conv?.harness === "claude-sdk")
   );
 }
@@ -5598,9 +5622,11 @@ function SessionHarnessPicker({
     effortLevelsFor(
       modelPickerKind === "codex"
         ? "codex-native"
-        : modelPickerKind === "sdk"
-          ? sessionHarness
-          : null,
+        : modelPickerKind === "antigravity"
+          ? "antigravity-native"
+          : modelPickerKind === "sdk"
+            ? sessionHarness
+            : null,
       codexModelOptions,
       pickerSelectedModel,
     ) ?? effortLevels;
@@ -5635,7 +5661,9 @@ function SessionHarnessPicker({
     setBusy(true);
     try {
       await change();
-    } catch {
+    } catch (error) {
+      if (modelPickerKind === "antigravity")
+        toast.error(error instanceof Error ? error.message : "Unable to change model or effort");
       // The store rolls back a refused change, so the pill shows what applied.
     } finally {
       busyRef.current = false;
@@ -5646,6 +5674,20 @@ function SessionHarnessPicker({
     void apply(async () => {
       const store = useChatStore.getState();
       const sourceSessionId = store.conversationId;
+      if (modelPickerKind === "antigravity" && sourceSessionId) {
+        const effort = reconcileEffortOnModelChange(
+          "antigravity-native",
+          codexModelOptions,
+          modelId ?? codexModelOptions.find((row) => row.isDefault)?.id,
+          selectedEffort,
+        );
+        try {
+          await updateSession(sourceSessionId, { modelOverride: modelId, reasoningEffort: effort });
+        } finally {
+          await store.refreshSessionState(sourceSessionId);
+        }
+        return;
+      }
       await store.setModel(modelId, {
         expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
       });
@@ -5997,6 +6039,7 @@ function useResolvedComposerModel(
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
+    modelPickerKind === "antigravity" ||
     modelPickerKind === "acp" ||
     modelPickerKind === "configured" ||
     modelPickerKind === "sdk";
@@ -6048,7 +6091,10 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
+        : modelPickerKind === "opencode" ||
+            modelPickerKind === "pi" ||
+            modelPickerKind === "devin" ||
+            modelPickerKind === "antigravity"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker

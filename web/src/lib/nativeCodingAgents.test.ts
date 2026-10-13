@@ -75,17 +75,23 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("native-agy")).toBe(canonical);
   });
 
-  // agy's only pre-emptive control is the all-or-nothing bypass, so it must
-  // declare `skipPermissions` and NOT Claude's graded `permissionMode` — the
-  // latter would emit `--permission-mode <mode>`, a flag agy does not accept.
-  it("gives antigravity-native the skipPermissions capability, not permissionMode", () => {
+  it("gives antigravity-native its own tier and model capabilities", () => {
     const agy = nativeCodingAgentForHarness("antigravity-native");
-    expect(agy?.capabilities).toEqual(["skipPermissions"]);
+    expect(agy?.capabilities).toEqual(["agyPermissionTier", "agyMode"]);
     expect(
-      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "skipPermissions"),
+      nativeAgentHasCapability(
+        { name: "antigravity-native-ui", harness: null },
+        "agyPermissionTier",
+      ),
+    ).toBe(true);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "agyMode"),
     ).toBe(true);
     expect(
       nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "permissionMode"),
+    ).toBe(false);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "modelPicker"),
     ).toBe(false);
   });
 

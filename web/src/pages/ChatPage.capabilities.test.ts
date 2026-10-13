@@ -332,3 +332,17 @@ describe("label-less native sessions (e.g. created before a harness rename)", ()
     expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
   });
 });
+
+it("enables Antigravity model, effort and permission controls", () => {
+  const session = {
+    labels: { "omnigent.wrapper": "antigravity-native-ui" },
+    harness: "antigravity-native",
+  };
+  expect(modelPickerKindForConv(session)).toBe("antigravity");
+  expect(shouldShowModelPicker(session)).toBe(true);
+  expect(shouldShowEffortPicker(session)).toBe(true);
+  expect(shouldShowPermissionModeControl(session)).toBe(true);
+  expect(effortLevelsForConv(session, [{ id: "gpt-oss", efforts: ["medium"] }], "gpt-oss")).toEqual(
+    ["medium"],
+  );
+});

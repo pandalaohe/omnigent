@@ -418,11 +418,23 @@ def test_run_turn_keeps_staged_preamble_when_injection_raises(
 
     _seed_state(tmp_path)
     write_agent_instructions_preamble(tmp_path, "be terse")
+    executor = _executor(tmp_path)
     injected["raise"] = RuntimeError("the agy terminal is no longer running (the TUI exited)")
-    events = asyncio.run(_run(_executor(tmp_path), "first"))
+    events = asyncio.run(_run(executor, "first"))
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert read_agent_instructions_preamble(tmp_path) == "be terse"
+
+    injected["raise"] = None
+    events = asyncio.run(_run(executor, "first"))
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    calls = _injected(injected)
+    assert len(calls) == 2
+    assert calls[1]["content"].count("<omnigent_agent_instructions>") == 1
+    assert calls[1]["content"].count("</omnigent_agent_instructions>") == 1
+    assert calls[1]["content"].count("be terse") == 1
+    assert calls[1]["content"].endswith("\n\nfirst")
+    assert read_agent_instructions_preamble(tmp_path) is None
 
 
 # ---------------------------------------------------------------------------

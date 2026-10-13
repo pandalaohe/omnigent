@@ -13,6 +13,7 @@
 
 import { useEffect, useState } from "react";
 import type { ProjectConfig } from "./projectsApi";
+import { normalizeAgyPermissionTier } from "./nativeHarnessModes";
 import { PERMISSION_DEFAULT_OPTIONS } from "./sessionDefaultModes";
 
 import { queueUserPreferencePatch } from "./userPreferencesSync";
@@ -30,6 +31,7 @@ export const CALLING_DEFAULT_HARNESSES = [
   "claude-sdk",
   "pi-native",
   "devin-native",
+  "antigravity-native",
 ] as const;
 
 /** SDK harnesses whose entries fall back to a native sibling's master row. */
@@ -45,6 +47,7 @@ const HARNESS_LABELS: Record<string, string> = {
   "claude-sdk": "Claude SDK",
   "pi-native": "Pi",
   "devin-native": "Devin",
+  "antigravity-native": "Antigravity",
 };
 
 /** Display label for a canonical harness id; unknown ids render as-is. */
@@ -126,7 +129,11 @@ export function resolveProjectInheritedField(
     candidates.push([projectHost?.[parent]?.[field], "project_host_native"]);
     candidates.push([masterHost?.[parent]?.[field], "master_native"]);
   }
-  for (const [value, source] of candidates) {
+  for (const [candidate, source] of candidates) {
+    const value =
+      harness === "antigravity-native" && field === "permission"
+        ? normalizeAgyPermissionTier(candidate)
+        : candidate;
     if (!value) continue;
     if (
       field === "permission" &&
@@ -145,14 +152,17 @@ export function resolveProjectInheritedField(
   return { value: null, source: "none" };
 }
 
-function sanitizeEntry(value: unknown): CallingDefaultEntry | null {
+function sanitizeEntry(value: unknown, harness: string): CallingDefaultEntry | null {
   if (!isRecord(value)) return null;
   const entry: CallingDefaultEntry = {};
   const { model, effort } = value;
   if (typeof model === "string" && model && !isClearValue(model)) entry.model = model;
   if (typeof effort === "string" && effort && !isClearValue(effort)) entry.effort = effort;
   for (const field of ["speed", "permission"] as const) {
-    const setting = value[field];
+    const setting =
+      harness === "antigravity-native" && field === "permission"
+        ? normalizeAgyPermissionTier(typeof value[field] === "string" ? value[field] : null)
+        : value[field];
     if (typeof setting === "string" && setting && !isClearValue(setting)) entry[field] = setting;
   }
   return entry;
@@ -166,7 +176,7 @@ export function readCallingDefaults(): CallingDefaultsTable {
     if (!isRecord(hostValue)) continue;
     const hostTable: Record<string, CallingDefaultEntry> = {};
     for (const [harness, entryValue] of Object.entries(hostValue)) {
-      const entry = sanitizeEntry(entryValue);
+      const entry = sanitizeEntry(entryValue, harness);
       if (entry !== null) hostTable[harness] = entry;
     }
     table[hostId] = hostTable;

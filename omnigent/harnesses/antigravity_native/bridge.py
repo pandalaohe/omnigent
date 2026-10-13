@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,6 +29,17 @@ _logger = logging.getLogger(__name__)
 ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.antigravity_native.bridge_id"
 ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR"
 ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID"
+AGY_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier"
+AGY_PERMISSION_TIERS = (
+    "ask",
+    "plan",
+    "accept-edits",
+    "auto-strict",
+    "auto-standard",
+    "auto-relaxed",
+    "full",
+)
+AGY_DEFAULT_PERMISSION_TIER = "auto-relaxed"
 
 _STATE_FILE = "state.json"
 # Advertises the runner-owned tmux pane (socket + target) hosting agy, so the
@@ -457,6 +469,148 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
     return agy_home_dir(bridge_dir) / ".gemini"
 
 
+def resolve_agy_permission_tier(
+    labels: Mapping[str, object] | None, launch_args: Sequence[str]
+) -> str:
+    """Prefer a valid server label, then legacy bypass args, then ask."""
+    tier = labels.get(AGY_PERMISSION_TIER_LABEL_KEY) if labels else None
+    if isinstance(tier, str) and tier in AGY_PERMISSION_TIERS:
+        return tier
+    return "full" if "--dangerously-skip-permissions" in launch_args else "ask"
+
+
+def agy_tier_launch_args(tier: str) -> list[str]:
+    """Return agy's launch flags for a permission tier."""
+    if tier not in AGY_PERMISSION_TIERS:
+        raise ValueError(f"Unknown agy permission tier: {tier!r}")
+    if tier == "full":
+        return ["--dangerously-skip-permissions"]
+    if tier == "plan":
+        return ["--mode", "plan"]
+    if tier == "accept-edits" or tier.startswith("auto-"):
+        return ["--mode", "accept-edits"]
+    return []
+
+
+def _read_agy_permission_json(path: Path) -> dict[str, object]:
+    if path.is_symlink():
+        raise ValueError(f"Refusing symlink permission file: {path}")
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Expected JSON object in permission file: {path}")
+    return loaded
+
+
+def _write_agy_permission_file(path: Path, content: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"Refusing symlink permission file: {path}")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise ValueError(f"Refusing symlink permission file: {path}")
+        os.replace(tmp_name, path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+
+
+def reassert_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
+    """Repair a drifted tier file from the confirmed tier."""
+    if tier not in AGY_PERMISSION_TIERS:
+        raise ValueError(f"Unknown agy permission tier: {tier!r}")
+    path = bridge_dir / "permission_tier"
+    if path.is_symlink():
+        raise ValueError(f"Refusing symlink permission file: {path}")
+    desired = tier + "\n"
+    try:
+        if path.read_text(encoding="utf-8") == desired:
+            return
+    except (FileNotFoundError, UnicodeDecodeError):
+        pass
+    _write_agy_permission_file(path, desired)
+
+
+def apply_agy_permission_tier(bridge_dir: Path, tier: str) -> None:
+    """Merge owned settings and the guard hook, then persist the tier."""
+    if tier not in AGY_PERMISSION_TIERS:
+        raise ValueError(f"Unknown agy permission tier: {tier!r}")
+    gemini = agy_gemini_dir(bridge_dir)
+    settings_path = gemini / "antigravity-cli" / "settings.json"
+    hooks_path = gemini / "config" / "hooks.json"
+    snapshot_path = bridge_dir / "agy_user_settings.json"
+    settings = _read_agy_permission_json(settings_path)
+    hooks = _read_agy_permission_json(hooks_path)
+    snapshot = _read_agy_permission_json(snapshot_path)
+    if (bridge_dir / "permission_tier").is_symlink():
+        raise ValueError("Refusing symlink permission_tier")
+    if not snapshot_path.exists():
+        snapshot = {
+            "allowNonWorkspaceAccess": {
+                "present": "allowNonWorkspaceAccess" in settings,
+                "value": settings.get("allowNonWorkspaceAccess"),
+            }
+        }
+        _write_agy_permission_file(snapshot_path, json.dumps(snapshot, indent=2) + "\n")
+    original = snapshot.get("allowNonWorkspaceAccess")
+    if not isinstance(original, dict) or not isinstance(original.get("present"), bool):
+        raise ValueError(f"Invalid user settings snapshot: {snapshot_path}")
+    auto = tier.startswith("auto-")
+    if tier == "full":
+        settings.pop("toolPermission", None)
+    else:
+        settings["toolPermission"] = "always-proceed" if auto else "request-review"
+    if auto:
+        settings["allowNonWorkspaceAccess"] = True
+    elif original["present"]:
+        settings["allowNonWorkspaceAccess"] = original["value"]
+    else:
+        settings.pop("allowNonWorkspaceAccess", None)
+    settings.pop("agentMode", None)
+    permissions = settings.get("permissions", {})
+    if not isinstance(permissions, dict):
+        raise ValueError(f"Expected permissions object in {settings_path}")
+    allow = permissions.get("allow", [])
+    if not isinstance(allow, list):
+        raise ValueError(f"Expected permissions.allow list in {settings_path}")
+    if "mcp(omnigent/*)" not in allow:
+        allow.append("mcp(omnigent/*)")
+    permissions["allow"] = allow
+    settings["permissions"] = permissions
+    if tier == "full":
+        hooks.pop("omnigent-guard", None)
+    else:
+        command = shlex.join(
+            [
+                sys.executable,
+                "-I",
+                str(Path(__file__).with_name("guard.py").resolve()),
+                "--tier-file",
+                str((bridge_dir / "permission_tier").absolute()),
+            ]
+        )
+        hooks["omnigent-guard"] = {
+            "enabled": True,
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{"type": "command", "command": command, "timeout": 10}],
+                }
+            ],
+        }
+    _write_agy_permission_file(
+        settings_path, json.dumps(settings, indent=2, sort_keys=True) + "\n"
+    )
+    _write_agy_permission_file(hooks_path, json.dumps(hooks, indent=2, sort_keys=True) + "\n")
+    reassert_agy_permission_tier(bridge_dir, tier)
+
+
 def build_mcp_config(
     bridge_dir: Path,
     *,
@@ -466,7 +620,7 @@ def build_mcp_config(
 
     Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.build_mcp_config`
     but emits agy's per-server MCP schema (lowercase ``command`` / ``args`` /
-    ``env`` keys plus ``enabledTools``, agy's auto-approve allowlist — verified
+    ``env`` keys plus ``enabledTools``, agy's tool-exposure allowlist — verified
     against agy 1.0.12's config struct) under the top-level ``mcpServers`` key.
     The server command is the SAME shared relay claude/codex/cursor use:
     ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
@@ -1097,6 +1251,10 @@ _TMUX_POLL_INTERVAL_S = 0.2
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # Settle pause after the draft renders, before the submit Enter.
 _PASTE_SETTLE_S = 0.2
+_IDLE_CLEAR_BATCH_SIZE = 300
+_IDLE_CLEAR_MAX_BATCHES = 4
+_IDLE_CLEAR_TIMEOUT_S = 5.0
+_BASELINE_CAPTURE_TIMEOUT_S = 5.0
 # How long one submit Enter is given to start a turn before it is re-sent.
 _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 # Re-send budget for a submit Enter that the TUI folded into the paste burst.
@@ -1109,6 +1267,7 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # a mid-turn steer; submission itself is verified by draft disappearance, NOT by
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
+_AGY_MODE_HINT_RE = re.compile(r"^[A-Z][a-z]*(?:-[a-z]+)* mode: .+ \(shift\+tab to cycle\)$")
 # agy collapses a paste carrying many line breaks into a single placeholder row
 # (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
 # The threshold is line-count based — ~13+ line breaks; total length does not
@@ -1118,6 +1277,7 @@ _AGY_ACTIVE_MARKER = "esc to cancel"
 # so both the render gate and the submit verification key off the placeholder
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
+_AGY_COLLAPSED_LINES_RE = re.compile(r"↑ \d+ more lines?")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1349,16 +1509,17 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _submit_needle(content: str) -> str:
+def _submit_needle(content: str, *, from_tail: bool = False) -> str:
     """
     A stable single-line substring used to confirm the paste rendered in the pane.
 
     :param content: Message content.
-    :returns: Up to 24 chars of the first line with at least 4 non-space chars,
-        or ``""`` when no such line exists (the caller then skips the
-        paste-commit poll and submits after the settle pause).
+    :param from_tail: Use the last qualifying line for agy's collapsed composer.
+    :returns: Up to 24 chars of the first (or last) line with at least 4 non-space
+        chars, or ``""`` when no such line exists.
     """
-    for line in content.splitlines():
+    lines = content.splitlines()
+    for line in reversed(lines) if from_tail else lines:
         stripped = line.strip()
         if len(stripped) >= 4:
             return stripped[:24]
@@ -1426,7 +1587,18 @@ def _agy_separator_line(line: str) -> bool:
     return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
 
 
-def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+def _agy_turn_running(pane: str) -> bool:
+    """Match activity in the footer, excluding draft and transcript text."""
+    lines = pane.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if _agy_separator_line(lines[index]):
+            return any(_AGY_ACTIVE_MARKER in line for line in lines[index + 1 :])
+    return _AGY_ACTIVE_MARKER in pane
+
+
+def _draft_in_input_region(
+    pane: str, needle: str, baseline_region: str, *, tail_needle: str = ""
+) -> bool:
     """
     Return whether the pasted draft is still visible in agy's composer.
 
@@ -1443,13 +1615,19 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     if region == baseline_region:
         return False
     candidates = _agy_draft_candidate_lines(region)
-    # A collapsed paste hides the text behind a placeholder, so no needle can
-    # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
+    # A single-chunk paste can hide all text behind a placeholder.
     if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
         return True
     normalized_needle = needle.strip() if needle else ""
     if not normalized_needle:
         return bool(candidates)
+    # A split paste in agy 1.3.4 hides the first lines but leaves the tail visible.
+    if (
+        tail_needle.strip()
+        and any(_AGY_COLLAPSED_LINES_RE.fullmatch(line) for line in candidates)
+        and any(tail_needle.strip() in line for line in candidates)
+    ):
+        return True
     return any(
         line == normalized_needle
         or line.startswith(normalized_needle)
@@ -1461,7 +1639,8 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
 def _agy_draft_candidate_lines(region: str) -> list[str]:
     """Return composer lines that can represent editable draft text.
 
-    A line carrying agy's ``>`` prompt glyph is editable draft content and is
+    The mode-cycle hint is chrome despite its ``>`` prompt glyph.
+    Other lines carrying agy's ``>`` prompt glyph are editable draft content and are
     kept verbatim (after the glyph is stripped) even when the user's own text
     contains a word like ``Generating`` or a footer phrase — otherwise a
     legitimate message would be filtered out and misread as "never rendered".
@@ -1475,6 +1654,8 @@ def _agy_draft_candidate_lines(region: str) -> list[str]:
             continue
         if line.startswith(">"):
             draft = line[1:].strip()
+            if _AGY_MODE_HINT_RE.fullmatch(draft):
+                continue
             if draft:
                 candidates.append(draft)
             continue
@@ -1517,6 +1698,7 @@ def _submit_and_verify(
     tmux_target: str,
     *,
     needle: str = "",
+    tail_needle: str = "",
     baseline_region: str = "",
     draft_seen: bool = False,
 ) -> None:
@@ -1553,7 +1735,7 @@ def _submit_and_verify(
     # Mid-turn steer: a turn is already running, so verifying via draft
     # disappearance is unreliable and a re-sent Enter could queue an empty turn.
     # Deliver one best-effort Enter and return (see the docstring).
-    if _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target):
+    if _agy_turn_running(_capture_pane(socket_path, tmux_target)):
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         return
     if not draft_seen:
@@ -1580,10 +1762,14 @@ def _submit_and_verify(
                 )
             pane = _capture_pane(socket_path, tmux_target)
             last_pane = pane or last_pane
-            if pane and not _draft_in_input_region(pane, needle, baseline_region):
+            if pane and not _draft_in_input_region(
+                pane, needle, baseline_region, tail_needle=tail_needle
+            ):
                 return
             time.sleep(_TMUX_POLL_INTERVAL_S)
-    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
+    draft_visible = _draft_in_input_region(
+        last_pane, needle, baseline_region, tail_needle=tail_needle
+    )
     raise RuntimeError(
         "agy did not accept the submitted message; the draft is still visible "
         "in the input box; "
@@ -1613,11 +1799,52 @@ def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
     pane = ""
     while True:
         pane = _capture_pane(socket_path, tmux_target) or pane
-        if _AGY_ACTIVE_MARKER in pane:
+        if _agy_turn_running(pane):
             return False
         if time.monotonic() >= deadline:
             return _AGY_VERIFYING_MARKER in pane.lower() and _AGY_IDLE_MARKER in pane
         time.sleep(_TMUX_POLL_INTERVAL_S)
+
+
+def _clear_idle_composer(socket_path: str, tmux_target: str, pane: str) -> str:
+    """Clear idle drafts in bounded batches; return unchanged placeholders for paste.
+    A composer that keeps changing without emptying exhausts the bound and raises.
+    """
+    if not pane:
+        raise RuntimeError("agy idle composer capture-pane failed; captured_pane_empty=True")
+    for _ in range(_IDLE_CLEAR_MAX_BATCHES):
+        before_region = _agy_input_region(pane)
+        if _agy_turn_running(pane) or not _agy_draft_candidate_lines(before_region):
+            return pane
+        _run_tmux(
+            socket_path,
+            "send-keys",
+            "-t",
+            tmux_target,
+            "-N",
+            str(_IDLE_CLEAR_BATCH_SIZE),
+            "C-w",
+        )
+        deadline = time.monotonic() + _IDLE_CLEAR_TIMEOUT_S
+        captured_pane_seen = False
+        while True:
+            captured_pane = _capture_pane(socket_path, tmux_target)
+            if captured_pane:
+                pane = captured_pane
+                captured_pane_seen = True
+            if _agy_turn_running(pane) or not _agy_draft_candidate_lines(_agy_input_region(pane)):
+                return pane
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+        if not captured_pane_seen:
+            raise RuntimeError("agy idle composer capture-pane failed; captured_pane_empty=True")
+        if _agy_input_region(pane) == before_region:
+            return pane
+    raise RuntimeError(
+        "agy idle composer did not clear; draft_candidates_empty=False; "
+        f"composer_tail:\n{_format_pane_debug_tail(_agy_input_region(pane))}"
+    )
 
 
 def _paste_and_submit(
@@ -1643,10 +1870,21 @@ def _paste_and_submit(
     :raises RuntimeError: When the TUI has exited, a tmux command fails, the
         pasted draft never renders, or the submit never starts a turn.
     """
-    # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
+    # C-a/C-k and Escape leave multi-line drafts; C-w batches clear an idle composer.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
+    capture_deadline = time.monotonic() + _BASELINE_CAPTURE_TIMEOUT_S
+    while True:
+        baseline_pane = _capture_pane(socket_path, tmux_target)
+        if baseline_pane:
+            break
+        if time.monotonic() >= capture_deadline:
+            raise RuntimeError(
+                "agy baseline capture-pane failed before paste; captured_pane_empty=True"
+            )
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    baseline_pane = _clear_idle_composer(socket_path, tmux_target, baseline_pane)
+    baseline_region = _agy_input_region(baseline_pane)
     # ``delete=False`` + name captured BEFORE the write, so a write failure still
     # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
     paste_path: str | None = None
@@ -1678,24 +1916,28 @@ def _paste_and_submit(
     # paste that never lands in the composer is caught rather than submitted blind
     # (``_draft_in_input_region`` keys off composer change when the needle is "").
     needle = _submit_needle(content)
+    tail_needle = _submit_needle(content, from_tail=True)
     # A mid-turn steer (agy already running a turn) is delivered best-effort: agy
     # queues it as the next turn and may not surface the draft in the composer the
     # same way an idle turn does, so a non-render is NOT a swallowed message here.
     # The render hard-fail below is for the idle/sequential case, where a paste
     # that never lands in the composer (e.g. eaten by an unhooked modal such as
     # the first-run trust gate) must fail loudly instead of vanishing.
-    mid_turn = _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target)
+    mid_turn = _agy_turn_running(_capture_pane(socket_path, tmux_target))
     draft_seen = False
     last_commit_pane = ""
     commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < commit_deadline:
         pane = _capture_pane(socket_path, tmux_target)
         last_commit_pane = pane or last_commit_pane
-        if _draft_in_input_region(pane, needle, baseline_region):
+        if _draft_in_input_region(pane, needle, baseline_region, tail_needle=tail_needle):
             draft_seen = True
             break
         time.sleep(_TMUX_POLL_INTERVAL_S)
     if not draft_seen and not mid_turn:
+        pane = _capture_pane(socket_path, tmux_target)
+        with contextlib.suppress(RuntimeError):
+            _clear_idle_composer(socket_path, tmux_target, pane)
         raise RuntimeError(
             "agy did not render the pasted message in its input box before submit; "
             f"pane_tail:\n{_format_pane_debug_tail(last_commit_pane)}"
@@ -1705,6 +1947,7 @@ def _paste_and_submit(
         socket_path,
         tmux_target,
         needle=needle,
+        tail_needle=tail_needle,
         baseline_region=baseline_region,
         draft_seen=draft_seen,
     )
@@ -1839,6 +2082,262 @@ def send_interaction_keys_via_tui(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+
+
+class AgyPermissionRollbackError(RuntimeError):
+    """Live permission state could not be restored; the runner must cold-resume."""
+
+
+# Verification budget for one live tier-switch step. The runner passes it as
+# ``timeout_s`` to ``switch_agy_permission_tier`` and the server derives its
+# forward timeout from it, so both sides budget from one number.
+AGY_SWITCH_STEP_TIMEOUT_S = 3.0
+
+
+def _agy_control_pane(bridge_dir: Path) -> str:
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError("antigravity-native tmux target not advertised")
+    return _capture_pane(info["socket_path"], info["tmux_target"])
+
+
+def _require_agy_idle(bridge_dir: Path) -> str:
+    pane = _agy_control_pane(bridge_dir)
+    mode = parse_agy_agent_mode(pane)
+    if mode is None and _AGY_ACTIVE_MARKER in pane:
+        raise RuntimeError("Antigravity is busy; wait for the active turn to finish")
+    if mode is None:
+        raise RuntimeError(f"Antigravity input is not idle; pane: {_format_pane_debug_tail(pane)}")
+    return pane
+
+
+def parse_agy_config_row(pane: str, row: str) -> str | None:
+    match = re.search(r"^\s*>\s+" + re.escape(row) + r"\s+(\S+)\s*$", pane, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def parse_agy_agent_mode(pane: str) -> str | None:
+    line = next((line for line in reversed(pane.splitlines()) if line.strip()), "")
+    if _AGY_IDLE_MARKER not in line:
+        return None
+    footer = line.split(_AGY_IDLE_MARKER, 1)[1].strip()
+    if footer.startswith("accept-edits · "):
+        return "accept-edits"
+    if footer.startswith("plan · "):
+        return "plan"
+    return "default" if footer else None
+
+
+_AGY_EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$")
+
+
+def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
+    """Split an agy model slug into its base id and trailing effort level.
+
+    agy exposes one slug per (model, effort) pair — ``gemini-3-flash-low``,
+    ``claude-sonnet-5-5-xhigh`` — so callers that need the bare model id or the
+    effort separately share this split instead of re-typing the ladder.
+
+    :param slug: An agy model slug, optionally carrying an effort suffix.
+    :returns: ``(base, effort)``; *effort* is ``None`` when the slug has none.
+    """
+    match = _AGY_EFFORT_SUFFIX_RE.search(slug)
+    if match is None:
+        return slug, None
+    return slug[: match.start()], match.group(1)
+
+
+def run_agy_slash_command(bridge_dir: Path, command: str, *, expect: str, timeout_s: float) -> str:
+    """Submit one idle slash command and verify its new pane confirmation."""
+    if not command.startswith("/") or "\n" in command or "\r" in command:
+        raise ValueError("Expected one slash command")
+    baseline = _require_agy_idle(bridge_dir)
+    info = read_tmux_info(bridge_dir)
+    assert info is not None
+    _paste_and_submit(bridge_dir, info["socket_path"], info["tmux_target"], content=command)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        pane = _agy_control_pane(bridge_dir)
+        matches = [line.strip() for line in pane.splitlines() if expect in line]
+        old = [line.strip() for line in baseline.splitlines() if expect in line]
+        if matches and (matches != old or pane.count(expect) > baseline.count(expect)):
+            return matches[-1]
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Antigravity did not confirm {command!r}; expected {expect!r}; "
+                f"pane: {_format_pane_debug_tail(pane)}"
+            )
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+
+
+def _set_agy_config_row(bridge_dir: Path, row: str, target: str, *, timeout_s: float) -> None:
+    row_filter = {"Tool Permission": "tool perm", "Non-Workspace Access": "non-work"}[row]
+
+    def open_row() -> str:
+        run_agy_slash_command(bridge_dir, "/config", expect="Settings", timeout_s=timeout_s)
+        info = read_tmux_info(bridge_dir)
+        assert info is not None
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "-l", row_filter)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            pane = _agy_control_pane(bridge_dir)
+            value = parse_agy_config_row(pane, row)
+            if value is not None:
+                return value
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Antigravity config row {row!r} missing; "
+                    f"pane: {_format_pane_debug_tail(pane)}"
+                )
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+
+    def close_row() -> None:
+        # The first Escape clears the search; the second leaves settings.
+        send_interaction_keys_via_tui(bridge_dir, "Escape")
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+        send_interaction_keys_via_tui(bridge_dir, "Escape")
+        deadline = time.monotonic() + timeout_s
+        while parse_agy_agent_mode(_agy_control_pane(bridge_dir)) is None:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Antigravity config did not close")
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+
+    try:
+        value = open_row()
+        for _ in range(4):
+            if value == target:
+                break
+            send_interaction_keys_via_tui(bridge_dir, "Right")
+            deadline = time.monotonic() + timeout_s
+            while True:
+                observed = parse_agy_config_row(_agy_control_pane(bridge_dir), row)
+                if observed is not None and observed != value:
+                    value = observed
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Antigravity config {row!r}: expected {target!r}; "
+                        f"observed {observed!r} after Right from {value!r}"
+                    )
+                time.sleep(_TMUX_POLL_INTERVAL_S)
+        if value != target:
+            raise RuntimeError(
+                f"Antigravity config {row!r}: expected {target!r}, observed {value!r}"
+            )
+    finally:
+        close_row()
+    try:
+        confirmed = open_row()
+        if confirmed != target:
+            raise RuntimeError(
+                f"Antigravity config {row!r}: expected {target!r}, reopened {confirmed!r}"
+            )
+    finally:
+        close_row()
+
+
+def _set_agy_agent_mode(bridge_dir: Path, target: str, *, timeout_s: float) -> None:
+    value = parse_agy_agent_mode(_require_agy_idle(bridge_dir))
+    for _ in range(3):
+        if value == target:
+            return
+        send_interaction_keys_via_tui(bridge_dir, "BTab")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            observed = parse_agy_agent_mode(_agy_control_pane(bridge_dir))
+            if observed is not None and observed != value:
+                value = observed
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Antigravity agent mode: expected {target!r}; "
+                    f"observed {observed!r} after Shift+Tab from {value!r}"
+                )
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+    if value != target:
+        raise RuntimeError(f"Antigravity agent mode: expected {target!r}, observed {value!r}")
+
+
+def switch_agy_permission_tier(
+    bridge_dir: Path, *, tier: str, previous: str, timeout_s: float
+) -> str:
+    """Switch live controls in guard-safe order and verify reverse undo on failure."""
+    if tier not in AGY_PERMISSION_TIERS or previous not in AGY_PERMISSION_TIERS:
+        raise ValueError("Unknown antigravity permission tier")
+    if "full" in (tier, previous):
+        raise ValueError("Skip permissions is create-only")
+    _require_agy_idle(bridge_dir)
+    snapshot_path = bridge_dir / "agy_user_settings.json"
+    # A launch always snapshots the user's /config values before any tier file
+    # is written, so a live switch without one means state was lost; guessing
+    # here could undo a user's own setting on rollback.
+    if not snapshot_path.exists():
+        raise ValueError("missing user settings snapshot")
+    snapshot = _read_agy_permission_json(snapshot_path)
+    user_access = snapshot.get("allowNonWorkspaceAccess", {})
+    if not isinstance(user_access, dict) or not isinstance(user_access.get("present"), bool):
+        raise ValueError("Invalid Antigravity user settings snapshot")
+    user_on = user_access["present"] and user_access.get("value") is True
+    auto, was_auto = tier.startswith("auto-"), previous.startswith("auto-")
+    mode = "accept-edits" if auto else "default" if tier == "ask" else tier
+    previous_mode = "accept-edits" if was_auto else "default" if previous == "ask" else previous
+    steps: list[tuple[str, str, str]]
+    if auto and not was_auto:
+        steps = [
+            ("tier", tier, previous),
+            ("Tool Permission", "always-proceed", "request-review"),
+            ("Non-Workspace Access", "on", "on" if user_on else "off"),
+            ("mode", mode, previous_mode),
+        ]
+    elif was_auto and not auto:
+        steps = [
+            ("Tool Permission", "request-review", "always-proceed"),
+            ("Non-Workspace Access", "on" if user_on else "off", "on"),
+            ("mode", mode, previous_mode),
+            ("tier", tier, previous),
+        ]
+    elif auto:
+        steps = [("tier", tier, previous)]
+    else:
+        steps = [("mode", mode, previous_mode)]
+
+    def apply(component: str, value: str) -> None:
+        if component == "tier":
+            reassert_agy_permission_tier(bridge_dir, value)
+        elif component == "mode":
+            _set_agy_agent_mode(bridge_dir, value, timeout_s=timeout_s)
+        else:
+            _set_agy_config_row(bridge_dir, component, value, timeout_s=timeout_s)
+
+    attempted: list[tuple[str, str, str]] = []
+    try:
+        for step in steps:
+            # A driver's failed verification can follow a successful key press.
+            attempted.append(step)
+            apply(step[0], step[1])
+        apply_agy_permission_tier(bridge_dir, tier)
+    except (OSError, RuntimeError, ValueError) as exc:
+        try:
+            for component, _, old in reversed(attempted):
+                apply(component, old)
+            apply_agy_permission_tier(bridge_dir, previous)
+        except (OSError, RuntimeError, ValueError) as undo:
+            detail = str(undo)
+            try:
+                reassert_agy_permission_tier(bridge_dir, "auto-strict")
+            except (OSError, ValueError) as safety:
+                detail += f"; deny-safe tier could not be written: {safety}"
+            try:
+                pane = _agy_control_pane(bridge_dir)
+            except (RuntimeError, OSError, ValueError) as capture:
+                pane = f"unavailable: {capture}"
+            raise AgyPermissionRollbackError(
+                f"Antigravity rollback unverified: {detail}; pane: {_format_pane_debug_tail(pane)}"
+            ) from exc
+        raise RuntimeError(
+            f"Antigravity permission switch failed; restored {previous}: {exc}"
+        ) from exc
+    return tier
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:

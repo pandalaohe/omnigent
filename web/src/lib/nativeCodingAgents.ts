@@ -75,7 +75,8 @@ export type NativeCodingAgentCapability =
   | "permissionMode"
   | "approvalMode"
   | "cursorMode"
-  | "skipPermissions"
+  | "agyPermissionTier"
+  | "agyMode"
   | "modelPicker"
   | "devinMode"
   | "devinPermission";
@@ -162,7 +163,7 @@ export const NATIVE_CODING_AGENTS = [
     //     rungs are not accepted by that field.
     //     `devinPermission` instead carries Devin's own four rungs
     //     (auto/accept-edits/smart/dangerous) as `terminal_launch_args`, the
-    //     same channel cursor/agy/codex modes use, so no gated field is sent.
+    //     same channel cursor/codex modes use, so no gated field is sent.
     //   * `modelPicker` would render pi's model list.
     key: "devin",
     agentName: "devin-native-ui",
@@ -222,10 +223,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
-    // agy's only pre-emptive control is the all-or-nothing
-    // `--dangerously-skip-permissions`, so it gets a two-value toggle rather
-    // than Claude's graded permissionMode selector.
-    capabilities: ["skipPermissions"],
+    capabilities: ["agyPermissionTier", "agyMode"],
   },
   {
     key: "goose",
