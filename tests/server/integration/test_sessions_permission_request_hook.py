@@ -276,6 +276,7 @@ class _DeliveryRecorder:
         *,
         conversation_store: Any,
         runner_router: Any,
+        persist_failure: bool = True,
     ) -> bool:
         self.calls.append((session_id, text))
         return True
@@ -6211,6 +6212,56 @@ async def test_codex_command_approval_defers_and_grants(
         assert again.json() == {"decision": "accept"}
         assert forwarded == []
         await collector.assert_no_event(0.2)
+    finally:
+        await collector.stop()
+
+
+async def test_codex_answer_stops_inflight_pending_notice(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending delivery racing the answer cannot arrive after the verdict."""
+    await _enable_async_approvals(monkeypatch)
+    pending_started = asyncio.Event()
+    pending_stopped = asyncio.Event()
+    delivered: list[str] = []
+
+    async def _deliver(
+        session_id: str,
+        text: str,
+        *,
+        conversation_store: Any,
+        runner_router: Any,
+        persist_failure: bool = True,
+    ) -> bool:
+        if text.startswith("Approval pending"):
+            pending_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pending_stopped.set()
+                raise
+        delivered.append(text)
+        return True
+
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", _deliver)
+    agent = await create_test_agent(client, "test-codex-pending-race")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_codex_command_payload(61, ["pnpm", "test"]),
+        )
+        assert response.status_code == 200
+        event = await _next_elicitation(collector)
+        await asyncio.wait_for(pending_started.wait(), timeout=3)
+        answer = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+        assert answer.status_code == 202
+        await asyncio.wait_for(pending_stopped.wait(), timeout=3)
+        await _wait_until(lambda: bool(delivered))
+        assert len(delivered) == 1
+        assert "granted: re-run" in delivered[0]
     finally:
         await collector.stop()
 

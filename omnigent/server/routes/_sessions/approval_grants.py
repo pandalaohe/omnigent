@@ -75,7 +75,9 @@ class ApprovalGrants:
 
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
-        self._grants: dict[tuple[str, tuple[str, ...]], tuple[ElicitationResult, float]] = {}
+        self._grants: dict[
+            tuple[str, tuple[str, ...]], tuple[ElicitationResult, float, str | None]
+        ] = {}
 
     def put(
         self,
@@ -83,6 +85,8 @@ class ApprovalGrants:
         key: tuple[str, ...],
         verdict: ElicitationResult,
         ttl_s: float,
+        *,
+        source_id: str | None = None,
     ) -> None:
         """
         Store one grant, replacing any prior grant for the same key.
@@ -93,10 +97,30 @@ class ApprovalGrants:
         :param verdict: The accepted web verdict; its content drives the
             grant-hit decision (remember / allow-all-edits / auto mode).
         :param ttl_s: Lifetime in seconds, e.g. ``86400``.
+        :param source_id: Durable card id backing this grant, when available.
         :returns: None.
         """
         self._prune()
-        self._grants[(session_id, key)] = (verdict, self._clock() + ttl_s)
+        self._grants[(session_id, key)] = (verdict, self._clock() + ttl_s, source_id)
+
+    def discard_if_source(self, session_id: str, key: tuple[str, ...], source_id: str) -> None:
+        """Revoke only a grant backed by this card, preserving a newer grant."""
+        entry = self._grants.get((session_id, key))
+        if entry is not None and entry[2] == source_id:
+            self._grants.pop((session_id, key), None)
+
+    def consume_with_source(
+        self, session_id: str, key: tuple[str, ...]
+    ) -> tuple[ElicitationResult, str | None] | None:
+        """Consume a live grant along with its durable card id."""
+        self._prune()
+        entry = self._grants.pop((session_id, key), None)
+        if entry is None:
+            return None
+        verdict, expires_at, source_id = entry
+        if expires_at <= self._clock():
+            return None
+        return verdict, source_id
 
     def consume(
         self,
@@ -110,14 +134,8 @@ class ApprovalGrants:
         :param key: Match key of the incoming call.
         :returns: The stored verdict, or ``None`` when absent/expired.
         """
-        self._prune()
-        entry = self._grants.pop((session_id, key), None)
-        if entry is None:
-            return None
-        verdict, expires_at = entry
-        if expires_at <= self._clock():
-            return None
-        return verdict
+        entry = self.consume_with_source(session_id, key)
+        return entry[0] if entry is not None else None
 
     def clear(self) -> None:
         """Drop every grant; test isolation."""
@@ -128,7 +146,7 @@ class ApprovalGrants:
         now = self._clock()
         expired = [
             grant_key
-            for grant_key, (_verdict, expires_at) in self._grants.items()
+            for grant_key, (_verdict, expires_at, _source_id) in self._grants.items()
             if expires_at <= now
         ]
         for grant_key in expired:
