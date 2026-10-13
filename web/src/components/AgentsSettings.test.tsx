@@ -15,6 +15,7 @@ import { AgentBadgeDisplaySetting, AgentsSettings } from "./AgentsSettings";
 const mocks = vi.hoisted(() => ({
   available: undefined as AvailableAgent[] | undefined,
   availableLoading: false,
+  availablePlaceholder: false,
   availableError: null as Error | null,
   catalog: [] as CustomAgent[],
   catalogLoading: false,
@@ -34,6 +35,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: () => ({
     data: mocks.available,
     isLoading: mocks.availableLoading,
+    isPlaceholderData: mocks.availablePlaceholder,
     error: mocks.availableError,
   }),
 }));
@@ -183,6 +185,27 @@ const builtinAcp: AvailableAgent = {
   acpHarness: true,
 };
 
+const installedNative: AvailableAgent = {
+  id: "ag_installed_native",
+  name: "release-helper",
+  display_name: "Release Helper",
+  description: "Prepares releases",
+  harness: "codex-native",
+  skills: [],
+  builtin: false,
+  mine: true,
+};
+
+const installedAcp: AvailableAgent = {
+  ...installedNative,
+  id: "ag_installed_acp",
+  name: "orion",
+  display_name: "Orion",
+  description: "Checks deployments",
+  harness: "acp:orion",
+  acpHarness: true,
+};
+
 function renderSettings(withBadgeDisplay = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
@@ -202,6 +225,7 @@ function renderSettings(withBadgeDisplay = false) {
 beforeEach(() => {
   localStorage.clear();
   mocks.availableLoading = false;
+  mocks.availablePlaceholder = false;
   mocks.availableError = null;
   mocks.catalogLoading = false;
   mocks.catalogError = null;
@@ -486,6 +510,64 @@ describe("AgentsSettings", () => {
       "aria-pressed",
       "false",
     );
+  });
+
+  it("pins installed native and ACP agents while preserving built-in and saved pins", () => {
+    mocks.available = [...mocks.available!, installedNative, installedAcp];
+    renderSettings();
+
+    const installed = screen.getByRole("heading", { name: "Installed agents" }).parentElement!;
+    expect(within(installed).getByText("Prepares releases")).toBeInTheDocument();
+    expect(within(installed).getByText("Checks deployments")).toBeInTheDocument();
+    expect(within(installed).queryByRole("button", { name: "View Orion" })).toBeNull();
+    expect(within(installed).queryByRole("button", { name: "Duplicate Orion" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Pin Release Helper" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_polly", "ag_builtin_debby", "ag_installed_native"],
+    });
+    expect(mocks.queueUserPreferencePatch).toHaveBeenCalledWith("agent_pins", {
+      ids: ["ag_builtin_polly", "ag_builtin_debby", "ag_installed_native"],
+    });
+    expect(screen.getByRole("button", { name: "Pin Orion" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Unpin Debby" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pin Orion" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_polly", "ag_installed_native", "ag_installed_acp"],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unpin Release Helper" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pin Reviewer" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({
+      ids: ["ag_builtin_polly", "ag_installed_acp", "ca_custom_reviewer"],
+    });
+  });
+
+  it.each([
+    ["available loading", { availableLoading: true, available: undefined }],
+    ["available error", { availableError: new Error("offline") }],
+    ["saved agents loading", { catalogLoading: true, catalog: undefined }],
+    ["saved agents error", { catalogError: new Error("offline") }],
+  ])("holds installed pins while %s", (_label, state) => {
+    mocks.available = [...mocks.available!, installedNative];
+    Object.assign(mocks, state);
+    renderSettings();
+    const pin = screen.queryByRole("button", { name: "Pin Release Helper" });
+    if (pin) expect(pin).toBeDisabled();
+  });
+
+  it("preserves installed pins while the available roster is placeholder data", () => {
+    const ids = ["ag_builtin_polly", "ag_installed_native"];
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids }));
+    mocks.availablePlaceholder = true;
+    renderSettings();
+
+    for (const name of ["Unpin Polly", "Pin Debby", "Pin Reviewer"]) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    expect(JSON.parse(localStorage.getItem("omnigent:agent-pins")!)).toEqual({ ids });
+    expect(mocks.queueUserPreferencePatch).not.toHaveBeenCalled();
   });
 
   it("leaves SDK product built-ins out of the pin candidates", () => {

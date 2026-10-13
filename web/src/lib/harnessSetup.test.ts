@@ -163,6 +163,35 @@ describe("harnessUnavailableReasonOnHost", () => {
     expect(harnessUnavailableReasonOnHost("jcode", hostWith({}))).toBe(null);
   });
 
+  it("leaves a dynamic ACP agent unknown when only aggregate ACP readiness is reported", () => {
+    const readinessMaps: Record<string, boolean | string>[] = [
+      { acp: true },
+      { acp: false },
+      { codex: true },
+    ];
+    for (const configured of readinessMaps) {
+      const host = hostWith(configured);
+      expect(harnessUnavailableReasonOnHost("acp:orion", host)).toBe(null);
+      expect(harnessReadinessOnHost("acp:orion", host).reason).toBe("readiness-unknown");
+    }
+    expect(harnessUnavailableReasonOnHost("acp:orion", hostWith(null))).toBe(null);
+  });
+
+  it("honors an explicit dynamic ACP readiness result", () => {
+    expect(harnessUnavailableReasonOnHost("acp:orion", hostWith({ "acp:orion": false }))).toBe(
+      "unconfigured",
+    );
+    expect(harnessReadinessOnHost("acp:orion", hostWith({ "acp:orion": false })).reason).toBe(
+      "unconfigured",
+    );
+    expect(
+      harnessUnavailableReasonOnHost("acp:orion", hostWith({ "acp:orion": "needs-auth" })),
+    ).toBe("needs-auth");
+    expect(harnessReadinessOnHost("acp:orion", hostWith({ "acp:orion": true })).reason).toBe(
+      "ready",
+    );
+  });
+
   it("never treats the Smart Routing auto sentinel as unconfigured", () => {
     // "auto" is a client-only sentinel — the daemon never reports a readiness key
     // for it, so the missing-key branch must not sweep it in (else Smart Routing

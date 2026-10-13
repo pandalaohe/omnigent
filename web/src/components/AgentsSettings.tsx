@@ -145,7 +145,14 @@ export function AgentsSettings() {
   // The Built-in list is the picker's built-in partition, harness rows
   // included; only the member-Agent rows carry the layer's controls.
   const builtinAgents = useMemo(
-    () => partitionAgentsByKind(selectableSessionAgents(available.data ?? [])).builtins,
+    () =>
+      partitionAgentsByKind(selectableSessionAgents(available.data ?? [])).builtins.filter(
+        (agent) => !agent.mine,
+      ),
+    [available.data],
+  );
+  const installedAgents = useMemo(
+    () => selectableSessionAgents(available.data ?? []).filter((agent) => agent.mine === true),
     [available.data],
   );
   const memberBuiltinAgents = useMemo(() => builtinAgents.filter(isMemberBuiltin), [builtinAgents]);
@@ -157,8 +164,11 @@ export function AgentsSettings() {
   // for both lists: saving a partial roster would drop pins it cannot see.
   const pinsReady =
     available.data !== undefined &&
+    !available.isLoading &&
+    !available.isPlaceholderData &&
     !available.error &&
     catalog.data !== undefined &&
+    !catalog.isLoading &&
     !catalog.error;
   const customAgentRows = useMemo(() => catalog.data ?? [], [catalog.data]);
   // SDK product built-ins live in New Chat's own SDK section and are not pin
@@ -168,8 +178,12 @@ export function AgentsSettings() {
     [memberBuiltinAgents],
   );
   const pinCandidates = useMemo(
-    () => [...pinnableBuiltinAgents, ...customAgentRows.map(customAgentForPicker)],
-    [pinnableBuiltinAgents, customAgentRows],
+    () => [
+      ...pinnableBuiltinAgents,
+      ...installedAgents,
+      ...customAgentRows.map(customAgentForPicker),
+    ],
+    [pinnableBuiltinAgents, installedAgents, customAgentRows],
   );
   const pinnedIds = useMemo(
     () => resolvePinnedAgentIds(storedPinnedIds, pinCandidates),
@@ -313,6 +327,30 @@ export function AgentsSettings() {
           );
         })}
       </div>
+      {installedAgents.length > 0 && (
+        <div>
+          <h2 className="mb-2 text-sm text-muted-foreground">Installed agents</h2>
+          {installedAgents.map((agent) => (
+            <div key={agent.id} className="flex min-h-14 items-center gap-2 border-b py-2">
+              <AgentBadge agentId={agent.id} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{agent.display_name}</div>
+                {agent.description && (
+                  <div className="truncate text-xs text-muted-foreground">{agent.description}</div>
+                )}
+              </div>
+              <PinToggle
+                agentId={agent.id}
+                name={agent.display_name}
+                pinned={pinnedIdSet.has(agent.id)}
+                canPin={!atPinLimit}
+                ready={pinsReady}
+                onToggle={togglePin}
+              />
+            </div>
+          ))}
+        </div>
+      )}
       <div>
         <div className="mb-2 flex items-center justify-between gap-3">
           <h2 className="text-sm text-muted-foreground">Custom agents</h2>

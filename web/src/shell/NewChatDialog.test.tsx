@@ -9958,6 +9958,17 @@ describe("NewChatLandingScreen pinned Agents", () => {
     skills: [],
     builtin: false,
   };
+  const installed: AvailableAgent = {
+    id: "ag_installed_orion",
+    name: "orion",
+    display_name: "Orion",
+    description: "Checks deployments",
+    harness: "acp:orion",
+    skills: [],
+    builtin: false,
+    mine: true,
+    acpHarness: true,
+  };
 
   beforeEach(setupLandingMocks);
   afterEach(() => {
@@ -9994,6 +10005,78 @@ describe("NewChatLandingScreen pinned Agents", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     expect(screen.getByTestId("new-chat-landing-agent-ag_polly")).toBeInTheDocument();
     expect(screen.getByTestId("new-chat-landing-agent-ag_debby")).toBeInTheDocument();
+  });
+
+  it("shows a persisted installed ACP pin and its own description on desktop", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [installed.id] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, debby, installed]);
+    mockHosts([{ ...host("online"), configured_harnesses: { acp: true } } as Host]);
+    renderLanding();
+    openPicker();
+
+    const row = screen.getByTestId("new-chat-landing-agent-ag_installed_orion");
+    expect(row).toHaveTextContent("Orion");
+    expect(row).toHaveTextContent("Checks deployments");
+    expect(screen.queryByTestId("new-chat-landing-custom-agents")?.textContent).toContain("Other");
+    fireEvent.click(row);
+    expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
+  });
+
+  it("uses a same-named installed agent's description instead of the built-in blurb", () => {
+    const installedPolly = {
+      ...installed,
+      id: "ag_installed_polly",
+      name: "polly",
+      display_name: "My Polly",
+      description: "Checks custom policies",
+      harness: "codex-native",
+    };
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [installedPolly.id] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, installedPolly]);
+    renderLanding();
+    openPicker();
+    const row = screen.getByTestId("new-chat-landing-agent-ag_installed_polly");
+    expect(row).toHaveTextContent("Checks custom policies");
+    expect(row).not.toHaveTextContent("Multi-agent coding");
+  });
+
+  it("uses a same-named saved agent's description instead of the built-in blurb", () => {
+    const savedPolly = {
+      ...saved,
+      id: "ca_polly_copy",
+      name: "polly",
+      display_name: "Polly copy",
+      description: "Plans release checks",
+    };
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [savedPolly.id] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, polly, savedPolly]);
+    renderLanding();
+    openPicker();
+    const row = screen.getByTestId("new-chat-landing-agent-ca_polly_copy");
+    expect(row).toHaveTextContent("Plans release checks");
+    expect(row).not.toHaveTextContent("Multi-agent coding");
+  });
+
+  it("keeps an explicit ACP slug failure visible after selecting an installed agent", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: [installed.id] }));
+    mockAgents([...DEFAULT_LANDING_AGENTS, installed]);
+    mockHosts([{ ...host("online"), configured_harnesses: { acp: true } } as Host]);
+    renderLanding();
+    openPicker();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_installed_orion"));
+    expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
+    mockHosts([
+      { ...host("online"), configured_harnesses: { acp: true, "acp:orion": false } } as Host,
+    ]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Check readiness" },
+    });
+    expect(screen.getByTestId("new-chat-landing-harness-warning")).toBeVisible();
+    openPicker();
+    expect(screen.getByTestId("new-chat-landing-agent-ag_installed_orion")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
   });
 
   it("labels Other... with the selected submenu Agent", () => {
@@ -10054,6 +10137,26 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
   function openPicker(): void {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
+
+  it("shows a persisted installed native pin on the mobile top level", () => {
+    localStorage.setItem("omnigent:agent-pins", JSON.stringify({ ids: ["ag_installed_native"] }));
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("ag_installed_native", "release-helper", {
+        display_name: "Release Helper",
+        description: "Prepares releases",
+        harness: "codex-native",
+        builtin: false,
+        mine: true,
+      }),
+    ]);
+    renderLanding();
+    openPicker();
+    expect(screen.getByTestId("new-chat-landing-agent-ag_installed_native")).toHaveTextContent(
+      "Prepares releases",
+    );
+    expect(screen.queryByTestId("new-chat-landing-page-back")).toBeNull();
+  });
 
   it("keeps harness configuration in one menu on narrow screens", () => {
     mockReadyDefaultHarnesses();
