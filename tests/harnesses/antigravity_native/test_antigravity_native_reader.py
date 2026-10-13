@@ -58,10 +58,327 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from omnigent.harnesses.antigravity_native import bridge as agy_bridge
 from omnigent.harnesses.antigravity_native import reader
-from omnigent.harnesses.antigravity_native.bridge import read_bridge_state
+from omnigent.harnesses.antigravity_native.bridge import (
+    AntigravityNativeBridgeState,
+    read_bridge_state,
+    write_bridge_state,
+)
 from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
+from omnigent.native.native_bridge_common import wrap_agent_instructions
+
+_WRAPPED_PLAN_TURN = wrap_agent_instructions("be terse", "Call the tool.")
+
+
+@pytest.mark.parametrize(
+    ("tier", "delivered", "agy_echo", "expected"),
+    [
+        ("plan", "Call the tool.", "/plan \n\nCall the tool.", "Call the tool."),
+        ("plan", "Reply briefly.", "/plan Reply briefly.", "Reply briefly."),
+        ("plan", "/plan Reply briefly.", "/plan Reply briefly.", "/plan Reply briefly."),
+        ("plan", "/plan Reply briefly.", "/plan /plan Reply briefly.", "/plan Reply briefly."),
+        ("plan", _WRAPPED_PLAN_TURN, "/plan " + _WRAPPED_PLAN_TURN, "Call the tool."),
+        ("ask", "Reply briefly.", "/plan Reply briefly.", "/plan Reply briefly."),
+    ],
+    ids=[
+        "plan-blank-line",
+        "plan-inline",
+        "user-slash-exact",
+        "user-slash-after-marker",
+        "staged-instructions",
+        "other-tier",
+    ],
+)
+async def test_plan_tier_user_echo_reconciles_delivered_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tier: str,
+    delivered: str,
+    agy_echo: str,
+    expected: str,
+) -> None:
+    """The read path commits the delivered turn, including a user-authored slash."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "permission_tier").write_text(tier + "\n")
+    monkeypatch.setattr(
+        agy_bridge,
+        "_wait_for_tmux_info",
+        lambda *a, **kw: {"socket_path": "/tmp/test-tmux.sock", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(agy_bridge, "_session_alive", lambda *a: True)
+    monkeypatch.setattr(agy_bridge, "_wait_for_agy_prompt_ready", lambda *a, **kw: None)
+    monkeypatch.setattr(agy_bridge, "_paste_and_submit", lambda *a, **kw: None)
+    monkeypatch.setattr(agy_bridge, "_account_verification_rejected", lambda *a: False)
+    agy_bridge.inject_user_message_via_tui(bridge_dir, content=delivered)
+
+    step = _load("user_input")
+    step["userInput"] = {"userResponse": agy_echo}
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242, bridge_dir=bridge_dir)
+
+    async def _no_interaction(*args: object) -> None:
+        return
+
+    async with httpx.AsyncClient(base_url="http://test") as client:
+        await reader._process_committed_step(
+            step,
+            client=client,
+            session_id=_SESSION_ID,
+            cascade_id=_CASCADE_ID,
+            state=state,
+            on_pending_interaction=_no_interaction,
+        )
+    messages = [data for kind, data in sink.posts if kind == "external_conversation_item"]
+    assert messages[0]["item_data"]["content"] == [{"type": "input_text", "text": expected}]
+
+
+async def test_plan_echo_uses_delivery_tier_and_keeps_queued_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later delivery and tier switch do not erase earlier plan receipts."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    tier = bridge_dir / "permission_tier"
+    tier.write_text("plan\n")
+    monkeypatch.setattr(
+        agy_bridge,
+        "_wait_for_tmux_info",
+        lambda *a, **kw: {"socket_path": "/tmp/test-tmux.sock", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(agy_bridge, "_session_alive", lambda *a: True)
+    monkeypatch.setattr(agy_bridge, "_wait_for_agy_prompt_ready", lambda *a, **kw: None)
+    monkeypatch.setattr(agy_bridge, "_paste_and_submit", lambda *a, **kw: None)
+    monkeypatch.setattr(agy_bridge, "_account_verification_rejected", lambda *a: False)
+
+    for content in ("First turn.", "Second turn."):
+        agy_bridge.inject_user_message_via_tui(bridge_dir, content=content)
+    tier.write_text("ask\n")
+
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242, bridge_dir=bridge_dir)
+
+    async def _no_interaction(*args: object) -> None:
+        return
+
+    async with httpx.AsyncClient(base_url="http://test") as client:
+        for index, text in enumerate(("/plan First turn.", "/plan Second turn.")):
+            step = _load("user_input")
+            step["metadata"]["executionId"] = f"turn-{index}"
+            step["userInput"] = {"userResponse": text}
+            await reader._process_committed_step(
+                step,
+                client=client,
+                session_id=_SESSION_ID,
+                cascade_id=_CASCADE_ID,
+                state=state,
+                on_pending_interaction=_no_interaction,
+            )
+    messages = [data for kind, data in sink.posts if kind == "external_conversation_item"]
+    assert [item["item_data"]["content"][0]["text"] for item in messages] == [
+        "First turn.",
+        "Second turn.",
+    ]
+    assert agy_bridge.reconcile_plan_input_echo(bridge_dir, "/plan Unrecorded turn.") == (
+        "/plan Unrecorded turn."
+    )
+
+
+async def _mirrored_user_text(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    echo: str,
+    execution_id: str,
+) -> str:
+    step = _load("user_input")
+    step["metadata"]["executionId"] = execution_id
+    step["userInput"] = {"userResponse": echo}
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242, bridge_dir=bridge_dir)
+
+    async def _no_interaction(*args: object) -> None:
+        return
+
+    async with httpx.AsyncClient(base_url="http://test") as client:
+        await reader._process_committed_step(
+            step,
+            client=client,
+            session_id=_SESSION_ID,
+            cascade_id=_CASCADE_ID,
+            state=state,
+            on_pending_interaction=_no_interaction,
+        )
+    messages = [data for kind, data in sink.posts if kind == "external_conversation_item"]
+    return messages[0]["item_data"]["content"][0]["text"]
+
+
+async def test_plan_echo_matches_queued_deliveries_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "permission_tier").write_text("plan\n")
+    agy_bridge._record_plan_input_receipt(bridge_dir, "hello")
+    agy_bridge._record_plan_input_receipt(bridge_dir, "/plan hello")
+    first = await _mirrored_user_text(
+        bridge_dir, monkeypatch, echo="/plan hello", execution_id="turn-1"
+    )
+    second = await _mirrored_user_text(
+        bridge_dir, monkeypatch, echo="/plan /plan hello", execution_id="turn-2"
+    )
+    assert [first, second] == ["hello", "/plan hello"]
+
+
+async def test_nonplan_user_slash_does_not_match_stale_plan_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    tier = bridge_dir / "permission_tier"
+    tier.write_text("plan\n")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id=_SESSION_ID, conversation_id="old-cascade"),
+    )
+    agy_bridge._record_plan_input_receipt(bridge_dir, "hello")
+    tier.write_text("ask\n")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id=_SESSION_ID, conversation_id=_CASCADE_ID),
+    )
+    agy_bridge._record_plan_input_receipt(bridge_dir, "/plan hello")
+    mirrored = await _mirrored_user_text(
+        bridge_dir, monkeypatch, echo="/plan hello", execution_id="turn-nonplan"
+    )
+    assert mirrored == "/plan hello"
+
+
+@pytest.mark.parametrize("clear_before_replay", [False, True], ids=["reader-restart", "resume"])
+async def test_plan_echo_replay_keeps_original_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clear_before_replay: bool
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "permission_tier").write_text("plan\n")
+    agy_bridge._record_plan_input_receipt(bridge_dir, "hello")
+    first = await _mirrored_user_text(
+        bridge_dir, monkeypatch, echo="/plan hello", execution_id="turn-1"
+    )
+    assert first == "hello"
+    if clear_before_replay:
+        agy_bridge.clear_bridge_state(bridge_dir)
+    replayed = await _mirrored_user_text(
+        bridge_dir, monkeypatch, echo="/plan hello", execution_id="turn-1"
+    )
+    assert replayed == "hello"
+
+
+async def test_first_tui_cascade_adopts_unmapped_plan_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "permission_tier").write_text("plan\n")
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id=_SESSION_ID, conversation_id="bootstrap-cascade"),
+    )
+    agy_bridge._record_plan_input_receipt(bridge_dir, "First turn.")
+
+    reader._adopt_cascade_in_place(bridge_dir, _SESSION_ID, _CASCADE_ID)
+
+    assert (
+        await _mirrored_user_text(
+            bridge_dir, monkeypatch, echo="/plan First turn.", execution_id="first-turn"
+        )
+        == "First turn."
+    )
+
+
+def test_clear_does_not_follow_receipt_directory_symlink(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    target = tmp_path / "innocent"
+    target.mkdir()
+    marker = target / "first-cascade"
+    marker.write_text("leave-me-alone\n")
+    (bridge_dir / "plan-input-receipts").symlink_to(target, target_is_directory=True)
+
+    agy_bridge.clear_bridge_state(bridge_dir)
+
+    assert marker.read_text() == "leave-me-alone\n"
+
+
+@pytest.mark.parametrize("tier", ["plan", "ask"])
+def test_receipt_storage_failure_does_not_block_tui_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "permission_tier").write_text(tier + "\n")
+    monkeypatch.setattr(
+        agy_bridge,
+        "_wait_for_tmux_info",
+        lambda *a, **kw: {"socket_path": "/tmp/test-tmux.sock", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(agy_bridge, "_session_alive", lambda *a: True)
+    monkeypatch.setattr(agy_bridge, "_wait_for_agy_prompt_ready", lambda *a, **kw: None)
+    monkeypatch.setattr(agy_bridge, "_account_verification_rejected", lambda *a: False)
+
+    def _storage_failure(*args: object) -> None:
+        raise OSError("receipt storage unavailable")
+
+    delivered: list[str] = []
+    monkeypatch.setattr(agy_bridge, "_record_plan_input_receipt", _storage_failure)
+    monkeypatch.setattr(
+        agy_bridge,
+        "_paste_and_submit",
+        lambda *a, **kw: delivered.append(cast(str, kw["content"])),
+    )
+
+    agy_bridge.inject_user_message_via_tui(bridge_dir, content="Original message.")
+
+    assert delivered == ["Original message."]
+
+
+def test_receipt_cleanup_failure_does_not_block_tui_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setattr(
+        agy_bridge,
+        "_wait_for_tmux_info",
+        lambda *a, **kw: {"socket_path": "/tmp/test-tmux.sock", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(agy_bridge, "_session_alive", lambda *a: True)
+    monkeypatch.setattr(agy_bridge, "_wait_for_agy_prompt_ready", lambda *a, **kw: None)
+    monkeypatch.setattr(agy_bridge.time, "sleep", lambda *a: None)
+
+    class _FailedReceipt:
+        def unlink(self, *, missing_ok: bool) -> None:
+            raise OSError("receipt cleanup unavailable")
+
+    monkeypatch.setattr(agy_bridge, "_record_plan_input_receipt", lambda *a: _FailedReceipt())
+    rejected = iter([True, False])
+    monkeypatch.setattr(agy_bridge, "_account_verification_rejected", lambda *a: next(rejected))
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        agy_bridge,
+        "_paste_and_submit",
+        lambda *a, **kw: delivered.append(cast(str, kw["content"])),
+    )
+
+    agy_bridge.inject_user_message_via_tui(bridge_dir, content="Original message.")
+
+    assert delivered == ["Original message.", "Original message."]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures + scaffolding

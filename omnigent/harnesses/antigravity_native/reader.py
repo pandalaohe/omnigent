@@ -69,6 +69,8 @@ from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
     is_placeholder_conversation_id,
     read_bridge_state,
+    rebind_unmapped_plan_input_receipts,
+    reconcile_plan_input_echo,
     write_bridge_state,
 )
 from omnigent.harnesses.antigravity_native.rpc import (
@@ -91,6 +93,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     _step_index,
     _tool_call_id,
     _trajectory_id,
+    _user_input_text,
     map_step_to_events,
     output_reasoning_delta_event,
     output_text_delta_event,
@@ -1032,6 +1035,7 @@ async def supervise_reader(
         seen=set(),
         interacted=set(),
         port=port,
+        bridge_dir=bridge_dir,
     )
 
     # Task T-G: the rotation detector records the new cascade id here and the
@@ -1290,6 +1294,7 @@ class _ReaderState:
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
     port: int = 0
+    bridge_dir: Path | None = None
     cumulative_input_tokens: int = 0
     cumulative_output_tokens: int = 0
     cumulative_cache_read_input_tokens: int = 0
@@ -1531,6 +1536,7 @@ async def _process_committed_step(
             session_id=session_id,
             cascade_id=cascade_id,
             turn_active=state.turn_active,
+            bridge_dir=state.bridge_dir,
         )
         # Telemetry: model-change detection on USER_INPUT (design §10.4).
         await _maybe_emit_model_change(
@@ -2269,6 +2275,7 @@ async def _emit_step(
     session_id: str,
     cascade_id: str,
     turn_active: bool,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Emit one new step's status edges + mapped conversation items.
@@ -2289,7 +2296,19 @@ async def _emit_step(
         turn_active = True
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
-    for event in map_step_to_events(step, conversation_id=cascade_id):
+    user_input_text = None
+    if step.get("type") == _TYPE_USER_INPUT and bridge_dir is not None:
+        raw_text = _user_input_text(step.get("userInput"))
+        try:
+            user_input_text = reconcile_plan_input_echo(
+                bridge_dir, raw_text, cascade_id=cascade_id, step_key=_step_key(step)
+            )
+        except OSError:
+            _logger.warning("agy plan-input receipt unavailable; keeping recorded user text")
+
+    for event in map_step_to_events(
+        step, conversation_id=cascade_id, user_input_text=user_input_text
+    ):
         await _post_event(client, session_id, event)
 
     if _is_turn_close_step(step) and turn_active:
@@ -2990,6 +3009,9 @@ def _adopt_cascade_in_place(bridge_dir: Path, session_id: str, new_cascade_id: s
     :param session_id: The Omnigent session to keep mirroring into.
     :param new_cascade_id: agy's freshly TUI-minted cascade/conversation id.
     """
+    old_state = read_bridge_state(bridge_dir)
+    if old_state is not None and old_state.conversation_id != new_cascade_id:
+        rebind_unmapped_plan_input_receipts(bridge_dir, old_state.conversation_id, new_cascade_id)
     write_bridge_state(
         bridge_dir,
         AntigravityNativeBridgeState(

@@ -940,6 +940,7 @@ def map_step_to_events(
     step: dict[str, object],
     *,
     conversation_id: str,
+    user_input_text: str | None = None,
 ) -> list[OutboundEvent]:
     """
     Map one agy RPC step to Omnigent conversation-item events.
@@ -990,6 +991,8 @@ def map_step_to_events(
         ``StreamAgentStateUpdates`` frame.
     :param conversation_id: agy conversation id (namespaces response ids and
         call ids).
+    :param user_input_text: Optional reader-reconciled USER_INPUT text. The
+        default uses the step as recorded by agy.
     :returns: Ordered events to POST for this step (possibly empty).
     """
     step_type = step.get("type")
@@ -1010,7 +1013,10 @@ def map_step_to_events(
     # (#1155). The reader dedups USER_INPUT by its per-turn ``executionId``, so
     # this emits exactly once per turn.
     if step_type == _TYPE_USER_INPUT:
-        text = strip_agent_instructions_block(_user_input_text(step.get("userInput"))).strip()
+        raw_text = user_input_text
+        if raw_text is None:
+            raw_text = _user_input_text(step.get("userInput"))
+        text = strip_agent_instructions_block(raw_text).strip()
         if not text:
             return []
         return [_user_message_event(text=text)]
