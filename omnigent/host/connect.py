@@ -3639,7 +3639,7 @@ class HostProcess:
 
             try:
                 agy_models = await asyncio.to_thread(list_agy_model_options)
-            except Exception:
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
                 _logger.warning("Antigravity model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,

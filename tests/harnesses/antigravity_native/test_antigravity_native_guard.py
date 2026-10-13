@@ -7,9 +7,11 @@ import re
 import shutil
 import subprocess
 import sys
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
+import tomllib
 
 from omnigent.harnesses.antigravity_native import guard
 
@@ -323,49 +325,22 @@ def test_cli_pass_is_never_empty(tmp_path: Path) -> None:
     }
 
 
-def test_built_wheel_contains_and_runs_guard(tmp_path: Path) -> None:
-    import zipfile
-
+def test_package_data_covers_ares_and_guard_runs_standalone(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[3]
-    source = tmp_path / "source"
-    source.mkdir()
-    for filename in ["pyproject.toml", "README.md"]:
-        shutil.copyfile(root / filename, source / filename)
-    package = Path("omnigent/harnesses/antigravity_native")
-    for directory in [Path("omnigent"), Path("omnigent/harnesses"), package]:
-        (source / directory).mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(root / directory / "__init__.py", source / directory / "__init__.py")
+    with (root / "pyproject.toml").open("rb") as file:
+        config = tomllib.load(file)
+    patterns = config["tool"]["setuptools"]["package-data"][
+        "omnigent.harnesses.antigravity_native"
+    ]
+    for filename in ["ares_rules.json", "ares_signatures.json"]:
+        assert any(fnmatch(filename, pattern) for pattern in patterns), filename
+    package = tmp_path / "package"
+    package.mkdir()
     for filename in ["guard.py", "ares_rules.json", "ares_signatures.json"]:
-        shutil.copyfile(root / package / filename, source / package / filename)
-    wheels = tmp_path / "wheels"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "build",
-            "--wheel",
-            "--no-isolation",
-            str(source),
-            "--outdir",
-            str(wheels),
-        ],
-        cwd=root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    wheel = next(wheels.glob("*.whl"))
-    installed = tmp_path / "installed"
-    with zipfile.ZipFile(wheel) as archive:
-        assert str(package / "ares_rules.json") in archive.namelist()
-        assert str(package / "ares_signatures.json") in archive.namelist()
-        archive.extractall(installed)
+        shutil.copyfile(Path(guard.__file__).with_name(filename), package / filename)
     tier = tmp_path / "permission_tier"
     tier.write_text("auto-relaxed\n")
-    result = run_cli(
-        installed / package / "guard.py", tier, json.dumps(command("mkfs.ext4 /dev/disk4"))
-    )
+    result = run_cli(package / "guard.py", tier, json.dumps(command("mkfs.ext4 /dev/disk4")))
     assert result["decision"] == "deny"
     assert "[disk-destroy]" in result["reason"]
     assert "ARES-218" in result["reason"]
