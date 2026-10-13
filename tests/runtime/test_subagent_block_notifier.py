@@ -1585,10 +1585,10 @@ async def test_configured_notifier_routes_notices_by_turn_origin(
         has_mcp_servers: bool = False,
         runner_router: Any | None = None,
         agent_revision: str | None = None,
-    ) -> str:
+    ) -> Any:
         recipients.append(session_id)
         fired.set()
-        return "item_wake"
+        return sessions_module._SessionEventDispatchResult(item_id="item_wake", pending_id=None)
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)
