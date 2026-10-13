@@ -322,7 +322,12 @@ async def test_held_completion_is_delivered_once_by_release(
         repeat = await client.post(f"/v1/sessions/{NEW_SESSION_ID}/succession/release")
         assert repeat.json() == {"status": "released", "delivered": 0}
         await asyncio.sleep(0.05)
-        assert len(server_client.posts) == 1, "a second release woke the successor again"
+        wake_posts = [
+            url
+            for url, _kwargs in server_client.posts
+            if url.endswith(f"/{NEW_SESSION_ID}/events")
+        ]
+        assert len(wake_posts) == 1, "a second release woke the successor again"
 
 
 @pytest.mark.asyncio
