@@ -10194,11 +10194,31 @@ async def _relay_runner_stream_once(
                         response_id=current_response_id,
                     )
                     if error_item is not None:
-                        await _relay_persist_error_once(
-                            conversation_store,
-                            session_id,
-                            error_item,
-                        )
+                        raw_input_stable_id = event.get("input_stable_id")
+                        if (
+                            isinstance(error_item.data, ErrorData)
+                            and _failed_event_undelivered(event)
+                            and isinstance(raw_input_stable_id, str)
+                            and re.fullmatch(r"[0-9a-f]{32}", raw_input_stable_id)
+                        ):
+                            error_item = error_item.model_copy(
+                                update={
+                                    "stable_id": uuid.uuid5(
+                                        uuid.NAMESPACE_URL,
+                                        f"codex-native-refusal:{session_id}:{raw_input_stable_id}",
+                                    ).hex
+                                }
+                            )
+                            # The stable id already deduplicates this attempt.
+                            # Payload-based error suppression could hide a
+                            # second refused attempt with the same text.
+                            await _relay_persist(conversation_store, session_id, error_item)
+                        else:
+                            await _relay_persist_error_once(
+                                conversation_store,
+                                session_id,
+                                error_item,
+                            )
 
                     # Persist resource lifecycle events
                     # (session.resource.created / .deleted) emitted by
