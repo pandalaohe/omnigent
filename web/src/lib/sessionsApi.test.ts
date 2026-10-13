@@ -440,6 +440,23 @@ describe("createBundledSession", () => {
 });
 
 describe("forkSession", () => {
+  it.each(["ask", "plan", "accept-edits", "auto-strict", "auto-standard", "auto-relaxed", "full"])(
+    "serializes Antigravity tier %s without launch args",
+    async (tier) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
+      await forkSession("conv_src", { config: { permissionTier: tier } });
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({ permission_tier: tier });
+    },
+  );
+
   it("POSTs the fork endpoint with the (url-encoded) source id and parses the fork", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

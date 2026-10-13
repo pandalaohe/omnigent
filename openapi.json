@@ -7568,6 +7568,18 @@
             "description": "Per-session LLM model override to apply to the fork, e.g. `\"claude-opus-4-7\"`. **Omitting** the field inherits the source's model (same as today, within the same provider family); an explicit value overrides it, and a clear alias (`\"default\"`, `\"off\"`, `\"reset\"`) resets the fork to the bound agent's default. Validated against a conservative model-id charset. Set by the web fork dialog's model picker.",
             "title": "Model Override"
           },
+          "permission_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Antigravity tier for the fork. Omitted inherits the source's tier, or uses the default for a different source harness. Ignored when the target uses another harness.",
+            "title": "Permission Tier"
+          },
           "reasoning_effort": {
             "anyOf": [
               {

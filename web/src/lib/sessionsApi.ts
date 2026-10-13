@@ -929,6 +929,7 @@ export async function forkSession(
       modelOverride?: string;
       reasoningEffort?: string;
       terminalLaunchArgs?: string[];
+      permissionTier?: string;
       codexBypassSandbox?: boolean;
     };
     sandbox?: { provider?: string | null; workspace?: string | null };
@@ -944,6 +945,7 @@ export async function forkSession(
     model_override?: string;
     reasoning_effort?: string;
     terminal_launch_args?: string[];
+    permission_tier?: string;
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
@@ -967,6 +969,9 @@ export async function forkSession(
   }
   if (config?.reasoningEffort !== undefined) {
     body.reasoning_effort = config.reasoningEffort;
+  }
+  if (config?.permissionTier !== undefined) {
+    body.permission_tier = config.permissionTier;
   }
   if (config?.terminalLaunchArgs !== undefined) {
     body.terminal_launch_args = config.terminalLaunchArgs;

@@ -24,6 +24,7 @@ from omnigent._platform import normalize_interactive_shells
 from omnigent._wrapper_labels import (
     ACP_SUBAGENT_ID_LABEL_KEY,
     ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
@@ -1070,6 +1071,7 @@ _UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
 
 # Live runner-owned model catalogs, keyed by wrapper label to route segment.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE: "antigravity-model-options",
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",

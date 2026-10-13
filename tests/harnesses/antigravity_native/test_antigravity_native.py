@@ -41,7 +41,7 @@ def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.As
 
 
 @pytest.fixture(autouse=True)
-def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """
     Resolve the agy binary to a fixed name so launch tests need no real install.
 
@@ -56,6 +56,7 @@ def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     ``tests/harnesses/antigravity_native/test_antigravity_native_launch.py``
     (which patches ``shutil.which`` directly), so nothing here needs the unstubbed binary lookup.
     """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "home"))
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.launch.agy_binary_path", lambda: "agy"
     )
@@ -334,8 +335,16 @@ async def test_daemon_resume_cold_falls_through_to_launch(
     assert launch_kwargs["conversation_id"] == "68caaeac-2eaf-4e2c-9b95-721b022f4903"
 
 
+@pytest.mark.parametrize(
+    "permission_mode,headless,expected_tier",
+    [
+        (None, False, None),
+        ("bypassPermissions", False, "full"),
+        (None, True, "full"),
+    ],
+)
 async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, permission_mode, headless, expected_tier
 ) -> None:
     """
     A fresh launch reattaches to the runner's auto-created terminal, not relaunch.
@@ -372,6 +381,7 @@ async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
     async def _create(*args: object, **kwargs: object) -> str:
+        assert kwargs["permission_tier"] == expected_tier
         return "conv_fresh123"
 
     async def _boom_launch(*args: object, **kwargs: object) -> object:
@@ -402,6 +412,8 @@ async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
             model=None,
             host_id="host_1",
             workspace="/tmp/ws",
+            permission_mode=permission_mode,
+            headless=headless,
             startup_progress=None,
         )
 
@@ -410,8 +422,16 @@ async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
     assert prepared.tmux_target == "main"
 
 
+@pytest.mark.parametrize(
+    "permission_mode,headless,expected_tier",
+    [
+        (None, False, None),
+        ("bypassPermissions", False, "full"),
+        (None, True, "full"),
+    ],
+)
 async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, permission_mode, headless, expected_tier
 ) -> None:
     """
     The LOCAL (non-daemon) prepare path also reattaches to the runner-owned terminal.
@@ -476,6 +496,8 @@ async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
             antigravity_args=(),
             command="agy",
             model=None,
+            permission_mode=permission_mode,
+            headless=headless,
             startup_progress=None,
         )
 
@@ -495,11 +517,15 @@ _PLACEHOLDER_ID = "agy_conv_fresh_placeholder"
 
 def _terminal_launch_handler(request: httpx.Request) -> httpx.Response:
     """Minimal handler that accepts the terminal POST and returns a stub resource."""
+    if request.method == "GET":
+        return httpx.Response(200, json={"labels": {}})
     return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
 
 
 def _terminal_launch_handler_with_pane(request: httpx.Request) -> httpx.Response:
     """Terminal POST handler that exposes a local tmux pane in the response metadata."""
+    if request.method == "GET":
+        return httpx.Response(200, json={"labels": {}})
     return httpx.Response(
         200,
         json={
@@ -537,6 +563,91 @@ async def test_launch_and_record_advertises_tmux_target_when_pane_exposed(
         )
     info = read_tmux_info(bridge_mod.bridge_dir_for_bridge_id(bridge_id))
     assert info == {"socket_path": "/tmp/agy/tmux.sock", "tmux_target": "main"}
+
+
+def _snapshot_launch_handler(
+    launch_calls: list[dict[str, object]], snapshot: dict[str, object]
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Handler returning *snapshot* on GET and a stub terminal resource on POST."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=snapshot)
+        return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
+
+    return handler
+
+
+async def _record_launch_and_record_args(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    snapshot: dict[str, object],
+    antigravity_args: tuple[str, ...],
+) -> list[dict[str, object]]:
+    """Run ``_launch_and_record`` with a stubbed launcher; return its kwargs."""
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    launch_calls: list[dict[str, object]] = []
+
+    def fake_build_agy_launch(**kwargs: object) -> tuple[list[str], dict[str, str]]:
+        launch_calls.append(kwargs)
+        return (["agy"], {})
+
+    monkeypatch.setattr(_mod, "build_agy_launch", fake_build_agy_launch)
+    async with _mock_client(_snapshot_launch_handler(launch_calls, snapshot)) as client:
+        await _mod._launch_and_record(
+            client,
+            session_id="conv_args",
+            bridge_id="bridge_cli_args",
+            conversation_id=_PLACEHOLDER_ID,
+            resume=False,
+            antigravity_args=antigravity_args,
+            command="agy",
+            model=None,
+            startup_progress=None,
+        )
+    return launch_calls
+
+
+async def test_launch_and_record_passes_cli_args_to_agy_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """CLI passthrough args reach the agy argv even when the session has stored args.
+
+    The snapshot's ``terminal_launch_args`` resolve the permission tier only;
+    the args the user typed on this launch must not be silently replaced by
+    them (an empty stored list included).
+    """
+    launch_calls = await _record_launch_and_record_args(
+        monkeypatch,
+        tmp_path,
+        snapshot={
+            "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
+            "terminal_launch_args": [],
+        },
+        antigravity_args=("--add-dir=/opt/work/extra",),
+    )
+    assert len(launch_calls) == 1
+    assert "--add-dir=/opt/work/extra" in launch_calls[0]["extra_args"]
+
+
+async def test_launch_and_record_strips_snapshot_skip_flag_for_non_full_tier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored skip flag whose tier label is no longer full must not reach agy."""
+    launch_calls = await _record_launch_and_record_args(
+        monkeypatch,
+        tmp_path,
+        snapshot={
+            "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
+            "terminal_launch_args": ["--dangerously-skip-permissions"],
+        },
+        antigravity_args=(),
+    )
+    assert len(launch_calls) == 1
+    extra_args = launch_calls[0]["extra_args"]
+    assert "--dangerously-skip-permissions" not in extra_args
+    assert list(extra_args) == ["--mode", "accept-edits"]
 
 
 # ---------------------------------------------------------------------------
@@ -585,20 +696,23 @@ def test_launch_is_headless_true_on_closed_stream(monkeypatch: pytest.MonkeyPatc
     assert _mod._launch_is_headless() is True
 
 
-async def test_launch_and_record_threads_headless_skip_flag(
+async def test_launch_and_record_uses_server_tier_for_headless_launch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``headless=True`` adds ``--dangerously-skip-permissions`` to the POSTed argv.
-
-    Confirms the phase-4 task-1 wiring is threaded all the way through
-    ``_launch_and_record`` → ``build_agy_launch`` → the terminal-launch
-    ``spec.args``, not just the unit-level ``should_skip_permissions``.
-    """
+    """Headless CLI fallback follows the server tier without adding bypass."""
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
 
     captured_args: list[str] = []
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
+                    "reasoning_effort": "high",
+                },
+            )
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
@@ -613,12 +727,14 @@ async def test_launch_and_record_threads_headless_skip_flag(
             antigravity_args=(),
             command="agy",
             model=None,
-            permission_mode=None,
-            headless=True,
             startup_progress=None,
         )
 
-    assert "--dangerously-skip-permissions" in captured_args
+    assert "--dangerously-skip-permissions" not in captured_args
+    assert captured_args[captured_args.index("--mode") + 1] == "accept-edits"
+    assert captured_args[captured_args.index("--effort") + 1] == "high"
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_headless_test")
+    assert (bridge_dir / "permission_tier").read_text() == "auto-relaxed\n"
 
 
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
@@ -644,6 +760,8 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     captured_env: dict[str, str] = {}
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"labels": {}})
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         captured_env.update(body["spec"]["env"])
@@ -659,8 +777,6 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
             antigravity_args=(),
             command="agy",
             model=None,
-            permission_mode=None,
-            headless=True,
             startup_progress=None,
         )
 
@@ -1314,3 +1430,85 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
 
     assert len(started) == 1
     assert started[0][0] == 52548  # safe candidate fallback (agy is up in the pane)
+
+
+AGY_MODELS = """gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)
+gemini-3.8-flash-low\tGemini 3.8 Flash (Low)
+claude-opus-5-5-low\tClaude Opus 5.5 (Low)
+claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)
+claude-opus-5-5-high\tClaude Opus 5.5 (High)
+claude-sonnet-5-5-low\tClaude Sonnet 5.5 (Low)
+claude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)
+claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+"""
+
+
+def test_parse_agy_models():
+    assert _mod.parse_agy_models_output(AGY_MODELS) == [
+        {
+            "id": base,
+            "displayName": label,
+            "isDefault": False,
+            "efforts": efforts,
+            "supportedReasoningEfforts": [{"reasoningEffort": effort} for effort in efforts],
+        }
+        for base, label, efforts in [
+            ("gemini-3.8-flash", "Gemini 3.8 Flash", ["low", "medium", "high"]),
+            ("claude-opus-5-5", "Claude Opus 5.5", ["low", "medium", "high"]),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5", ["low", "medium", "high"]),
+            ("gpt-oss-120b", "GPT-OSS 120B", ["medium"]),
+        ]
+    ]
+
+
+@pytest.mark.parametrize("status,output", [(0, AGY_MODELS), (1, "signed out"), (0, "signed out")])
+def test_list_agy_models_command(monkeypatch, tmp_path, status, output):
+    import subprocess
+
+    calls = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda _: tmp_path))
+    monkeypatch.setattr(_mod, "agy_binary_path", lambda: "agy")
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, status, output, "")
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    if status == 0 and output == AGY_MODELS:
+        assert len(_mod.list_agy_model_options()) == 4
+    else:
+        with pytest.raises(RuntimeError):
+            _mod.list_agy_model_options()
+    assert calls == [["agy", f"--gemini_dir={tmp_path / '.gemini'}", "models"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", [None, "full"])
+async def test_cli_create_sends_tier_before_binding(tier):
+    import json
+
+    def handler(request):
+        metadata = json.loads(
+            request.content.split(b'name="metadata"')[1]
+            .split(b"\r\n\r\n", 1)[1]
+            .split(b"\r\n--", 1)[0]
+        )
+        labels = metadata["labels"]
+        if tier:
+            assert labels["omnigent.antigravity_native.permission_tier"] == "full"
+        else:
+            assert "omnigent.antigravity_native.permission_tier" not in labels
+        return httpx.Response(201, json={"session_id": "conv_agy"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        assert (
+            await _mod._create_antigravity_session(
+                client, b"bundle", bridge_id="bridge", permission_tier=tier
+            )
+            == "conv_agy"
+        )

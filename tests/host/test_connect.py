@@ -9911,3 +9911,38 @@ def test_run_host_process_classifies_how_the_host_ended(
         )
 
     assert _host_exit_reasons(caplog) == [expected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_antigravity_host_catalog_availability(monkeypatch, tmp_path, failed):
+    from omnigent.harnesses.antigravity_native import main as agy
+    from omnigent.host import connect as host_connect
+    from omnigent.host.frames import HostModelOptionsFrame
+
+    def catalog():
+        if failed:
+            raise RuntimeError("signed out")
+        return [
+            {
+                "id": "gpt-oss-120b",
+                "displayName": "GPT-OSS 120B",
+                "isDefault": False,
+                "efforts": ["medium"],
+            }
+        ]
+
+    monkeypatch.setattr(agy, "list_agy_model_options", catalog)
+    monkeypatch.setattr(
+        host_connect,
+        "_model_configuration_source_for_harness",
+        lambda _: {"kind": "subscription", "label": "Subscription"},
+    )
+    host = _make_host_process()
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="agy-catalog", harness="antigravity-native")
+    )
+    assert result.status == ("failed" if failed else "ok")
+    if not failed:
+        assert result.models[0]["id"] == "gpt-oss-120b"
+        assert result.models[0]["efforts"] == ["medium"]

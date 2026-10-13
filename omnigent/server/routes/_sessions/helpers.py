@@ -11203,6 +11203,31 @@ def _spec_config_flag_explicitly_enabled(spec: AgentSpec, key: str) -> bool:
     return isinstance(value, str) and value.lower() == "true"
 
 
+def _stamp_antigravity_permission_tier(
+    labels: dict[str, str], launch_args: list[str] | None, *, default: str | None = None
+) -> list[str]:
+    from omnigent.harnesses.antigravity_native.bridge import (
+        AGY_DEFAULT_PERMISSION_TIER,
+        AGY_PERMISSION_TIER_LABEL_KEY,
+        AGY_PERMISSION_TIERS,
+    )
+
+    explicit = labels.get(AGY_PERMISSION_TIER_LABEL_KEY)
+    if explicit is not None and explicit not in AGY_PERMISSION_TIERS:
+        raise OmnigentError("Invalid antigravity permission tier", code=ErrorCode.INVALID_INPUT)
+    tier = explicit or (default if default in AGY_PERMISSION_TIERS else None)
+    args = [arg for arg in (launch_args or []) if arg != "--dangerously-skip-permissions"]
+    tier = tier or (
+        "full"
+        if "--dangerously-skip-permissions" in (launch_args or [])
+        else AGY_DEFAULT_PERMISSION_TIER
+    )
+    labels[AGY_PERMISSION_TIER_LABEL_KEY] = tier
+    if tier == "full":
+        args.append("--dangerously-skip-permissions")
+    return args
+
+
 def _derive_terminal_launch_args_from_spec(
     spec: AgentSpec, *, headless_defaults: bool = True
 ) -> list[str] | None:
@@ -11246,8 +11271,8 @@ def _derive_terminal_launch_args_from_spec(
       mapped). Opt-IN: absent / false leaves args unset.
     - antigravity-native + ``executor.config.permission_mode:
       bypassPermissions`` -> ``["--dangerously-skip-permissions"]``, agy's
-      only pre-emptive permission control. Opt-IN like claude-native;
-      other / absent modes leave args unset.
+      create-only full tier. Other / absent modes leave args unset and the server
+      stamps its default permission tier.
 
     Value-matching policy: enabling values are matched without whitespace
     tolerance. Flag-valued keys (``yolo``) accept a real bool or the

@@ -381,6 +381,7 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
     _stable_id_reuse_is_exact_retry,
+    _stamp_antigravity_permission_tier,
     _stop_session_via_runner,
     _strip_succession_operation_labels,
     _usage_by_model_for_display,
@@ -12935,7 +12936,8 @@ async def _create_session_from_existing_agent(
                     resolved_harness,
                 )
             elif (
-                body.permission_mode is None
+                resolved_harness != "antigravity-native"
+                and body.permission_mode is None
                 and body.approval_mode is None
                 and CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in (body.labels or {})
                 and not _launch_args_set_permission(validated_launch_args, resolved_harness)
@@ -13026,6 +13028,20 @@ async def _create_session_from_existing_agent(
 
     if sdk_permission_labels:
         initial_labels.update(sdk_permission_labels)
+
+    create_harness = (
+        sub_spec.executor.harness_kind
+        if sub_spec is not None
+        else await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
+        )
+    )
+    if create_harness == "antigravity-native":
+        validated_launch_args = _stamp_antigravity_permission_tier(
+            initial_labels,
+            validated_launch_args,
+            default=project_resolution.permission if body.sub_agent_name is None else None,
+        )
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
@@ -13455,6 +13471,13 @@ def _create_session_from_bundle(
             ) from exc
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
+
+    if _spec_harness(spec) == "antigravity-native":
+        labels = dict(metadata.labels or {})
+        launch_args = _stamp_antigravity_permission_tier(labels, metadata.terminal_launch_args)
+        metadata = metadata.model_copy(
+            update={"labels": labels, "terminal_launch_args": launch_args}
+        )
 
     if agent_store is not None and metadata.parent_session_id is None:
         agent = uploaded_agent_for(

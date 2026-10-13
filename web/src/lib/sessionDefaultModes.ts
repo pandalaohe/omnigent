@@ -1,5 +1,6 @@
 import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
 import { CODEX_APPROVAL_PRESETS } from "@/lib/codexApprovalMode";
+import { AGY_NATIVE_PERMISSION_TIERS } from "@/lib/nativeHarnessModes";
 import { speedOptionsForModel } from "@/lib/speedTiers";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -20,6 +21,7 @@ export const PERMISSION_DEFAULT_OPTIONS: Record<
   string,
   readonly { value: string; label: string }[]
 > = {
+  "antigravity-native": AGY_NATIVE_PERMISSION_TIERS,
   codex: CODEX_APPROVAL_PRESETS,
   "codex-native": CODEX_APPROVAL_PRESETS,
   "claude-native": CLAUDE_PERMISSION_OPTIONS,

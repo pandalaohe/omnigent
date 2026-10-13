@@ -701,6 +701,7 @@ export interface NativeModelOption {
   defaultReasoningEffort?: string;
   /** Reasoning efforts advertised for this model. */
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
+  efforts?: string[];
   /** Service tiers advertised by the host for this specific model. */
   serviceTiers?: { id: string; name: string }[];
   /** Host's effective service tier when this model is selected and no override is sent. */

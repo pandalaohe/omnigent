@@ -182,6 +182,13 @@ class _HandleOpencodeNativeCostPopupFn(Protocol):
 class NativeControls:
     """Native-harness control handlers the runner app's event dispatch calls."""
 
+    handle_antigravity_native_permission_mode_change: Callable[
+        [str, str | None], Coroutine[Any, Any, Response]
+    ]
+    handle_antigravity_native_model_change: Callable[..., Coroutine[Any, Any, Response]]
+    handle_antigravity_native_effort_change: Callable[
+        [str, str | None], Coroutine[Any, Any, Response]
+    ]
     codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
     handle_claude_native_btw_dismiss: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
@@ -231,7 +238,7 @@ def build_native_controls(
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
-    _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
+    _ensure_native_terminal_for_turn: Callable[..., Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
     _ingest_cond: dict[str, asyncio.Condition],
     _ingest_next_seq: dict[str, int],
@@ -1340,6 +1347,210 @@ def build_native_controls(
             )
         return Response(status_code=204)
 
+    async def _handle_antigravity_native_permission_mode_change(
+        conv_id: str,
+        mode: str | None,
+    ) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            AGY_PERMISSION_TIERS,
+            AGY_SWITCH_STEP_TIMEOUT_S,
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            AgyPermissionRollbackError,
+            bridge_dir_for_bridge_id,
+            resolve_agy_permission_tier,
+            switch_agy_permission_tier,
+        )
+        from omnigent.runner.native.orchestration import (
+            _AGY_CONFIRMED_PERMISSION_TIERS,
+            _session_payload_for_host_spawn_check,
+        )
+
+        if mode is None or mode not in AGY_PERMISSION_TIERS or mode == "full":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": "Skip permissions is create-only"
+                    if mode == "full"
+                    else "Invalid permission tier"
+                },
+            )
+        snapshot = await _session_payload_for_host_spawn_check(server_client, conv_id)
+        if snapshot is None:
+            return JSONResponse(
+                status_code=503, content={"detail": "Could not fetch Antigravity tier"}
+            )
+        labels = snapshot.get("labels")
+        labels = labels if isinstance(labels, dict) else {}
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        raw_args = snapshot.get("terminal_launch_args")
+        launch_args = raw_args if isinstance(raw_args, list) else []
+        previous = _AGY_CONFIRMED_PERMISSION_TIERS.get(
+            bridge_dir.resolve()
+        ) or resolve_agy_permission_tier(labels, launch_args)
+        try:
+            settled = await asyncio.to_thread(
+                switch_agy_permission_tier,
+                bridge_dir,
+                tier=mode,
+                previous=previous,
+                timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
+            )
+        except AgyPermissionRollbackError as exc:
+            try:
+                from omnigent.entities.session_resources import terminal_resource_id
+
+                # The failed undo already reasserted the deny-safe tier file;
+                # record it so every later turn re-asserts auto-strict until a
+                # real launch confirms the pane state again.
+                _AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] = "auto-strict"
+                await resource_registry.close_terminal(
+                    conv_id, terminal_resource_id("antigravity", "main")
+                )
+                await _ensure_native_terminal_for_turn(
+                    conv_id, "antigravity-native", lifecycle_locked=True
+                )
+            except Exception as relaunch:  # noqa: BLE001 - the unsafe pane must not be reported as recovered.
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "antigravity_native_permission_mode_failed",
+                        "detail": _client_safe_error_detail(
+                            RuntimeError(f"{exc}; cold resume failed: {relaunch}"),
+                            context="antigravity-native permission change",
+                        ),
+                    },
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native permission change"
+                    ),
+                },
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native permission change"
+                    ),
+                },
+            )
+        _AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] = settled
+        return JSONResponse(status_code=200, content={"permission_mode": settled})
+
+    async def _handle_antigravity_native_model_change(
+        conv_id: str,
+        model: str | None,
+        *,
+        effort: str | None = None,
+        effort_set: bool = False,
+    ) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            run_agy_slash_command,
+            split_agy_effort_suffix,
+        )
+        from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
+
+        if not model or not model.strip():
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Antigravity cannot confirm a default model reset"},
+            )
+        snapshot = await _session_payload_for_host_spawn_check(server_client, conv_id)
+        if snapshot is None:
+            return JSONResponse(
+                status_code=503, content={"detail": "Could not fetch Antigravity model settings"}
+            )
+        raw_labels = snapshot.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        if not effort_set:
+            raw_effort = _session_reasoning_effort.get(conv_id) or snapshot.get("reasoning_effort")
+            effort = raw_effort if isinstance(raw_effort, str) else None
+        selected = (
+            split_agy_effort_suffix(model.strip())[0] + "-" + effort if effort else model.strip()
+        )
+        try:
+            await asyncio.to_thread(
+                run_agy_slash_command,
+                bridge_dir,
+                f"/model {selected}",
+                expect="Model set to",
+                timeout_s=3.0,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_model_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native model change"
+                    ),
+                },
+            )
+        if effort_set:
+            if effort:
+                _session_reasoning_effort[conv_id] = effort
+            else:
+                _session_reasoning_effort.pop(conv_id, None)
+        return JSONResponse(status_code=200, content={"model": selected})
+
+    async def _handle_antigravity_native_effort_change(
+        conv_id: str, effort: str | None
+    ) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            run_agy_slash_command,
+        )
+        from omnigent.runner.native.orchestration import _session_payload_for_host_spawn_check
+
+        if not effort:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Antigravity cannot confirm a default effort reset"},
+            )
+        snapshot = await _session_payload_for_host_spawn_check(server_client, conv_id)
+        if snapshot is None:
+            return JSONResponse(
+                status_code=503, content={"detail": "Could not fetch Antigravity effort settings"}
+            )
+        raw_labels = snapshot.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        try:
+            await asyncio.to_thread(
+                run_agy_slash_command,
+                bridge_dir,
+                f"/effort {effort}",
+                expect=f"Effort set to {effort}",
+                timeout_s=3.0,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_effort_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native effort change"
+                    ),
+                },
+            )
+        _session_reasoning_effort[conv_id] = effort
+        return JSONResponse(status_code=200, content={"effort": effort})
+
     async def _handle_devin_native_model_change(
         conv_id: str,
         model: str | None,
@@ -2155,6 +2366,9 @@ def build_native_controls(
         return Response(status_code=204)
 
     return NativeControls(
+        handle_antigravity_native_permission_mode_change=_handle_antigravity_native_permission_mode_change,
+        handle_antigravity_native_model_change=_handle_antigravity_native_model_change,
+        handle_antigravity_native_effort_change=_handle_antigravity_native_effort_change,
         codex_native_model_options=_codex_native_model_options,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
         handle_claude_native_compact=_handle_claude_native_compact,

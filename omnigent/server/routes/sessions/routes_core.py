@@ -28,6 +28,10 @@ from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+)
 from omnigent.calling_defaults import load_master
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
@@ -46,6 +50,13 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.harnesses.antigravity_native.bridge import (
+    AGY_DEFAULT_PERMISSION_TIER,
+    AGY_PERMISSION_TIER_LABEL_KEY,
+    AGY_PERMISSION_TIERS,
+    AGY_SWITCH_STEP_TIMEOUT_S,
+    resolve_agy_permission_tier,
+)
 from omnigent.member_snapshot import MEMBER_LABEL_PREFIX, launched_from_library_agent
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
@@ -203,6 +214,7 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
+    _stamp_antigravity_permission_tier,
     _strip_succession_operation_labels,
     _surface_model_change_forward_failure,
     _title_content_from_item,
@@ -355,6 +367,12 @@ _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
     "The previous selections have been restored."
 )
+
+
+#: Forward budget for an agy live tier switch: the runner's worst case is a
+#: four-step cross-family sweep (ten per-step budgets each) plus its reverse
+#: undo on failure, so both sides derive from the runner's step constant.
+_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S = AGY_SWITCH_STEP_TIMEOUT_S * 10 * 4 * 2
 
 
 def _runner_reply_field(body: str, key: str) -> object:
@@ -1794,6 +1812,13 @@ def register_core_routes(
             parsed_metadata = parsed_metadata.model_copy(
                 update={"labels": {**parsed_metadata.labels, **member_labels}}
             )
+        if (
+            spec_harness(spec) == "antigravity-native"
+            and project_resolution.permission in AGY_PERMISSION_TIERS
+        ):
+            labels = dict(parsed_metadata.labels or {})
+            labels.setdefault(AGY_PERMISSION_TIER_LABEL_KEY, project_resolution.permission)
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
                 _create_session_from_bundle,
@@ -3667,6 +3692,10 @@ def register_core_routes(
                     f"To fork this session instead, run: omnigent run --fork {session_id}",
                     code=ErrorCode.FORBIDDEN,
                 )
+        if body.labels and AGY_PERMISSION_TIER_LABEL_KEY in body.labels:
+            raise OmnigentError(
+                "Antigravity permission tier is server-owned", code=ErrorCode.INVALID_INPUT
+            )
         if body.labels:
             _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
@@ -3719,6 +3748,7 @@ def register_core_routes(
         permission_mode_requested = "permission_mode" in body.model_fields_set
         requested_permission_mode: str | None = None
         sdk_permission_mode = False
+        agy_permission_mode = False
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
@@ -3739,6 +3769,22 @@ def register_core_routes(
             )
             if wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
                 allowed_permission_modes: tuple[str, ...] = tuple(_CLAUDE_NATIVE_PERMISSION_MODES)
+            elif wrapper_for_permission_mode == ANTIGRAVITY_NATIVE_WRAPPER_VALUE:
+                agy_permission_mode = True
+                if (
+                    body.permission_mode == "full"
+                    or resolve_agy_permission_tier(
+                        conv_for_permission_mode.labels,
+                        conv_for_permission_mode.terminal_launch_args or [],
+                    )
+                    == "full"
+                ):
+                    raise OmnigentError(
+                        "Skip permissions is create-only", code=ErrorCode.INVALID_INPUT
+                    )
+                allowed_permission_modes = tuple(
+                    tier for tier in AGY_PERMISSION_TIERS if tier != "full"
+                )
             elif wrapper_for_permission_mode == _DEVIN_NATIVE_WRAPPER_LABEL_VALUE:
                 from omnigent.harnesses.devin_native.bridge import DEVIN_PERMISSION_MODES
 
@@ -3757,7 +3803,7 @@ def register_core_routes(
             else:
                 raise OmnigentError(
                     "permission_mode is only supported for claude-native and "
-                    "devin-native or claude-sdk sessions",
+                    "devin-native, antigravity-native or claude-sdk sessions",
                     code=ErrorCode.INVALID_INPUT,
                 )
             if body.permission_mode not in allowed_permission_modes:
@@ -3999,6 +4045,27 @@ def register_core_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
+        if terminal_launch_args is not None:
+            agy_native_session = (
+                conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                in (
+                    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+                    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+                )
+                or _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+                == "antigravity-native"
+            )
+            if agy_native_session and (
+                "--dangerously-skip-permissions" in terminal_launch_args
+            ) != ("--dangerously-skip-permissions" in (conv.terminal_launch_args or [])):
+                raise OmnigentError(
+                    "Skip permissions is create-only", code=ErrorCode.INVALID_INPUT
+                )
+        if agy_permission_mode and body.silent:
+            raise OmnigentError(
+                "Antigravity permission changes require runner confirmation",
+                code=ErrorCode.INVALID_INPUT,
+            )
         previous_runner_id = conv.runner_id
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);
@@ -4443,15 +4510,21 @@ def register_core_routes(
             updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
             == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
         )
+        agy_native = (
+            updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            == ANTIGRAVITY_NATIVE_WRAPPER_VALUE
+        )
         # This server rolls back Codex refusals and keeps unconfirmed changes, so the
         # runner neither saves a refusal nor waits out this server's forward timeout.
-        negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        negotiation: dict[str, object] = (
+            {"rollback_on_refusal": True} if codex_native or agy_native else {}
+        )
         combined_model_forward = False
         _model_forward = None
         if (
             live_forward
             and (effort is not None or clear_effort)
-            and (effort_changed or (live_model_change and codex_native))
+            and (effort_changed or (live_model_change and (codex_native or agy_native)))
         ):
             effort_event: dict[str, object] = {
                 "type": "effort_change",
@@ -4459,7 +4532,7 @@ def register_core_routes(
                 **negotiation,
             }
             combined_model_forward = bool(
-                live_model_change and updated.model_override and codex_native
+                live_model_change and updated.model_override and (codex_native or agy_native)
             )
             event = (
                 {
@@ -4487,7 +4560,7 @@ def register_core_routes(
             )
             if combined_model_forward:
                 _model_forward = effort_forward
-            if model_applied and effort_forward is not None:
+            if codex_native and model_applied and effort_forward is not None:
                 if _runner_reply_field(effort_forward.body, "codex_settings_applied") is not True:
                     # Older runners apply only the model; reset against that
                     # model after its update has completed.
@@ -4497,6 +4570,37 @@ def register_core_routes(
                         effort_event,
                         timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                     )
+            confirmed_model = (
+                _runner_reply_field(effort_forward.body, "model")
+                if agy_native and effort_forward is not None and combined_model_forward
+                else None
+            )
+            agy_settings_confirmed = (
+                effort_forward is not None
+                and effort_forward.status_code == 200
+                and (
+                    isinstance(confirmed_model, str) and bool(confirmed_model.strip())
+                    if combined_model_forward
+                    else _runner_reply_field(effort_forward.body, "effort")
+                    == updated.reasoning_effort
+                )
+            )
+            if agy_native and not agy_settings_confirmed:
+                assert conv is not None
+                await _restore_refused_settings(
+                    conversation_store,
+                    session_id,
+                    previous=conv,
+                    attempted=updated,
+                    restore_model=combined_model_forward,
+                    live_change=live_change,
+                    began=began,
+                    saved=saved,
+                )
+                raise OmnigentError(
+                    "The terminal did not confirm the settings change. The previous selection has been restored.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             if codex_native and (
                 (effort_forward is None and model_applied)
                 or (
@@ -4542,6 +4646,32 @@ def register_core_routes(
                     {"type": "model_change", "model": updated.model_override, **negotiation},
                     # The runner can answer by confirming a TUI model dialog.
                     timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                )
+            confirmed_model = (
+                _runner_reply_field(_model_forward.body, "model")
+                if agy_native and _model_forward is not None
+                else None
+            )
+            if agy_native and (
+                _model_forward is None
+                or _model_forward.status_code != 200
+                or not isinstance(confirmed_model, str)
+                or not confirmed_model.strip()
+            ):
+                assert conv is not None
+                await _restore_refused_settings(
+                    conversation_store,
+                    session_id,
+                    previous=conv,
+                    attempted=updated,
+                    restore_model=True,
+                    live_change=live_change,
+                    began=began,
+                    saved=saved,
+                )
+                raise OmnigentError(
+                    "The terminal did not confirm the settings change. The previous selection has been restored.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -4623,6 +4753,11 @@ def register_core_routes(
                     "type": "permission_mode_change",
                     "permission_mode": requested_permission_mode,
                 },
+                **(
+                    {"timeout_s": _AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S}
+                    if agy_permission_mode
+                    else {}
+                ),
             )
             if (
                 sdk_permission_mode
@@ -4640,7 +4775,19 @@ def register_core_routes(
                 requested_permission_mode,
                 _mode_result,
             )
-            if not sdk_permission_mode:
+            if agy_permission_mode:
+                if (
+                    _mode_result is None
+                    or _mode_result.status_code != 200
+                    or _runner_reply_field(_mode_result.body, "permission_mode")
+                    != requested_permission_mode
+                ):
+                    raise OmnigentError(
+                        "Antigravity tier change was not confirmed",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                labels_to_set[AGY_PERMISSION_TIER_LABEL_KEY] = _confirmed_permission_mode
+            elif not sdk_permission_mode:
                 labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = (
                     _confirmed_permission_mode
                 )
@@ -5144,7 +5291,6 @@ def register_core_routes(
             dropped_label_keys_set |= {
                 key for key in (source.labels or {}) if key.startswith(MEMBER_LABEL_PREFIX)
             }
-        dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
         # dropped above (instance-scoped), so a bypass-armed source never
@@ -5162,6 +5308,41 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+
+        target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
+        target_harness = (
+            target_native.harness
+            if target_native is not None
+            else await asyncio.to_thread(
+                _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+            )
+            if not switching_agent
+            else None
+        )
+        if target_harness == "antigravity-native":
+            # The fork's tier is restamped from extra_labels below (the store
+            # applies those AFTER the drop), so the source's tier label must
+            # not shadow it.
+            dropped_label_keys_set.add(AGY_PERMISSION_TIER_LABEL_KEY)
+            source_harness = await asyncio.to_thread(
+                _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+            )
+            source_tier = (
+                resolve_agy_permission_tier(source.labels, source.terminal_launch_args or [])
+                if source_harness == "antigravity-native" or not switching_agent
+                else AGY_DEFAULT_PERMISSION_TIER
+            )
+            extra_labels[AGY_PERMISSION_TIER_LABEL_KEY] = body.permission_tier or source_tier
+            inherited_args = (
+                override_launch_args
+                if launch_args_set
+                else source.terminal_launch_args
+                if not switching_agent
+                else None
+            )
+            override_launch_args = _stamp_antigravity_permission_tier(extra_labels, inherited_args)
+            launch_args_set = True
+        dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # Side chats use the source for shared-runner routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.

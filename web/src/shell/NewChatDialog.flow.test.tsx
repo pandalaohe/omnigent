@@ -1585,6 +1585,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels).toEqual({
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "antigravity-native-ui",
+      "omnigent.antigravity_native.permission_tier": "auto-relaxed",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
       ...composerContextToLabels({
         workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
@@ -1668,8 +1669,8 @@ describe("NewChatLandingScreen create flow", () => {
       harness: "antigravity-native",
       agentName: "antigravity-native-ui",
       displayName: "Antigravity",
-      mode: "skip",
-      expectedArgs: ["--dangerously-skip-permissions"],
+      mode: "full",
+      expectedArgs: undefined,
     },
   ])("seeds the last launched mode for $harness", async (testCase) => {
     localStorage.setItem(
@@ -1926,7 +1927,37 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
-  it("posts --dangerously-skip-permissions when the bypass is picked for antigravity-native", async () => {
+  it.each(["ask", "plan", "accept-edits", "auto-strict", "auto-standard", "auto-relaxed", "full"])(
+    "creates Antigravity tier %s through its label",
+    async (tier) => {
+      setAgents([
+        agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+      ]);
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_agy" }),
+      } as unknown as Response);
+      renderLanding();
+      await waitForWorkspaceSeed();
+      pickPermissionOption(tier);
+      typeMessage("go");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+      const body = JSON.parse(init.body as string);
+      expect(body.labels["omnigent.antigravity_native.permission_tier"]).toBe(tier);
+      expect(body.terminal_launch_args).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ["default", "ask"],
+    ["skip", "full"],
+  ])("restores legacy Antigravity mode %s", async (legacy, tier) => {
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "antigravity-native": { mode: legacy } }),
+    );
     setAgents([
       agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
     ]);
@@ -1934,25 +1965,53 @@ describe("NewChatLandingScreen create flow", () => {
       ok: true,
       json: async () => ({ id: "conv_agy" }),
     } as unknown as Response);
-
     renderLanding();
     await waitForWorkspaceSeed();
-    pickPermissionOption("skip");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(
+      JSON.parse(init.body as string).labels["omnigent.antigravity_native.permission_tier"],
+    ).toBe(tier);
+  });
 
+  it("creates Antigravity with a base model id and a supported effort", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "claude-sonnet-5-5",
+          displayName: "Claude Sonnet",
+          efforts: ["low", "medium", "high"],
+        },
+        { id: "gpt-oss", displayName: "GPT OSS", efforts: ["medium"] },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_agy" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_agy");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Claude Sonnet" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "GPT OSS" }));
+    expect(screen.queryByRole("menuitemcheckbox", { name: "High" })).toBeNull();
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Low" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Medium" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    // agy's ONLY pre-emptive control, as a bare single token. Claude's
-    // `["--permission-mode", ...]` pair would be rejected by agy, which has no
-    // such flag — so assert the exact spelling, not merely "some args".
-    expect(body.terminal_launch_args).toEqual(["--dangerously-skip-permissions"]);
-    expect(
-      JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")[
-        "antigravity-native"
-      ]?.mode,
-    ).toBe("skip");
+    expect(body.model_override).toBe("gpt-oss");
+    expect(body.reasoning_effort).toBe("medium");
   });
 
   it("remembers the launched execution mode for cursor-native", async () => {
@@ -1996,7 +2055,7 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(init.body as string);
     // Anchor so the absence check is not vacuous against a malformed body.
     expect(body.labels?.["omnigent.wrapper"]).toBe("antigravity-native-ui");
-    // Untouched → agy keeps its own request-review prompt.
+    expect(body.labels["omnigent.antigravity_native.permission_tier"]).toBe("auto-relaxed");
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
@@ -2006,15 +2065,13 @@ describe("NewChatLandingScreen create flow", () => {
     ]);
     renderLanding();
     await waitForWorkspaceSeed();
-    // agy exposes no firing pre-tool hook, so Omnigent cannot re-gate tools
-    // once this is armed — the banner is the only guardrail the user gets.
     expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
-    pickPermissionOption("skip");
+    pickPermissionOption("full");
     expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveAttribute("role", "alert");
     expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toHaveTextContent(
       "all tool permission prompts disabled",
     );
-    pickPermissionOption("default");
+    pickPermissionOption("ask");
     expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
   });
 

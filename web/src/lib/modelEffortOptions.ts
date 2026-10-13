@@ -32,6 +32,14 @@ export function effortLevelsFor(
       // Fusion model), so derive it from the selected model's catalog entry —
       // its `supportedReasoningEfforts` — rather than a fixed ladder.
       return codexEffortLevelsForModel(rows, model);
+    case "antigravity-native": {
+      const selected = rows.find((row) => row.id === model);
+      const efforts =
+        selected?.efforts ??
+        selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??
+        [];
+      return ["low", "medium", "high"].filter((effort) => efforts.includes(effort));
+    }
     case "pi-native":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
@@ -46,7 +54,10 @@ export function reconcileEffortOnModelChange(
   effort: string | null,
 ): string | null {
   // Devin's model switch keeps the selected effort even if the new model omits it.
-  if ((harness === "codex-native" || harness === "codex") && effort !== null) {
+  if (
+    (harness === "codex-native" || harness === "codex" || harness === "antigravity-native") &&
+    effort !== null
+  ) {
     return effortLevelsFor(harness, rows, model)?.includes(effort) ? effort : null;
   }
   return effort;

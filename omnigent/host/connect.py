@@ -3634,6 +3634,24 @@ class HostProcess:
                 models=with_source(pi_models),
             )
 
+        if harness == "antigravity-native":
+            from omnigent.harnesses.antigravity_native.main import list_agy_model_options
+
+            try:
+                agy_models = await asyncio.to_thread(list_agy_model_options)
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("Antigravity model catalog unavailable", exc_info=True)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Antigravity model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(agy_models),
+            )
+
         if harness == "devin-native":
             # devin authenticates through its own CLI login; the host shells
             # ``devin models list`` (list_devin_cli_model_options) to preview the

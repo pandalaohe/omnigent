@@ -63,7 +63,9 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -92,6 +94,7 @@ from omnigent._wrapper_labels import (
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
+    AGY_PERMISSION_TIER_LABEL_KEY,
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
@@ -104,6 +107,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     prepare_bridge_dir,
     read_bridge_state,
     seed_isolated_agy_home,
+    split_agy_effort_suffix,
     update_conversation_id,
     write_bridge_state,
     write_mcp_config,
@@ -113,6 +117,7 @@ from omnigent.harnesses.antigravity_native.launch import (
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
+    should_skip_permissions,
 )
 from omnigent.harnesses.antigravity_native.reader import run_reader_with_bridge
 from omnigent.harnesses.antigravity_native.rpc import (
@@ -207,6 +212,51 @@ class PreparedAntigravityTerminal:
     reattached: bool
 
 
+def parse_agy_models_output(text: str) -> list[dict[str, object]]:
+    """Group agy's tab-separated model variants in catalog order."""
+    families: dict[str, dict[str, object]] = {}
+    family_efforts: dict[str, set[str]] = {}
+    ladder = ("low", "medium", "high", "xhigh", "max")
+    for line in text.splitlines():
+        slug, separator, label = line.strip().partition("\t")
+        if not separator or not slug or not label:
+            continue
+        base, effort = split_agy_effort_suffix(slug)
+        if base not in families:
+            families[base] = {
+                "id": base,
+                "displayName": re.sub(
+                    r" \((Low|Medium|High|Xhigh|Max)\)$", "", label, flags=re.IGNORECASE
+                ),
+                "isDefault": False,
+            }
+            family_efforts[base] = set()
+        if effort:
+            family_efforts[base].add(effort)
+    for base, option in families.items():
+        efforts = [level for level in ladder if level in family_efforts[base]]
+        option["efforts"] = efforts
+        option["supportedReasoningEfforts"] = [{"reasoningEffort": level} for level in efforts]
+    return list(families.values())
+
+
+def list_agy_model_options(*, timeout_s: float = 15.0) -> list[dict[str, object]]:
+    """Read the account's catalog from its real Gemini directory."""
+    completed = subprocess.run(
+        [agy_binary_path(), f"--gemini_dir={Path.home() / '.gemini'}", "models"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_s,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"agy models failed (exit {completed.returncode})")
+    options = parse_agy_models_output(completed.stdout)
+    if not options:
+        raise RuntimeError("agy models returned no model rows (sign in to agy first)")
+    return options
+
+
 def run_antigravity_native(
     *,
     server: str | None,
@@ -240,12 +290,8 @@ def run_antigravity_native(
         e.g. ``"gemini-2.5-pro"``. ``None`` lets agy use its default.
     :param permission_mode: Optional Omnigent permission mode, e.g.
         ``"bypassPermissions"``. ``"bypassPermissions"`` maps to agy's
-        ``--dangerously-skip-permissions`` (its only pre-emptive control);
-        any other value (or ``None``) leaves agy's default ``request-review``
-        prompt in place for the attended user — unless the launch is headless,
-        in which case the prompt is auto-bypassed so an unattended turn does not
-        hang (see
-        :func:`omnigent.harnesses.antigravity_native.launch.should_skip_permissions`).
+        ``--dangerously-skip-permissions`` for legacy callers. The local launch
+        fallback reads the server-resolved permission tier.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after the session is prepared.
     :returns: None after the terminal attach session ends.
@@ -262,9 +308,6 @@ def run_antigravity_native(
     # before any server work. agy is OAuth-only (subscription), inherited
     # from ~/.gemini — nothing is seeded.
     launch = resolve_native_antigravity_launch(model=model)
-    # Detect headless ONCE here (a controlling TTY on stdin+stdout means an
-    # interactive client will attach to drive agy's request-review prompt; a
-    # non-TTY launch must auto-bypass or the unattended turn hangs forever).
     headless = _launch_is_headless()
     with TemporaryDirectory(prefix="omnigent-antigravity-native-") as tmpdir:
         spec_path = _materialize_antigravity_agent_spec(Path(tmpdir))
@@ -611,6 +654,9 @@ async def _prepare_antigravity_terminal(
                 client,
                 session_bundle,
                 bridge_id=bridge_id,
+                permission_tier="full"
+                if should_skip_permissions(permission_mode=permission_mode, headless=headless)
+                else None,
             )
         else:
             _update_progress(startup_progress, "Loading Antigravity session...")
@@ -690,8 +736,6 @@ async def _prepare_antigravity_terminal(
             antigravity_args=antigravity_args,
             command=command,
             model=model,
-            permission_mode=permission_mode,
-            headless=headless,
             startup_progress=startup_progress,
         )
     return PreparedAntigravityTerminal(
@@ -805,6 +849,9 @@ async def _prepare_antigravity_terminal_via_daemon(
                     client,
                     session_bundle,
                     bridge_id=bridge_id,
+                    permission_tier="full"
+                    if should_skip_permissions(permission_mode=permission_mode, headless=headless)
+                    else None,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
@@ -904,8 +951,6 @@ async def _prepare_antigravity_terminal_via_daemon(
             antigravity_args=antigravity_args,
             command=command,
             model=model,
-            permission_mode=permission_mode,
-            headless=headless,
             startup_progress=startup_progress,
         )
     return PreparedAntigravityTerminal(
@@ -928,8 +973,6 @@ async def _launch_and_record(
     antigravity_args: tuple[str, ...],
     command: str,
     model: str | None,
-    permission_mode: str | None = None,
-    headless: bool = False,
     startup_progress: RunnerStartupProgress | None,
 ) -> LaunchedAntigravityTerminal:
     """
@@ -971,14 +1014,31 @@ async def _launch_and_record(
     :param antigravity_args: Raw pass-through agy args.
     :param command: agy executable to run.
     :param model: Optional agy model id.
-    :param permission_mode: Optional Omnigent permission mode threaded into the
-        agy argv assembly (maps ``"bypassPermissions"`` to the bypass flag).
-    :param headless: ``True`` when no interactive client will attach (forces
-        the agy permission-bypass flag so an unattended turn does not hang).
     :param startup_progress: Optional user-visible progress renderer.
     :returns: Launched terminal resource details.
     :raises click.ClickException: If the terminal launch fails.
     """
+    from omnigent.harnesses.antigravity_native.bridge import (
+        agy_tier_launch_args,
+        apply_agy_permission_tier,
+        resolve_agy_permission_tier,
+    )
+
+    snapshot = await _fetch_antigravity_session(client, session_id)
+    labels = snapshot.get("labels")
+    raw_launch_args = snapshot.get("terminal_launch_args")
+    if raw_launch_args is not None and not (
+        isinstance(raw_launch_args, list) and all(isinstance(arg, str) for arg in raw_launch_args)
+    ):
+        raise click.ClickException("Invalid Antigravity terminal_launch_args in session snapshot.")
+    launch_args = tuple(raw_launch_args) if isinstance(raw_launch_args, list) else antigravity_args
+    tier = resolve_agy_permission_tier(labels if isinstance(labels, dict) else None, launch_args)
+    # The resolved tier is the single source for the skip-permissions flag: a
+    # copy in the passthrough args must not survive a later non-full tier; the
+    # persisted snapshot args only resolve the tier, never reach agy.
+    passthrough_args = tuple(
+        arg for arg in antigravity_args if arg != "--dangerously-skip-permissions"
+    )
     bridge_dir = prepare_bridge_dir(bridge_id)
     # Clear stale turn/conversation state so a fresh launch rediscovers this run's
     # real agy conversation id instead of binding to the previous run's.
@@ -988,15 +1048,7 @@ async def _launch_and_record(
     # ``seed_isolated_agy_home`` — in the isolated dir agy actually reads under
     # ``--gemini_dir``. Seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
-    argv, env_overrides = build_agy_launch(
-        conversation_id=conversation_id if resume else None,
-        model=model,
-        resume=resume,
-        permission_mode=permission_mode,
-        headless=headless,
-        extra_args=antigravity_args,
-        log_dir=bridge_dir,
-    )
+
     # Scope agy to a per-session isolated Gemini dir, exactly as the runner-owned
     # launch does. agy has no --mcp-config flag and ignores every ANTIGRAVITY_* env
     # knob, so its MCP relay config and its settings can only be scoped through the
@@ -1005,19 +1057,27 @@ async def _launch_and_record(
     # survey/trust seeds below rewrote the user's own settings.json. HOME stays real
     # so keyring-backed auth (macOS Keychain) keeps working (#1477).
     await asyncio.to_thread(write_mcp_config, bridge_dir)
-    env_overrides = {
-        **env_overrides,
-        **await asyncio.to_thread(
-            seed_isolated_agy_home,
-            bridge_dir,
-            trusted_workspace=Path.cwd().resolve(),
-        ),
-    }
+    env_overrides = await asyncio.to_thread(
+        seed_isolated_agy_home,
+        bridge_dir,
+        trusted_workspace=Path.cwd().resolve(),
+    )
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
     # under --gemini_dir, never the user's real ~/.gemini.
     await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    await asyncio.to_thread(apply_agy_permission_tier, bridge_dir, tier)
+    effort = snapshot.get("reasoning_effort")
+    argv, launch_env = build_agy_launch(
+        conversation_id=conversation_id if resume else None,
+        model=model,
+        resume=resume,
+        extra_args=passthrough_args + tuple(agy_tier_launch_args(tier)),
+        effort=effort if isinstance(effort, str) and effort else None,
+        log_dir=bridge_dir,
+    )
+    env_overrides.update(launch_env)
     # Lead the args so the flag is never swallowed by a later positional.
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     _update_progress(startup_progress, "Starting Antigravity terminal...")
@@ -1405,6 +1465,7 @@ async def _create_antigravity_session(
     bundle: bytes,
     *,
     bridge_id: str,
+    permission_tier: str | None = None,
 ) -> str:
     """
     Create a bundled terminal-first Antigravity session.
@@ -1425,6 +1486,8 @@ async def _create_antigravity_session(
     """
     labels = dict(_SESSION_LABELS)
     labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
+    if permission_tier is not None:
+        labels[AGY_PERMISSION_TIER_LABEL_KEY] = permission_tier
     metadata: dict[str, object] = {"labels": labels}
     resp = await client.post(
         "/v1/sessions",
@@ -1760,18 +1823,7 @@ def _launch_is_headless() -> bool:
     the launch is treated as headless so the caller can auto-bypass agy's prompt
     (see :func:`omnigent.harnesses.antigravity_native.launch.should_skip_permissions`).
 
-    .. note:: This TTY signal governs ONLY the human-invoked CLI launch path
-       (``run_antigravity_native`` → here, the single call site). The
-       server-spawned / web-attached path
-       (:func:`omnigent.runner.app._auto_create_antigravity_terminal`, the
-       claude/codex auto-create analogue) does NOT consult this function — it
-       passes ``headless=False`` to ``build_agy_launch`` directly, because the
-       web client attaches to the agy pane through the runner tunnel and answers
-       agy's ``request-review`` prompt there. **Keep that invariant:** a
-       server-spawned launch must never key headlessness on the runner process's
-       (absent) controlling TTY, which would conflate "no CLI tty" with "no
-       client attached" and silently disable agy's per-tool prompt for a watching
-       web user.
+    The runner launch reads the server's tier label and never consults its own TTY.
 
     :returns: ``True`` when no interactive terminal is attached (headless).
     """

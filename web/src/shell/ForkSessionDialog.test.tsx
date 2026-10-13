@@ -1662,3 +1662,140 @@ describe("ForkSessionDialog", () => {
     });
   });
 });
+
+describe("Antigravity fork controls", () => {
+  function seedAgy(tier: string, legacySkip = false) {
+    const agy = testAgent("ag_agy", "antigravity-native-ui", {
+      display_name: "Antigravity",
+      harness: "antigravity-native",
+    });
+    setAgents([agy, ...AVAILABLE_AGENTS], "antigravity-native");
+    useSessionAgentMock.mockReturnValue({ data: agy } as unknown as ReturnType<
+      typeof useSessionAgent
+    >);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_src",
+        agentId: "ag_agy",
+        harness: "antigravity-native",
+        hostId: "host_1",
+        workspace: "/opt/work/repo",
+        labels: {
+          "omnigent.wrapper": "antigravity-native-ui",
+          ...(tier ? { "omnigent.antigravity_native.permission_tier": tier } : {}),
+        },
+        terminalLaunchArgs: legacySkip ? ["--dangerously-skip-permissions"] : [],
+        modelOverride: "claude-sonnet-5-5",
+        reasoningEffort: "high",
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    useHostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "claude-sonnet-5-5",
+          displayName: "Claude Sonnet",
+          efforts: ["low", "medium", "high"],
+        },
+        { id: "gpt-oss", displayName: "GPT OSS", efforts: ["medium"] },
+      ],
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+      ReturnType<typeof forkSession>
+    >);
+    renderDialog({ sourceWorkspace: "/opt/work/repo", sourceHostId: "host_1" });
+  }
+
+  it.each([
+    ["auto-standard", false, "auto-standard"],
+    ["", true, "full"],
+    ["", false, "ask"],
+  ])("inherits an untouched tier %s", async (tier, skip, expected) => {
+    seedAgy(tier, skip);
+    expect(screen.getByTestId("fork-session-config-model")).toBeVisible();
+    expect(screen.getByTestId("fork-session-config-effort")).toBeVisible();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({ permissionTier: expected });
+  });
+
+  it("sends a chosen tier and filters effort when the model changes", async () => {
+    seedAgy("auto-relaxed");
+    fireEvent.click(screen.getByTestId("fork-session-config-agy-skip"));
+    fireEvent.click(screen.getByRole("option", { name: "Plan only" }));
+    fireEvent.click(screen.getByTestId("fork-session-config-model"));
+    fireEvent.click(screen.getByRole("option", { name: "GPT OSS" }));
+    fireEvent.click(screen.getByTestId("fork-session-config-effort"));
+    expect(screen.queryByRole("option", { name: "High" })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Low" })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: "Medium" }));
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({
+      permissionTier: "plan",
+      modelOverride: "gpt-oss",
+      reasoningEffort: "medium",
+    });
+  });
+
+  it("omits the tier after switching to another agent", async () => {
+    seedAgy("auto-strict");
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_claude_native"));
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({});
+  });
+
+  it("seeds the agy default tier when the source ran another harness", async () => {
+    const agy = testAgent("ag_agy", "antigravity-native-ui", {
+      display_name: "Antigravity",
+      harness: "antigravity-native",
+    });
+    setAgents([agy, ...AVAILABLE_AGENTS], "claude-native");
+    useSessionAgentMock.mockReturnValue({ data: AVAILABLE_AGENTS[1] } as unknown as ReturnType<
+      typeof useSessionAgent
+    >);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_src",
+        agentId: "ag_claude_native",
+        harness: "claude-native",
+        hostId: "host_1",
+        workspace: "/opt/work/repo",
+        labels: { "omnigent.wrapper": "claude-native-ui" },
+        terminalLaunchArgs: [],
+        modelOverride: "claude-sonnet-5-5",
+        reasoningEffort: "high",
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    useHostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "claude-sonnet-5-5",
+          displayName: "Claude Sonnet",
+          efforts: ["low", "medium", "high"],
+        },
+      ],
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+      ReturnType<typeof forkSession>
+    >);
+    renderDialog({ sourceWorkspace: "/opt/work/repo", sourceHostId: "host_1" });
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_agy"));
+    // The picker shows the agy default, not the claude source's mode.
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({
+      permissionTier: "auto-relaxed",
+    });
+  });
+});

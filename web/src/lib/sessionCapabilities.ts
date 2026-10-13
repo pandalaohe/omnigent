@@ -50,6 +50,8 @@ export function supportsEffortControl(
     // Devin has no --effort flag: effort is a model-variant suffix the executor
     // recombines and re-applies via /model, so the in-chat effort dial is live.
     wrapper === DEVIN_NATIVE_WRAPPER ||
+    wrapper === "antigravity-native-ui" ||
+    (wrapper == null && session?.harness === "antigravity-native") ||
     (wrapper == null && session?.harness === "codex-native") ||
     isSdkHarnessSession(session)
   );
