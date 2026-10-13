@@ -258,6 +258,7 @@ ARCHIVE_KEEP_WORKTREE_LABEL_KEY = "omnigent.archive_keep_worktree"
 ARCHIVE_WORKTREE_MODE_LABEL_KEY = "omnigent.archive_worktree_mode"
 ARCHIVE_REMOVED_WORKTREE_LABEL_KEY = "omnigent.archive_removed_worktree"
 ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY = "omnigent.archive_worktree_admission_fence"
+ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX = f"{ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY}."
 ARCHIVE_CASCADE_LABEL_KEY = "omnigent.archive_cascade"
 
 

@@ -18,6 +18,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import cast
 
 from sqlalchemy import Engine, or_, select, tuple_, update
@@ -47,7 +48,9 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.stores.conversation_store import (
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX,
     ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+    worktree_admission_fingerprint,
 )
 
 # A host is considered live only if its row was touched (connect or
@@ -320,33 +323,80 @@ class HostStore:
                 ).scalars()
             )
 
-    def _require_rotation_fence_settled(self, bound_ids: set[str]) -> None:
+    def _extend_rotation_worktree_fences(
+        self, bound_ids: set[str], old_host_id: str, new_host_id: str
+    ) -> None:
+        """Protect the new identity before rebinding, retaining the old fences on failure."""
         if not bound_ids:
             return
-        labels_by_id: dict[str, set[str]] = {}
-        with self._conv_session("host_rotation_worktree_fences") as session:
-            for conversation_id, key in session.execute(
-                select(SqlConversationLabel.conversation_id, SqlConversationLabel.key).where(
+        with self._session("host_rotation_worktree_paths") as session:
+            paths = {
+                row.id: row.worktree or row.workspace
+                for row in session.execute(
+                    select(SqlConversationMetadata).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(bound_ids),
+                    )
+                ).scalars()
+            }
+
+        def write(session: Session) -> None:
+            labels_by_id: dict[str, dict[str, str]] = {}
+            for conversation_id, key, value in session.execute(
+                select(
+                    SqlConversationLabel.conversation_id,
+                    SqlConversationLabel.key,
+                    SqlConversationLabel.value,
+                ).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(bound_ids),
-                    SqlConversationLabel.key.in_(
-                        (
-                            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
-                            ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
-                        )
+                    or_(
+                        SqlConversationLabel.key.in_(
+                            (
+                                ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                                ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+                            )
+                        ),
+                        SqlConversationLabel.key.startswith(
+                            ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX, autoescape=True
+                        ),
                     ),
                 )
             ):
-                labels_by_id.setdefault(conversation_id, set()).add(key)
-        if any(
-            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in labels
-            and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in labels
-            for labels in labels_by_id.values()
-        ):
-            raise OmnigentError(
-                "Host identity rotation is blocked by unresolved worktree removal",
-                code=ErrorCode.CONFLICT,
-            )
+                labels_by_id.setdefault(conversation_id, {})[key] = value
+            for conversation_id, labels in labels_by_id.items():
+                path = paths.get(conversation_id)
+                if (
+                    not path
+                    or ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY not in labels
+                    or ARCHIVE_REMOVED_WORKTREE_LABEL_KEY in labels
+                ):
+                    continue
+                parsed = (
+                    PureWindowsPath(path)
+                    if PureWindowsPath(path).is_absolute()
+                    else PurePosixPath(path)
+                )
+                for root in (parsed, *parsed.parents):
+                    if (
+                        worktree_admission_fingerprint(old_host_id, str(root))
+                        not in labels.values()
+                    ):
+                        continue
+                    fingerprint = worktree_admission_fingerprint(new_host_id, str(root))
+                    key = f"{ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX}{fingerprint}"
+                    if key not in labels:
+                        session.add(
+                            SqlConversationLabel(
+                                workspace_id=current_workspace_id(),
+                                conversation_id=conversation_id,
+                                key=key,
+                                value=fingerprint,
+                                updated_at=now_epoch(),
+                            )
+                        )
+
+        run_write_transaction(self._conv_session, "host_rotation_worktree_fences", write)
 
     def upsert_on_connect(
         self,
@@ -552,7 +602,9 @@ class HostStore:
             if rotation_source_id is not None:
                 rotation_token = self.acquire_worktree_admission(rotation_source_id, required=True)
                 rotation_bound_ids = self._rotation_bound_ids(rotation_source_id)
-                self._require_rotation_fence_settled(rotation_bound_ids)
+                self._extend_rotation_worktree_fences(
+                    rotation_bound_ids, rotation_source_id, host_id
+                )
             return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
         finally:
             if rotation_source_id is not None and rotation_token is not None:
@@ -589,7 +641,7 @@ class HostStore:
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
         :param platform: Platform reported with the reconnecting hello.
-        :param expected_bound_ids: Session ids checked for unresolved removal
+        :param expected_bound_ids: Session ids whose removal fences were extended
             under the old host's admission lease.
         :returns: The newly inserted :class:`SqlHost` row.
         """
