@@ -918,6 +918,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -971,6 +972,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -979,6 +981,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
+        assert session_id == "a3f4361a350851cfb9eb3db2bf2b0380"
         del transport, loaded_thread_id, terminal_launch_args
 
     runs: list[_ForwarderRun] = []
@@ -1253,6 +1256,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -1302,6 +1306,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1310,6 +1315,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :raises RuntimeError: Always, mirroring the app-server error.
         """
+        assert session_id == "b7d2c1e0aa114b52b7c2f1d3e4a5b6c7"
         del transport, terminal_launch_args
         raise RuntimeError(f"thread {loaded_thread_id} already has an active writer")
 
@@ -1437,6 +1443,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -1488,6 +1495,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.
@@ -1496,6 +1504,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :raises CodexAppServerResponseError: Always, mirroring the app-server.
         """
+        assert session_id == "c8e3d2f1bb225c63c8d3a2e4f5b6c7d8"
         del transport, terminal_launch_args
         raise codex_app_mod.CodexAppServerResponseError(
             {

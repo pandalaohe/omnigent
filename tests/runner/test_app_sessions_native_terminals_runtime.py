@@ -557,6 +557,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test", "IGNORED": "nope"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -702,6 +703,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -710,6 +712,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
+        assert session_id == "76cbdcbbf84d4149b2a7d7441b6966c1"
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
@@ -821,6 +824,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         "check_for_update_on_startup=false",
         "--dangerously-bypass-hook-trust",
         *permission_args,
+        "-c",
+        f'shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID="{session_id}"',
         "resume",
         "--remote",
         app_server.listen_url,
@@ -831,6 +836,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
+    assert launched.env["OMNIGENT_RUNNER_PRIMARY_SESSION_ID"] == session_id
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
     # A kept pane is what lets the exit event carry Codex's exit status and
@@ -1105,6 +1111,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id(session_id))
             self.listen_url: str | None = None
@@ -1194,6 +1201,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1202,6 +1210,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
+        assert session_id == "8aedf63f5e4046ae21b35fec5b35da50"
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "fork-resume must not expose stale bridge state before preload"
         )
@@ -1414,6 +1423,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id(session_id))
             self.listen_url: str | None = None
@@ -1494,8 +1504,10 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
+        assert session_id == "70a19efac3ec27549a70acbb4d0c635a"
         assert terminal_launch_args is None
         preload_calls.append((transport, loaded_thread_id))
 
@@ -1660,6 +1672,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "codex-home"
             self.listen_url: str | None = None
@@ -1944,6 +1957,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
         def __init__(self) -> None:
             """:returns: None."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "codex-home"
             self.listen_url: str | None = None
@@ -4524,6 +4538,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
 
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -4577,6 +4592,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -4585,6 +4601,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :param terminal_launch_args: Pass-through args, unused.
         """
+        assert session_id == "83acdbadf84d4149b2a7d7441b6966aa"
         del transport, loaded_thread_id, terminal_launch_args
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -4765,6 +4782,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
 
         def __init__(self) -> None:
             """Initialize the fake app-server state."""
+            self.session_id = session_id
             self.env = {"OPENAI_API_KEY": "sk-test"}
             self.codex_home = tmp_path / "unconfigured-codex-home"
             self.listen_url: str | None = None
@@ -4818,8 +4836,10 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         retain_client: bool = False,
         cwd: Path | None = None,
         agent_pid: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
+        assert session_id == "5b0c7e2a9d1f4c3b8e6a7d5f4c3b2a1e"
         del transport, loaded_thread_id, terminal_launch_args
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:

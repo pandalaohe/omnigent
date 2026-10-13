@@ -195,6 +195,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
         env={},
         codex_home=tmp_path / "codex-home",
         agent_pid=None,
+        session_id="conv_test",
     )
     preload = AsyncMock(return_value=client)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
@@ -236,6 +237,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
             model=None,
         )
     assert preload.await_args.kwargs["retain_client"] is True
+    assert preload.await_args.kwargs["session_id"] == "conv_test"
     assert closed == ["terminal", "client", "server"]
 
 

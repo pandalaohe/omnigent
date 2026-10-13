@@ -155,6 +155,7 @@ async def codex_launch_harness(
         config_overrides=[],
         listen_url=None,
         agent_pid=None,
+        session_id=None,
         start=AsyncMock(side_effect=lambda: events.append("app-server-start")),
         close=AsyncMock(),
     )
@@ -162,6 +163,7 @@ async def codex_launch_harness(
     def build_server(**kwargs: Any) -> SimpleNamespace:
         builds.append(kwargs)
         app_server.codex_home = kwargs["codex_home"]
+        app_server.session_id = kwargs["session_id"]
         # The real builder writes provider definitions into the private config.
         app_server.config_overrides = [
             override
@@ -577,6 +579,7 @@ async def test_resumed_fallback_resets_pick_only_if_preload_and_terminal_succeed
         harness.registry.launch_auxiliary_terminal.assert_awaited_once()
 
     preload.assert_awaited_once()
+    assert preload.await_args.kwargs["session_id"] == _SESSION_ID
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
     assert harness.resets == (
         [] if preload_fails else [{"expected_model_override": _RETIRED_PICK}]
