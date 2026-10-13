@@ -312,6 +312,9 @@ _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 # window only for creates that present it, so web UI creates do not spend
 # the agent's budget.
 _AGENT_CREATE_HEADERS = {CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
+# Create can await host worktree operations before returning an id. Keep
+# transport deadlines, but let the enclosing tool budget bound response reads.
+_SESSION_CREATE_TIMEOUT = httpx.Timeout(30.0, read=None)
 
 # Priority 5f.0b: Session-open write. ``sys_session_open`` opens a plain
 # top-level session on any host / project / agent of the caller's user.
@@ -1684,7 +1687,7 @@ async def _patch_subagent_label(
     except httpx.HTTPError as exc:
         return f"{type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
-        return f"{resp.status_code} {resp.text[:200]}"
+        return f"{resp.status_code} {resp.text}"
     return None
 
 
@@ -5156,7 +5159,7 @@ async def _post_created_child_message(
                 return f"{type(exc).__name__}: {exc}"
             if _message_post_accepted(resp):
                 return None
-    return f"{resp.status_code} {resp.text[:200]}"
+    return f"{resp.status_code} {resp.text}"
 
 
 async def _post_child_message_recovering(
@@ -5290,8 +5293,8 @@ async def _finalize_created_session(
     Every create that carries a message runs create → register → post: the
     work entry exists before the child can run, so a fast first turn cannot
     race its tracking. A remote child is marked started only after the POST
-    is accepted; a failed POST marks the entry failed and returns
-    ``child_not_ready``. The handle reports where the child runs (D24):
+    is accepted; a failed POST marks the entry failed and is reported
+    separately from the successful creation. The handle reports where the child runs (D24):
     ``host_id`` / ``host_name`` / ``workspace`` / ``worktree`` /
     ``git_branch`` / ``harness``.
 
@@ -5308,7 +5311,7 @@ async def _finalize_created_session(
         create (which keeps the parent's runner).
     :param inherited_host_id: Effective host inherited from the caller,
         used when the child row carries no host of its own.
-    :returns: JSON handle, or a ``child_not_ready`` error.
+    :returns: JSON handle with a separate first-message delivery outcome.
     """
     from omnigent.runner import subagent_work as _subagent_work
     from omnigent.server.schemas import SessionCreatedEvent
@@ -5345,6 +5348,7 @@ async def _finalize_created_session(
         and placement.host_id != placement.caller_host_id
     )
 
+    initial_message: _JsonObject | None = None
     if isinstance(message, str) and message:
         # Stamp the dispatch id before the first turn runs, mirroring the
         # by-id send path: restart recovery finds an undrained create-
@@ -5356,50 +5360,44 @@ async def _finalize_created_session(
             server_client, child_id, _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
         )
         if stamp_error is not None:
-            return json.dumps(
-                {
-                    "error": "dispatch_stamp_failed",
-                    "conversation_id": child_id,
-                    "message": (
-                        "child session created but its first message was not sent "
-                        "(could not record the dispatch); retry with sys_session_send"
+            initial_message = {
+                "status": "failed",
+                "error": "dispatch_stamp_failed",
+                "detail": stamp_error,
+            }
+        else:
+            _subagent_work.register_subagent_work(
+                parent_session_id=conversation_id,
+                child_session_id=child_id,
+                agent=agent_label,
+                title=label,
+                work_id=work_id,
+                remote=remote,
+                host_id=host_id if remote else None,
+                placement_label=placement_label,
+                registered_by="sys_session_create",
+            )
+            post_error = await _post_created_child_message(
+                server_client, child_id, message, remote=remote
+            )
+            if post_error is not None:
+                _subagent_work.mark_subagent_work_terminal(
+                    child_id,
+                    status="failed",
+                    output=(
+                        f"Error: child session {child_id} was created but its first "
+                        f"message could not be delivered: {post_error}"
                     ),
-                }
-            )
-        _subagent_work.register_subagent_work(
-            parent_session_id=conversation_id,
-            child_session_id=child_id,
-            agent=agent_label,
-            title=label,
-            work_id=work_id,
-            remote=remote,
-            host_id=host_id if remote else None,
-            placement_label=placement_label,
-            registered_by="sys_session_create",
-        )
-        post_error = await _post_created_child_message(
-            server_client, child_id, message, remote=remote
-        )
-        if post_error is not None:
-            _subagent_work.mark_subagent_work_terminal(
-                child_id,
-                status="failed",
-                output=(
-                    f"Error: child session {child_id} was created but its first "
-                    f"message could not be delivered: {post_error}"
-                ),
-            )
-            return json.dumps(
-                {
+                )
+                initial_message = {
+                    "status": "failed",
                     "error": "child_not_ready",
-                    "conversation_id": child_id,
-                    "message": post_error,
+                    "detail": post_error,
                 }
-            )
-        if remote:
-            # The first turn's running edge stays on the child's host; the
-            # accepted POST is the start proof this runner has.
-            _subagent_work.mark_subagent_work_started(child_id)
+            else:
+                initial_message = {"status": "sent"}
+                if remote:
+                    _subagent_work.mark_subagent_work_started(child_id)
 
     evt = SessionCreatedEvent(
         type="session.created",
@@ -5425,6 +5423,7 @@ async def _finalize_created_session(
             "worktree": _optional_string(meta.get("worktree")) if meta is not None else None,
             "git_branch": _optional_string(meta.get("git_branch")) if meta is not None else None,
             "harness": _optional_string(meta.get("harness")) if meta is not None else None,
+            **({"initial_message": initial_message} if initial_message is not None else {}),
         }
     )
 
@@ -5508,7 +5507,7 @@ def _open_rate_error(resp: httpx.Response) -> str:
     :param resp: The refused ``POST /v1/sessions`` response.
     :returns: A compact JSON error object for the orchestrator.
     """
-    detail = resp.text[:200]
+    detail = resp.text
     try:
         payload = resp.json()
     except ValueError:
@@ -5710,20 +5709,25 @@ async def _execute_session_create(
         resp = await server_client.post(
             "/v1/sessions",
             json=body,
-            timeout=30.0,
+            timeout=_SESSION_CREATE_TIMEOUT,
             headers=_AGENT_CREATE_HEADERS,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_create failed: {exc}"})
+        return json.dumps(
+            {
+                "error": f"sys_session_create failed: {type(exc).__name__}: {exc}",
+                "message": "Creation outcome unknown; check sub_agents before retrying.",
+            }
+        )
     if resp.status_code == 404:
-        return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
+        return json.dumps({"error": "agent_not_found", "agent_id": agent_id, "detail": resp.text})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "agent_id": agent_id})
+        return json.dumps({"error": "access_denied", "agent_id": agent_id, "detail": resp.text})
     if resp.status_code == 429:
         return _open_rate_error(resp)
     if resp.status_code >= 400:
         return json.dumps(
-            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
+            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}
         )
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
@@ -5841,18 +5845,25 @@ async def _upload_config_bundle(
             "/v1/sessions",
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
-            timeout=60.0,
+            timeout=_SESSION_CREATE_TIMEOUT,
             headers=_AGENT_CREATE_HEADERS,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_create failed: {exc}"})
+        return json.dumps(
+            {
+                "error": f"sys_session_create failed: {type(exc).__name__}: {exc}",
+                "message": "Creation outcome unknown; check sub_agents before retrying.",
+            }
+        )
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "config_path": config_path})
+        return json.dumps(
+            {"error": "access_denied", "config_path": config_path, "detail": resp.text}
+        )
     if resp.status_code == 429:
         return _open_rate_error(resp)
     if resp.status_code >= 400:
         return json.dumps(
-            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
+            {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}
         )
     data: _JsonObject = resp.json()
     return data

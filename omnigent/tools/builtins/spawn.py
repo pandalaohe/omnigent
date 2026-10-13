@@ -1084,7 +1084,10 @@ class SysSessionCreateTool(Tool):
             "worktree is never removed automatically. "
             "Returns {conversation_id, agent_id, title, status, project_id, "
             "host_id, host_name, workspace, worktree, git_branch, harness}; "
-            "the session runs asynchronously — monitor it with "
+            "If a first message was requested, initial_message reports sent "
+            "or failed separately from creation, with the failure detail; "
+            "use sys_session_send with the returned conversation_id to retry. "
+            "The session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send."
         )
@@ -1138,7 +1141,11 @@ class SysSessionCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Optional human-readable label for the "
-                                "new session, e.g. 'auth refactor'."
+                                "new session, e.g. 'auth refactor'. Child summaries "
+                                "interpret a colon (including ': ') as "
+                                "'agent:instance', or 'ui:agent:instance'; "
+                                "avoid colons for an unsplit display label. "
+                                "The stored session title remains verbatim."
                             ),
                         },
                         "message": {
