@@ -979,6 +979,11 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     events = _collect_turn_events(executor, "do not duplicate")
 
     assert [type(event) for event in events] == [ExecutorError]
+    if isinstance(error, CodexAppServerResponseError):
+        assert events[0].code == "codex_native_input_refused"
+        assert events[0].undelivered is True
+    else:
+        assert events[0].undelivered is False
     assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
     state = read_bridge_state(tmp_path)
     assert state is not None
@@ -1002,6 +1007,106 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     else:
         assert "rpc_error_code" not in attrs
     assert "do not duplicate" not in json.dumps(attrs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,undelivered",
+    [
+        pytest.param(
+            CodexAppServerResponseError({"code": -32600, "message": "invalid turn id"}),
+            True,
+            id="explicit-refusal",
+        ),
+        pytest.param(RuntimeError("request timed out"), False, id="ambiguous-timeout"),
+    ],
+)
+async def test_adapter_failed_steer_preserves_external_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: Exception,
+    undelivered: bool,
+) -> None:
+    """Adapter cleanup must not interrupt a Codex turn it did not start."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _FailingSteerClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                type(self).requests.append((method, params))
+                raise error
+            return await super().request(method, params)
+
+    _FailingSteerClient.requests = []
+    _FailingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FailingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_original")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_failed_steer", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(Exception) as raised:
+        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="peer input"), ctx)
+    await asyncio.sleep(0)
+    detail = adapter._build_error_detail(raised.value)
+    assert (detail.undelivered is True) is undelivered
+    assert adapter._executor is executor
+    assert adapter._abandoned_executor_cleanup is None
+    await adapter.on_shutdown()
+    assert [method for method, _params in _FailingSteerClient.requests] == ["turn/steer"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_original"
+
+
+@pytest.mark.asyncio
+async def test_adapter_cancelled_steer_still_interrupts_active_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real cancelled turn still sends Codex's interrupt request."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _SameTurnClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                type(self).requests.append((method, params))
+                return {"result": {"turnId": "turn_original"}}
+            return await super().request(method, params)
+
+    _SameTurnClient.requests = []
+    _SameTurnClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _SameTurnClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_original")
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_cancelled_steer", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    ctx.cancelled.set()
+
+    await adapter.run_turn(CreateResponseRequest(model="test-agent", input="peer input"), ctx)
+    await adapter.on_shutdown()
+    assert _SameTurnClient.requests == [
+        (
+            "turn/steer",
+            {
+                "threadId": "thread_123",
+                "expectedTurnId": "turn_original",
+                "input": [{"type": "text", "text": "peer input"}],
+            },
+        ),
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_original"}),
+    ]
 
 
 def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(

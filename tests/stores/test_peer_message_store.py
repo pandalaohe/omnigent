@@ -97,6 +97,23 @@ def test_transition_compare_and_set(store: SqlAlchemyPeerMessageStore) -> None:
     assert store.transition("0" * 32, "queued", expected_states=("pending",)) is False
 
 
+def test_transition_rejects_stale_native_attempt_reason(store: SqlAlchemyPeerMessageStore) -> None:
+    """State alone cannot distinguish two delivery attempts on one record."""
+    attempt_a = "native_attempt:" + "a" * 32
+    attempt_b = "native_attempt:" + "b" * 32
+    record = store.create(_record("attempt-cas", state="delivering", reason=attempt_a))
+    assert store.transition(
+        record.id, "queued", "native_refused", ("delivering",), expected_reason=attempt_a
+    )
+    assert store.transition(record.id, "delivering", attempt_b, ("queued",))
+    assert not store.transition(
+        record.id, "queued", "native_refused", ("delivering",), expected_reason=attempt_a
+    )
+    current = store.get(record.id)
+    assert current is not None
+    assert (current.state, current.reason) == ("delivering", attempt_b)
+
+
 def test_notice_owed_at_round_trips(store: SqlAlchemyPeerMessageStore) -> None:
     """``create`` and ``get`` carry the owed mark."""
     seeded = store.create(_record("no", notice_owed_at=4321))

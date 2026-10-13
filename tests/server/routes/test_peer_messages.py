@@ -15,6 +15,7 @@ import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any, cast
 
 import httpx
@@ -611,7 +612,7 @@ async def test_is_subagent_same_owner(
     ("harness", "disposition"),
     [
         ("claude-native", "delivered"),
-        ("codex-native", "delivered"),
+        ("codex-native", "queued"),
         ("pi-native", "is_subagent"),
         ("sdk", "is_subagent"),
     ],
@@ -638,8 +639,8 @@ async def test_dispatched_child_harness_gate(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    if disposition == "delivered":
-        assert body["disposition"] == "delivered", resp.text
+    if disposition in {"delivered", "queued"}:
+        assert body["disposition"] == disposition, resp.text
         assert len(peer_env["fake"].calls) == 1
     else:
         assert body["reason"] == disposition, resp.text
@@ -1558,12 +1559,12 @@ async def test_persisted_elicitation_count_above_local_keeps_receiver_queued(
     assert fake.calls == []
 
 
-async def test_codex_native_running_receiver_queues(
+async def test_codex_native_running_receiver_waits_for_native_receipt(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """codex-native stays busy: a refused steer drops the input."""
+    """The runner gets the peer input while the native receipt stays durable."""
     sender = peer_env["sender"]
     fake: _FakePostEvent = peer_env["fake"]
     receiver = _steerable_receiver(monkeypatch, peer_env, harness="codex-native")
@@ -1573,7 +1574,23 @@ async def test_codex_native_running_receiver_queues(
         headers=_headers(ALICE, peer_env["sender_token"]),
     )
     assert resp.json()["disposition"] == "queued", resp.text
-    assert fake.calls == []
+    assert resp.json()["reason"] == "uncertain"
+    assert len(fake.calls) == 1
+    peer_id = resp.json()["peer_id"]
+    record = peer_env["peer_store"].get(peer_id)
+    assert record is not None and record.state == "delivering"
+    assert record.reason is not None and record.reason.startswith("native_attempt:")
+    assert fake.calls[0]["data"]["stable_id"] == record.reason.removeprefix("native_attempt:")
+    assert peer_module._record_to_dict(record)["reason"] == "awaiting_native_receipt"
+    duplicate = await peer_env["app"].state.peer_send(
+        sender=sender,
+        receiver_id=receiver.id,
+        text=record.text,
+        correlation_id=None,
+        peer_id=peer_id,
+    )
+    assert duplicate["reason"] == "awaiting_native_receipt"
+    assert peer_module._record_to_dict(replace(record, state="delivered"))["reason"] is None
 
 
 async def test_sdk_running_receiver_queues(

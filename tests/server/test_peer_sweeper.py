@@ -18,9 +18,16 @@ import pytest
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
-from omnigent.entities.conversation import Conversation, ConversationItem, MessageData
+from omnigent.entities.conversation import (
+    Conversation,
+    ConversationItem,
+    ErrorData,
+    MessageData,
+    NewConversationItem,
+)
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 
@@ -107,6 +114,7 @@ class _FakePeerStore(PeerMessageStore):
         reason: str | None = None,
         expected_states: tuple[str, ...] | None = None,
         *,
+        expected_reason: str | None = None,
         expires_at: int | None = None,
         relay_depth: int | None = None,
         notice: bool = False,
@@ -116,6 +124,8 @@ class _FakePeerStore(PeerMessageStore):
             if row is None:
                 return False
             if expected_states is not None and row.state not in expected_states:
+                return False
+            if expected_reason is not None and row.reason != expected_reason:
                 return False
             row.state = state
             if reason is not None:
@@ -212,6 +222,11 @@ class _FakeConversationStore:
     def __init__(self) -> None:
         self.convs: dict[str, Conversation] = {}
         self.visible_text: dict[str, list[str]] = {}
+        self.items: dict[str, ConversationItem] = {}
+
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        del conversation_id
+        return self.items.get(item_id)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self.convs.get(conversation_id)
@@ -222,7 +237,14 @@ class _FakeConversationStore:
         # Mirror the real store: each hit is a decoded conversation item, so
         # the sweeper's marker validation reads role/content, not raw text.
         hits = [t for t in self.visible_text.get(conversation_id, []) if query in t][:limit]
-        return [
+        mirrors = [
+            item
+            for item in self.items.values()
+            if item.type == "message"
+            and isinstance(item.data, MessageData)
+            and any(query in str(block.get("text", "")) for block in item.data.content)
+        ]
+        synthetic = [
             ConversationItem(
                 id=f"item_{i}",
                 type="message",
@@ -233,6 +255,7 @@ class _FakeConversationStore:
             )
             for i, text in enumerate(hits)
         ]
+        return (mirrors + synthetic)[:limit]
 
 
 class _TrueStateScript:
@@ -295,6 +318,7 @@ class _DeliverScript:
         peer_id: str,
         text: str,
         *,
+        attempt_id: str | None = None,
         acting_user_id: Any = None,
     ) -> tuple[str, str | None]:
         self.calls.append(
@@ -304,6 +328,7 @@ class _DeliverScript:
                 "ref": ref,
                 "peer_id": peer_id,
                 "text": text,
+                "attempt_id": attempt_id,
                 "acting_user_id": acting_user_id,
             }
         )
@@ -707,6 +732,185 @@ async def test_uncertain_delivery_past_expiry_expires_with_notice(
     assert _row(harness.store, record.id).state == "expired"
     assert len(harness.post_event.calls) == 1
     assert "expired" in harness.post_event.calls[0]["text"]
+
+
+async def test_codex_refused_attempt_requeues_without_trusting_failed_user_item(
+    harness: _Harness,
+) -> None:
+    """An explicit RPC refusal is the only safe retry signal for its attempt."""
+    attempt = "a" * 32
+    record = harness.seed_record(
+        state="delivering", reason=f"native_attempt:{attempt}", updated_at=harness._now
+    )
+    refusal_id = uuid.uuid5(uuid.NAMESPACE_URL, f"codex-native-refusal:receiver:{attempt}").hex
+    harness.conv_store.items[refusal_id] = ConversationItem(
+        id=refusal_id,
+        type="error",
+        status="completed",
+        response_id="failed_turn",
+        created_at=0,
+        data=ErrorData(source="execution", code="codex_native_input_refused", message="rejected"),
+    )
+    # The undelivered-input settlement persisted this envelope as a user
+    # item, but it did not come from Codex's native transcript.
+    harness.conv_store.visible_text["receiver"] = [_envelope(record)]
+
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+
+    assert _row(harness.store, record.id).state == "queued"
+
+
+async def test_codex_ambiguous_attempt_waits_for_mirror_or_expiry(harness: _Harness) -> None:
+    attempt = "b" * 32
+    record = harness.seed_record(
+        id="f" * 32,
+        state="delivering",
+        reason=f"native_attempt:{attempt}",
+        updated_at=harness._now,
+    )
+    harness._now += 130
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+    assert _row(harness.store, record.id).state == "delivering"
+
+    mirror = ConversationItem(
+        id="native_mirror",
+        type="message",
+        status="completed",
+        response_id="codex_turn_accepted",
+        created_at=0,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": _envelope(record)}]),
+    )
+    harness.conv_store.items[mirror.id] = mirror
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+    assert _row(harness.store, record.id).state == "delivered"
+
+
+async def test_codex_refusal_keeps_explicit_release(harness: _Harness) -> None:
+    attempt = "c" * 32
+    record = harness.seed_record(
+        state="delivering",
+        reason=f"released:native_attempt:{attempt}",
+        updated_at=harness._now,
+    )
+    refusal_id = uuid.uuid5(uuid.NAMESPACE_URL, f"codex-native-refusal:receiver:{attempt}").hex
+    harness.conv_store.items[refusal_id] = ConversationItem(
+        id=refusal_id,
+        type="error",
+        status="completed",
+        response_id="failed_turn",
+        created_at=0,
+        data=ErrorData(source="execution", code="codex_native_input_refused", message="rejected"),
+    )
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+    queued = _row(harness.store, record.id)
+    assert (queued.state, queued.reason) == ("queued", "released")
+
+
+async def test_codex_known_pre_submit_failure_requeues(harness: _Harness) -> None:
+    attempt = "e" * 32
+    record = harness.seed_record(
+        state="delivering", reason=f"native_attempt:{attempt}", updated_at=harness._now
+    )
+    receipt_id = uuid.uuid5(uuid.NAMESPACE_URL, f"codex-native-refusal:receiver:{attempt}").hex
+    harness.conv_store.items[receipt_id] = ConversationItem(
+        id=receipt_id,
+        type="error",
+        status="completed",
+        response_id="failed_turn",
+        created_at=0,
+        data=ErrorData(source="execution", code="codex_app_server_stopped", message="stopped"),
+    )
+    await harness.sweeper._reconcile_stale_delivering(harness._now)
+    assert _row(harness.store, record.id).state == "queued"
+
+
+async def test_codex_native_mirror_after_many_failed_envelopes(db_uri: str) -> None:
+    """Real transcript search must reach the native mirror beyond failed inputs."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    receiver = conv_store.create_conversation(title="Receiver")
+    record = SessionPeerMessage(
+        id=uuid.uuid4().hex,
+        sender_session_id=uuid.uuid4().hex,
+        receiver_session_id=receiver.id,
+        ref="ref-many",
+        text="body",
+        state="delivering",
+        reason=f"native_attempt:{'d' * 32}",
+        created_at=1000,
+        expires_at=2000,
+    )
+    store = _FakePeerStore()
+    store.seed(record)
+    sweeper = PeerSweeper(
+        peer_store=store,
+        conversation_store=conv_store,
+        permission_store=None,
+        true_state=_TrueStateScript(),
+        deliver=_DeliverScript(),
+        post_event_impl=_PostEventScript(),
+    )
+    envelope = _envelope(record)
+    for index in range(6):
+        conv_store.append(
+            receiver.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"failed_{index}",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": envelope}]
+                    ),
+                )
+            ],
+        )
+    await sweeper._reconcile_one(dataclasses.replace(record), 1000)
+    assert _row(store, record.id).state == "delivering"
+
+    conv_store.append(
+        receiver.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="codex_turn_accepted",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": envelope}]),
+            )
+        ],
+    )
+    await sweeper._reconcile_one(dataclasses.replace(record), 1000)
+    assert _row(store, record.id).state == "delivered"
+
+
+async def test_stale_refusal_cannot_requeue_newer_native_attempt(harness: _Harness) -> None:
+    """A delayed sweeper with attempt A cannot undo another sweeper's B claim."""
+    attempt_a = "a" * 32
+    attempt_b = "b" * 32
+    record = harness.seed_record(state="delivering", reason=f"native_attempt:{attempt_a}")
+    old_snapshot = dataclasses.replace(record)
+    refusal_id = uuid.uuid5(uuid.NAMESPACE_URL, f"codex-native-refusal:receiver:{attempt_a}").hex
+    harness.conv_store.items[refusal_id] = ConversationItem(
+        id=refusal_id,
+        type="error",
+        status="completed",
+        response_id="failed_turn",
+        created_at=0,
+        data=ErrorData(source="execution", code="codex_native_input_refused", message="rejected"),
+    )
+    other_sweeper = PeerSweeper(
+        peer_store=harness.store,
+        conversation_store=cast(Any, harness.conv_store),
+        permission_store=None,
+        true_state=harness.true_state,
+        deliver=harness.deliver,
+        post_event_impl=harness.post_event,
+    )
+    await other_sweeper._reconcile_one(dataclasses.replace(record), harness._now)
+    assert harness.store.transition(
+        record.id, "delivering", f"native_attempt:{attempt_b}", ("queued",)
+    )
+
+    await harness.sweeper._reconcile_one(old_snapshot, harness._now)
+    current = _row(harness.store, record.id)
+    assert (current.state, current.reason) == ("delivering", f"native_attempt:{attempt_b}")
 
 
 async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:

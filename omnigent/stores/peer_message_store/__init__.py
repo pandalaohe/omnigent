@@ -106,6 +106,7 @@ class PeerMessageStore(ABC):
         reason: str | None = None,
         expected_states: tuple[str, ...] | None = None,
         *,
+        expected_reason: str | None = None,
         expires_at: int | None = None,
         relay_depth: int | None = None,
         notice: bool = False,
@@ -123,6 +124,8 @@ class PeerMessageStore(ABC):
             it.
         :param expected_states: States the caller last saw; a concurrent
             move makes this return ``False``.
+        :param expected_reason: When supplied, the exact reason the caller
+            last saw; a newer delivery attempt makes this return ``False``.
         :param expires_at: New expiry, or omitted to leave it. Used by the
             sweeper's startup reconciliation, which resets a crash-orphaned
             ``delivering`` record's expiry when it reverts to ``pending``.

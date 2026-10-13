@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -7272,6 +7273,57 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert len(consumed) == 1
         assert consumed[0]["data"]["cleared_pending_id"] == pending_id
         assert consumed[0]["data"]["created_by"] == "alice@example.com"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["codex_native_input_refused", "codex_app_server_unreachable"])
+async def test_relay_records_codex_refusal_for_exact_peer_attempt(code: str) -> None:
+    """The sweeper can distinguish an explicit refusal from an unknown RPC result."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    attempt = "a" * 32
+    pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "[Peer message from session ...]"}],
+        stable_id=attempt,
+    )
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.in_progress",
+                    "response": {"id": "resp_refused", "model": "codex"},
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": attempt,
+                    "response": {
+                        "id": "resp_refused",
+                        "model": "codex",
+                        "error": {
+                            "code": code,
+                            "message": "Codex refused the steer",
+                            "undelivered": True,
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        receipt_id = uuid.uuid5(uuid.NAMESPACE_URL, f"codex-native-refusal:{sid}:{attempt}").hex
+        assert store.persisted_by_stable_id[receipt_id] == store.appended_items[1]
     finally:
         pending_inputs.reset_for_tests()
 
