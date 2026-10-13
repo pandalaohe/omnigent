@@ -47,6 +47,9 @@ _STATE_FILE = "state.json"
 # the tmux/TUI section at the end of this module). Written by the runner after
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
+_PLAN_INPUT_RECEIPTS_DIR = "plan-input-receipts"
+_FIRST_PLAN_INPUT_CASCADE = "first-cascade"
+_MAX_PLAN_INPUT_RECEIPTS = 128
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
 
 # Prefix of the launcher-minted placeholder conversation id (see
@@ -1133,6 +1136,27 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: None.
     """
+    receipts_dir = bridge_dir / _PLAN_INPUT_RECEIPTS_DIR
+    state = read_bridge_state(bridge_dir)
+    first_cascade = _first_plan_input_cascade(bridge_dir)
+    cascade_id = first_cascade or (
+        state.conversation_id
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id)
+        else None
+    )
+    for receipt in _plan_input_receipts(bridge_dir):
+        record = _read_plan_input_receipt(receipt)
+        if record is None or record[2] is not None:
+            continue
+        if cascade_id is None:
+            receipt.unlink(missing_ok=True)
+        else:
+            _write_agy_permission_file(
+                receipt,
+                json.dumps({"digest": record[0], "plan": record[1], "cascade": cascade_id}) + "\n",
+            )
+    if receipts_dir.is_dir() and not receipts_dir.is_symlink():
+        (receipts_dir / _FIRST_PLAN_INPUT_CASCADE).unlink(missing_ok=True)
     for runtime_file in (_STATE_FILE, _TMUX_FILE):
         with contextlib.suppress(FileNotFoundError):
             (bridge_dir / runtime_file).unlink()
@@ -1962,6 +1986,161 @@ def _paste_and_submit(
     )
 
 
+def _plan_input_digest(text: str) -> str:
+    """Identify a delivered turn without persisting its contents."""
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _plan_input_receipts(bridge_dir: Path) -> list[Path]:
+    receipts_dir = bridge_dir / _PLAN_INPUT_RECEIPTS_DIR
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        return []
+    return sorted(receipts_dir.glob("receipt_*"))
+
+
+def _read_plan_input_receipt(path: Path) -> tuple[str, bool, str | None] | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    digest, plan, cascade = record.get("digest"), record.get("plan"), record.get("cascade")
+    if not isinstance(digest, str) or len(digest) != 64 or not isinstance(plan, bool):
+        return None
+    if cascade is not None and not isinstance(cascade, str):
+        return None
+    return digest, plan, cascade
+
+
+def _first_plan_input_cascade(bridge_dir: Path) -> str | None:
+    receipts_dir = bridge_dir / _PLAN_INPUT_RECEIPTS_DIR
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        return None
+    path = receipts_dir / _FIRST_PLAN_INPUT_CASCADE
+    if path.is_symlink():
+        return None
+    try:
+        return path.read_text(encoding="ascii").strip() or None
+    except (OSError, UnicodeError):
+        return None
+
+
+def _record_plan_input_receipt(bridge_dir: Path, content: str) -> Path:
+    """Record each delivered turn's digest, tier, and known agy cascade."""
+    tier_path = bridge_dir / "permission_tier"
+    if tier_path.is_symlink():
+        raise ValueError("Refusing symlink permission_tier")
+    try:
+        tier = tier_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        tier = ""
+    state = read_bridge_state(bridge_dir)
+    cascade_id = (
+        state.conversation_id
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id)
+        else None
+    )
+
+    receipts_dir = bridge_dir / _PLAN_INPUT_RECEIPTS_DIR
+    if receipts_dir.is_symlink():
+        raise ValueError("Refusing symlink plan-input-receipts")
+    receipts_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f"receipt_{time.time_ns()}_", dir=receipts_dir)
+    receipt = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            json.dump(
+                {
+                    "digest": _plan_input_digest(content),
+                    "plan": tier == "plan",
+                    "cascade": cascade_id,
+                },
+                handle,
+            )
+            handle.write("\n")
+    except BaseException:
+        receipt.unlink(missing_ok=True)
+        raise
+    for stale in _plan_input_receipts(bridge_dir)[:-_MAX_PLAN_INPUT_RECEIPTS]:
+        stale.unlink(missing_ok=True)
+    return receipt
+
+
+def rebind_unmapped_plan_input_receipts(
+    bridge_dir: Path, old_cascade_id: str, new_cascade_id: str
+) -> None:
+    """Carry pending deliveries from the headless bootstrap to the first TUI cascade."""
+    for receipt in _plan_input_receipts(bridge_dir):
+        record = _read_plan_input_receipt(receipt)
+        if record is None or record[2] != old_cascade_id:
+            continue
+        try:
+            _write_agy_permission_file(
+                receipt,
+                json.dumps({"digest": record[0], "plan": record[1], "cascade": new_cascade_id})
+                + "\n",
+            )
+        except OSError:
+            _logger.warning("Could not rebind pending plan-input receipt", exc_info=True)
+
+
+def reconcile_plan_input_echo(
+    bridge_dir: Path,
+    text: str,
+    *,
+    cascade_id: str | None = None,
+    step_key: tuple[object, ...] | None = None,
+) -> str:
+    """Bind one delivered turn to a USER_INPUT identity for repeatable mirroring."""
+    if cascade_id is None or step_key is None:
+        return text
+    receipts_dir = bridge_dir / _PLAN_INPUT_RECEIPTS_DIR
+    if receipts_dir.is_symlink() or not receipts_dir.is_dir():
+        return text
+    identity = hashlib.sha256(
+        json.dumps((cascade_id, step_key), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    mapped = receipts_dir / f"mapped_{identity}"
+    exact = _plan_input_digest(text)
+    prefixed = (
+        _plan_input_digest(text.removeprefix("/plan ")) if text.startswith("/plan ") else None
+    )
+
+    bound = _read_plan_input_receipt(mapped)
+    if bound is not None:
+        digest, plan, _ = bound
+        if digest == exact:
+            return text
+        if plan and digest == prefixed:
+            return text.removeprefix("/plan ")
+        return text
+
+    first_cascade = _first_plan_input_cascade(bridge_dir)
+    for receipt in _plan_input_receipts(bridge_dir):
+        record = _read_plan_input_receipt(receipt)
+        if record is None:
+            continue
+        digest, plan, delivered_cascade = record
+        if delivered_cascade not in (None, cascade_id):
+            continue
+        if delivered_cascade is None and first_cascade not in (None, cascade_id):
+            continue
+        if digest == exact:
+            result = text
+        elif plan and digest == prefixed:
+            result = text.removeprefix("/plan ")
+        else:
+            continue
+        if delivered_cascade is None and first_cascade is None:
+            _write_agy_permission_file(receipts_dir / _FIRST_PLAN_INPUT_CASCADE, cascade_id + "\n")
+        os.replace(receipt, mapped)
+        return result
+    return text
+
+
 def inject_user_message_via_tui(
     bridge_dir: Path,
     *,
@@ -2028,9 +2207,28 @@ def inject_user_message_via_tui(
     # first poll and returns immediately.
     retry_deadline = time.monotonic() + _VERIFY_RETRY_TIMEOUT_S
     while True:
-        _paste_and_submit(bridge_dir, socket_path, tmux_target, content=content)
-        if not _account_verification_rejected(socket_path, tmux_target):
+        try:
+            receipt = _record_plan_input_receipt(bridge_dir, content)
+        except OSError:
+            _logger.warning("Could not record TUI delivery receipt", exc_info=True)
+            receipt = None
+        try:
+            _paste_and_submit(bridge_dir, socket_path, tmux_target, content=content)
+            rejected = _account_verification_rejected(socket_path, tmux_target)
+        except BaseException:
+            if receipt is not None:
+                try:
+                    receipt.unlink(missing_ok=True)
+                except OSError:
+                    _logger.warning("Could not remove TUI delivery receipt", exc_info=True)
+            raise
+        if not rejected:
             return
+        if receipt is not None:
+            try:
+                receipt.unlink(missing_ok=True)
+            except OSError:
+                _logger.warning("Could not remove rejected TUI delivery receipt", exc_info=True)
         if time.monotonic() >= retry_deadline:
             raise RuntimeError(
                 "agy is still verifying the Antigravity account and rejected the message "
