@@ -49,3 +49,19 @@ describe("reconcileEffortOnModelChange", () => {
     expect(reconcileEffortOnModelChange(harness, rows, model, effort)).toBe(expected);
   });
 });
+
+it("filters Antigravity efforts per model and clears an unsupported pick", () => {
+  const models = [
+    { id: "claude-sonnet-5-5", efforts: ["low", "medium", "high", "max"] },
+    { id: "gpt-oss", efforts: ["medium"] },
+  ];
+  expect(effortLevelsFor("antigravity-native", models, "claude-sonnet-5-5")).toEqual([
+    "low",
+    "medium",
+    "high",
+  ]);
+  expect(effortLevelsFor("antigravity-native", models, "gpt-oss")).toEqual(["medium"]);
+  expect(effortLevelsFor("antigravity-native", rows, "model-b")).toEqual(["medium"]);
+  expect(effortLevelsFor("antigravity-native", models, "unknown")).toEqual([]);
+  expect(reconcileEffortOnModelChange("antigravity-native", models, "gpt-oss", "high")).toBeNull();
+});

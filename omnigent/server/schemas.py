@@ -2912,6 +2912,9 @@ class SessionForkRequest(BaseModel):
         (``"default"``, ``"off"``, ``"reset"``) resets it. Validated
         against the shared effort vocabulary; provider support is enforced
         at launch. Set by the web fork dialog's effort picker.
+    :param permission_tier: Antigravity tier for the fork. Omitted inherits
+        the source's tier, or uses the default for a different source harness.
+        Ignored when the target uses another harness.
     :param terminal_launch_args: Per-session native-terminal pass-through
         args to apply to the fork, e.g. ``["--permission-mode", "auto"]``
         (the fork dialog's permission-/approval-mode selector).
@@ -2953,6 +2956,7 @@ class SessionForkRequest(BaseModel):
     up_to_response_id: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
+    permission_tier: str | None = None
     terminal_launch_args: list[str] | None = None
     codex_bypass_sandbox: bool = False
     host_type: Literal["external", "managed"] = "external"
@@ -2964,6 +2968,15 @@ class SessionForkRequest(BaseModel):
     side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("permission_tier")
+    @classmethod
+    def _validate_permission_tier(cls, value: str | None) -> str | None:
+        from omnigent.harnesses.antigravity_native.bridge import AGY_PERMISSION_TIERS
+
+        if value is not None and value not in AGY_PERMISSION_TIERS:
+            raise ValueError(f"permission_tier must be one of {AGY_PERMISSION_TIERS}")
+        return value
 
     @model_validator(mode="after")
     def _check_managed_fork_fields(self) -> Self:

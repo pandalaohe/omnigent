@@ -35,6 +35,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
+import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { effectiveWorktree, type Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
@@ -48,9 +49,10 @@ import {
   claudePermissionModeFromSession,
 } from "@/lib/claudePermissionMode";
 import {
-  AGY_NATIVE_DEFAULT_SKIP_MODE,
-  AGY_NATIVE_SKIP_MODES,
-  AGY_NATIVE_SKIP_VALUE,
+  agyPermissionTierFromSession,
+  AGY_NATIVE_DEFAULT_PERMISSION_TIER,
+  AGY_NATIVE_PERMISSION_TIERS,
+  AGY_NATIVE_FULL_PERMISSION_TIER,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
@@ -225,6 +227,7 @@ export interface ForkRunConfigValue {
   modelOverride?: string;
   reasoningEffort?: string;
   terminalLaunchArgs?: string[];
+  permissionTier?: string;
   /**
    * DANGEROUS codex full-bypass opt-in. Only emitted (as `true`) when the
    * user explicitly picks "Bypass approvals & sandbox" for a codex target;
@@ -290,12 +293,13 @@ function ForkRunConfig({
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(targetAgent, "cursorMode");
-  const hasAgySkip = nativeAgentHasCapability(targetAgent, "skipPermissions");
+  const hasAgyPermissionTier = nativeAgentHasCapability(targetAgent, "agyPermissionTier");
   const hasModelPicker = nativeAgentHasCapability(targetAgent, "modelPicker");
   // Codex resolves its own catalog, so it gets a model row even though it lacks
   // the modelPicker capability (mirrors the new-session dialog).
   const isCodex = targetHarness === "codex-native";
-  const showModel = hasModelPicker || isCodex;
+  const hasAgyMode = nativeAgentHasCapability(targetAgent, "agyMode");
+  const showModel = hasModelPicker || isCodex || hasAgyMode;
 
   // Live model catalog for the target harness on the picked host. Only the
   // native harnesses that expose a picker resolve a catalog; others pass a
@@ -309,6 +313,7 @@ function ForkRunConfig({
   const modelOptions = useMemo(
     () =>
       (hostModelOptions ?? []).map((option) => ({
+        ...option,
         id: option.id,
         displayName: option.displayName ?? option.id,
         isDefault: option.isDefault,
@@ -331,14 +336,18 @@ function ForkRunConfig({
     return picked && modelOptions.some((m) => m.id === picked) ? picked : MODEL_SELECT_DEFAULT;
   }, [sameFamilyAsSource, sourceSession, modelOptions]);
   const seededEffort = useMemo(() => {
-    // Seed only an effort the picker can display; a source value outside the
-    // offered vocabulary (e.g. "minimal") falls back to Default rather than
-    // leaving the Select on an empty, unselectable value.
     const effort = sameFamilyAsSource ? sourceSession?.reasoningEffort : null;
-    return effort && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === effort)
-      ? effort
-      : EFFORT_SELECT_NONE;
-  }, [sameFamilyAsSource, sourceSession]);
+    const options = hasAgyMode
+      ? (effortLevelsFor(
+          targetHarness,
+          modelOptions,
+          seededModel === MODEL_SELECT_DEFAULT
+            ? modelOptions.find((row) => row.isDefault)?.id
+            : seededModel,
+        ) ?? [])
+      : CLAUDE_NATIVE_EFFORTS.map((option) => option.value);
+    return effort && options.includes(effort) ? effort : EFFORT_SELECT_NONE;
+  }, [sameFamilyAsSource, sourceSession, hasAgyMode, targetHarness, modelOptions, seededModel]);
   const seededPermission = useMemo(() => {
     // Permission mode rides terminal_launch_args, which the backend copies
     // ONLY on a same-AGENT fork (copy_terminal_launch_args = not switching).
@@ -352,6 +361,13 @@ function ForkRunConfig({
     return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
   }, [sameAgentAsSource, sourceSession]);
   const seededModeValue = useMemo(() => {
+    // The source's tier is meaningful only when the source itself ran
+    // antigravity-native; a claude/codex source forks into agy's default.
+    if (hasAgyPermissionTier) {
+      return nativeCodingAgentForSession(sourceSession)?.harness === "antigravity-native"
+        ? agyPermissionTierFromSession(sourceSession)
+        : AGY_NATIVE_DEFAULT_PERMISSION_TIER;
+    }
     // Same as permission: launch args carry over only on a same-agent fork, so
     // seed the mode from the source only then; otherwise the harness's default.
     const source = sameAgentAsSource ? (sourceSession?.terminalLaunchArgs ?? []) : [];
@@ -359,14 +375,8 @@ function ForkRunConfig({
       ? CODEX_NATIVE_APPROVAL_MODES
       : hasCursor
         ? CURSOR_NATIVE_EXEC_MODES
-        : hasAgySkip
-          ? AGY_NATIVE_SKIP_MODES
-          : [];
-    const dflt = hasApproval
-      ? CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-      : hasCursor
-        ? CURSOR_NATIVE_DEFAULT_EXEC_MODE
-        : AGY_NATIVE_DEFAULT_SKIP_MODE;
+        : [];
+    const dflt = hasApproval ? CODEX_NATIVE_DEFAULT_APPROVAL_MODE : CURSOR_NATIVE_DEFAULT_EXEC_MODE;
     // Codex bypass rides a LABEL, not launch args, so match it first: a
     // same-agent fork of a bypass-armed codex source seeds the bypass option.
     // (The source label is still dropped server-side; re-selecting here is the
@@ -384,7 +394,7 @@ function ForkRunConfig({
       .sort((a, b) => b.args.length - a.args.length)
       .find((m) => m.args.length > 0 && m.args.every((arg) => source.includes(arg)));
     return match?.value ?? dflt;
-  }, [isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
+  }, [isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgyPermissionTier]);
 
   const [model, setModel] = useState(seededModel);
   const [effort, setEffort] = useState(seededEffort);
@@ -411,6 +421,18 @@ function ForkRunConfig({
   const changeModel = (v: string) => {
     setTouched((t) => ({ ...t, model: true }));
     setModel(v);
+    if (
+      hasAgyMode &&
+      reconcileEffortOnModelChange(
+        targetHarness,
+        modelOptions,
+        v === MODEL_SELECT_DEFAULT ? modelOptions.find((row) => row.isDefault)?.id : v,
+        effort === EFFORT_SELECT_NONE ? null : effort,
+      ) === null
+    ) {
+      setEffort(EFFORT_SELECT_NONE);
+      setTouched((t) => ({ ...t, effort: true }));
+    }
   };
   const changeEffort = (v: string) => {
     setTouched((t) => ({ ...t, effort: true }));
@@ -472,16 +494,21 @@ function ForkRunConfig({
       }
     } else if (hasCursor && touched.mode) {
       value.terminalLaunchArgs = CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === mode)?.args ?? [];
-    } else if (hasAgySkip && touched.mode) {
-      value.terminalLaunchArgs = AGY_NATIVE_SKIP_MODES.find((m) => m.value === mode)?.args ?? [];
+    }
+    if (hasAgyPermissionTier && (touched.mode || sourceSession !== null))
+      value.permissionTier = mode;
+    if (hasAgyMode && touched.effort) {
+      value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
     }
     onChange(value);
   }, [
     showModel,
+    hasAgyMode,
     hasPermission,
     hasApproval,
     hasCursor,
-    hasAgySkip,
+    hasAgyPermissionTier,
+    sourceSession,
     isCodex,
     model,
     effort,
@@ -493,10 +520,20 @@ function ForkRunConfig({
 
   if (
     targetHarness === null ||
-    (!showModel && !hasPermission && !hasApproval && !hasCursor && !hasAgySkip)
+    (!showModel && !hasPermission && !hasApproval && !hasCursor && !hasAgyPermissionTier)
   ) {
     return null;
   }
+
+  const effortOptions = hasAgyMode
+    ? (
+        effortLevelsFor(
+          targetHarness,
+          modelOptions,
+          model === MODEL_SELECT_DEFAULT ? modelOptions.find((row) => row.isDefault)?.id : model,
+        ) ?? []
+      ).map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))
+    : CLAUDE_NATIVE_EFFORTS;
 
   return (
     <div className="flex flex-col gap-4" data-testid="fork-session-run-config">
@@ -525,7 +562,7 @@ function ForkRunConfig({
         </ForkConfigRow>
       )}
 
-      {hasPermission && (
+      {(hasPermission || hasAgyMode) && (
         <>
           <ForkConfigRow label="Effort">
             <Select
@@ -543,7 +580,7 @@ function ForkRunConfig({
               </SelectTrigger>
               <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
                 <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                {CLAUDE_NATIVE_EFFORTS.map((e) => (
+                {effortOptions.map((e) => (
                   <SelectItem key={e.value} value={e.value}>
                     {e.label}
                   </SelectItem>
@@ -552,18 +589,20 @@ function ForkRunConfig({
             </Select>
           </ForkConfigRow>
 
-          <ForkConfigRow label="Permissions">
-            <DescribedSelect
-              value={permission}
-              onValueChange={changePermission}
-              options={CLAUDE_NATIVE_PERMISSION_MODES}
-              testId="fork-session-config-permission"
-              ariaLabel="Permissions"
-              triggerClassName="text-sm"
-              contentClassName={FORK_SELECT_ITEM_SM}
-              componentId="fork_session.config.permission"
-            />
-          </ForkConfigRow>
+          {hasPermission && (
+            <ForkConfigRow label="Permissions">
+              <DescribedSelect
+                value={permission}
+                onValueChange={changePermission}
+                options={CLAUDE_NATIVE_PERMISSION_MODES}
+                testId="fork-session-config-permission"
+                ariaLabel="Permissions"
+                triggerClassName="text-sm"
+                contentClassName={FORK_SELECT_ITEM_SM}
+                componentId="fork_session.config.permission"
+              />
+            </ForkConfigRow>
+          )}
         </>
       )}
 
@@ -619,13 +658,13 @@ function ForkRunConfig({
         </ForkConfigRow>
       )}
 
-      {hasAgySkip && (
+      {hasAgyPermissionTier && (
         <>
           <ForkConfigRow label="Permissions">
             <DescribedSelect
               value={mode}
               onValueChange={changeMode}
-              options={AGY_NATIVE_SKIP_MODES}
+              options={AGY_NATIVE_PERMISSION_TIERS}
               testId="fork-session-config-agy-skip"
               ariaLabel="Permissions"
               triggerClassName="text-sm"
@@ -633,7 +672,7 @@ function ForkRunConfig({
               componentId="fork_session.config.permission"
             />
           </ForkConfigRow>
-          {mode === AGY_NATIVE_SKIP_VALUE && (
+          {mode === AGY_NATIVE_FULL_PERMISSION_TIER && (
             <div
               role="alert"
               data-testid="fork-session-agy-skip-banner"

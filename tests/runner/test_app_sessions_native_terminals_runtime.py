@@ -2283,6 +2283,8 @@ async def _run_antigravity_auto_create(
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
 
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "home"))
+
     # No-op the launch builder + onboarding seed so nothing tries to find agy.
     def _fake_build_agy_launch(**kwargs: Any) -> tuple[tuple[str, ...], dict[str, str]]:
         if build_agy_launch_calls is not None:
@@ -2468,8 +2470,7 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     antigravity-native sub-agent with ``permission_mode: bypassPermissions``
     persists ``["--dangerously-skip-permissions"]`` on the session, and the
     runner's auto-create must forward it verbatim into the agy argv (with the
-    web-attended stance kept: ``permission_mode=None`` / ``headless=False`` so
-    bypass comes ONLY from the pass-through args). A failure means the derived
+    server-owned tier supplying the bypass flag). A failure means the derived
     flag is dropped and the worker parks on approval cards.
     """
     launch_calls: list[dict[str, Any]] = []
@@ -2484,9 +2485,37 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     assert len(launch_calls) == 1
     call = launch_calls[0]
     assert call["extra_args"] == ("--dangerously-skip-permissions",)
-    # Bypass must come only from the pass-through args on this attended path.
-    assert call["permission_mode"] is None
-    assert call["headless"] is False
+
+
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_strips_persisted_skip_flag_for_non_full_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The resolved tier owns the skip-permissions flag on the runner launch path.
+
+    A session whose persisted ``terminal_launch_args`` still carry
+    ``--dangerously-skip-permissions`` but whose server-owned tier label is no
+    longer ``full`` must launch WITHOUT the flag; other persisted args pass
+    through untouched.
+    """
+    launch_calls: list[dict[str, Any]] = []
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id="92c6f9222c7ac0f45ba2736b57b51f88",
+        snapshot={
+            "labels": {"omnigent.antigravity_native.permission_tier": "auto-relaxed"},
+            "terminal_launch_args": ["--dangerously-skip-permissions", "--some-passthrough"],
+        },
+        candidate_ports=[52550],
+        build_agy_launch_calls=launch_calls,
+    )
+    assert len(launch_calls) == 1
+    extra_args = launch_calls[0]["extra_args"]
+    assert "--dangerously-skip-permissions" not in extra_args
+    assert "--some-passthrough" in extra_args
 
 
 @pytest.mark.asyncio
@@ -4984,3 +5013,55 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
             await forwarder
         native._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         native._AUTO_FORWARDER_TASKS.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tier,expected_args,tool_permission",
+    [
+        ("ask", (), "request-review"),
+        ("plan", ("--mode", "plan"), "request-review"),
+        ("accept-edits", ("--mode", "accept-edits"), "request-review"),
+        ("auto-strict", ("--mode", "accept-edits"), "always-proceed"),
+        ("auto-standard", ("--mode", "accept-edits"), "always-proceed"),
+        ("auto-relaxed", ("--mode", "accept-edits"), "always-proceed"),
+        ("full", ("--dangerously-skip-permissions",), None),
+    ],
+)
+async def test_auto_create_antigravity_applies_server_tier_and_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tier: str,
+    expected_args: tuple[str, ...],
+    tool_permission: str | None,
+) -> None:
+    from omnigent.harnesses.antigravity_native import bridge as bridge_mod
+    from omnigent.runner.native import orchestration
+
+    calls: list[dict[str, Any]] = []
+    session_id = "agy-tier-test"
+    await _run_antigravity_auto_create(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        snapshot={
+            "labels": {bridge_mod.AGY_PERMISSION_TIER_LABEL_KEY: tier},
+            "reasoning_effort": "high",
+        },
+        candidate_ports=[],
+        build_agy_launch_calls=calls,
+    )
+    assert calls[0]["extra_args"] == expected_args
+    assert calls[0]["effort"] == "high"
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    assert (bridge_dir / "permission_tier").read_text() == tier + "\n"
+    settings = json.loads(
+        (bridge_mod.agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json").read_text()
+    )
+    assert settings.get("toolPermission") == tool_permission
+    assert settings["permissions"]["allow"] == ["mcp(omnigent/*)"]
+    hooks = json.loads(
+        (bridge_mod.agy_gemini_dir(bridge_dir) / "config" / "hooks.json").read_text()
+    )
+    assert ("omnigent-guard" in hooks) == (tier != "full")
+    assert orchestration._AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] == tier

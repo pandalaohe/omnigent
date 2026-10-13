@@ -6529,6 +6529,9 @@ async def _run_antigravity_reader(
     )
 
 
+_AGY_CONFIRMED_PERMISSION_TIERS: dict[Path, str] = {}
+
+
 async def _auto_create_antigravity_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -6561,16 +6564,8 @@ async def _auto_create_antigravity_terminal(
     over tmux whether or not a web client has opened the Terminal panel (see
     the ``tmux_start_on_attach`` note on the spec below).
 
-    **Permissions are web-attended, not headless.** The web client attaches
-    to the agy pane through the runner tunnel and answers agy's
-    ``request-review`` TUI prompt there, so the launch is treated as
-    *attended* (``headless=False``). Auto-bypass comes only from the user's
-    persisted ``terminal_launch_args`` (which carry
-    ``--dangerously-skip-permissions`` when the user asked for bypass) —
-    the same pass-through mechanism codex/claude use. A server-spawned
-    launch must NOT key headlessness on the runner process's (absent) TTY,
-    which would silently disable the per-tool prompt for a watching web
-    user.
+    The server permission tier controls settings, the guard hook, and mode flags.
+    Legacy sessions resolve to ask unless their launch args request bypass.
 
     Fresh sessions launch with no ``--conversation``: the runner cold-starts
     the conversation over connect-RPC (11a) so the reader binds agy's real id
@@ -6606,9 +6601,12 @@ async def _auto_create_antigravity_terminal(
         AntigravityNativeBridgeState,
         agy_gemini_dir,
         agy_home_dir,
+        agy_tier_launch_args,
+        apply_agy_permission_tier,
         clear_bridge_state,
         ensure_agy_feedback_survey_disabled,
         prepare_bridge_dir,
+        resolve_agy_permission_tier,
         seed_isolated_agy_home,
         write_bridge_state,
         write_mcp_config,
@@ -6630,9 +6628,6 @@ async def _auto_create_antigravity_terminal(
         raise RuntimeError(f"Invalid workspace for Antigravity session {session_id!r}.")
     workspace = _codex_session_workspace(session_workspace)
 
-    # The user's pass-through agy args (e.g. ``--dangerously-skip-permissions``)
-    # persisted by the CLI/web launch. Appended verbatim — bypass only happens
-    # when the user put the flag here (see the docstring on web-attended perms).
     raw_launch_args = snapshot.get("terminal_launch_args")
     terminal_launch_args: tuple[str, ...] = ()
     if raw_launch_args is not None:
@@ -6691,20 +6686,6 @@ async def _auto_create_antigravity_terminal(
     # ``--gemini_dir``; seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
 
-    argv, env_overrides = build_agy_launch(
-        conversation_id=external_session_id if resume else None,
-        model=model,
-        resume=resume,
-        # Web-attended: a web client drives agy's request-review prompt over the
-        # tunnel, so this is NOT headless. Bypass comes only via the pass-through
-        # args below (see docstring). permission_mode is left unset for the same
-        # reason — the runner has no separate per-tool mode to map here.
-        permission_mode=None,
-        headless=False,
-        extra_args=terminal_launch_args,
-        log_dir=bridge_dir,
-    )
-
     # Wire the Omnigent MCP relay so the wrapped agy gets the sys_* tools
     # (spawn sub-agent sessions, drive Omnigent terminals, list agents/models,
     # sys_os_*) — the only native harness that otherwise lacks them (#1194).
@@ -6718,14 +6699,11 @@ async def _auto_create_antigravity_terminal(
     # (file I/O) and done BEFORE terminal launch so agy sees the config on its
     # first MCP scan.
     await asyncio.to_thread(write_mcp_config, bridge_dir)
-    env_overrides = {
-        **env_overrides,
-        **await asyncio.to_thread(
-            seed_isolated_agy_home,
-            bridge_dir,
-            trusted_workspace=workspace,
-        ),
-    }
+    env_overrides = await asyncio.to_thread(
+        seed_isolated_agy_home,
+        bridge_dir,
+        trusted_workspace=workspace,
+    )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under
@@ -6734,6 +6712,25 @@ async def _auto_create_antigravity_terminal(
     # /.gemini/antigravity-cli/settings.json to its arg), NOT the user's real
     # HOME — env_overrides no longer carries a HOME key.
     await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    tier = resolve_agy_permission_tier(
+        labels if isinstance(labels, dict) else None, terminal_launch_args
+    )
+    await asyncio.to_thread(apply_agy_permission_tier, bridge_dir, tier)
+    # The resolved tier is the single source for the skip-permissions flag; a
+    # copy persisted in the launch args must not survive a later non-full tier.
+    persisted_args = tuple(
+        arg for arg in terminal_launch_args if arg != "--dangerously-skip-permissions"
+    )
+    effort = snapshot.get("reasoning_effort")
+    argv, launch_env = build_agy_launch(
+        conversation_id=external_session_id if resume else None,
+        model=model,
+        resume=resume,
+        extra_args=persisted_args + tuple(agy_tier_launch_args(tier)),
+        effort=effort if isinstance(effort, str) and effort else None,
+        log_dir=bridge_dir,
+    )
+    env_overrides.update(launch_env)
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
@@ -6830,6 +6827,8 @@ async def _auto_create_antigravity_terminal(
             tmux_start_on_attach=False,
         ),
     )
+
+    _AGY_CONFIRMED_PERMISSION_TIERS[bridge_dir.resolve()] = tier
 
     # Resolve THIS session's own agy tmux pane (socket + target). Used to scope
     # the cold-start's ``StartCascade`` port to the agy running under this

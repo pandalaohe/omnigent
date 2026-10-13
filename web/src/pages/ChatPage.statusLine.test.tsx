@@ -16,6 +16,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import { USAGE_CONTEXT_STORAGE_KEY, usageContextSourceKey } from "@/lib/usageContextPreferences";
 import { useChatStore } from "@/store/chatStore";
+import * as sessionsApi from "@/lib/sessionsApi";
+import { toast } from "sonner";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions); these status-line tests don't exercise it, so stub the hook to
@@ -229,6 +231,100 @@ describe("Composer status line (branch + context ring)", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["ask", "Ask every time", false],
+    ["plan", "Plan only", false],
+    ["accept-edits", "Accept edits", false],
+    ["auto-strict", "Auto · strict", false],
+    ["auto-standard", "Auto · standard", false],
+    ["auto-relaxed", "Auto · relaxed", false],
+    ["full", "Skip permissions", true],
+  ])("shows Antigravity tier %s with the correct lock", (tier, label, locked) => {
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_test",
+        labels: {
+          "omnigent.wrapper": "antigravity-native-ui",
+          "omnigent.antigravity_native.permission_tier": tier,
+        },
+      },
+      isLoading: false,
+      error: null,
+    });
+    useChatStore.setState({ sessionHarness: "antigravity-native" });
+    renderComposer({ modelPickerKind: "antigravity", showClaudePermissionMode: true });
+    const picker = screen.getByRole("button", { name: `Permission mode: ${label}` });
+    if (locked) expect(picker).toBeDisabled();
+    else {
+      expect(picker).toBeEnabled();
+      fireEvent.pointerDown(picker, { button: 0 });
+      expect(screen.queryByRole("menuitemradio", { name: "Skip permissions" })).toBeNull();
+    }
+  });
+
+  it("shows a refused Antigravity permission change and keeps the confirmed tier", async () => {
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_test",
+        labels: {
+          "omnigent.wrapper": "antigravity-native-ui",
+          "omnigent.antigravity_native.permission_tier": "ask",
+        },
+      },
+      isLoading: false,
+      error: null,
+    });
+    useChatStore.setState({ sessionHarness: "antigravity-native" });
+    const patch = vi
+      .spyOn(sessionsApi, "updateSession")
+      .mockRejectedValueOnce(new Error("Runner is busy"));
+    renderComposer({ modelPickerKind: "antigravity", showClaudePermissionMode: true });
+    fireEvent.pointerDown(screen.getByTestId("composer-permission-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-permission-option-auto-relaxed"));
+    await waitFor(() =>
+      expect(patch).toHaveBeenCalledWith("conv_test", { claudePermissionMode: "auto-relaxed" }),
+    );
+    expect(await screen.findByText("Runner is busy")).toBeVisible();
+    expect(screen.getByTestId("composer-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Ask every time",
+    );
+  });
+
+  it("sends a combined model and effort change and re-reads on refusal", async () => {
+    const models = [{ id: "gpt-oss", displayName: "GPT OSS", efforts: ["medium"] }];
+    useSessionMock.mockReturnValue({
+      session: { id: "conv_test", labels: { "omnigent.wrapper": "antigravity-native-ui" } },
+      isLoading: false,
+      error: null,
+    });
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      sessionHarness: "antigravity-native",
+      sessionModelOverride: "claude-sonnet-5-5",
+      sessionReasoningEffort: "high",
+      refreshSessionState: refresh,
+    });
+    const patch = vi
+      .spyOn(sessionsApi, "updateSession")
+      .mockRejectedValueOnce(new Error("Model switch refused"));
+    vi.spyOn(sessionsApi, "refreshSessionModelOptions").mockResolvedValue(models);
+    const failure = vi.spyOn(toast, "error");
+    renderComposer({ modelPickerKind: "antigravity", showModels: true, codexModelOptions: models });
+    fireEvent.pointerDown(screen.getByTestId("composer-config-gear"), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-agent-edit"));
+    fireEvent.click(screen.getByTestId("composer-agent-model-gpt-oss"));
+    await waitFor(() =>
+      expect(patch).toHaveBeenCalledWith("conv_test", {
+        modelOverride: "gpt-oss",
+        reasoningEffort: null,
+      }),
+    );
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith("conv_test"));
+    await waitFor(() => expect(failure).toHaveBeenCalledWith("Model switch refused"));
+    expect(useChatStore.getState().sessionModelOverride).toBe("claude-sonnet-5-5");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
   });
 
   it("never renders the session cost in the status line", () => {

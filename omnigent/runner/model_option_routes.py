@@ -202,6 +202,26 @@ def register_model_option_routes(
             )
         return JSONResponse(status_code=200, content={"models": models})
 
+    @app.get("/v1/sessions/{session_id}/antigravity-model-options")
+    async def get_session_antigravity_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "antigravity-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.harnesses.antigravity_native.main import list_agy_model_options
+
+        try:
+            models = await asyncio.to_thread(list_agy_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native model options"
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
+
     @app.get("/v1/sessions/{session_id}/cursor-model-options")
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "cursor-native":
@@ -383,6 +403,8 @@ def register_model_option_routes(
             return await get_session_kiro_model_options(session_id)
         if harness == "devin-native":
             return await get_session_devin_model_options(session_id)
+        if harness == "antigravity-native":
+            return await get_session_antigravity_model_options(session_id)
         return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")

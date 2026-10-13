@@ -2677,3 +2677,57 @@ def test_fork_enforces_current_policy_before_creating_destination(
         assert not conv_store.fork_calls
         assert len(conv_store._convs) == 1
         assert file_store.files == original_files
+
+
+@pytest.mark.parametrize(
+    "source_tier,requested,expected",
+    [
+        ("auto-relaxed", "ask", "ask"),
+        ("plan", None, "plan"),
+        ("full", None, "full"),
+        ("ask", "full", "full"),
+    ],
+)
+def test_antigravity_fork_tier_stamping(source_tier, requested, expected):
+    from omnigent.native.native_coding_agents import ANTIGRAVITY_NATIVE_CODING_AGENT
+
+    source = _make_conversation(
+        labels={
+            "omnigent.wrapper": "antigravity-native-ui",
+            "omnigent.antigravity_native.permission_tier": source_tier,
+        }
+    )
+    source.harness_override = "antigravity-native"
+    source.terminal_launch_args = (
+        ["--dangerously-skip-permissions"] if source_tier == "full" else []
+    )
+    agent = Agent(
+        id=source.agent_id,
+        name=ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name,
+        bundle_location="builtin",
+        version=1,
+        created_at=1,
+    )
+    store = _ConversationStore({source.id: source})
+    response = TestClient(_build_app(store, _AgentStore({agent.id: agent}))).post(
+        f"/v1/sessions/{source.id}/fork", json={"permission_tier": requested} if requested else {}
+    )
+    assert response.status_code == 201, response.text
+    call = store.fork_calls[0]
+    assert "omnigent.antigravity_native.permission_tier" in call["dropped_label_keys"]
+    assert call["extra_labels"]["omnigent.antigravity_native.permission_tier"] == expected
+    assert call["override_terminal_launch_args"] == (
+        ["--dangerously-skip-permissions"] if expected == "full" else []
+    )
+    assert call["override_terminal_launch_args_set"] is True
+
+
+def test_fork_tier_ignored_for_other_harness_and_invalid_value_rejected():
+    source = _make_conversation()
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store))
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={"permission_tier": "full"})
+    assert response.status_code == 201, response.text
+    assert "omnigent.antigravity_native.permission_tier" not in store.fork_calls[0]["extra_labels"]
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={"permission_tier": "invalid"})
+    assert response.status_code == 422, response.text

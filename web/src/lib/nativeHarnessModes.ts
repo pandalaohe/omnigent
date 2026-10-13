@@ -45,8 +45,13 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     yolo: "full-access",
   },
   "antigravity-native": {
-    default: "manual",
-    skip: "full-access",
+    ask: "manual",
+    plan: "read-only",
+    "accept-edits": "edit-automatic",
+    "auto-strict": "automatic",
+    "auto-standard": "automatic",
+    "auto-relaxed": "automatic",
+    full: "full-access",
   },
 };
 
@@ -66,30 +71,71 @@ export function permissionModeConcept(
 ): PermissionModeConcept {
   if (!harness || !value) return "default";
   const canonicalHarness = PERMISSION_HARNESS_ALIASES[harness] ?? harness;
-  return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
+  return (
+    PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[
+      canonicalHarness === "antigravity-native"
+        ? (normalizeAgyPermissionTier(value) ?? value)
+        : value
+    ] ?? "default"
+  );
 }
 
-// Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
-// knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
-// per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather
-// than Claude's graded selector. "default" sends no flags and leaves agy's own
-// request-review prompt in place. Keep in sync with `agy --help`.
-export const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
-export const AGY_NATIVE_SKIP_VALUE = "skip";
-export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
+// The server owns tier launch flags; create sends the tier label instead.
+export const AGY_NATIVE_PERMISSION_TIER_LABEL_KEY = "omnigent.antigravity_native.permission_tier";
+export const AGY_NATIVE_DEFAULT_PERMISSION_TIER = "auto-relaxed";
+export const AGY_NATIVE_FULL_PERMISSION_TIER = "full";
+export const AGY_NATIVE_PERMISSION_TIERS: NativeHarnessMode[] = [
+  { value: "ask", label: "Ask every time", description: "Prompts before tools run", args: [] },
+  { value: "plan", label: "Plan only", description: "Read-only planning", args: [] },
   {
-    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
-    label: "Ask every time",
-    description: "Prompts before each tool runs",
+    value: "accept-edits",
+    label: "Accept edits",
+    description: "Approves workspace edits",
     args: [],
   },
   {
-    value: AGY_NATIVE_SKIP_VALUE,
+    value: "auto-strict",
+    label: "Auto · strict",
+    description: "Runs tools with strict guard rules",
+    args: [],
+  },
+  {
+    value: "auto-standard",
+    label: "Auto · standard",
+    description: "Runs tools with standard guard rules",
+    args: [],
+  },
+  {
+    value: "auto-relaxed",
+    label: "Auto · relaxed",
+    description: "Runs tools with relaxed guard rules",
+    args: [],
+  },
+  {
+    value: "full",
     label: "Skip permissions",
-    description: "Runs everything; no prompts or safety checks",
-    args: ["--dangerously-skip-permissions"],
+    description: "Runs everything without prompts or guard checks",
+    args: [],
   },
 ];
+
+export function agyPermissionTierFromSession(
+  session:
+    | { labels?: Record<string, string | null> | null; terminalLaunchArgs?: string[] | null }
+    | null
+    | undefined,
+): string {
+  const tier = session?.labels?.[AGY_NATIVE_PERMISSION_TIER_LABEL_KEY];
+  if (AGY_NATIVE_PERMISSION_TIERS.some((option) => option.value === tier)) return tier!;
+  return session?.terminalLaunchArgs?.includes("--dangerously-skip-permissions") ? "full" : "ask";
+}
+
+export function normalizeAgyPermissionTier(
+  value: string | null | undefined,
+): string | null | undefined {
+  // Remove legacy values two local/host-custom releases after this one.
+  return value === "default" ? "ask" : value === "skip" ? "full" : value;
+}
 
 // The Auto Harness's Permissions vocabulary: Default only. No cross-harness
 // permission mapping exists, so the row stays locked and the create call sends
