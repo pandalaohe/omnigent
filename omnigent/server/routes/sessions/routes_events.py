@@ -1144,8 +1144,31 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        if isinstance(request, _RunnerEventContext) and conv.runner_id != request.runner_id:
-            raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
+        if isinstance(request, _RunnerEventContext):
+            # Native Agent-tool mirrors share the owning parent's process;
+            # their saved runner binding can lag behind a parent restart.
+            ancestor = conv
+            seen = {conv.id}
+            while (
+                ancestor.kind == "sub_agent"
+                and ancestor.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
+            ):
+                if (
+                    ancestor.parent_conversation_id is None
+                    or ancestor.parent_conversation_id in seen
+                ):
+                    ancestor = None
+                    break
+                seen.add(ancestor.parent_conversation_id)
+                ancestor = await asyncio.to_thread(
+                    conversation_store.get_conversation, ancestor.parent_conversation_id
+                )
+                if ancestor is None:
+                    break
+            if ancestor is None or ancestor.runner_id != request.runner_id:
+                raise OmnigentError(
+                    "session is not bound to this runner", code=ErrorCode.FORBIDDEN
+                )
         return user_id, conv
 
     async def _record_touch(
