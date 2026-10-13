@@ -14,7 +14,7 @@ _HOST = "1234567890abcdef1234567890abcdef"
 _RUNNER = "runner-shared"
 
 
-async def test_stop_child_on_parent_runner_releases_only_the_child(
+async def test_stop_child_on_parent_runner_keeps_the_runner(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -50,13 +50,9 @@ async def test_stop_child_on_parent_runner_releases_only_the_child(
             )
             assert response.status_code == 202, response.text
             host_stop.assert_not_awaited()
-            assert requests == [
-                ("POST", f"/v1/sessions/{child.id}/events"),
-                ("DELETE", f"/v1/sessions/{child.id}"),
-            ]
-            saved_child = store.get_conversation(child.id)
+            # The runner stops the child's own harness; the runner keeps the session.
+            assert requests == [("POST", f"/v1/sessions/{child.id}/events")]
             saved_sibling = store.get_conversation(sibling.id)
-            assert saved_child is not None and saved_child.live_status == "idle"
             assert saved_sibling is not None and saved_sibling.live_status == "running"
             assert sessions._session_status_cache.get(sibling.id) == "running"
             for row in (parent, child, sibling):
