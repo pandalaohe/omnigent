@@ -111,6 +111,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_LOCK_LABEL_KEY,
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     ARCHIVE_STOP_WHEN_IDLE_LABEL_KEY,
+    ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX,
     ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
@@ -1222,7 +1223,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     select(SqlConversationLabel.conversation_id)
                     .where(
                         SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                        or_(
+                            SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                            SqlConversationLabel.key.startswith(
+                                ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX, autoescape=True
+                            ),
+                        ),
                         SqlConversationLabel.value.in_(fingerprints),
                     )
                     .limit(1)
@@ -1235,11 +1241,26 @@ class SqlAlchemyConversationStore(ConversationStore):
         fingerprint = worktree_admission_fingerprint(host_id, root)
 
         def write(session: Session) -> None:
+            fence_keys = or_(
+                SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                SqlConversationLabel.key.startswith(
+                    ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX, autoescape=True
+                ),
+            )
+            owners = list(
+                session.execute(
+                    select(SqlConversationLabel.conversation_id).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        fence_keys,
+                        SqlConversationLabel.value == fingerprint,
+                    )
+                ).scalars()
+            )
             session.execute(
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
-                    SqlConversationLabel.value == fingerprint,
+                    fence_keys,
+                    SqlConversationLabel.conversation_id.in_(owners),
                 )
             )
 

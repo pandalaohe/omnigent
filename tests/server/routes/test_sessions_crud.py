@@ -981,6 +981,28 @@ async def test_json_create_rejects_handoff_label(
     assert response.json()["error"]["code"] == "invalid_input"
 
 
+async def test_create_and_patch_reject_worktree_fence_aliases(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    from omnigent.stores.conversation_store import ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="sample-agent", bundle_location="test:///bundle")
+    for suffix in ("a" * 64, "future"):
+        key = f"{ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX}{suffix}"
+        labels = {key: "b" * 64}
+        response = await client.post("/v1/sessions", json={"agent_id": agent_id, "labels": labels})
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "invalid_input"
+        response = await client.patch(f"/v1/sessions/{session_id}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "invalid_input"
+        current = store.get_conversation(session_id)
+        assert current is not None and key not in current.labels
+
+
 async def test_patch_rejects_handoff_label(
     client: httpx.AsyncClient,
     session_id: str,

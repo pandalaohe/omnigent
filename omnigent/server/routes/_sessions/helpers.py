@@ -11538,6 +11538,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         )
     from omnigent.stores.conversation_store import (
         ARCHIVE_CASCADE_LABEL_KEY,
+        ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX,
         ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
     )
 
@@ -11556,6 +11557,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if any(key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.") for key in labels):
         raise OmnigentError(
             "archive cascade labels are server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if any(key.startswith(ARCHIVE_WORKTREE_ADMISSION_FENCE_ALIAS_PREFIX) for key in labels):
+        raise OmnigentError(
+            "worktree admission fence labels are server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # Pins are per-user: the client may only write the bare canonical
