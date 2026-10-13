@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.native import native_bridge_common
 
 if TYPE_CHECKING:
@@ -1247,6 +1248,8 @@ _TMUX_SEND_TIMEOUT_S = 10.0
 _TMUX_READY_TIMEOUT_S = 30.0
 # Poll cadence for the readiness / paste-commit / submit-verify loops.
 _TMUX_POLL_INTERVAL_S = 0.2
+# Five intervals let an RPC-driven prompt close before a selection is sent.
+_INTERACTION_DISMISSAL_POLLS = 6
 # How long to wait for the pasted draft to render in the input box before Enter.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # Settle pause after the draft renders, before the submit Enter.
@@ -2048,7 +2051,7 @@ def send_interaction_keys_via_tui(
     *keys: str,
 ) -> None:
     """
-    Send raw key arguments to the agy TUI pane to answer its in-process prompt.
+    Send raw key arguments to the agy TUI pane.
 
     The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
     attended agy TUI maintains in parallel with the RPC step state: its
@@ -2061,8 +2064,10 @@ def send_interaction_keys_via_tui(
     for that interaction can stay open** — and the next typed turn then lands in
     that stale prompt's filter/amend buffer instead of starting a fresh turn
     (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
-    prompt, mirroring cursor-native's
+    TUI"). Older agy builds can need a TUI selection after RPC delivery. The
+    interaction injector guards that selection with
+    :func:`dismiss_interaction_prompt_via_tui`. This raw primitive also serves
+    permission-tier controls, mirroring cursor-native's
     :func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys`.
 
     Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
@@ -2091,6 +2096,132 @@ def send_interaction_keys_via_tui(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+
+
+def _compact_prompt_text(text: str) -> str:
+    """Compare question/option labels through terminal wrapping."""
+    return re.sub(r"\s+", "", text)
+
+
+def _wrapped_command_text(text: str) -> str:
+    """Join display line breaks while preserving all horizontal whitespace."""
+    return re.sub(r"\r?\n", "", text)
+
+
+def _prompt_options(region: str) -> dict[str, str]:
+    """Extract numbered choice labels, including lines wrapped below a choice."""
+    choices = list(re.finditer(r"(?m)^\s*>?\s*([1-9]\d*)\.\s+", region))
+    navigation = region.find("↑/↓ Navigate")
+    options: dict[str, str] = {}
+    for index, match in enumerate(choices):
+        end = choices[index + 1].start() if index + 1 < len(choices) else navigation
+        options[match.group(1)] = region[match.end() : end if end >= 0 else len(region)].strip()
+    return options
+
+
+def _live_interaction_prompt(
+    pane: str, expected: PendingInteraction, keys: tuple[str, ...]
+) -> bool:
+    """Recognize the answered interaction in the live pane tail, not scrollback."""
+    lines = [line.rstrip("\r") for line in pane.splitlines() if line.strip()]
+    if not lines or not lines[-1].strip().startswith(_AGY_ACTIVE_MARKER):
+        return False
+    separators = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
+    region = "\n".join(lines[separators[-1] + 1 :] if separators else lines[-16:])
+    if "↑/↓ Navigate" not in region or not keys:
+        return False
+    options = _prompt_options(region)
+
+    spec = expected["spec"]
+    if expected["kind"] == "permission":
+        if keys not in (("1", "Enter"), ("4", "Enter")) or keys[0] not in options:
+            return False
+        resource = spec.get("resource")
+        target = resource.get("target") if isinstance(resource, dict) else None
+        command = re.search(
+            r"Requesting permission for:\s*(.*?)\s*Run this command\?",
+            region,
+            re.DOTALL,
+        )
+        label = options[keys[0]].lstrip()
+        return bool(
+            isinstance(target, str)
+            and target
+            and "\n" not in target
+            and "\r" not in target
+            and command
+            and _wrapped_command_text(command.group(1)) == target
+            and (
+                (keys[0] == "1" and re.match(r"(?i)yes\b", label))
+                or (keys[0] == "4" and re.match(r"(?i)no\b", label))
+            )
+        )
+
+    questions = spec.get("questions")
+    heading = re.search(
+        r"(?m)^Question ([1-9]\d*)/([1-9]\d*):\s*(.*?)(?=^\s*>?\s*[1-9]\d*\.\s)",
+        region,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not isinstance(questions, list) or heading is None:
+        return False
+    question_index, total = int(heading.group(1)) - 1, int(heading.group(2))
+    if total != len(questions) or question_index >= len(questions):
+        return False
+    question = questions[question_index]
+    if not isinstance(question, dict):
+        return False
+    text = question.get("question")
+    expected_options = question.get("options")
+    if not isinstance(text, str) or not text or not isinstance(expected_options, list):
+        return False
+    if _compact_prompt_text(heading.group(3)) != _compact_prompt_text(text):
+        return False
+    option_ids: set[str] = set()
+    for option in expected_options:
+        if not isinstance(option, dict):
+            return False
+        option_id, option_text = option.get("id"), option.get("text")
+        if not isinstance(option_id, str) or not isinstance(option_text, str):
+            return False
+        if option_id not in options or _compact_prompt_text(
+            options[option_id]
+        ) != _compact_prompt_text(option_text):
+            return False
+        option_ids.add(option_id)
+    if not option_ids:
+        return False
+    if keys == ("Escape",):
+        return True
+    return len(keys) >= 2 and keys[-1] == "Enter" and all(key in option_ids for key in keys[:-1])
+
+
+def dismiss_interaction_prompt_via_tui(
+    bridge_dir: Path, *keys: str, expected: PendingInteraction
+) -> bool:
+    """Dismiss a still-open agy interaction after RPC delivery.
+
+    Recent agy builds close the TUI prompt when RPC answers it. Wait briefly and
+    recheck the live pane before sending keys, matching its text to the answered
+    interaction. Older builds with a persistent prompt still receive the original
+    selection. A failed capture is inconclusive and never authorizes a key send.
+    """
+    if not keys:
+        raise RuntimeError("antigravity-native TUI selection requires at least one key")
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError("antigravity-native tmux target not advertised")
+    for attempt in range(_INTERACTION_DISMISSAL_POLLS):
+        if attempt:
+            time.sleep(_TMUX_POLL_INTERVAL_S)
+        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        if not pane:
+            _logger.warning("agy interaction pane capture failed; skipping TUI dismissal")
+            return False
+        if not _live_interaction_prompt(pane, expected, keys):
+            return False
+    send_interaction_keys_via_tui(bridge_dir, *keys)
+    return True
 
 
 class AgyPermissionRollbackError(RuntimeError):

@@ -36,6 +36,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -3009,6 +3010,140 @@ def test_send_interaction_keys_via_tui_rejects_empty_keys(tmp_path: Path) -> Non
     """No keys is a programming error, not an empty send-keys call."""
     with pytest.raises(RuntimeError, match="at least one key"):
         send_interaction_keys_via_tui(tmp_path / "bridge")
+
+
+_PERMISSION_A = PendingInteraction(
+    kind="permission",
+    trajectory_id="trajectory-a",
+    step_index=2,
+    spec={"resource": {"action": "command", "target": "printf 'READY\\n'"}},
+)
+_QUESTION_A = PendingInteraction(
+    kind="ask_question",
+    trajectory_id="trajectory-a",
+    step_index=2,
+    spec={
+        "questions": [
+            {
+                "question": "Which color?",
+                "options": [{"id": "1", "text": "Red"}, {"id": "2", "text": "Blue"}],
+            }
+        ]
+    },
+)
+_PERMISSION_A_PANE = (
+    "Command\n────────────────────────\nRequesting permission for:\n"
+    "   printf 'READY\\n'\n\nRun this command?\n> 1. Yes, run command\n"
+    "  4. No, cancel\n↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n"
+    "esc to cancel    Gemini · medium"
+)
+_PERMISSION_B_PANE = _PERMISSION_A_PANE.replace("READY", "DIFFERENT")
+_SPACE_PERMISSION = PendingInteraction(
+    kind="permission",
+    trajectory_id="trajectory-a",
+    step_index=2,
+    spec={"resource": {"action": "command", "target": "printf 'a b'"}},
+)
+_SPACE_PERMISSION_PANE = _PERMISSION_A_PANE.replace("READY\\n", "a b")
+_NO_SPACE_PERMISSION_PANE = _PERMISSION_A_PANE.replace("READY\\n", "ab")
+_QUESTION_A_PANE = (
+    "Question\n────────────────────────\nQuestion 1/1: Which color?\n"
+    "  1. Red\n> 2. Blue\n  3. Write-in...\n"
+    "↑/↓ Navigate · enter Select · esc Skip\nesc to cancel    Gemini · medium"
+)
+_QUESTION_B_PANE = _QUESTION_A_PANE.replace("Which color?", "Which shape?")
+
+
+@pytest.mark.parametrize(
+    "panes,expected,keys,expected_sends",
+    [
+        ([_PERMISSION_A_PANE] * 6, _PERMISSION_A, ("1", "Enter"), [("1", "Enter")]),
+        ([_QUESTION_A_PANE] * 6, _QUESTION_A, ("2", "Enter"), [("2", "Enter")]),
+        ([_QUESTION_A_PANE] * 6, _QUESTION_A, ("Escape",), [("Escape",)]),
+        ([_QUESTION_A_PANE, _QUESTION_B_PANE], _QUESTION_A, ("Escape",), []),
+        ([_QUESTION_B_PANE] * 6, _QUESTION_A, ("Escape",), []),
+        ([_SPACE_PERMISSION_PANE] * 6, _SPACE_PERMISSION, ("1", "Enter"), [("1", "Enter")]),
+        ([_NO_SPACE_PERMISSION_PANE] * 6, _SPACE_PERMISSION, ("1", "Enter"), []),
+        (
+            [_SPACE_PERMISSION_PANE.replace("a b", "a\n b")] * 6,
+            PendingInteraction(
+                kind="permission",
+                trajectory_id="trajectory-a",
+                step_index=2,
+                spec={"resource": {"action": "command", "target": "printf 'ab'"}},
+            ),
+            ("1", "Enter"),
+            [],
+        ),
+        (
+            [_PERMISSION_A_PANE.replace("READY", "REA\nDY")] * 6,
+            _PERMISSION_A,
+            ("1", "Enter"),
+            [("1", "Enter")],
+        ),
+        (
+            [_QUESTION_A_PANE.replace("Blue", "Bl\nue")] * 6,
+            _QUESTION_A,
+            ("2", "Enter"),
+            [("2", "Enter")],
+        ),
+        ([_PERMISSION_A_PANE, *([_PERMISSION_B_PANE] * 5)], _PERMISSION_A, ("1", "Enter"), []),
+        ([_PERMISSION_B_PANE] * 6, _PERMISSION_A, ("1", "Enter"), []),
+        ([_QUESTION_A_PANE, *([_QUESTION_B_PANE] * 5)], _QUESTION_A, ("2", "Enter"), []),
+        ([_QUESTION_B_PANE] * 6, _QUESTION_A, ("2", "Enter"), []),
+        (
+            [_PERMISSION_A_PANE] * 6,
+            PendingInteraction(
+                kind="permission",
+                trajectory_id="trajectory-a",
+                step_index=2,
+                spec={"resource": {"action": "command"}},
+            ),
+            ("1", "Enter"),
+            [],
+        ),
+        (
+            [_PERMISSION_A_PANE + "\n────────────\n>\n────────────\n? for shortcuts"],
+            _PERMISSION_A,
+            ("1", "Enter"),
+            [],
+        ),
+        (
+            [_PERMISSION_A_PANE + "\n────────────\n>\n────────────\nesc to cancel"],
+            _PERMISSION_A,
+            ("1", "Enter"),
+            [],
+        ),
+        ([""], _PERMISSION_A, ("1", "Enter"), []),
+    ],
+)
+def test_interaction_dismissal_only_targets_persistent_live_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    panes: list[str],
+    expected: PendingInteraction,
+    keys: tuple[str, ...],
+    expected_sends: list[tuple[str, ...]],
+) -> None:
+    from omnigent.harnesses.antigravity_native.bridge import dismiss_interaction_prompt_via_tui
+
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    sends: list[tuple[str, ...]] = []
+    captures = iter(panes)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=next(captures), stderr="")
+        if "send-keys" in cmd:
+            sends.append(tuple(cmd[cmd.index("main") + 1 :]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    dismiss_interaction_prompt_via_tui(bridge_dir, *keys, expected=expected)
+    assert sends == expected_sends
 
 
 def _agy_settings_path(home: Path) -> Path:
