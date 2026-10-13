@@ -71,7 +71,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -782,6 +782,23 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,
         )
+
+
+def _borrows_parent_runner(conversation_store: ConversationStore, conv: Conversation) -> bool:
+    """
+    Report whether a session runs on its parent's runner rather than its own.
+
+    A child co-located on its parent's runner may still carry a host binding,
+    so ``host_id`` alone cannot tell the runner's owner from a borrower.
+
+    :param conversation_store: Store used to read the parent row.
+    :param conv: The session row to classify.
+    :returns: ``True`` when the parent is bound to the same runner.
+    """
+    if conv.runner_id is None or conv.parent_conversation_id is None:
+        return False
+    parent = conversation_store.get_conversation(conv.parent_conversation_id)
+    return parent is not None and parent.runner_id == conv.runner_id
 
 
 async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
@@ -2211,33 +2228,58 @@ def register_events_routes(
                         background_task_count=0,
                         scheduled_run_outcome="failed",
                     )
-            if (
-                stop_delivered
-                and not conv.host_id
-                and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+            if stop_delivered:
+                stop_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            borrows_parent_runner = stop_conv is not None and await asyncio.to_thread(
+                _borrows_parent_runner, conversation_store, stop_conv
+            )
+            if stop_delivered and (
+                borrows_parent_runner
+                or (not conv.host_id and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY))
             ):
                 # A shared-runner chat owns its harness resources, while the
                 # parent owns the runner. Keep the persisted transcript.
                 try:
                     cleanup_client = await _get_runner_client(session_id, runner_router)
                     if cleanup_client is None:
-                        raise ConnectionError("Side-chat runner is unavailable")
+                        raise ConnectionError("Shared runner is unavailable")
                     cleanup_resp = await cleanup_client.delete(
                         f"/v1/sessions/{session_id}", timeout=60.0
                     )
                     cleanup_resp.raise_for_status()
                 except (httpx.HTTPError, ConnectionError) as exc:
                     raise OmnigentError(
-                        "Couldn't release the side chat's resources. Please try again.",
+                        "Couldn't release the chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     ) from exc
-            # Only the host-bound parent owns the shared runner. Stopping
-            # that process disconnects all its chats; child bindings keep it alive.
-            if stop_delivered:
-                stop_conv = await asyncio.to_thread(
-                    conversation_store.get_conversation, session_id
-                )
-            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+                if (
+                    borrows_parent_runner
+                    and stop_conv is not None
+                    and stop_conv.runner_id is not None
+                    and _session_status_from_cache(session_id, stop_conv.live_status) == "running"
+                ):
+                    # The shared runner stays up, so no disconnect settles the stopped turn.
+                    settled = await asyncio.wrap_future(
+                        session_live_state.submit(
+                            "settle_intentionally_stopped_session",
+                            conversation_store.settle_intentionally_stopped_session,
+                            session_id,
+                            stop_conv.runner_id,
+                        )
+                    )
+                    if settled:
+                        session_live_state.forget_live_status(session_id)
+                        _publish_status(session_id, "idle", persist_live_status=False)
+            # Only the runner's owner stops it. Stopping that process disconnects
+            # all its chats; borrowed bindings keep it alive.
+            if (
+                stop_conv is not None
+                and stop_conv.host_id
+                and stop_conv.runner_id
+                and not borrows_parent_runner
+            ):
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
                 host_stopped = await _stop_host_runner_intentionally(
                     session_id,
