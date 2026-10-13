@@ -387,6 +387,73 @@ def test_custom_update_refuses_to_pause_when_session_query_fails(
     assert paused == []
 
 
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("response_delay_s", [15.0, 65.0])
+def test_custom_drain_allows_slow_lists_but_rejects_timeouts(
+    monkeypatch: pytest.MonkeyPatch, force: bool, response_delay_s: float
+) -> None:
+    """Use the HTTP client's budget, retaining fail-closed behavior beyond it."""
+    import httpx
+
+    import omnigent.cli as cli_module
+
+    record = _HostDaemonRecord(
+        pid=123,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id="host-1",
+    )
+    monkeypatch.setattr(cli_module, "_custom_host_records", lambda _host_id: [record])
+    monkeypatch.setattr(
+        cli_module, "_host_http_headers_cache", {("https://server.example.com", None): {}}
+    )
+    timeouts: list[float] = []
+    cursors: list[str | int | None] = []
+
+    class _SlowClient:
+        def __init__(self, *, timeout: float, **_kwargs: object) -> None:
+            self.timeout = timeout
+            timeouts.append(timeout)
+
+        def __enter__(self) -> _SlowClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def request(
+            self, method: str, path: str, *, params: dict[str, str | int], **_kwargs: object
+        ) -> httpx.Response:
+            assert (method, path) == ("GET", "/v1/sessions")
+            assert params["host_id"] == "host-1"
+            after = params.get("after")
+            cursors.append(after)
+            if self.timeout < response_delay_s:
+                raise httpx.ReadTimeout("The read operation timed out")
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": "idle", "host_id": "host-1", "status": "idle"}],
+                    "has_more": after is None,
+                    "last_id": "idle",
+                },
+            )
+
+    monkeypatch.setattr(httpx, "Client", _SlowClient)
+    if response_delay_s > 60.0:
+        with pytest.raises(click.ClickException, match=r"ReadTimeout.*Host was left running"):
+            cli_module._drain_custom_host_sessions("host-1", force=force)
+        assert cursors == [None]
+        assert timeouts == [60.0]
+    else:
+        cli_module._drain_custom_host_sessions("host-1", force=force)
+        assert cursors == [None, "idle"]
+        assert timeouts == [60.0, 60.0]
+
+
 def test_force_stops_only_running_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     import omnigent.cli as cli_module
 
