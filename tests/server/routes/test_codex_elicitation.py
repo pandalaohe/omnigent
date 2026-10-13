@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.runtime.subagent_block_notifier import _block_reason
 from omnigent.server.routes._codex_elicitation import (
     _codex_command_preview,
     _codex_mcp_elicitation_response,
@@ -73,6 +74,45 @@ class TestParseCodexElicitationRequest:
             }
         )
         assert req.method == "item/commandExecution/requestApproval"
+
+    def test_mcp_notice_elides_image_and_preserves_approval_detail(self) -> None:
+        meta = {
+            "codex_approval_kind": "mcp_tool_call",
+            "tool_name": "img2img",
+            "tool_description": "Full description " * 100,
+            "tool_params": {
+                "ref_image": "iVBORw0KGgo" + "A" * 10000,
+                "prompt": "Change the tie to green",
+                "image": "data:image/png;base64,AAAA",
+                "options": {"size": "large"},
+            },
+        }
+        req = parse_codex_elicitation_request(
+            {
+                "id": 1,
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "serverName": "image-provider",
+                    "mode": "form",
+                    "message": "Approve img2img",
+                    "requestedSchema": {"type": "object"},
+                    "_meta": meta,
+                },
+            }
+        )
+        preview = _block_reason({"params": req.params.model_dump()})
+        assert preview is not None
+        assert "image-provider.img2img" in preview
+        assert "ref_image=<omitted>" in preview
+        assert "Change the tie to green" in preview
+        assert "iVBOR" not in preview
+        assert "data:image" not in preview
+        assert "Full description" not in preview
+        assert len(preview) <= 200
+        assert req.params.model_extra is not None
+        assert req.params.model_extra["_meta"] == meta
+        assert req.params.message == "Approve img2img"
+        assert req.params.content_preview == _json_preview(req.codex_params)
 
 
 # ── Codex MCP approval persistence ───────────────────────────────────

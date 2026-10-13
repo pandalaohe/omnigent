@@ -1334,13 +1334,7 @@ def test_format_block_notice_lists_all_questions_and_options() -> None:
     assert "…" not in notice
 
 
-def test_block_reason_prefers_the_full_command_over_the_preview() -> None:
-    """
-    A command approval's action is the verbatim command, not the preview.
-
-    ``content_preview`` is hard-capped by the producer; the notice must
-    carry the whole command so the parent sees the exact gated action.
-    """
+def test_block_reason_prefers_a_bounded_command_over_the_preview() -> None:
     long_command = "pnpm exec vitest run " + "x" * 1500
     event = {
         "type": "response.elicitation_request",
@@ -1353,7 +1347,39 @@ def test_block_reason_prefers_the_full_command_over_the_preview() -> None:
         },
     }
 
-    assert _block_reason(event) == long_command
+    assert _block_reason(event) == long_command[:199] + "…"
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"tool_name": "Tool" * 100},
+        {"tool_name": "Tool", "content_preview": "x" * 1000},
+        {"content_preview": "x" * 1000},
+        {"ask_user_question": {"questions": [{"question": "x" * 1000}]}},
+    ],
+)
+def test_block_reason_caps_every_action_branch(params: dict[str, Any]) -> None:
+    reason = _block_reason({"params": params})
+    assert reason is not None
+    assert len(reason) <= 200
+    assert reason.endswith("…")
+
+
+def test_block_reason_summarizes_mcp_metadata_before_raw_command() -> None:
+    params = {
+        "server_name": "image-provider",
+        "command": '{"ref_image":"' + "A" * 10000 + '"}',
+        "content_preview": "raw request",
+        "_meta": {
+            "codex_approval_kind": "mcp_tool_call",
+            "tool_name": "img2img",
+            "tool_params": {"ref_image": "iVBOR" + "A" * 10000, "prompt": "Green tie"},
+        },
+    }
+    assert _block_reason({"params": params}) == (
+        'image-provider.img2img(ref_image=<omitted>, prompt="Green tie")'
+    )
 
 
 def test_format_block_notice_annotates_source_with_agent_host_and_cwd(

@@ -22,9 +22,11 @@ import asyncio
 import concurrent.futures
 import contextlib
 import enum
+import json
 import logging
 import threading
 from collections.abc import Awaitable, Callable
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -37,8 +39,7 @@ _REQUEST_TYPE = "response.elicitation_request"
 _RESOLVED_TYPE = "response.elicitation_resolved"
 _STALE_TYPE = "response.elicitation_stale"
 
-# Max length of the legacy prompt message echoed into the parent's notice.
-# Full commands and question lists are deliberately uncapped.
+# Bound every action echoed into the parent's notice; the card keeps full detail.
 _REASON_MAX_CHARS = 200
 
 # MCP ElicitResult verdicts a resolution event may carry.
@@ -601,10 +602,8 @@ def _block_reason(event: dict[str, Any]) -> str | None:
     """
     Extract the action a blocked elicitation is waiting on.
 
-    Preference order: the full command (Codex command approvals and
-    Claude Bash), the question list for a question card, the tool name
-    plus its content preview (already capped at 1024 by the producer),
-    then the legacy prompt message with the 200-char cap.
+    Prefer an MCP tool summary, command, question list, tool preview,
+    then the legacy prompt. Every branch has the same 200-char cap.
 
     :param event: The ``response.elicitation_request`` event dict; reads
         the nested ``params``.
@@ -613,6 +612,22 @@ def _block_reason(event: dict[str, Any]) -> str | None:
     params = event.get("params")
     if not isinstance(params, dict):
         return None
+    action = _block_action(params)
+    if action is None:
+        return None
+    action = action.strip()
+    if not action:
+        return None
+    if len(action) > _REASON_MAX_CHARS:
+        return action[: _REASON_MAX_CHARS - 1].rstrip() + "…"
+    return action
+
+
+def _block_action(params: dict[str, Any]) -> str | None:
+    """Choose the action before applying the notice's common length cap."""
+    mcp_summary = _mcp_tool_call_action(params)
+    if mcp_summary is not None:
+        return mcp_summary
     command = params.get("command")
     if isinstance(command, str) and command.strip():
         return command
@@ -630,21 +645,43 @@ def _block_reason(event: dict[str, Any]) -> str | None:
     message = params.get("message")
     if not isinstance(message, str):
         return None
-    message = message.strip()
-    if not message:
-        return None
-    if len(message) > _REASON_MAX_CHARS:
-        return message[: _REASON_MAX_CHARS - 1].rstrip() + "…"
     return message
+
+
+def _mcp_tool_call_action(params: dict[str, Any]) -> str | None:
+    """Summarize an MCP approval without copying descriptions or large arguments."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict) or meta.get("codex_approval_kind") != "mcp_tool_call":
+        return None
+    server = params.get("serverName") or params.get("server_name")
+    tool = meta.get("tool_name") or params.get("tool_name")
+    label = ".".join(value[:60] for value in (server, tool) if isinstance(value, str) and value)
+    if not isinstance(tool, str) or not tool:
+        message = params.get("message")
+        if isinstance(message, str) and message:
+            label = f"{label}: {message[:80]}" if label else message[:80]
+    label = label or "MCP tool call"
+    arguments = meta.get("tool_params")
+    rendered: list[str] = []
+    if isinstance(arguments, dict):
+        for key, value in islice(arguments.items(), 6):
+            if isinstance(value, str) and len(value) <= 80 and not value.startswith("data:"):
+                preview = json.dumps(value, ensure_ascii=False)
+            elif value is None or isinstance(value, bool | int | float):
+                preview = str(value)[:80]
+            else:
+                preview = "<omitted>"
+            rendered.append(f"{str(key)[:40]}={preview}")
+        if len(arguments) > 6:
+            rendered.append("…")
+    return f"{label}({', '.join(rendered)})" if rendered else label
 
 
 def _questions_action(payload: Any) -> str | None:
     """
     Render an AskUserQuestion payload as one action line.
 
-    Lists every question with its option labels. The harness bounds the
-    payload at 4 questions × 4 options, so nothing is truncated here —
-    the parent gets the same choices the human sees.
+    Includes question text and option labels; the notice bounds the result.
 
     :param payload: The ``params.ask_user_question`` value, e.g.
         ``{"questions": [{"question": "Which DB?", "options":

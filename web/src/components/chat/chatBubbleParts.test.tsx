@@ -599,6 +599,15 @@ describe("UserBubble long-prompt collapse", () => {
     expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
   });
 
+  it("allows the user bubble's flex rows to shrink around an unbroken token", () => {
+    render(<BubbleView bubble={userBubble("A".repeat(2000))} />);
+    const bubble = screen.getByTestId("message-bubble");
+    const content = bubble.querySelector(".text-ui")!;
+    expect(content).toHaveClass("wrap-anywhere");
+    expect(content.parentElement).toHaveClass("min-w-0", "max-w-full");
+    expect(content.parentElement?.parentElement).toHaveClass("min-w-0", "max-w-full");
+  });
+
   it("hides the tail when collapsed, shows it when expanded, hides it again when re-collapsed", () => {
     render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
 
