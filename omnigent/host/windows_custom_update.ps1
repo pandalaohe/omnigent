@@ -14,7 +14,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TargetCommit,
     [Parameter(Mandatory = $true)]
-    [string]$HostId
+    [string]$HostId,
+    [string]$ConstraintsDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,6 +132,7 @@ try {
         old_commit = $OldCommit
         target_commit = $TargetCommit
         host_id = $HostId
+        constraints_dir = $ConstraintsDirectory
     }
     foreach ($entry in $expected.GetEnumerator()) {
         if ([string]$instruction.($entry.Key) -ne [string]$entry.Value) {
@@ -216,6 +218,9 @@ finally {
         [Console]::Error.WriteLine("Failed to write custom Host update result: $($_.Exception.Message)")
     }
     Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
+    if ($ConstraintsDirectory) {
+        Remove-Item -LiteralPath $ConstraintsDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 exit $exitCode
