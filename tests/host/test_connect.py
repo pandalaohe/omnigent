@@ -3071,7 +3071,9 @@ async def test_cancelled_remove_keeps_later_worktree_list_behind_worker(
         with pytest.raises(asyncio.CancelledError):
             await removal
         listing = asyncio.create_task(
-            host._handle_list_worktrees(HostListWorktreesFrame(request_id="list", repo_path=path))
+            host._handle_list_worktrees(
+                HostListWorktreesFrame(request_id="list", repo_path=path, for_cleanup=True)
+            )
         )
         await asyncio.sleep(0.05)
         assert not list_called.is_set()
@@ -3087,6 +3089,35 @@ async def test_cancelled_remove_keeps_later_worktree_list_behind_worker(
             break
         await asyncio.sleep(0.01)
     assert host._host_subprocess_tasks == set()
+
+
+@pytest.mark.parametrize("for_status", [False, True])
+async def test_display_worktree_list_does_not_wait_for_mutation_lock(
+    monkeypatch: pytest.MonkeyPatch, for_status: bool
+) -> None:
+    from omnigent.host.git_worktree import WorktreeInfo
+
+    host = _make_host_process()
+    path = "/opt/work/sample-app"
+    monkeypatch.setattr(
+        "omnigent.host.connect.list_worktrees",
+        lambda **_kwargs: [WorktreeInfo(path=path, branch="main", is_main=True, detached=False)],
+    )
+    async with host._worktree_operation_lock:
+        result = await asyncio.wait_for(
+            host._handle_list_worktrees(
+                HostListWorktreesFrame(
+                    request_id="display",
+                    repo_path=path,
+                    for_cleanup=for_status,
+                    for_status=for_status,
+                )
+            ),
+            timeout=0.5,
+        )
+    assert result.status == "ok"
+    assert result.worktrees is not None
+    assert result.worktrees[0]["path"] == path
 
 
 async def test_owner_lookup_overlaps_capability_discovery_after_websocket_upgrade(
