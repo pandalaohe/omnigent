@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import ipaddress
 import logging
 import re
 import threading
@@ -10,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
@@ -22,6 +24,7 @@ from omnigent.extensions.api import (
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
+    ExternalPageContribution,
     PageContribution,
     PrimaryNavigationContribution,
 )
@@ -157,11 +160,64 @@ def _validate_relative_path(
         raise ExtensionValidationError(f"{field_name} must use one of: {expected}")
 
 
-def _validate_page(extension_id: str, page: PageContribution) -> None:
+def _validate_external_url(value: object, field_name: str) -> None:
+    if not isinstance(value, str):
+        raise ExtensionValidationError(f"{field_name} must be a string")
+    if len(value) > 2048:
+        raise ExtensionValidationError(f"{field_name} must be at most 2048 characters")
+    if any(char.isspace() or not char.isprintable() for char in value):
+        raise ExtensionValidationError(f"{field_name} contains whitespace or control characters")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ExtensionValidationError(f"{field_name} has an invalid host or port") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise ExtensionValidationError(f"{field_name} must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ExtensionValidationError(f"{field_name} must not contain userinfo")
+    if not host:
+        raise ExtensionValidationError(f"{field_name} must have a host")
+    if "%" in host:
+        raise ExtensionValidationError(f"{field_name} has an invalid host")
+    if parsed.netloc.startswith("["):
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError as exc:
+            raise ExtensionValidationError(f"{field_name} has an invalid IPv6 host") from exc
+        if not re.fullmatch(r"\[[^\]]+\](?::[0-9]+)?", parsed.netloc):
+            raise ExtensionValidationError(f"{field_name} has an invalid host or port")
+    else:
+        labels = host.removesuffix(".").split(".")
+        if any(not re.fullmatch(_ID_SEGMENT, label) for label in labels):
+            raise ExtensionValidationError(f"{field_name} has an invalid DNS or IPv4 host")
+        for label in labels:
+            if label.startswith("xn--"):
+                try:
+                    label.encode("ascii").decode("idna")
+                except UnicodeError as exc:
+                    raise ExtensionValidationError(
+                        f"{field_name} has an invalid DNS or IPv4 host"
+                    ) from exc
+        # A numeric final label makes the browser parse the host as IPv4.
+        if labels[-1].isdigit() or re.fullmatch(r"0x[0-9a-f]*", labels[-1]):
+            try:
+                ipaddress.IPv4Address(host.removesuffix("."))
+            except ValueError as exc:
+                raise ExtensionValidationError(f"{field_name} has an invalid IPv4 host") from exc
+    if parsed.netloc.endswith(":") and port is None:
+        raise ExtensionValidationError(f"{field_name} must have a parseable port")
+
+
+def _validate_page(extension_id: str, page: PageContribution | ExternalPageContribution) -> None:
     _validate_contribution_id(extension_id, page.id, "page")
     _require_text(page.title, f"page {page.id!r} title")
     _validate_relative_path(page.route, f"page {page.id!r} route", route=True)
-    _require_symbol(page.view, f"page {page.id!r} view")
+    if isinstance(page, ExternalPageContribution):
+        _validate_external_url(page.url, f"page {page.id!r} URL")
+    else:
+        _require_symbol(page.view, f"page {page.id!r} view")
 
 
 def _validate_navigation(
@@ -214,7 +270,7 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     if not isinstance(manifest.permissions, frozenset):
         raise ExtensionValidationError("permissions must be a frozenset")
     for field_name, values, expected_type in (
-        ("pages", manifest.pages, PageContribution),
+        ("pages", manifest.pages, (PageContribution, ExternalPageContribution)),
         ("primary_navigation", manifest.primary_navigation, PrimaryNavigationContribution),
         ("commands", manifest.commands, CommandContribution),
     ):
@@ -269,7 +325,10 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
             f"running version is {VERSION}"
         )
 
-    if manifest.pages and manifest.entrypoints.browser is None:
+    if (
+        any(isinstance(page, PageContribution) for page in manifest.pages)
+        and manifest.entrypoints.browser is None
+    ):
         raise ExtensionValidationError(
             f"extension {manifest.id!r} contributes pages but has no browser entrypoint"
         )
@@ -307,6 +366,14 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
 
     for page in manifest.pages:
         _validate_page(manifest.id, page)
+        if (
+            isinstance(page, ExternalPageContribution)
+            and ExtensionPermission.PAGES_EXTERNAL not in manifest.permissions
+        ):
+            raise ExtensionValidationError(
+                f"page {page.id!r} requires permission "
+                f"{ExtensionPermission.PAGES_EXTERNAL.value!r}"
+            )
     for command in manifest.commands:
         _validate_command(manifest.id, command)
 

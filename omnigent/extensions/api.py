@@ -17,6 +17,7 @@ class ExtensionPermission(StrEnum):
     """Host capabilities an extension may request."""
 
     NAVIGATION = "navigation"
+    PAGES_EXTERNAL = "pages.external"
     PROJECTS_READ = "projects.read"
     PROJECTS_WRITE = "projects.write"
     SESSIONS_READ = "sessions.read"
@@ -39,6 +40,16 @@ class PageContribution:
     title: str
     route: str
     view: str
+
+
+@dataclass(frozen=True)
+class ExternalPageContribution:
+    """An external web page framed below the extension's namespaced route."""
+
+    id: str
+    title: str
+    route: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -74,7 +85,7 @@ class ExtensionManifest:
     entrypoints: ExtensionEntrypoints = field(default_factory=ExtensionEntrypoints)
     permissions: frozenset[ExtensionPermission] = frozenset()
     activation_events: tuple[str, ...] = ()
-    pages: tuple[PageContribution, ...] = ()
+    pages: tuple[PageContribution | ExternalPageContribution, ...] = ()
     primary_navigation: tuple[PrimaryNavigationContribution, ...] = ()
     commands: tuple[CommandContribution, ...] = ()
 

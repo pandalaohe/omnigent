@@ -15,6 +15,7 @@ from omnigent.extensions import (
     ExtensionEntrypoints,
     ExtensionManifest,
     ExtensionPermission,
+    ExternalPageContribution,
     PageContribution,
     PrimaryNavigationContribution,
 )
@@ -146,6 +147,7 @@ def test_modern_entry_point_discovery_selects_extension_group(
 def test_extension_permission_values_include_read_only_sessions() -> None:
     assert {permission.value for permission in ExtensionPermission} == {
         "navigation",
+        "pages.external",
         "projects.read",
         "projects.write",
         "sessions.read",
@@ -775,3 +777,181 @@ def test_load_errors_are_a_stably_ordered_dict(monkeypatch: pytest.MonkeyPatch) 
 
     assert isinstance(errors, dict)
     assert list(errors) == ["a-bad", "z-bad"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://dashboard.example.com/",
+        "http://dashboard.example.com:8080/reports?view=compact#summary",
+        "https://Dashboard.Example.Com./",
+        "https://xn--bcher-kva.example/",
+        "https://192.0.2.1/",
+        "https://[2001:db8::1]:8080/",
+        pytest.param("https://dashboard.example.com/" + "a" * 2018, id="maximum-length"),
+    ],
+)
+def test_external_pages_load_without_browser_bundle(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    original = _manifest()
+    page = ExternalPageContribution(
+        id="acme.review.dashboard", title="Dashboard", route="dashboard", url=url
+    )
+    manifest = replace(
+        original,
+        entrypoints=ExtensionEntrypoints(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(page,),
+    )
+    _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    state = registry.plugin_state()
+
+    assert state.manifests == (manifest,)
+    assert state.load_errors == {}
+    assert state.asset_package(manifest.id) is None
+
+
+def test_external_page_requires_permission(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = ExternalPageContribution(
+        id="acme.review.dashboard",
+        title="Dashboard",
+        route="dashboard",
+        url="https://dashboard.example.com/",
+    )
+    manifest = replace(_manifest(), entrypoints=ExtensionEntrypoints(), pages=(page,))
+    _install_entry_points(monkeypatch, _EntryPoint("review", manifest))
+
+    state = registry.plugin_state()
+
+    assert state.manifests == ()
+    assert state.load_errors["review"] == (
+        "page 'acme.review.dashboard' requires permission 'pages.external'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        (None, "must be a string"),
+        ("/reports", "absolute http"),
+        ("javascript:alert(1)", "absolute http"),
+        ("ftp://dashboard.example.com/", "absolute http"),
+        ("https://user@dashboard.example.com/", "userinfo"),
+        ("https://@dashboard.example.com/", "userinfo"),
+        ("https:///reports", "must have a host"),
+        ("https://dashboard.example.com:invalid/", "invalid host or port"),
+        ("https://dashboard.example.com:65536/", "invalid host or port"),
+        ("https://dashboard.example.com:/", "parseable port"),
+        (" https://dashboard.example.com/", "whitespace or control"),
+        ("https://dashboard.example.com/ ", "whitespace or control"),
+        ("https://dashboard.example.com/re ports", "whitespace or control"),
+        ("https://dashboard.example.com/\nreports", "whitespace or control"),
+        ("https://dashboard.example.com/\x00", "whitespace or control"),
+        ("https://dashboard.example.com/\x7f", "whitespace or control"),
+        ("https://dashboard.example.com/\u202e", "whitespace or control"),
+        ("https://bad host.example/", "whitespace or control"),
+        ("https://%ZZ/", "invalid host"),
+        ("https://%65xample.com/", "invalid host"),
+        ("https://[v1.foo]/", "invalid IPv6 host"),
+        ("https://[invalid]/", "invalid host or port"),
+        ("https://[2001:db8::1]extra/", "invalid host or port"),
+        ("https://[fe80::1%25eth0]/", "invalid host"),
+        ("https://-dashboard.example.com/", "invalid DNS"),
+        ("https://dashboard-.example.com/", "invalid DNS"),
+        ("https://dashboard..example.com/", "invalid DNS"),
+        ("https://dáshboard.example.com/", "invalid DNS"),
+        ("https://xn--0/", "invalid DNS"),
+        ("https://xn--a-ecp/", "invalid DNS"),
+        ("https://dashboard.123/", "invalid IPv4"),
+        ("https://999.0.2.1/", "invalid IPv4"),
+        ("https://dashboard.example.com\\reports/", "invalid DNS"),
+        pytest.param(
+            "https://dashboard.example.com/" + "a" * 2019,
+            "at most 2048",
+            id="too-long",
+        ),
+    ],
+)
+def test_rejects_invalid_external_page_urls(url: object, message: str) -> None:
+    page = ExternalPageContribution(
+        id="acme.review.dashboard",
+        title="Dashboard",
+        route="dashboard",
+        url=url,  # type: ignore[arg-type]
+    )
+    manifest = replace(
+        _manifest(),
+        entrypoints=ExtensionEntrypoints(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(page,),
+    )
+
+    with pytest.raises(registry.ExtensionValidationError, match=message):
+        registry.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"id": "other.publisher.dashboard"}, "must be namespaced"),
+        ({"title": ""}, "must be non-empty"),
+        ({"route": "reports/daily"}, "exactly one segment"),
+    ],
+)
+def test_external_pages_share_page_validation(change: dict[str, object], message: str) -> None:
+    page = ExternalPageContribution(
+        id="acme.review.dashboard",
+        title="Dashboard",
+        route="dashboard",
+        url="https://dashboard.example.com/",
+    )
+    manifest = replace(
+        _manifest(),
+        entrypoints=ExtensionEntrypoints(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(replace(page, **change),),
+    )
+
+    with pytest.raises(registry.ExtensionValidationError, match=message):
+        registry.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("page_id", "route", "message"),
+    [
+        ("acme.review.external", "dashboard", "duplicate page routes"),
+        ("acme.review.dashboard", "external", "duplicate page ids"),
+    ],
+)
+def test_rejects_duplicate_pages_across_kinds(page_id: str, route: str, message: str) -> None:
+    page = ExternalPageContribution(
+        id=page_id, title="Dashboard", route=route, url="https://dashboard.example.com/"
+    )
+    manifest = replace(
+        _manifest(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(*_manifest().pages, page),
+    )
+
+    with pytest.raises(registry.ExtensionValidationError, match=message):
+        registry.validate_manifest(manifest)
+
+
+def test_mixed_pages_still_require_browser_bundle() -> None:
+    page = ExternalPageContribution(
+        id="acme.review.external",
+        title="Dashboard",
+        route="external",
+        url="https://dashboard.example.com/",
+    )
+    manifest = replace(
+        _manifest(),
+        entrypoints=ExtensionEntrypoints(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(*_manifest().pages, page),
+    )
+
+    with pytest.raises(registry.ExtensionValidationError, match="has no browser entrypoint"):
+        registry.validate_manifest(manifest)
