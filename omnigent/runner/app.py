@@ -4918,6 +4918,25 @@ def create_runner_app(
     # A human driving the session's pane this recently skips the ping —
     # the native pane reaper's own evidence window.
     _KEEP_WARM_USER_ACTIVE_WINDOW_S = 60.0
+    _KEEP_WARM_LOG_REASONS = frozenset(
+        {
+            "card",
+            "unknown",
+            "busy",
+            "preempted",
+            "composer_draft",
+            "composer_changed",
+            "user_active",
+            "no_live_client",
+            "btw_unavailable",
+            "dismiss_failed",
+            "aborted",
+            "tool_attempt",
+            "timeout",
+            "harness_error",
+            "unsupported",
+        }
+    )
 
     async def _keep_warm_pane_user_active(conversation_id: str) -> bool | None:
         """
@@ -5028,25 +5047,49 @@ def create_runner_app(
                         payload: Any = resp.json() if resp.status_code == 200 else None
                     except httpx.TimeoutException:
                         receipt = _keep_warm_receipt(
-                            attempt_id, outcome="failed", reason="timeout"
+                            attempt_id,
+                            outcome="failed",
+                            reason="dismiss_failed" if harness == "claude-native" else "timeout",
                         )
                     except Exception:  # noqa: BLE001 — any transport/parse failure is one failed ping
                         receipt = _keep_warm_receipt(
-                            attempt_id, outcome="failed", reason="harness_error"
+                            attempt_id,
+                            outcome="failed",
+                            reason="dismiss_failed"
+                            if harness == "claude-native"
+                            else "harness_error",
                         )
                     else:
-                        if isinstance(payload, dict):
+                        if isinstance(payload, dict) and (
+                            harness != "claude-native"
+                            or payload.get("outcome") in ("ok", "skipped", "failed")
+                        ):
                             # The runner owns the attempt id; the server settles by it.
                             payload["attempt_id"] = attempt_id
                             receipt = payload
                         else:
                             receipt = _keep_warm_receipt(
-                                attempt_id, outcome="failed", reason="harness_error"
+                                attempt_id,
+                                outcome="failed",
+                                reason="dismiss_failed"
+                                if harness == "claude-native"
+                                else "harness_error",
                             )
                     finally:
                         _keep_warm_status_hold[conversation_id] = (
                             time.monotonic() + _KEEP_WARM_STATUS_GRACE_S
                         )
+        reason = receipt.get("reason")
+        _logger.info(
+            "keep-warm attempt session=%s attempt=%s family=%s outcome=%s reason=%s",
+            conversation_id,
+            attempt_id,
+            family if family in ("claude", "codex") else "unknown",
+            receipt.get("outcome")
+            if receipt.get("outcome") in ("ok", "skipped", "failed")
+            else "unknown",
+            reason if isinstance(reason, str) and reason in _KEEP_WARM_LOG_REASONS else "none",
+        )
         try:
             await server_client.post(
                 f"/v1/sessions/{conversation_id}/events",

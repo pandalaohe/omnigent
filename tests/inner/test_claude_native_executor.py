@@ -2678,7 +2678,7 @@ async def test_keep_warm_cost_window_excludes_an_injection_parked_behind_the_cos
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_bridge_failure_reports_harness_error(
+async def test_keep_warm_bridge_failure_reports_unverified_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2697,7 +2697,7 @@ async def test_keep_warm_bridge_failure_reports_harness_error(
     assert receipt == {
         "attempt_id": "att-1",
         "outcome": "failed",
-        "reason": "harness_error",
+        "reason": "dismiss_failed",
         "input_total": None,
         "cache_read": None,
         "cache_write": None,
