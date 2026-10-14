@@ -32,6 +32,9 @@ _logger = logging.getLogger(__name__)
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
 
+# Optional existing-tree discovery must not hold session persistence behind a busy host.
+_WORKTREE_LOOKUP_TIMEOUT_S: float = 5.0
+
 # Folder facts run five short git reads with a 10 s per-command host
 # timeout; the settings dialog wants them quickly and can re-read on
 # Refresh, so the server waits only modestly longer than one read.
@@ -345,6 +348,7 @@ async def list_worktrees_on_host(
     repo_path: str,
     for_cleanup: bool = False,
     for_status: bool = False,
+    timeout: float | None = None,
 ) -> list[dict[str, object]]:
     """
     Send a ``host.list_worktrees`` frame and await the result.
@@ -356,6 +360,7 @@ async def list_worktrees_on_host(
         host — the canonical picked directory, e.g.
         ``"/Users/alice/myrepo"``.
     :param for_cleanup: Recover a canonical workspace without following replacement symlinks.
+    :param timeout: Override the listing wait for a latency-sensitive caller.
     :returns: One dict per worktree with keys ``path``, ``branch``,
         ``is_main``, ``detached``, and optional ``updated_at``
         (main first).
@@ -379,7 +384,7 @@ async def list_worktrees_on_host(
         request_id=request_id,
         frame=frame,
         op="worktree listing",
-        timeout=15.0 if for_status else _WORKTREE_TIMEOUT_S,
+        timeout=timeout if timeout is not None else (15.0 if for_status else _WORKTREE_TIMEOUT_S),
     )
     if result.get("status") != "ok":
         raise WorktreeProxyError(
@@ -410,8 +415,14 @@ async def existing_linked_worktree(
             host_conn=conn,
             repo_path=workspace,
             for_cleanup=True,
+            timeout=_WORKTREE_LOOKUP_TIMEOUT_S,
         )
-    except (WorktreeProxyError, WorktreeHostUnavailableError):
+    except WorktreeHostUnavailableError as exc:
+        _logger.warning(
+            "Existing worktree lookup unavailable for host %s: %s", host_id, exc.message
+        )
+        return None
+    except WorktreeProxyError:
         return None
     from omnigent.server.routes._workspace_validation import _is_subpath_of
 

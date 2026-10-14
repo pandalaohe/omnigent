@@ -17,8 +17,10 @@ from typing import Any
 import pytest
 
 from omnigent.host.frames import (
+    CAP_WORKTREE_ARCHIVE_CONTENT,
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     decode_host_frame,
 )
@@ -27,6 +29,7 @@ from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
     create_worktree_on_host,
+    existing_linked_worktree,
     folder_facts_on_host,
     remove_worktree_on_host,
 )
@@ -81,6 +84,7 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
 
     create_reply: dict[str, Any] = {}
     remove_reply: dict[str, Any] = {}
+    list_reply: dict[str, Any] = {}
     # Frames the proxy sent, captured here (registry.send_text enqueues
     # to outbound_queue rather than ws.send_text, so we record from the
     # drain task instead of from the fake ws).
@@ -102,10 +106,15 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
                 fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(remove_reply)
+            elif isinstance(frame, HostListWorktreesFrame) and list_reply:
+                fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(list_reply)
 
     drain_task = asyncio.create_task(_drain())
     registry._create_reply_for_test = create_reply  # type: ignore[attr-defined]
     registry._remove_reply_for_test = remove_reply  # type: ignore[attr-defined]
+    registry._list_reply_for_test = list_reply  # type: ignore[attr-defined]
     registry._sent_frames_for_test = sent_frames  # type: ignore[attr-defined]
 
     try:
@@ -116,6 +125,47 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
             await asyncio.wait_for(drain_task, timeout=1.0)
         except asyncio.TimeoutError:
             drain_task.cancel()
+
+
+async def test_existing_worktree_lookup_does_not_hold_creation_for_write_timeout(
+    host_setup: HostRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = host_setup.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append(CAP_WORKTREE_ARCHIVE_CONTENT)
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree._WORKTREE_LOOKUP_TIMEOUT_S", 0.02, raising=False
+    )
+    result = await asyncio.wait_for(
+        existing_linked_worktree(
+            host_registry=host_setup, host_id=_HOST_ID, workspace="/opt/work/repo"
+        ),
+        timeout=0.5,
+    )
+    assert result is None
+    assert conn.pending_list_worktrees == {}
+
+
+async def test_existing_worktree_lookup_keeps_linked_root_and_branch(
+    host_setup: HostRegistry,
+) -> None:
+    conn = host_setup.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append(CAP_WORKTREE_ARCHIVE_CONTENT)
+    host_setup._list_reply_for_test.update(  # type: ignore[attr-defined]
+        {
+            "status": "ok",
+            "worktrees": [
+                {"path": "/opt/work/repo", "branch": "main", "is_main": True},
+                {"path": "/opt/work/topic", "branch": "feature/topic", "is_main": False},
+            ],
+        }
+    )
+    result = await existing_linked_worktree(
+        host_registry=host_setup, host_id=_HOST_ID, workspace="/opt/work/topic/src"
+    )
+    assert result == ("/opt/work/topic", "feature/topic")
+    assert conn.pending_list_worktrees == {}
 
 
 @pytest.mark.parametrize("workspace", [None, "/Users/alice/myrepo-worktrees/feature-login/web"])

@@ -4004,7 +4004,8 @@ class HostProcess:
                     repo_path=frame.repo_path,
                     for_cleanup=frame.for_cleanup,
                 ),
-                worktree_operation=True,
+                # Only cleanup validation must wait for prior mutations to finish.
+                worktree_operation=frame.for_cleanup and not frame.for_status,
             )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(
