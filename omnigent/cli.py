@@ -103,6 +103,7 @@ from omnigent.process_logging import (
 from omnigent.update_check import (
     _build_upgrade_suggestion,
     _find_repo_root,
+    _prepare_uv_git_install,
     _probe_installed_distribution,
     _read_installed_wheel_info,
     _run_upgrade_command,
@@ -9819,7 +9820,14 @@ def _launch_windows_custom_host_update(
             "executable on PATH."
         )
     process: subprocess.Popen[bytes] | None = None
+    constraints_dir: Path | None = None
     try:
+        install_args = shlex.split(install_command)
+        if install_args[:3] == ["uv", "tool", "install"] and any(
+            arg.startswith("git+") for arg in install_args[3:]
+        ):
+            constraints_dir = Path(tempfile.mkdtemp(prefix="locked-install-", dir=paths["root"]))
+            install_args = _prepare_uv_git_install(install_args, constraints_dir)
         _copy_windows_custom_host_helper(paths["helper"])
         paths["log"].write_text("", encoding="utf-8")
         probe_code = (
@@ -9829,7 +9837,8 @@ def _launch_windows_custom_host_update(
         instruction: dict[str, object] = {
             "schema_version": 1,
             "parent_pid": os.getpid(),
-            "install_argv": shlex.split(install_command),
+            "install_argv": install_args,
+            "constraints_dir": str(constraints_dir) if constraints_dir is not None else "",
             "recovery_command": recovery_command,
             "old_commit": old_commit,
             "target_commit": target_commit,
@@ -9888,6 +9897,8 @@ def _launch_windows_custom_host_update(
                     target_commit,
                     "-HostId",
                     host_id,
+                    "-ConstraintsDirectory",
+                    str(constraints_dir) if constraints_dir is not None else "",
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=helper_output,
@@ -9939,6 +9950,8 @@ def _launch_windows_custom_host_update(
                     },
                 )
         paths["lock"].unlink(missing_ok=True)
+        if constraints_dir is not None:
+            shutil.rmtree(constraints_dir, ignore_errors=True)
         raise
 
 
@@ -10190,7 +10203,7 @@ def host_update() -> None:
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="Print the exact installer command without stopping the Host.",
+    help="Preview the installer request without stopping the Host.",
 )
 @click.option(
     "--force",
@@ -10301,7 +10314,12 @@ def _host_update_custom_impl(
             f"Detected installer: {info.detected_installer}\n"
             f"Detected extras: {', '.join(sorted(info.extras)) if info.extras else '(none)'}\n"
             "Web UI build: skipped for this Host-only install\n"
-            f"Would run: {suggestion.command}"
+            + (
+                "Dependencies: target uv.lock (exported before installation)\n"
+                if info.detected_installer == "uv"
+                else ""
+            )
+            + f"Would run: {suggestion.command}"
         )
         return
 

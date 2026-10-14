@@ -1727,6 +1727,75 @@ def _build_nightly_upgrade_suggestion(
     )
 
 
+def _prepare_uv_git_install(
+    args: list[str], directory: Path, *, env: dict[str, str] | None = None
+) -> list[str]:
+    """Constrain a uv git install to the target's runtime lock, before mutating the tool."""
+    from urllib.parse import parse_qs
+
+    if args[:3] != ["uv", "tool", "install"]:
+        return args
+    source = next((arg for arg in args[3:] if arg.startswith("git+")), None)
+    if source is None:
+        return args
+    url, revision = _split_vcs_url(source)
+    fragment = source.partition("#")[2]
+    options = parse_qs(fragment)
+    repo = directory / "source"
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repo), "fetch", "--quiet", "--depth=1", "--", url, revision or "HEAD"],
+        check=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        check=True,
+        env=env,
+    )
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    project = (repo / options.get("subdirectory", [""])[0]).resolve()
+    if not project.is_relative_to(repo.resolve()):
+        raise ValueError("Git install subdirectory must be inside the target repository")
+    if not (project / "uv.lock").is_file():
+        raise ValueError("The target git revision has no uv.lock; refusing an unlocked upgrade")
+    constraints = directory / "constraints.txt"
+    export = [
+        "uv",
+        "export",
+        "--project",
+        str(project),
+        "--frozen",
+        "--no-dev",
+        "--no-default-groups",
+        "--no-emit-project",
+        "--no-emit-local",
+        "--no-hashes",
+        "--output-file",
+        str(constraints),
+    ]
+    for extra in _parse_extras_from_spec(options.get("egg", [""])[0]):
+        export.extend(["--extra", extra])
+    subprocess.run(export, check=True, env=env, stdout=subprocess.DEVNULL)
+    # Refresh the application build while reusing locked dependency wheels.
+    # Windows still forces environment recreation to replace stale entrypoints.
+    prepared: list[str] = []
+    for arg in args:
+        if arg == "--reinstall":
+            prepared.extend(["--reinstall-package", _DIST_NAME])
+        elif arg == source:
+            prepared.append(f"git+{url}@{sha}" + (f"#{fragment}" if fragment else ""))
+        else:
+            prepared.append(arg)
+    return [*prepared, "--constraints", str(constraints)]
+
+
 def _run_upgrade_command(
     command: str,
     console: Console,
@@ -1756,11 +1825,22 @@ def _run_upgrade_command(
     console.print(f"[yellow]Running:[/yellow] {command}")
     try:
         args = shlex.split(command)
-        result = (
-            subprocess.run(args, check=False)
-            if env is None
-            else subprocess.run(args, check=False, env=env)
-        )
+        if args[:3] == ["uv", "tool", "install"] and any(
+            arg.startswith("git+") for arg in args[3:]
+        ):
+            with tempfile.TemporaryDirectory(prefix="omnigent-upgrade-") as temporary:
+                args = _prepare_uv_git_install(args, Path(temporary), env=env)
+                console.print("Installing dependencies from the target uv.lock.")
+                result = subprocess.run(args, check=False, env=env)
+        else:
+            result = (
+                subprocess.run(args, check=False)
+                if env is None
+                else subprocess.run(args, check=False, env=env)
+            )
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]Upgrade preparation failed:[/red] {exc}")
+        return exc.returncode
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our

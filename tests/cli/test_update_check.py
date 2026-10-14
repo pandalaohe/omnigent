@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import textwrap
 import time
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2132,6 +2134,287 @@ def test_legacy_cache_without_kind_field_defaults_to_clone(
 # ------------------------------------------------------------------
 
 
+@pytest.fixture
+def locked_upgrade_source(tmp_path: Path) -> tuple[Path, str]:
+    """A git target whose dependency pin differs from an unconstrained install."""
+    repo = tmp_path / "source"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text(
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n'
+        '[project]\nname = "omnigent"\nversion = "1.0"\n'
+        'requires-python = ">=3.12"\ndependencies = ["idna>=3"]\n'
+        '[project.optional-dependencies]\nwindows = ["colorama>=0.4"]\n'
+    )
+    (repo / "backend.py").write_text(
+        textwrap.dedent("""\
+        import pathlib, zipfile
+        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+            name = 'omnigent-1.0-py3-none-any.whl'
+            with zipfile.ZipFile(pathlib.Path(wheel_directory) / name, 'w') as wheel:
+                wheel.writestr('fixture_cli.py', 'def main(): print("locked fixture")\\n')
+                wheel.writestr('omnigent-1.0.dist-info/METADATA',
+                    'Metadata-Version: 2.1\\nName: omnigent\\nVersion: 1.0\\n'
+                    'Requires-Dist: idna>=3\\nProvides-Extra: windows\\n'
+                    'Requires-Dist: colorama>=0.4; extra == "windows"\\n')
+                wheel.writestr('omnigent-1.0.dist-info/WHEEL',
+                    'Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n')
+                wheel.writestr('omnigent-1.0.dist-info/entry_points.txt',
+                    '[console_scripts]\\nlocked-fixture = fixture_cli:main\\n')
+                wheel.writestr('omnigent-1.0.dist-info/RECORD', '')
+            return name
+    """)
+    )
+    (repo / "uv.lock").write_text(
+        'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n'
+        '[[package]]\nname = "omnigent"\nversion = "1.0"\nsource = { virtual = "." }\n'
+        'dependencies = [{ name = "idna" }]\n'
+        '[package.optional-dependencies]\nwindows = [{ name = "colorama" }]\n'
+        '[package.metadata]\nprovides-extras = ["windows"]\n'
+        '[[package]]\nname = "idna"\nversion = "3.18"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        '[[package]]\nname = "colorama"\nversion = "0.4.6"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    return repo, sha
+
+
+def test_run_upgrade_command_uses_target_lock(
+    locked_upgrade_source: tuple[Path, str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from rich.console import Console
+
+    from omnigent.update_check import _run_upgrade_command
+
+    repo, sha = locked_upgrade_source
+    real_run = subprocess.run
+    installs: list[list[str]] = []
+    constraints: list[Path] = []
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["uv", "tool", "install"]:
+            installs.append(args)
+            assert "--reinstall" not in args
+            path = Path(args[args.index("--constraints") + 1])
+            constraints.append(path)
+            contents = path.read_text()
+            assert "idna==3.18" in contents
+            assert "colorama==0.4.6" in contents
+            assert "omnigent==" not in contents
+            return subprocess.CompletedProcess(args, 0)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    env = {**os.environ, "UV_CACHE_DIR": str(tmp_path / "cache")}
+    code = _run_upgrade_command(
+        f"uv tool install --reinstall --python 3.12 git+{repo.as_uri()}@{sha}"
+        "#egg=omnigent[windows]",
+        Console(),
+        env=env,
+    )
+    assert code == 0
+    assert len(installs) == 1
+    assert f"git+{repo.as_uri()}@{sha}#egg=omnigent[windows]" in installs[0]
+    assert not constraints[0].exists()
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_locked_upgrade_installs_pinned_wheels_offline(
+    locked_upgrade_source: tuple[Path, str], tmp_path: Path, force: bool
+) -> None:
+    from rich.console import Console
+
+    from omnigent.update_check import _run_upgrade_command
+
+    repo, sha = locked_upgrade_source
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    for name, version in [("idna", "3.18"), ("idna", "99.0"), ("colorama", "0.4.6")]:
+        dist = f"{name}-{version}.dist-info"
+        with zipfile.ZipFile(wheels / f"{name}-{version}-py3-none-any.whl", "w") as wheel:
+            wheel.writestr(
+                f"{dist}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            )
+            wheel.writestr(
+                f"{dist}/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            )
+            wheel.writestr(f"{dist}/RECORD", "")
+    env = {
+        **os.environ,
+        "UV_TOOL_DIR": str(tmp_path / "tools"),
+        "UV_TOOL_BIN_DIR": str(tmp_path / "bin"),
+        "UV_CACHE_DIR": str(tmp_path / "cache"),
+        "UV_NO_INDEX": "1",
+        "UV_FIND_LINKS": str(wheels),
+        "UV_NO_CONFIG": "1",
+        "UV_OFFLINE": "1",
+    }
+    command = (
+        f"uv tool install {'--force ' if force else ''}--reinstall --python {sys.executable} "
+        f"git+{repo.as_uri()}@{sha}#egg=omnigent[windows]"
+    )
+    # A repeat must work after the previous temporary constraints file is gone.
+    for _ in range(2):
+        assert _run_upgrade_command(command, Console(), env=env) == 0
+        python = (
+            tmp_path
+            / "tools"
+            / "omnigent"
+            / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        )
+        installed = subprocess.check_output(
+            [
+                str(python),
+                "-c",
+                "from importlib.metadata import version; "
+                "print(version('idna'), version('colorama'))",
+            ],
+            text=True,
+        ).strip()
+        assert installed == "3.18 0.4.6"
+
+
+@pytest.mark.parametrize("failure", ["missing-lock", "invalid-extra", "fetch"])
+def test_locked_upgrade_aborts_before_install(
+    locked_upgrade_source: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    from rich.console import Console
+
+    from omnigent.update_check import _run_upgrade_command
+
+    repo, sha = locked_upgrade_source
+    real_run = subprocess.run
+    if failure == "missing-lock":
+        (repo / "uv.lock").unlink()
+        real_run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qam",
+                "remove lock",
+            ],
+            check=True,
+        )
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+    if failure == "fetch":
+        sha = "f" * 40
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert args[:3] != ["uv", "tool", "install"], "must preserve the existing install"
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    extra = "#egg=omnigent[missing]" if failure == "invalid-extra" else ""
+    env = {**os.environ, "UV_CACHE_DIR": str(tmp_path / "cache")}
+    assert (
+        _run_upgrade_command(
+            f"uv tool install git+{repo.as_uri()}@{sha}{extra}", Console(), env=env
+        )
+        != 0
+    )
+
+
+@pytest.mark.parametrize("launch_fails", [False, True])
+def test_windows_locked_install_constraints_lifetime(
+    locked_upgrade_source: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_fails: bool,
+) -> None:
+    import omnigent.cli as cli_module
+
+    repo, sha = locked_upgrade_source
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(cli_module.shutil, "which", lambda name: name)
+    monkeypatch.setattr(
+        cli_module, "_copy_windows_custom_host_helper", lambda path: path.write_text("")
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_read_custom_host_update_result",
+        lambda: {"helper_pid": 321, "status": "running"},
+    )
+
+    class Process:
+        pid = 321
+
+        def poll(self) -> None:
+            return None
+
+    def launch(args: list[str], **kwargs: object) -> Process:
+        if launch_fails:
+            raise OSError("fixture launch failed")
+        return Process()
+
+    prepare = cli_module._prepare_uv_git_install
+
+    def prepare_then_stub(args: list[str], directory: Path) -> list[str]:
+        result = prepare(args, directory)
+        monkeypatch.setattr(cli_module.subprocess, "Popen", launch)
+        return result
+
+    monkeypatch.setattr(cli_module, "_prepare_uv_git_install", prepare_then_stub)
+    kwargs = {
+        "install_command": f"uv tool install --force --reinstall git+{repo.as_uri()}@{sha}",
+        "recovery_command": "fixture recovery",
+        "old_commit": "a" * 40,
+        "target_commit": sha,
+        "host_id": "fixture-host",
+        "previous_records": [],
+        "wrapper": tmp_path / "service.cmd",
+    }
+    if launch_fails:
+        with pytest.raises(OSError, match="fixture launch failed"):
+            cli_module._launch_windows_custom_host_update(**kwargs)
+        assert not list((tmp_path / "data" / "updates").glob("locked-install-*"))
+    else:
+        cli_module._launch_windows_custom_host_update(**kwargs)
+        paths = cli_module._custom_host_update_paths()
+        instruction = json.loads(paths["instruction"].read_text())
+        args = instruction["install_argv"]
+        assert "--force" in args and "--reinstall" not in args
+        constraints = Path(args[args.index("--constraints") + 1])
+        assert "idna==3.18" in constraints.read_text()
+        assert constraints.parent == Path(instruction["constraints_dir"])
+
+
 def test_run_upgrade_command_invokes_subprocess(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2163,9 +2446,7 @@ def test_run_upgrade_command_invokes_subprocess(
     monkeypatch.setattr(_subprocess, "run", _fake_run)
 
     console = Console(stderr=True)
-    code = _run_upgrade_command(
-        "uv tool install --reinstall git+https://example.test/repo.git", console
-    )
+    code = _run_upgrade_command("uv tool install --reinstall omnigent[all]", console)
 
     # shlex.split tokenization is the contract — a single
     # whitespace-joined string would let an installer interpret
@@ -2176,7 +2457,7 @@ def test_run_upgrade_command_invokes_subprocess(
             "tool",
             "install",
             "--reinstall",
-            "git+https://example.test/repo.git",
+            "omnigent[all]",
         ]
     ]
     # The exit code must propagate unchanged so the caller's
