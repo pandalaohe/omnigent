@@ -1,4 +1,4 @@
-/** The free-text answer most recently used in a pending async question card. */
+/** A selected free-text answer in a pending async question card. */
 export interface CardInputTarget {
   sessionId: string;
   cardId: string;
@@ -7,23 +7,52 @@ export interface CardInputTarget {
   insert: (text: string, files: File[], commentIds: string[]) => boolean;
 }
 
-let target: CardInputTarget | null = null;
+const targets = new Map<string, Map<string, CardInputTarget>>();
+
+function targetForSession(sessionId: string): CardInputTarget | null {
+  const cards = targets.get(sessionId);
+  if (!cards) return null;
+  let bottom: CardInputTarget | null = null;
+  for (const candidate of cards.values()) {
+    if (!candidate.element.isConnected) continue;
+    if (
+      !bottom ||
+      bottom.element.compareDocumentPosition(candidate.element) & Node.DOCUMENT_POSITION_FOLLOWING
+    ) {
+      bottom = candidate;
+    }
+  }
+  return bottom;
+}
 
 export type CardInsertResult = "absent" | "inserted" | "rejected";
 
 export function setQuestionCardInputTarget(next: CardInputTarget): void {
-  target = next;
+  let cards = targets.get(next.sessionId);
+  if (!cards) {
+    cards = new Map();
+    targets.set(next.sessionId, cards);
+  }
+  const existing = cards.get(next.cardId);
+  if (existing?.questionKey === next.questionKey && existing.element === next.element) {
+    existing.insert = next.insert;
+  } else {
+    cards.set(next.cardId, next);
+  }
 }
 
 export function clearQuestionCardInputTarget(sessionId: string, cardId?: string): void {
-  if (target?.sessionId === sessionId && (cardId === undefined || target.cardId === cardId)) {
-    target = null;
+  if (cardId === undefined) targets.delete(sessionId);
+  else {
+    const cards = targets.get(sessionId);
+    cards?.delete(cardId);
+    if (cards?.size === 0) targets.delete(sessionId);
   }
 }
 
 /** Capture the intended card before an asynchronous source action begins. */
 export function captureQuestionCardInputTarget(sessionId: string): CardInputTarget | null {
-  return target?.sessionId === sessionId ? target : null;
+  return targetForSession(sessionId);
 }
 
 export function insertIntoQuestionCard(
@@ -34,7 +63,8 @@ export function insertIntoQuestionCard(
   intendedTarget: CardInputTarget | null = captureQuestionCardInputTarget(sessionId),
 ): CardInsertResult {
   if (!intendedTarget) return "absent";
-  if (target !== intendedTarget || !intendedTarget.element.isConnected) return "rejected";
+  if (targetForSession(sessionId) !== intendedTarget || !intendedTarget.element.isConnected)
+    return "rejected";
   if (!intendedTarget.insert(text, files, commentIds)) return "rejected";
   intendedTarget.element.focus({ preventScroll: true });
   return "inserted";

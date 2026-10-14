@@ -317,7 +317,7 @@ export function ApprovalCard({
         }
       : undefined;
   const submitBinary = (action: "accept" | "decline") => {
-    submit(elicitationId, action);
+    return submit(elicitationId, action);
   };
   const submitOption = (label: string) => {
     submit(elicitationId, "accept", { answer: label });

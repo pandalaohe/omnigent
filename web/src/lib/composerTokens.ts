@@ -331,6 +331,27 @@ export function removeTokens<D extends DraftShape>(draft: D, file: File): D {
   );
 }
 
+/** Close gaps left by removed files, keeping text labels aligned with the
+ *  delivered file order. Files must have distinct labels; unknown tokens stay put. */
+export function compactLabels<D extends DraftShape>(draft: D, files: readonly File[]): D {
+  const next: Record<TokenKind, number> = { image: 0, file: 0 };
+  const replacements = new Map<string, string>();
+  for (const file of files) {
+    const label = registry.get(file);
+    if (!label) continue;
+    next[label.kind] += 1;
+    const compact = { kind: label.kind, n: next[label.kind] };
+    replacements.set(tokenText(label), tokenText(compact));
+    registry.set(file, compact);
+  }
+  return withFields(
+    draft,
+    getFields(draft).map((field) =>
+      field.replace(TOKEN_RE, (match) => replacements.get(match) ?? match),
+    ),
+  );
+}
+
 /** The authored fields whose text changes when `files[index]`'s token is
  *  removed, as the new text for each (per-field, so the caller keeps the
  *  active field and a side-chat draft intact). */
