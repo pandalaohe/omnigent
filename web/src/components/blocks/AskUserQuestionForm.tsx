@@ -24,7 +24,7 @@
 //     one per selected option with a preview).
 //
 // Submit is gated on EVERY question having an answer (a predefined
-// option selected, or the custom row selected with non-empty text).
+// option selected, custom text, or an async-card image).
 // Selections are gathered into a flat ``{[question id or text]:
 // answer}`` map matching MCP's ``ElicitResult.content`` shape and
 // passed to ``onSubmit``.
@@ -50,6 +50,16 @@ import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
 import { validateAttachments } from "@/lib/attachments";
+import {
+  applyFieldEdit,
+  assignLabels,
+  compactLabels,
+  deleteTokenAt,
+  labelOf,
+  removeTokens,
+  tokenInsertion,
+  tokenText,
+} from "@/lib/composerTokens";
 import { uploadFile } from "@/lib/filesApi";
 import { clearQuestionCardInputTarget, setQuestionCardInputTarget } from "@/lib/questionCardInput";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
@@ -77,7 +87,7 @@ interface AskUserQuestionFormProps {
     answers: AskUserQuestionAnswers,
     meta?: Record<string, unknown>,
   ) => void | boolean | Promise<void | boolean>;
-  onReject: () => void;
+  onReject: () => void | boolean | Promise<void | boolean>;
   /**
    * Free markdown the producer wants shown above the questions — the
    * async card's recap, report paths, or links. Rendered through the
@@ -222,10 +232,13 @@ export function AskUserQuestionForm({
   const customInputsRef = useRef(customInputs);
   customInputsRef.current = customInputs;
   const [images, setImages] = useState<Record<string, File[]>>({});
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
   const [stagedComments, setStagedComments] = useState<Record<string, StagedCommentBlock[]>>({});
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
+  const resolvedRef = useRef(false);
   const mountedRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const customInputRef = useRef<HTMLTextAreaElement>(null);
@@ -252,62 +265,98 @@ export function AskUserQuestionForm({
   useEffect(() => {
     if (!asyncSessionId || !asyncCardId) return;
     return () => clearQuestionCardInputTarget(asyncSessionId, asyncCardId);
-  }, [asyncSessionId, asyncCardId, activeQuestionKey]);
+  }, [asyncSessionId, asyncCardId]);
 
   useLayoutEffect(() => {
     const pending = pendingCaretRef.current;
     if (!pending || !current || pending.key !== questionKey(current)) return;
     customInputRef.current?.setSelectionRange(pending.offset, pending.offset);
+    caretRef.current[pending.key] = { start: pending.offset, end: pending.offset };
     pendingCaretRef.current = null;
   }, [customInputs, current]);
 
-  const addImages = (key: string, incoming: File[]): boolean => {
-    if (submittingRef.current) return false;
+  const commitCustomText = (key: string, text: string, caret: number) => {
+    const next = { ...customInputsRef.current, [key]: text };
+    customInputsRef.current = next;
+    setCustomInputs(next);
+    caretRef.current[key] = { start: caret, end: caret };
+    pendingCaretRef.current = { key, offset: caret };
+  };
+
+  const addImages = (key: string, incoming: File[], insertedText = ""): File[] | null => {
+    if (submittingRef.current) return null;
     const nonImages = incoming.filter((file) => !file.type.startsWith("image/"));
     const { accepted, errors } = validateAttachments(
       incoming.filter((file) => file.type.startsWith("image/")),
     );
     if (nonImages.length) errors.push("Only images can be attached to a question answer.");
     setAttachmentError(errors.length ? errors.join("\n") : null);
-    if (errors.length) return false;
-    if (accepted.length)
-      setImages((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), ...accepted] }));
-    return true;
+    if (errors.length) return null;
+    if (!accepted.length && !insertedText) return [];
+    const existing = imagesRef.current[key] ?? [];
+    const seen = new Set(existing);
+    const prepared = accepted.map((file) => {
+      const owned =
+        labelOf(file) || seen.has(file)
+          ? new File([file], file.name, { type: file.type, lastModified: file.lastModified })
+          : file;
+      seen.add(owned);
+      return owned;
+    });
+    assignLabels(prepared, existing);
+    const nextImages = { ...imagesRef.current, [key]: [...existing, ...prepared] };
+    imagesRef.current = nextImages;
+    if (accepted.length) setImages(nextImages);
+    const value = customInputsRef.current[key] ?? "";
+    const { start, end } = caretRef.current[key] ?? { start: value.length, end: value.length };
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const prefix = insertedText
+      ? before && !before.endsWith("\n")
+        ? `\n\n${insertedText}`
+        : insertedText
+      : "";
+    const withPrefix = before + prefix + after;
+    const cursor = before.length + prefix.length;
+    const { insert } = prepared.length
+      ? tokenInsertion(withPrefix, cursor, cursor, prepared)
+      : { insert: "" };
+    const field = activeQuestionKey === key ? customInputRef.current : null;
+    const edit = applyFieldEdit(field, value, { start, end }, prefix + insert);
+    commitCustomText(key, edit.text, edit.caret);
+    setCustomSelected((prev) => ({ ...prev, [key]: true }));
+    const question = questions.find((q) => questionKey(q) === key);
+    if (question && !question.multiSelect) {
+      setSelections((prev) => ({ ...prev, [key]: "" }));
+    }
+    return prepared;
   };
 
-  const activateCustomInput = (key: string) => {
+  useLayoutEffect(() => {
+    const key = activeQuestionKey;
     const element = customInputRef.current;
-    if (!asyncTarget || !element || submittingRef.current) return;
+    if (!asyncTarget || !key) return;
+    if (!element || !customSelected[key] || resolvedRef.current) {
+      clearQuestionCardInputTarget(asyncTarget.sessionId, asyncTarget.cardId);
+      return;
+    }
     setQuestionCardInputTarget({
       ...asyncTarget,
       questionKey: key,
       element,
       insert: (text, files, ids) => {
         if (submittingRef.current) return false;
-        if (files.length && !addImages(key, files)) return false;
+        const prepared = addImages(key, files, text);
+        if (!prepared) return false;
         if (ids.length && text)
           setStagedComments((prev) => ({
             ...prev,
-            [key]: [...(prev[key] ?? []), { text, files: [...files], ids: [...ids] }],
+            [key]: [...(prev[key] ?? []), { text, files: prepared, ids: [...ids] }],
           }));
-        if (text) {
-          const value = customInputsRef.current[key] ?? "";
-          const { start, end } = caretRef.current[key] ?? {
-            start: value.length,
-            end: value.length,
-          };
-          const before = value.slice(0, start);
-          const after = value.slice(end);
-          const insertion = before && !before.endsWith("\n") ? `\n\n${text}` : text;
-          setCustomInputs((prev) => ({ ...prev, [key]: before + insertion + after }));
-          pendingCaretRef.current = { key, offset: before.length + insertion.length };
-        }
-        if (!current.multiSelect) handleCustomToggleSingle(key);
-        else setCustomSelected((prev) => ({ ...prev, [key]: true }));
         return true;
       },
     });
-  };
+  });
 
   const enterCard = () => {
     if (!current) return;
@@ -369,7 +418,12 @@ export function AskUserQuestionForm({
   const handleCustomInput = (key: string, e: ChangeEvent<HTMLTextAreaElement>) => {
     if (submittingRef.current) return;
     const text = e.target.value;
-    setCustomInputs((prev) => ({ ...prev, [key]: text }));
+    customInputsRef.current = { ...customInputsRef.current, [key]: text };
+    setCustomInputs(customInputsRef.current);
+    caretRef.current[key] = {
+      start: e.target.selectionStart,
+      end: e.target.selectionEnd,
+    };
     // Typing implies intent to use the custom answer — auto-check
     // the custom radio/checkbox so the user doesn't have to click
     // twice. Clearing the text doesn't auto-uncheck (the user may
@@ -423,6 +477,10 @@ export function AskUserQuestionForm({
     setAttachmentError(null);
     try {
       const imageIds: Record<string, string[]> = {};
+      for (const q of questions) {
+        const key = questionKey(q);
+        if (images[key]?.length) imageIds[key] = [];
+      }
       await Promise.all(
         questions.map(async (q) => {
           const key = questionKey(q);
@@ -462,8 +520,32 @@ export function AskUserQuestionForm({
         ...(Object.keys(imageIds).length ? { omnigent_question_images: imageIds } : {}),
         ...(ids.length ? { omnigent_comment_ids: ids } : {}),
       };
+      // Delivery follows serialized metadata order, including numeric question keys.
+      let imageNumber = 0;
+      for (const key of Object.keys(imageIds)) {
+        const labels = new Map<string, string>();
+        for (const file of images[key] ?? []) {
+          imageNumber += 1;
+          const label = labelOf(file);
+          if (label) labels.set(tokenText(label), `[image ${imageNumber}]`);
+        }
+        if (!customSelected[key]) continue;
+        const customText = (customInputs[key] ?? "").trim();
+        const deliveredText = customText.replace(
+          /\[image \d+\]/g,
+          (token) => labels.get(token) ?? token,
+        );
+        const answer = finalAnswers[key];
+        finalAnswers[key] = Array.isArray(answer)
+          ? answer.map((value) => (value === customText ? deliveredText : value))
+          : deliveredText;
+      }
       const accepted = await onSubmit(finalAnswers, Object.keys(meta).length ? meta : undefined);
       if (accepted === false) setAttachmentError("Could not submit the answer. Try again.");
+      else {
+        resolvedRef.current = true;
+        clearQuestionCardInputTarget(asyncTarget.sessionId, asyncTarget.cardId);
+      }
     } catch (error) {
       setAttachmentError(
         error instanceof Error ? error.message : "Could not attach the image. Try again.",
@@ -481,14 +563,42 @@ export function AskUserQuestionForm({
     void handleSubmit();
   };
 
+  const reject = async () => {
+    if (submittingRef.current) return;
+    if (!asyncTarget) {
+      onReject();
+      return;
+    }
+    submittingRef.current = true;
+    setSubmitting(true);
+    setAttachmentError(null);
+    try {
+      const accepted = await onReject();
+      if (accepted === false) setAttachmentError("Could not cancel the question. Try again.");
+      else {
+        resolvedRef.current = true;
+        clearQuestionCardInputTarget(asyncTarget.sessionId, asyncTarget.cardId);
+      }
+    } catch (error) {
+      setAttachmentError(
+        error instanceof Error ? error.message : "Could not cancel the question. Try again.",
+      );
+    } finally {
+      submittingRef.current = false;
+      if (mountedRef.current) setSubmitting(false);
+    }
+  };
+
   const rejectAndLeave = () => {
     if (submittingRef.current) return;
     leaveQuestionCard(rootRef.current);
-    onReject();
+    void reject();
   };
 
   const abortAndLeave = () => {
     if (!onAbort || submittingRef.current) return;
+    resolvedRef.current = true;
+    if (asyncTarget) clearQuestionCardInputTarget(asyncTarget.sessionId, asyncTarget.cardId);
     leaveQuestionCard(rootRef.current);
     onAbort();
   };
@@ -831,18 +941,46 @@ export function AskUserQuestionForm({
               onChange={(e) => handleCustomInput(currentKey, e)}
               onFocus={(event) => {
                 setHighlight(current.options.length);
+                if (pendingCaretRef.current?.key === currentKey) return;
                 caretRef.current[currentKey] = {
                   start: event.currentTarget.selectionStart,
                   end: event.currentTarget.selectionEnd,
                 };
-                activateCustomInput(currentKey);
               }}
               onSelect={(event) => {
+                if (pendingCaretRef.current?.key === currentKey) return;
                 caretRef.current[currentKey] = {
                   start: event.currentTarget.selectionStart,
                   end: event.currentTarget.selectionEnd,
                 };
               }}
+              onKeyDown={
+                asyncTarget
+                  ? (event) => {
+                      if (
+                        submittingRef.current ||
+                        (event.key !== "Backspace" && event.key !== "Delete") ||
+                        event.ctrlKey ||
+                        event.metaKey ||
+                        event.altKey ||
+                        event.shiftKey ||
+                        event.currentTarget.selectionStart !== event.currentTarget.selectionEnd
+                      )
+                        return;
+                      const edit = deleteTokenAt(
+                        event.currentTarget,
+                        event.currentTarget.value,
+                        event.currentTarget.selectionStart,
+                        event.key,
+                        imagesRef.current[currentKey] ?? [],
+                      );
+                      if (edit) {
+                        event.preventDefault();
+                        commitCustomText(currentKey, edit.text, edit.caret);
+                      }
+                    }
+                  : undefined
+              }
               onPaste={
                 asyncTarget
                   ? (event) => {
@@ -889,10 +1027,26 @@ export function AskUserQuestionForm({
                 files={images[currentKey] ?? []}
                 onRemove={(index) => {
                   if (submittingRef.current) return;
-                  setImages((prev) => ({
-                    ...prev,
-                    [currentKey]: (prev[currentKey] ?? []).filter((_, i) => i !== index),
-                  }));
+                  const files = imagesRef.current[currentKey] ?? [];
+                  const removed = files[index];
+                  if (!removed) return;
+                  const remaining = files.filter((_, i) => i !== index);
+                  const text = customInputsRef.current[currentKey] ?? "";
+                  const caret = caretRef.current[currentKey]?.start ?? text.length;
+                  const strippedPrefix = removeTokens(
+                    { quotes: [], text: text.slice(0, caret) },
+                    removed,
+                  );
+                  const stripped = removeTokens({ quotes: [], text }, removed);
+                  const compacted = compactLabels(stripped, remaining);
+                  commitCustomText(
+                    currentKey,
+                    compacted.text,
+                    Math.min(strippedPrefix.text.length, compacted.text.length),
+                  );
+                  const nextImages = { ...imagesRef.current, [currentKey]: remaining };
+                  imagesRef.current = nextImages;
+                  setImages(nextImages);
                   setAttachmentError(null);
                 }}
               />
@@ -964,7 +1118,7 @@ export function AskUserQuestionForm({
           onClick={(event) => {
             if (submittingRef.current) return;
             if (event.detail === 0) rejectAndLeave();
-            else onReject();
+            else void reject();
           }}
           disabled={submitting}
           className="ml-auto"
@@ -980,7 +1134,12 @@ export function AskUserQuestionForm({
             onClick={(event) => {
               if (submittingRef.current) return;
               if (event.detail === 0) abortAndLeave();
-              else onAbort();
+              else {
+                resolvedRef.current = true;
+                if (asyncTarget)
+                  clearQuestionCardInputTarget(asyncTarget.sessionId, asyncTarget.cardId);
+                onAbort();
+              }
             }}
             disabled={submitting}
             data-testid="ask-user-question-abort"

@@ -255,11 +255,7 @@ import { useComments } from "@/hooks/useComments";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
-import {
-  clearQuestionCardInputTarget,
-  insertIntoQuestionCard,
-  quoteForQuestionCard,
-} from "@/lib/questionCardInput";
+import { insertIntoQuestionCard, quoteForQuestionCard } from "@/lib/questionCardInput";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -4375,7 +4371,6 @@ function ComposerImpl(
   };
 
   const handleTextFocus = (id: string | null, element: HTMLTextAreaElement) => {
-    if (conversationId) clearQuestionCardInputTarget(conversationId);
     textareaRef.current = element;
     focusedFieldRef.current = true;
     focusText(id);
