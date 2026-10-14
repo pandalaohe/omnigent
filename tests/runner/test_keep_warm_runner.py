@@ -189,7 +189,7 @@ class _KeepWarmProcessManager:
 class _ReceiptHarnessClient:
     """Harness client stub answering a scripted status + receipt and recording posts."""
 
-    def __init__(self, receipt: dict[str, Any], *, status_code: int = 200) -> None:
+    def __init__(self, receipt: object, *, status_code: int = 200) -> None:
         self._receipt = receipt
         self._status_code = status_code
         self.posts: list[dict[str, Any]] = []
@@ -418,12 +418,15 @@ async def test_keep_warm_ping_without_live_harness_skips_no_live_client(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(tmp_path: Path) -> None:
+async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """Happy path: the harness gets the ``keep_warm`` event; its receipt is relayed verbatim."""
     harness = _ReceiptHarnessClient(_OK_RECEIPT)
     mgr = _KeepWarmProcessManager(harness_client=harness)
     server = _RecordingServerClient()
     app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    caplog.set_level("INFO", logger="omnigent.runner.app")
     async with _runner_test_client(app) as http:
         resp = await http.post(
             f"/v1/sessions/{_CONV}/events",
@@ -440,6 +443,10 @@ async def test_keep_warm_ping_forwards_to_harness_and_posts_its_receipt(tmp_path
         }
     ]
     assert server.posts == [{"type": "external_keep_warm_receipt", "data": _OK_RECEIPT}]
+    assert (
+        "keep-warm attempt session=conv_x attempt=att-1 family=claude outcome=ok reason=none"
+        in caplog.text
+    )
     # The ping re-arms both idle clocks even though the work is delegated.
     assert mgr.noted == [_CONV]
     assert app.state.native_pane_reaper.noted == [_CONV]
@@ -747,6 +754,58 @@ async def test_keep_warm_ping_harness_timeout_reports_failed_timeout(tmp_path: P
                 "estimated": False,
             },
         }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_timeout_reports_unverified_close(tmp_path: Path) -> None:
+    mgr = _KeepWarmProcessManager(harness_client=_TimeoutHarnessClient())
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={
+                "type": "keep_warm_ping",
+                "attempt_id": "att-1",
+                "family": "claude",
+                "harness": "claude-native",
+            },
+        )
+    await _await_keep_warm_task(_CONV)
+
+    assert resp.status_code == 202
+    assert server.posts[0]["data"]["reason"] == "dismiss_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [(500, {}), (200, []), (200, {}), (200, {"outcome": "invalid"})],
+)
+async def test_claude_native_untrusted_receipt_reports_unverified_close(
+    tmp_path: Path, status_code: int, payload: object
+) -> None:
+    mgr = _KeepWarmProcessManager(
+        harness_client=_ReceiptHarnessClient(payload, status_code=status_code)
+    )
+    server = _RecordingServerClient()
+    app = _build_app(mgr, server, instance=_pane_instance(tmp_path))
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{_CONV}/events",
+            json={
+                "type": "keep_warm_ping",
+                "attempt_id": "att-1",
+                "family": "claude",
+                "harness": "claude-native",
+            },
+        )
+    await _await_keep_warm_task(_CONV)
+
+    assert resp.status_code == 202
+    assert server.posts == [
+        {"type": "external_keep_warm_receipt", "data": _DISMISS_FAILED_RECEIPT}
     ]
 
 

@@ -205,7 +205,7 @@ class ClaudeNativeExecutor(Executor):
                     "claude-native: keep-warm ping failed",
                     extra={"session_id": self._request_session_id},
                 )
-                return _keep_warm_receipt(attempt_id, outcome="failed", reason="harness_error")
+                return _keep_warm_receipt(attempt_id, outcome="failed", reason="dismiss_failed")
             if result.outcome != "ok":
                 return _keep_warm_receipt(attempt_id, outcome=result.outcome, reason=result.reason)
             # The measured window stays under the lock, so no injected

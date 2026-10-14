@@ -1786,6 +1786,8 @@ class ChildKeepWarmSweeper:
             reason = data.get("reason")
             if isinstance(reason, str) and reason:
                 state.k = reason if reason in _STOP_REASON_CODES else "other"
+            if outcome == "failed" and reason == "dismiss_failed":
+                state.f = _FAILURE_PAUSE_THRESHOLD
         state.a = None
         state.p = None
         if state.f >= _FAILURE_PAUSE_THRESHOLD and not (state.s == "p" and state.why == "fail"):

@@ -13240,6 +13240,46 @@ def test_btw_overlay_present_false_on_bare_composer() -> None:
     assert claude_native_bridge._btw_overlay_present(pane) is False
 
 
+def test_btw_overlay_current_footer_and_short_border() -> None:
+    """The current footer has copy but no fork; the top rule may end in one glyph."""
+    pane = "\n".join(
+        [
+            "old transcript line",
+            "  Opus 4.8 · status " + " " * 65 + "▔",
+            "",
+            "    /btw is this ready?",
+            "",
+            "      yes",
+            "",
+            "    ↑/↓ to scroll · c to copy · Esc to close",
+        ]
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None, "current settled footer should parse"
+    assert overlay.question == "/btw is this ready?"
+    assert overlay.answer == "yes"
+    assert claude_native_bridge._btw_overlay_present(pane) is True
+
+
+def test_btw_overlay_ignores_a_scrollback_footer_above_composer() -> None:
+    pane = _btw_pane(
+        "    /btw old question",
+        "      old answer",
+        "    ↑/↓ to scroll · c to copy · Esc to close",
+        "─" * 80,
+        "❯ ",
+        "─" * 80,
+    )
+    assert claude_native_bridge._btw_overlay_present(pane) is False
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+@pytest.mark.parametrize("pane", [_MODEL_PICKER_PANE, _MCP_APPROVAL_DIALOG_PANE])
+def test_btw_overlay_does_not_match_other_panels(pane: str) -> None:
+    assert claude_native_bridge._btw_overlay_present(pane) is False
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
 # ---------------------------------------------------------------------------
 # Bridge HTTP server bind/advertise behavior.
 #
@@ -13809,6 +13849,15 @@ _KEEP_WARM_OVERLAY_PANE = _btw_pane(
     "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
 )
 
+_KEEP_WARM_CURRENT_OVERLAY_PANE = _btw_pane(
+    "",
+    f"    {_KEEP_WARM_TEXT}",
+    "",
+    "      ok",
+    "",
+    "    ↑/↓ to scroll · c to copy · Esc to close",
+)
+
 # The marked overlay while the answer is still generating: the question is
 # on screen, the footer carries no copy/fork, and the spinner line shows.
 _KEEP_WARM_ANSWERING_PANE = _btw_pane(
@@ -13931,6 +13980,19 @@ def test_keep_warm_btw_occupied_pane_skips_busy(
     assert sends == []
 
 
+def test_keep_warm_btw_current_overlay_over_old_composer_blocks_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _composer_pane() + _KEEP_WARM_CURRENT_OVERLAY_PANE
+    sends = _fake_tmux(monkeypatch, [pane])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "busy")
+    assert sends == []
+
+
 def test_keep_warm_btw_composer_draft_skips_composer_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14023,6 +14085,65 @@ def test_keep_warm_btw_happy_path_pastes_enters_and_dismisses(
     assert ["send-keys", "-l", "-t", "claude:0.0", "\x1b[107;5u"] not in sends
 
 
+def test_keep_warm_btw_current_overlay_dismisses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_CURRENT_OVERLAY_PANE,
+            _KEEP_WARM_CURRENT_OVERLAY_PANE,
+            _IDLE_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("ok")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
+
+
+def test_keep_warm_btw_foreign_panel_after_settle_does_not_prove_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [
+            _IDLE_PANE,
+            _composer_pane(_KEEP_WARM_TEXT),
+            _KEEP_WARM_CURRENT_OVERLAY_PANE,
+            _composer_pane() + _MODEL_PICKER_PANE,
+        ],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
+    assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
+
+
+def test_keep_warm_btw_api_error_closes_but_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    error_pane = _KEEP_WARM_CURRENT_OVERLAY_PANE.replace(
+        "      ok", "      (API error: Login expired · Please run /login)"
+    )
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), error_pane, error_pane, _IDLE_PANE],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "harness_error")
+    assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Escape"]
+
+
 def test_keep_warm_btw_composer_mismatch_sends_no_cleanup_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14071,6 +14192,19 @@ def test_keep_warm_btw_dialog_after_paste_receives_no_keys(
     assert sends[0][:3] == ["load-buffer", "-b", "omnigent-paste"]
     assert sends[1][:1] == ["paste-buffer"]
     assert len(sends) == 2
+
+
+def test_keep_warm_btw_overlay_after_paste_blocks_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pane = _composer_pane(_KEEP_WARM_TEXT) + _KEEP_WARM_CURRENT_OVERLAY_PANE
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE, pane])
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("skipped", "composer_changed")
+    assert all("Enter" not in send for send in sends)
 
 
 def test_keep_warm_btw_multiline_composer_draft_skips_composer_draft(
@@ -14312,7 +14446,7 @@ def test_keep_warm_btw_unmarked_overlay_is_not_dismissed(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "btw_unavailable")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
 
@@ -14334,7 +14468,7 @@ def test_keep_warm_btw_prompt_during_overlay_poll_aborts(
 
     result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
 
-    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "aborted")
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
     assert sends[-1] == ["send-keys", "-t", "claude:0.0", "Enter"]
     assert ["send-keys", "-t", "claude:0.0", "Escape"] not in sends
 
@@ -14642,6 +14776,21 @@ def test_keep_warm_btw_no_overlay_fails_btw_unavailable(
     assert sends[2] == ["send-keys", "-t", "claude:0.0", "Enter"]
     # No Escape: only a verifiably-present overlay may be dismissed.
     assert len(sends) == 3
+
+
+def test_keep_warm_btw_stale_composer_does_not_prove_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, btw_guard_trackers: None
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _composer_pane(_KEEP_WARM_TEXT), _IDLE_PANE, ""],
+    )
+
+    result = claude_native_bridge.run_keep_warm_btw(bridge_dir)
+
+    assert result == claude_native_bridge.KeepWarmBtwResult("failed", "dismiss_failed")
+    assert all("Escape" not in send for send in sends)
 
 
 def test_keep_warm_btw_slow_answer_settles_and_dismisses(

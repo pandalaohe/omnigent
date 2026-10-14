@@ -977,6 +977,24 @@ async def test_failed_receipts_pause_at_three(harness: _Harness) -> None:
     assert len(harness.notices.lines) == 1
 
 
+async def test_unverified_overlay_close_pauses_after_one_receipt(harness: _Harness) -> None:
+    parent = _parent(harness)
+    u = harness.now - 55 * 60
+    child = _child(harness, parent.id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u)
+    await _tick(harness)
+    pending = _read_label(harness, child.id)
+    assert pending is not None and pending.a is not None
+
+    assert await harness.sweeper.settle_receipt(
+        child.id,
+        {"attempt_id": pending.a, "outcome": "failed", "reason": "dismiss_failed"},
+    )
+    paused = _read_label(harness, child.id)
+    assert paused is not None and paused.s == "p" and paused.why == "fail"
+    assert paused.k == "dismiss_failed" and paused.a is None
+    assert len(harness.notices.lines) == 1
+
+
 async def test_claude_two_measured_misses_pause_warming(harness: _Harness) -> None:
     """Scenario 15: two receipts with ``cache_write > cache_read`` → sticky pause."""
     parent = _parent(harness)

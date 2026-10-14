@@ -5022,10 +5022,9 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 # finishes — it does not stream chunk-by-chunk into the pane.
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 _BTW_FOOTER_CLOSE_HINT = "Esc to close"
-# A settled overlay's footer offers copy + fork; while the answer is
-# still generating the footer carries neither and a ``✻ Answering…`` line
-# shows in the region. Both conditions gate "the exchange is complete".
-_BTW_FOOTER_COMPLETE_HINTS = ("c to copy", "f to fork")
+# A settled overlay offers copy; older versions also offered fork. While
+# generating, the spinner remains in the overlay region.
+_BTW_FOOTER_COMPLETE_HINT = "c to copy"
 _BTW_ANSWERING_HINT = "Answering"
 _BTW_QUESTION_PREFIX = "/btw"
 # A settled overlay footer offers this only when earlier /btw exchanges
@@ -5140,6 +5139,22 @@ class PaneSignals:
     btw_overlay: BtwOverlay | None = None
 
 
+def _btw_overlay_bounds(lines: list[str]) -> tuple[int, int] | None:
+    """Locate the live overlay's top rule and bottom footer."""
+    footer_idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if footer_idx is None or _BTW_FOOTER_CLOSE_HINT not in lines[footer_idx]:
+        return None
+    border_idx = next(
+        (
+            i
+            for i in range(footer_idx - 1, -1, -1)
+            if lines[i].rstrip().endswith(_BTW_OVERLAY_BORDER_GLYPH)
+        ),
+        None,
+    )
+    return (border_idx, footer_idx) if border_idx is not None else None
+
+
 def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     """
     Parse a *completed* ``/btw`` side-chat overlay from a captured pane.
@@ -5152,20 +5167,12 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     :returns: The parsed overlay, or ``None``.
     """
     lines = pane.splitlines()
-    footer_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
-        None,
-    )
-    if footer_idx is None:
+    bounds = _btw_overlay_bounds(lines)
+    if bounds is None:
         return None
+    border_idx, footer_idx = bounds
     footer = lines[footer_idx]
-    if not all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
-        return None
-    border_idx = next(
-        (i for i in range(footer_idx - 1, -1, -1) if _BTW_OVERLAY_BORDER_GLYPH in lines[i]),
-        None,
-    )
-    if border_idx is None:
+    if _BTW_FOOTER_COMPLETE_HINT not in footer:
         return None
     region = lines[border_idx + 1 : footer_idx]
     # A ``✻ Answering…`` line means the (current) exchange is still in
@@ -5210,24 +5217,20 @@ def _btw_overlay_present(pane: str) -> bool:
     :returns: True when the ``/btw`` overlay is visible.
     """
     lines = pane.splitlines()
-    footer_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
-        None,
-    )
-    if footer_idx is None:
+    bounds = _btw_overlay_bounds(lines)
+    if bounds is None:
         return False
-    if not any(_BTW_OVERLAY_BORDER_GLYPH in line for line in lines[:footer_idx]):
-        return False
+    border_idx, footer_idx = bounds
     footer = lines[footer_idx]
-    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # The /btw footer offers copy (settled), switch (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
     # surfaces) from matching.
-    if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
+    if _BTW_FOOTER_COMPLETE_HINT in footer:
         return True
     if "to switch" in footer:
         return True
-    return any(_BTW_ANSWERING_HINT in line for line in lines[:footer_idx])
+    return any(_BTW_ANSWERING_HINT in line for line in lines[border_idx + 1 : footer_idx])
 
 
 def _keep_warm_btw_overlay_present(pane: str) -> bool:
@@ -5247,16 +5250,14 @@ def _keep_warm_btw_overlay_present(pane: str) -> bool:
     if not _btw_overlay_present(pane):
         return False
     lines = pane.splitlines()
-    footer_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
-        None,
-    )
-    if footer_idx is None:
+    bounds = _btw_overlay_bounds(lines)
+    if bounds is None:
         return False
+    border_idx, footer_idx = bounds
     question_idx = next(
         (
             i
-            for i in range(footer_idx - 1, -1, -1)
+            for i in range(footer_idx - 1, border_idx, -1)
             if lines[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
         ),
         None,
@@ -8213,7 +8214,7 @@ class KeepWarmBtwResult:
         overlay appeared or the attempt had to abort.
     :param reason: Machine reason for non-ok outcomes: ``"card"``,
         ``"unknown"``, ``"busy"``, ``"composer_draft"``,
-        ``"user_active"``, ``"composer_changed"``, ``"aborted"``,
+        ``"user_active"``, ``"composer_changed"``, ``"harness_error"``,
         ``"timeout"``, ``"dismiss_failed"``, or ``"btw_unavailable"``.
     """
 
@@ -8245,9 +8246,14 @@ def _composer_region_text(pane: str) -> str | None:
     :returns: The full composer text, or ``None`` when the render
         can't be read exactly.
     """
+    if _btw_overlay_present(pane):
+        return None
     lines = pane.splitlines()
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
+        return None
+    # A modal footer below an older framed composer means that box is covered.
+    if any(_ESCAPE_DISMISS_HINT.search(line) for line in lines[rules[-1] + 1 :]):
         return None
     # Claude Code renders the glyph's separator as a no-break space (U+00A0).
     region = [line.rstrip(" \xa0") for line in lines[rules[-2] + 1 : rules[-1]]]
@@ -8404,9 +8410,8 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
     Each attempt re-reads a fresh capture. A failed capture (``""``) is
     unknown, never evidence: as an attempt's first capture it returns
     ``False`` with no key spent; inside the post-Escape poll it keeps
-    polling until the deadline. A readable capture without our marked
-    overlay (:func:`_keep_warm_btw_overlay_present`) is closed —
-    ``True``, no key spent. A readable capture still showing it gates
+    polling until the deadline. A missing marker proves closure only
+    with a readable, uncovered composer. A capture still showing it gates
     the Escape on no pending user prompt and Claude free behind the
     overlay (:func:`_claude_free_behind_keep_warm_overlay`). After an
     Escape, fresh captures are polled
@@ -8426,8 +8431,8 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string.
-    :returns: ``True`` when our overlay is verifiably not on screen on a
-        readable capture; ``False`` when closed could not be verified (a
+    :returns: ``True`` when the uncovered composer verifies closure;
+        ``False`` when closed could not be verified (a
         gate refused, the capture unreadable, or it stays open after two
         Escapes).
     """
@@ -8437,8 +8442,7 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
             # A failed capture is unknown — never evidence of closed; spend no key.
             return False
         if not _keep_warm_btw_overlay_present(pane):
-            # Readable, and ours is not on screen: closed (a sent Escape did it, or it never was).
-            return True
+            return _keep_warm_overlay_closed(pane)
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
             return False
         if not _claude_free_behind_keep_warm_overlay(bridge_dir, socket_path, tmux_target):
@@ -8448,9 +8452,19 @@ def _dismiss_keep_warm_btw_overlay(bridge_dir: Path, socket_path: str, tmux_targ
         while time.monotonic() < deadline:
             time.sleep(_KEEP_WARM_DISMISS_POLL_INTERVAL_S)
             pane = _capture_pane(socket_path, tmux_target)
-            if pane != "" and not _keep_warm_btw_overlay_present(pane):
+            if _keep_warm_overlay_closed(pane):
                 return True
     return False
+
+
+def _keep_warm_overlay_closed(pane: str) -> bool:
+    """Require a freshly readable, uncovered composer before declaring close."""
+    return (
+        bool(pane)
+        and not _btw_overlay_present(pane)
+        and claude_pane_text_ready(pane)
+        and _composer_region_text(pane) is not None
+    )
 
 
 def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
@@ -8491,11 +8505,9 @@ def run_keep_warm_btw(bridge_dir: Path) -> KeepWarmBtwResult:
     ``dismiss_failed``). If the answer outlives the overlay settle
     deadline — the call's hard :data:`_KEEP_WARM_BRIDGE_BUDGET_S`
     budget minus the :data:`_KEEP_WARM_CLOSE_RESERVE_S` close time —
-    our marked overlay in ANY state (seen on the settle loop's last
-    readable capture) is Escaped the same way →
-    ``timeout`` (closed) or ``dismiss_failed`` — the ping always
-    closes what it opened, so the session never reads running until a
-    person presses Esc. Keys go only into our own marked overlay on a
+    a fresh capture of our marked overlay in ANY state is Escaped the
+    same way → ``timeout`` (closed) or ``dismiss_failed`` (closure
+    unverified, so warming pauses). Keys go only into our own marked overlay on a
     fresh capture, whose dismissal accepts idle or that dialog-open
     status behind the overlay. Accepted residual: a real turn that
     starts behind our overlay and is reported as ``"dialog open"``
@@ -8540,7 +8552,7 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
     if running:
         return KeepWarmBtwResult("skipped", "busy")
     pane = _capture_pane(socket_path, tmux_target)
-    if not claude_pane_text_ready(pane):
+    if not claude_pane_text_ready(pane) or _btw_overlay_present(pane):
         return KeepWarmBtwResult("skipped", "busy")
     draft = _composer_region_text(pane)
     if draft is None:
@@ -8577,7 +8589,7 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
         if running:
             return KeepWarmBtwResult("skipped", "busy")
         draft = _composer_region_text(pane)
-        if draft == KEEP_WARM_BTW_TEXT:
+        if draft == KEEP_WARM_BTW_TEXT and claude_pane_text_ready(pane):
             break
         if draft not in (None, ""):
             return KeepWarmBtwResult("skipped", "composer_changed")
@@ -8593,7 +8605,7 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
         if pane != "":
             last_readable_pane = pane
         if _has_approval_wait(bridge_dir) or _user_prompt_visible(pane):
-            return KeepWarmBtwResult("failed", "aborted")
+            return KeepWarmBtwResult("failed", "dismiss_failed")
         # No status read here: our own open /btw overlay reports
         # waiting/"dialog open"; the dismissal's gate protects the Escape.
         overlay = _btw_overlay_from_pane(pane)
@@ -8608,20 +8620,18 @@ def _guarded_keep_warm_btw(bridge_dir: Path, deadline: float) -> KeepWarmBtwResu
             with _keep_warm_tmux_deadline(deadline):
                 dismissed = _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target)
             if dismissed:
+                if overlay.answer.startswith("(API error:"):
+                    return KeepWarmBtwResult("failed", "harness_error")
                 return KeepWarmBtwResult("ok")
             return KeepWarmBtwResult("failed", "dismiss_failed")
         time.sleep(_KEEP_WARM_OVERLAY_POLL_INTERVAL_S)
-    # The answer outlived its budget: close our marked overlay. The last
-    # readable capture decides; an unreadable window still enters the
-    # dismissal, whose own fresh capture verifies ownership before a key.
-    if last_readable_pane is None or _keep_warm_btw_overlay_present(last_readable_pane):
-        with _keep_warm_tmux_deadline(deadline):
-            dismissed = _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target)
-        if dismissed:
-            return KeepWarmBtwResult("failed", "timeout")
+    # Only a fresh capture can prove closure after the settle budget expires.
+    with _keep_warm_tmux_deadline(deadline):
+        dismissed = _dismiss_keep_warm_btw_overlay(bridge_dir, socket_path, tmux_target)
+    if not dismissed:
         return KeepWarmBtwResult("failed", "dismiss_failed")
-    # Not ours / not present: leave it alone. No fallback: repeated
-    # btw_unavailable failures pause keep-warm for the session.
+    if last_readable_pane is None or _keep_warm_btw_overlay_present(last_readable_pane):
+        return KeepWarmBtwResult("failed", "timeout")
     return KeepWarmBtwResult("failed", "btw_unavailable")
 
 
