@@ -79,6 +79,10 @@ reads a local copy outside the working checkout. See
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
 | `attachment_max_upload_bytes` | `2147483648` (2 GiB) | Encoded bytes per upload request, any type |
+| `attachment_max_image_bytes` | `52428800` (50 MiB) | Bytes per compressible image upload (PNG, JPEG, WebP, static GIF) |
+| `attachment_max_uncompressed_image_bytes` | `5242880` (5 MiB) | Bytes per other image upload |
+| `attachment_max_pdf_bytes` | `20971520` (20 MiB) | Bytes per PDF upload |
+| `attachment_max_text_bytes` | `10485760` (10 MiB) | Bytes per text/code upload |
 | `filesystem_attachment_max_bytes` | `0` (unlimited) | Bytes per file |
 | `filesystem_attachment_max_files` | `0` (unlimited) | Stored files of these types per session |
 | `filesystem_attachment_max_total_bytes` | `0` (unlimited) | Combined bytes of these types per session |
@@ -112,9 +116,14 @@ Classification uses the stored filename's extension, even when the browser
 reports a different MIME type. It does not identify file formats from their
 bytes, inspect archive entries, or detect renamed binary content. The denylist
 does not restrict files the agent creates or downloads through other tools.
-Images, PDFs, and text/code uploads retain their separate existing limits;
-the web composer validates against the limits published by `/v1/info`,
-falling back to its built-in ceilings on an older server.
+Images, PDFs, and text/code uploads use the separate limits above; the web
+composer and question answer images validate against the values published by
+`/v1/info`, falling back to their built-in ceilings on an older server.
+Image compression still targets the model's image budget after admission.
+Every animated GIF, regardless of size, is stored unchanged as a by-path file
+for the agent. It uses the `filesystem_attachment_max_*` limits and requires
+path-attachment support. Static GIFs keep the image upload limit and normal
+compression. The chat still displays GIF image previews.
 
 Request-phase policies receive the filename and content type for these files,
 with an empty `text` value. Their document, archive, and database contents are

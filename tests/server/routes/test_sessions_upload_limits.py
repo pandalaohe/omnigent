@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import tracemalloc
 from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, BinaryIO
@@ -15,6 +16,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
@@ -103,6 +105,160 @@ def _upload(
         f"/v1/sessions/{session_id}/resources/files",
         files={"file": (filename, data, content_type)},
     )
+
+
+def _gif(*, animated: bool) -> bytes:
+    buffer = BytesIO()
+    first = Image.new("RGB", (2, 2), "red")
+    if animated:
+        second = Image.new("RGB", (2, 2), "blue")
+        first.save(buffer, format="GIF", save_all=True, append_images=[second], duration=100)
+    else:
+        first.save(buffer, format="GIF")
+    return buffer.getvalue()
+
+
+def _animated_gif_with_comment(comment_size: int) -> bytes:
+    original = _gif(animated=True)
+    packed = original[10]
+    color_table_size = 3 * (1 << ((packed & 7) + 1)) if packed & 0x80 else 0
+    after_color_table = 13 + color_table_size
+    blocks, remainder = divmod(comment_size, 255)
+    comment = b"!\xfe" + (b"\xff" + b"C" * 255) * blocks
+    if remainder:
+        comment += bytes([remainder]) + b"C" * remainder
+    comment += b"\x00"
+    return original[:after_color_table] + comment + original[after_color_table:]
+
+
+def test_gif_probe_skips_large_comment_with_bounded_reads_and_memory() -> None:
+    from omnigent.server.routes.sessions.routes_resources import _is_animated_gif
+
+    original = _animated_gif_with_comment(4 * 1024 * 1024)
+
+    class TrackedSpool(BytesIO):
+        largest_read = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.largest_read = max(self.largest_read, size)
+            return super().read(size)
+
+    spool = TrackedSpool(original)
+    tracemalloc.start()
+    try:
+        assert _is_animated_gif(spool)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert spool.tell() == 0
+    assert spool.largest_read <= 13
+    assert peak < 512 * 1024
+
+
+def test_large_animated_gif_upload_preserves_original_bytes(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = _animated_gif_with_comment(4 * 1024 * 1024)
+    assert len(original) > 3_500_000
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {
+            "attachment_max_image_bytes": 1 * 1024 * 1024,
+            "filesystem_attachment_max_bytes": 0,
+        },
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "large.gif", original, "image/gif")
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+    content = client.get(f"/v1/sessions/{session_id}/resources/files/{body['id']}/content")
+    assert content.status_code == 200, content.text
+    assert content.headers["content-type"] == "image/gif"
+    assert content.content == original
+
+
+@pytest.mark.parametrize("cut", range(61, 69))
+def test_truncated_animated_gif_upload_does_not_crash(
+    upload_client: tuple[TestClient, str], cut: int
+) -> None:
+    client, session_id = upload_client
+    response = _upload(client, session_id, "truncated.gif", _gif(animated=True)[:cut], "image/gif")
+    assert response.status_code in (201, 413), response.text
+
+
+def test_animated_gif_keeps_pixel_bomb_guard(upload_client: tuple[TestClient, str]) -> None:
+    client, session_id = upload_client
+    original = _gif(animated=True)
+    oversized_screen = original[:6] + b"\xff\xff\xff\xff" + original[10:]
+    response = _upload(client, session_id, "huge-dimensions.gif", oversized_screen, "image/gif")
+    assert response.status_code == 413, response.text
+
+
+@pytest.mark.parametrize("filename,mime", [("moving.gif", "image/gif"), ("moving.gif", "")])
+def test_animated_gif_routes_by_path_with_original_bytes_and_mime(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    mime: str,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"attachment_max_image_bytes": 1, "filesystem_attachment_max_bytes": 0},
+    )
+    client, session_id = upload_client
+    original = _gif(animated=True)
+    response = _upload(client, session_id, filename, original, mime)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+    content = client.get(f"/v1/sessions/{session_id}/resources/files/{body['id']}/content")
+    assert content.status_code == 200, content.text
+    assert content.headers["content-type"] == "image/gif"
+    assert content.content == original
+
+
+def test_tiny_animated_gif_still_routes_by_path(upload_client: tuple[TestClient, str]) -> None:
+    client, session_id = upload_client
+    original = _gif(animated=True)
+    response = _upload(client, session_id, "tiny.gif", original, "image/gif")
+    assert response.status_code == 201, response.text
+    assert response.json()["metadata"]["source_metadata"] == {"delivery": "filesystem"}
+
+
+def test_static_gif_remains_inline_and_obeys_image_cap(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, session_id = upload_client
+    original = _gif(animated=False)
+    response = _upload(client, session_id, "still.gif", original, "image/gif")
+    assert response.status_code == 201, response.text
+    assert response.json()["metadata"]["source_metadata"] != {"delivery": "filesystem"}
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"attachment_max_image_bytes": len(original) - 1},
+    )
+    assert _upload(client, session_id, "capped.gif", original, "image/gif").status_code == 413
+
+
+def test_animated_gif_obeys_filesystem_cap_count_and_host_capability(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, session_id = upload_client
+    original = _gif(animated=True)
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"filesystem_attachment_max_bytes": len(original) - 1},
+    )
+    assert _upload(client, session_id, "capped.gif", original, "image/gif").status_code == 413
+    monkeypatch.setattr("omnigent.server.server_config.load_server_config", dict)
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_file_limit", lambda: 1
+    )
+    assert _upload(client, session_id, "first.gif", original, "image/gif").status_code == 201
+    assert _upload(client, session_id, "second.gif", original, "image/gif").status_code == 413
+    client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4").hello.capabilities = []
+    assert _upload(client, session_id, "old-host.gif", original, "image/gif").status_code == 409
 
 
 @pytest.mark.parametrize(
@@ -342,6 +498,74 @@ async def test_read_upload_capped_boundary(size: int, rejected: bool) -> None:
         assert error.value.status_code == 413
     else:
         assert await _read_upload_capped(upload, 100) == data
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "config_key"),
+    [
+        ("picture.png", "image/png", "attachment_max_image_bytes"),
+        ("drawing.svg", "image/svg+xml", "attachment_max_uncompressed_image_bytes"),
+        ("report.pdf", "application/pdf", "attachment_max_pdf_bytes"),
+        ("notes.txt", "text/plain", "attachment_max_text_bytes"),
+    ],
+)
+def test_configured_inline_limit_rejects_upload(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+    config_key: str,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config", lambda: {config_key: 10}
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, filename, b"x" * 11, content_type)
+    assert response.status_code == 413, response.text
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "config_key"),
+    [
+        ("picture.png", "image/png", "attachment_max_image_bytes"),
+        ("drawing.svg", "image/svg+xml", "attachment_max_uncompressed_image_bytes"),
+        ("report.pdf", "application/pdf", "attachment_max_pdf_bytes"),
+        ("notes.txt", "text/plain", "attachment_max_text_bytes"),
+    ],
+)
+@pytest.mark.parametrize("configured_limit", [32, 0])
+def test_raised_or_unlimited_inline_cap_bypasses_old_read_backstop(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+    config_key: str,
+    configured_limit: int,
+) -> None:
+    from omnigent.runtime import content_resolver
+
+    # A small stand-in for the former fixed 50 MiB read backstop keeps this
+    # route test tiny while exercising the same admission path.
+    monkeypatch.setattr(content_resolver, "MAX_ATTACHMENT_UPLOAD_BYTES", 8)
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {config_key: configured_limit},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, filename, b"x" * 16, content_type)
+    assert response.status_code == 201, response.text
+
+
+def test_invalid_inline_cap_uses_default(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"attachment_max_text_bytes": -1},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "notes.txt", b"x" * 16, "text/plain")
+    assert response.status_code == 201, response.text
 
 
 @pytest.mark.parametrize(

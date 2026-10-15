@@ -933,6 +933,34 @@ async def test_resolve_file_reference_by_path_reuses_without_content_get(
 
 
 @pytest.mark.asyncio
+async def test_animated_gif_image_block_materializes_original_by_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    original = b"GIF89a two-frame original bytes"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=original, headers={"content-type": "image/gif"})
+        metadata = _by_path_meta("moving.gif", stored_bytes=len(original))
+        metadata["content_type"] = "image/gif"
+        return httpx.Response(200, json=metadata)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        blocks = await resolve_file_reference(
+            {"type": "input_image", "file_id": "file_1", "filename": "moving.gif"},
+            session_id="conv_1",
+            client=client,
+        )
+
+    target = _session_target(tmp_path, "file_1", "moving.gif")
+    assert blocks == [{"type": "input_text", "text": f"[Attached: {target}]"}]
+    assert target.read_bytes() == original
+
+
+@pytest.mark.asyncio
 async def test_resolve_file_reference_inline_matches_resolve_file_id_block() -> None:
     """An inline row resolves exactly as resolve_file_id_block, plus its notice."""
     payload = {

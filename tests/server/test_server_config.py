@@ -303,6 +303,25 @@ def test_attachment_limits_reflect_configuration(monkeypatch: pytest.MonkeyPatch
     assert limits["session_bytes"] == 4096
 
 
+def test_inline_attachment_limits_load_yaml_and_fall_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "attachment_max_image_bytes: 67108864\n"
+        "attachment_max_uncompressed_image_bytes: 0\n"
+        "attachment_max_pdf_bytes: -1\n"
+        "attachment_max_text_bytes: invalid\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    limits = server_config_module.attachment_limits()
+    assert limits["image_bytes"] == 64 * 1024**2
+    assert limits["uncompressed_image_bytes"] is None
+    assert limits["pdf_bytes"] == 20 * 1024**2
+    assert limits["text_bytes"] == 10 * 1024**2
+
+
 # ── archive cleanup settings ──────────────────────────────────────
 
 

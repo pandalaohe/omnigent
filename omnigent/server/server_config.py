@@ -326,9 +326,8 @@ def attachment_limits() -> dict[str, int | None]:
     """Every attachment size limit the web client should enforce.
 
     Published verbatim by ``GET /v1/info`` as ``attachment_limits`` (``None``
-    = unlimited). The first four are deployment settings read per call; the
-    last four are the fixed inline per-type caps from
-    :mod:`omnigent.runtime.content_resolver`.
+    = unlimited). All limits are deployment settings read per call. The
+    inline per-type defaults come from :mod:`omnigent.runtime.content_resolver`.
     """
     from omnigent.runtime.content_resolver import (
         IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
@@ -342,10 +341,12 @@ def attachment_limits() -> dict[str, int | None]:
         "file_bytes": filesystem_attachment_upload_limit(),
         "session_files": filesystem_attachment_file_limit(),
         "session_bytes": filesystem_attachment_total_bytes_limit(),
-        "image_bytes": MAX_IMAGE_UPLOAD_BYTES,
-        "uncompressed_image_bytes": IMAGE_UNCOMPRESSED_UPLOAD_BYTES,
-        "pdf_bytes": MAX_PDF_UPLOAD_BYTES,
-        "text_bytes": MAX_TEXT_UPLOAD_BYTES,
+        "image_bytes": _config_limit("attachment_max_image_bytes", MAX_IMAGE_UPLOAD_BYTES),
+        "uncompressed_image_bytes": _config_limit(
+            "attachment_max_uncompressed_image_bytes", IMAGE_UNCOMPRESSED_UPLOAD_BYTES
+        ),
+        "pdf_bytes": _config_limit("attachment_max_pdf_bytes", MAX_PDF_UPLOAD_BYTES),
+        "text_bytes": _config_limit("attachment_max_text_bytes", MAX_TEXT_UPLOAD_BYTES),
     }
 
 

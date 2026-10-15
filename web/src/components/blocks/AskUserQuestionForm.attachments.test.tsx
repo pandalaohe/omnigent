@@ -2,6 +2,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { castAskUserQuestionPayload } from "@/lib/askUserQuestion";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { AttachmentLimits } from "@/lib/attachments";
+import type { ServerInfo } from "@/lib/capabilities";
 import * as filesApi from "@/lib/filesApi";
 import {
   captureQuestionCardInputTarget,
@@ -37,26 +40,65 @@ afterEach(() => {
 function renderAsyncForm(
   specs: { id: string; question: string; options?: { label: string }[] }[],
   onReject = vi.fn(),
+  limits?: AttachmentLimits,
 ) {
   const payload = castAskUserQuestionPayload({ questions: specs });
   if (!payload) throw new Error("Expected valid question payload");
   const onSubmit = vi.fn().mockResolvedValue(true);
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <FileViewerContext.Provider value={fileViewer}>
-        <AskUserQuestionForm
-          questions={payload.questions}
-          asyncTarget={{ sessionId: "session-a", cardId: "card-a" }}
-          onSubmit={onSubmit}
-          onReject={onReject}
-        />
-      </FileViewerContext.Provider>
+      <CapabilitiesProvider
+        info={limits ? ({ attachment_limits: limits } as ServerInfo) : "loading"}
+      >
+        <FileViewerContext.Provider value={fileViewer}>
+          <AskUserQuestionForm
+            questions={payload.questions}
+            asyncTarget={{ sessionId: "session-a", cardId: "card-a" }}
+            onSubmit={onSubmit}
+            onReject={onReject}
+          />
+        </FileViewerContext.Provider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
   return onSubmit;
 }
 
 describe("async question answer images", () => {
+  it("accepts a GIF with blank browser MIME as an answer image", () => {
+    renderAsyncForm([{ id: "q1", question: "Show the animation" }], vi.fn(), {
+      image_bytes: 1,
+      upload_bytes: 100,
+    });
+    const gif = new File(["GIF89a"], "moving.gif");
+    fireEvent.change(screen.getByLabelText("Choose answer images"), {
+      target: { files: [gif] },
+    });
+    expect(screen.getByRole("button", { name: "Remove moving.gif" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("rejects an image over the server's configured cap", () => {
+    renderAsyncForm([{ id: "q1", question: "Show the problem" }], vi.fn(), {
+      image_bytes: 10,
+    });
+    const image = new File(["sixteen bytes!!!"], "large.png", { type: "image/png" });
+    fireEvent.change(screen.getByLabelText("Choose answer images"), { target: { files: [image] } });
+    expect(screen.getByRole("alert")).toHaveTextContent("large.png");
+    expect(screen.queryByRole("button", { name: "Remove large.png" })).not.toBeInTheDocument();
+  });
+
+  it("accepts a configured image cap beyond the older client fallback", () => {
+    renderAsyncForm([{ id: "q1", question: "Show the problem" }], vi.fn(), {
+      image_bytes: 64 * 1024 * 1024,
+    });
+    const image = new File(["png"], "large.png", { type: "image/png" });
+    Object.defineProperty(image, "size", { value: 51 * 1024 * 1024 });
+    fireEvent.change(screen.getByLabelText("Choose answer images"), { target: { files: [image] } });
+    expect(screen.getByRole("button", { name: "Remove large.png" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("uploads an image-only answer, preserving its question key", async () => {
     vi.mocked(filesApi.uploadFile).mockResolvedValue({ id: "image-a" } as Awaited<
       ReturnType<typeof filesApi.uploadFile>

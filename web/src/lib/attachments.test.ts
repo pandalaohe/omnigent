@@ -39,6 +39,7 @@ describe("classifyAttachment", () => {
   it("classifies images by MIME", () => {
     expect(classifyAttachment(makeFile("a.png", "image/png"))).toBe("image");
     expect(classifyAttachment(makeFile("a.jpg", "image/jpeg"))).toBe("image");
+    expect(classifyAttachment(makeFile("a.gif", ""))).toBe("image");
   });
 
   it("classifies PDF by MIME or extension", () => {
@@ -148,6 +149,22 @@ describe("validateAttachments", () => {
     expect(accepted).toHaveLength(0);
     expect(errors[0]).toContain("clip.mp4");
     expect(errors[0]).toContain("10 MB");
+  });
+
+  it("allows a compressible image above the fallback when the server raises its cap", () => {
+    const image = makeFile("large.png", "image/png");
+    Object.defineProperty(image, "size", { value: 51 * MB });
+    expect(validateAttachments([image]).accepted).toHaveLength(0);
+    expect(validateAttachments([image], { image_bytes: 64 * MB }).accepted).toEqual([image]);
+  });
+
+  it("defers GIF image/file caps to the server while enforcing the request cap", () => {
+    const gif = makeFile("moving.gif", "", 20);
+    const limits = { image_bytes: 1, file_bytes: 1, upload_bytes: 20 };
+    expect(validateAttachments([gif], limits).accepted).toEqual([gif]);
+    expect(validateAttachments([makeFile("moving.gif", "image/gif", 21)], limits).accepted).toEqual(
+      [],
+    );
   });
 
   it("treats a null limit as unlimited for that category", () => {

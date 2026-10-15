@@ -499,6 +499,28 @@ async def test_info_publishes_default_attachment_limits(
     }
 
 
+@pytest.mark.asyncio
+async def test_info_publishes_configured_inline_limits(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "attachment_max_image_bytes: 67108864\n"
+        "attachment_max_uncompressed_image_bytes: 0\n"
+        "attachment_max_pdf_bytes: 4096\n"
+        "attachment_max_text_bytes: 512\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    limits = resp.json()["attachment_limits"]
+    assert limits["image_bytes"] == 64 * 1024**2
+    assert limits["uncompressed_image_bytes"] is None
+    assert limits["pdf_bytes"] == 4096
+    assert limits["text_bytes"] == 512
+
+
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:
     output = BytesIO()
     Image.new("RGBA", (2, 2), color).save(output, format="PNG")

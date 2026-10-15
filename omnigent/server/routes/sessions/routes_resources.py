@@ -13,7 +13,7 @@ import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, BinaryIO, cast
 
 import httpx
 from fastapi import (
@@ -27,6 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from PIL import Image
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
@@ -293,6 +294,75 @@ def _get_image_compression_gate() -> asyncio.Semaphore:
 
         _image_compression_gate = asyncio.Semaphore(image_compression_concurrency())
     return _image_compression_gate
+
+
+def _is_animated_gif(spool: BinaryIO) -> bool:
+    """Find two complete GIF images without decoding or collecting extension data."""
+    try:
+        end = spool.seek(0, os.SEEK_END)
+        spool.seek(0)
+
+        def skip(size: int) -> bool:
+            if spool.tell() + size > end:
+                return False
+            spool.seek(size, os.SEEK_CUR)
+            return True
+
+        def skip_subblocks() -> bool:
+            while block_size := spool.read(1):
+                if block_size == b"\x00":
+                    return True
+                if not skip(block_size[0]):
+                    return False
+            return False
+
+        header = spool.read(13)  # Signature/version and logical screen descriptor.
+        if len(header) != 13 or header[:6] not in (b"GIF87a", b"GIF89a"):
+            return False
+        screen_size = int.from_bytes(header[6:8], "little") * int.from_bytes(
+            header[8:10], "little"
+        )
+        max_pixels = Image.MAX_IMAGE_PIXELS
+        if max_pixels is not None and screen_size > 2 * max_pixels:
+            raise HTTPException(
+                status_code=413, detail="the image's dimensions are too large to process"
+            )
+        packed = header[10]
+        if packed & 0x80 and not skip(3 * (1 << ((packed & 7) + 1))):
+            return False
+
+        frames = 0
+        while marker := spool.read(1):
+            if marker == b"\x21":  # Extension label, then size-prefixed data blocks.
+                if not spool.read(1) or not skip_subblocks():
+                    return False
+            elif marker == b"\x2c":  # Image descriptor and optional local color table.
+                descriptor = spool.read(9)
+                if len(descriptor) != 9:
+                    return False
+                frame_size = int.from_bytes(descriptor[4:6], "little") * int.from_bytes(
+                    descriptor[6:8], "little"
+                )
+                if max_pixels is not None and frame_size > 2 * max_pixels:
+                    raise HTTPException(
+                        status_code=413, detail="the image's dimensions are too large to process"
+                    )
+                packed = descriptor[8]
+                if packed & 0x80 and not skip(3 * (1 << ((packed & 7) + 1))):
+                    return False
+                if not spool.read(1) or not skip_subblocks():  # LZW size and image data.
+                    return False
+                frames += 1
+                if frames == 2:
+                    return True
+            else:
+                # A trailer or an unknown/incomplete block cannot supply frame two.
+                return False
+        return False
+    except (OSError, ValueError):
+        return False
+    finally:
+        spool.seek(0)
 
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
@@ -1916,7 +1986,6 @@ def register_resources_routes(
         from omnigent.inner.native_attachments import requires_filesystem
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
-            MAX_ATTACHMENT_UPLOAD_BYTES,
             ImageCompressionError,
             _resolve_content_type,
             attachment_text_type_for_extension,
@@ -1925,7 +1994,10 @@ def register_resources_routes(
             image_filename_for_content_type,
             image_needs_compression,
         )
-        from omnigent.server.server_config import filesystem_attachment_upload_limit
+        from omnigent.server.server_config import (
+            attachment_limits,
+            filesystem_attachment_upload_limit,
+        )
 
         # Validate the type and limits before buffering the file.
         content_type = _resolve_content_type(
@@ -1935,6 +2007,13 @@ def register_resources_routes(
         # Check the filename first so a misleading MIME cannot make a legacy
         # filesystem format look inline.
         filesystem_required = requires_filesystem(file.filename)
+        animated_gif = False
+        if content_type == "image/gif" or Path(file.filename).suffix.lower() == ".gif":
+            async with _get_image_compression_gate():
+                animated_gif = await asyncio.to_thread(_is_animated_gif, file.file)
+            if animated_gif:
+                filesystem_required = True
+                content_type = "image/gif"
         type_limit = None if filesystem_required else attachment_upload_limit(content_type)
         if type_limit is None and not filesystem_required:
             # The browser/OS can mislabel a text/code file as binary (e.g. a
@@ -1945,12 +2024,13 @@ def register_resources_routes(
             if ext_type is not None:
                 content_type = ext_type
                 type_limit = attachment_upload_limit(content_type)
-        # Everything the inline set cannot carry goes by path: persisted for
-        # the agent host and streamed there by the runner, never gated by
-        # harness.
+        # Files selected for path delivery are persisted for the agent host
+        # and streamed there by the runner, never gated by harness.
         if type_limit is None:
-            # Drop the declared type so the file is never stored as text.
-            content_type = _resolve_content_type("application/octet-stream", file.filename)
+            # Keep image/gif for animations, including unnamed browser uploads.
+            # Other path files discard a misleading declared text type.
+            if not animated_gif:
+                content_type = _resolve_content_type("application/octet-stream", file.filename)
             await _require_filesystem_attachment_support(request, conv)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
@@ -2031,7 +2111,18 @@ def register_resources_routes(
                         code=ErrorCode.INTERNAL_ERROR,
                     ) from exc
             else:
-                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+                limits = attachment_limits()
+                if content_type.startswith("image/"):
+                    limit_key = (
+                        "image_bytes"
+                        if content_type in _COMPRESSIBLE_IMAGE_MIMES
+                        else "uncompressed_image_bytes"
+                    )
+                elif content_type == "application/pdf":
+                    limit_key = "pdf_bytes"
+                else:
+                    limit_key = "text_bytes"
+                read_limit = limits[limit_key]
                 # Persist original dimensions only after a downscale.
                 source_dims: tuple[int, int] | None = None
                 if content_type in _COMPRESSIBLE_IMAGE_MIMES:

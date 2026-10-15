@@ -5630,6 +5630,44 @@ describe("chatStore — send (cross-session routing)", () => {
 });
 
 describe("chatStore — send (file attachments)", () => {
+  it("keeps a blank-MIME GIF as an image through optimistic and uploaded sends", async () => {
+    const gif = new File(["gif bytes"], "moving.gif");
+    const started = beginLocalConversation("inspect", [gif]);
+    expect(started).not.toBeNull();
+    expect(useChatStore.getState().pendingUserMessages[0]!.content).toContainEqual({
+      type: "input_image",
+      file_id: expect.stringMatching(/^pending:/),
+      filename: "moving.gif",
+    });
+
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return mockResponse({ id: "file_gif", name: "moving.gif", metadata: { bytes: 9 } });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("inspect", "agent_xyz", [gif]);
+    expect(useChatStore.getState().pendingUserMessages.at(-1)!.content).toContainEqual({
+      type: "input_image",
+      file_id: "file_gif",
+      filename: "moving.gif",
+    });
+    const post = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url) === "/v1/sessions/conv_existing/events" &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(JSON.parse((post![1] as RequestInit).body as string).data.content).toContainEqual({
+      type: "input_image",
+      file_id: "file_gif",
+      filename: "moving.gif",
+    });
+  });
+
   it("keeps an inline attachment between the surrounding text blocks", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",

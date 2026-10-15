@@ -6,12 +6,12 @@
  * omnigent/runtime/content_resolver.py (`attachment_upload_limit`) and the
  * upload route (413 for oversized). Keeping a copy here lets us reject a
  * bad file at paste/drop/pick time — before a slow upload — with a friendly
- * message. The server still enforces; this is UX only. Keep the limits in
- * sync with the Python constants.
+ * message. The server still enforces; this is UX only. The fixed values below
+ * are fallbacks for older servers that do not publish attachment limits.
  */
 
 /**
- * Per-type upload size limits, in megabytes. Mirrors the server caps.
+ * Fallback per-type upload size limits, in megabytes. Mirrors server defaults.
  *
  * Compressible raster images accept a large upload — the server
  * downscales/re-encodes an oversized one under the provider's per-image limit
@@ -19,9 +19,7 @@
  * shrunk by hand. Other image types (SVG, …) can't be shrunk, so they keep the
  * smaller `UNCOMPRESSED_IMAGE_LIMIT_MB` cap (see `validateAttachments`).
  *
- * These are fixed client-side ceilings, so a deployment that raises a server
- * limit (e.g. `filesystem_attachment_max_bytes`) also needs these raised for the
- * extra allowance to be usable from the web UI.
+ * Current servers publish their configured ceilings through `/v1/info`.
  */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
   image: 50,
@@ -31,7 +29,7 @@ export const ATTACHMENT_SIZE_LIMITS_MB = {
 } as const;
 
 // Raster image types the server can compress under the model limit; only these
-// get the large image cap. Mirrors _COMPRESSIBLE_IMAGE_MIMES on the server.
+// get the large fallback image cap. Animated GIFs are routed by path server-side.
 const COMPRESSIBLE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 // Image types we don't compress (SVG, …) keep this smaller cap. Mirrors
@@ -173,10 +171,9 @@ function extensionOf(filename: string): string {
 }
 
 /**
- * Classify a file into an attachment category. Images, PDF and text are
- * inlined into the model context; everything else is a `"file"` the server
- * stores and the agent host receives by path. Files requiring local tools are
- * identified by extension; other types also use the browser MIME.
+ * Classify a file into an attachment category for browser validation. The
+ * server detects animated GIFs and delivers those by path. Files requiring
+ * local tools are identified by extension; other types also use browser MIME.
  */
 export function classifyAttachment(file: File): AttachmentCategory {
   const type = file.type || "";
@@ -184,7 +181,7 @@ export function classifyAttachment(file: File): AttachmentCategory {
 
   // Match the server even when a browser mislabels a ZIP as text/plain.
   if (FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)) return "file";
-  if (type.startsWith("image/")) return "image";
+  if (type.startsWith("image/") || ext === ".gif") return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
     type.startsWith("text/") ||
@@ -228,7 +225,8 @@ function formatLimitBytes(bytes: number): string {
  */
 function limitBytesFor(file: File, limits: AttachmentLimits | undefined): number | null {
   const category = classifyAttachment(file);
-  const compressible = COMPRESSIBLE_IMAGE_MIMES.has(file.type || "");
+  const gif = file.type === "image/gif" || extensionOf(file.name || "") === ".gif";
+  const compressible = COMPRESSIBLE_IMAGE_MIMES.has(file.type || "") || gif;
   if (limits === undefined) {
     // Non-compressible images (SVG, …) can't be shrunk server-side, so they
     // keep the smaller cap; compressible raster images get the large cap.
@@ -238,6 +236,10 @@ function limitBytesFor(file: File, limits: AttachmentLimits | undefined): number
         : ATTACHMENT_SIZE_LIMITS_MB[category];
     return limitMb * 1024 * 1024;
   }
+  // The browser cannot know whether a GIF has more than one frame. Static GIFs
+  // use the image cap and animations use the filesystem cap, so let the server
+  // apply that choice after probing the file. The request cap applies to both.
+  if (gif) return typeof limits.upload_bytes === "number" ? limits.upload_bytes : null;
   const categoryKey: keyof AttachmentLimits =
     category === "image"
       ? compressible
