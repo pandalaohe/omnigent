@@ -13305,7 +13305,7 @@ async def _handle_mcp_tools_list(
     return _mcp_ok_response(rpc_id, {"tools": tools})
 
 
-async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
+async def _read_upload_capped(file: UploadFile, limit_bytes: int | None) -> bytes:
     """
     Read an uploaded file into memory, aborting if it exceeds *limit_bytes*.
 
@@ -13314,7 +13314,7 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
     than one chunk past the limit.
 
     :param file: The multipart upload.
-    :param limit_bytes: Maximum allowed size in bytes.
+    :param limit_bytes: Maximum allowed size in bytes, or ``None`` for unlimited.
     :returns: The full file content.
     :raises HTTPException: 413 when the upload exceeds *limit_bytes*.
     """
@@ -13325,7 +13325,7 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
         if not chunk:
             break
         total += len(chunk)
-        if total > limit_bytes:
+        if limit_bytes is not None and total > limit_bytes:
             raise HTTPException(
                 status_code=413,
                 detail=(

@@ -150,6 +150,13 @@ describe("validateAttachments", () => {
     expect(errors[0]).toContain("10 MB");
   });
 
+  it("allows a compressible image above the fallback when the server raises its cap", () => {
+    const image = makeFile("large.png", "image/png");
+    Object.defineProperty(image, "size", { value: 51 * MB });
+    expect(validateAttachments([image]).accepted).toHaveLength(0);
+    expect(validateAttachments([image], { image_bytes: 64 * MB }).accepted).toEqual([image]);
+  });
+
   it("treats a null limit as unlimited for that category", () => {
     // A video far over the fixed 50 MB ceiling still passes when the server
     // publishes no per-file cap and the upload-request cap does not bound it.

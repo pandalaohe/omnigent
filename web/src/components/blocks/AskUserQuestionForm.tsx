@@ -50,6 +50,7 @@ import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
 import { validateAttachments } from "@/lib/attachments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   applyFieldEdit,
   assignLabels,
@@ -202,6 +203,7 @@ export function AskUserQuestionForm({
   onAbort,
   asyncTarget,
 }: AskUserQuestionFormProps) {
+  const serverInfo = useServerInfo();
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -288,6 +290,7 @@ export function AskUserQuestionForm({
     const nonImages = incoming.filter((file) => !file.type.startsWith("image/"));
     const { accepted, errors } = validateAttachments(
       incoming.filter((file) => file.type.startsWith("image/")),
+      serverInfo !== "loading" ? serverInfo.attachment_limits : undefined,
     );
     if (nonImages.length) errors.push("Only images can be attached to a question answer.");
     setAttachmentError(errors.length ? errors.join("\n") : null);

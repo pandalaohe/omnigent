@@ -1916,7 +1916,6 @@ def register_resources_routes(
         from omnigent.inner.native_attachments import requires_filesystem
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
-            MAX_ATTACHMENT_UPLOAD_BYTES,
             ImageCompressionError,
             _resolve_content_type,
             attachment_text_type_for_extension,
@@ -1925,7 +1924,10 @@ def register_resources_routes(
             image_filename_for_content_type,
             image_needs_compression,
         )
-        from omnigent.server.server_config import filesystem_attachment_upload_limit
+        from omnigent.server.server_config import (
+            attachment_limits,
+            filesystem_attachment_upload_limit,
+        )
 
         # Validate the type and limits before buffering the file.
         content_type = _resolve_content_type(
@@ -2031,7 +2033,18 @@ def register_resources_routes(
                         code=ErrorCode.INTERNAL_ERROR,
                     ) from exc
             else:
-                read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+                limits = attachment_limits()
+                if content_type.startswith("image/"):
+                    limit_key = (
+                        "image_bytes"
+                        if content_type in _COMPRESSIBLE_IMAGE_MIMES
+                        else "uncompressed_image_bytes"
+                    )
+                elif content_type == "application/pdf":
+                    limit_key = "pdf_bytes"
+                else:
+                    limit_key = "text_bytes"
+                read_limit = limits[limit_key]
                 # Persist original dimensions only after a downscale.
                 source_dims: tuple[int, int] | None = None
                 if content_type in _COMPRESSIBLE_IMAGE_MIMES:

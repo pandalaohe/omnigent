@@ -6,12 +6,12 @@
  * omnigent/runtime/content_resolver.py (`attachment_upload_limit`) and the
  * upload route (413 for oversized). Keeping a copy here lets us reject a
  * bad file at paste/drop/pick time — before a slow upload — with a friendly
- * message. The server still enforces; this is UX only. Keep the limits in
- * sync with the Python constants.
+ * message. The server still enforces; this is UX only. The fixed values below
+ * are fallbacks for older servers that do not publish attachment limits.
  */
 
 /**
- * Per-type upload size limits, in megabytes. Mirrors the server caps.
+ * Fallback per-type upload size limits, in megabytes. Mirrors server defaults.
  *
  * Compressible raster images accept a large upload — the server
  * downscales/re-encodes an oversized one under the provider's per-image limit
@@ -19,9 +19,7 @@
  * shrunk by hand. Other image types (SVG, …) can't be shrunk, so they keep the
  * smaller `UNCOMPRESSED_IMAGE_LIMIT_MB` cap (see `validateAttachments`).
  *
- * These are fixed client-side ceilings, so a deployment that raises a server
- * limit (e.g. `filesystem_attachment_max_bytes`) also needs these raised for the
- * extra allowance to be usable from the web UI.
+ * Current servers publish their configured ceilings through `/v1/info`.
  */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
   image: 50,

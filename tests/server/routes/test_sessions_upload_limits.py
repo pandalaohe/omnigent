@@ -345,6 +345,74 @@ async def test_read_upload_capped_boundary(size: int, rejected: bool) -> None:
 
 
 @pytest.mark.parametrize(
+    ("filename", "content_type", "config_key"),
+    [
+        ("picture.png", "image/png", "attachment_max_image_bytes"),
+        ("drawing.svg", "image/svg+xml", "attachment_max_uncompressed_image_bytes"),
+        ("report.pdf", "application/pdf", "attachment_max_pdf_bytes"),
+        ("notes.txt", "text/plain", "attachment_max_text_bytes"),
+    ],
+)
+def test_configured_inline_limit_rejects_upload(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+    config_key: str,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config", lambda: {config_key: 10}
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, filename, b"x" * 11, content_type)
+    assert response.status_code == 413, response.text
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "config_key"),
+    [
+        ("picture.png", "image/png", "attachment_max_image_bytes"),
+        ("drawing.svg", "image/svg+xml", "attachment_max_uncompressed_image_bytes"),
+        ("report.pdf", "application/pdf", "attachment_max_pdf_bytes"),
+        ("notes.txt", "text/plain", "attachment_max_text_bytes"),
+    ],
+)
+@pytest.mark.parametrize("configured_limit", [32, 0])
+def test_raised_or_unlimited_inline_cap_bypasses_old_read_backstop(
+    upload_client: tuple[TestClient, str],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_type: str,
+    config_key: str,
+    configured_limit: int,
+) -> None:
+    from omnigent.runtime import content_resolver
+
+    # A small stand-in for the former fixed 50 MiB read backstop keeps this
+    # route test tiny while exercising the same admission path.
+    monkeypatch.setattr(content_resolver, "MAX_ATTACHMENT_UPLOAD_BYTES", 8)
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {config_key: configured_limit},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, filename, b"x" * 16, content_type)
+    assert response.status_code == 201, response.text
+
+
+def test_invalid_inline_cap_uses_default(
+    upload_client: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.server_config.load_server_config",
+        lambda: {"attachment_max_text_bytes": -1},
+    )
+    client, session_id = upload_client
+    response = _upload(client, session_id, "notes.txt", b"x" * 16, "text/plain")
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.parametrize(
     "filename,content_type,status",
     [
         ("archive.zip", "application/zip", 415),
