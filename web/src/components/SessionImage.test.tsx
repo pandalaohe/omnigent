@@ -124,6 +124,17 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     expect(authenticatedFetch).toHaveBeenCalledWith("/p");
   });
 
+  it("previews an animated GIF response as its original blob", async () => {
+    const gif = new Blob(["GIF89a original animation"], { type: "image/gif" });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(gif) });
+    render(<SessionImage path="/v1/sessions/a/files/gif/content" alt="moving.gif" />);
+    expect(await screen.findByRole("img", { name: "moving.gif" })).toHaveAttribute(
+      "src",
+      "blob:fake-url",
+    );
+    expect(createObjectURL).toHaveBeenCalledWith(gif);
+  });
+
   it("renders the error fallback when the response is not ok", async () => {
     // WHY: a non-ok HTTP response must reject and drop into the error state —
     // a labelled role="img" fallback chip rather than a broken <img>.

@@ -105,15 +105,13 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # upload time via :func:`compress_image_attachment`, so the stored blob —
 # and the base64 re-sent every turn — always fits. The compressed result is
 # what lands in the file store (see the ``files`` upload route).
-# Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
+# The server publishes configurable upload caps; the web keeps these defaults
+# only for older servers that do not publish them.
 MAX_IMAGE_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
 MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
-# Per-attachment read cap, not an aggregate one. It is applied as
-# ``min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)``: only compressible images
-# reach 50 MB (then shrink to <= IMAGE_MODEL_BUDGET_BYTES before storage);
-# PDF/text keep their smaller per-type caps. So this is no longer a sub-32 MB
-# request backstop — nothing oversized is stored because images are compressed.
+# Legacy default retained for callers that compare the type defaults. Upload
+# routes use configurable per-type caps and the separate request-body cap.
 MAX_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
 
 # The larger image cap only applies to raster formats we can actually shrink
@@ -235,9 +233,8 @@ def attachment_upload_limit(content_type: str) -> int | None:
     :param content_type: The resolved MIME type, e.g. ``"image/png"``.
         Use :func:`_resolve_content_type` to derive it from the upload's
         declared type + filename first.
-    :returns: The per-type byte limit (still subject to
-        :data:`MAX_ATTACHMENT_UPLOAD_BYTES`), or ``None`` when the type is
-        not an allowed attachment.
+    :returns: The default per-type byte limit, or ``None`` when the type is
+        not an inline attachment. Upload routes apply configured limits.
     """
     if content_type.startswith("image/"):
         if content_type in _COMPRESSIBLE_IMAGE_MIMES:

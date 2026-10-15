@@ -65,6 +65,19 @@ function renderAsyncForm(
 }
 
 describe("async question answer images", () => {
+  it("accepts a GIF with blank browser MIME as an answer image", () => {
+    renderAsyncForm([{ id: "q1", question: "Show the animation" }], vi.fn(), {
+      image_bytes: 1,
+      upload_bytes: 100,
+    });
+    const gif = new File(["GIF89a"], "moving.gif");
+    fireEvent.change(screen.getByLabelText("Choose answer images"), {
+      target: { files: [gif] },
+    });
+    expect(screen.getByRole("button", { name: "Remove moving.gif" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("rejects an image over the server's configured cap", () => {
     renderAsyncForm([{ id: "q1", question: "Show the problem" }], vi.fn(), {
       image_bytes: 10,

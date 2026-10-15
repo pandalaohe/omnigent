@@ -44,6 +44,11 @@ describe("ComposerAttachments", () => {
     expect(img).toHaveAttribute("src", "blob:mock");
   });
 
+  it("previews a GIF whose browser MIME is blank", () => {
+    renderList([new File([new Uint8Array(4)], "moving.gif")]);
+    expect(screen.getByRole("img", { name: "moving.gif" })).toHaveAttribute("src", "blob:mock");
+  });
+
   it("shows a non-image file as a card with name, type, and size (no thumbnail)", () => {
     renderList([new File([new Uint8Array(4)], "notes.txt", { type: "text/plain" })]);
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
@@ -117,6 +122,7 @@ describe("iconForFile", () => {
     expect(iconForFile(new File([], "data.sqlite", { type: "" }))).toBe(Database);
     // No matching extension, so the image/* MIME wins (image without preview).
     expect(iconForFile(new File([], "photo.heic", { type: "image/heic" }))).toBe(FileImage);
+    expect(iconForFile(new File([], "moving.gif"))).toBe(FileImage);
     expect(iconForFile(new File([], "mystery", { type: "" }))).toBe(FileIcon);
   });
 });

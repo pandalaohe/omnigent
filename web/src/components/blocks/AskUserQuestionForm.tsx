@@ -49,7 +49,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
-import { validateAttachments } from "@/lib/attachments";
+import { classifyAttachment, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   applyFieldEdit,
@@ -287,9 +287,9 @@ export function AskUserQuestionForm({
 
   const addImages = (key: string, incoming: File[], insertedText = ""): File[] | null => {
     if (submittingRef.current) return null;
-    const nonImages = incoming.filter((file) => !file.type.startsWith("image/"));
+    const nonImages = incoming.filter((file) => classifyAttachment(file) !== "image");
     const { accepted, errors } = validateAttachments(
-      incoming.filter((file) => file.type.startsWith("image/")),
+      incoming.filter((file) => classifyAttachment(file) === "image"),
       serverInfo !== "loading" ? serverInfo.attachment_limits : undefined,
     );
     if (nonImages.length) errors.push("Only images can be attached to a question answer.");

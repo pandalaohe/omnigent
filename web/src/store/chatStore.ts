@@ -135,7 +135,7 @@ import type {
 } from "@/lib/types";
 import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 import { uploadFile } from "@/lib/filesApi";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { mentionItemPath, mentionMarkerFor } from "@/lib/composerMentions";
 import { insertIntoQuestionCard } from "@/lib/questionCardInput";
 import {
@@ -292,7 +292,7 @@ function pendingComposerContent(
     const filename = part.file.name || "image.png";
     const fileId = `${PENDING_FILE_PREFIX}${attachmentKey(part.file)}`;
     return [
-      part.file.type.startsWith("image/")
+      classifyAttachment(part.file) === "image"
         ? { type: "input_image", file_id: fileId, filename }
         : { type: "input_file", file_id: fileId, filename },
     ];
@@ -1715,9 +1715,10 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
       setterFor(sessionId)({ uploadProgress: null });
     }
   })();
-  const block: ContentBlock = file.type.startsWith("image/")
-    ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
-    : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
+  const block: ContentBlock =
+    classifyAttachment(file) === "image"
+      ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
+      : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
   let bySession = uploadedFileBlockCache.get(file);
   if (bySession === undefined) {
     bySession = new Map<string, ContentBlock>();
@@ -2446,7 +2447,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       const filename = part.file.name || "image.png";
       const fileId = `pending:${attachmentKey(part.file)}`;
-      return part.file.type.startsWith("image/")
+      return classifyAttachment(part.file) === "image"
         ? [{ type: "input_image" as const, file_id: fileId, filename }]
         : [{ type: "input_file" as const, file_id: fileId, filename }];
     });

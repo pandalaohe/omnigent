@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { attachmentFilename, attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { ComposerChipRow } from "@/components/composer/ChatComposer";
@@ -129,7 +129,7 @@ export function iconForFile(file: File): LucideIcon {
   const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
   if (ext && EXTENSION_ICONS[ext]) return EXTENSION_ICONS[ext];
   const type = file.type || "";
-  if (type.startsWith("image/")) return FileImage;
+  if (classifyAttachment(file) === "image") return FileImage;
   if (type.startsWith("video/")) return FileVideo;
   if (type.startsWith("audio/")) return FileAudio;
   return FileIcon;
@@ -169,7 +169,7 @@ function AttachmentTile({
 }) {
   // An image whose blob can't decode falls back to the file card (spec rule 4).
   const [thumbFailed, setThumbFailed] = useState(false);
-  const showThumb = file.type.startsWith("image/") && !thumbFailed;
+  const showThumb = classifyAttachment(file) === "image" && !thumbFailed;
   const name = attachmentFilename(file);
   const url = useObjectUrl(showThumb ? file : null);
   const hoverProps = onHover
