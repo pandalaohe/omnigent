@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 
@@ -1492,6 +1492,9 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
 
 def test_codex_sdk_seed_is_distinct_and_uses_host_defaults(seed_stores: _SeedStores) -> None:
     from omnigent.db.utils import builtin_agent_id
+    from omnigent.runner.tool_dispatch import _granted_tool_names
+    from omnigent.spec.types import AgentSpec
+    from omnigent.tools.manager import ToolManager
 
     for _ in range(2):
         server_app._ensure_default_codex_sdk_agent(
@@ -1506,6 +1509,34 @@ def test_codex_sdk_seed_is_distinct_and_uses_host_defaults(seed_stores: _SeedSto
     assert loaded.spec.executor.harness_kind == "codex"
     assert loaded.spec.executor.model is None
     assert loaded.spec.executor.auth is None
+    assert loaded.spec.spawn is True
+    assert loaded.spec.os_env is None
+    assert loaded.spec.terminals is None
+
+    def advertised_names(spec: AgentSpec) -> set[str]:
+        manager = ToolManager(spec)
+        try:
+            return {schema["function"]["name"] for schema in manager.get_tool_schemas()}
+        finally:
+            manager.shutdown()
+
+    without_spawn = replace(loaded.spec, spawn=False)
+    expected_added = {
+        "sys_session_create",
+        "sys_session_send",
+        "sys_session_close",
+        "sys_list_models",
+    }
+    advertised = advertised_names(loaded.spec)
+    advertised_added = advertised - advertised_names(without_spawn)
+    assert expected_added <= advertised_added <= expected_added | {"sys_advise_models"}
+    assert {"sys_session_create", "sys_session_close"} <= advertised
+    assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in advertised)
+
+    granted = _granted_tool_names(loaded.spec, "codex")
+    assert granted - _granted_tool_names(without_spawn, "codex") == advertised_added
+    assert "sys_session_create" in granted
+    assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in granted)
 
 
 def test_claude_sdk_seed_is_idempotent(seed_stores: _SeedStores) -> None:

@@ -5,4 +5,5 @@ executor:
   type: omnigent
   config:
     harness: codex
+spawn: true
 instructions: You are a coding assistant. Help the user complete their task.
