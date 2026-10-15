@@ -14678,9 +14678,13 @@ async def test_sys_session_create_workspace_places_on_caller_host() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_host_equal_to_caller_is_a_noop() -> None:
+async def test_sys_session_create_host_equal_to_caller_is_a_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Naming the caller's own effective host sends no placement fields."""
-    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_HOST_NAME_CACHE", {})
 
     bodies: list[dict[str, Any]] = []
     handler = _create_placement_handler(
@@ -14694,7 +14698,7 @@ async def test_sys_session_create_host_equal_to_caller_is_a_noop() -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as server_client:
-        output = await execute_tool(
+        output = await tool_dispatch.execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps({"agent_id": "ag_x", "title": "same", "host": "alpha"}),
             server_client=server_client,

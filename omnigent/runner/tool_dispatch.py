@@ -5040,7 +5040,7 @@ async def _resolve_create_placement(
     if same_host and workspace_out is None and git is None:
         # Explicit host equal to the caller's own, nothing else to place:
         # exactly today's inherit — no placement fields sent.
-        return placement, None
+        return dataclasses.replace(placement, host_name=target_host_name), None
     if workspace_out is None and git is None:
         return placement, None
     return dataclasses.replace(
