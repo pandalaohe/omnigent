@@ -181,7 +181,7 @@ class _SideEffectRecorder:
 # ── client factory ────────────────────────────────────────────────────────────
 
 
-def _make_client(store: _RecordingStore) -> TestClient:
+def _make_client(store: _RecordingStore, **router_options: Any) -> TestClient:
     """FastAPI test client with auth and permissions disabled."""
     router = create_sessions_router(
         conversation_store=store,  # type: ignore[arg-type]
@@ -189,6 +189,7 @@ def _make_client(store: _RecordingStore) -> TestClient:
         runner_router=None,
         auth_provider=None,
         permission_store=None,
+        **router_options,
     )
     app = FastAPI()
 

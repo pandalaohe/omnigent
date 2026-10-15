@@ -34,6 +34,50 @@ from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMe
 _APP = object()  # PeerSweeper only ever forwards this; a sentinel is enough.
 
 
+async def test_refused_sdk_peer_stays_queued_after_capability_disappears(db_uri: str) -> None:
+    from omnigent.sdk_peer_delivery import sdk_attempt_reason
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sender = conversations.create_conversation(title="sender")
+    receiver = conversations.create_conversation(title="receiver", harness_override="codex")
+    store = SqlAlchemyPeerMessageStore(db_uri)
+    record = store.create(
+        SessionPeerMessage(
+            id=uuid.uuid4().hex,
+            sender_session_id=sender.id,
+            receiver_session_id=receiver.id,
+            ref="retry",
+            text="peer",
+            state="queued",
+            reason=sdk_attempt_reason("d" * 32, "refused"),
+            created_at=1,
+            expires_at=100,
+        )
+    )
+    calls = []
+
+    async def idle(*args, **kwargs):
+        return "idle", True
+
+    async def deliver(*args, **kwargs):
+        calls.append(kwargs)
+        return "uncertain", "awaiting_sdk_receipt"
+
+    sweeper = PeerSweeper(
+        peer_store=store,
+        conversation_store=conversations,
+        permission_store=None,
+        true_state=idle,
+        deliver=deliver,
+        post_event_impl=deliver,
+        sdk_capable=lambda _: False,
+    )
+    await sweeper._process_due(record, 2)
+    assert calls == []
+    fresh = store.get(record.id)
+    assert (fresh.state, fresh.reason) == ("queued", record.reason)
+
+
 def _row(store: PeerMessageStore, peer_id: str) -> SessionPeerMessage:
     """Fetch a record the test just seeded/transitioned; a miss is a test bug."""
     record = store.get(peer_id)
@@ -84,6 +128,25 @@ class _FakePeerStore(PeerMessageStore):
 
     def get(self, peer_id: str) -> SessionPeerMessage | None:
         return self._rows.get(peer_id)
+
+    def claim_oldest(
+        self, peer_id: str, reason: str | None, expected_states: tuple[str, ...]
+    ) -> bool:
+        with self._lock:
+            row = self._rows.get(peer_id)
+            if row is None or row.state not in expected_states:
+                return False
+            if any(
+                older.id != row.id
+                and older.sender_session_id == row.sender_session_id
+                and older.receiver_session_id == row.receiver_session_id
+                and older.state in ("pending", "queued", "delivering")
+                and (older.created_at, older.id) < (row.created_at, row.id)
+                for older in self._rows.values()
+            ):
+                return False
+            row.state, row.reason = "delivering", reason
+            return True
 
     def list_for_session(
         self,
@@ -911,6 +974,30 @@ async def test_stale_refusal_cannot_requeue_newer_native_attempt(harness: _Harne
     await harness.sweeper._reconcile_one(old_snapshot, harness._now)
     current = _row(harness.store, record.id)
     assert (current.state, current.reason) == ("delivering", f"native_attempt:{attempt_b}")
+
+
+async def test_sdk_persisted_envelope_cannot_confirm_delivery(harness: _Harness) -> None:
+    """SDK inputs are stored before forwarding, so only an SDK receipt counts."""
+    reason = f"sdk_wait:{'a' * 32}"
+    record = harness.seed_record(state="delivering", reason=reason, created_at=harness._now - 300)
+    harness.conv_store.visible_text["receiver"] = [_envelope(record)]
+    await harness.sweeper._reconcile_one(
+        dataclasses.replace(record), harness._now, age_from=harness._now - 300
+    )
+    current = _row(harness.store, record.id)
+    assert (current.state, current.reason) == ("delivering", f"sdk_unknown:{'a' * 32}")
+    await harness.sweeper._reconcile_one(dataclasses.replace(current), harness._now + 1)
+    assert _row(harness.store, record.id).state == "delivering"
+    assert harness.deliver.calls == []
+
+
+async def test_sdk_unknown_attempt_expires_with_notice(harness: _Harness) -> None:
+    record = harness.seed_record(
+        state="delivering", reason=f"sdk_unknown:{'a' * 32}", expires_at=harness._now
+    )
+    await harness.sweeper._reconcile_one(dataclasses.replace(record), harness._now)
+    assert _row(harness.store, record.id).state == "expired"
+    assert harness.deliver.calls == []
 
 
 async def test_two_concurrent_flushes_post_once(harness: _Harness) -> None:

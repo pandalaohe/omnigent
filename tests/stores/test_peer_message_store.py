@@ -7,9 +7,13 @@ and the ref count against a real SQLite database.
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Lock
 
 import pytest
+import sqlalchemy as sa
 
+from omnigent.db.db_models import SqlConversation, SqlSessionPeerMessage, current_workspace_id
 from omnigent.entities import SessionPeerMessage
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 
@@ -35,6 +39,27 @@ def _record(seed: str, **overrides) -> SessionPeerMessage:
     return SessionPeerMessage(**kwargs)  # type: ignore[arg-type]
 
 
+class _TestPeerStore(SqlAlchemyPeerMessageStore):
+    """Supply real receiver rows when a backend requires a row lock."""
+
+    _seed_lock = Lock()
+
+    def create(self, record: SessionPeerMessage) -> SessionPeerMessage:
+        if self._engine.dialect.name != "sqlite":
+            with self._seed_lock, self._session_immediate("seed_test_receiver") as session:
+                key = (current_workspace_id(), record.receiver_session_id)
+                if session.get(SqlConversation, key) is None:
+                    session.add(
+                        SqlConversation(
+                            id=record.receiver_session_id,
+                            root_conversation_id=record.receiver_session_id,
+                            created_at=0,
+                            updated_at=0,
+                        )
+                    )
+        return super().create(record)
+
+
 @pytest.fixture()
 def store(db_uri: str) -> SqlAlchemyPeerMessageStore:
     """A fresh :class:`SqlAlchemyPeerMessageStore` backed by the test SQLite DB.
@@ -42,7 +67,7 @@ def store(db_uri: str) -> SqlAlchemyPeerMessageStore:
     :param db_uri: Per-test SQLite URI from the root conftest fixture.
     :returns: A ready-to-use :class:`SqlAlchemyPeerMessageStore` instance.
     """
-    return SqlAlchemyPeerMessageStore(db_uri)
+    return _TestPeerStore(db_uri)
 
 
 def test_create_and_get_round_trip(store: SqlAlchemyPeerMessageStore) -> None:
@@ -52,6 +77,7 @@ def test_create_and_get_round_trip(store: SqlAlchemyPeerMessageStore) -> None:
     assert created.text == "text r1"
     assert created.reply_peer_id is None
     assert created.replied_at is None
+    assert created.pair_sequence == 1
     fetched = store.get(created.id)
     assert fetched == created
     assert store.get(_uid("missing")) is None
@@ -339,3 +365,109 @@ def test_list_for_session_oldest_first(store: SqlAlchemyPeerMessageStore) -> Non
     assert [r.id for r in oldest_two] == [oldest.id, _uid("of-new-0-id")]
     newest_two = store.list_for_session(receiver, ("pending",), 2, sender_session_id=sender)
     assert [r.id for r in newest_two] == [_uid("of-new-54-id"), _uid("of-new-53-id")]
+
+
+@pytest.mark.parametrize("first_state", ["pending", "queued"])
+def test_pair_order_uses_admission_not_second_or_id(
+    store: SqlAlchemyPeerMessageStore, first_state: str
+) -> None:
+    sender, receiver = _uid("admission-sender"), _uid("admission-receiver")
+    first = store.create(
+        _record(
+            "z-admission",
+            id="f" * 32,
+            sender_session_id=sender,
+            receiver_session_id=receiver,
+            state=first_state,
+        )
+    )
+    second = store.create(
+        _record("a-admission", id="1" * 32, sender_session_id=sender, receiver_session_id=receiver)
+    )
+    assert [first.pair_sequence, second.pair_sequence] == [1, 2]
+    assert [
+        row.id
+        for row in store.list_for_session(receiver, sender_session_id=sender, oldest_first=True)
+    ] == [first.id, second.id]
+    assert not store.claim_oldest(second.id, "sdk_wait:second", ("pending",))
+    assert store.claim_oldest(first.id, "sdk_wait:first", (first_state,))
+    assert not store.claim_oldest(second.id, "sdk_wait:second", ("pending",))
+    assert store.transition(first.id, "delivered", expected_states=("delivering",))
+    assert store.claim_oldest(second.id, "sdk_wait:second", ("pending",))
+    assert store.get(second.id).reason == "sdk_wait:second"  # type: ignore[union-attr]
+
+
+def test_create_repairs_null_legacy_rows_before_new_admission(
+    store: SqlAlchemyPeerMessageStore,
+) -> None:
+    sender, receiver = _uid("legacy-sender"), _uid("legacy-receiver")
+    old = store.create(
+        _record("legacy-old", sender_session_id=sender, receiver_session_id=receiver)
+    )
+    with store._engine.begin() as conn:
+        conn.execute(
+            sa.update(SqlSessionPeerMessage)
+            .where(SqlSessionPeerMessage.workspace_id == 0, SqlSessionPeerMessage.id == old.id)
+            .values(pair_sequence=None)
+        )
+    new = store.create(
+        _record("legacy-new", sender_session_id=sender, receiver_session_id=receiver)
+    )
+    assert store.get(old.id).pair_sequence == 1  # type: ignore[union-attr]
+    assert new.pair_sequence == 2
+    assert not store.claim_oldest(new.id, None, ("pending",))
+
+
+def test_concurrent_writers_allocate_unique_pair_sequence(
+    store: SqlAlchemyPeerMessageStore,
+) -> None:
+    sender, receiver = _uid("concurrent-sender"), _uid("concurrent-receiver")
+    gate = Barrier(6)
+
+    def write(index: int) -> SessionPeerMessage:
+        gate.wait(timeout=10)
+        return store.create(
+            _record(
+                f"concurrent-{index}",
+                sender_session_id=sender,
+                receiver_session_id=receiver,
+                created_at=1000,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(write, range(6)))
+    assert sorted(row.pair_sequence for row in results) == list(range(1, 7))
+    oldest = min(results, key=lambda row: row.pair_sequence)
+    newer = max(results, key=lambda row: row.pair_sequence)
+    assert not store.claim_oldest(newer.id, None, ("pending",))
+    assert store.claim_oldest(oldest.id, None, ("pending",))
+
+
+def test_concurrent_claims_reserve_only_oldest(store: SqlAlchemyPeerMessageStore) -> None:
+    sender, receiver = _uid("claim-sender"), _uid("claim-receiver")
+    first = store.create(
+        _record("claim-first", sender_session_id=sender, receiver_session_id=receiver)
+    )
+    second = store.create(
+        _record("claim-second", sender_session_id=sender, receiver_session_id=receiver)
+    )
+    gate = Barrier(2)
+
+    def claim(peer_id: str) -> bool:
+        gate.wait(timeout=10)
+        return store.claim_oldest(peer_id, "sdk_wait:claim", ("pending",))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, (first.id, second.id)))
+    assert results == [True, False]
+    assert store.get(first.id).state == "delivering"  # type: ignore[union-attr]
+    assert store.get(second.id).state == "pending"  # type: ignore[union-attr]
+
+
+def test_row_lock_backend_requires_receiver(store: SqlAlchemyPeerMessageStore) -> None:
+    if store._engine.dialect.name == "sqlite":
+        pytest.skip("SQLite uses the immediate transaction without a receiver row")
+    real_store = SqlAlchemyPeerMessageStore(store.storage_location)
+    with pytest.raises(RuntimeError, match="receiver conversation missing"):
+        real_store.create(_record("missing-receiver-lock"))

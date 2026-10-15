@@ -1245,6 +1245,8 @@ class CreateResponseRequest(BaseModel):
     # the message, so the runner can drop the buffered copy and not
     # re-deliver it in a continuation turn. ``None`` for fresh turns.
     injection_id: str | None = None
+    peer_delivery: dict[str, str] | None = None
+    peer_delivery_start: bool = False
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -4415,6 +4417,16 @@ class InjectionConsumedEvent(_SSEEventBase):
     injection_id: str
 
 
+class SDKPeerReceiptEvent(_SSEEventBase):
+    """Runner-internal SDK receipt, never a client conversation event."""
+
+    type: Literal["sdk.peer.receipt"] = "sdk.peer.receipt"
+    peer_id: str
+    attempt_id: str
+    outcome: Literal["accepted", "refused", "unknown"]
+    proof_source: str
+
+
 class OutputFileDoneEvent(_SSEEventBase):
     """
     A streamed file output completed materializing.
@@ -5494,6 +5506,7 @@ class SubagentToolCallEvent(_SSEEventBase):
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
+    | SDKPeerReceiptEvent
     | PolicyEvaluationRequestEvent
     | SubagentStartedEvent
     | SubagentCompletedEvent

@@ -42,6 +42,13 @@ from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations
+from omnigent.sdk_peer_delivery import (
+    CLAUDE_SDK_PEER_CAPABILITY,
+    SDK_PEER_CAPABILITY,
+    SDKPeerInput,
+    sdk_attempt,
+    sdk_attempt_reason,
+)
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.child_session_recovery import is_parent_owned_subagent
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
@@ -62,6 +69,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _inherited_placement,
+    _resolve_harness,
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -127,7 +135,9 @@ def _native_attempt_id(reason: str | None) -> str | None:
 
 def _released_peer_reason(reason: str | None) -> bool:
     return reason == _PEER_RELEASED_REASON or bool(
-        reason and reason.startswith(f"{_PEER_RELEASED_REASON}:{_NATIVE_ATTEMPT_REASON_PREFIX}")
+        reason
+        and reason.startswith(f"{_PEER_RELEASED_REASON}:")
+        and (_native_attempt_id(reason) is not None or sdk_attempt(reason) is not None)
     )
 
 
@@ -356,9 +366,9 @@ def has_older_undelivered(
     ``delivering`` one from the same sender is still on its way to the same
     receiver. In-flight ``delivering`` records block too, so an uncertain
     record holds this pair's newer messages (they stay durable as
-    ``queued``) until reconciliation settles it. "Older" is ``created_at``
-    strictly smaller than *before_created_at* when given; equal-second ties
-    stay unordered. *exclude_id* skips the record under judgment. The
+    ``queued``) until reconciliation settles it. Existing records use their
+    durable pair sequence; legacy test doubles fall back to timestamps.
+    *exclude_id* skips the record under judgment. The
     sender-scoped lookup asks for the two oldest matching records, so the
     true oldest is found no matter how many newer same-pair records exist.
 
@@ -370,6 +380,7 @@ def has_older_undelivered(
     :param exclude_id: A record id to ignore, or ``None``.
     :returns: ``True`` when an older undelivered record exists.
     """
+    target = peer_message_store.get(exclude_id) if exclude_id is not None else None
     records = peer_message_store.list_for_session(
         receiver_id,
         ("pending", "queued", "delivering"),
@@ -379,6 +390,10 @@ def has_older_undelivered(
     )
     for record in records:
         if record.id == exclude_id:
+            continue
+        if target is not None and target.pair_sequence is not None:
+            if record.pair_sequence is None or record.pair_sequence < target.pair_sequence:
+                return True
             continue
         if before_created_at is not None and record.created_at >= before_created_at:
             continue
@@ -892,6 +907,15 @@ def effective_owner_id(
 
 
 def _public_peer_reason(record: SessionPeerMessage) -> str | None:
+    sdk = sdk_attempt(record.reason)
+    if sdk is not None:
+        return (
+            "sdk_delivery_unknown"
+            if sdk[1] == "unknown"
+            else "awaiting_sdk_receipt"
+            if record.state == "delivering"
+            else None
+        )
     if _native_attempt_id(record.reason) is not None:
         return "awaiting_native_receipt" if record.state == "delivering" else None
     return record.reason
@@ -914,6 +938,20 @@ def _record_to_dict(record: SessionPeerMessage) -> dict[str, Any]:
         "updated_at": record.updated_at,
         "expires_at": record.expires_at,
     }
+
+
+def _sender_agent_name(sender: Conversation, agent_store: AgentStore | None) -> str | None:
+    if agent_store is None or not sender.agent_id:
+        return None
+    try:
+        agent = agent_store.get(sender.agent_id)
+    except Exception:
+        return None
+    return public_agent_name(agent.name) if agent is not None else None
+
+
+def _sender_project_id(sender: Conversation) -> str | None:
+    return sender.project_id or (sender.labels or {}).get(PROJECT_LABEL_KEY)
 
 
 def register_peer_routes(
@@ -959,20 +997,6 @@ def register_peer_routes(
     """
     flags = feature_flags if feature_flags is not None else resolve_feature_flags()
 
-    def _sender_agent_name(sender: Conversation) -> str | None:
-        if agent_store is None or not sender.agent_id:
-            return None
-        try:
-            agent = agent_store.get(sender.agent_id)
-        except Exception:
-            return None
-        return public_agent_name(agent.name) if agent is not None else None
-
-    def _sender_project_id(sender: Conversation) -> str | None:
-        if sender.project_id:
-            return sender.project_id
-        return (sender.labels or {}).get(PROJECT_LABEL_KEY)
-
     def _receiver_summary(
         receiver: Conversation,
         *,
@@ -1005,6 +1029,22 @@ def register_peer_routes(
     def _new_record_id(correlation_id: str | None) -> str:
         del correlation_id
         return secrets.token_hex(16)
+
+    def _sdk_capable(conv: Conversation) -> bool:
+        if not flags.enabled(Feature.SDK_PEER_STEERING) or runner_router is None:
+            return False
+        try:
+            harness = _resolve_harness(conv, agent_store=agent_store)
+        except Exception:
+            return False
+        if harness not in ("codex", "claude-sdk"):
+            return False
+        has_capability = getattr(runner_router, "runner_has_capability", None)
+        if has_capability is None or not has_capability(conv.runner_id, SDK_PEER_CAPABILITY):
+            return False
+        return harness != "claude-sdk" or has_capability(
+            conv.runner_id, CLAUDE_SDK_PEER_CAPABILITY
+        )
 
     async def _true_state(
         conv: Conversation, *, receiver: bool = False
@@ -1093,11 +1133,8 @@ def register_peer_routes(
                     # Read the count off the row this busy verdict came from.
                     row = fresh
         if busy:
-            if (
-                not (receiver and conv.parent_conversation_id is not None)
-                and native
-                and terminal_ready
-                and _is_steerable_harness(conv)
+            if not (receiver and conv.parent_conversation_id is not None) and (
+                (native and terminal_ready and _is_steerable_harness(conv)) or _sdk_capable(conv)
             ):
                 if not _has_blocking_elicitation(row, pending_elicitations.snapshot_for(conv.id)):
                     return "steerable", runner_online
@@ -1132,17 +1169,23 @@ def register_peer_routes(
         :returns: The delivery disposition and its reason, if any.
         """
         native_receiver = await asyncio.to_thread(_is_native_terminal_session, receiver)
+        record = (
+            await asyncio.to_thread(peer_message_store.get, peer_id)
+            if peer_message_store is not None
+            else None
+        )
+        sdk_delivery = bool(record is not None and sdk_attempt(record.reason))
         envelope = format_peer_envelope(
             sender_session_id=sender.id,
             sender_title=sender.title,
-            sender_agent_name=_sender_agent_name(sender),
+            sender_agent_name=_sender_agent_name(sender, agent_store),
             sender_project_id=_sender_project_id(sender),
             ref=ref,
             peer_id=peer_id,
             text=text,
         )
         deliver_impl = post_event_impl
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"trusted_peer": True}
         if acting_user_id is not _ACTING_USER_ID_NOT_GIVEN:
             kwargs["acting_user_id"] = acting_user_id
         if require_init_success:
@@ -1157,6 +1200,15 @@ def register_peer_routes(
                         "role": "user",
                         "content": [{"type": "input_text", "text": envelope}],
                         "peer_message_id": peer_id,
+                        **(
+                            {
+                                "peer_delivery": SDKPeerInput(
+                                    peer_id, attempt_id, envelope
+                                ).metadata()
+                            }
+                            if sdk_delivery and attempt_id is not None
+                            else {}
+                        ),
                         **({"stable_id": attempt_id} if attempt_id is not None else {}),
                     },
                 ),
@@ -1198,6 +1250,8 @@ def register_peer_routes(
             # ``delivering`` where reconciliation could mark it delivered
             # from that persisted envelope.
             return "failed", "not_ready"
+        if sdk_delivery:
+            return "uncertain", "awaiting_sdk_receipt"
         if native_receiver and _is_codex_native_harness(receiver):
             # The events POST only confirms that the runner has the message.
             # Codex accepts it later through turn/start or turn/steer; the
@@ -1676,9 +1730,11 @@ def register_peer_routes(
                     receiver_session_id=receiver_id,
                     ref=ref,
                     text=body.text,
-                    state="delivering",
+                    state="queued",
                     reason=(
-                        f"{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
+                        sdk_attempt_reason(secrets.token_hex(16), "wait")
+                        if _sdk_capable(receiver)
+                        else f"{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
                         if _is_codex_native_harness(receiver)
                         else None
                     ),
@@ -1689,6 +1745,12 @@ def register_peer_routes(
                 ),
             )
             record = delivering
+            attempt_reason = record.reason
+            if not await asyncio.to_thread(
+                peer_message_store.claim_oldest, record.id, attempt_reason, ("queued",)
+            ):
+                return await _queued_response_for_record(record, runner_online)
+            record.state = "delivering"
             # Re-check right before delivering: the readiness probe above and
             # this record's own creation each awaited a store write, during
             # which a turn can start concurrently. Busy queues this same
@@ -1707,6 +1769,7 @@ def register_peer_routes(
                     ("delivering",),
                 )
                 return await _queued_response_for_record(record, runner_online)
+            sdk_identity = sdk_attempt(record.reason)
             result_state, reason = await _deliver(
                 request,
                 sender,
@@ -1714,7 +1777,11 @@ def register_peer_routes(
                 record.ref,
                 record.id,
                 body.text,
-                attempt_id=_native_attempt_id(record.reason),
+                attempt_id=(
+                    sdk_identity[0]
+                    if sdk_identity is not None
+                    else _native_attempt_id(record.reason)
+                ),
                 acting_user_id=acting_user_id,
                 require_init_success=require_init_success,
             )
@@ -1729,6 +1796,17 @@ def register_peer_routes(
                 response = await _queued_response_for_record(record, runner_online)
                 response["reason"] = "uncertain"
                 return response
+            if sdk_identity is not None and result_state in ("failed", "rejected"):
+                await asyncio.to_thread(
+                    peer_message_store.transition,
+                    record.id,
+                    "queued",
+                    sdk_attempt_reason(sdk_identity[0], "refused"),
+                    ("delivering",),
+                    expected_reason=attempt_reason,
+                )
+                fresh = await asyncio.to_thread(peer_message_store.get, record.id)
+                return await _queued_response_for_record(fresh or record, runner_online)
             stored_state = "failed" if result_state == "rejected" else result_state
             await asyncio.to_thread(
                 peer_message_store.transition,
@@ -2015,6 +2093,7 @@ def register_peer_routes(
             permission_store=permission_store,
             true_state=_true_state,
             deliver=_deliver,
+            sdk_capable=_sdk_capable,
             post_event_impl=post_event_impl,
         )
 

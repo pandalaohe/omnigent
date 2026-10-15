@@ -5,11 +5,16 @@ from __future__ import annotations
 import builtins
 from typing import Any, cast
 
-from sqlalchemy import asc, desc, func, or_, select, update
+from sqlalchemy import asc, desc, exists, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlSessionPeerMessage, current_workspace_id, uuid_to_bytes
+from omnigent.db.db_models import (
+    SqlConversation,
+    SqlSessionPeerMessage,
+    current_workspace_id,
+    uuid_to_bytes,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -46,6 +51,7 @@ def _record_to_entity(row: SqlSessionPeerMessage) -> SessionPeerMessage:
         not_before=row.not_before,
         notice_owed_at=row.notice_owed_at,
         workspace_id=row.workspace_id,
+        pair_sequence=row.pair_sequence,
     )
 
 
@@ -81,10 +87,56 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
             immediate=True,
         )
 
+    def _lock_receiver(self, session: Session, receiver_id: str) -> None:
+        """Serialize pair admission and claims on the receiver conversation."""
+        if self._engine.dialect.name == "sqlite":
+            return  # The managed session already began an IMMEDIATE transaction.
+        locked_id = session.execute(
+            select(SqlConversation.id)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == receiver_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if locked_id is None:
+            raise RuntimeError("receiver conversation missing for peer ordering lock")
+
+    def _fill_legacy_pair_sequence(
+        self, session: Session, sender_id: str, receiver_id: str
+    ) -> int:
+        """Assign any legacy NULL rows before allocating a new admission."""
+        pair = (
+            SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+            SqlSessionPeerMessage.sender_session_id == sender_id,
+            SqlSessionPeerMessage.receiver_session_id == receiver_id,
+        )
+        maximum = session.scalar(
+            select(func.max(SqlSessionPeerMessage.pair_sequence)).where(*pair)
+        )
+        sequence = maximum or 0
+        legacy = session.scalars(
+            select(SqlSessionPeerMessage)
+            .where(*pair, SqlSessionPeerMessage.pair_sequence.is_(None))
+            .order_by(asc(SqlSessionPeerMessage.created_at), asc(SqlSessionPeerMessage.id))
+        ).all()
+        for row in legacy:
+            sequence += 1
+            row.pair_sequence = sequence
+        session.flush()
+        return sequence
+
     def create(self, record: SessionPeerMessage) -> SessionPeerMessage:
         """Insert a new peer-message record."""
 
         def write(session: Session) -> SessionPeerMessage:
+            self._lock_receiver(session, record.receiver_session_id)
+            sequence = (
+                self._fill_legacy_pair_sequence(
+                    session, record.sender_session_id, record.receiver_session_id
+                )
+                + 1
+            )
             row = SqlSessionPeerMessage(
                 id=record.id,
                 sender_session_id=record.sender_session_id,
@@ -102,12 +154,74 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 relay_depth=record.relay_depth,
                 not_before=record.not_before,
                 notice_owed_at=record.notice_owed_at,
+                pair_sequence=sequence,
             )
             session.add(row)
             session.flush()
             return _record_to_entity(row)
 
         return run_write_transaction(self._session_immediate, "insert_peer_message", write)
+
+    def claim_oldest(
+        self,
+        peer_id: str,
+        reason: str | None,
+        expected_states: tuple[str, ...],
+    ) -> bool:
+        """Move one unblocked pair record to delivering in one transaction."""
+        if not expected_states:
+            return False
+
+        def write(session: Session) -> bool:
+            # Read only the immutable receiver id before acquiring its lock.
+            receiver_id = session.scalar(
+                select(SqlSessionPeerMessage.receiver_session_id).where(
+                    SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                    SqlSessionPeerMessage.id == peer_id,
+                )
+            )
+            if receiver_id is None:
+                return False
+            self._lock_receiver(session, receiver_id)
+            target = session.get(SqlSessionPeerMessage, (current_workspace_id(), peer_id))
+            if target is None or target.state not in expected_states:
+                return False
+            self._fill_legacy_pair_sequence(
+                session, target.sender_session_id, target.receiver_session_id
+            )
+            if target.pair_sequence is None:
+                raise RuntimeError("peer pair sequence was not allocated")
+            older = session.scalar(
+                select(
+                    exists().where(
+                        SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                        SqlSessionPeerMessage.sender_session_id == target.sender_session_id,
+                        SqlSessionPeerMessage.receiver_session_id == target.receiver_session_id,
+                        SqlSessionPeerMessage.pair_sequence < target.pair_sequence,
+                        SqlSessionPeerMessage.state.in_(("pending", "queued", "delivering")),
+                    )
+                )
+            )
+            if older:
+                return False
+            values: dict[str, Any] = {"state": "delivering", "updated_at": now_epoch()}
+            if reason is not None:
+                values["reason"] = reason
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    update(SqlSessionPeerMessage)
+                    .where(
+                        SqlSessionPeerMessage.workspace_id == current_workspace_id(),
+                        SqlSessionPeerMessage.id == peer_id,
+                        SqlSessionPeerMessage.state.in_(sorted(expected_states)),
+                    )
+                    .values(**values)
+                ),
+            )
+            return bool(result.rowcount)
+
+        return run_write_transaction(self._session_immediate, "claim_oldest_peer_message", write)
 
     def get(self, peer_id: str) -> SessionPeerMessage | None:
         """Return a peer message by id, or ``None`` if not found."""
@@ -137,7 +251,11 @@ class SqlAlchemyPeerMessageStore(PeerMessageStore):
                 stmt = stmt.where(SqlSessionPeerMessage.state.in_(sorted(states)))
             if sender_session_id is not None:
                 stmt = stmt.where(SqlSessionPeerMessage.sender_session_id == sender_session_id)
-            if oldest_first:
+            if oldest_first and sender_session_id is not None:
+                stmt = stmt.order_by(
+                    asc(SqlSessionPeerMessage.pair_sequence), asc(SqlSessionPeerMessage.id)
+                )
+            elif oldest_first:
                 stmt = stmt.order_by(
                     asc(SqlSessionPeerMessage.created_at), asc(SqlSessionPeerMessage.id)
                 )

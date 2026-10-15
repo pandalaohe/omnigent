@@ -5059,6 +5059,17 @@
             ],
             "title": "Model"
           },
+          "peer_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Message Id"
+          },
           "role": {
             "description": "`\"user\"` or `\"assistant\"`.",
             "enum": [

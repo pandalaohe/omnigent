@@ -44,6 +44,20 @@ class PeerMessageStore(ABC):
         ...
 
     @abstractmethod
+    def claim_oldest(
+        self,
+        peer_id: str,
+        reason: str | None,
+        expected_states: tuple[str, ...],
+    ) -> bool:
+        """Claim the oldest actionable message in its sender/receiver pair.
+
+        An older pending, queued, or delivering record blocks the claim.
+        The successful claim moves the target to delivering and stores reason.
+        """
+        ...
+
+    @abstractmethod
     def get(self, peer_id: str) -> SessionPeerMessage | None:
         """
         Return a peer message by id, or ``None`` if not found.
@@ -72,9 +86,8 @@ class PeerMessageStore(ABC):
         :param sender_session_id: When given, return only records from
             this sender. Used for a per-pair lookup that must not be
             crowded out by other senders' records.
-        :param oldest_first: When ``True``, order by creation time
-            ascending instead of descending, so a bounded per-pair
-            query finds the oldest records rather than the newest page.
+        :param oldest_first: When ``True`` with a sender filter, order by
+            durable pair admission sequence. Otherwise order by creation.
         :returns: :class:`SessionPeerMessage` instances in reverse
             creation order, or forward creation order when
             ``oldest_first`` is set.

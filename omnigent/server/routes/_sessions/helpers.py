@@ -8008,6 +8008,9 @@ def _build_new_item(
         ) from exc
     if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
         data = data.model_copy(update={"user_authored": True})
+    if isinstance(data, MessageData):
+        # Only accepted SDK receipt persistence owns the recovery-suppression marker.
+        data = data.model_copy(update={"peer_message_id": None})
     return NewConversationItem(
         type=body.type,
         response_id=response_id,

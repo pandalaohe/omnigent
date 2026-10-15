@@ -27,6 +27,7 @@ class Feature(StrEnum):
     HARNESS_SETTINGS_UI = "harness_settings_ui"
     PROJECT_ASSIGNMENTS = "project_assignments"
     SESSION_PEER_MESSAGING = "session_peer_messaging"
+    SDK_PEER_STEERING = "sdk_peer_steering"
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.16.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SDK_PEER_STEERING,
+        description="Non-interrupting SDK peer input with durable delivery receipts",
+        owner="server",
+        review_by_release="0.17.0",
+        frontend_visible=False,
     ),
 )
 

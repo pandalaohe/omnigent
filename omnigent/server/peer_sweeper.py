@@ -46,6 +46,7 @@ from starlette.requests import Request
 from omnigent.db.utils import now_epoch
 from omnigent.entities import SessionPeerMessage
 from omnigent.entities.conversation import Conversation, ErrorData, MessageData
+from omnigent.sdk_peer_delivery import sdk_attempt, sdk_attempt_reason
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.routes.sessions.routes_peer import (
@@ -119,6 +120,7 @@ class PeerSweeper:
         interval: float = _DEFAULT_INTERVAL_S,
         clock: Callable[[], int] = now_epoch,
         batch_limit: int = _DEFAULT_BATCH_LIMIT,
+        sdk_capable: Callable[[Conversation], bool] = lambda _conv: False,
     ) -> None:
         """
         :param peer_store: Durable record store.
@@ -147,6 +149,7 @@ class PeerSweeper:
         self._interval = interval
         self._clock = clock
         self._batch_limit = batch_limit
+        self._sdk_capable = sdk_capable
         self._parked: dict[str, list[tuple[str | None, str]]] = {}
         self._flush_locks: dict[str, asyncio.Lock] = {}
         self._app: Any | None = None
@@ -396,15 +399,23 @@ class PeerSweeper:
         # back the same mutable row on every read, so ``record.state``
         # itself can flip to ``delivering`` as a side effect of that CAS.
         origin_state = record.state
-        attempt_reason = None
-        if _is_codex_native_harness(receiver):
+        sdk_capable = self._sdk_capable(receiver)
+        if sdk_attempt(record.reason) is not None and not sdk_capable:
+            # A receipt-controlled attempt must never fall back to legacy delivery.
+            return
+        attempt_reason = _PEER_RELEASED_REASON if _released_peer_reason(record.reason) else None
+        if sdk_capable:
+            attempt_reason = sdk_attempt_reason(
+                secrets.token_hex(16), "wait", released=_released_peer_reason(record.reason)
+            )
+        elif _is_codex_native_harness(receiver):
             prefix = f"{_PEER_RELEASED_REASON}:" if _released_peer_reason(record.reason) else ""
             attempt_reason = f"{prefix}{_NATIVE_ATTEMPT_REASON_PREFIX}{secrets.token_hex(16)}"
         state, _runner_online = await self._true_state(receiver, receiver=True)
         if state not in ("idle", "steerable"):
             return
         moved = await asyncio.to_thread(
-            self._store.transition, record.id, "delivering", attempt_reason, (origin_state,)
+            self._store.claim_oldest, record.id, attempt_reason, (origin_state,)
         )
         if not moved:
             # Lost the CAS race — another tick (or the inline route) already
@@ -439,6 +450,7 @@ class PeerSweeper:
             receiver, self._conversation_store, self._permission_store
         )
         try:
+            sdk_identity = sdk_attempt(attempt_reason)
             result_state, reason = await self._deliver(
                 request,
                 sender,
@@ -446,7 +458,11 @@ class PeerSweeper:
                 record.ref,
                 record.id,
                 record.text,
-                attempt_id=_native_attempt_id(attempt_reason),
+                attempt_id=(
+                    sdk_identity[0]
+                    if sdk_identity is not None
+                    else _native_attempt_id(attempt_reason)
+                ),
                 acting_user_id=receiver_owner,
             )
         except Exception:
@@ -712,6 +728,39 @@ class PeerSweeper:
     async def _reconcile_one(
         self, record: SessionPeerMessage, now: int, *, age_from: int | None = None
     ) -> None:
+        sdk = sdk_attempt(record.reason)
+        if sdk is not None:
+            attempt_id, phase = sdk
+            if record.expires_at <= now:
+                moved = await asyncio.to_thread(
+                    self._store.transition,
+                    record.id,
+                    "expired",
+                    None,
+                    ("delivering",),
+                    expected_reason=record.reason,
+                    notice=True,
+                )
+                if moved:
+                    receiver = await asyncio.to_thread(
+                        self._conversation_store.get_conversation, record.receiver_session_id
+                    )
+                    await self._notify_for(
+                        record, "expired", None, receiver.title if receiver else None, self._app
+                    )
+            elif phase == "wait" and (age_from is None or now - age_from >= _RECONCILE_GRACE_S):
+                await asyncio.to_thread(
+                    self._store.transition,
+                    record.id,
+                    "delivering",
+                    sdk_attempt_reason(
+                        attempt_id, "unknown", released=_released_peer_reason(record.reason)
+                    ),
+                    ("delivering",),
+                    expected_reason=record.reason,
+                )
+            # An AP-side envelope exists before SDK submission and is not a receipt.
+            return
         attempt_id = _native_attempt_id(record.reason)
         native_attempt = attempt_id is not None
         limit = 5

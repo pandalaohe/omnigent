@@ -41,12 +41,38 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.serve import (
     _handle_tunnel_frame,
+    _send_hello,
     _serve_tunnel_once,
     _websocket_auth_redirect_url,
     _websocket_close_code,
     _websocket_http_status,
     serve_tunnel,
 )
+from omnigent.sdk_peer_delivery import CLAUDE_SDK_PEER_CAPABILITY, SDK_PEER_CAPABILITY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claude_supported", [False, True])
+async def test_hello_advertises_only_available_sdk_peer_receipts(
+    monkeypatch: pytest.MonkeyPatch, claude_supported: bool
+) -> None:
+    """The Claude hook capability reflects the cheap local support check."""
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.claude_peer_receipts_supported",
+        lambda: claude_supported,
+    )
+    sent: list[str] = []
+
+    async def send_text(frame: str) -> None:
+        sent.append(frame)
+
+    await _send_hello(send_text, "test")
+    hello = decode_frame(sent[0])
+    assert isinstance(hello, HelloFrame)
+    assert SDK_PEER_CAPABILITY in hello.capabilities
+    assert (CLAUDE_SDK_PEER_CAPABILITY in hello.capabilities) is claude_supported
 
 
 @dataclass

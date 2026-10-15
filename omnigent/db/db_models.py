@@ -2700,6 +2700,7 @@ class SqlSessionPeerMessage(OmnigentBase):
     :param notice_owed_at: Unix epoch second the terminal record's
         back-notice was left unposted for its sender, or ``None`` when no
         notice is owed.
+    :param pair_sequence: Durable admission order within one sender/receiver pair.
     """
 
     __tablename__ = "session_peer_messages"
@@ -2734,6 +2735,7 @@ class SqlSessionPeerMessage(OmnigentBase):
     )
     not_before: Mapped[int | None] = mapped_column(Integer, nullable=True)
     notice_owed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pair_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         # Receiver-side reads: the sweeper and the held panel.
@@ -2758,5 +2760,12 @@ class SqlSessionPeerMessage(OmnigentBase):
             "workspace_id",
             "ref",
             "id",
+        ),
+        Index(
+            "ix_session_peer_messages_pair_sequence",
+            "workspace_id",
+            "sender_session_id",
+            "receiver_session_id",
+            "pair_sequence",
         ),
     )

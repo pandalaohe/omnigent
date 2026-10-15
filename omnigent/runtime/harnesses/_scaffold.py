@@ -1440,6 +1440,10 @@ class HarnessApp:
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+            if request.peer_delivery is not None and not request.peer_delivery_start:
+                # The active turn ended between runner admission and this hop.
+                return Response(status_code=status.HTTP_409_CONFLICT)
+
             if self._shutting_down.is_set():
                 raise OmnigentError(
                     "harness is shutting down; refusing new turn",

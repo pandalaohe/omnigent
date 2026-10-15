@@ -62,6 +62,7 @@ from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigne
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.sdk_peer_delivery import SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import ElicitationResult
 
 
@@ -1994,6 +1995,196 @@ class TestCodexExecutor(unittest.TestCase):
                 },
             )
             self.assertEqual(session.active_turn_id, "turn-1")
+
+        _run(_t())
+
+    def test_peer_steer_classifies_rpc_reply(self):
+        cases = [
+            ({"result": {"turnId": "turn-1"}}, "accepted", "codex_turn_steer"),
+            ({"result": {}}, "unknown", "codex_turn_steer_unverified"),
+            ({"result": {"turnId": "turn-2"}}, "unknown", "codex_turn_steer_unverified"),
+            (
+                {"result": {"turnId": "turn-1"}, "error": {}},
+                "unknown",
+                "codex_turn_steer_unverified",
+            ),
+            (
+                {"error": {"code": -32600, "message": "no active turn to steer"}},
+                "refused",
+                "codex_turn_steer_rejected",
+            ),
+            (
+                {
+                    "error": {
+                        "code": -32600,
+                        "message": "expected active turn id `turn-1` but found `turn-2`",
+                    }
+                },
+                "refused",
+                "codex_turn_steer_rejected",
+            ),
+            (
+                {"error": {"code": -32603, "message": "connection lost"}},
+                "unknown",
+                "codex_turn_steer_error",
+            ),
+            (
+                {"error": {"code": -32600, "message": "unrelated invalid request"}},
+                "unknown",
+                "codex_turn_steer_error",
+            ),
+        ]
+        for reply, expected, source in cases:
+            with self.subTest(reply=reply):
+
+                async def _t(reply=reply, expected=expected, source=source):
+                    session = _CodexAppServerSession(
+                        codex_path="/bin/echo",
+                        cwd="/opt/work/omnigent/fork/worktree",
+                        env={},
+                        tool_executor=None,
+                    )
+                    session.thread_id = "thread-1"
+                    session.active_turn_id = "turn-1"
+                    sent = []
+
+                    async def send(payload):
+                        sent.append(payload)
+                        session._pending_requests[payload["id"]].set_result(reply)
+
+                    session._send_message = send
+                    outcome = await session.steer_peer_message("peer text")
+                    assert outcome == (expected, source)
+                    assert sent[0]["method"] == "turn/steer"
+                    assert sent[0]["params"] == {
+                        "threadId": "thread-1",
+                        "expectedTurnId": "turn-1",
+                        "input": [{"type": "text", "text": "peer text"}],
+                    }
+                    assert session.active_turn_id == "turn-1"
+
+                _run(_t())
+
+    def test_peer_steer_missing_turn_and_transport_failure(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/opt/work/omnigent/fork/worktree",
+                env={},
+                tool_executor=None,
+            )
+            session.thread_id = "thread-1"
+            session._request = AsyncMock()
+            assert await session.steer_peer_message("peer text") == (
+                "refused",
+                "codex_no_active_turn",
+            )
+            session._request.assert_not_awaited()
+            session.active_turn_id = "turn-1"
+            session._request.side_effect = ConnectionError("disconnected after write")
+            assert await session.steer_peer_message("peer text") == (
+                "unknown",
+                "codex_turn_steer_error",
+            )
+            assert session.active_turn_id == "turn-1"
+
+        _run(_t())
+
+    def test_peer_steer_captures_turn_across_await_and_cancellation(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/opt/work/omnigent/fork/worktree",
+                env={},
+                tool_executor=None,
+            )
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            params = []
+
+            async def request(method, value):
+                params.append((method, value))
+                entered.set()
+                await release.wait()
+                return {"result": {"turnId": "turn-1"}}
+
+            session._request = request
+            task = asyncio.create_task(session.steer_peer_message("peer text"))
+            await entered.wait()
+            session.thread_id = "thread-2"
+            session.active_turn_id = "turn-2"
+            release.set()
+            assert await task == ("accepted", "codex_turn_steer")
+            assert params[0][1]["expectedTurnId"] == "turn-1"
+            assert params[0][1]["threadId"] == "thread-1"
+            assert session.active_turn_id == "turn-2"
+
+            executor = CodexExecutor(codex_path="/bin/echo")
+            executor._session_states["s1"] = _CodexSessionState(app_session=session)
+            session.interrupt_turn = AsyncMock()
+            session.close = AsyncMock()
+            entered.clear()
+            release.clear()
+            reports = []
+
+            async def report(value):
+                reports.append(value)
+
+            delivery = SDKPeerInput("a" * 32, "b" * 32, "peer text")
+            submit = asyncio.create_task(executor.submit_peer_message("s1", delivery, report))
+            await entered.wait()
+            submit.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await submit
+            assert reports == [
+                SDKPeerOutcome.for_input(delivery, "unknown", "codex_steer_cancelled")
+            ]
+            assert session.active_turn_id == "turn-2"
+            assert executor._session_states["s1"].app_session is session
+            session.interrupt_turn.assert_not_awaited()
+            session.close.assert_not_awaited()
+
+        _run(_t())
+
+    def test_peer_executor_reports_refusal_without_session_and_preserves_user_enqueue(self):
+        async def _t():
+            executor = CodexExecutor(codex_path="/bin/echo")
+            delivery = SDKPeerInput("a" * 32, "b" * 32, "peer text")
+            reports = []
+
+            async def report(value):
+                reports.append(value)
+
+            await executor.submit_peer_message("missing", delivery, report)
+            assert reports == [
+                SDKPeerOutcome.for_input(delivery, "refused", "codex_no_active_session")
+            ]
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/opt/work/omnigent/fork/worktree",
+                env={},
+                tool_executor=None,
+            )
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(return_value={"result": {}})
+            executor._session_states["s1"] = _CodexSessionState(app_session=session)
+            assert await executor.enqueue_session_message("s1", "ordinary text") is True
+            await executor.submit_peer_message("s1", delivery, report)
+            assert reports[-1] == SDKPeerOutcome.for_input(
+                delivery, "unknown", "codex_turn_steer_unverified"
+            )
+            assert session.active_turn_id == "turn-1"
+            session._request.assert_any_await(
+                "turn/steer",
+                {
+                    "threadId": "thread-1",
+                    "expectedTurnId": "turn-1",
+                    "input": [{"type": "text", "text": "ordinary text"}],
+                },
+            )
 
         _run(_t())
 

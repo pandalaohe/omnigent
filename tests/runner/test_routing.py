@@ -201,6 +201,28 @@ async def test_runner_router_wait_for_runner_resolves_when_runner_registers() ->
 
 
 @pytest.mark.asyncio
+async def test_runner_capability_uses_current_live_hello() -> None:
+    """A reconnect replaces advertised capabilities; an offline runner has none."""
+    registry = TunnelRegistry()
+    router = RunnerRouter(registry=registry, conversation_store=_ConversationStore({}))  # type: ignore[arg-type]
+    try:
+        assert not router.runner_has_capability("runner_one", "sdk_peer_receipts_v1")
+        hello = _hello(harnesses=["codex"])
+        hello.capabilities = ["sdk_peer_receipts_v1"]
+        old = registry.register("runner_one", _FakeWebSocket(), hello)
+        assert router.runner_has_capability("runner_one", "sdk_peer_receipts_v1")
+        assert not router.runner_has_capability("runner_one", "claude_sdk_hook_receipts_v1")
+        registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+        assert not router.runner_has_capability("runner_one", "sdk_peer_receipts_v1")
+        registry.deregister("runner_one", old)
+        assert registry.get("runner_one") is not None
+        registry.deregister("runner_one")
+        assert not router.runner_has_capability("runner_one", "sdk_peer_receipts_v1")
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runner_router_requires_pinned_runner_to_be_online() -> None:
     """A pinned offline runner fails instead of silently rerouting."""
     registry = TunnelRegistry()

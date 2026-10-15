@@ -8133,11 +8133,26 @@ async def _forward_event_to_runner(
     turn_id = f"turn_{uuid.uuid4().hex}"
     # A web send is persisted under its client stable id (see _web_send_stable_id).
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [item],
-    )
+    sdk_peer = body.data.get("peer_delivery") is not None
+    if sdk_peer:
+        # The peer store owns undelivered input. Only an SDK accepted receipt
+        # may put it in conversation history, where recovery could replay it.
+        persisted_items = [
+            ConversationItem(
+                id=body.data["peer_delivery"]["attempt_id"],
+                type=item.type,
+                response_id=turn_id,
+                data=item.data,
+                status="completed",
+                created_at=now_epoch(),
+            )
+        ]
+    else:
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
     if (
         item.stable_id is not None
         and persisted_items[0].deduplicated
@@ -8154,11 +8169,8 @@ async def _forward_event_to_runner(
             session_id,
             [item],
         )
-    await _seed_missing_title_from_user_message(
-        conv,
-        item,
-        conversation_store,
-    )
+    if not sdk_peer:
+        await _seed_missing_title_from_user_message(conv, item, conversation_store)
     # Don't publish status="running" or input.consumed here —
     # wait until after the forward to the runner succeeds.
     # Publishing early causes the REPL to start its streaming
@@ -8242,6 +8254,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if sdk_peer:
+        runner_body.pop("persisted_item_id")
     if runner_body["type"] == "message" and runner_body.get("role") == "user":
         archive_states = await runner_archive_states_for_conversation(
             conv,
@@ -8603,6 +8617,8 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
+            if sdk_peer:
+                raise HTTPException(status_code=502, detail="SDK peer forward has no receipt")
             # The live runner took nothing, so ``idle`` would read as a finished
             # turn that never ran. Persist the reason: the status edge is
             # SSE-only and would vanish on reload. Not strictly terminal — the
@@ -8641,7 +8657,8 @@ async def _forward_event_to_runner(
             )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
-        _publish_input_consumed(session_id, persisted_items[0])
+        if not sdk_peer:
+            _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
             "turn dispatched to runner for session=%s",
             session_id,
@@ -8736,6 +8753,8 @@ async def _forward_event_to_runner(
                     attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
+        if sdk_peer:
+            raise HTTPException(status_code=502, detail="SDK peer forward has no receipt") from exc
         # Transport failure — the runner never answered. The message is already
         # persisted (invariant I1), and a trailing user item is what
         # ``create_session`` replays as a recovery turn when the runner

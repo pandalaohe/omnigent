@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -40,8 +41,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequen
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import partial
+from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
-from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeAlias, cast
+
+if TYPE_CHECKING:
+    from claude_agent_sdk import SessionKey, SessionStoreEntry
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
@@ -60,6 +65,7 @@ from omnigent.models.claude_model_vocabulary import (
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.session_default_modes import CLAUDE_FAST_MODE_SETTINGS
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_serialization import json_dumps_transport_safe
@@ -884,6 +890,61 @@ class _QuerySlot:
     busy: int = 0
     maintenance: bool = False
     tool_attempted: bool = False
+    permission_waits: int = 0
+
+
+@dataclass
+class _ClaudePeerPending:
+    delivery: SDKPeerInput
+    report: ReportPeerOutcome
+    tool_use_id: str | None = None
+    hook_event: str | None = None
+    session_id: str | None = None
+    submitted: bool = False
+    envelope_digest: bytes | None = None
+
+
+def claude_peer_receipts_supported() -> bool:
+    """Check the installed SDK and selected CLI without starting either."""
+    try:
+        import claude_agent_sdk
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+        sdk_parts = tuple(int(part) for part in version("claude-agent-sdk").split(".")[:3])
+        from claude_agent_sdk._cli_version import __cli_version__
+
+        cli_parts = tuple(int(part) for part in __cli_version__.split(".")[:3])
+        fields = ClaudeAgentOptions.__dataclass_fields__
+        bundled = (
+            pathlib.Path(claude_agent_sdk.__file__).parent
+            / "_bundled"
+            / ("claude.exe" if os.name == "nt" else "claude")
+        )
+        system_cli = _find_system_claude()
+        return (
+            sdk_parts >= (0, 2, 94)
+            and cli_parts >= (2, 1, 169)
+            and bundled.is_file()
+            and (system_cli is None or pathlib.Path(system_cli).samefile(bundled))
+            and callable(HookMatcher)
+            and {"session_store", "session_store_flush", "can_use_tool", "hooks"} <= fields.keys()
+        )
+    except (ImportError, PackageNotFoundError, AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+class _ClaudePeerReceiptStore:
+    """Observe only hook context receipts; local SDK transcripts remain the resume owner."""
+
+    def __init__(self, owner: ClaudeSDKExecutor, session_key: str):
+        self._owner = owner
+        self._session_key = session_key
+
+    async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:  # noqa: ARG002
+        return None
+
+    async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        await self._owner._observe_peer_mirror(self._session_key, key, entries)
 
 
 class _KeepWarmPingOutcome(NamedTuple):
@@ -1858,6 +1919,10 @@ class ClaudeSDKExecutor(Executor):
         # Per-session query slots serializing real turns and keep-warm pings.
         self._query_slots: dict[str, _QuerySlot] = {}
         self._pending_framework_context: dict[str, str] = {}
+        self._peer_pending: dict[str, list[_ClaudePeerPending]] = {}
+        self._peer_late: dict[str, list[_ClaudePeerPending]] = {}
+        self._peer_locks: dict[str, asyncio.Lock] = {}
+        self._peer_used_hooks: dict[str, set[tuple[str, str, str]]] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
         # Force-close tasks for clients evicted on turn cancellation, kept
@@ -2126,9 +2191,13 @@ class ClaudeSDKExecutor(Executor):
         return state.client
 
     async def close_session(self, session_key: str) -> None:
+        await self.finish_peer_messages(session_key)
         self._crashed_sessions.pop(session_key, None)
         self._query_slots.pop(session_key, None)
         await self._close_live_client(session_key)
+        self._peer_late.pop(session_key, None)
+        self._peer_locks.pop(session_key, None)
+        self._peer_used_hooks.pop(session_key, None)
 
     def _query_slot(self, session_key: str) -> _QuerySlot:
         """Return the session's query slot, creating it on first use."""
@@ -2494,6 +2563,117 @@ class ClaudeSDKExecutor(Executor):
         # once the active turn ends, preserving in-order delivery.
         return False
 
+    async def submit_peer_message(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> None:
+        """Queue a peer only for a currently active, receipt-capable main turn."""
+        slot = self._query_slots.get(session_key)
+        if (
+            not claude_peer_receipts_supported()
+            or slot is None
+            or slot.busy <= 0
+            or slot.maintenance
+            or slot.permission_waits
+        ):
+            await report(SDKPeerOutcome.for_input(delivery, "refused", "claude_hook_unavailable"))
+            return
+        existing = self._peer_pending.get(session_key, []) + self._peer_late.get(session_key, [])
+        if any(
+            item.delivery.peer_id == delivery.peer_id
+            and item.delivery.attempt_id == delivery.attempt_id
+            for item in existing
+        ):
+            return
+        self._peer_pending.setdefault(session_key, []).append(_ClaudePeerPending(delivery, report))
+
+    async def finish_peer_messages(self, session_key: str) -> None:
+        """Settle queued work at turn end; reserved work without proof is unknown."""
+        async with self._peer_locks.setdefault(session_key, asyncio.Lock()):
+            pending = self._peer_pending.pop(session_key, [])
+            for item in pending:
+                outcome = "unknown" if item.submitted else "refused"
+                source = (
+                    "claude_hook_no_receipt" if item.submitted else "claude_hook_not_submitted"
+                )
+                if item.submitted:
+                    # No executable hook queue survives turn end. Keep only
+                    # correlation for a mirror batch that arrives afterward.
+                    item.envelope_digest = hashlib.sha256(item.delivery.text.encode()).digest()
+                    item.delivery = SDKPeerInput(
+                        item.delivery.peer_id, item.delivery.attempt_id, ""
+                    )
+                    self._peer_late.setdefault(session_key, []).append(item)
+                await item.report(SDKPeerOutcome.for_input(item.delivery, outcome, source))
+
+    async def _observe_peer_mirror(
+        self, session_key: str, key: object, entries: Sequence[object]
+    ) -> None:
+        """Require main transcript, exact session/tool/envelope and a reserved attempt."""
+        if (
+            not isinstance(key, dict)
+            or key.get("subpath")
+            or not isinstance(key.get("session_id"), str)
+        ):
+            return
+        async with self._peer_locks.setdefault(session_key, asyncio.Lock()):
+            await self._observe_peer_mirror_locked(session_key, key, entries)
+
+    async def _observe_peer_mirror_locked(
+        self, session_key: str, key: dict[str, object], entries: Sequence[object]
+    ) -> None:
+        pending = self._peer_pending.get(session_key, [])
+        late = self._peer_late.get(session_key, [])
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "attachment":
+                continue
+            attachment = entry.get("attachment")
+            if (
+                not isinstance(attachment, dict)
+                or attachment.get("type") != "hook_additional_context"
+            ):
+                continue
+            event = attachment.get("hookEvent")
+            tool_id = attachment.get("toolUseID")
+            content = attachment.get("content")
+            hook_name = attachment.get("hookName")
+            if (
+                event not in ("PostToolUse", "PostToolUseFailure")
+                or not isinstance(hook_name, str)
+                or not (hook_name == event or hook_name.startswith(f"{event}:"))
+                or not isinstance(tool_id, str)
+                or not isinstance(content, list)
+                or len(content) != 1
+                or not isinstance(content[0], str)
+                or entry.get("sessionId") != key["session_id"]
+            ):
+                continue
+            for item in tuple(pending) + tuple(late):
+                if (
+                    item.submitted
+                    and item.session_id == key["session_id"]
+                    and item.hook_event == event
+                    and item.tool_use_id == tool_id
+                    and (
+                        item.delivery.text == content[0]
+                        if item.envelope_digest is None
+                        else item.envelope_digest == hashlib.sha256(content[0].encode()).digest()
+                    )
+                ):
+                    await item.report(
+                        SDKPeerOutcome.for_input(
+                            item.delivery, "accepted", "claude_session_store_hook"
+                        )
+                    )
+                    if item in pending:
+                        pending.remove(item)
+                    else:
+                        late.remove(item)
+                    break
+        if not pending:
+            self._peer_pending.pop(session_key, None)
+        if not late:
+            self._peer_late.pop(session_key, None)
+
     @staticmethod
     async def _force_close_client(client: _ClaudeClient) -> None:
         # getattr defensively: runs on the success path too, so must
@@ -2659,6 +2839,56 @@ class ClaudeSDKExecutor(Executor):
         hooks = dict(getattr(options, "hooks", None) or {})
         hooks.setdefault("UserPromptSubmit", []).append(hook_matcher(hooks=[add_context]))
         options.hooks = hooks
+
+    def _install_peer_hooks(self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str) -> None:
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            return
+
+        for event in ("PostToolUse", "PostToolUseFailure"):
+
+            async def deliver(
+                payload: object, tool_use_id: str | None, _context: object, *, event: str = event
+            ) -> _JsonObject:
+                slot = self._query_slots.get(session_key)
+                if (
+                    slot is None
+                    or slot.busy <= 0
+                    or slot.maintenance
+                    or slot.permission_waits
+                    or not isinstance(payload, dict)
+                    or payload.get("hook_event_name") != event
+                    or payload.get("agent_id") is not None
+                    or not isinstance(payload.get("session_id"), str)
+                    or not isinstance(tool_use_id, str)
+                    or payload.get("tool_use_id") != tool_use_id
+                ):
+                    return {}
+                hook_key = (payload["session_id"], event, tool_use_id)
+                used_hooks = self._peer_used_hooks.setdefault(session_key, set())
+                if hook_key in used_hooks:
+                    return {}
+                pending = self._peer_pending.get(session_key, [])
+                item = next((candidate for candidate in pending if not candidate.submitted), None)
+                if item is None:
+                    return {}
+                used_hooks.add(hook_key)
+                item.submitted = True
+                item.tool_use_id = tool_use_id
+                item.hook_event = event
+                item.session_id = payload["session_id"]
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": item.delivery.text,
+                    }
+                }
+
+            hooks = dict(getattr(options, "hooks", None) or {})
+            entries = list(hooks.get(event) or [])
+            entries.append(hook_matcher(hooks=[deliver]))
+            hooks[event] = entries
+            options.hooks = hooks
 
     def _install_keep_warm_maintenance_hook(
         self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str
@@ -2920,6 +3150,7 @@ class ClaudeSDKExecutor(Executor):
         perm_ctx: object,
         *,
         permission_mode: str | None = None,
+        session_key: str | None = None,
     ) -> object:
         """
         Unified ``options.can_use_tool`` callback for the claude-sdk path.
@@ -2949,17 +3180,21 @@ class ClaudeSDKExecutor(Executor):
         """
         from claude_agent_sdk import PermissionResultAllow
 
-        policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
-        if policy_result is not None:
-            # Hard DENY from policy — block before execution.
-            return policy_result
-        # Policy allowed (or no policy gate). Under bypassPermissions we
-        # never prompt; otherwise defer to the elicitation gate.
-        if (
-            permission_mode or self._permission_mode
-        ) == "bypassPermissions" or self._elicitation_handler is None:
-            return PermissionResultAllow()
-        return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
+        slot = self._query_slots.get(session_key) if session_key is not None else None
+        if slot is not None:
+            slot.permission_waits += 1
+        try:
+            policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
+            if policy_result is not None:
+                return policy_result
+            if (
+                permission_mode or self._permission_mode
+            ) == "bypassPermissions" or self._elicitation_handler is None:
+                return PermissionResultAllow()
+            return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
+        finally:
+            if slot is not None:
+                slot.permission_waits -= 1
 
     async def run_turn(
         self,
@@ -3226,12 +3461,16 @@ class ClaudeSDKExecutor(Executor):
             or self._elicitation_handler is not None
         ):
             options.can_use_tool = partial(
-                self._can_use_tool_gate, permission_mode=permission_mode
+                self._can_use_tool_gate, permission_mode=permission_mode, session_key=session_key
             )
 
         self._install_subagent_router_hook(sdk, options, model, session_key)
         self._install_framework_context_hook(sdk, options, session_key)
         self._install_keep_warm_maintenance_hook(sdk, options, session_key)
+        if claude_peer_receipts_supported() and getattr(sdk, "HookMatcher", None) is not None:
+            options.session_store = _ClaudePeerReceiptStore(self, session_key)
+            options.session_store_flush = "eager"
+            self._install_peer_hooks(sdk, options, session_key)
 
         # Log the full configuration for debugging
         logger.info(
@@ -3881,6 +4120,7 @@ class ClaudeSDKExecutor(Executor):
         finally:
             self._pending_framework_context.pop(session_key, None)
             slot.busy -= 1
+            await self.finish_peer_messages(session_key)
         # A turn can end without ``ResultMessage`` usage — the CLI can close
         # the stream early, fail terminally (auth failure, rejected retries),
         # or be cut short before its final usage is reported. In all of those

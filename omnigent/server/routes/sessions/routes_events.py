@@ -38,6 +38,7 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.entities.conversation import (
+    MessageData,
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError
@@ -71,6 +72,13 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.sdk_peer_delivery import (
+    SDK_PEER_RECEIPT_EVENT,
+    AttemptPhase,
+    SDKPeerInput,
+    sdk_attempt,
+    sdk_attempt_reason,
+)
 from omnigent.server import presence
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -223,6 +231,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_external_output_reasoning_delta,
     _publish_external_output_text_delta,
     _publish_external_tool_output_delta,
+    _publish_input_consumed,
     _publish_input_deny_terminal,
     _publish_interrupted,
     _publish_mcp_startup,
@@ -627,6 +636,14 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         or event.tools
         # A child-history recovery item keeps its per-entry replay-cursor checks.
         or "recovery_after" in event.data
+        or any(
+            key in event.data
+            for key in ("peer_message_id", "peer_delivery", "peer_delivery_start")
+        )
+        or (
+            isinstance(event.data.get("item_data"), dict)
+            and "peer_message_id" in event.data["item_data"]
+        )
     ):
         return False
     item_type = event.data.get("item_type")
@@ -1044,6 +1061,7 @@ class _RunnerEventContext:
 
 _RUNNER_EVENT_TYPES = frozenset(
     {
+        SDK_PEER_RECEIPT_EVENT,
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
@@ -1309,6 +1327,7 @@ def register_events_routes(
         *,
         acting_user_id: Any = _ACTING_USER_ID_UNSET,
         require_init_success: bool = False,
+        trusted_peer: bool = False,
     ) -> dict[str, bool | str | None]:
         return await _post_event_impl(
             request,
@@ -1316,6 +1335,7 @@ def register_events_routes(
             body,
             acting_user_id=acting_user_id,
             require_init_success=require_init_success,
+            trusted_peer=trusted_peer,
         )
 
     async def _subagent_wake_successor(
@@ -1490,6 +1510,7 @@ def register_events_routes(
         *,
         acting_user_id: Any = _ACTING_USER_ID_UNSET,
         require_init_success: bool = False,
+        trusted_peer: bool = False,
     ) -> dict[str, bool | str | None]:
         """
         Submit a session event (input message, tool output,
@@ -1592,6 +1613,118 @@ def register_events_routes(
         user_id, conv = await _authorized_conversation(
             request, session_id, acting_user_id=acting_user_id
         )
+        nested_item = body.data.get("item_data")
+        if not trusted_peer and (
+            any(
+                key in body.data
+                for key in ("peer_message_id", "peer_delivery", "peer_delivery_start")
+            )
+            or (isinstance(nested_item, dict) and "peer_message_id" in nested_item)
+        ):
+            raise OmnigentError("Peer delivery metadata is server-owned", code=ErrorCode.FORBIDDEN)
+        if body.type == SDK_PEER_RECEIPT_EVENT:
+            receipt_token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+            receipt_runner = (
+                request.runner_id
+                if isinstance(request, _RunnerEventContext)
+                else token_bound_runner_id(receipt_token)
+                if receipt_token
+                else None
+            )
+            if not conv.runner_id or receipt_runner != conv.runner_id:
+                raise OmnigentError(
+                    "SDK receipts require the bound runner", code=ErrorCode.FORBIDDEN
+                )
+            try:
+                identity = SDKPeerInput.from_metadata(
+                    {key: body.data.get(key) for key in ("peer_id", "attempt_id")}, ""
+                )
+                outcome = body.data.get("outcome")
+                if outcome not in ("accepted", "refused", "unknown"):
+                    raise ValueError("Invalid SDK peer outcome")
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            if peer_message_store is not None:
+                record = await asyncio.to_thread(peer_message_store.get, identity.peer_id)
+                attempt = sdk_attempt(record.reason) if record is not None else None
+                receipt_accepted = bool(
+                    record is not None
+                    and record.receiver_session_id == session_id
+                    and record.state == "delivered"
+                    and attempt == (identity.attempt_id, "accepted")
+                    and outcome == "accepted"
+                )
+                if (
+                    record is not None
+                    and record.receiver_session_id == session_id
+                    and record.state == "delivering"
+                    and attempt is not None
+                    and attempt[0] == identity.attempt_id
+                    and attempt[1] in ("wait", "unknown")
+                ):
+                    phases: dict[str, AttemptPhase] = {
+                        "accepted": "accepted",
+                        "refused": "refused",
+                        "unknown": "unknown",
+                    }
+                    phase = phases[outcome]
+                    moved = await asyncio.to_thread(
+                        peer_message_store.transition,
+                        record.id,
+                        {"accepted": "delivered", "refused": "queued", "unknown": "delivering"}[
+                            outcome
+                        ],
+                        sdk_attempt_reason(
+                            identity.attempt_id,
+                            phase,
+                            released=(record.reason or "").startswith("released:"),
+                        ),
+                        ("delivering",),
+                        expected_reason=record.reason,
+                    )
+                    receipt_accepted = bool(moved and outcome == "accepted")
+                if receipt_accepted and record is not None:
+                    from omnigent.server.routes.sessions.routes_peer import (
+                        _sender_agent_name,
+                        _sender_project_id,
+                        format_peer_envelope,
+                    )
+
+                    sender = await asyncio.to_thread(
+                        conversation_store.get_conversation, record.sender_session_id
+                    )
+                    envelope = format_peer_envelope(
+                        sender_session_id=record.sender_session_id,
+                        sender_title=sender.title if sender is not None else None,
+                        sender_agent_name=_sender_agent_name(sender, agent_store)
+                        if sender is not None
+                        else "session",
+                        sender_project_id=_sender_project_id(sender)
+                        if sender is not None
+                        else None,
+                        ref=record.ref,
+                        peer_id=record.id,
+                        text=record.text,
+                    )
+                    persisted = await asyncio.to_thread(
+                        conversation_store.append,
+                        session_id,
+                        [
+                            NewConversationItem(
+                                type="message",
+                                response_id=f"peer_{identity.attempt_id}",
+                                stable_id=identity.attempt_id,
+                                data=MessageData(
+                                    role="user",
+                                    content=[{"type": "input_text", "text": envelope}],
+                                    peer_message_id=record.id,
+                                ),
+                            )
+                        ],
+                    )
+                    if not persisted[0].deduplicated:
+                        _publish_input_consumed(session_id, persisted[0])
+            return {"queued": False}
         if in_flight is not None and body.type != _EXTERNAL_NATIVE_SUBAGENT_SNAPSHOT_TYPE:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.

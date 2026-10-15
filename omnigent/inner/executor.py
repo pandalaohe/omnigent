@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
@@ -702,6 +703,16 @@ class Executor:
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
         """Send a new user message to a live session without interrupting it, if supported."""
         return False
+
+    async def submit_peer_message(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> None:
+        """Submit a peer attempt separately from ordinary continuation input."""
+        del session_key
+        await report(SDKPeerOutcome.for_input(delivery, "refused", "unsupported_executor"))
+
+    async def finish_peer_messages(self, session_key: str) -> None:
+        """Settle unconsumed peer attempts before the turn stream closes."""
 
     async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # noqa: ARG002 — default unsupported; subclasses with a keep-warm channel override
         """Ping the live session so the provider prompt cache stays warm; returns the receipt."""

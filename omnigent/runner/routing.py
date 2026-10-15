@@ -295,6 +295,11 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+        """Read a capability from this runner's current live hello frame."""
+        session = self._registry.get(runner_id)
+        return session is not None and capability in session.hello.capabilities
+
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
         """
         Wait until *runner_id* has a live tunnel or *timeout_s* elapses.

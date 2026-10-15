@@ -109,6 +109,7 @@ def _build_peer_app(
     liveness_lookup: Any,
     feature_flags: Any,
     runner_tunnel_tokens: frozenset[str] | None = None,
+    runner_router: Any = None,
 ) -> FastAPI:
     """A minimal app hosting only the peer routes, wired via ``register_peer_routes``.
 
@@ -144,7 +145,7 @@ def _build_peer_app(
         runner_tunnel_tokens=runner_tunnel_tokens,
         feature_flags=feature_flags,
         peer_message_store=peer_message_store,
-        runner_router=None,
+        runner_router=runner_router,
         agent_store=agent_store,
         app_state=app.state,
     ).send
@@ -1303,8 +1304,7 @@ async def test_busy_recheck_after_record_creation_queues_same_record(
 
     def _create_then_go_busy(record: Any) -> Any:
         created = real_create(record)
-        if created.state == "delivering":
-            sessions_module._session_status_cache[receiver.id] = "running"
+        sessions_module._session_status_cache[receiver.id] = "running"
         return created
 
     monkeypatch = pytest.MonkeyPatch()
@@ -1342,8 +1342,7 @@ async def test_busy_recheck_child_is_queued_not_steered(
 
     def _create_then_go_busy(record: Any) -> Any:
         created = real_create(record)
-        if created.state == "delivering":
-            sessions_module._session_status_cache[child.id] = "running"
+        sessions_module._session_status_cache[child.id] = "running"
         return created
 
     monkeypatch.setattr(peer_store, "create", _create_then_go_busy)
@@ -1635,12 +1634,12 @@ async def test_codex_native_running_receiver_waits_for_native_receipt(
     assert peer_module._record_to_dict(replace(record, state="delivered"))["reason"] is None
 
 
-async def test_sdk_running_receiver_queues(
+async def test_sdk_running_receiver_queues_without_opt_in(
     peer_client: httpx.AsyncClient,
     peer_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An SDK session mid-turn has no steer path and stays queued."""
+    """Default-off SDK steering preserves the queued behavior."""
     sender = peer_env["sender"]
     receiver = peer_env["receiver"]
     fake: _FakePostEvent = peer_env["fake"]
@@ -1652,6 +1651,89 @@ async def test_sdk_running_receiver_queues(
     )
     assert resp.json()["disposition"] == "queued", resp.text
     assert fake.calls == []
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude-sdk"])
+@pytest.mark.parametrize("gate", ["ready", "missing_capability", "flag_off", "approval", "child"])
+async def test_sdk_peer_steering_requires_live_capability_and_input_gate(
+    peer_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, harness: str, gate: str
+) -> None:
+    from omnigent.sdk_peer_delivery import SDK_PEER_CAPABILITY, sdk_attempt
+    from omnigent.server.routes.sessions import SessionLiveness
+
+    receiver, sender = peer_env["receiver"], peer_env["sender"]
+    conv_store = peer_env["conv_store"]
+    conv_store.update_conversation(receiver.id, harness_override=harness)
+    if gate == "child":
+        receiver = conv_store.create_conversation(
+            title="child",
+            agent_id=AGENT_ID,
+            runner_id=receiver.runner_id,
+            parent_conversation_id=sender.id,
+            kind="default",
+            harness_override=harness,
+        )
+    monkeypatch.setitem(cast(Any, sessions_module._session_status_cache), receiver.id, "running")
+
+    class Router:
+        def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+            return gate != "missing_capability" or capability != SDK_PEER_CAPABILITY
+
+    app = _build_peer_app(
+        conversation_store=conv_store,
+        permission_store=peer_env["perm_store"],
+        agent_store=None,
+        peer_message_store=peer_env["peer_store"],
+        post_event_impl=peer_env["fake"],
+        liveness_lookup=lambda ids: {
+            sid: SessionLiveness(runner_online=True, host_online=True) for sid in ids
+        },
+        feature_flags=resolve_feature_flags(
+            {
+                "OMNIGENT_FEATURES": "session_peer_messaging"
+                + (",sdk_peer_steering" if gate != "flag_off" else "")
+            }
+        ),
+        runner_router=Router(),
+    )
+    if gate == "approval":
+        pending_elicitations.record_publish(
+            receiver.id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": "approval",
+                "params": {"message": "Approve?"},
+            },
+        )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{receiver.id}/peer-messages",
+                json={"sender_session_id": sender.id, "text": "sdk input"},
+                headers=_headers(ALICE, peer_env["sender_token"]),
+            )
+        assert response.status_code == 200, response.text
+        if gate == "child":
+            assert response.json()["disposition"] == "refused"
+            assert peer_env["fake"].calls == []
+            return
+        record = peer_env["peer_store"].get(response.json()["peer_id"])
+        assert response.json()["disposition"] == "queued"
+        if gate == "ready":
+            assert record.state == "delivering"
+            assert sdk_attempt(record.reason)[1] == "wait"
+            assert peer_env["fake"].calls[0]["data"]["peer_delivery"] == {
+                "peer_id": record.id,
+                "attempt_id": sdk_attempt(record.reason)[0],
+            }
+            assert record.reason not in str(response.json())
+        else:
+            assert record.state == "queued"
+            assert peer_env["fake"].calls == []
+    finally:
+        pending_elicitations.reset_for_tests()
 
 
 async def test_inline_uncertain_leaves_record_delivering(

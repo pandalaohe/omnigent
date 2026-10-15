@@ -41,6 +41,7 @@ class SessionPeerMessage:
         back-notice was left unposted for its sender, or ``None`` when no
         notice is owed.
     :param workspace_id: Tenant partition key that owns this row.
+    :param pair_sequence: Durable admission order within one sender/receiver pair.
     """
 
     id: str
@@ -60,3 +61,4 @@ class SessionPeerMessage:
     not_before: int | None = None
     notice_owed_at: int | None = None
     workspace_id: int = 0
+    pair_sequence: int | None = None

@@ -74,6 +74,7 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.sdk_peer_delivery import PeerOutcome, ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
 from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
 from omnigent.spec.types import RetryPolicy
@@ -2983,6 +2984,30 @@ async def _keep_warm_queue_events(
         yield await queue.get()
 
 
+class _CodexRPCResponseError(RuntimeError):
+    """Preserve JSON-RPC rejection fields for callers that need exact outcomes."""
+
+    def __init__(self, error: object) -> None:
+        self.code = error.get("code") if isinstance(error, dict) else None
+        self.message = error.get("message") if isinstance(error, dict) else None
+        super().__init__(str(error))
+
+
+def _is_rejected_peer_steer(error: _CodexRPCResponseError, expected_turn_id: str) -> bool:
+    if error.code != -32600 or not isinstance(error.message, str):
+        return False
+    message = error.message.strip()
+    if message == "no active turn to steer":
+        return True
+    prefix = "expected active turn id "
+    expected, separator, found = message.partition(" but found ")
+    return (
+        bool(separator and found.strip("`'\" "))
+        and expected.startswith(prefix)
+        and expected[len(prefix) :].strip("`'\"") == expected_turn_id
+    )
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -4607,6 +4632,39 @@ class _CodexAppServerSession:
             self.active_turn_id = turn_id
         return True
 
+    async def steer_peer_message(self, text: str) -> tuple[PeerOutcome, str]:
+        """Submit to the captured turn and require matching SDK receipt evidence."""
+        thread_id, turn_id = self.thread_id, self.active_turn_id
+        if thread_id is None or turn_id is None:
+            return "refused", "codex_no_active_turn"
+        try:
+            response = await self._request(
+                "turn/steer",
+                {
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": text}],
+                },
+            )
+        except _CodexRPCResponseError as exc:
+            if _is_rejected_peer_steer(exc, turn_id):
+                return "refused", "codex_turn_steer_rejected"
+            return "unknown", "codex_turn_steer_error"
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a submitted steer may have reached Codex
+            logger.debug("Codex peer turn/steer has no receipt", exc_info=True)
+            return "unknown", "codex_turn_steer_error"
+
+        result = (
+            response.get("result")
+            if isinstance(response, dict) and "error" not in response
+            else None
+        )
+        if isinstance(result, dict) and result.get("turnId") == turn_id:
+            return "accepted", "codex_turn_steer"
+        return "unknown", "codex_turn_steer_unverified"
+
     async def interrupt_turn(self) -> bool:
         if self.thread_id is None or self.active_turn_id is None:
             return False
@@ -4687,7 +4745,7 @@ class _CodexAppServerSession:
                 future.exception()
         error = response.get("error")
         if error:
-            raise RuntimeError(str(error))
+            raise _CodexRPCResponseError(error)
         return response
 
     async def _send_response(self, request_id: int | str, result: CodexParams) -> None:
@@ -5379,6 +5437,26 @@ class CodexExecutor(Executor):
         if state is None or state.app_session is None:
             return False
         return await state.app_session.enqueue_message(content)
+
+    async def submit_peer_message(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> None:
+        state = self._session_states.get(session_key)
+        app_session = state.app_session if state is not None else None
+        if app_session is None:
+            outcome, source = "refused", "codex_no_active_session"
+        else:
+            try:
+                outcome, source = await app_session.steer_peer_message(delivery.text)
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    report(SDKPeerOutcome.for_input(delivery, "unknown", "codex_steer_cancelled"))
+                )
+                raise
+            except Exception:  # noqa: BLE001 — never fail or close the active turn
+                logger.debug("Codex peer submission has no receipt", exc_info=True)
+                outcome, source = "unknown", "codex_turn_steer_error"
+        await report(SDKPeerOutcome.for_input(delivery, outcome, source))
 
     async def keep_warm(self, *, attempt_id: str, family: str) -> dict[str, Any]:
         """

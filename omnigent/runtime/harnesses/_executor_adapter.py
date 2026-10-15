@@ -45,6 +45,7 @@ from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.sdk_peer_delivery import PeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
@@ -55,6 +56,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    SDKPeerReceiptEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -277,6 +279,25 @@ class ExecutorAdapter(HarnessApp):
         _active_tool_parent = None
 
         user_message = _extract_last_user_message(request.input)
+        initial_peer = (
+            SDKPeerInput.from_metadata(request.peer_delivery, user_message)
+            if request.peer_delivery is not None
+            else None
+        )
+
+        def initial_peer_receipt(outcome: PeerOutcome, proof: str) -> None:
+            nonlocal initial_peer
+            if initial_peer is None:
+                return
+            ctx.emit(
+                SDKPeerReceiptEvent(
+                    peer_id=initial_peer.peer_id,
+                    attempt_id=initial_peer.attempt_id,
+                    outcome=outcome,
+                    proof_source=proof,
+                )
+            )
+            initial_peer = None
 
         # Watcher forwards mid-turn steering injections into the in-flight executor session.
         injection_watcher = asyncio.create_task(
@@ -307,6 +328,12 @@ class ExecutorAdapter(HarnessApp):
                     system_prompt=system_prompt,
                     config=config,
                 ):
+                    if isinstance(
+                        event, (TextChunk, ReasoningChunk, ToolCallRequest, TurnComplete)
+                    ):
+                        initial_peer_receipt("accepted", "sdk_turn_response")
+                    elif isinstance(event, ExecutorError) and event.undelivered:
+                        initial_peer_receipt("refused", "sdk_turn_not_started")
                     if ctx.cancelled.is_set():
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
@@ -413,10 +440,12 @@ class ExecutorAdapter(HarnessApp):
                 agent_span = None
             raise
         finally:
+            initial_peer_receipt("unknown", "sdk_turn_ended_without_receipt")
             # Cancel the injection watcher (long-polls a queue; cancellation is the only way out).
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await injection_watcher
+            await executor.finish_peer_messages(self._session_key)
             if tctx is not None:
                 try:
                     from opentelemetry import trace as otel_trace
@@ -573,6 +602,37 @@ class ExecutorAdapter(HarnessApp):
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
             text = _extract_user_text(injection.input)
+            if injection.peer_delivery is not None:
+                delivery = SDKPeerInput.from_metadata(injection.peer_delivery, text)
+
+                async def report_peer(outcome: SDKPeerOutcome) -> None:
+                    ctx.emit(
+                        SDKPeerReceiptEvent(
+                            peer_id=outcome.peer_id,
+                            attempt_id=outcome.attempt_id,
+                            outcome=outcome.outcome,
+                            proof_source=outcome.proof_source,
+                        )
+                    )
+
+                if ctx.cancelled.is_set() or getattr(ctx, "_pending_human_waits", 0) or not text:
+                    await report_peer(SDKPeerOutcome.for_input(delivery, "refused", "input_gate"))
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        executor.submit_peer_message(self._session_key, delivery, report_peer),
+                        timeout=10.0,
+                    )
+                except asyncio.CancelledError:
+                    await report_peer(
+                        SDKPeerOutcome.for_input(delivery, "unknown", "submission_cancelled")
+                    )
+                    return
+                except Exception:
+                    await report_peer(
+                        SDKPeerOutcome.for_input(delivery, "unknown", "submission_failed")
+                    )
+                continue
             if not text:
                 _logger.warning(
                     "skipping in-band injection with no text payload: %r",

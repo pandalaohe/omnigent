@@ -231,6 +231,12 @@ from omnigent.runtime.prompt import (
     raw_author_instructions,
     session_startup_extras,
 )
+from omnigent.sdk_peer_delivery import (
+    SDK_PEER_RECEIPT_EVENT,
+    SDK_PEER_STREAM_EVENT,
+    SDKPeerInput,
+    SDKPeerOutcome,
+)
 from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
@@ -2192,6 +2198,11 @@ def create_runner_app(
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers
+    # Keep only identities and terminal states; executable peer text is never queued here.
+    _sdk_peer_attempts: OrderedDict[tuple[str, str], tuple[str, SDKPeerOutcome | None]] = (
+        OrderedDict()
+    )
+    app.state.sdk_peer_attempts = _sdk_peer_attempts
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
     _author_attribution_sessions: set[str] = set()
@@ -2218,6 +2229,84 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+
+    async def _post_sdk_peer_receipt(session_id: str, outcome: SDKPeerOutcome) -> None:
+        payload = {
+            "type": SDK_PEER_RECEIPT_EVENT,
+            "data": dataclasses.asdict(outcome),
+        }
+        for attempt in range(3):
+            try:
+                response = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                    json=payload,
+                    timeout=5.0,
+                )
+                if 200 <= response.status_code < 300:
+                    return
+                if response.status_code in {409, 422}:
+                    break
+            except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError):
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.2 * (2**attempt))
+        _logger.warning(
+            "SDK peer receipt delivery failed: session=%s peer=%s attempt=%s outcome=%s",
+            session_id,
+            outcome.peer_id,
+            outcome.attempt_id,
+            outcome.outcome,
+            extra={"session_id": session_id},
+        )
+
+    def _send_sdk_peer_receipt(session_id: str, outcome: SDKPeerOutcome) -> None:
+        task = asyncio.create_task(_post_sdk_peer_receipt(session_id, outcome))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    def _track_sdk_peer(session_id: str, delivery: SDKPeerInput) -> bool:
+        key = (session_id, delivery.attempt_id)
+        existing = _sdk_peer_attempts.get(key)
+        if existing is not None:
+            return False
+        _sdk_peer_attempts[key] = (delivery.peer_id, None)
+        # Retain recent settled identities to suppress duplicate HTTP deliveries.
+        while len(_sdk_peer_attempts) > 2048:
+            settled = next(
+                (k for k, (_, result) in _sdk_peer_attempts.items() if result is not None),
+                None,
+            )
+            if settled is None:
+                break
+            _sdk_peer_attempts.pop(settled)
+        return True
+
+    def _settle_sdk_peer(session_id: str, outcome: SDKPeerOutcome) -> None:
+        key = (session_id, outcome.attempt_id)
+        tracked = _sdk_peer_attempts.get(key)
+        if tracked is None or tracked[0] != outcome.peer_id:
+            return
+        previous = tracked[1]
+        if previous is not None and not (
+            previous.outcome == "unknown" and outcome.outcome == "accepted"
+        ):
+            return
+        _sdk_peer_attempts[key] = (outcome.peer_id, outcome)
+        if outcome.outcome != "accepted":
+            history = _session_histories.get(session_id)
+            if history is not None:
+                _session_histories[session_id] = [
+                    item for item in history if item.get("peer_message_id") != outcome.peer_id
+                ]
+        _send_sdk_peer_receipt(session_id, outcome)
+
+    def _unknown_sdk_peers(session_id: str, source: str) -> None:
+        for (tracked_session, attempt_id), (peer_id, result) in list(_sdk_peer_attempts.items()):
+            if tracked_session == session_id and result is None:
+                _settle_sdk_peer(
+                    session_id, SDKPeerOutcome(peer_id, attempt_id, "unknown", source)
+                )
+
     # One watcher per session for a pending Databricks sign-in (see _start_sign_in_watch).
     _sign_in_watchers: dict[str, asyncio.Task[None]] = {}
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
@@ -4075,6 +4164,8 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
+            if harness_name in {"claude-sdk", "codex"} and _trailing_sdk_peer_item(raw_history):
+                needs_turn = False
             if (
                 needs_turn
                 and recovery_id is None
@@ -4117,6 +4208,10 @@ def create_runner_app(
                 not execution_seen
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
+                and not (
+                    harness_name in {"claude-sdk", "codex"}
+                    and _trailing_sdk_peer_item(raw_history)
+                )
             ):
                 recovery_turn = "recovery_prompt"
                 if is_native_harness(harness_name):
@@ -4465,6 +4560,9 @@ def create_runner_app(
     async def delete_session(session_id: str) -> JSONResponse:
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
+        _unknown_sdk_peers(session_id, "runner_session_deleted")
+        for key in [key for key in _sdk_peer_attempts if key[0] == session_id]:
+            _sdk_peer_attempts.pop(key)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
@@ -4647,6 +4745,19 @@ def create_runner_app(
             item_id = item.get("id")
             return item_id if isinstance(item_id, str) and item_id else None
         return None
+
+    def _trailing_sdk_peer_item(items: list[_JsonObject]) -> bool:
+        """A persisted peer envelope alone cannot authorize an SDK recovery turn."""
+        for item in reversed(items):
+            if item.get("type") not in _HISTORY_INPUT_ITEM_TYPES:
+                continue
+            return (
+                item.get("type") == "message"
+                and item.get("role", "user") == "user"
+                and isinstance(item.get("peer_message_id"), str)
+                and bool(item["peer_message_id"])
+            )
+        return False
 
     def _forward_of_replayed_item(
         conversation_id: str,
@@ -5321,6 +5432,7 @@ def create_runner_app(
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
         a replacement turn that ran and finished during a teardown await.
         """
+        _unknown_sdk_peers(conv_id, "runner_turn_rebound")
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
 
@@ -5643,6 +5755,7 @@ def create_runner_app(
             )
             return
 
+        _unknown_sdk_peers(conv_id, "runner_turn_ended")
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         # A claude-sdk `/compact` turn that ended without emitting
@@ -7308,6 +7421,10 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        if isinstance(msg_body.get("peer_delivery"), dict):
+            harness_body["peer_delivery"] = msg_body["peer_delivery"]
+            if msg_body.get("peer_delivery_start") is True:
+                harness_body["peer_delivery_start"] = True
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -8113,6 +8230,31 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                if _evt_type == SDK_PEER_STREAM_EVENT:
+                                    try:
+                                        receipt_input = SDKPeerInput.from_metadata(
+                                            {
+                                                "peer_id": event.get("peer_id"),
+                                                "attempt_id": event.get("attempt_id"),
+                                            },
+                                            "",
+                                        )
+                                    except ValueError:
+                                        continue
+                                    outcome = event.get("outcome")
+                                    proof_source = event.get("proof_source")
+                                    if (
+                                        outcome in {"accepted", "refused", "unknown"}
+                                        and isinstance(proof_source, str)
+                                        and proof_source
+                                    ):
+                                        _settle_sdk_peer(
+                                            conv_id,
+                                            SDKPeerOutcome.for_input(
+                                                receipt_input, outcome, proof_source
+                                            ),
+                                        )
+                                    continue
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -8747,7 +8889,107 @@ def create_runner_app(
                         server_client=server_client,
                     )
 
-                _replayed_forward = _forward_of_replayed_item(conversation_id, message_body)
+                _peer_delivery: SDKPeerInput | None = None
+                if "peer_delivery" in message_body:
+                    try:
+                        _peer_delivery = SDKPeerInput.from_metadata(
+                            message_body["peer_delivery"],
+                            _side_chat_text_from_content(message_body.get("content")),
+                        )
+                    except ValueError:
+                        return JSONResponse(
+                            status_code=422,
+                            content={"error": "invalid_peer_delivery"},
+                        )
+                    tracked = _sdk_peer_attempts.get((conversation_id, _peer_delivery.attempt_id))
+                    if tracked is not None:
+                        if tracked[0] == _peer_delivery.peer_id and tracked[1] is not None:
+                            _send_sdk_peer_receipt(conversation_id, tracked[1])
+                        return JSONResponse(
+                            status_code=202 if tracked[0] == _peer_delivery.peer_id else 409,
+                            content={"status": "duplicate_peer_delivery"},
+                        )
+                    _peer_harness = _session_harness_name(conversation_id)
+                    if (
+                        _peer_harness not in {"claude-sdk", "codex"}
+                        or conversation_id in _child_session_parents
+                        or pending_approvals.has_pending(conversation_id)
+                        or not _peer_delivery.text
+                    ):
+                        _track_sdk_peer(conversation_id, _peer_delivery)
+                        _settle_sdk_peer(
+                            conversation_id,
+                            SDKPeerOutcome.for_input(
+                                _peer_delivery, "refused", "runner_peer_input_gate"
+                            ),
+                        )
+                        return JSONResponse(status_code=202, content={"status": "refused"})
+
+                    if conversation_id in _active_turns:
+                        _track_sdk_peer(conversation_id, _peer_delivery)
+                        if (
+                            conversation_id not in _live_response_id
+                            or not process_manager.has_session(conversation_id)
+                            or not process_manager.has_active_turn(conversation_id)
+                        ):
+                            _settle_sdk_peer(
+                                conversation_id,
+                                SDKPeerOutcome.for_input(
+                                    _peer_delivery, "refused", "runner_no_active_sdk_client"
+                                ),
+                            )
+                            return JSONResponse(status_code=202, content={"status": "refused"})
+                        _peer_response_id = _live_response_id[conversation_id]
+                        _peer_turn_epoch = _turn_bind_epoch.get(conversation_id)
+                        try:
+                            _hc = await process_manager.get_client(conversation_id, "any")
+                            if (
+                                _live_response_id.get(conversation_id) != _peer_response_id
+                                or _turn_bind_epoch.get(conversation_id) != _peer_turn_epoch
+                            ):
+                                _settle_sdk_peer(
+                                    conversation_id,
+                                    SDKPeerOutcome.for_input(
+                                        _peer_delivery, "unknown", "runner_sdk_turn_rebound"
+                                    ),
+                                )
+                                return JSONResponse(status_code=202, content={"status": "unknown"})
+                            _injection_resp = await _hc.post(
+                                f"/v1/sessions/{conversation_id}/events",
+                                json={**message_body, "previous_response_id": _peer_response_id},
+                                timeout=5.0,
+                            )
+                        except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError):
+                            _settle_sdk_peer(
+                                conversation_id,
+                                SDKPeerOutcome.for_input(
+                                    _peer_delivery, "unknown", "runner_sdk_injection_transport"
+                                ),
+                            )
+                        else:
+                            if _injection_resp.status_code in {409, 422}:
+                                _settle_sdk_peer(
+                                    conversation_id,
+                                    SDKPeerOutcome.for_input(
+                                        _peer_delivery, "refused", "runner_sdk_injection_rejected"
+                                    ),
+                                )
+                            elif not 200 <= _injection_resp.status_code < 300:
+                                _settle_sdk_peer(
+                                    conversation_id,
+                                    SDKPeerOutcome.for_input(
+                                        _peer_delivery, "unknown", "runner_sdk_injection_http"
+                                    ),
+                                )
+                        return JSONResponse(status_code=202, content={"status": "pending"})
+
+                    message_body["peer_delivery_start"] = True
+
+                _replayed_forward = (
+                    _forward_of_replayed_item(conversation_id, message_body)
+                    if _peer_delivery is None
+                    else None
+                )
                 if _replayed_forward is not None:
                     return _replayed_forward
 
@@ -8863,6 +9105,8 @@ def create_runner_app(
                     "role": message_body.get("role", "user"),
                     "content": message_body.get("content", []),
                 }
+                if _peer_delivery is not None:
+                    new_item["peer_message_id"] = _peer_delivery.peer_id
                 if conversation_id in _session_histories:
                     await _restore_pending_session_attachments(conversation_id)
                     _session_histories[conversation_id].append(new_item)
@@ -8875,13 +9119,28 @@ def create_runner_app(
                     )
                     # The history load can outlive a replay turn that records
                     # this item; re-check before installing history and starting.
-                    _replayed_forward = _forward_of_replayed_item(conversation_id, message_body)
+                    _replayed_forward = (
+                        _forward_of_replayed_item(conversation_id, message_body)
+                        if _peer_delivery is None
+                        else None
+                    )
                     if _replayed_forward is not None:
                         return _replayed_forward
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
+                if _peer_delivery is not None and conversation_id in _active_turns:
+                    _track_sdk_peer(conversation_id, _peer_delivery)
+                    _settle_sdk_peer(
+                        conversation_id,
+                        SDKPeerOutcome.for_input(
+                            _peer_delivery, "refused", "runner_peer_start_raced"
+                        ),
+                    )
+                    return JSONResponse(status_code=202, content={"status": "refused"})
                 _begin_turn_slot(conversation_id)
+                if _peer_delivery is not None:
+                    _track_sdk_peer(conversation_id, _peer_delivery)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -10434,6 +10693,10 @@ def create_runner_app(
                     session_id not in _active_turns
                     and new_items
                     and new_items[-1].get("role") == "user"
+                    and not (
+                        _session_harness_name(session_id) in {"claude-sdk", "codex"}
+                        and _trailing_sdk_peer_item(all_new)
+                    )
                 ):
                     _begin_turn_slot(session_id)
                     _publish_turn_status(session_id, "running")
