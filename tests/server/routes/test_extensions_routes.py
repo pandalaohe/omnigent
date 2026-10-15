@@ -16,12 +16,15 @@ from omnigent.extensions import (
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
+    ExternalPageContribution,
     PageContribution,
     PrimaryNavigationContribution,
 )
+from omnigent.extensions.assets import resolve_bundle
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -404,3 +407,105 @@ def test_extension_routes_are_mounted_before_spa_fallback(
     assert expected <= set(paths)
     spa_index = next(index for index, path in enumerate(paths) if path == "")
     assert all(paths.index(path) < spa_index for path in expected)
+
+
+async def test_external_only_catalog_is_enabled_without_bundle(
+    db_uri: str, tmp_path: Path
+) -> None:
+    page = ExternalPageContribution(
+        id="acme.review.dashboard",
+        title="Dashboard",
+        route="dashboard",
+        url="https://dashboard.example.com/",
+    )
+    manifest = replace(
+        _manifest(),
+        entrypoints=ExtensionEntrypoints(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(page,),
+    )
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=ExtensionPluginState(manifests=(manifest,)),
+    )
+
+    async with _client(app) as client:
+        listing = await client.get("/v1/extensions")
+        detail = await client.get("/v1/extensions/acme.review")
+
+    assert listing.status_code == detail.status_code == 200
+    item = detail.json()
+    assert listing.json()["data"] == [item]
+    assert item["status"] == "enabled"
+    assert item["permissions"] == ["pages.external"]
+    assert item["pages"] == [
+        {
+            "id": "acme.review.dashboard",
+            "title": "Dashboard",
+            "route": "dashboard",
+            "kind": "external",
+            "view": None,
+            "url": "https://dashboard.example.com/",
+        }
+    ]
+    assert item["primary_navigation"][0]["page"] == "acme.review.dashboard"
+    assert item["browser"] == {
+        "declared": False,
+        "has_styles": False,
+        "digest": None,
+        "script_url": None,
+        "style_url": None,
+    }
+
+
+async def test_catalog_serializes_view_and_external_page_kinds(tmp_path: Path) -> None:
+    page = ExternalPageContribution(
+        id="acme.review.external",
+        title="Dashboard",
+        route="external",
+        url="https://dashboard.example.com/",
+    )
+    manifest = replace(
+        _manifest(),
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(*_manifest().pages, page),
+    )
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "extension.js").write_text("console.log('ok')")
+    (tmp_path / "dist" / "extension.css").write_text("body{}")
+    bundle = resolve_bundle(manifest, root_override=tmp_path)
+    app = FastAPI()
+    app.include_router(
+        create_extensions_router(
+            ExtensionPluginState(manifests=(manifest,)),
+            bundles={manifest.id: bundle},
+        ),
+        prefix="/v1",
+    )
+
+    async with _client(app) as client:
+        response = await client.get("/v1/extensions/acme.review")
+
+    assert response.status_code == 200
+    item = response.json()
+
+    assert item["status"] == "enabled"
+    assert item["pages"] == [
+        {
+            "id": "acme.review.dashboard",
+            "title": "Review dashboard",
+            "route": "dashboard",
+            "kind": "view",
+            "view": "review-dashboard",
+            "url": None,
+        },
+        {
+            "id": "acme.review.external",
+            "title": "Dashboard",
+            "route": "external",
+            "kind": "external",
+            "view": None,
+            "url": "https://dashboard.example.com/",
+        },
+    ]

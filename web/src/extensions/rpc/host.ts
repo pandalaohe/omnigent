@@ -1,5 +1,5 @@
 import { authenticatedFetch } from "@/lib/identity";
-import type { ExtensionCatalogItem, ExtensionPage } from "../types";
+import type { ExtensionCatalogItem, ExtensionViewPage } from "../types";
 import { EXTENSION_RPC_VERSION, type ExtensionIdentity } from "./protocol";
 
 export interface LoadedExtensionBundle {
@@ -65,7 +65,7 @@ function encodeBase64(value: string): string {
 
 export function buildExtensionDocument(
   bundle: LoadedExtensionBundle,
-  page: ExtensionPage,
+  page: ExtensionViewPage,
   nonce: string,
 ): { srcDoc: string; identity: ExtensionIdentity } {
   const identity: ExtensionIdentity = {

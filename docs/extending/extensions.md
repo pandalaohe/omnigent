@@ -1,8 +1,8 @@
 # Extensions
 
 Omnigent extensions are operator-installed Python distributions that contribute
-validated application metadata. V1 supports namespaced browser pages and links
-in the primary sidebar.
+validated application metadata. V1 supports namespaced browser views, external
+web pages, and links in the primary sidebar.
 
 ## Trust model
 
@@ -10,10 +10,10 @@ Installing a Python distribution is a full-code-trust operation: Python entry
 points execute in the Omnigent server process while their manifests are loaded.
 Only administrators should install extension packages.
 
-Browser UI receives a separate boundary. It runs in an opaque-origin sandboxed
-iframe, cannot access the parent React tree, cookies, authenticated transport,
-or native bridges, and has no network egress. Privileged actions use the
-versioned, permission-checked browser SDK.
+Browser views receive a separate boundary. Each runs in an opaque-origin
+sandboxed iframe, cannot access the parent React tree, cookies, authenticated
+transport, or native bridges, and has no network egress. Privileged actions use
+the versioned, permission-checked browser SDK.
 
 ```text
 trusted Python package -> validated manifest -> server catalog
@@ -23,9 +23,31 @@ trusted Python package -> validated manifest -> server catalog
                                       checked MessageChannel API
 ```
 
+External pages require the `pages.external` permission. The host frames the
+specified HTTP or HTTPS URL directly; Omnigent does not fetch or proxy it.
+The document runs in its own origin and can use its own network and storage.
+It has no browser SDK or host RPC access. The frame allows scripts, same-origin
+access, forms, and popups, but grants no top navigation, downloads, or device
+features. It sends no referrer. Declared URLs on the application's own origin
+are refused because scripts with same-origin access could remove the sandbox.
+
+This check covers the declared URL only: the site can redirect or navigate its
+frame, including to the application's origin. Such a navigation loads the
+application's own content; the host does not prevent it. Declare only sites
+trusted by the operator. Sites can also refuse framing through their response
+headers; the toolbar remains available to open them separately.
+
+An HTTPS application does not embed HTTP pages, including loopback URLs. It
+shows an explanation and buttons to open the page in a window or a new tab.
+The window button requests a 480 by 720 popup; browser policies may open a tab
+instead. In the desktop application, external origins outside the popup
+allowlist open in the default browser.
+
 ## V1 contribution points
 
-- `pages`: one-segment routes under `/extensions/{extension_id}/{route}`.
+- `pages`: one-segment routes under `/extensions/{extension_id}/{route}`,
+  using `PageContribution` for a sandboxed browser view or
+  `ExternalPageContribution` for an external web page.
 - `primary_navigation`: links rendered in the extension-owned slot between
   Inbox and Usage. `order` sorts only within that slot.
 

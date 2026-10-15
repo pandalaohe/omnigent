@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/spinner";
-import type { ExtensionCatalogItem, ExtensionPage } from "./types";
+import type { ExtensionCatalogItem, ExtensionViewPage } from "./types";
 import { buildExtensionDocument, createExtensionNonce, loadExtensionBundle } from "./rpc/host";
 import {
   EXTENSION_RPC_SOURCE,
@@ -42,7 +42,7 @@ export function ExtensionViewHost({
   events = NO_HOST_EVENTS,
 }: {
   extension: ExtensionCatalogItem;
-  page: ExtensionPage;
+  page: ExtensionViewPage;
   refresh: () => Promise<ExtensionCatalogItem[]>;
   methods?: Readonly<Record<string, HostMethod>>;
   events?: Readonly<Record<string, unknown>>;

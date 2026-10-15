@@ -1,8 +1,21 @@
-export interface ExtensionPage {
+export type ExtensionPage = ExtensionViewPage | ExtensionExternalPage;
+
+export interface ExtensionViewPage {
   id: string;
   title: string;
   route: string;
+  kind?: "view";
   view: string;
+  url?: null;
+}
+
+export interface ExtensionExternalPage {
+  id: string;
+  title: string;
+  route: string;
+  kind: "external";
+  view: null;
+  url: string;
 }
 
 export interface ExtensionPrimaryNavigation {

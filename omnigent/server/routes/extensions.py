@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.extensions import ExtensionManifest, ExtensionPluginState
+from omnigent.extensions import ExtensionManifest, ExtensionPluginState, ExternalPageContribution
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -23,7 +23,9 @@ class ExtensionPageResponse(BaseModel):
     id: str
     title: str
     route: str
-    view: str
+    kind: Literal["view", "external"] = "view"
+    view: str | None
+    url: str | None = None
 
 
 class ExtensionPrimaryNavigationResponse(BaseModel):
@@ -105,7 +107,14 @@ def _serialize_manifest(
         []
         if unavailable
         else [
-            ExtensionPageResponse(id=page.id, title=page.title, route=page.route, view=page.view)
+            ExtensionPageResponse(
+                id=page.id,
+                title=page.title,
+                route=page.route,
+                kind="external" if isinstance(page, ExternalPageContribution) else "view",
+                view=None if isinstance(page, ExternalPageContribution) else page.view,
+                url=page.url if isinstance(page, ExternalPageContribution) else None,
+            )
             for page in sorted(manifest.pages, key=lambda item: item.id)
         ]
     )

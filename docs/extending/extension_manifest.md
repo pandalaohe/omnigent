@@ -60,6 +60,8 @@ def get_manifest() -> ExtensionManifest:
 - IDs are lowercase, publisher-qualified, immutable, and globally collision
   checked. Contribution IDs begin with the owning extension ID.
 - Page routes contain exactly one safe segment and are always namespaced.
+  IDs, route uniqueness, navigation references, and activation metadata apply
+  equally to view and external pages.
 - The manifest distribution/version must match installed package metadata.
 - `requires_omnigent` is a PEP 440 release-line range.
 - Browser paths are fixed to `dist/extension.js` and optional
@@ -68,6 +70,60 @@ def get_manifest() -> ExtensionManifest:
   are disabled deterministically.
 - One invalid field rejects the whole extension; one rejected extension does not
   prevent others from loading.
+
+## External pages
+
+`ExtensionManifest.pages` accepts both `PageContribution(id, title, route, view)`
+and `ExternalPageContribution(id, title, route, url)`. External pages require
+`ExtensionPermission.PAGES_EXTERNAL` (`"pages.external"`). Only view pages
+require a browser entrypoint; an external-only extension can ship no bundle.
+
+```python
+from omnigent.extensions import (
+    EXTENSION_API_VERSION,
+    ExtensionManifest,
+    ExtensionPermission,
+    ExternalPageContribution,
+)
+
+
+def get_manifest() -> ExtensionManifest:
+    return ExtensionManifest(
+        id="acme.dashboard",
+        display_name="Dashboard",
+        distribution="omnigent-acme-dashboard",
+        version="1.0.0",
+        requires_omnigent=">=0.11,<1",
+        extension_api=EXTENSION_API_VERSION,
+        permissions=frozenset({ExtensionPermission.PAGES_EXTERNAL}),
+        pages=(
+            ExternalPageContribution(
+                id="acme.dashboard.overview",
+                title="Dashboard",
+                route="overview",
+                url="https://dashboard.example.com/",
+            ),
+        ),
+    )
+```
+
+The URL must be an absolute HTTP or HTTPS string of at most 2048 characters,
+without whitespace, control characters, or userinfo. It must have
+a valid port when specified and an ASCII DNS, IPv4, or bracketed IPv6 host.
+DNS labels use letters, digits, and hyphens, with no leading or trailing hyphen;
+a trailing dot is allowed. Percent-encoded hosts and IPvFuture are rejected.
+
+The catalog preserves `id`, `title`, `route`, and `view` for view pages and adds
+`kind` and `url`:
+
+| Page kind | `kind` | `view` | `url` |
+| --- | --- | --- | --- |
+| Browser view | `"view"` | View symbol | `null` |
+| External page | `"external"` | `null` | Declared URL |
+
+Web consumers treat missing `kind` as `"view"` for older catalogs. Unknown kinds
+show the not-found page. See the [trust model](extensions.md#trust-model) for
+framing restrictions and navigation limitations.
 
 ## Compatibility
 

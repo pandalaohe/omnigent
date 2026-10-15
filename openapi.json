@@ -3345,6 +3345,15 @@
             "title": "Id",
             "type": "string"
           },
+          "kind": {
+            "default": "view",
+            "enum": [
+              "view",
+              "external"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
           "route": {
             "title": "Route",
             "type": "string"
@@ -3353,9 +3362,27 @@
             "title": "Title",
             "type": "string"
           },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
           "view": {
-            "title": "View",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "View"
           }
         },
         "required": [

@@ -7,6 +7,7 @@ from omnigent.extensions.api import (
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
+    ExternalPageContribution,
     PageContribution,
     PrimaryNavigationContribution,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "ExtensionPermission",
     "ExtensionPluginState",
     "ExtensionValidationError",
+    "ExternalPageContribution",
     "PageContribution",
     "PrimaryNavigationContribution",
     "check_extension_package",
