@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -1490,23 +1491,39 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
     assert seed_stores.agent_store.get_by_name("codex-sdk") is not None
 
 
-def test_codex_sdk_seed_is_distinct_and_uses_host_defaults(seed_stores: _SeedStores) -> None:
+@pytest.mark.parametrize(
+    ("name", "harness", "native_name", "seed_agent"),
+    [
+        ("codex-sdk", "codex", "codex-native-ui", server_app._ensure_default_codex_sdk_agent),
+        (
+            "claude-sdk",
+            "claude-sdk",
+            "claude-native-ui",
+            server_app._ensure_default_claude_sdk_agent,
+        ),
+    ],
+)
+def test_sdk_seed_is_distinct_and_uses_host_defaults(
+    seed_stores: _SeedStores,
+    name: str,
+    harness: str,
+    native_name: str,
+    seed_agent: Callable[..., None],
+) -> None:
     from omnigent.db.utils import builtin_agent_id
     from omnigent.runner.tool_dispatch import _granted_tool_names
     from omnigent.spec.types import AgentSpec
     from omnigent.tools.manager import ToolManager
 
     for _ in range(2):
-        server_app._ensure_default_codex_sdk_agent(
-            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
-        )
-    agent = seed_stores.agent_store.get_by_name("codex-sdk")
+        seed_agent(seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    agent = seed_stores.agent_store.get_by_name(name)
     assert agent is not None
-    assert agent.id == builtin_agent_id("codex-sdk")
-    assert agent.id != builtin_agent_id("codex-native-ui")
+    assert agent.id == builtin_agent_id(name)
+    assert agent.id != builtin_agent_id(native_name)
     assert agent.version == 1
     loaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
-    assert loaded.spec.executor.harness_kind == "codex"
+    assert loaded.spec.executor.harness_kind == harness
     assert loaded.spec.executor.model is None
     assert loaded.spec.executor.auth is None
     assert loaded.spec.spawn is True
@@ -1533,25 +1550,10 @@ def test_codex_sdk_seed_is_distinct_and_uses_host_defaults(seed_stores: _SeedSto
     assert {"sys_session_create", "sys_session_close"} <= advertised
     assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in advertised)
 
-    granted = _granted_tool_names(loaded.spec, "codex")
-    assert granted - _granted_tool_names(without_spawn, "codex") == advertised_added
+    granted = _granted_tool_names(loaded.spec, harness)
+    assert granted - _granted_tool_names(without_spawn, harness) == advertised_added
     assert "sys_session_create" in granted
     assert not any(name.startswith(("sys_os_", "sys_terminal_")) for name in granted)
-
-
-def test_claude_sdk_seed_is_idempotent(seed_stores: _SeedStores) -> None:
-    from omnigent.db.utils import builtin_agent_id
-
-    for _ in range(2):
-        server_app._ensure_default_claude_sdk_agent(
-            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
-        )
-    agent = seed_stores.agent_store.get_by_name("claude-sdk")
-    assert agent is not None
-    assert agent.id == builtin_agent_id("claude-sdk")
-    assert agent.version == 1
-    loaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
-    assert loaded.spec.executor.harness_kind == "claude-sdk"
 
 
 def test_claude_sdk_seed_skips_foreign_template(
