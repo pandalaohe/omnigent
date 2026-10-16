@@ -2131,7 +2131,9 @@ async def test_sessions_native_path_injects_mcp_schemas() -> None:
         # Sessions-native POST returns 202; the turn runs as a
         # background task. Wait for the background turn to complete.
         assert resp.status_code == 202
-        await asyncio.sleep(0.1)
+        turn_task = app.state.active_turns.get("4e92b5a0c0ee6db3f874f9c4a3f855a5")
+        if turn_task is not None:
+            await asyncio.wait_for(turn_task, timeout=5.0)
 
     assert harness_client.posted_bodies, "harness must receive at least one event"
     body = harness_client.posted_bodies[0]
@@ -2708,9 +2710,21 @@ async def test_stop_then_release_side_chat_preserves_other_runner_sessions() -> 
 
 
 @pytest.mark.asyncio
-async def test_session_stream_receives_events() -> None:
+@pytest.mark.parametrize("stream_delay_s", [0.0, 0.15])
+async def test_session_stream_receives_events(
+    monkeypatch: pytest.MonkeyPatch, stream_delay_s: float
+) -> None:
     """``GET /v1/sessions/{id}/stream`` yields events published by proxy_stream."""
     app, _pm, _hc = _build_lifecycle_app()
+    original_aiter_text = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+    async def _delayed_stream(handle: Any) -> AsyncIterator[str]:
+        # A turn may take longer than the HTTP acceptance request under load.
+        await asyncio.sleep(stream_delay_s)
+        async for frame in original_aiter_text(handle):
+            yield frame
+
+    monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", _delayed_stream)
 
     async with _runner_client(app) as client:
         # Create the session first.
@@ -2737,31 +2751,27 @@ async def test_session_stream_receives_events() -> None:
                         collected.append(json.loads(payload))
 
         sub_task = asyncio.create_task(_subscribe())
-        await asyncio.sleep(0.05)
-
-        # Trigger a turn — proxy_stream publishes events via
-        # session_stream. The stream stays open across turns;
-        # deleting the session sends [DONE].
-        resp = await client.post(
-            "/v1/sessions/4ee52d986b72704408b5ff36fe8421e0/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "model": "test-agent",
-                "content": [{"type": "input_text", "text": "hi"}],
-                "harness": "openai-agents",
-            },
-        )
-        async for _ in resp.aiter_text():
-            pass
-
-        # Allow turn-end bookkeeping to run.
-        await asyncio.sleep(0.05)
-
-        # Delete the session to close the stream ([DONE]).
-        await client.delete("/v1/sessions/4ee52d986b72704408b5ff36fe8421e0")
-
-        await asyncio.wait_for(sub_task, timeout=5.0)
+        try:
+            resp = await client.post(
+                "/v1/sessions/4ee52d986b72704408b5ff36fe8421e0/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "harness": "openai-agents",
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            # The response only accepts the turn. Deleting an unfinished turn
+            # cancels its harness stream, so wait for the background drain.
+            turn_task = app.state.active_turns.get("4ee52d986b72704408b5ff36fe8421e0")
+            if turn_task is not None:
+                await asyncio.wait_for(turn_task, timeout=5.0)
+        finally:
+            # Session creation buffers events even before the SSE reader starts.
+            await client.delete("/v1/sessions/4ee52d986b72704408b5ff36fe8421e0")
+            await asyncio.wait_for(sub_task, timeout=5.0)
 
     # session.status=running + harness frames + session.status=idle.
     statuses = [e.get("status") for e in collected if e.get("type") == "session.status"]
@@ -2769,10 +2779,11 @@ async def test_session_stream_receives_events() -> None:
     assert statuses[-1] in ("idle", "failed"), (
         f"last session.status must be idle or failed, got statuses: {statuses}"
     )
-    harness_events = [e for e in collected if e.get("type") != "session.status"]
-    assert len(harness_events) >= 2, (
-        f"Expected at least 2 harness events, got {len(harness_events)}: {harness_events}"
-    )
+    harness_events = [e for e in collected if e.get("type", "").startswith("response.")]
+    assert [e["type"] for e in harness_events] == [
+        "response.output_text.delta",
+        "response.completed",
+    ], harness_events
 
 
 @pytest.mark.asyncio

@@ -2112,34 +2112,45 @@ async def test_inactivity_monitor_waits_for_active_work_to_finish() -> None:
 
 
 @pytest.mark.asyncio
-async def test_inactivity_monitor_honors_activity_reset() -> None:
+async def test_inactivity_monitor_honors_activity_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Recent activity delays shutdown until the new idle window expires.
 
     :returns: None.
     """
-    loop = asyncio.get_running_loop()
-    last_activity = loop.time()
-    shutdowns: list[str] = []
+    from types import SimpleNamespace
 
-    task = asyncio.create_task(
+    from omnigent.runner import _entry
+
+    now = 0.0
+    last_activity = 0.0
+    shutdowns: list[float] = []
+
+    async def _advance_clock(delay: float) -> None:
+        nonlocal now, last_activity
+        now += delay
+        if now == 30.0:
+            last_activity = now
+        await asyncio.sleep(0)
+
+    clock = SimpleNamespace(time=lambda: now)
+    monkeypatch.setattr(
+        _entry,
+        "asyncio",
+        SimpleNamespace(get_running_loop=lambda: clock, sleep=_advance_clock),
+    )
+    await asyncio.wait_for(
         _run_inactivity_monitor(
-            idle_timeout_s=0.06,
+            idle_timeout_s=60.0,
             get_last_activity=lambda: last_activity,
             has_active_work=lambda: False,
-            request_shutdown=lambda: shutdowns.append("shutdown"),
-            poll_interval_s=0.005,
-        )
+            request_shutdown=lambda: shutdowns.append(now),
+            poll_interval_s=10.0,
+        ),
+        timeout=5.0,
     )
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(asyncio.shield(task), timeout=0.03)
-    last_activity = loop.time()
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(asyncio.shield(task), timeout=0.04)
-    assert shutdowns == []
-    assert not task.done()
-
-    await asyncio.wait_for(task, timeout=0.1)
-    assert shutdowns == ["shutdown"]
+    assert shutdowns == [90.0]
 
 
 def test_parent_process_is_alive_detects_current_process() -> None:

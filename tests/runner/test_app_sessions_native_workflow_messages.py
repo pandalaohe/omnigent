@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1159,7 +1158,7 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
     import asyncio as _aio
 
     gate = _aio.Event()  # never set → harness stream blocks forever
-    app, _pm, _hc = _build_blocking_app(gate)
+    app, _pm, hc = _build_blocking_app(gate)
 
     async with _runner_client(app) as client:
         await client.post(
@@ -1184,9 +1183,7 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
                         collected.append(json.loads(payload))
 
         sub_task = _aio.create_task(_sub())
-        await _aio.sleep(0.05)
-
-        async def _stuck() -> None:
+        try:
             resp = await client.post(
                 "/v1/sessions/1a6237b81972b420cfd54818b51d1e21/events",
                 json={
@@ -1197,21 +1194,14 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
                     "harness": "openai-agents",
                 },
             )
-            async for _ in resp.aiter_text():
-                pass
-
-        turn_task = _aio.create_task(_stuck())
-        await _aio.sleep(0.1)
-
-        # DELETE cancels the turn task — exercises `_drain_streaming_response`'s
-        # CancelledError path.
-        del_resp = await client.delete("/v1/sessions/1a6237b81972b420cfd54818b51d1e21")
-        assert del_resp.status_code == 200
-
-        gate.set()  # unblock the stuck stream so the test can finish
-        with contextlib.suppress(Exception):
-            await _aio.wait_for(turn_task, timeout=2.0)
-        await _aio.wait_for(sub_task, timeout=2.0)
+            assert resp.status_code == 202, resp.text
+            # Cancel during the harness drain, after setup has finished.
+            await _aio.wait_for(hc.post_seen.wait(), timeout=5.0)
+        finally:
+            del_resp = await client.delete("/v1/sessions/1a6237b81972b420cfd54818b51d1e21")
+            assert del_resp.status_code == 200
+            gate.set()
+            await _aio.wait_for(sub_task, timeout=5.0)
 
     statuses = [e["status"] for e in collected if e.get("type") == "session.status"]
     # Without the fix, the only emitted status is "running" — client stays stuck.
