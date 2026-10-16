@@ -2131,7 +2131,9 @@ async def test_sessions_native_path_injects_mcp_schemas() -> None:
         # Sessions-native POST returns 202; the turn runs as a
         # background task. Wait for the background turn to complete.
         assert resp.status_code == 202
-        await asyncio.sleep(0.1)
+        turn_task = app.state.active_turns.get("4e92b5a0c0ee6db3f874f9c4a3f855a5")
+        if turn_task is not None:
+            await asyncio.wait_for(turn_task, timeout=5.0)
 
     assert harness_client.posted_bodies, "harness must receive at least one event"
     body = harness_client.posted_bodies[0]
