@@ -747,9 +747,19 @@ async def test_timer_firing_stops_on_row8_off_only_without_spec_timers(
             )
         )
         server.flow_timer_enabled = False
-        await asyncio.sleep(0.15)
-        running = output["timer_id"] in runner_app._session_timers.get(_SESSION, {})
-        runner_app.cancel_timer(_SESSION, output["timer_id"])
+        timer_task = runner_app._session_timers[_SESSION][output["timer_id"]]
+        try:
+            async with asyncio.timeout(5):
+                if spec_timers:
+                    while len(server.wakes) < 2:
+                        server.woken.clear()
+                        await server.woken.wait()
+                else:
+                    await asyncio.shield(timer_task)
+            running = output["timer_id"] in runner_app._session_timers.get(_SESSION, {})
+        finally:
+            runner_app.cancel_timer(_SESSION, output["timer_id"])
+            await timer_task
     assert running is spec_timers
     assert (len(server.wakes) >= 2) is spec_timers
 
