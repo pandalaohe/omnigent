@@ -1507,12 +1507,10 @@ async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
 
 
 @pytest.fixture
-async def startup_app(db_uri):
-    import httpx
+def startup_http_app(db_uri):
     from fastapi.responses import JSONResponse
 
     from omnigent.errors import OmnigentError
-    from omnigent.host.frames import CAP_HARNESS_STARTUP
     from omnigent.server.routes.harness_startup import create_harness_startup_router
 
     app, registry, store = _owned_app(db_uri, authed_user="owner")
@@ -1525,6 +1523,16 @@ async def startup_app(db_uri):
     async def error_handler(request, exc):
         return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
 
+    return app, registry, store, auth
+
+
+@pytest.fixture
+async def startup_app(startup_http_app):
+    import httpx
+
+    from omnigent.host.frames import CAP_HARNESS_STARTUP
+
+    app, registry, _store, auth = startup_http_app
     peer = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(peer, registry)
     conn = registry.get(_HOST_ID)
@@ -1540,10 +1548,28 @@ async def startup_app(db_uri):
         await peer.wait(timeout=budget(2.0))
 
 
+async def test_startup_requires_auth_before_host_lookup(startup_http_app, monkeypatch):
+    """An unauthenticated HTTP request needs no established host tunnel."""
+    import httpx
+
+    app, registry, store, auth = startup_http_app
+    monkeypatch.setattr(auth, "get_user_id", lambda request: None)
+
+    def unexpected_host_io(*args, **kwargs):
+        pytest.fail("unauthenticated startup request reached host lookup or dispatch")
+
+    monkeypatch.setattr(store, "get_host", unexpected_host_io)
+    monkeypatch.setattr(registry, "send_text", unexpected_host_io)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/startup")
+    assert response.status_code == 401
+
+
 @pytest.mark.parametrize(
     "user,harness,state,status",
     [
-        (None, "claude-native", "online", 401),
         ("stranger", "claude-native", "online", 403),
         ("owner", "claude-native", "offline", 409),
         ("owner", "claude-native", "old", 501),
