@@ -43,6 +43,8 @@ Env vars read at startup:
   value is read from this process's own environment.
 - ``HARNESS_ACP_PROMPT_TIMEOUT_S``: optional idle (time-without-progress) deadline in
   seconds for a prompt turn (default 300); must be positive and finite or the child aborts.
+- ``HARNESS_ACP_INIT_TIMEOUT_S``: positive finite seconds per handshake/session-setup
+  RPC (default 30), forwarded from the agent's ``init_timeout_s`` configuration.
 - ``HARNESS_ACP_PERMISSION_MODE``: Omnigent permission stance, ``auto`` (default) or
   ``bypassPermissions`` — the latter skips the approval card for a tool call no
   policy had an opinion on, so a headless agent runs without parking on prompts.
@@ -67,6 +69,7 @@ from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.onboarding.acp_auth import parse_init_timeout_s
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -184,6 +187,9 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         env_unset=_csv_names(_ENV_ENV_UNSET),
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
+        init_timeout_s=parse_init_timeout_s(
+            float(os.environ.get("HARNESS_ACP_INIT_TIMEOUT_S", "30"))
+        ),
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)
 
