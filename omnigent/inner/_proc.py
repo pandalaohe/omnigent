@@ -310,11 +310,31 @@ def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
     for pid, create_time in identities.items():
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() == create_time and _getpgid_fn(pid) == pgid:
+            if proc.create_time() != create_time:
+                continue
+            # An unreaped leader still reserves its PID/group on macOS even
+            # though getpgid can no longer resolve the zombie.
+            if pid == pgid and proc.status() == psutil.STATUS_ZOMBIE:
+                return True
+            if _getpgid_fn(pid) == pgid:
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
     return False
+
+
+def _snapshot_group_identities(pgid: int) -> dict[int, float]:
+    """Find current group members and their descendants after a leader exits."""
+    identities: dict[int, float] = {}
+    if _getpgid_fn is None:
+        return identities
+    for member in psutil.process_iter():
+        try:
+            if _getpgid_fn(member.pid) == pgid:
+                identities.update(_snapshot_identities(member.pid))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return identities
 
 
 def _signal_tree_census(
@@ -324,6 +344,7 @@ def _signal_tree_census(
     force: bool,
     remove: bool,
     snapshot_root: bool,
+    owned_pgid: int | None,
 ) -> dict[int, float]:
     """Signal a bounded union of remembered and currently observable descendants."""
     remembered = _remember_identities(process, {}, remove=False)
@@ -341,6 +362,8 @@ def _signal_tree_census(
         if expected_root is not None and current.get(pid) != expected_root:
             current = {}
             snapshot_root = False
+        if owned_pgid is not None and _identity_in_group(identities, owned_pgid):
+            current.update(_snapshot_group_identities(owned_pgid))
         before = len(identities)
         identities.update(current)
         _signal_identities(identities, force=force)
@@ -390,6 +413,7 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
         force=False,
         remove=False,
         snapshot_root=leader_live,
+        owned_pgid=owned_pgid if group_is_owned else None,
     )
     group_signaled = group_is_owned and _killpg(pid, signal.SIGTERM, owned_pgid=owned_pgid)
     if not group_signaled and not identities:
@@ -432,6 +456,7 @@ def kill_tree(process: _ProcessLike | None) -> None:
         force=True,
         remove=True,
         snapshot_root=leader_live,
+        owned_pgid=owned_pgid if group_is_owned else None,
     )
     group_signaled = group_is_owned and _killpg(pid, _SIGKILL, owned_pgid=owned_pgid)
     if not group_signaled and not identities:

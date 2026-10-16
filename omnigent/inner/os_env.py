@@ -28,6 +28,7 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
+from . import _proc
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -1536,14 +1537,23 @@ def _shell_impl(
     """
     argv = _shell_argv(shell_path, command)
     try:
-        completed = subprocess.run(
+        with subprocess.Popen(
             argv,
             cwd=str(cwd),
             env=_child_shell_env(),
             text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **_proc.spawn_kwargs(),
+        ) as process:
+            try:
+                _proc.remember_process_group(process)
+                stdout, stderr = process.communicate(timeout=timeout)
+            except BaseException:
+                # The shell can exit before children release its output pipes.
+                _proc.kill_tree(process)
+                raise
+            returncode = process.wait()
     except subprocess.TimeoutExpired as exc:
         # ``subprocess.TimeoutExpired.stdout``/``stderr`` are ``str | bytes
         # | None`` from the stdlib; widening the op result at this boundary
@@ -1563,22 +1573,22 @@ def _shell_impl(
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
-    stdout = _truncate_output(completed.stdout, "stdout", max_output)
-    stderr = _truncate_output(completed.stderr, "stderr", max_output)
+    detail = stderr.strip() or stdout.strip()
+    stdout = _truncate_output(stdout, "stdout", max_output)
+    stderr = _truncate_output(stderr, "stderr", max_output)
     result: OpResult = {
         "stdout": stdout,
         "stderr": stderr,
-        "exit_code": completed.returncode,
+        "exit_code": returncode,
         "timed_out": False,
         "shell": shell_path,
         "cwd": str(cwd),
     }
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    if returncode != 0:
         if detail:
-            result["error"] = f"Command exited with status {completed.returncode}: {detail}"
+            result["error"] = f"Command exited with status {returncode}: {detail}"
         else:
-            result["error"] = f"Command exited with status {completed.returncode}"
+            result["error"] = f"Command exited with status {returncode}"
     return result
 
 

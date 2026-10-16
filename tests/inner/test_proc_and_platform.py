@@ -315,6 +315,20 @@ def test_identity_census_skips_reused_pid(monkeypatch: pytest.MonkeyPatch) -> No
     reused.kill.assert_not_called()
 
 
+@pytest.mark.parametrize(("create_time", "expected"), [(100.0, True), (200.0, False)])
+def test_owned_zombie_leader_keeps_group_identity(
+    monkeypatch: pytest.MonkeyPatch, create_time: float, expected: bool
+) -> None:
+    """An unreaped leader reserves its group even when getpgid cannot find it."""
+    leader = Mock()
+    leader.create_time.return_value = create_time
+    leader.status.return_value = psutil.STATUS_ZOMBIE
+    monkeypatch.setattr(_proc.psutil, "Process", lambda pid: leader)
+    monkeypatch.setattr(_proc, "_getpgid_fn", Mock(side_effect=ProcessLookupError))
+
+    assert _proc._identity_in_group({43210: 100.0}, 43210) is expected
+
+
 def test_kill_tree_does_not_adopt_reused_reaped_leader_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
+import json
 import os
+import shlex
 import shutil
+import sys
+import time
 import tracemalloc
 from pathlib import Path
 
+import psutil
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -169,6 +175,55 @@ def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     assert result["exit_code"] is None
     assert result["timed_out"] is True
     assert result["error"] == "Command timed out after 1 seconds"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX shell job and session inheritance")
+@pytest.mark.parametrize("layout", ["foreground", "background", "detached", "background-detached"])
+def test_shell_timeout_stops_descendants(tmp_path: Path, layout: str) -> None:
+    """A helper shell timeout stops both its command and that command's child."""
+    pid_file = tmp_path / "pids.json"
+    script = tmp_path / "spawn_tree.py"
+    script.write_text(
+        "import json, os, psutil, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)', "
+        "sys.argv[1]], start_new_session=sys.argv[2].endswith('detached'))\n"
+        "identities = [[pid, psutil.Process(pid).create_time()] "
+        "for pid in (os.getpid(), child.pid)]\n"
+        "Path(sys.argv[1]).write_text(json.dumps(identities))\n"
+        "time.sleep(60)\n"
+    )
+    command = shlex.join([sys.executable, str(script), str(pid_file), layout])
+    command += " &" if layout.startswith("background") else "; :"
+    os_env = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    processes: list[psutil.Process] = []
+    try:
+        started = time.monotonic()
+        result = asyncio.run(os_env.shell(command, timeout=1))
+        elapsed = time.monotonic() - started
+        assert result.get("timed_out") is True, result
+        identities = json.loads(pid_file.read_text())
+        assert len({pid for pid, _created in identities}) == 2, identities
+        for pid, created in identities:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                process = psutil.Process(pid)
+                if process.create_time() == created:
+                    processes.append(process)
+        _gone, alive = psutil.wait_procs(processes, timeout=2)
+        for process in alive:
+            assert str(pid_file) in process.cmdline()
+        assert not alive, f"Timed-out command left live descendants: {[p.pid for p in alive]}"
+        assert elapsed < 10, f"Timeout cleanup took {elapsed:.1f}s instead of stopping the command"
+    finally:
+        for process in processes:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                process.kill()
+        psutil.wait_procs(processes, timeout=2)
+        os_env.close()
 
 
 # ---------------------------------------------------------------------------
